@@ -2952,7 +2952,6 @@ dependencies = [
  "anyhow",
  "decdn-protocol",
  "iroh",
- "iroh-gossip",
  "serde",
  "thiserror 2.0.19",
  "tokio",

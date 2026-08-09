@@ -69,9 +69,20 @@ gpg --verify image-digest.txt.asc image-digest.txt
 docker pull "$(cat image-digest.txt)"
 ```
 
-Every tag you can pull — `latest`, `<version>` and `<major>.<minor>` — is
-created only after that digest has been signed, so an unpinned
-`docker pull ghcr.io/decdn/decdn` also resolves to a signed image. Pulling by
+The image is published to two registries, `ghcr.io/decdn/decdn-node` and
+`decdn/decdn-node` on Docker Hub. `image-digest.txt` records the GHCR reference,
+but the mirror is a verbatim manifest copy rather than a rebuild, so both serve
+the *same* digest and that one signature covers both:
+
+```bash
+DIGEST="$(cut -d@ -f2 image-digest.txt)"
+docker pull "ghcr.io/decdn/decdn-node@${DIGEST}"
+docker pull "decdn/decdn-node@${DIGEST}"        # identical bytes
+```
+
+Every tag you can pull — `latest`, `<version>` and `<major>.<minor>`, on either
+registry — is created only after that digest has been signed, so an unpinned
+`docker pull decdn/decdn-node` also resolves to a signed image. Pulling by
 digest is still stronger: it pins the exact bytes you verified.
 
 CI pushes the image manifest untagged, so before signing no tag resolves to it —
@@ -102,7 +113,31 @@ separately, so the `decdn-node` binary inside it is byte-identical to the one in
 `SHA256SUMS` therefore also tells you what is in the image:
 
 ```bash
-docker run --rm --entrypoint sha256sum ghcr.io/decdn/decdn:<version> \
+docker run --rm --entrypoint sha256sum ghcr.io/decdn/decdn-node:<version> \
   /usr/local/bin/decdn-node
 tar xzOf decdn-node-<version>-x86_64-unknown-linux-gnu.tar.gz | sha256sum
+```
+
+### Crates published to crates.io
+
+The library crates and both binaries are also published to crates.io
+(`decdn-node`, `decdn-cli` and the crates they depend on). **Those artifacts
+carry no maintainer signature** — crates.io has no detached-signature mechanism,
+and the `.crate` files are built and uploaded from a maintainer's machine after
+the GitHub Release is signed, not from the signed archives.
+
+If you need the guarantees described above, use the GitHub Release: its
+`SHA256SUMS` and container digest are what a maintainer signs. `cargo install`
+is a convenience path, and what it gives you is crates.io's own transport and
+immutability guarantees — a published version can never be altered, only yanked.
+
+To tie a `.crate` back to the signed tag yourself, read the commit out of the
+`.cargo_vcs_info.json` that cargo embeds, and check it is the one the tag points
+at. A plain file-by-file diff will not be clean: cargo rewrites `Cargo.toml` in
+the package (inlining inherited fields, dropping `[workspace]`) and keeps the
+original alongside it as `Cargo.toml.orig`.
+
+```bash
+tar xzOf decdn-cli-<version>.crate decdn-cli-<version>/.cargo_vcs_info.json
+git rev-parse v<version>^{commit}
 ```

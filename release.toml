@@ -10,6 +10,11 @@ tag-name = "v{{version}}"
 pre-release-commit-message = "chore(release): v{{version}}"
 push = true
 push-remote = "origin"
+# Not a "we never publish" flag — the workspace does go to crates.io, via
+# .github/scripts/publish-crates.sh. It must not happen HERE: this step runs
+# before CI has built anything and before a human has verified anything, and a
+# crates.io version is immutable, so an upload at this point could never be
+# taken back if the release then failed. See RELEASING.md.
 publish = false
 sign-commit = true
 sign-tag = true

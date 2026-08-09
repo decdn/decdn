@@ -16,6 +16,10 @@
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
 #                         signed digest in image-digest.txt
+#   DECDN_SKIP_DOCKERHUB  set to 1 to tag on GHCR only, skipping the Docker Hub
+#                         mirror (implied by DECDN_SKIP_IMAGE_TAGS)
+#   DECDN_DOCKERHUB_REPO  override the Docker Hub repository
+#                         (default: decdn/decdn-node)
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -25,9 +29,15 @@ set -euo pipefail
 TAG="${1:?tag required, e.g. v0.1.2}"
 VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
-IMAGE="ghcr.io/${REPO}"
+# `-node`: the image carries the daemon only, so it is not named after the repo.
+# Must match release.yml's IMAGE_NAME, which is what wrote image-digest.txt.
+IMAGE="ghcr.io/${REPO}-node"
+# Derived from $REPO, exactly like $IMAGE. Hard-defaulting this to
+# `decdn/decdn-node` would mean a DECDN_REPO=<fork> rehearsal promotes GHCR tags
+# on the fork while pushing `latest` to the PRODUCTION Docker Hub repository —
+# which the maintainer is logged in to, so it would succeed silently.
+DOCKERHUB_IMAGE="docker.io/${DECDN_DOCKERHUB_REPO:-${REPO}-node}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
-SKIP_IMAGE_TAGS="${DECDN_SKIP_IMAGE_TAGS:-}"
 
 # The three files a signature covers. SHA256SUMS transitively covers every
 # archive, so the archives carry no individual .asc.
@@ -38,6 +48,31 @@ SIGN_TARGETS=(
 )
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# `1`/`true`/`yes` enable, `0`/`false`/`no`/empty do not, anything else is a
+# typo and stops the script. A bare `[[ -n ]]` test would make
+# DECDN_SKIP_DOCKERHUB=0 mean "skip" — the opposite of what someone typing 0
+# intends — and DECDN_SKIP_IMAGE_TAGS=0 would ship a release with no pullable
+# image tag at all.
+enabled() {
+  local name="$1" value="${2:-}"
+  case "${value,,}" in
+    ''|0|false|no) return 1 ;;
+    1|true|yes)    return 0 ;;
+    *) die "$name must be 1/true/yes or 0/false/no, got '$value'" ;;
+  esac
+}
+
+SKIP_IMAGE_TAGS=""
+if enabled DECDN_SKIP_IMAGE_TAGS "${DECDN_SKIP_IMAGE_TAGS:-}"; then
+  SKIP_IMAGE_TAGS=1
+fi
+# Skipping every tag necessarily skips the mirror: there would be nothing to
+# mirror, and pushing an untagged copy to a second registry helps nobody.
+SKIP_DOCKERHUB="$SKIP_IMAGE_TAGS"
+if enabled DECDN_SKIP_DOCKERHUB "${DECDN_SKIP_DOCKERHUB:-}"; then
+  SKIP_DOCKERHUB=1
+fi
 
 # ---- preconditions -------------------------------------------------------
 
@@ -58,17 +93,45 @@ if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
     die "docker not found on PATH (set DECDN_SKIP_IMAGE_TAGS=1 to skip tag promotion)"
   docker buildx version >/dev/null 2>&1 ||
     die "docker buildx not available (set DECDN_SKIP_IMAGE_TAGS=1 to skip tag promotion)"
+
+  # A warning, not a die: some credential setups (per-registry `credHelpers`,
+  # external tooling) keep no `auths` entry, so a miss here is not proof of a
+  # missing login. Docker Hub is the second registry and
+  # the newer requirement, so it is the one worth flagging early — an operator
+  # who has only ever run `docker login ghcr.io` gets told now rather than
+  # after the signatures are already uploaded.
+  if [[ -z "$SKIP_DOCKERHUB" ]] &&
+     ! grep -q 'index\.docker\.io' "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null; then
+    echo "warning: no Docker Hub credentials found in the docker config." >&2
+    echo "         Run \`docker login docker.io\`, or set DECDN_SKIP_DOCKERHUB=1" >&2
+    echo "         to tag on GHCR only." >&2
+  fi
 fi
 
 # Resolve the signing key to a full fingerprint. `gpg --list-secret-keys` with
 # NO argument exits 0 even on a completely empty keyring, so testing its exit
-# status proves nothing — extracting a fingerprint is the real check. Resolving
-# to a fingerprint also avoids gpg's substring uid matching, where a loose
-# DECDN_SIGNING_KEY could silently select a key nobody intended.
-FPR=$(gpg --list-secret-keys --with-colons ${SIGNING_KEY:+"$SIGNING_KEY"} 2>/dev/null |
-  awk -F: '/^fpr:/ {print $10; exit}') || true
+# status proves nothing — extracting a fingerprint is the real check.
+#
+# Only the `fpr` following a `sec` record is taken: gpg emits one per subkey
+# too, and a signing subkey would otherwise be mistaken for a second key.
+mapfile -t SECRET_FPRS < <(
+  gpg --list-secret-keys --with-colons ${SIGNING_KEY:+"$SIGNING_KEY"} 2>/dev/null |
+    awk -F: '/^sec:/ {want = 1} /^fpr:/ && want {print $10; want = 0}'
+)
 # shellcheck disable=SC2016  # the quotes are inside a double-quoted ${:+}, so it does expand
-[[ -n "$FPR" ]] || die "no usable gpg secret key${SIGNING_KEY:+ matching '$SIGNING_KEY'}"
+(( ${#SECRET_FPRS[@]} > 0 )) ||
+  die "no usable gpg secret key${SIGNING_KEY:+ matching '$SIGNING_KEY'}"
+
+# gpg substring-matches uids, so a loose DECDN_SIGNING_KEY can select more than
+# one key. Taking the first silently signs the release with a key the operator
+# did not name — which the KEYS check below would not catch, since it only
+# asks whether the key is *a* published maintainer key.
+if [[ -n "$SIGNING_KEY" ]] && (( ${#SECRET_FPRS[@]} > 1 )); then
+  die "DECDN_SIGNING_KEY '$SIGNING_KEY' is ambiguous — it matches ${#SECRET_FPRS[@]} secret keys:
+$(printf '  %s\n' "${SECRET_FPRS[@]}")
+Use a full fingerprint."
+fi
+FPR="${SECRET_FPRS[0]}"
 
 # A gpg home containing ONLY the published maintainer keys. Both the tag
 # signature and the signatures produced below are verified against this rather
@@ -129,9 +192,12 @@ REMOTE_TAG=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha) ||
 # An annotated tag's ref points at the tag object; dereference to the commit.
 REMOTE_COMMIT=$(git rev-parse "${REMOTE_TAG}^{commit}")
 [[ "$LOCAL_TAG" == "$REMOTE_COMMIT" ]] || die \
-  "local tag $TAG ($LOCAL_TAG) differs from origin ($REMOTE_COMMIT).
-The draft was built from origin's tag, so signing now would vouch for
-artifacts you have not verified. Reconcile the tags first."
+  "local tag $TAG ($LOCAL_TAG) differs from ${REPO}'s ($REMOTE_COMMIT).
+The draft was built from that tag, so signing now would vouch for artifacts you
+have not verified. Reconcile the tags first.
+Note the fetch above used the git remote \`origin\`, while this compares against
+the GitHub API for $REPO; if DECDN_REPO points somewhere your origin does not,
+reconcile those first."
 
 IS_DRAFT=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft) || die \
   "could not read release $TAG from $REPO.
@@ -186,7 +252,10 @@ Re-run the upload-assets job, then retry."
 # Anchored match, not a prefix glob: a prefix test passes on a multi-line file
 # whose second line names a different registry, and on a truncated digest.
 DIGEST_REF=$(tr -d '\r' < image-digest.txt | head -n1)
-[[ $(wc -l < image-digest.txt) -le 1 ]] ||
+# `grep -c ''`, not `wc -l`: wc counts newlines, so a two-line file with no
+# trailing newline reports 1 and sails through — which is exactly the
+# "second line names a different registry" case this guard exists to catch.
+[[ $(grep -c '' image-digest.txt) -le 1 ]] ||
   die "image-digest.txt has more than one line"
 [[ "$DIGEST_REF" =~ ^"${IMAGE}"@sha256:[0-9a-f]{64}$ ]] ||
   die "image-digest.txt is not a single $IMAGE digest reference: $DIGEST_REF"
@@ -237,33 +306,69 @@ else
     PROMOTE_TAGS=( "latest" "$VERSION" "${VERSION%.*}" )
   fi
 
+  DIGEST="${DIGEST_REF#*@}"
+
+  # Points every tag in PROMOTE_TAGS at the signed digest, in $1.
+  #
+  # `imagetools create` copies the source manifest verbatim, so this both
+  # promotes within GHCR and copies to another registry without a rebuild or a
+  # local pull — and the copy keeps the same digest, which is what lets one
+  # signature over image-digest.txt vouch for the mirror too. The inspect loop
+  # is what PROVES that rather than assuming it: if a future buildx ever
+  # rewrote the manifest, the digest would move and this would refuse to go on.
+  # Set once the GHCR tags are live, so a later failure can say so. By the time
+  # the Docker Hub leg runs, `ghcr.io/...:latest` ALREADY resolves to the new
+  # digest while the release is still a draft — an operator who hits a Docker
+  # Hub auth wall and stops for the day must be told that, not just "re-run".
+  GHCR_PROMOTED=""
+
+  promote_to() {
+    local target="$1" login_hint="$2" t got create_args=() already=""
+    if [[ -n "$GHCR_PROMOTED" ]]; then
+      already="
+${IMAGE} tags are ALREADY promoted — :latest now serves an unpublished release.
+Either finish this script, or re-point the ${IMAGE} tags at the previous digest."
+    fi
+    for t in "${PROMOTE_TAGS[@]}"; do
+      create_args+=( -t "${target}:${t}" )
+    done
+    docker buildx imagetools create "${create_args[@]}" "${IMAGE}@${DIGEST}" || die \
+      "failed to promote image tags on ${target} (registry auth? run \`docker login ${login_hint}\`).
+Signatures are uploaded and the release is still a draft.
+Fix the problem and re-run this script — it is idempotent.${already}"
+
+    for t in "${PROMOTE_TAGS[@]}"; do
+      got=$(docker buildx imagetools inspect "${target}:${t}" \
+        --format '{{.Manifest.Digest}}' 2>/dev/null) || got=""
+      [[ "$got" == "$DIGEST" ]] ||
+        die "${target}:${t} resolves to '${got}', not the signed digest ${DIGEST}${already}"
+      echo "    ${target}:${t} -> ${DIGEST}"
+    done
+  }
+
   # Tags the untagged manifest CI already pushed — no rebuild, no pull — so
   # every tag a user can pull resolves to the digest signed above.
   echo "==> Promoting image tags to the signed digest: ${PROMOTE_TAGS[*]}"
-  DIGEST="${DIGEST_REF#*@}"
-  create_args=()
-  for t in "${PROMOTE_TAGS[@]}"; do
-    create_args+=( -t "${IMAGE}:${t}" )
-  done
-  docker buildx imagetools create "${create_args[@]}" "${IMAGE}@${DIGEST}" || die \
-    "failed to promote image tags (registry auth? run \`docker login ghcr.io\`).
-Signatures are uploaded and the release is still a draft.
-Fix the problem and re-run this script — it is idempotent."
+  promote_to "$IMAGE" "ghcr.io"
+  GHCR_PROMOTED=1
 
-  for t in "${PROMOTE_TAGS[@]}"; do
-    got=$(docker buildx imagetools inspect "${IMAGE}:${t}" \
-      --format '{{.Manifest.Digest}}' 2>/dev/null) || got=""
-    [[ "$got" == "$DIGEST" ]] ||
-      die "${IMAGE}:${t} resolves to '${got}', not the signed digest ${DIGEST}"
-    echo "    ${IMAGE}:${t} -> ${DIGEST}"
-  done
+  if [[ -n "$SKIP_DOCKERHUB" ]]; then
+    echo "==> Skipping the Docker Hub mirror (DECDN_SKIP_DOCKERHUB set)"
+  else
+    # Before the release leaves draft, not after: the two registries are
+    # advertised as interchangeable, so publishing with only one populated
+    # would send half of `docker pull` users to a tag that does not exist.
+    echo "==> Mirroring the signed digest to $DOCKERHUB_IMAGE"
+    promote_to "$DOCKERHUB_IMAGE" "docker.io"
+  fi
 fi
 
 echo "==> Publishing $TAG"
 gh release edit "$TAG" --repo "$REPO" --draft=false || die \
-  "signatures are uploaded and the image tags are promoted, but the release is
-STILL A DRAFT — :latest now serves an unpublished release. Re-run this script,
-or publish manually: gh release edit $TAG --repo $REPO --draft=false"
+  "signatures are uploaded and the image tags are promoted on every registry,
+but the release is STILL A DRAFT — :latest now serves an unpublished release.
+Re-run this script, or publish manually:
+gh release edit $TAG --repo $REPO --draft=false"
 
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"

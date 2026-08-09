@@ -28,6 +28,31 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Container image renamed to `decdn-node`, and now published to Docker Hub as
+  well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
+  the same image is published as `decdn/decdn-node` on Docker Hub. The image
+  ships the daemon only — the `decdn` CLI is deliberately not in it — so it is
+  no longer named after the repository. No release had been cut under the old
+  name, so nothing existing breaks; any local script pinning
+  `ghcr.io/decdn/decdn` must be updated.
+  - The mirror is a manifest copy, not a second build: `sign-release.sh` uses
+    `docker buildx imagetools create`, which copies the manifest bytes verbatim,
+    so both registries serve one identical digest and the existing GPG signature
+    over `image-digest.txt` covers both. The script re-reads every tag on both
+    registries and refuses to publish the release if any resolves to a different
+    digest. `image-digest.txt` still records a single GHCR reference.
+  - New env overrides: `DECDN_SKIP_DOCKERHUB=1` (tag on GHCR only) and
+    `DECDN_DOCKERHUB_REPO`. No new Actions secret — the mirror happens on the
+    maintainer's machine at signing time, keeping "no publish credential in CI".
+- **`TERMS.md` and `TERMS_README.md` moved from the repo root to
+  `crates/cli/`.** The terms text is embedded by `decdn-cli` with
+  `include_str!`, which cannot reach outside its own package; from the root it
+  was unreachable in a published `.crate` and `cargo install decdn-cli` would
+  have failed to build. The file's bytes are unchanged, so the on-chain
+  `currentTermsHash` preimage and the hash lock in `terms.rs` are unaffected.
+  The out-of-band verification command becomes
+  `cast keccak 0x$(xxd -p -c1000000 crates/cli/TERMS.md)`.
+
 - **ABI-breaking: `OriginAssignment` replaces propose/ratify with publisher
   vetting plus instant origin seating (#1491).** Origin authorization used to
   couple two decisions in one flow — a publisher proposed a whole operator set
@@ -1079,6 +1104,61 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **The workspace is published to crates.io.** Eleven crates ship —
+  `decdn-protocol`, `-config-types`, `-bao-range`, `-common`, `-cache`,
+  `-gossip`, `-reputation`, `-incentive`, `-client-pull`, `-node` and
+  `decdn-cli` — making `cargo install decdn-cli` and `cargo install decdn-node`
+  work. `decdn-e2e` stays `publish = false`.
+  - Publishing is a new maintainer-run step, `.github/scripts/publish-crates.sh`,
+    which runs *after* `sign-release.sh`. It verifies the tag against `KEYS` and
+    against `origin`, requires the GitHub Release to be published rather than a
+    draft, and publishes from a detached worktree at the tag rather than from the
+    working copy. There is still no registry credential in Actions secrets.
+  - `[workspace.package]` gains `version`, `repository`, `homepage`, `keywords`
+    and `categories`; every crate inherits them and carries its own `README.md`.
+    The internal `[workspace.dependencies]` entries gain `version` fields, which
+    is what makes them publishable — cargo rejects a path dependency with no
+    version, since a published crate has no path to follow.
+- **Two packaging gates, because a crates.io version can never be replaced.**
+  `release.yml` now runs `cargo publish --workspace --dry-run --locked` before
+  the draft release is created, which packages and verify-builds every crate. A
+  cheap `packaging` CI job (and matching pre-commit hooks) runs
+  `check-package-embeds.sh` — no publishable crate may `include_str!` a file
+  outside its own package — and `check-deployment-mirror.sh`.
+  - The checker covers `include!`, `include_str!`, `include_bytes!` in all three
+    delimiter forms, and `#[path = "…"]`; it enumerates workspace members from
+    the root manifest rather than a `crates/*` glob, treats a target that git
+    does not track as unshipped, and fails rather than reporting success when it
+    finds no publishable crates. Its logic lives in
+    `.github/scripts/check_package_embeds.py` with unit tests under
+    `.github/scripts/tests/`.
+  - `#[cfg(test)]` sites are accepted rather than failed — the verify build does
+    not enable `cfg(test)`, so they do not block publishing — but each must be
+    listed in the checker's `KNOWN_TEST_ONLY` allowlist, and a listed entry that
+    no longer fires also fails. Two are listed today, both embedding
+    `examples/configs/arbitrum-sepolia.toml`
+    (`crates/cli/src/commands/config.rs`, `crates/common/src/config/mod.rs`);
+    `cargo test` cannot run from those published crates as a result.
+  - The `packaging` job also runs `cargo package --workspace --no-verify` and
+    asserts the image repository agrees across `release.yml`, `sign-release.sh`
+    and `security.yml`.
+- **`crates/cli/deployments/421614.json`,** a byte-identical mirror of
+  `contracts/deployments/421614.json` (which stays canonical — the Foundry
+  deploy script writes it). Same `include_str!` constraint as `TERMS.md`. A
+  redeploy must be copied across; `check-deployment-mirror.sh` fails on drift in
+  both CI and pre-commit, so stale baked-in contract addresses cannot ship
+  silently.
+- **The Dockerfile's base image is pinned by digest, and Dependabot now tracks
+  the `docker` ecosystem** to bump it. The pin is what makes two builds of the
+  same release tag ship identical base layers; it is also what makes the
+  Dependabot entry work at all, since Dependabot can update a digest but cannot
+  derive a version from the `bookworm-slim` tag.
+- **`publish-crates.sh` refuses to start when more than five crates are new to
+  crates.io.** `PublishNew` allows a burst of five and then roughly one per ten
+  minutes, and the first release creates eleven crates — one run would be
+  rate-limited partway through, leaving some permanently published and the
+  version spent. Clearing this is a one-time manual step; see RELEASING.md.
+  Override with `DECDN_ALLOW_RATE_LIMIT=1` once the limit has been raised.
 - **ADR 009 bootstrap-multisig governance phase (#1175).** `DeployProtocol` run
   with `BOOTSTRAP_MULTISIG=<addr>` seats that multisig as the Timelock's sole
   `PROPOSER_ROLE`/`CANCELLER_ROLE` holder and grants `DecdnGovernor` neither, so

@@ -24,6 +24,20 @@ updates:
       # iroh ecosystem is pinned per ADR 001; upgrades require manual coordination
       - dependency-name: "iroh*"
 
+  # Bumps the Dockerfile's pinned base-image digest. This only works because
+  # the FROM line carries an explicit `@sha256:` — Dependabot updates a tag only
+  # when it can parse a version out of it, and `bookworm-slim` gives it nothing,
+  # so with a bare tag this ecosystem would open no PRs at all.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Same rationale as the cargo ecosystem above.
+    commit-message:
+      prefix: chore
+      include: scope
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

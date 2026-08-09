@@ -1,10 +1,15 @@
 [package]
 name = "decdn-protocol"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Wire protocol types and ALPN definitions for deCDN"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde = { workspace = true }

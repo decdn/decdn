@@ -1,10 +1,15 @@
 [package]
 name = "decdn-node"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "CLI entry point and runtime wiring for a deCDN node"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "decdn-node"

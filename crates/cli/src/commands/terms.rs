@@ -15,10 +15,15 @@ use std::io::{self, IsTerminal, Write};
 use alloy::primitives::{B256, keccak256};
 use anyhow::Context;
 
-/// The canonical operator terms, embedded from the repo-root `TERMS.md` so the
+/// The canonical operator terms, embedded from this crate's `TERMS.md` so the
 /// displayed text is the exact preimage of the recorded hash — there is no
 /// external document to fetch or substitute (ADR 019 § Terms Acceptance).
-pub const TERMS_TEXT: &str = include_str!("../../../../TERMS.md");
+///
+/// The file lives in the crate rather than at the repo root because `include_str!`
+/// may not escape the package: a path outside it is unreachable from the
+/// published `.crate`, so `cargo install decdn-cli` would fail to build. See
+/// `TERMS_README.md` alongside it for the editing rules.
+pub const TERMS_TEXT: &str = include_str!("../../TERMS.md");
 
 /// `keccak256` of the embedded terms — the value the operator's signature
 /// commits to and which must equal the network's on-chain `currentTermsHash`.
@@ -216,7 +221,8 @@ mod tests {
     }
 
     /// Locks the embedded terms hash to `keccak256` of the exact `TERMS.md`
-    /// bytes (verify out-of-band: `cast keccak 0x$(xxd -p -c1000000 TERMS.md)`).
+    /// bytes (verify out-of-band:
+    /// `cast keccak 0x$(xxd -p -c1000000 crates/cli/TERMS.md)`).
     /// Editing TERMS.md deliberately flips this — that is intended: the hash is
     /// consensus-critical, so a terms change is a gated event that must be paired
     /// with a governance `setCurrentTermsHash` bump and a new deploy value.
