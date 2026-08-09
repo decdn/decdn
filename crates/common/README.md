@@ -5,8 +5,8 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 > **Status: early implementation.** deCDN is pre-launch — no network is deployed. Wire formats, APIs and on-chain interfaces change without compatibility shims.
 
 Types shared by the two deCDN binaries (`decdn-node` and `decdn`): the config schema and its
-resolver, node identity loading, and the local admin JSON-RPC trait plus its request/response
-DTOs.
+resolver, the shared clap argument definitions both binaries build their command lines from,
+node identity loading, and the local admin JSON-RPC trait plus its request/response DTOs.
 
 Split out so the daemon and the CLI agree on config and admin wire shapes by construction
 rather than by convention — see the dockerd-style two-binary rationale in the repo's

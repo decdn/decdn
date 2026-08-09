@@ -129,6 +129,15 @@ the GitHub Release is signed, not from the signed archives.
 If you need the guarantees described above, use the GitHub Release: its
 `SHA256SUMS` and container digest are what a maintainer signs. `cargo install`
 is a convenience path, and what it gives you is crates.io's own transport and
-immutability guarantees — a published version can never be altered, only
-yanked — plus the assurance that the uploaded source matches the signed tag,
-which you can check yourself by diffing a `.crate` against it.
+immutability guarantees — a published version can never be altered, only yanked.
+
+To tie a `.crate` back to the signed tag yourself, read the commit out of the
+`.cargo_vcs_info.json` that cargo embeds, and check it is the one the tag points
+at. A plain file-by-file diff will not be clean: cargo rewrites `Cargo.toml` in
+the package (inlining inherited fields, dropping `[workspace]`) and keeps the
+original alongside it as `Cargo.toml.orig`.
+
+```bash
+tar xzOf decdn-cli-<version>.crate decdn-cli-<version>/.cargo_vcs_info.json
+git rev-parse v<version>^{commit}
+```

@@ -5,7 +5,7 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 > **Status: early implementation.** deCDN is pre-launch — no network is deployed. Wire formats, APIs and on-chain interfaces change without compatibility shims.
 
 Local per-peer reputation scoring (ADR 008): an exponentially weighted moving average over
-observed probe and delivery outcomes, used to rank candidate peers.
+observed delivery outcomes, used to rank candidate peers. Probes record nothing.
 
 Scores are strictly local. There is no gossip aggregation and no shared reputation state — a
 node's view is built only from what it has itself observed.

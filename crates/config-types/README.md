@@ -8,7 +8,8 @@ The config *vocabulary* — the value types a deCDN node's configuration is writ
 (`RetryPolicy`, `DecompressMode`, `OriginUrl`, `OriginKind`, `Hash`, `PinnedHashes`) — factored
 out so that `decdn-cache` and `decdn-common` can share them without depending on each other.
 
-A leaf crate: `serde` and `url`, nothing else. No `iroh-blobs`, no AWS SDK.
+A leaf crate — `serde`, `url` and `anyhow`, nothing heavier. No `iroh-blobs`, no
+AWS SDK.
 
 ## License
 

@@ -13,8 +13,10 @@ categories.workspace = true
 
 [dependencies]
 decdn-protocol = { workspace = true }
+# `iroh` for `PublicKey` (the NodeId scores are keyed by). No `iroh-gossip`:
+# scoring is local-only (ADR 008), and the dependency was left over from the
+# removed network tier.
 iroh = { workspace = true }
-iroh-gossip = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

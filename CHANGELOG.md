@@ -1125,21 +1125,40 @@ since project inception and will roll into the first tagged release.
   cheap `packaging` CI job (and matching pre-commit hooks) runs
   `check-package-embeds.sh` — no publishable crate may `include_str!` a file
   outside its own package — and `check-deployment-mirror.sh`.
-  - `check-package-embeds.sh` hard-fails on production sites and reports
-    `#[cfg(test)]` ones as warnings: the verify build does not enable
-    `cfg(test)`, so those do not block publishing, but the file is still absent
-    from the `.crate` and those tests cannot run from it. Two such warnings
-    exist today, both embedding `examples/configs/arbitrum-sepolia.toml`
-    (`crates/cli/src/commands/config.rs`, `crates/common/src/config/mod.rs`).
+  - The checker covers `include!`, `include_str!`, `include_bytes!` in all three
+    delimiter forms, and `#[path = "…"]`; it enumerates workspace members from
+    the root manifest rather than a `crates/*` glob, treats a target that git
+    does not track as unshipped, and fails rather than reporting success when it
+    finds no publishable crates. Its logic lives in
+    `.github/scripts/check_package_embeds.py` with unit tests under
+    `.github/scripts/tests/`.
+  - `#[cfg(test)]` sites are accepted rather than failed — the verify build does
+    not enable `cfg(test)`, so they do not block publishing — but each must be
+    listed in the checker's `KNOWN_TEST_ONLY` allowlist, and a listed entry that
+    no longer fires also fails. Two are listed today, both embedding
+    `examples/configs/arbitrum-sepolia.toml`
+    (`crates/cli/src/commands/config.rs`, `crates/common/src/config/mod.rs`);
+    `cargo test` cannot run from those published crates as a result.
+  - The `packaging` job also runs `cargo package --workspace --no-verify` and
+    asserts the image repository agrees across `release.yml`, `sign-release.sh`
+    and `security.yml`.
 - **`crates/cli/deployments/421614.json`,** a byte-identical mirror of
   `contracts/deployments/421614.json` (which stays canonical — the Foundry
   deploy script writes it). Same `include_str!` constraint as `TERMS.md`. A
   redeploy must be copied across; `check-deployment-mirror.sh` fails on drift in
   both CI and pre-commit, so stale baked-in contract addresses cannot ship
   silently.
-- **Dependabot now tracks the `docker` ecosystem,** so the Dockerfile's
-  `debian:bookworm-slim` base gets bumped. Nothing updated it before, and the
-  release image is rebuilt from it on every tag.
+- **The Dockerfile's base image is pinned by digest, and Dependabot now tracks
+  the `docker` ecosystem** to bump it. The pin is what makes two builds of the
+  same release tag ship identical base layers; it is also what makes the
+  Dependabot entry work at all, since Dependabot can update a digest but cannot
+  derive a version from the `bookworm-slim` tag.
+- **`publish-crates.sh` refuses to start when more than five crates are new to
+  crates.io.** `PublishNew` allows a burst of five and then roughly one per ten
+  minutes, and the first release creates eleven crates — one run would be
+  rate-limited partway through, leaving some permanently published and the
+  version spent. Clearing this is a one-time manual step; see RELEASING.md.
+  Override with `DECDN_ALLOW_RATE_LIMIT=1` once the limit has been raised.
 - **ADR 009 bootstrap-multisig governance phase (#1175).** `DeployProtocol` run
   with `BOOTSTRAP_MULTISIG=<addr>` seats that multisig as the Timelock's sole
   `PROPOSER_ROLE`/`CANCELLER_ROLE` holder and grants `DecdnGovernor` neither, so

@@ -12,8 +12,9 @@ cargo install decdn-cli
 decdn config init --chain arbitrum-sepolia
 ```
 
-Deliberately links no blob store and no AWS SDK — publishing and verifying content goes
-through the leaf crates (`decdn-protocol`, `decdn-config-types`, `decdn-bao-range`) only.
+Deliberately links no blob store and no AWS SDK: the range verification the publish path
+needs lives in the `iroh-blobs`-free `decdn-bao-range`, reached through
+`decdn-client-pull`.
 
 ## License
 

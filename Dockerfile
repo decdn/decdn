@@ -12,7 +12,14 @@
 #   cargo build --release -p decdn-node
 #   cp target/release/decdn-node dist/amd64/
 #   docker build -t decdn-node .
-FROM debian:bookworm-slim
+# Pinned by digest, not just by tag. `bookworm-slim` is a moving target, so two
+# builds of the same release tag could ship different base layers — which sits
+# badly with a release whose whole story is that a maintainer signs exact bytes.
+# The digest is also what makes the `docker` Dependabot ecosystem useful here:
+# it can bump a digest, but it cannot derive a version from `bookworm-slim`, so
+# without this pin it would open no PRs at all. This is the multi-arch index
+# digest, so linux/amd64 and linux/arm64 both resolve from it.
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \

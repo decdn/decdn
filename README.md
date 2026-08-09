@@ -46,6 +46,9 @@ the dockerd-style split rationale.
 
 ### Install
 
+From the first tagged release (nothing is published yet — see the status note
+above):
+
 ```bash
 cargo install decdn-cli          # the `decdn` CLI
 cargo install decdn-node         # the daemon

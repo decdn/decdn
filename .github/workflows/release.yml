@@ -174,11 +174,13 @@ jobs:
       - name: Verify every crate packages and builds standalone
         run: cargo publish --workspace --dry-run --locked
 
-      # semver-checks runs against the previous release tag rather than the
-      # crates.io baseline: at this point in the run the tag's own version is
-      # not on crates.io yet (publish-crates.sh comes after signing), so a
-      # registry baseline would lag by a release. The first release has no prior
-      # tag, so semver-checks is skipped then (nothing to compare against).
+      # Baseline = the highest v* tag that does not point at HEAD, rather than
+      # the crates.io registry baseline. Publishing is a manual post-signing
+      # step (publish-crates.sh) that can be skipped or fail partway, so the
+      # registry is not a reliable record of the previous release — and the tag
+      # baseline needs no registry round-trip and works before the first
+      # publish. The first release has no prior tag, so semver-checks is
+      # skipped then (nothing to compare against).
       - name: Determine semver baseline
         id: baseline
         env:

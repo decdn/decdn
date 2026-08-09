@@ -28,9 +28,10 @@ repository = "https://github.com/decdn/decdn"
 homepage = "https://decdn.org"
 keywords = ["cdn", "p2p", "content-delivery", "iroh", "blake3"]
 categories = ["network-programming", "web-programming"]
-# `readme` is deliberately NOT here: an inherited readme path resolves against
-# the workspace root, which is outside every package, so each crate sets its own
-# `readme = "README.md"`.
+# `readme` is deliberately NOT here — not because inheritance would break
+# packaging (cargo copies a workspace-root readme into the .crate quite happily)
+# but because these are public crates.io landing pages and each one needs to
+# describe its own crate. Inheriting would put the same text on all eleven.
 
 [workspace.dependencies]
 # Internal crates. The `version` is what makes these publishable — cargo rejects

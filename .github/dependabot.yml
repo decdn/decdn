@@ -24,9 +24,10 @@ updates:
       # iroh ecosystem is pinned per ADR 001; upgrades require manual coordination
       - dependency-name: "iroh*"
 
-  # The Dockerfile's `debian:bookworm-slim` base was previously bumped by
-  # nothing at all — the release image is rebuilt from it on every tag, so a
-  # base-image CVE would ship silently between the weekly Trivy scans.
+  # Bumps the Dockerfile's pinned base-image digest. This only works because
+  # the FROM line carries an explicit `@sha256:` — Dependabot updates a tag only
+  # when it can parse a version out of it, and `bookworm-slim` gives it nothing,
+  # so with a bare tag this ecosystem would open no PRs at all.
   - package-ecosystem: docker
     directory: /
     schedule:
