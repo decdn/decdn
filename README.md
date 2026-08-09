@@ -87,3 +87,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development environment setup, build 
 ## Operations
 
 - [Operator runbook](docs/runbook.md)
+- [Release process](RELEASING.md) — cutting, signing and publishing a release
+- [Security policy](SECURITY.md) — reporting a vulnerability, verifying a release
