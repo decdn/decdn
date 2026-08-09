@@ -78,15 +78,36 @@ FPR=$(gpg --list-secret-keys --with-colons ${SIGNING_KEY:+"$SIGNING_KEY"} 2>/dev
 # shellcheck disable=SC2016  # the quotes are inside a double-quoted ${:+}, so it does expand
 [[ -n "$FPR" ]] || die "no usable gpg secret key${SIGNING_KEY:+ matching '$SIGNING_KEY'}"
 
-# Build a keyring containing ONLY the published maintainer keys. Signatures get
-# verified against this, not against the personal keyring — verifying against
-# your own keyring only proves you can read your own signature, which was never
-# in doubt. This is the question consumers will actually ask.
-KEYRING=$(mktemp -d)/keys.gpg
-gpg --no-default-keyring --keyring "$KEYRING" --import "$KEYS_FILE" >/dev/null 2>&1 ||
+# A gpg home containing ONLY the published maintainer keys. Both the tag
+# signature and the signatures produced below are verified against this rather
+# than the personal keyring: verifying against your own keyring only proves you
+# can read a signature you already trust, which was never in doubt. This is the
+# question consumers will actually ask. It is a full home rather than a bare
+# keyring file so `git verify-tag` can use it via GNUPGHOME.
+KEYS_HOME=$(mktemp -d)
+chmod 700 "$KEYS_HOME"
+# Single EXIT trap for the whole script — a second `trap ... EXIT` later would
+# replace this one and leak the key home. WORKDIR does not exist yet, hence the
+# :- guard.
+cleanup() {
+  local rc=$?
+  rm -rf "$KEYS_HOME"
+  if [[ -n "${WORKDIR:-}" ]]; then
+    if (( rc == 0 )); then
+      rm -rf "$WORKDIR"
+    else
+      # Keep the artifacts on failure: a checksum mismatch or a bad signature
+      # is exactly when the operator needs to look at the bytes, and
+      # re-downloading costs several hundred megabytes.
+      echo "artifacts kept for inspection: $WORKDIR" >&2
+    fi
+  fi
+}
+trap cleanup EXIT
+gpg --homedir "$KEYS_HOME" --import "$KEYS_FILE" >/dev/null 2>&1 ||
   die "KEYS is not a valid OpenPGP keyring"
 
-gpg --no-default-keyring --keyring "$KEYRING" --list-keys "$FPR" >/dev/null 2>&1 || die \
+gpg --homedir "$KEYS_HOME" --list-keys "$FPR" >/dev/null 2>&1 || die \
   "signing key $FPR is not published in KEYS.
 Consumers follow SECURITY.md and would reject this signature. Add your public
 key to KEYS first (RELEASING.md § One-time setup), or point DECDN_SIGNING_KEY
@@ -103,8 +124,12 @@ git fetch --tags --force origin >/dev/null 2>&1 ||
 git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null ||
   die "tag $TAG does not exist"
 
+# Verified against KEYS, not your own keyring — otherwise a tag signed by any
+# key you happen to have imported would pass, while consumers following
+# SECURITY.md would reject the release it produced.
 echo "==> Verifying $TAG"
-git verify-tag "$TAG" || die "$TAG is not signed by a key in your keyring"
+GNUPGHOME="$KEYS_HOME" git verify-tag "$TAG" ||
+  die "$TAG is not signed by a key published in KEYS"
 
 LOCAL_TAG=$(git rev-parse "refs/tags/${TAG}^{commit}")
 REMOTE_TAG=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha) ||
@@ -128,19 +153,9 @@ esac
 
 # ---- download and check --------------------------------------------------
 
+# Picked up by the EXIT trap installed above; kept on failure so the operator
+# can inspect the bytes rather than re-download them.
 WORKDIR=$(mktemp -d)
-# Keep the directory on failure: a checksum mismatch or a bad signature is
-# exactly when the operator needs to look at the bytes, and re-downloading
-# costs several hundred megabytes.
-cleanup() {
-  local rc=$?
-  if (( rc == 0 )); then
-    rm -rf "$WORKDIR"
-  else
-    echo "artifacts kept for inspection: $WORKDIR" >&2
-  fi
-}
-trap cleanup EXIT
 
 echo "==> Downloading $TAG assets"
 gh release download "$TAG" --repo "$REPO" --dir "$WORKDIR" ||
@@ -193,7 +208,7 @@ for f in "${SIGN_TARGETS[@]}"; do
     die "failed to sign $f (passphrase or gpg-agent problem?); nothing has been published"
   # Verified against the KEYS-only keyring, so this confirms what a consumer
   # will see rather than what this machine can already read.
-  gpg --no-default-keyring --keyring "$KEYRING" --verify "${f}.asc" "$f" 2>/dev/null ||
+  gpg --homedir "$KEYS_HOME" --verify "${f}.asc" "$f" 2>/dev/null ||
     die "signature on $f does not verify against KEYS"
   echo "    signed $f"
 done

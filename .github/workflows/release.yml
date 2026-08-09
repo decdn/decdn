@@ -74,12 +74,20 @@ jobs:
       # database setup is needed — importing the keyring is enough.
       - name: Verify tag signature
         shell: bash
+        env:
+          # Isolated keyring, not the runner's default. Importing KEYS into the
+          # default home would let `git verify-tag` succeed on any key that
+          # already happened to be there, so the "only keys in origin/main:KEYS
+          # are trusted" guarantee would depend on the runner starting clean
+          # rather than on anything this step controls.
+          GNUPGHOME: ${{ runner.temp }}/keys-gnupg
         run: |
           set -o pipefail
           # No --depth: this repo is checked out at fetch-depth 0, and a shallow
           # fetch would impose a shallow boundary that the semver baseline and
           # cargo-semver-checks below both need the history behind.
           git fetch --no-tags origin main
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
           git show origin/main:KEYS > "$RUNNER_TEMP/KEYS" || {
             echo "::error::cannot read KEYS from origin/main"; exit 1; }
           gpg --import "$RUNNER_TEMP/KEYS" || {
@@ -156,6 +164,11 @@ jobs:
           HEAD_SHA=$(git rev-parse HEAD)
           PREV=""
           for t in $(git tag --list 'v[0-9]*' --sort=-v:refname); do
+            # The glob is far looser than the version format below assumes, so
+            # apply the same strict semver filter used on the triggering tag.
+            # An odd tag like `v1.2` or `v0-wip` would otherwise become the
+            # baseline and feed garbage to the major/minor comparison.
+            [[ "${t#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || continue
             # Capture rather than inlining: `-e` is suspended inside an `if`
             # condition, so a rev-list failure on a dangling tag would yield an
             # empty string, compare unequal, and silently become the baseline.
