@@ -151,9 +151,12 @@ REMOTE_TAG=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha) ||
 # An annotated tag's ref points at the tag object; dereference to the commit.
 REMOTE_COMMIT=$(git rev-parse "${REMOTE_TAG}^{commit}")
 [[ "$LOCAL_TAG" == "$REMOTE_COMMIT" ]] || die \
-  "local tag $TAG ($LOCAL_TAG) differs from origin ($REMOTE_COMMIT).
-The draft was built from origin's tag, so signing now would vouch for
-artifacts you have not verified. Reconcile the tags first."
+  "local tag $TAG ($LOCAL_TAG) differs from ${REPO}'s ($REMOTE_COMMIT).
+The draft was built from that tag, so signing now would vouch for artifacts you
+have not verified. Reconcile the tags first.
+Note the fetch above used the git remote \`origin\`, while this compares against
+the GitHub API for $REPO; if DECDN_REPO points somewhere your origin does not,
+reconcile those first."
 
 IS_DRAFT=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft) || die \
   "could not read release $TAG from $REPO.

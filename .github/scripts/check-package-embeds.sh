@@ -22,6 +22,11 @@
 # out to workspace fixtures is legitimate for them.
 set -euo pipefail
 
+command -v python3 >/dev/null || {
+  echo "error: python3 not found on PATH; it is required to parse the crate sources" >&2
+  exit 1
+}
+
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 

@@ -30,7 +30,10 @@ die() { echo "error: $*" >&2; exit 1; }
 
 # ---- preconditions -------------------------------------------------------
 
-for tool in cargo gh gpg git curl; do
+# python3 is in here because it reads the crate list out of `cargo metadata`
+# below. Bare coreutils (sed, head, cat) are not: they are assumed the way bash
+# itself is.
+for tool in cargo gh gpg git curl python3; do
   command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 
@@ -97,8 +100,11 @@ REMOTE_TAG=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha) ||
   die "tag $TAG not found on $REPO"
 REMOTE_COMMIT=$(git rev-parse "${REMOTE_TAG}^{commit}")
 [[ "$LOCAL_TAG" == "$REMOTE_COMMIT" ]] || die \
-  "local tag $TAG ($LOCAL_TAG) differs from origin ($REMOTE_COMMIT).
-crates.io would receive code that was never released. Reconcile the tags first."
+  "local tag $TAG ($LOCAL_TAG) differs from ${REPO}'s ($REMOTE_COMMIT).
+crates.io would receive code that was never released. Reconcile the tags first.
+Note the fetch above used the git remote \`origin\`, while this compares against
+the GitHub API for $REPO; if DECDN_REPO points somewhere your origin does not,
+reconcile those first."
 
 # The signed release is the gate. Publishing first would put code on crates.io —
 # permanently, since a version cannot be replaced — that no signature vouches
