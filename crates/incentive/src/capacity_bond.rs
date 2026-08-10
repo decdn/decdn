@@ -8,11 +8,14 @@
 //! 2.3) — are mirrored. See the macro body below for the exact surface.
 //! Two gotchas worth flagging here rather than at the call site:
 //!
-//! - `getActiveNodes` returns `_registeredAddrs` unfiltered (the
-//!   contract's own comment at its definition documents this); callers
-//!   must combine with `isActive(operator)` for the strict
-//!   "registered AND bond ≥ minBond AND no unbonding AND not ejected"
-//!   predicate.
+//! - `getRegisteredNodes` returns the `_registeredAddrs` page (every
+//!   registered operator, unfiltered for bond / unbonding / ejection)
+//!   alongside a parallel `active[]` that the contract computes with
+//!   `isActive(operator)` per entry — the strict "registered AND bond ≥
+//!   minBond AND no unbonding AND not ejected" predicate. Callers take
+//!   the membership set from `active[]` and keep the full page for the
+//!   payout bindings (an unbonding operator is `active == false` but
+//!   still payable), with no per-entry round-trip.
 //! - `nodeIdOf` returns `(bytes32 nodeId, bool active)` where the bool
 //!   is the full `isActive` predicate, not a separate "registered"
 //!   flag.
@@ -114,14 +117,20 @@ mod sol_types {
                 uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount
             );
 
-            /// Paginated snapshot of `_registeredAddrs` — every
-            /// operator with a current registration, **NOT** filtered
-            /// for bond / unbonding / ejection. Callers combine with
-            /// `isActive(operator)` to get the strict active set.
-            function getActiveNodes(uint256 offset, uint256 limit) external view returns (NodeInfo[] memory);
+            /// Paginated snapshot of `_registeredAddrs` — every operator
+            /// with a current registration, **NOT** filtered for bond /
+            /// unbonding / ejection — paired with a parallel `active[]`
+            /// where `active[i] == isActive(page[i].ethAddress)`, computed
+            /// on-chain. Take membership from `active`; keep `page` for the
+            /// payout bindings (an unbonding operator is `active == false`
+            /// but still present and payable).
+            function getRegisteredNodes(uint256 offset, uint256 limit)
+                external
+                view
+                returns (NodeInfo[] memory page, bool[] memory active);
 
             /// Cardinality of `_registeredAddrs`.
-            function getActiveNodeCount() external view returns (uint256);
+            function getRegisteredNodeCount() external view returns (uint256);
 
             /// How many slashes have ever been minted against `operator`.
             /// Paired with `operatorSlashIdAt`, this replaces re-scanning the

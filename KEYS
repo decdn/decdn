@@ -1,0 +1,23 @@
+Public keys trusted to sign deCDN releases. Import with `gpg --import KEYS`.
+
+A release tag, the SHA256SUMS manifest, the SBOM and image-digest.txt are each
+signed by one maintainer's personal key. A good signature from ANY key in this
+file is authentic — see SECURITY.md. Adding or removing a maintainer is a
+change to this file.
+
+  Ant Somers <ant@decdn.org>
+  DA75 1570 6F18 73D2 74D8  A369 9E11 A9FF D62D AADB
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEanigZRYJKwYBBAHaRw8BAQdAXB6xg4XVGmve59MN5EUHPlEVhZuSO2V0TYQa
+j0l7ASu0GkFudCBTb21lcnMgPGFudEBkZWNkbi5vcmc+iJkEExYKAEEWIQTadRVw
+bxhz0nTYo2meEan/1i2q2wUCanigZQIbAwUJBaOagAULCQgHAgIiAgYVCgkICwIE
+FgIDAQIeBwIXgAAKCRCeEan/1i2q2z4VAP9R8ha+nmRqgWnZh7N8VInlO71pXbeW
+8GIYaZxp1FdgBQD+L+U2XomAtXAK7Yh52DOUfhQhq2ME2AXutkGeA2UEoQm4OARq
+eKBlEgorBgEEAZdVAQUBAQdA0M8mYVvDIMRDYQHurFQdYhmCKjjxuLFNyyEtb82H
+/VEDAQgHiHgEGBYKACAWIQTadRVwbxhz0nTYo2meEan/1i2q2wUCanigZQIbDAAK
+CRCeEan/1i2q2yLLAQC/TKs0jU6nQu7oot+sAJI754t0fktoAks1dfb8k8rKOgEA
+2JAAMJACUKFQArfPQrekJvVL2ZMINf8AdU7FXPt2Jwc=
+=ulJ+
+-----END PGP PUBLIC KEY BLOCK-----

@@ -19,13 +19,13 @@
 //! config > default.
 //!
 //! The chain/discovery/delivery seams (`resolve_chain`, `resolve_target_node`,
-//! `probe_and_rank`, `open_or_reuse`, `fetch_blob`, `write_blob_atomic`) are
-//! `pub(crate)` so `decdn bundle pull` (#391) reuses the same paid-fetch kernel
-//! across a bundle's many entries.
+//! `probe_and_rank`, `open_or_reuse`, `drive_fetch`/`DriveFetchDeps`,
+//! `temp_in_parent`) are `pub(crate)` so `decdn bundle pull` (#391) reuses the
+//! same gap-driven, reactive-top-up fetch core across a bundle's many entries.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -34,10 +34,12 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{
     LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
 };
+use decdn_client_pull::driver::{DriveConfig, drive};
+use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
-    ChannelContext, ChannelLedger, Cumulative, ProgressCallback, PullDeadlines,
-    ResumeOffsetPastEnd, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull, sign_client_binding, stream_fetch_tracked_with_progress,
+    BudgetPacer, ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, PeerSource,
+    ProgressCallback, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    open_progressive_pull, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -49,7 +51,6 @@ use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_pass
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::rate::min_payment;
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
-use decdn_protocol::MB_BYTES;
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
@@ -63,19 +64,6 @@ use decdn_client_pull::provider;
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
-
-/// Reactive graduation (#1497): after an on-chain `topUp`, the node's settlement
-/// watcher can briefly lag the `ChannelToppedUp` event, so its pre-serve deposit
-/// gate (#1518) still sees the pre-top-up deposit and refuses the resumed open
-/// (collapsed to `NotFound`). The client that performed the top-up waits out that
-/// lag by retrying the open — money-safe, since an open sends no vouchers and does
-/// not move `byte_offset`. `MAX_TOPUP_SETTLE_WAITS * TOPUP_SETTLE_BACKOFF` bounds
-/// the total wait (15s), comfortably above the daemon's chain-event poll cadence
-/// yet well under a fetch's overall deadline.
-const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
-/// Backoff between resume-open retries while waiting for the node's chain watcher
-/// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
-const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
@@ -870,579 +858,6 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyh
     }
 }
 
-/// The scratch file a streaming fetch writes into before it is promoted to
-/// `--output`. Living beside the destination (not in `/tmp`) is what makes the
-/// final step an atomic same-filesystem rename, and what lets a later invocation
-/// find the partial and resume it.
-fn partial_path(output: &Path) -> PathBuf {
-    let mut name = output.as_os_str().to_os_string();
-    name.push(".partial");
-    PathBuf::from(name)
-}
-
-/// Outcome of a streaming fetch into the partial file.
-struct StreamedFetch {
-    /// Whole-blob size the node signed for.
-    total_bytes: u64,
-    /// Byte offset this attempt started from — non-zero when a prior partial was
-    /// resumed. Drives the whole-file re-hash, which is only needed when some of
-    /// the output came off disk rather than off the verified wire.
-    resumed_from: u64,
-}
-
-/// Fetch `hash` into `<output>.partial`, writing each bao chunk group the moment
-/// it verifies and resuming an interrupted prior attempt (#1120, #1122).
-///
-/// This is the streaming counterpart of [`fetch_blob`]. Where that buffers the
-/// whole blob in RAM (twice — the wire form and then the decoded form) and writes
-/// once at the end, this holds one chunk group and appends as it goes, so peak
-/// memory is independent of blob size and an interruption leaves a resumable
-/// prefix on disk instead of nothing.
-///
-/// Resume re-runs discovery in the caller, not here: content is content-addressed,
-/// so whichever node this call is pointed at can serve the tail.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)] // One sequential open→stream→persist→classify attempt loop. Each stage's comment explains a money-relevant decision (which watermark to settle, when a partial is poison, why a flush failure outranks a pull failure); splitting them out would separate those from the loop state they justify.
-async fn fetch_blob_streaming<P>(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
-    ctx: &mut ChannelContext,
-    slash_dom: &Eip712Domain,
-    provider: Address,
-    store: &RedbBuyerChannelStore,
-    hash: [u8; 32],
-    namespace_id: [u8; 32],
-    deadlines: PullDeadlines,
-    max_blob_bytes: u64,
-    max_rate_per_mb: u64,
-    partial: &Path,
-    on_progress: Option<&ProgressCallback>,
-    // Reactive graduation (#1497): funding handles for a mid-fetch top-up. Only
-    // touched when a genuine `InsufficientDeposit` is confirmed against the
-    // buyer's own ledger — see the reactive branch below.
-    contract: &PaymentChannel::PaymentChannelInstance<P>,
-    rpc: &P,
-    self_address: Address,
-    payment_channel_addr: Address,
-    max_approve: bool,
-    working_deposit: U256,
-) -> anyhow::Result<StreamedFetch>
-where
-    P: alloy::providers::Provider + Clone,
-{
-    use std::io::{BufWriter, Seek, SeekFrom};
-
-    // What a previous attempt left behind, snapped down to a chunk-group
-    // boundary: the server anchors its proof to whole groups, so anything past
-    // the last boundary has to be re-fetched anyway.
-    //
-    // Only `NotFound` means "no partial". Any other stat error (permissions, a
-    // transient fault, `ENOTDIR`) must NOT be read as zero: that would silently
-    // truncate a large verified prefix and re-pay for the whole blob, which is
-    // real money lost to a condition we could have reported.
-    let mut byte_offset = decdn_client_pull::sink::resume_offset(existing_partial_len(partial)?);
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .truncate(false)
-        .open(partial)
-        .map_err(|e| anyhow::anyhow!("open {}: {e}", partial.display()))?;
-    // The truncate-and-seek to `byte_offset` happens at the top of the attempt
-    // loop below, which covers the first pass too — the file's length always
-    // equals the verified prefix length when a pull starts.
-
-    // One ledger for this channel, seeded from its persisted cumulative state so
-    // the first voucher continues at `prior_nonce + 1` rather than restarting
-    // from zero (which the node rejects as a stale nonce). Same seeding the
-    // buffered path does internally.
-    let ledger = Arc::new(ChannelLedger::new(Cumulative {
-        nonce: ctx.prior_nonce,
-        bytes: ctx.prior_bytes_delivered,
-        amount: ctx.prior_amount,
-    }));
-
-    // Reactive graduation (#1497): the CONTENT offset the CURRENT leg started
-    // from, and the channel-cumulative WIRE-byte baseline at that moment. The
-    // reactive top-up branch feeds these to `content_paid_frontier` to recover the
-    // PAID content frontier: `committed().bytes - fetch_start_committed_bytes` is
-    // the WIRE bytes an ACCEPTED voucher covered on this leg (vouchers pay in wire
-    // bytes — content plus bao proof, ADR 038), which that helper maps back into
-    // content space. This counts only paid bytes — unlike the on-disk file length,
-    // which runs ahead of payment: the credit window (ADR 003 §Credit window) lets
-    // the node stream up to a full interval's worth of content before the voucher
-    // that pays for it is even due, and `decode_to_sink` flushes and verifies those
-    // bytes to disk as they arrive, independent of whether that voucher is later
-    // accepted.
-    //
-    // PER-LEG, not per-fetch. `content_paid_frontier` inverts the wire cost of ONE
-    // contiguous delivery starting at `fetch_start_offset`, but `committed().bytes`
-    // is channel-cumulative and keeps climbing across every attempt in the loop
-    // below. Left anchored at the fetch's start, a second leg's delta would sum two
-    // independent bao range encodings — re-billing the first leg's span and its
-    // re-sent root->offset proof path — and the inflated budget would map to a
-    // frontier PAST the true paid one: content skipped unbilled (the exact under-pay
-    // this helper exists to prevent), `byte_offset` beyond the verified on-disk
-    // prefix, `set_len` zero-extending the partial, and the whole-file hash check
-    // failing a fetch already paid for. So these are re-anchored on EVERY successful
-    // open below, which is the only place a new leg can begin.
-    let mut fetch_start_offset = byte_offset;
-    let mut fetch_start_committed_bytes = ledger.committed().bytes;
-
-    // Wallet-less resume (#1481): a voucher rejection carrying a bundle signed by
-    // our OWN key means our persisted watermark had fallen behind what the node
-    // holds — reseed from it and reopen. The buffered path gets this from
-    // `fetch_inner`'s internal loop; the streaming path has to drive its own,
-    // because between attempts the OUTPUT FILE must be rewound to `byte_offset`
-    // (the retry re-fetches the same span, and appending it twice would corrupt
-    // the download). `client-pull` cannot do that for us — it does not own the
-    // file — so the loop lives here and the two share `MAX_RESUME_ATTEMPTS`.
-    // A `loop` with an explicit counter, not `for attempt in 0..=MAX`: the
-    // stale-partial restart below must NOT consume the resume budget (it is a
-    // restart, not a retry), and with a `for` range a restart on the final
-    // iteration fell out of the loop entirely — dropping the real error for an
-    // internal "unreachable" string, after telling the user it was refetching.
-    // Here every path either returns or increments, so there is no fall-through
-    // to get wrong.
-    let mut total_bytes = 0u64;
-    let mut attempt = 0u32;
-    let mut restarted = false;
-    // Reactive graduation (#1497): bounds how many times a genuine mid-fetch
-    // `InsufficientDeposit` is answered with an on-chain `topUp` rather than a
-    // terminal error. Separate budget from `attempt`/`MAX_RESUME_ATTEMPTS` — see
-    // `MAX_TOPUP_ATTEMPTS`'s doc.
-    let mut topups = 0u32;
-    // The upstream's quoted per-MB rate and voucher cadence (in bytes) from the
-    // most recent successful open, used to price the NEXT voucher when deciding
-    // whether a mid-stream `InsufficientDeposit` is genuine (see the reactive
-    // branch below). Only ever consulted after at least one successful open —
-    // exactly the case where an `InsufficientDeposit` can occur, since it is
-    // raised by a voucher rejection mid-stream, never by the open handshake
-    // itself.
-    let mut quoted_rate_per_mb = 0u64;
-    let mut voucher_interval_bytes = 0u64;
-    // Reactive graduation (#1497): set right after an on-chain top-up so the NEXT
-    // open-time refusal is understood as the node's chain watcher not yet having
-    // observed the top-up (its pre-serve deposit gate, #1518, still sees the stale
-    // deposit) — waited out via `TOPUP_SETTLE_BACKOFF` rather than misread as a
-    // stale partial. Cleared on the first successful open. `settle_waits` bounds it.
-    let mut awaiting_topup_settle = false;
-    let mut settle_waits = 0u32;
-    loop {
-        // Open BEFORE touching the file. The rewind below is destructive, and an
-        // open can fail for reasons that have nothing to do with the partial (the
-        // node has evicted the blob, the channel is unknown, the link is down) —
-        // truncating first would destroy a verified, paid-for prefix and then
-        // fail anyway, leaving the user worse off than when they started.
-        let opened = open_progressive_pull(
-            endpoint,
-            target.clone(),
-            ctx,
-            Arc::clone(&ledger),
-            slash_dom,
-            provider,
-            hash,
-            namespace_id,
-            byte_offset,
-            micros_now(),
-            max_blob_bytes,
-            max_rate_per_mb,
-            deadlines,
-        )
-        .await;
-
-        let result = match opened {
-            Ok((header, pull)) => {
-                total_bytes = header.total_bytes;
-                quoted_rate_per_mb = header.rate_per_mb;
-                voucher_interval_bytes = header.interval_bytes;
-                // The node accepted this open, so its chain watcher has caught up
-                // to any prior top-up — clear the settle-wait state (#1497).
-                awaiting_topup_settle = false;
-                settle_waits = 0;
-                // A new leg starts here, so re-anchor the paid-frontier baselines
-                // (#1497 review finding). This is the single place they are set
-                // after the initial capture: every path that begins another
-                // delivery — resume retry, from-zero restart, post-top-up resume —
-                // reaches this arm first, so anchoring here keeps
-                // `committed().bytes - fetch_start_committed_bytes` equal to THIS
-                // leg's wire spend and nothing else. See the capture site above for
-                // what goes wrong when a second leg inherits a stale baseline.
-                fetch_start_offset = byte_offset;
-                fetch_start_committed_bytes = ledger.committed().bytes;
-                // The open succeeded, so this attempt is really going to write.
-                // Rewind to the verified prefix: a no-op on the first pass, and on
-                // a retry it discards whatever the failed attempt left behind.
-                file.set_len(byte_offset)
-                    .map_err(|e| anyhow::anyhow!("truncate {}: {e}", partial.display()))?;
-                file.seek(SeekFrom::Start(byte_offset))
-                    .map_err(|e| anyhow::anyhow!("seek {}: {e}", partial.display()))?;
-                let mut writer = BufWriter::new(&mut file);
-                let pulled = decdn_client_pull::sink::pull_to_sink(
-                    pull,
-                    hash,
-                    header.total_bytes,
-                    byte_offset,
-                    &mut writer,
-                    on_progress,
-                )
-                .await;
-                // Flush before anything else: bytes stuck in the `BufWriter` are
-                // bytes the resume path would re-pay for. This must run on the
-                // ERROR path too — that is the whole point of the partial file.
-                let flushed = std::io::Write::flush(&mut writer)
-                    .map_err(|e| anyhow::anyhow!("flush {}: {e}", partial.display()));
-                drop(writer);
-                combine_pull_and_flush(pulled, flushed)
-            }
-            Err(e) => Err(e),
-        };
-
-        // The upstream may hold vouchers we sent but never saw acked, so persist
-        // the watermark before doing anything else — otherwise the next attempt
-        // re-signs a spent nonce and the channel is stranded, which is exactly
-        // the failure #1122 describes.
-        let progress = watermark_after(&result, &ledger, ctx.prior_nonce);
-        persist_watermark(store, provider, ctx.channel_id, &progress);
-
-        let Err(err) = result else {
-            file.sync_all()
-                .map_err(|e| anyhow::anyhow!("sync {}: {e}", partial.display()))?;
-            return Ok(StreamedFetch {
-                total_bytes,
-                resumed_from: byte_offset,
-            });
-        };
-        // Reactive graduation (#1497): after a top-up, the node's settlement
-        // watcher may not yet have applied the on-chain `ChannelToppedUp`, so its
-        // pre-serve deposit gate (#1518) refuses the resumed open — the node
-        // collapses that to `NotFound`, the same shape `resume_may_be_stale` keys
-        // on. Retrying the OPEN is money-safe (no vouchers sent, `byte_offset`
-        // unchanged), so wait briefly for the watcher to catch up before treating
-        // this as a stale partial and rewinding to zero. Bounded by
-        // `MAX_TOPUP_SETTLE_WAITS`; on exhaustion, fall through to the normal
-        // stale-partial handling below.
-        if awaiting_topup_settle && resume_may_be_stale(&err) {
-            if settle_waits < MAX_TOPUP_SETTLE_WAITS {
-                settle_waits += 1;
-                eprintln!(
-                    "note: the node has not yet observed the on-chain top-up; waiting for its \
-                     chain watcher before resuming (wait {settle_waits}/{MAX_TOPUP_SETTLE_WAITS})"
-                );
-                tokio::time::sleep(TOPUP_SETTLE_BACKOFF).await;
-                continue;
-            }
-            awaiting_topup_settle = false;
-        }
-        // Retry from the start when the refusal is consistent with the resume
-        // offset being wrong (see `resume_may_be_stale`). At most once per
-        // invocation, and it is a restart rather than a retry, so it does not
-        // spend the resume budget.
-        //
-        // This is safe to attempt on an ambiguous signal ONLY because the rewind
-        // now happens after a successful open: if the node simply does not have
-        // the blob, the from-zero open fails too and the prefix is still on disk,
-        // untouched, for a later run against a node that does.
-        if !restarted && byte_offset > 0 && resume_may_be_stale(&err) {
-            eprintln!(
-                "note: the node would not serve a resume at byte {byte_offset} of {}; \
-                 retrying from the start in case the partial belongs to another blob \
-                 ({err})",
-                partial.display()
-            );
-            restarted = true;
-            byte_offset = 0;
-            // The paid-frontier baselines still point at the ABANDONED resume
-            // attempt, but they are re-anchored to this from-zero restart by the
-            // successful-open arm above before any voucher can be signed against
-            // them (#1497 finding) — no re-anchor is needed here.
-            continue;
-        }
-        // Reactive graduation (#1497): a genuine mid-fetch ceiling hit —
-        // validated against our OWN ledger, not the node's word — tops the
-        // channel up toward `working_deposit` and resumes at the PAID frontier.
-        // Desync is handled above by the reseed path (`genuine_exhaustion` now
-        // gates on whether an attached `WatermarkBundle` ADVANCES past
-        // `ledger.committed()`, not merely on its presence — a channel that has
-        // ever had a voucher accepted gets a bundle on every watermark-gated
-        // rejection thereafter, including a genuinely-exhausted one, so bundle
-        // presence alone is not evidence of desync); a node crying poverty while
-        // our ledger still has headroom falls through to the terminal error
-        // below (we refuse to fund a bogus claim), as does a delegate key that
-        // cannot fund (`top_up_decision` -> `Exhausted`, handled explicitly
-        // below rather than silently falling through).
-        //
-        // The next voucher's true cost is `ceil(interval_bytes * quoted_rate_per_mb
-        // / 1 MiB)` — the exact formula `ChannelLedger`'s own `next_voucher` uses
-        // — from the QUOTED rate/cadence on the most recent successful open, never
-        // the buyer's `max_rate_per_mb` ceiling (that bounds what we're willing to
-        // pay, not what the next voucher actually costs).
-        let committed = ledger.committed();
-        let remaining = ctx.deposit.saturating_sub(committed.amount);
-        let next_cost = U256::from(voucher_interval_bytes)
-            .saturating_mul(U256::from(quoted_rate_per_mb))
-            .div_ceil(U256::from(MB_BYTES));
-        if topups < decdn_client_pull::MAX_TOPUP_ATTEMPTS
-            && working_deposit > U256::ZERO
-            && decdn_client_pull::genuine_exhaustion(&err, ctx, committed, remaining, next_cost)
-        {
-            let funder = store.get_by_provider(provider)?.map(|state| state.funder);
-            let is_funder = funder.is_some_and(|funder| funder == self_address);
-            let additional = working_deposit.saturating_sub(remaining);
-            match top_up_decision(additional, is_funder) {
-                TopUpDecision::TopUp(additional) => {
-                    ensure_allowance(
-                        rpc,
-                        ctx.token,
-                        self_address,
-                        payment_channel_addr,
-                        if max_approve { None } else { Some(additional) },
-                    )
-                    .await?;
-                    // Grade the outcome rather than re-reading the store: `Added`
-                    // carries the new total directly, and the other two variants
-                    // mean the `topUp` MINED — the USDC is escrowed on-chain — but
-                    // the local row could not be credited. Those are terminal here.
-                    // `top_up` reports them via `tracing`, which this binary
-                    // installs no subscriber for, so they would otherwise be
-                    // invisible; and continuing would leave `ctx.deposit` stale, so
-                    // the next pass would recompute the same shortfall, escrow
-                    // again, and (on `UnknownChannel`, where the funder lookup below
-                    // now returns `None`) blame a nonexistent third-party funder for
-                    // a channel this key does fund.
-                    match top_up(contract, store, provider, additional).await? {
-                        DepositOutcome::Added(new_deposit) => ctx.deposit = new_deposit,
-                        DepositOutcome::UnknownChannel => {
-                            return Err(anyhow::anyhow!(
-                                "mid-fetch top-up of {additional} µUSDC for channel \
-                                 {} landed on-chain but no local record remains to \
-                                 credit it: the deposit is ESCROWED AND UNTRACKED. \
-                                 Reconcile against the chain before retrying",
-                                ctx.channel_id
-                            ));
-                        }
-                        DepositOutcome::ChannelMismatch => {
-                            return Err(anyhow::anyhow!(
-                                "mid-fetch top-up of {additional} µUSDC for channel \
-                                 {} landed on-chain but the local record now tracks a \
-                                 different channel for provider {provider}: the deposit \
-                                 is escrowed against the topped-up channel. Reconcile \
-                                 against the chain before retrying",
-                                ctx.channel_id
-                            ));
-                        }
-                    }
-                    eprintln!(
-                        "note: channel exhausted mid-fetch after the node delivered its \
-                         initial deposit's worth of verified bytes; topped up {additional} \
-                         µUSDC toward the working deposit (channel now holds {}) and \
-                         resuming (top-up {}/{})",
-                        ctx.deposit,
-                        topups + 1,
-                        decdn_client_pull::MAX_TOPUP_ATTEMPTS
-                    );
-                    topups += 1;
-                    // Resume at the PAID frontier of this blob, NOT the raw
-                    // on-disk length: `existing_partial_len` answers "how much
-                    // verified content is on disk", but the credit window
-                    // (ADR 003 §Credit window) lets the node stream — and
-                    // `decode_to_sink` flush and bao-verify — a full interval's
-                    // worth of content before the voucher that pays for it is
-                    // even due. Using the on-disk length here would skip billing
-                    // for that credited-but-unpaid tail entirely (an under-pay /
-                    // free-bandwidth hole), while leaving `byte_offset`
-                    // unadvanced (the original bug) would re-serve and re-pay for
-                    // whatever WAS already accepted.
-                    //
-                    // The paid frontier is derived in CONTENT bytes. Vouchers pay
-                    // for WIRE bytes — bao-encoded content plus interleaved proof
-                    // (ADR 038) — so `ledger.committed().bytes` is a channel-
-                    // cumulative WIRE watermark, and `fetch_start_committed_bytes`
-                    // is the WIRE baseline captured when THIS blob's fetch began.
-                    // Their delta is the wire bytes an ACCEPTED voucher covered on
-                    // this leg; `content_paid_frontier` maps that wire watermark
-                    // back through the bao tree to the largest chunk-group content
-                    // boundary provably inside it. That is `<= fetch_start_offset
-                    // + wire_delta` (wire >= content), so it can never overshoot
-                    // into unbilled content (the wire-vs-content under-pay this
-                    // fixes); it is `<= the on-disk content length` (bao decode
-                    // always leads payment); and `[frontier, on_disk_len)` is
-                    // re-fetched and paid once on the next attempt — a bounded
-                    // over-pay of strictly under one chunk group, never a skip.
-                    let paid_wire_this_blob =
-                        u64::try_from(committed.bytes.saturating_sub(fetch_start_committed_bytes))
-                            .unwrap_or(u64::MAX);
-                    byte_offset = decdn_client_pull::sink::content_paid_frontier(
-                        fetch_start_offset,
-                        total_bytes,
-                        paid_wire_this_blob,
-                    );
-                    // The node's chain watcher may not observe this top-up before
-                    // the immediate resume-open below; mark it so an open-time
-                    // refusal is waited out, not misread as a stale partial (#1497).
-                    awaiting_topup_settle = true;
-                    settle_waits = 0;
-                    continue;
-                }
-                TopUpDecision::Exhausted => {
-                    // This key only signs vouchers (a publisher-pays delegate,
-                    // #1481) — it is not the on-chain channel funder and
-                    // `topUp` is funder-only (`PaymentChannel.sol`); attempting
-                    // it would just revert. Fail fast and terminally with an
-                    // actionable message instead of looping into the resync
-                    // path below (which cannot heal a genuine, non-desync
-                    // exhaustion) or letting an opaque on-chain revert surface.
-                    let funder_display =
-                        funder.map_or_else(|| "<unknown>".to_string(), |f| f.to_string());
-                    return Err(anyhow::anyhow!(
-                        "channel exhausted mid-fetch: this key ({self_address}) only signs \
-                         vouchers and is not the channel's funder ({funder_display}); it \
-                         cannot top up — ask the funder to raise the deposit"
-                    ));
-                }
-                // Nothing left to add (deposit already at/above the working
-                // target): fall through to the terminal error below.
-                TopUpDecision::NotNeeded => {}
-            }
-        }
-        if attempt >= decdn_client_pull::MAX_RESUME_ATTEMPTS {
-            return Err(err);
-        }
-        match decdn_client_pull::resumable_watermark(&err, ctx) {
-            // Only an ADVANCING bundle is a desync worth retrying — `reseed`
-            // reports that, and refuses to regress the watermark. A bundle that
-            // merely echoes our own committed watermark (which the node attaches to
-            // every watermark-gated rejection once a voucher has been accepted,
-            // including a genuinely exhausted one that this pass declined to fund)
-            // would otherwise burn the whole resume budget re-sending vouchers the
-            // node has already refused, and bury the real error behind it.
-            Some(bundle) if ledger.reseed(Cumulative::from(bundle)) => {
-                // Worth surfacing rather than logging silently: it means this
-                // client's persisted watermark had fallen behind what it had
-                // actually signed, which is the #1122 desync healing itself.
-                eprintln!(
-                    "note: the node holds a later voucher than this client recorded; \
-                     resynced and retrying (attempt {}/{})",
-                    attempt + 1,
-                    decdn_client_pull::MAX_RESUME_ATTEMPTS + 1
-                );
-                attempt += 1;
-            }
-            Some(_) | None => return Err(err),
-        }
-    }
-}
-
-/// Whether a failed open is consistent with the resume offset being wrong — i.e.
-/// the `.partial` on disk belonging to a different (or larger) blob.
-///
-/// Two signals qualify, and the second is unavoidably ambiguous:
-///
-/// - [`ResumeOffsetPastEnd`] — the node signed a response whose `total_bytes` is
-///   at or below our offset. Unambiguous, but only reachable against a
-///   non-conforming server.
-/// - `NotFound` — what an honest node actually sends. Its range gate refuses
-///   `byte_offset >= total_bytes` with `RangeNotSatisfiable` *before* signing,
-///   and that **deliberately collapses to `NotFound` on the wire** alongside a
-///   cache miss and an unknown channel (`ServeRejectReason::wire_error`): telling
-///   a client its range was bad is a reputation-benign refusal, and the codes are
-///   kept indistinguishable on purpose. So the client cannot separate "your
-///   offset is past the end" from "I don't have this blob".
-///
-/// Acting on the ambiguous one is safe here only because the caller rewinds the
-/// partial *after* a successful open: a genuine cache miss fails the from-zero
-/// open too, and the prefix survives untouched.
-///
-/// Everything else — stalls, resets, hash mismatches, local flush failures — must
-/// NOT qualify. Those say nothing about the offset, and treating them as stale
-/// would discard a verified prefix the user has already paid for.
-fn resume_may_be_stale(err: &anyhow::Error) -> bool {
-    if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
-        return true;
-    }
-    err.downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
-}
-
-/// Combine a pull result with the flush of the bytes it wrote.
-///
-/// A flush failure is LOCAL and terminal — the disk is full, or the file went
-/// away — so it wins over the pull's error: reporting "the peer stalled" for an
-/// `ENOSPC` sends the user hunting in the wrong place, and a local fault must
-/// never be mistaken for anything the retry loop can resolve.
-///
-/// But the pull error is CHAINED rather than dropped. It can be the only record
-/// that the peer served corrupt bytes (`HashMismatch`, which also means the
-/// on-disk prefix is poisoned) or that the channel needs a top-up — losing it
-/// would erase the misbehaviour along with the diagnosis.
-fn combine_pull_and_flush(
-    pulled: anyhow::Result<VoucherProgress>,
-    flushed: anyhow::Result<()>,
-) -> anyhow::Result<VoucherProgress> {
-    match (pulled, flushed) {
-        (Ok(progress), Ok(())) => Ok(progress),
-        (Ok(_), Err(flush_err)) => Err(flush_err),
-        (Err(pull_err), Ok(())) => Err(pull_err),
-        (Err(pull_err), Err(flush_err)) => {
-            Err(flush_err.context(format!("the transfer had also failed: {pull_err:#}")))
-        }
-    }
-}
-
-/// The watermark to persist after an attempt, given how it ended.
-///
-/// The two ledger readers are equal whenever every voucher has been resolved, and
-/// diverge exactly when some are still armed — so which one is correct depends on
-/// whether the upstream's silence is ambiguous:
-///
-/// - **Ambiguous failure** (stall, reset, local fault): the upstream persists a
-///   voucher before it acks, so it most likely holds the armed ones. Settle HIGH
-///   (`settlement`). Settling low re-signs a spent nonce and wedges the channel;
-///   settling high at worst skips a nonce, which the serve side meters and
-///   accepts. The errors are not symmetric, so take the survivable one (#1122).
-/// - **Explicit rejection**: the node told us it refused a voucher and tore the
-///   stream down. It applies vouchers in strict nonce order, so everything
-///   pipelined BEHIND the rejected one (#1484 sends optimistically, so there
-///   usually is something) was provably never taken. `resolve_reject` pops only
-///   the front of the outstanding set, so `settlement` would still report those
-///   followers. Settle at the acked watermark instead — and note the store
-///   refuses to regress (`AdvanceOutcome::Regressed` is warn-only), so an
-///   inflated value here is PERMANENT and can push `last_amount` above the
-///   deposit, wedging the channel from the other direction.
-fn watermark_after(
-    outcome: &anyhow::Result<VoucherProgress>,
-    ledger: &ChannelLedger,
-    prior_nonce: U256,
-) -> VoucherProgress {
-    match outcome {
-        Ok(progress) => *progress,
-        Err(e) if e.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
-            VoucherProgress::from_cumulative(ledger.committed(), prior_nonce)
-        }
-        Err(_) => VoucherProgress::from_cumulative(ledger.settlement(), prior_nonce),
-    }
-}
-
-/// Length of an existing partial download, or `0` if there isn't one.
-///
-/// Only `NotFound` means "no partial". Any other stat error (permissions, a
-/// transient fault, `ENOTDIR`) must NOT be folded to zero: the caller truncates
-/// to this value, so a silent `0` would destroy a large verified prefix and
-/// re-pay for the whole blob — real money lost to a condition we could have
-/// reported.
-fn existing_partial_len(path: &Path) -> anyhow::Result<u64> {
-    match std::fs::metadata(path) {
-        Ok(m) => Ok(m.len()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(anyhow::anyhow!(
-            "stat {}: {e} (refusing to treat this as 'no partial download' — \
-             that would discard a resumable prefix and re-pay for it)",
-            path.display()
-        )),
-    }
-}
-
 /// Persist what the channel paid, warning rather than masking the fetch outcome.
 ///
 /// Shared by the buffered and streaming paths: the bytes were paid for either
@@ -1470,52 +885,6 @@ fn persist_watermark(
              (provider {provider}): {e}"
         ),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn fetch_blob(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
-    ctx: &ChannelContext,
-    slash_dom: &Eip712Domain,
-    provider: Address,
-    store: &RedbBuyerChannelStore,
-    hash: [u8; 32],
-    namespace_id: [u8; 32],
-    deadlines: PullDeadlines,
-    max_blob_bytes: u64,
-    max_rate_per_mb: u64,
-    on_progress: Option<&ProgressCallback>,
-) -> anyhow::Result<Vec<u8>> {
-    let channel_id = ctx.channel_id;
-    let timestamp_us = micros_now();
-    // `stream_fetch_tracked_with_progress` reports the acked watermark via
-    // `progress` even on an error/timeout, so a paid-but-failed delivery still
-    // advances the stored watermark — otherwise the next reuse would re-sign a
-    // stale nonce. `on_progress` is the byte-delivery readout (`fetch` renders a
-    // bar; `bundle pull` passes `None`).
-    let mut progress = VoucherProgress::default();
-    let result = stream_fetch_tracked_with_progress(
-        endpoint,
-        target,
-        ctx,
-        slash_dom,
-        provider,
-        hash,
-        namespace_id,
-        0,
-        timestamp_us,
-        deadlines,
-        max_blob_bytes,
-        max_rate_per_mb,
-        &mut progress,
-        on_progress,
-    )
-    .await;
-
-    persist_watermark(store, provider, channel_id, &progress);
-
-    Ok(result?.to_vec())
 }
 
 /// Fetch a single blob over `cdn/client/v1`, auto-opening/reusing a payment
@@ -1558,7 +927,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // derived from the adopted channel's on-chain `provider`, and there is no
     // discovery/probe/select step to run before prompting for the keystore
     // password.
-    let (node_id, provider, mut ctx, slash_dom, contract, rpc, self_address) =
+    let (node_id, provider, ctx, slash_dom, contract, rpc, self_address) =
         if let Some(raw_channel_id) = &common.channel_id {
             let channel_id = parse_channel_id(raw_channel_id)?;
             let expected_provider = common
@@ -1677,103 +1046,379 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
             alloy::primitives::U256::from(n).to_be_bytes()
         });
-    // Stream to `<output>.partial` rather than buffering the blob (#1120): peak
-    // memory becomes one chunk group instead of ~2× the blob, and an interrupted
-    // fetch leaves a resumable prefix behind instead of nothing. A prior partial
-    // is picked up automatically and only the un-fetched tail is re-paid for.
-    let partial = partial_path(&args.output);
-    let streamed = fetch_blob_streaming(
-        &endpoint,
-        target,
-        &mut ctx,
-        &slash_dom,
-        provider,
-        &store,
-        hash,
-        namespace_id,
-        // A node that accepts the connection and never answers is as dead as one that
-        // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
-        // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
-        // said so in the user's own flags, so this `?` is the belt to that braces (#1145
-        // review).
-        PullDeadlines::capped(
-            common.stall_timeout(),
-            common.stall_timeout(),
-            common.hard_cap(),
-        )?,
-        max_blob_bytes,
-        common.max_rate_per_mb,
-        &partial,
-        Some(&on_progress),
-        // Reactive graduation (#1497): funding handles for a mid-fetch top-up.
-        &contract,
-        &rpc,
+    // A node that accepts the connection and never answers is as dead as one that
+    // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
+    // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
+    // said so in the user's own flags, so this `?` is the belt to those braces.
+    let deadlines = PullDeadlines::capped(
+        common.stall_timeout(),
+        common.stall_timeout(),
+        common.hard_cap(),
+    )?;
+
+    // Immutable channel fact captured before `ctx` moves into `drive_fetch`
+    // (which wraps it behind the shared, interior-mutable handle #1608 A5).
+    let channel_id = ctx.channel_id;
+
+    // The shared pull/funding deps the driver core borrows for the whole fetch.
+    let deps = DriveFetchDeps {
+        endpoint: &endpoint,
+        store: &store,
+        contract: &contract,
+        rpc: &rpc,
+        slash_dom: &slash_dom,
         self_address,
-        chain.payment_channel,
-        chain.max_approve,
-        chain.working_deposit,
+        chain: &chain,
+        namespace_id,
+        max_rate_per_mb: common.max_rate_per_mb,
+        max_blob_bytes,
+        deadlines,
+    };
+
+    // Run the gap-driven driver core (header-probe -> ClientRangedStore ->
+    // PeerSource -> drive -> watermark). The `indicatif` bar and its `on_progress`
+    // closure stay here — `drive_fetch` reports only through the callback. Clear
+    // the bar around the call so it never overwrites the terminal outcome (success
+    // line or error), on either path.
+    let result = drive_fetch(
+        &deps,
+        ctx,
+        target,
+        provider,
+        channel_id,
+        hash,
+        &args.output,
+        Some(&on_progress),
+        || bar.finish_and_clear(),
     )
     .await;
-    // Clear the bar before the terminal outcome (success line or error) so it
-    // never overwrites the final message, on either path.
+    // Safety net for the header-probe-failure early-return path inside
+    // `drive_fetch` (before `drive()` ever runs, so `finish_progress` above is
+    // never invoked on that path). `finish_and_clear` is idempotent, so this is
+    // a harmless no-op on the success/drive-error paths where the hook already
+    // cleared the bar before `persist_watermark` ran.
     bar.finish_and_clear();
-    // On error the partial file is deliberately LEFT in place — it is what the
-    // next invocation resumes from, and deleting it here would re-charge the user
-    // for every byte already paid for.
-    let streamed = streamed.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
+    let total_bytes = result?;
 
-    // A resumed fetch mixed bytes this process verified on the wire with bytes an
-    // earlier process left on disk. The latter are unverified — not because a
-    // prefix cannot be checked, but because this client keeps no outboard sidecar
-    // to check it against (see `sink::resume_offset`) — so settle it here against
-    // the content hash before anything is promoted. A fetch that started at 0
-    // verified every byte as it landed and needs no second pass.
-    if streamed.resumed_from > 0 {
-        let file = std::fs::File::open(&partial)
-            .map_err(|e| anyhow::anyhow!("reopen {}: {e}", partial.display()))?;
-        let genuine =
-            decdn_client_pull::sink::resume_is_genuine(hash, std::io::BufReader::new(file))
-                .map_err(|e| anyhow::anyhow!("verify {}: {e}", partial.display()))?;
-        if !genuine {
-            // The bad bytes are in the prefix we inherited, so there is nothing
-            // to salvage — drop it so the retry starts clean rather than
-            // resuming onto the same corruption forever. If the removal itself
-            // fails, say so: telling the user it "has been discarded" when it
-            // has not sends them into a loop where the error message is what
-            // prevents them diagnosing it.
-            let hex = blake3::Hash::from_bytes(hash).to_hex();
-            return Err(match std::fs::remove_file(&partial) {
-                Ok(()) => anyhow::anyhow!(
-                    "the partial download at {} did not match {hex} and has been discarded; \
-                     re-run to fetch it cleanly",
-                    partial.display()
-                ),
-                Err(e) => anyhow::anyhow!(
-                    "the partial download at {} did not match {hex} and could not be removed \
-                     ({e}); delete it by hand before re-running, or every retry will resume \
-                     onto the same corrupt bytes",
-                    partial.display()
-                ),
-            });
+    println!("fetched {total_bytes} bytes -> {}", args.output.display());
+    Ok(())
+}
+
+/// Shared pull/funding deps [`drive_fetch`] borrows for the lifetime of one
+/// fetch. Mirrors the locals `fetch()` and `bundle_pull::PullCtx` already hold so
+/// both callers drive the same gap-driven core (P4). Every field is a borrow or a
+/// `Copy` scalar; the per-fetch `ctx`, target, and output are passed to
+/// `drive_fetch` directly (the `ctx` moves, since it must be wrapped in
+/// `Arc<Mutex>`).
+pub(crate) struct DriveFetchDeps<'a, P> {
+    pub(crate) endpoint: &'a Endpoint,
+    pub(crate) store: &'a RedbBuyerChannelStore,
+    pub(crate) contract: &'a PaymentChannel::PaymentChannelInstance<P>,
+    pub(crate) rpc: &'a P,
+    pub(crate) slash_dom: &'a Eip712Domain,
+    pub(crate) self_address: Address,
+    pub(crate) chain: &'a ResolvedChain,
+    pub(crate) namespace_id: [u8; 32],
+    pub(crate) max_rate_per_mb: u64,
+    pub(crate) max_blob_bytes: u64,
+    pub(crate) deadlines: PullDeadlines,
+}
+
+/// The gap-driven driver core shared by `decdn fetch` and `bundle pull` (P4):
+/// learn `total_bytes` from a throwaway header-only open, open the
+/// [`ClientRangedStore`] beside `output`, `drive` only the missing ranges into it
+/// (bao-verifying every byte on ingest and promoting `.partial` to `output` on
+/// finalize), then persist the resulting voucher watermark. Returns the whole-blob
+/// `total_bytes` on success.
+///
+/// Behavior-preserving extraction of the block `fetch()` ran inline. The
+/// `indicatif` bar stays owned by the caller; `drive_fetch` reports progress
+/// only through `progress` and clears the bar via the `finish_progress` hook
+/// (called right after `drive()` returns, before `persist_watermark`, matching
+/// the pre-extraction ordering — `bundle pull` passes a no-op). The cache-miss
+/// annotation is applied on both the header-open and the drive failure, so both
+/// callers get the same explained error.
+///
+/// `ctx` moves in — it is wrapped in `Arc<Mutex>` so the source and driver can
+/// share it (the source clones it to open each gap's pull; the driver credits a
+/// mid-fetch top-up's new deposit through the same handle so the next open sees
+/// it).
+/// Which ledger reader `drive_fetch` persists, per drive outcome. This is
+/// money: the store refuses to regress a watermark (`AdvanceOutcome::Regressed`
+/// is warn-only), so a value written here is effectively permanent.
+///
+/// - `Ok` → `committed`, what the pull reported was acked.
+/// - Explicit `UpstreamVoucherRejected` → `committed`. The node refused a
+///   voucher and tore the stream down, applying vouchers in strict nonce
+///   order, so anything pipelined behind the rejected one was provably never
+///   taken. Settling at `settlement` would still count those followers and
+///   could inflate the persisted amount past what the node actually holds.
+/// - Any other `Err` → `settlement`, the high reader. The upstream persists a
+///   voucher before acking, so an ambiguous failure (stall, IO error, …)
+///   probably holds the armed ones; settling low risks re-signing a spent
+///   nonce and wedging the channel (#1122).
+fn select_watermark(
+    outcome: &anyhow::Result<()>,
+    committed: Cumulative,
+    settlement: Cumulative,
+    prior_nonce: U256,
+) -> VoucherProgress {
+    match outcome {
+        Ok(()) => VoucherProgress::from_cumulative(committed, prior_nonce),
+        Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
+            VoucherProgress::from_cumulative(committed, prior_nonce)
         }
+        Err(_) => VoucherProgress::from_cumulative(settlement, prior_nonce),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_fetch<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    ctx: ChannelContext,
+    target: EndpointAddr,
+    provider: Address,
+    channel_id: B256,
+    hash: [u8; 32],
+    output: &Path,
+    progress: Option<&ProgressCallback>,
+    finish_progress: impl FnOnce(),
+) -> anyhow::Result<u64>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    // Immutable channel facts captured before `ctx` moves behind the shared,
+    // interior-mutable handle the driver and source both read/write (#1608 A5).
+    let prior_nonce = ctx.prior_nonce;
+    let token = ctx.token;
+
+    // One ledger for this channel, seeded from its persisted cumulative state so
+    // the first voucher continues at `prior_nonce + 1` (the node rejects a
+    // restart-from-zero as a stale nonce). Shared (`Arc`) with the driver and
+    // source; the watermark to persist afterwards is read straight back off it.
+    let ledger = Arc::new(ChannelLedger::new(Cumulative {
+        nonce: prior_nonce,
+        bytes: ctx.prior_bytes_delivered,
+        amount: ctx.prior_amount,
+    }));
+
+    // Learn the whole-blob size before constructing the ranged store: the store is
+    // keyed on `(root, total_bytes)`, and the signed `StreamResponse` header is the
+    // authoritative source of `total_bytes`. This throwaway open is a handshake
+    // only — no voucher is signed until the first paid interval, so it pays nothing
+    // — and its pull is dropped immediately; `drive` re-opens exactly the gaps it
+    // needs. The cache-miss annotation is applied here too, so an unbound or
+    // underfunded refusal is still explained at this first contact.
+    let (header, first_pull) = open_progressive_pull(
+        deps.endpoint,
+        target.clone(),
+        &ctx,
+        Arc::clone(&ledger),
+        deps.slash_dom,
+        provider,
+        hash,
+        deps.namespace_id,
+        0,
+        micros_now(),
+        deps.max_blob_bytes,
+        deps.max_rate_per_mb,
+        deps.deadlines,
+        0,
+    )
+    .await
+    .map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
+    let total_bytes = header.total_bytes;
+    drop(first_pull);
+
+    // The store sits beside `output`, keyed by the output's own file name, so its
+    // promoted final path IS `output` (no post-finalize rename) and its `.partial`
+    // matches the pre-#1608 `<output>.partial` placement. A prior `.partial.ranges`
+    // record resumes; only `missing_ranges(R)` is re-pulled and no already-held
+    // byte is re-paid.
+    let (store_dir, stem) = ranged_store_location(output)?;
+    let ranged_store = ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
+        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", output.display()))?;
+
+    // `topUp` is funder-only on-chain, so a delegate voucher-signer (publisher-pays,
+    // #1481) cannot reactively top up — decided once here, up front.
+    let is_funder = deps
+        .store
+        .get_by_provider(provider)?
+        .map(|state| state.funder)
+        .is_some_and(|funder| funder == deps.self_address);
+    let funder = CliFunder {
+        contract: deps.contract,
+        rpc: deps.rpc,
+        store: deps.store,
+        provider,
+        token,
+        self_address: deps.self_address,
+        payment_channel_addr: deps.chain.payment_channel,
+        max_approve: deps.chain.max_approve,
+        is_funder,
+    };
+
+    // Share the context behind interior mutability: the source clones it to open
+    // each gap's pull, and the driver credits a mid-fetch top-up's new deposit
+    // through the same handle so the next open sees it.
+    let ctx = Arc::new(Mutex::new(ctx));
+    let peer_source = PeerSource::new(
+        deps.endpoint,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        deps.slash_dom,
+        provider,
+        deps.namespace_id,
+        deps.max_blob_bytes,
+        deps.max_rate_per_mb,
+        deps.deadlines,
+    );
+    let pacer = BudgetPacer::new();
+    let drive_config = DriveConfig::cli(deps.chain.working_deposit);
+
+    // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
+    // blob on a fresh fetch, just the gap on a resume — into the ranged store,
+    // which bao-verifies every byte on `ingest_stream` and promotes the `.partial`
+    // to `output` on `finalize`.
+    let drive_result = drive(
+        &ranged_store,
+        &peer_source,
+        &pacer,
+        &funder,
+        &ctx,
+        &ledger,
+        hash,
+        0,
+        0,
+        &drive_config,
+        progress,
+        None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
+        None, // served_paid: no downstream leg on the client path
+    )
+    .await;
+
+    // Clear the progress bar (or run the caller's no-op, for `bundle pull`)
+    // now — matching the pre-extraction `fetch()`, which cleared its `indicatif`
+    // bar immediately after `drive(...).await` returned and BEFORE
+    // `persist_watermark`. `persist_watermark` can `eprintln!` a rare
+    // non-advance warning; that warning must never race the still-active bar.
+    finish_progress();
+
+    // Persist the voucher watermark from the shared ledger the same way the
+    // pre-#1608 loop's `watermark_after` chose it: on an explicit voucher
+    // rejection the acked (committed) watermark is safe; on an ambiguous failure
+    // settle HIGH (`settlement`) so a reuse never re-signs a spent nonce.
+    let vprogress = select_watermark(
+        &drive_result,
+        ledger.committed(),
+        ledger.settlement(),
+        prior_nonce,
+    );
+    persist_watermark(deps.store, provider, channel_id, &vprogress);
+
+    // On error the `.partial` + sidecars are deliberately LEFT in place — they are
+    // what the next invocation resumes from (only the still-missing gap is
+    // re-pulled, and no held byte is re-paid). The whole-file re-hash the old
+    // streaming path ran (`verify_resumed_prefix`) is GONE: the store bao-verifies
+    // every ingested byte and `finalize` runs a whole-blob `valid_ranges` sweep, so
+    // an inherited prefix is verified structurally, not by a second full re-hash.
+    drive_result.map_err(|err| match ctx.lock() {
+        Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+        Err(_) => err,
+    })?;
+
+    Ok(total_bytes)
+}
+
+/// The CLI's [`Funder`] over its funding chain (#1608 A5): a mid-fetch reactive
+/// top-up runs the same `top_up_decision -> ensure_allowance -> top_up` path the
+/// pre-#1608 `fetch_blob_streaming` loop ran inline, now behind the driver's
+/// injected [`Funder`] seam so the gap driver stays chain-handle-agnostic. The
+/// driver decides WHETHER to fund (its pacer confirms a genuine, ledger-
+/// corroborated exhaustion and that budget/attempts remain); this only executes
+/// the on-chain move and returns the [`DepositOutcome`] for the driver to credit.
+struct CliFunder<'a, P> {
+    contract: &'a PaymentChannel::PaymentChannelInstance<P>,
+    rpc: &'a P,
+    store: &'a RedbBuyerChannelStore,
+    provider: Address,
+    token: Address,
+    self_address: Address,
+    payment_channel_addr: Address,
+    max_approve: bool,
+    /// Whether `self_address` is the channel's on-chain funder. `topUp` is
+    /// funder-only (`PaymentChannel.sol`), so a delegate voucher-signer
+    /// (publisher-pays, #1481) yields [`TopUpDecision::Exhausted`] and top-up
+    /// fails fast with an actionable message rather than an opaque revert.
+    is_funder: bool,
+}
+
+impl<P> Funder for CliFunder<'_, P>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    fn max_topups(&self) -> u32 {
+        decdn_client_pull::MAX_TOPUP_ATTEMPTS
     }
 
-    // Promote the verified partial in place of a copy-through: an atomic rename
-    // on the same filesystem, so `--output` never exists in a half-written state
-    // and the blob is never held in memory to be written a second time.
-    std::fs::rename(&partial, &args.output).map_err(|e| {
-        anyhow::anyhow!(
-            "promote {} -> {}: {e}",
-            partial.display(),
-            args.output.display()
-        )
-    })?;
-    println!(
-        "fetched {} bytes -> {}",
-        streamed.total_bytes,
-        args.output.display()
-    );
-    Ok(())
+    fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+        Box::pin(async move {
+            match top_up_decision(additional, self.is_funder) {
+                TopUpDecision::TopUp(additional) => {
+                    // `topUp` pulls `additional` USDC via `transferFrom`, so the
+                    // standing allowance must cover it first: unlimited under
+                    // `--max-approve`, else exactly `additional`.
+                    ensure_allowance(
+                        self.rpc,
+                        self.token,
+                        self.self_address,
+                        self.payment_channel_addr,
+                        if self.max_approve {
+                            None
+                        } else {
+                            Some(additional)
+                        },
+                    )
+                    .await?;
+                    // The escrowed-but-untracked outcomes (`UnknownChannel` /
+                    // `ChannelMismatch`) come straight back for the driver to treat
+                    // as terminal — it will not credit a deposit it cannot track.
+                    top_up(self.contract, self.store, self.provider, additional).await
+                }
+                TopUpDecision::Exhausted => anyhow::bail!(
+                    "channel exhausted mid-fetch: this key ({}) only signs vouchers and is not \
+                     the channel's funder; it cannot top up — ask the funder to raise the deposit",
+                    self.self_address
+                ),
+                // The pacer only asks for a strictly-positive top-up, so a zero
+                // `additional` (`NotNeeded`) is unreachable; reject it defensively.
+                TopUpDecision::NotNeeded => anyhow::bail!(
+                    "reactive top-up requested with nothing to add (deposit already at the working \
+                     target)"
+                ),
+            }
+        })
+    }
+}
+
+/// Where the [`ClientRangedStore`] for `--output` lives: its directory (the
+/// output's parent, or the current dir) and its stem (the output's own file
+/// name). Keying the store by the output name makes its promoted final path IS
+/// `--output` (no post-finalize rename), and its `.partial` sits beside the
+/// destination exactly like the pre-#1608 `<output>.partial`, so promotion is a
+/// same-filesystem atomic rename.
+fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let stem = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("--output {} has no usable file name", output.display()))?
+        .to_string();
+    Ok((dir, stem))
 }
 
 /// The `decdn fetch` delivery progress bar plus the callback that drives it,
@@ -2071,17 +1716,6 @@ pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTe
         Some(p) => tempfile::NamedTempFile::new_in(p),
         None => tempfile::NamedTempFile::new_in("."),
     }
-}
-
-/// Write `bytes` to `target` atomically: a unique `O_CREAT|O_EXCL` temp in the
-/// destination directory, then an atomic rename-replace.
-pub(crate) fn write_blob_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut tmp = temp_in_parent(target)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(target).map_err(|e| e.error)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2412,212 +2046,26 @@ mod tests {
         assert!(msg.contains("must not be the zero address"), "{err}");
     }
 
-    /// The partial lives beside `--output` with a suffix, not in a temp dir: the
-    /// promote step is a rename, which is only atomic within one filesystem, and
-    /// a later invocation has to be able to find it to resume.
-    /// The stale-partial restart must fire on the refusals that say something
-    /// about the OFFSET, and on nothing else.
-    ///
-    /// The predicate this replaced was `resumable_watermark(..).is_none()` — i.e.
-    /// "anything that is not a resumable voucher rejection" — which is true of
-    /// every ordinary stall, reset and local flush failure. Each of those would
-    /// have truncated a verified prefix the user already paid for and re-fetched
-    /// the whole blob: the exact waste resume exists to prevent, and invisible to
-    /// every other test because they all drive the happy path.
-    ///
-    /// `NotFound` has to be in the accepted set even though it is ambiguous: an
-    /// honest node refuses an out-of-bounds range with `RangeNotSatisfiable`,
-    /// which collapses to `NotFound` on the wire by design, so it is the only
-    /// signal a real resume-past-the-end ever produces.
     #[test]
-    fn only_offset_shaped_refusals_count_as_a_stale_partial() {
-        use decdn_client_pull::{HashMismatch, PullStalled};
-
-        let past_end = anyhow::Error::new(ResumeOffsetPastEnd {
-            total_bytes: 100,
-            byte_offset: 500_000,
-        });
-        assert!(
-            resume_may_be_stale(&past_end),
-            "an explicit past-end response must restart"
-        );
-
-        // `mid_stream` is just the no-evidence constructor; `resume_may_be_stale`
-        // reads only the error code, which is the same on both refusal shapes.
-        let refused_not_found =
-            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
-        assert!(
-            resume_may_be_stale(&refused_not_found),
-            "NotFound is what an honest node's range refusal collapses to"
-        );
-
-        // Everything below must NOT restart. A resumed transfer that merely
-        // hiccups has to keep its prefix.
-        let transient: Vec<anyhow::Error> = vec![
-            anyhow::Error::new(PullStalled {
-                after: Duration::from_secs(30),
-            }),
-            anyhow::Error::new(HashMismatch),
-            anyhow::anyhow!("flush /tmp/out.partial: No space left on device"),
-            anyhow::anyhow!("connection reset"),
-            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::InternalError)),
-        ];
-        for err in &transient {
-            assert!(
-                !resume_may_be_stale(err),
-                "this says nothing about the offset and must not discard the prefix: {err:#}"
-            );
-        }
-    }
-
-    /// Which ledger reader an attempt persists, per outcome. This is money: the
-    /// store refuses to regress a watermark (`AdvanceOutcome::Regressed` is
-    /// warn-only), so a value written here is effectively permanent.
-    ///
-    /// The three cases must differ, and each is wrong in a different direction:
-    ///
-    /// - success → whatever the pull reported;
-    /// - AMBIGUOUS failure → `settlement()`, the high reader. The upstream
-    ///   persists a voucher before acking, so it probably holds the armed ones;
-    ///   settling low re-signs a spent nonce and wedges the channel (#1122).
-    /// - EXPLICIT rejection → `committed()`, the low reader. The node refused a
-    ///   voucher and tore the stream down, and it applies them in strict nonce
-    ///   order, so anything pipelined behind the rejected one was provably never
-    ///   taken. `resolve_reject` pops only the FRONT of the outstanding set, so
-    ///   `settlement()` would still report those followers and inflate
-    ///   `last_amount` — potentially above the deposit, wedging the channel from
-    ///   the other side.
-    #[tokio::test]
-    async fn watermark_after_picks_the_reader_that_matches_the_outcome() -> anyhow::Result<()> {
-        use decdn_protocol::client::VoucherRejectReason;
-
-        // Two vouchers issued and left armed — never acked, never rejected.
-        let armed = || async {
-            let ledger = ChannelLedger::new(Cumulative::default());
-            for _ in 0..2u32 {
-                ledger.issue(1_000, 10, |_next| async { Ok(()) }).await?;
-            }
-            Ok::<_, anyhow::Error>(ledger)
-        };
-
-        // The two readers must actually diverge, or this test proves nothing.
-        let ledger = armed().await?;
-        anyhow::ensure!(
-            ledger.settlement().nonce > ledger.committed().nonce,
-            "fixture is inert: settlement and committed must differ while vouchers are armed"
-        );
-        let high = ledger.settlement().nonce;
-        let low = ledger.committed().nonce;
-
-        // Ambiguous failure — a stall says nothing about what the node kept.
-        let ambiguous: anyhow::Result<VoucherProgress> = Err(anyhow::anyhow!("peer stalled"));
-        let got = watermark_after(&ambiguous, &ledger, U256::ZERO);
-        anyhow::ensure!(
-            got.acked().map(|(n, _, _)| n) == Some(high),
-            "an ambiguous failure must settle HIGH, or the channel wedges on a spent nonce"
-        );
-
-        // Explicit rejection — the node told us it took nothing further.
-        let rejected: anyhow::Result<VoucherProgress> =
-            Err(anyhow::Error::new(UpstreamVoucherRejected {
-                reason: VoucherRejectReason::StaleNonce,
-                bundle: None,
-            }));
-        let got = watermark_after(&rejected, &ledger, U256::ZERO);
-        let persisted = got.acked().map(|(n, _, _)| n);
-        anyhow::ensure!(
-            persisted == Some(low) || persisted.is_none(),
-            "an explicit rejection must settle at the ACKED watermark ({low}), not {persisted:?}              — vouchers pipelined behind a rejected one were never taken, and the store will              not let an inflated value be corrected later"
-        );
-        Ok(())
-    }
-
-    /// A flush failure is local and terminal, so it must win — but the pull error
-    /// must survive as context. It can be the only record that the peer served
-    /// corrupt bytes (which also means the on-disk prefix is poisoned) or that the
-    /// channel needs a top-up; the `and_then` this replaced dropped it entirely.
-    #[test]
-    fn combine_pull_and_flush_prefers_the_flush_error_but_keeps_the_pull_cause() {
-        let progress = VoucherProgress::default();
-
-        let ok = combine_pull_and_flush(Ok(progress), Ok(()));
-        assert!(ok.is_ok(), "both succeeding must succeed");
-
-        let pull_only = combine_pull_and_flush(Err(anyhow::anyhow!("peer stalled")), Ok(()))
-            .expect_err("a failed pull must fail");
-        assert!(format!("{pull_only:#}").contains("peer stalled"));
-
-        let flush_only = combine_pull_and_flush(Ok(progress), Err(anyhow::anyhow!("disk full")))
-            .expect_err("a failed flush must fail");
-        assert!(format!("{flush_only:#}").contains("disk full"));
-
-        // The load-bearing case: both failed.
-        let both = combine_pull_and_flush(
-            Err(anyhow::anyhow!(
-                "received bytes do not match requested hash"
-            )),
-            Err(anyhow::anyhow!("disk full")),
-        )
-        .expect_err("both failing must fail");
-        let rendered = format!("{both:#}");
-        assert!(
-            rendered.contains("disk full"),
-            "the local flush fault must win: {rendered}"
-        );
-        assert!(
-            rendered.contains("do not match requested hash"),
-            "the pull cause must be chained, not dropped: {rendered}"
-        );
-    }
-
-    /// Only `NotFound` may be read as "no partial". Any other stat error folded to
-    /// `0` would truncate a large verified prefix and silently re-pay for it.
-    #[test]
-    fn existing_partial_len_reports_stat_errors_instead_of_zero() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-
-        let absent = dir.path().join("nothing.partial");
-        assert_eq!(existing_partial_len(&absent)?, 0, "absent means no partial");
-
-        let present = dir.path().join("some.partial");
-        std::fs::write(&present, b"0123456789")?;
+    fn ranged_store_location_sits_beside_the_output() {
+        // The store's stem is the output's file name and its dir is the output's
+        // parent, so its promoted final path (`dir/stem`) IS `--output` and its
+        // `.partial` (`dir/{stem}.partial`) sits beside the destination — the
+        // pre-#1608 `<output>.partial` placement, without a post-finalize rename.
+        let (dir, stem) = ranged_store_location(Path::new("/data/out/movie.mkv")).unwrap();
+        assert_eq!(dir, Path::new("/data/out"));
+        assert_eq!(stem, "movie.mkv");
+        assert_eq!(dir.join(&stem), Path::new("/data/out/movie.mkv"));
         assert_eq!(
-            existing_partial_len(&present)?,
-            10,
-            "present reports length"
+            dir.join(format!("{stem}.partial")),
+            Path::new("/data/out/movie.mkv.partial")
         );
 
-        // A regular file used as a directory component: stat fails with something
-        // that is NOT NotFound, which must surface rather than read as zero.
-        let not_a_dir = present.join("child.partial");
-        let err = existing_partial_len(&not_a_dir)
-            .expect_err("a non-NotFound stat error must not be folded to 0");
-        assert!(
-            format!("{err:#}").contains("refusing to treat this"),
-            "the error must name the money consequence: {err:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn partial_path_sits_beside_the_output() {
-        let p = partial_path(Path::new("/data/out/movie.mkv"));
-        assert_eq!(p, Path::new("/data/out/movie.mkv.partial"));
-        // A bare filename must stay relative — joining onto a parent of "" would
-        // otherwise send it to the filesystem root.
-        assert_eq!(
-            partial_path(Path::new("blob.bin")),
-            Path::new("blob.bin.partial")
-        );
-    }
-
-    #[test]
-    fn write_blob_atomic_replaces_existing_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("out.bin");
-        std::fs::write(&path, b"old contents that are longer").expect("seed");
-        write_blob_atomic(&path, b"new").expect("write");
-        assert_eq!(std::fs::read(&path).expect("read back"), b"new");
+        // A bare filename must stay relative — the dir falls back to "." rather
+        // than joining onto a parent of "" (which would send it to the root).
+        let (dir, stem) = ranged_store_location(Path::new("blob.bin")).unwrap();
+        assert_eq!(dir, Path::new("."));
+        assert_eq!(stem, "blob.bin");
     }
 
     #[test]
@@ -2731,6 +2179,60 @@ mod tests {
         assert_eq!(
             top_up_decision(U256::from(100u64), false),
             TopUpDecision::Exhausted
+        );
+    }
+
+    /// `select_watermark` is the money-critical 3-way choice `drive_fetch`
+    /// persists after `drive(...)` returns: which ledger reader to trust, per
+    /// outcome. Build two distinct `Cumulative` values standing in for
+    /// `committed` and `settlement` and assert each outcome picks the intended
+    /// one — this is the coverage the deleted `watermark_after` test carried
+    /// for the pre-#1608 loop.
+    #[test]
+    fn select_watermark_picks_the_reader_that_matches_the_outcome() {
+        use decdn_protocol::client::VoucherRejectReason;
+
+        let committed = Cumulative {
+            nonce: U256::from(3u64),
+            bytes: U256::from(3_000u64),
+            amount: U256::from(30u64),
+        };
+        let settlement = Cumulative {
+            nonce: U256::from(5u64),
+            bytes: U256::from(5_000u64),
+            amount: U256::from(50u64),
+        };
+        let prior_nonce = U256::ZERO;
+
+        // Success — persist the acked (committed) watermark.
+        let ok: anyhow::Result<()> = Ok(());
+        let got = select_watermark(&ok, committed, settlement, prior_nonce);
+        assert_eq!(
+            got.acked().map(|(n, _, _)| n),
+            Some(committed.nonce),
+            "success must persist the committed watermark"
+        );
+
+        // Explicit voucher rejection — still committed: vouchers pipelined
+        // behind the rejected one were provably never taken.
+        let rejected: anyhow::Result<()> = Err(anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: None,
+        }));
+        let got = select_watermark(&rejected, committed, settlement, prior_nonce);
+        assert_eq!(
+            got.acked().map(|(n, _, _)| n),
+            Some(committed.nonce),
+            "an explicit rejection must persist the committed watermark"
+        );
+
+        // Ambiguous failure — settle HIGH so a reuse never re-signs a spent nonce.
+        let ambiguous: anyhow::Result<()> = Err(anyhow::anyhow!("peer stalled"));
+        let got = select_watermark(&ambiguous, committed, settlement, prior_nonce);
+        assert_eq!(
+            got.acked().map(|(n, _, _)| n),
+            Some(settlement.nonce),
+            "an ambiguous failure must persist the settlement watermark"
         );
     }
 }

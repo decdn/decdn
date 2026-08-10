@@ -1,21 +1,22 @@
 name: Release
 
+# Versions are cut locally, never here. A maintainer runs `cargo release
+# <level> --execute`, which bumps the workspace and makes a GPG-signed commit
+# and tag with their own key (see RELEASING.md). Pushing that tag is what
+# starts this workflow. CHANGELOG.md is maintained by hand; git-cliff is used
+# below only to generate the GitHub release notes.
+#
+# This workflow builds and stages; it does not sign and it does not publish.
+# The GitHub Release is created as a *draft* and the container image manifest is
+# pushed untagged, so no NAME a user would pull resolves to anything before a
+# maintainer has signed it with .github/scripts/sign-release.sh. (The manifest
+# is still fetchable by its digest — untagged is not unreachable — but no tag
+# points at unsigned bytes, and the digest is not advertised anywhere a user
+# would look.) There is no signing key in Actions secrets.
 on:
-  workflow_dispatch:
-    inputs:
-      level:
-        description: "Release level"
-        required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
-      dry_run:
-        description: "Dry run (no publish, no push)"
-        required: false
-        type: boolean
-        default: false
+  push:
+    tags:
+      - 'v[0-9]*'
 
 permissions:
   contents: write
@@ -23,14 +24,17 @@ permissions:
 
 concurrency:
   group: release
-  # cancel-in-progress: false — tag push / docker push / release-asset upload
-  # are not idempotent; cancelling mid-flight can leave the release half-published.
+  # cancel-in-progress: false — docker push / release-asset upload are not
+  # idempotent; cancelling mid-flight can leave the draft half-built.
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # `-node`, because the image carries the daemon only — the `decdn` CLI is
+  # deliberately not in it (see Dockerfile). Same repository path on Docker Hub,
+  # which sign-release.sh mirrors the signed digest to.
+  IMAGE_NAME: ${{ github.repository }}-node
 
 jobs:
   release:
@@ -45,10 +49,69 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure git
+      # The tag is the only input, and it is attacker-controllable: the `v[0-9]*`
+      # trigger glob matches things like `v0$(whoami)`. The version flows into
+      # archive filenames and image tags in later jobs, so pin it to strict
+      # semver here and let everything downstream trust these outputs.
+      - name: Get version from tag
+        id: version
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not a semver release tag (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      # A release is only built for a tag signed by a maintainer key published
+      # on `main`. The keyring is read from origin/main, NOT from the tagged
+      # tree: reading it from the tag would let whoever pushes the tag supply
+      # both the key and the check, so the tag would only prove it was signed
+      # by a key it vouches for itself.
+      #
+      # DEFENCE IN DEPTH, NOT A BOUNDARY — until the repository is public.
+      # For a `push` event GitHub runs the workflow definition from the pushed
+      # ref, so a tag can carry a release.yml with this step deleted, and that
+      # workflow still receives contents:write and packages:write. Reading KEYS
+      # from main does not help while main itself is unprotected.
+      #
+      # Both holes close with the same switch: branch and tag protection are
+      # unavailable on the current plan (the API returns 403 "Upgrade to GitHub
+      # Pro or make this repository public") and become available when this
+      # repository is open-sourced. Configure them AT that point — see
+      # RELEASING.md § Before open-sourcing. Until then the enforceable
+      # guarantee is the maintainer signature itself, which consumers verify
+      # off-platform against a pinned fingerprint.
+      #
+      # `git verify-tag` exits 0 on a good-but-untrusted signature, so no trust
+      # database setup is needed — importing the keyring is enough.
+      - name: Verify tag signature
+        shell: bash
+        env:
+          # Isolated keyring, not the runner's default. Importing KEYS into the
+          # default home would let `git verify-tag` succeed on any key that
+          # already happened to be there, so the "only keys in origin/main:KEYS
+          # are trusted" guarantee would depend on the runner starting clean
+          # rather than on anything this step controls.
+          GNUPGHOME: ${{ runner.temp }}/keys-gnupg
+        run: |
+          set -o pipefail
+          # No --depth: this repo is checked out at fetch-depth 0, and a shallow
+          # fetch would impose a shallow boundary that the semver baseline and
+          # cargo-semver-checks below both need the history behind.
+          git fetch --no-tags origin main
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          git show origin/main:KEYS > "$RUNNER_TEMP/KEYS" || {
+            echo "::error::cannot read KEYS from origin/main"; exit 1; }
+          gpg --import "$RUNNER_TEMP/KEYS" || {
+            echo "::error::KEYS on origin/main is not a valid OpenPGP keyring"; exit 1; }
+          if ! git verify-tag "$GITHUB_REF_NAME"; then
+            echo "::error::$GITHUB_REF_NAME is not signed by a key in KEYS on main." \
+                 "Releases must be cut locally with a signed tag — see RELEASING.md."
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -56,16 +119,43 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release
-          # Releases are dispatched from main, so only main writes this
-          # partition; a dry-run dispatched from a branch stays restore-only
-          # and won't burn a cache slot in the shared 10 GiB store.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Reuse the `clippy` partition rather than a `release` one: the
+          # pre-release verification below runs the same
+          # `cargo clippy --workspace --all-targets` as ci.yml's clippy job, so
+          # the artifacts match. A `release` partition would never be populated
+          # — tag pushes are not on a branch, so this job cannot save, and no
+          # job in ci.yml writes that key.
+          shared-key: clippy
+          save-if: false
+
+      # The version bump happens locally and is unpoliced by CI, so confirm the
+      # tag matches the manifests it claims to describe. Catches a hand-typed
+      # tag or a tag pushed without `cargo release`. Checks every crate, not
+      # just one: `shared-version` is supposed to move all twelve in lockstep,
+      # and a partially-applied bump is exactly what this is here to catch.
+      # `shell: bash` is deliberate: the default shell for a `run:` block is
+      # `bash -e` with NO pipefail, so a `cargo metadata` failure here would be
+      # masked by jq exiting 0 on empty input and reported as a bogus version
+      # mismatch. `shell: bash` runs with `-eo pipefail`.
+      - name: Check tag matches crate versions
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          MISMATCHED=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg v "$VERSION" \
+              '.packages[] | select(.version != $v) | "\(.name)=\(.version)"')
+          if [ -n "$MISMATCHED" ]; then
+            echo "::error::tag says $VERSION but these crates disagree: $MISMATCHED"
+            echo "Cut releases with \`cargo release\` so all twelve stay in step."
+            exit 1
+          fi
+          echo "All crates are at $VERSION."
 
       - name: Install tools
-        uses: taiki-e/install-action@v2.85.2
+        uses: taiki-e/install-action@v2.85.9
         with:
-          tool: cargo-release,git-cliff,cargo-nextest
+          tool: git-cliff,cargo-nextest
 
       - name: Pre-release verification
         run: |
@@ -73,42 +163,119 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo nextest run --workspace --no-tests=pass
 
-      # Semver-checks on patch/minor. Skipped for major since breaking changes are expected.
+      # publish-crates.sh uploads these to crates.io after the release is
+      # signed, and a crates.io version can never be replaced. Packaging must
+      # therefore be proven BEFORE the draft exists, not discovered mid-publish.
+      #
+      # The verify build is the point: it compiles each crate from its packaged
+      # .crate, which is the only thing that catches a file referenced from
+      # outside the package (an `include_str!` reaching the workspace root
+      # builds fine in-tree and fails for every `cargo install` user).
+      - name: Verify every crate packages and builds standalone
+        run: cargo publish --workspace --dry-run --locked
+
+      # Baseline = the highest v* tag that does not point at HEAD, rather than
+      # the crates.io registry baseline. Publishing is a manual post-signing
+      # step (publish-crates.sh) that can be skipped or fail partway, so the
+      # registry is not a reliable record of the previous release — and the tag
+      # baseline needs no registry round-trip and works before the first
+      # publish. The first release has no prior tag, so semver-checks is
+      # skipped then (nothing to compare against).
+      - name: Determine semver baseline
+        id: baseline
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Highest v* tag that does NOT point at HEAD. The release tag always
+          # points at HEAD now that cutting is local, so skipping tags on HEAD
+          # is what makes this resolve to the *previous* release rather than
+          # comparing the revision against itself.
+          HEAD_SHA=$(git rev-parse HEAD)
+          PREV=""
+          for t in $(git tag --list 'v[0-9]*' --sort=-v:refname); do
+            # The glob is far looser than the version format below assumes, so
+            # apply the same strict semver filter used on the triggering tag.
+            # An odd tag like `v1.2` or `v0-wip` would otherwise become the
+            # baseline and feed garbage to the major/minor comparison.
+            [[ "${t#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || continue
+            # Capture rather than inlining: `-e` is suspended inside an `if`
+            # condition, so a rev-list failure on a dangling tag would yield an
+            # empty string, compare unequal, and silently become the baseline.
+            sha=$(git rev-list -n1 "$t") || {
+              echo "::error::cannot resolve tag $t"; exit 1; }
+            if [ "$sha" != "$HEAD_SHA" ]; then
+              PREV="$t"
+              break
+            fi
+          done
+          if [ -z "$PREV" ]; then
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "breaking=false" >> "$GITHUB_OUTPUT"
+            echo "No prior release tag; skipping semver-checks."
+            exit 0
+          fi
+          echo "rev=$PREV" >> "$GITHUB_OUTPUT"
+          echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+
+          # A major bump is expected to break; so is a minor bump while the
+          # major is 0, which cargo treats as the breaking component for 0.x.
+          # Running semver-checks across either is noise, so skip it there.
+          PREV_VERSION="${PREV#v}"
+          CUR_MAJOR="${VERSION%%.*}"
+          PREV_MAJOR="${PREV_VERSION%%.*}"
+          CUR_MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PREV_MINOR=$(echo "$PREV_VERSION" | cut -d. -f2)
+          if [ "$CUR_MAJOR" != "$PREV_MAJOR" ] ||
+             { [ "$CUR_MAJOR" = "0" ] && [ "$CUR_MINOR" != "$PREV_MINOR" ]; }; then
+            echo "breaking=true" >> "$GITHUB_OUTPUT"
+            echo "$PREV_VERSION -> $VERSION is a breaking bump; skipping semver-checks."
+          else
+            echo "breaking=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: cargo semver-checks
-        if: inputs.level != 'major'
+        if: ${{ steps.baseline.outputs.has_baseline == 'true' && steps.baseline.outputs.breaking == 'false' }}
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: default-features
+          baseline-rev: ${{ steps.baseline.outputs.rev }}
 
-      # inputs.level is a constrained choice enum (patch/minor/major), not free-text
-      - name: Validate release (dry run)
-        if: inputs.dry_run
-        run: cargo release "$LEVEL" --workspace --no-confirm --no-publish --no-push --no-tag
-        env:
-          LEVEL: ${{ inputs.level }}
-
-      - name: Execute release
-        if: ${{ !inputs.dry_run }}
-        run: cargo release "$LEVEL" --workspace --no-confirm --no-publish --execute
-        env:
-          LEVEL: ${{ inputs.level }}
-
-      - name: Get new version
-        if: ${{ !inputs.dry_run }}
-        id: version
+      # Created as a draft. Draft assets require authentication to download, so
+      # the archives are not publicly reachable until sign-release.sh publishes
+      # them. Idempotent, so "Re-run failed jobs" works after a flake in a
+      # later job — but it refuses to touch an already-published release.
+      - name: Create draft GitHub Release
+        shell: bash
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | \
-            jq -r '.packages[] | select(.name == "decdn-node") | .version')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
-        run: |
+          # GitHub caps release bodies at 125000 chars. The first release has
+          # no prior tag to bound `--latest`, so cliff emits the whole history
+          # and overflows; truncate (and flag it) only when we actually exceed
+          # the limit, leaving normal releases untouched.
           git cliff --latest --strip header > /tmp/release-notes.md
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "::error::git-cliff produced empty release notes for $TAG." \
+                 "Check that the commits since the last tag are conventional."
+            exit 1
+          fi
+          if [ "$(wc -c < /tmp/release-notes.md)" -gt 125000 ]; then
+            head -c 120000 /tmp/release-notes.md > /tmp/release-notes.trunc.md
+            printf '\n\n_Changelog truncated. See the full commit history for details._\n' \
+              >> /tmp/release-notes.trunc.md
+            mv /tmp/release-notes.trunc.md /tmp/release-notes.md
+          fi
+          if gh release view "$TAG" --json isDraft --jq .isDraft > /tmp/is-draft 2>/dev/null; then
+            if [ "$(cat /tmp/is-draft)" != "true" ]; then
+              echo "::error::release $TAG is already published; refusing to overwrite it"
+              exit 1
+            fi
+            echo "Draft already exists; refreshing its notes."
+            gh release edit "$TAG" --notes-file /tmp/release-notes.md
+          else
+            gh release create "$TAG" \
+              --draft \
+              --title "$TAG" \
+              --notes-file /tmp/release-notes.md
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -116,7 +283,6 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.archive_name }} ${{ matrix.target }}
     needs: release
-    if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -127,12 +293,20 @@ jobs:
       matrix:
         include:
           # decdn-node (daemon) — five targets.
+          #
+          # Both Linux targets go through `cross`, never a native build. A
+          # native build links against the runner's glibc — ubuntu-latest is
+          # 24.04, glibc 2.39 — which is NEWER than debian:bookworm-slim (2.36),
+          # so the binary would not run in our own container, nor on Debian 12
+          # or RHEL 9. `cross` images pin an old glibc (~2.31), which fixes the
+          # floor independently of whatever ubuntu-latest points at next.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-node
             binary: decdn-node
             archive_name: decdn-node
             archive: tar.gz
+            cross: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-node
@@ -158,13 +332,14 @@ jobs:
             binary: decdn-node.exe
             archive_name: decdn-node
             archive: zip
-          # decdn (user CLI) — same five targets.
+          # decdn (user CLI) — same five targets, same glibc reasoning.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-cli
             binary: decdn
             archive_name: decdn
             archive: tar.gz
+            cross: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-cli
@@ -200,11 +375,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2.85.2
+        uses: taiki-e/install-action@v2.85.9
         with:
           tool: cross
 
@@ -252,11 +427,14 @@ jobs:
         with:
           name: ${{ matrix.archive_name }}-${{ matrix.target }}
           path: ${{ matrix.archive_name }}-${{ needs.release.outputs.version }}-${{ matrix.target }}.*
+          # Default is `warn`, which leaves a leg green when it produced
+          # nothing — the manifest job downstream would then hash a short set
+          # and a maintainer would sign an incomplete release.
+          if-no-files-found: error
 
   upload-assets:
     name: Upload release assets
     needs: [release, build-binaries]
-    if: ${{ !inputs.dry_run }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
@@ -267,71 +445,179 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Upload to GitHub Release
-        run: gh release upload "$TAG" artifacts/*
+      # SHA256SUMS ships unsigned from here. `sign-release.sh` re-checks it
+      # against the uploaded bytes and signs it with a maintainer key before
+      # the draft is published — one signature covering every archive.
+      #
+      # The count assertion is load-bearing. `sha256sum` with zero file
+      # arguments reads STDIN rather than failing, so a `shopt -s nullglob`
+      # glob that matched nothing produced a valid-looking manifest with a
+      # single line naming the file `-` (the hash of empty stdin). That
+      # manifest then passes `sha256sum --check` with `-: OK`, and a
+      # maintainer would sign a release containing no binaries at all.
+      - name: Generate checksum manifest
+        working-directory: artifacts
+        shell: bash
+        env:
+          EXPECTED_ARCHIVES: "10"
+        run: |
+          archives=( ./*.tar.gz ./*.zip )
+          for a in "${archives[@]}"; do
+            [ -e "$a" ] || {
+              echo "::error::archive glob did not match any file: $a"; exit 1; }
+          done
+          if [ "${#archives[@]}" -ne "$EXPECTED_ARCHIVES" ]; then
+            echo "::error::expected $EXPECTED_ARCHIVES archives, found ${#archives[@]}:" \
+                 "${archives[*]}"
+            exit 1
+          fi
+          # Bare names, not ./-prefixed: consumers run `sha256sum --check` from
+          # the directory they downloaded into, and sign-release.sh matches
+          # manifest entries against plain filenames.
+          sha256sum -- "${archives[@]#./}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload to draft release
+        run: gh release upload "$TAG" --clobber artifacts/*
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release.outputs.tag }}
 
   docker:
     name: Docker image
-    needs: release
-    if: ${{ !inputs.dry_run }}
+    # Needs build-binaries: the image is assembled from the Linux archives that
+    # job produces, so the binary inside the image is byte-identical to the one
+    # the signed SHA256SUMS covers.
+    needs: [release, build-binaries]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
-      contents: read
+      # `write`, not `read`: this job uploads the SBOM and image-digest.txt to
+      # the draft release, and a job-level permissions block fully overrides
+      # the workflow-level grant rather than adding to it.
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release.outputs.tag }}
 
+      # Still needed: the apt-get layer runs under emulation for arm64. That is
+      # seconds, not the multi-minute cargo build it replaces.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       - name: Setup Blacksmith Builder
         uses: useblacksmith/setup-docker-builder@v2
 
+      - name: Download Linux daemon archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: decdn-node-*-unknown-linux-gnu
+          path: archives
+          merge-multiple: true
+
+      # dist/<arch>/ is keyed on buildx's TARGETARCH (amd64/arm64) rather than
+      # the Rust target triple, so the Dockerfile's COPY needs no branching.
+      - name: Unpack archives into dist/
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64 dist/arm64
+          tar xzf "archives/decdn-node-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C dist/amd64
+          tar xzf "archives/decdn-node-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            -C dist/arm64
+          for a in amd64 arm64; do
+            [ -x "dist/$a/decdn-node" ] || {
+              echo "::error::dist/$a/decdn-node missing or not executable"; exit 1; }
+          done
+          sha256sum dist/*/decdn-node
+
+          # Enforce the glibc floor rather than trusting `cross: true` to stay
+          # in the matrix. A natively-built binary needs GLIBC_2.39 (the
+          # runner's), which does not exist in debian:bookworm-slim (2.36) — it
+          # would fail at exec with "version `GLIBC_2.38' not found", and the
+          # published archive would be unrunnable on Debian 12 / RHEL 9 too.
+          MAX_ALLOWED=2.36
+          for a in amd64 arm64; do
+            need=$(objdump -T "dist/$a/decdn-node" \
+              | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+            echo "dist/$a/decdn-node requires glibc <= $need"
+            if [ "$(printf '%s\n%s\n' "$need" "$MAX_ALLOWED" | sort -V | tail -1)" \
+                 != "$MAX_ALLOWED" ]; then
+              echo "::error::dist/$a/decdn-node needs glibc $need, above the" \
+                   "$MAX_ALLOWED floor. Is this target still built with \`cross\`?"
+              exit 1
+            fi
+          done
+
       - name: Log in to GHCR
-        uses: docker/login-action@v4.5.2
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Only `labels` is consumed — `push-by-digest` below creates no tag, so
+      # metadata-action's tag output is unused. `images` is still required for
+      # it to compute the OCI source/revision labels.
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},value=v${{ needs.release.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.release.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=unused
 
-      - name: Build and push
+      # Pushed WITHOUT a tag. `push-by-digest=true` uploads the manifest and
+      # leaves it untagged, so nothing is pullable by name until
+      # sign-release.sh promotes `latest`, `<version>` and `<major>.<minor>`
+      # from the signed digest. A tag published before the digest is signed
+      # would be an unvouched-for image anyone could pull.
+      #
+      # An untagged push into the release package, rather than a tagged push
+      # into a staging one: GHCR keys a package version by digest and treats
+      # tags as metadata on it, so a staging tag would end up on the same
+      # version as `latest` after promotion and deleting it to tidy up would
+      # delete the released image.
+      - name: Build and push by digest
         id: build
-        uses: useblacksmith/build-push-action@v2.2.0
+        uses: useblacksmith/build-push-action@v2.3.0
         with:
           context: .
           file: Dockerfile
-          push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
+      # Scanned by digest in the release package — the untagged manifest is
+      # already there, it just has no tag pointing at it yet.
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: decdn-${{ needs.release.outputs.version }}-sbom.spdx.json
           upload-release-assets: false
           upload-artifact: false
 
-      - name: Upload SBOM to release
+      # GPG has no native OCI-image signature format, so the image is attested
+      # out of band: image-digest.txt records the exact
+      # ghcr.io/...@sha256:... reference, and sign-release.sh signs that file
+      # locally. cosign will later replace this with an in-registry signature.
+      - name: Record image digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "${IMAGE}@${DIGEST}" > image-digest.txt
+
+      - name: Upload SBOM and digest to draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release.outputs.tag }}
           VERSION: ${{ needs.release.outputs.version }}
-        run: gh release upload "$TAG" "decdn-${VERSION}-sbom.spdx.json"
+        run: |
+          gh release upload "$TAG" --clobber \
+            "decdn-${VERSION}-sbom.spdx.json" \
+            image-digest.txt

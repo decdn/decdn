@@ -85,11 +85,18 @@ and would silently miss data on a prefix rename.
 
 - **Container image** ships `decdn-node` only — daemon-only is the
   dominant container use case; a publisher wanting the CLI in a
-  container rebuilds from the release archive.
+  container rebuilds from the release archive. The image copies the
+  `decdn-node` binary out of the Linux release archives. It does not
+  compile from source. The binary in the image is therefore identical
+  to the archived one, and one signed `SHA256SUMS` covers both.
 - **Release archives** ship both binaries as separate tarballs per
   target (Linux x86_64 + aarch64, macOS x86_64 + aarch64, Windows
   x86_64): `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
   `decdn-${VERSION}-${TARGET}.tar.gz` (publishers).
+- **Platform floor.** The Linux binaries link glibc dynamically. Both
+  Linux targets build with `cross`, which sets the floor at glibc 2.31
+  (Debian 11, Ubuntu 20.04, RHEL 8). See
+  [ADR 000](000-language.md#consequences).
 - **`cargo install --path crates/cli`** and
   **`cargo install --path crates/node`** both work standalone.
 

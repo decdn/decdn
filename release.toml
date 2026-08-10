@@ -1,10 +1,21 @@
-[workspace]
 shared-version = true
 tag-name = "v{{version}}"
-pre-release-hook = ["git-cliff", "--output", "CHANGELOG.md", "--tag", "v{{version}}"]
+# No pre-release-hook. cargo-release runs hooks once per package with the cwd
+# set to that package's directory, so a `git-cliff --output CHANGELOG.md` hook
+# wrote twelve stray crates/*/CHANGELOG.md files and never touched the root
+# changelog. Those files are untracked, `git reset --hard` does not remove
+# them, and cargo-release refuses to run with a dirty tree — so every release
+# blocked the next one. CHANGELOG.md is maintained per-PR; git-cliff generates
+# the GitHub release notes in .github/workflows/release.yml instead.
 pre-release-commit-message = "chore(release): v{{version}}"
 push = true
 push-remote = "origin"
+# Not a "we never publish" flag — the workspace does go to crates.io, via
+# .github/scripts/publish-crates.sh. It must not happen HERE: this step runs
+# before CI has built anything and before a human has verified anything, and a
+# crates.io version is immutable, so an upload at this point could never be
+# taken back if the release then failed. See RELEASING.md.
 publish = false
-sign-tag = false
+sign-commit = true
+sign-tag = true
 dependent-version = "upgrade"

@@ -1,10 +1,15 @@
 [package]
 name = "decdn-client-pull"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Shared client-side paid-pull machinery used by both the node (node-to-node miss pulls) and the CLI (client fetch / bundle pull): the cdn/client/v1 requester and the buyer PaymentChannel open kernel"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # Exposes the legacy single-deadline test helpers (`PullDeadlines::whole_transfer`,
@@ -48,6 +53,9 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+decdn-bao-range = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -41,7 +41,14 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
+mod admit_store;
+mod funder;
 mod resume;
+
+#[allow(unused_imports, reason = "wired by Task 11's driver construction")]
+pub(crate) use admit_store::NodeAdmitStore;
+#[allow(unused_imports, reason = "wired by Task 11's driver construction")]
+pub(crate) use funder::NodeFunder;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -725,6 +732,9 @@ impl NodeOrigin {
             // bait-and-switch cannot select through this path.
             effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb),
             deadlines,
+            // Whole-tail fetch; a bounded gap request is the gap-driven driver's
+            // (#1608) `source::PeerSource`, not this candidate-fallback open.
+            0,
         )
         .await
         {
@@ -1098,7 +1108,7 @@ impl Origin for NodeOrigin {
             }
 
             // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-            // This is the generic `Origin::fetch` path (buffered / prefetch / warm),
+            // This is the generic `Origin::fetch` path (the buffered `populate` fill),
             // a hash-only pull with no client namespace, so it takes no on-chain
             // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
             // client-serve path is `open_progressive_pull`.
@@ -1175,7 +1185,7 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
 /// origin* is then reached with this same namespace so its own pull-through gate
 /// resolves (#1401, threaded by the progressive client-serve path). Origin backends
 /// (S3/HTTP/FS) are hash-keyed and never see it. `NO_NAMESPACE` (0) resolves to no
-/// authorized origins, so a hash-only pull (prefetch / warm) simply gets no
+/// authorized origins, so a hash-only pull (the buffered fill) simply gets no
 /// directory fallback (ADR 002 §Namespace 0).
 async fn discover(
     deps: &NodeOriginDeps,
@@ -1743,9 +1753,9 @@ async fn pull_from_candidate(
     // this pull's defining property since #1134 is that it need not return: it runs
     // with `hard_cap: None`, so nothing inside it ends a slow-but-progressing
     // transfer, and everything that does end one is external and DROPS the future —
-    // the foreground `outer_pull_deadline`, the background warm's
-    // `BACKGROUND_FILL_HARD_CAP`, and `pull_through_bg_shutdown` on restart. On every
-    // one of those paths the copy-back never ran and the acked watermark died with
+    // the foreground `outer_pull_deadline`, or the serve future being dropped (client
+    // disconnect, node shutdown). On every one of those paths the copy-back never ran
+    // and the acked watermark died with
     // the frame, while the USDC it recorded had already left the node. The next pull
     // then re-signed a stale nonce, the upstream rejected `StaleNonce`, and the
     // channel was wedged until it expired.
@@ -1777,15 +1787,14 @@ async fn pull_from_candidate(
     // `pull_timeout` used to wrap this whole fetch, which quietly capped the blob
     // size a node could pull through at roughly `pull_timeout × link speed` — at
     // the 20 s default, any blob needing more than ~20 s of transfer was
-    // unfetchable on this path, and the background warm that should have rescued it
-    // was capped by the same budget. The stall bound catches the thing a deadline
+    // unfetchable on this path. The stall bound catches the thing a deadline
     // should catch (an upstream that stops delivering) without penalising size or
     // link speed.
     //
     // The FOREGROUND serve path is still bounded — the delivery handler wraps the
     // whole `discover → probe → rank → pull` in `outer_pull_deadline`, so a client
-    // never waits longer than that; on expiry it gets a clean miss and the transfer
-    // continues in a detached background warm. So "no hard cap here" does not mean
+    // never waits longer than that; on expiry it gets a clean miss and nothing
+    // continues (#1610 removed the detached warm). So "no hard cap here" does not mean
     // "a client can wait forever".
     let _stream_guard = deps.metrics.outbound_stream_guard();
     // `ctx` is `&mut` from here on: a landed reactive top-up raises `ctx.deposit`, and

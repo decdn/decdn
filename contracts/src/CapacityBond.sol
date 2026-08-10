@@ -723,7 +723,7 @@ contract CapacityBond is
     ///         (operators may correct their initial `registerNode` region);
     ///         every subsequent call is gated by `regionStabilityWindow`.
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
-    ///         so all downstream readers (`getActiveNodes`, off-chain DHT)
+    ///         so all downstream readers (`getRegisteredNodes`, off-chain DHT)
     ///         see the same source of truth. `regionPrev` retains the prior
     ///         value for the ADR 030 § Region-stability window blacklist-scope
     ///         ripening predicate
@@ -1484,21 +1484,38 @@ contract CapacityBond is
         return isActive(ethAddress);
     }
 
-    function getActiveNodeCount() external view returns (uint256) {
+    function getRegisteredNodeCount() external view returns (uint256) {
         return _registeredAddrs.length;
     }
 
-    function getActiveNodes(uint256 offset, uint256 limit) external view returns (NodeInfo[] memory page) {
+    /// @notice Paginated read of the registered-operator set, with per-entry
+    ///         activeness computed on-chain.
+    /// @dev    Returns the raw `_registeredAddrs` page (every operator whose node
+    ///         record is registered, regardless of bond/unbonding/ejection) plus
+    ///         a parallel `active[]` where `active[i] == isActive(page[i].ethAddress)`.
+    ///         The two projections diverge on purpose: an operator mid-unbonding is
+    ///         `active[i] == false` but still present in `page` because it remains
+    ///         payable, so the off-chain node→address bindings must survive. Computing
+    ///         `active` here lets callers derive the true active-membership set from a
+    ///         single call, with no per-entry `isActive` round-trip (issue #1565).
+    function getRegisteredNodes(uint256 offset, uint256 limit)
+        external
+        view
+        returns (NodeInfo[] memory page, bool[] memory active)
+    {
         uint256 len = _registeredAddrs.length;
         if (offset >= len || limit == 0) {
-            return new NodeInfo[](0);
+            return (new NodeInfo[](0), new bool[](0));
         }
         uint256 end = offset + limit;
         if (end > len) end = len;
         uint256 size = end - offset;
         page = new NodeInfo[](size);
+        active = new bool[](size);
         for (uint256 i = 0; i < size; i++) {
-            page[i] = _nodes[_registeredAddrs[offset + i]];
+            address operator = _registeredAddrs[offset + i];
+            page[i] = _nodes[operator];
+            active[i] = isActive(operator);
         }
     }
 

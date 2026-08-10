@@ -44,6 +44,23 @@ The container image ships `decdn-node` only. Publishers grab the
 both. See [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for
 the dockerd-style split rationale.
 
+### Install
+
+From the first tagged release (nothing is published yet — see the status note
+above):
+
+```bash
+cargo install decdn-cli          # the `decdn` CLI
+cargo install decdn-node         # the daemon
+docker pull decdn/decdn-node     # or ghcr.io/decdn/decdn-node
+```
+
+Signed release archives are attached to each [GitHub
+release](https://github.com/decdn/decdn/releases); they are the channel a
+maintainer's signature covers, so prefer them if you verify signatures — see
+[SECURITY.md](SECURITY.md). Operator terms accepted at registration live in
+[`crates/cli/TERMS.md`](crates/cli/TERMS.md), embedded verbatim in the CLI.
+
 ### Crate Structure
 
 ```
@@ -87,3 +104,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development environment setup, build 
 ## Operations
 
 - [Operator runbook](docs/runbook.md)
+- [Release process](RELEASING.md) — cutting, signing and publishing a release
+- [Security policy](SECURITY.md) — reporting a vulnerability, verifying a release

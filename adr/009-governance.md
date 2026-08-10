@@ -62,7 +62,9 @@ Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWind
 
 #### Non-operator holder protection
 
-Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, drop burn below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on burn preserves the deflationary lever; the 0% floor on treasury permits governance to simplify the split without dropping operator-aligned cashflow.
+Non-operator value accrual is structurally guaranteed at the *contract* level, not at the governance level. Operators cannot vote to push the operator-base share above the 90% upper bound, hold an active burn bucket below the 5% lower bound, or otherwise expropriate non-operator-aligned shares — see the immutable [§ Governable Parameters with Safety Bounds](#governable-parameters-with-safety-bounds) below. The cashflow invariant (40% floor on the operator base) ensures clients still receive paid delivery; the 5% floor on an active burn bucket preserves the deflationary lever; the 0% floor on treasury permits governance to simplify the split without dropping operator-aligned cashflow.
+
+The burn bucket is the one share that also accepts zero. That is the dormant launch configuration — split `[9000, 0, 1000]`, `buybackBurner == address(0)` — which governance later activates to the steady-state target `[6000, 3000, 1000]` per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split). The bucket is therefore either off or at 5% or more; governance cannot leave it nominally on at a negligible share, and turning it off is as observable as any other 48-hour timelocked share change.
 
 #### Investor disposition (Open Q #7 resolved)
 
@@ -93,10 +95,10 @@ The three `FeeRouter` shares are governable within the bounds below. **Sum-to-10
 | Parameter | Default | Min | Max |
 | --- | ---: | ---: | ---: |
 | Operator base share | 60% | 40% | 90% |
-| Burn share | 30% | 5% | 50% |
+| Burn share | 30% (0% while dormant) | 5% when active | 50% |
 | Treasury share | 10% | 0% | 30% |
 
-The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever; the 0% floor on treasury lets governance simplify the split.
+The 40% floor on the operator-base share is the cashflow invariant: operators always receive enough liquid USDC to cover at least a meaningful fraction of infrastructure costs even under extreme governance proposals. The 5% floor on burn preserves the deflationary lever and binds whenever the bucket is active; a zero burn share is separately permitted as the dormant launch configuration ([§ Non-operator holder protection](#non-operator-holder-protection) above). The 0% floor on treasury lets governance simplify the split.
 
 #### CapacityBond curve and governance parameters (per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 

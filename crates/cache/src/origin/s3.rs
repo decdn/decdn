@@ -36,15 +36,16 @@ use aws_smithy_http_client::{Builder as HttpBuilder, tls};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
 use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use iroh_blobs::Hash;
 use tokio_util::io::ReaderStream;
 
 use super::fs::OBAO4_SUFFIX;
 use super::{
-    DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest,
-    OriginUrl, OutboardFetch, decompress,
+    BlobTooLargeMarker, DecompressMode, Origin, OriginByteStream, OriginFetch, OriginKind,
+    OriginRangeFetch, OriginRangeRequest, OriginUrl, OutboardFetch, decompress,
 };
-use crate::error::OriginPullError;
+use crate::error::{OriginError, OriginPullError};
 
 /// Validated, runtime-ready configuration for an [`S3Origin`].
 ///
@@ -523,6 +524,70 @@ fn classify_head_object_error(
     }
 }
 
+/// Prepend the `s3://bucket/key` request context to a body-phase stream
+/// `io::Error`, so a mid-stream failure carries the same identifying prefix
+/// that header-phase errors get from [`classify_get_object_error`]. `#271`
+/// deferred this: the body error surfaces from `ReaderStream` after the
+/// `GetObject` future has already returned, so `log_target` has to be
+/// threaded in through a per-chunk `map` adapter rather than a single
+/// `.context(...)` call.
+///
+/// The wrapper is deliberately narrow so it does not disturb
+/// [`crate::retry::classify_io_error`], which the engine's side-channel
+/// reader runs over every body-phase `io::Error`. That classifier recovers
+/// typed markers — [`BlobTooLargeMarker`] and [`OriginError`] (e.g.
+/// `DecompressionFailed`) — by downcasting the error's inner, and routes
+/// every other error on its [`std::io::ErrorKind`]. To keep both signals
+/// intact this helper:
+///
+///   * passes a typed-marker error through **untouched** — re-wrapping it in
+///     a `String` would hide the marker and silently reclassify a
+///     deterministic permanent error as a transient `Other`; and
+///   * preserves the original `ErrorKind` on the prefixed error, so the
+///     transient/permanent routing of network faults (`UnexpectedEof`,
+///     `ConnectionReset`, …) is unchanged; and
+///   * keeps the original error reachable as the `source()` of the returned
+///     error (via [`PrefixedBodyError`]) rather than flattening it into a
+///     formatted `String`, so downstream `.source()` walks and the
+///     payload-preserving intent of `classify_io_error` stay intact.
+fn prefix_body_stream_error(log_target: &str, e: std::io::Error) -> std::io::Error {
+    if e.get_ref()
+        .is_some_and(|inner| inner.is::<BlobTooLargeMarker>() || inner.is::<OriginError>())
+    {
+        return e;
+    }
+    let kind = e.kind();
+    std::io::Error::new(
+        kind,
+        PrefixedBodyError {
+            prefix: log_target.to_string(),
+            inner: e,
+        },
+    )
+}
+
+/// Error wrapper produced by [`prefix_body_stream_error`]. `Display` prepends
+/// the `s3://bucket/key` request context; `source()` returns the original
+/// `io::Error` so the error chain is preserved rather than flattened into a
+/// formatted string.
+#[derive(Debug)]
+struct PrefixedBodyError {
+    prefix: String,
+    inner: std::io::Error,
+}
+
+impl std::fmt::Display for PrefixedBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.prefix, self.inner)
+    }
+}
+
+impl std::error::Error for PrefixedBodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.inner)
+    }
+}
+
 impl Origin for S3Origin {
     fn kind(&self) -> OriginKind {
         OriginKind::S3
@@ -626,20 +691,16 @@ impl Origin for S3Origin {
             // wrapped into the `io::Error` that `ReaderStream`
             // emits and captured by the engine's
             // `count_and_cap_stream` side channel. The `s3://`
-            // bucket/key prefix is **not** carried into that
-            // error path — the prefix is in `log_target` here but
-            // we don't have a hook to attach it once the stream
-            // is in flight. Operators should pair the `s3://...`
-            // failures they see at headers phase
-            // (`classify_get_object_error`) with engine logs and
-            // the bucket/key that the request was issued for.
-            // A body-phase context wrapper is deferred: it needs a
-            // bespoke
-            // `Stream::map(io::Error → io::Error::other(format!("{log_target}: …")))`
-            // adapter wrapping every chunk, and the header-phase
-            // prefix plus the engine log already identify the
-            // request, so the added allocation per chunk buys
-            // little.
+            // bucket/key prefix is attached to that error below via
+            // `prefix_body_stream_error`, so a mid-stream failure
+            // carries the same identifying context as the
+            // header-phase `classify_get_object_error` errors
+            // (issue #1617). The per-chunk `map` closure runs for
+            // every item, but it is a cheap passthrough on `Ok`
+            // (no allocation or formatting) and only builds the
+            // prefixed error on `Err`; it preserves the
+            // `io::ErrorKind` and any typed marker so the engine's
+            // `classify_io_error` still routes the error correctly.
             let async_read = resp.body.into_async_read();
             let raw_stream = ReaderStream::new(async_read);
             // Layer the decoder (if any) onto the raw chunk stream. For an
@@ -668,6 +729,12 @@ impl Origin for S3Origin {
             } else {
                 advertised_size
             };
+            // Attach the `s3://bucket/key` request context to any body-phase
+            // stream error (issue #1617). `log_target` is moved into the
+            // per-chunk `map`; it is not read again after this point.
+            let stream: OriginByteStream = Box::pin(
+                stream.map(move |item| item.map_err(|e| prefix_body_stream_error(&log_target, e))),
+            );
             Ok(OriginFetch::Found { stream, size_hint })
         })
     }
@@ -927,6 +994,75 @@ mod tests {
             prefix: String::new(),
             credentials: Some(S3Credentials::DefaultChain { profile: None }),
         }
+    }
+
+    #[test]
+    fn body_stream_error_gains_s3_prefix() {
+        // A plain network-fault io error (no typed marker) must come out
+        // carrying the `s3://bucket/key` request context, mirroring the
+        // header-phase `classify_get_object_error` prefix (issue #1617).
+        let log_target = "s3://decdn-blobs/ab/abcdef";
+        let raw = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let wrapped = prefix_body_stream_error(log_target, raw);
+        let msg = wrapped.to_string();
+        assert!(
+            msg.starts_with(log_target),
+            "body error lost the s3://bucket/key prefix: {msg}"
+        );
+        assert!(
+            msg.contains("connection reset"),
+            "prefix wrapper dropped the underlying error text: {msg}"
+        );
+        // Kind must survive so retry routing is unchanged.
+        assert_eq!(wrapped.kind(), std::io::ErrorKind::ConnectionReset);
+        // The original error must stay reachable as `source()` rather than
+        // being flattened into the prefixed string.
+        let source = std::error::Error::source(&wrapped)
+            .expect("prefixed body error must expose the original error as source()");
+        assert_eq!(
+            source.to_string(),
+            "connection reset",
+            "source() must be the un-prefixed original error"
+        );
+    }
+
+    #[test]
+    fn body_stream_error_preserves_retry_classification() {
+        // The prefix wrapper must not change how `classify_io_error` routes a
+        // transient network fault: an `UnexpectedEof` (mid-body truncation)
+        // stays Transient after prefixing.
+        let raw = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated body");
+        let wrapped = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", raw);
+        assert!(
+            matches!(
+                crate::retry::classify_io_error(wrapped),
+                OriginPullError::Transient(_)
+            ),
+            "prefixing broke transient classification of a mid-body EOF"
+        );
+    }
+
+    #[test]
+    fn body_stream_error_passes_typed_marker_through() {
+        // A typed `OriginError` marker (e.g. a decode failure) must pass
+        // through untouched so `classify_io_error`'s downcast still fires and
+        // routes it Permanent. Re-wrapping it in a prefixed `String` would
+        // hide the marker and silently reclassify it as a transient `Other`.
+        let typed = std::io::Error::other(OriginError::MalformedEncoding);
+        let out = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", typed);
+        // Message is unchanged (no prefix added) …
+        assert!(
+            !out.to_string().starts_with("s3://"),
+            "typed marker was wrapped and lost its downcast identity"
+        );
+        // … and the downcast-driven classification still lands on Permanent.
+        assert!(
+            matches!(
+                crate::retry::classify_io_error(out),
+                OriginPullError::Permanent(_)
+            ),
+            "typed marker no longer classifies Permanent after prefixing"
+        );
     }
 
     #[test]

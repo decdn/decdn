@@ -15,12 +15,13 @@ use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bao_tree::{BaoTree, ChunkRanges};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use iroh_blobs::Hash;
 use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
+use iroh_blobs::{Hash, HashAndFormat};
+use iroh_io::AsyncStreamReader;
 use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
@@ -1411,6 +1412,53 @@ impl CacheEngine {
         })
     }
 
+    /// A live watch of which chunk ranges of `hash` are present, for progressive
+    /// serve-while-filling (#1621 Task 4). Yields the current bitfield's
+    /// [`bao_tree::ChunkRanges`] first, then further updates as the blob fills.
+    ///
+    /// Mirrors [`Self::present_ranges`]'s guards (refuse an evicted/blacklisted
+    /// hash, gate a never-seen hash via `status()` before observing — a hash
+    /// with no defined current state has nothing to watch), but stays a live
+    /// stream instead of a point-in-time snapshot. Deliberately uses
+    /// `ObserveProgress::stream()`, NEVER `await_completion`, which blocks
+    /// until the blob is complete and would hang forever on a partial blob.
+    pub async fn observe_present_ranges(
+        &self,
+        hash: Hash,
+    ) -> CacheResult<Pin<Box<dyn futures_util::Stream<Item = bao_tree::ChunkRanges> + Send>>> {
+        use futures_util::StreamExt;
+        // Same guards as `present_ranges`: never observe an evicted/blacklisted
+        // hash, and gate a never-seen hash (observe has no defined current state).
+        if self.refuses(hash) {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "observe_present_ranges: hash is evicted/blacklisted"
+            )));
+        }
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        if matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound) {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "observe_present_ranges: blob not present"
+            )));
+        }
+        // `.stream()` yields the current bitfield first, then updates. NEVER
+        // `.await_completion()` — it loops until complete and hangs on a partial.
+        let stream = self
+            .inner
+            .store
+            .blobs()
+            .observe(hash)
+            .stream()
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        Ok(Box::pin(stream.map(|bf| bf.ranges)))
+    }
+
     /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
     /// (`byte_len == 0` = to `blob_size`) that are NOT present on disk.
     ///
@@ -1576,6 +1624,25 @@ impl CacheEngine {
             m.evicted_operator.inc();
         }
         Ok(())
+    }
+
+    /// Protect a partial (range-admitted) blob from GC by giving its raw hash a
+    /// deterministic named tag. Idempotent — `set` overwrites the same name, so
+    /// re-admitting more ranges never proliferates tags. The `decdn-partial-`
+    /// prefix is opaque to iroh-blobs; `drop_named_tags_for` (evict) matches by
+    /// hash and removes it. A GC sweep in the sub-second window between
+    /// `import_bao_bytes` and this `set` is bounded by the GC interval and
+    /// self-heals on the next admit. #1607.
+    async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
+        let name = format!("decdn-partial-{hash}");
+        self.inner
+            .store
+            .tags()
+            .set(name.as_bytes(), HashAndFormat::raw(hash))
+            .await
+            .map_err(|e| {
+                CacheError::Store(anyhow::Error::from(e).context("protect_partial: tags().set"))
+            })
     }
 
     /// Delete every named tag pointing at `hash`, making the underlying
@@ -2052,12 +2119,14 @@ impl CacheEngine {
     /// fallback is always correct; the optimization only reduces the origin
     /// hop's cost.
     ///
-    /// This is **partial**-blob population: unlike [`Self::populate`] it does
-    /// not promote a named tag or make [`Self::has`] return `true` (which
-    /// requires a `Complete` blob), and it does not announce a DHT insert — a
-    /// node holding only a range is not advertised as a full holder (ADR 037
-    /// §"partial warming copies are not advertised"). A subsequent whole-blob
-    /// pull-through (or further range pulls) completes the blob.
+    /// This is **partial**-blob population. It installs a deterministic
+    /// `decdn-partial-<hash>` named tag so the imported range survives GC
+    /// (#1607, via `protect_partial`) — but, unlike [`Self::populate`],
+    /// it does not make [`Self::has`] return `true` (which requires a `Complete`
+    /// blob), and it does not announce a DHT insert — a node holding only a
+    /// range is not advertised as a full holder (ADR 037 §"partial warming
+    /// copies are not advertised"). A subsequent whole-blob pull-through (or
+    /// further range pulls) completes the blob.
     ///
     /// # Errors
     ///
@@ -2229,7 +2298,131 @@ impl CacheEngine {
                 )
             })?;
 
+        self.protect_partial(hash).await?;
+
         Ok(RangePullOutcome::Served)
+    }
+
+    /// Import an already-encoded interleaved bao range for `hash`, verified
+    /// against the root on import (iroh-blobs `import_bao_bytes`). Thin
+    /// wrapper over the same store call `pull_through_range` makes, exposed so
+    /// `NodeRangedStore::admit` need not reach into the private store handle.
+    pub async fn admit_bao(
+        &self,
+        hash: Hash,
+        chunk_ranges: bao_tree::ChunkRanges,
+        bao_bytes: bytes::Bytes,
+    ) -> CacheResult<()> {
+        self.inner
+            .store
+            .blobs()
+            .import_bao_bytes(hash, chunk_ranges, bao_bytes)
+            .await
+            .map_err(|e| {
+                CacheError::Store(anyhow::Error::from(e).context("admit_bao: import_bao_bytes"))
+            })?;
+        self.protect_partial(hash).await?;
+        Ok(())
+    }
+
+    /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
+    /// blob) off `reader` into the cache as a B0-tagged **partial**,
+    /// O(chunk-group), verifying against the root incrementally. Returns the
+    /// drained `reader` (for `BlobSource::finish`). This is the range analogue
+    /// of the whole-blob tee ([`TeeReservation::begin`]): a bounded mpsc
+    /// channel feeds a `ChannelRecvStream` that iroh-blobs
+    /// `import_bao_reader` decodes and verifies concurrently with the caller's
+    /// read loop, so memory stays O(one channel's worth of chunks) rather than
+    /// O(range size).
+    ///
+    /// The wire the caller forwards is header-less (ADR 038) — unlike
+    /// `import_bao_reader`'s own `recv_exact(&mut size)` convention, which
+    /// expects an 8-byte LE size prefix as the first bytes on the stream. This
+    /// method supplies that prefix itself, from the trusted `total_bytes`
+    /// (the signed whole-blob size), rather than reading it off `reader`.
+    ///
+    /// # Errors
+    ///
+    /// - [`CacheError::VerifyFailed`] — the decoder rejected a chunk group or
+    ///   parent hash against the root `hash`: the forwarded bytes are corrupt
+    ///   (a lying upstream). Nothing is admitted.
+    /// - [`CacheError::Store`] — a local store fault, an import-task join
+    ///   fault, or a read fault on `reader` itself (distinct from corruption —
+    ///   mirrors the transport/corruption split in `bao_decoded_source`).
+    pub async fn admit_bao_stream<R>(
+        &self,
+        hash: Hash,
+        chunk_ranges: ChunkRanges,
+        total_bytes: u64,
+        mut reader: R,
+    ) -> CacheResult<R>
+    where
+        R: AsyncStreamReader + Send,
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
+        let engine = self.clone();
+        let import = tokio::spawn(async move {
+            engine
+                .inner
+                .store
+                .blobs()
+                .import_bao_reader(hash, chunk_ranges, ChannelRecvStream::new(rx))
+                .await
+        });
+
+        // Inject the 8-byte LE size prefix `import_bao_reader` expects as the
+        // first thing its `RecvStream` yields — the wire itself carries no
+        // in-band header (ADR 038), so it comes from the signed `total_bytes`
+        // instead of a read off `reader`.
+        let mut read_err = None;
+        if tx
+            .send(Bytes::copy_from_slice(&total_bytes.to_le_bytes()))
+            .await
+            .is_ok()
+        {
+            loop {
+                match reader.read_bytes(ADMIT_STREAM_READ_LEN).await {
+                    Ok(chunk) if chunk.is_empty() => break,
+                    Ok(chunk) => {
+                        if tx.send(chunk).await.is_err() {
+                            // The import task ended before this chunk landed —
+                            // its outcome (awaited below) explains why.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        read_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        // Drop the sender to end the fed stream (mirrors `TeeSink::finish`),
+        // whether the loop ended on EOF, a closed import task, or a read fault.
+        drop(tx);
+
+        let outcome = import.await.map_err(|e| {
+            CacheError::Store(anyhow::anyhow!(
+                "admit_bao_stream: import task join failed: {e}"
+            ))
+        })?;
+
+        if let Some(e) = read_err {
+            // A local fault reading `reader`, independent of the import
+            // task's outcome — surface it rather than whatever (likely
+            // truncated-feed) outcome the import task landed on.
+            return Err(CacheError::Store(
+                anyhow::Error::from(e).context("admit_bao_stream: reader read_bytes failed"),
+            ));
+        }
+
+        match outcome {
+            Ok(_drained) => {
+                self.protect_partial(hash).await?;
+                Ok(reader)
+            }
+            Err(e) => Err(classify_import_bao_reader_error(hash, e)),
+        }
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
@@ -3680,6 +3873,37 @@ enum StreamCommitOutcome {
 /// forward overlap rather than ping-ponging one chunk at a time.
 const TEE_SINK_CHANNEL_CAP: usize = 8;
 
+/// Read granularity [`CacheEngine::admit_bao_stream`] uses to drain its
+/// upstream `reader` into the feeder channel. Arbitrary — the
+/// [`ChannelRecvStream`]/decoder side re-buffers to whatever boundaries the
+/// bao tree needs (the same way [`TeeSink::write`]'s network-chunk-sized
+/// pushes already do) — chosen as a plain streaming-I/O size, not tied to
+/// `CHUNK_GROUP_BYTES`.
+const ADMIT_STREAM_READ_LEN: usize = 64 * 1024;
+
+/// Classify a [`iroh_blobs::api::RequestError`] from
+/// [`CacheEngine::admit_bao_stream`]'s `import_bao_reader` call. A genuine bao
+/// verify rejection (chunk-group or parent hash mismatch) is surfaced by
+/// `bao-tree`'s decoder as an `io::Error` of kind `InvalidData` (see
+/// `bao_tree::io::error::DecodeError`'s `From<DecodeError> for io::Error`); a
+/// truncated/short feed instead surfaces `UnexpectedEof`, and any other
+/// failure is a genuinely local store/transport fault. Walking the error
+/// chain (rather than pattern-matching the `#[stack_error]`-derived
+/// `RequestError`/`Error` shapes directly) is robust to how many wrapper
+/// layers iroh-blobs interposes.
+fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError) -> CacheError {
+    let err = anyhow::Error::from(e).context("admit_bao_stream: import_bao_reader failed");
+    let verify_failed = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::InvalidData);
+    if verify_failed {
+        CacheError::VerifyFailed { expected: hash }
+    } else {
+        CacheError::Store(err)
+    }
+}
+
 /// Result of [`CacheEngine::open_tee_sink`] (#856).
 #[derive(Debug)]
 pub enum TeeOpen {
@@ -4256,6 +4480,13 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use std::future::Future;
@@ -7099,5 +7330,229 @@ mod tests {
             "no origin serves the outboard; open_local_outboard_pull should degrade to Ok(None)"
         );
         Ok(())
+    }
+
+    // -- #1607: admit_bao tags its partial so it survives GC --
+
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes()[0];
+        }
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &plaintext,
+            crate::range_pull::IROH_BLOCK_SIZE,
+        );
+        (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+    }
+
+    fn bao_for(
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: bytes::Bytes,
+        off: u64,
+        len: u64,
+        total: u64,
+    ) -> (Hash, bao_tree::ChunkRanges, bytes::Bytes) {
+        let aligned = crate::range_pull::align_range(off, len, total).unwrap();
+        let s = aligned.fetch_start() as usize;
+        let e = aligned.fetch_end() as usize;
+        let encoded =
+            crate::range_pull::encode_verified_range(root, &aligned, &plaintext[s..e], outboard)
+                .unwrap();
+        (Hash::from(root), aligned.chunk_ranges().clone(), encoded)
+    }
+
+    async fn count_tags_for(engine: &CacheEngine, hash: Hash) -> usize {
+        let mut stream = engine.inner.store.tags().list().await.unwrap();
+        let mut n = 0usize;
+        while let Some(info) = stream.next().await {
+            if info.unwrap().hash == hash {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn admit_bao_tags_the_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        // Admit one interior group -> a genuine partial.
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard.clone(), group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(
+            !engine.present_ranges(hash).await.unwrap().is_complete(),
+            "still partial"
+        );
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "partial admit creates exactly one protecting tag"
+        );
+
+        // Idempotent: admit a second group -> still exactly one tag.
+        let (h2, r2, b2) = bao_for(root, &plaintext, outboard, 2 * group, group, total);
+        engine.admit_bao(h2, r2, b2).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "re-admit does not proliferate tags"
+        );
+    }
+
+    // -- Task 9: admit_bao_stream — O(chunk-group) streaming range admit --
+
+    #[tokio::test]
+    async fn admit_bao_stream_admits_a_partial_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+
+        // `bao_for` (via `encode_verified_range`) prepends the 8-byte LE size
+        // header the in-memory `import_bao_bytes` path expects. The wire
+        // `admit_bao_stream` consumes is header-less (ADR 038) — the size
+        // comes from `total_bytes` instead — so strip it here to synthesize
+        // that header-less wire for the reader.
+        assert!(bao.len() > 8, "bao_for output must carry the 8-byte header");
+        let header_less = bao.slice(8..);
+
+        let reader = engine
+            .admit_bao_stream(hash, ranges.clone(), total, header_less)
+            .await
+            .unwrap();
+        assert_eq!(reader.len(), 0, "the reader is fully drained");
+
+        let present = engine.present_ranges(hash).await.unwrap();
+        assert!(!present.is_complete(), "still partial");
+        assert!(!present.is_empty(), "the admitted range is present");
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "streaming admit creates exactly one protecting tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_rejects_corrupt_bao() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        let mut corrupt = bao.slice(8..).to_vec();
+        let flip_at = corrupt.len() / 2;
+        let byte = corrupt.get_mut(flip_at).expect("non-empty header-less bao");
+        *byte ^= 0xFF;
+
+        let err = engine
+            .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+            "expected VerifyFailed, got {err:?}"
+        );
+        assert!(
+            engine.present_ranges(hash).await.unwrap().is_empty(),
+            "nothing admitted from a corrupt bao"
+        );
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            0,
+            "a rejected import must not tag a partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
+        use iroh_blobs::api::blobs::BlobStatus;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let tmp = tempfile::tempdir().unwrap();
+        // Short GC interval so the store's internal run_gc loop sweeps quickly.
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![],
+            16,
+            PinnedHashes::empty(),
+            RetryPolicy::disabled(),
+            CircuitBreakerPolicy::default(),
+            Some(std::sync::Arc::new(CacheMetrics::default())),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+        // Tagged: normal admit_bao (protect_partial fires).
+        let (root_a, pt_a, ob_a) = synth_blob(total as usize);
+        let (ha, ra, ba) = bao_for(root_a, &pt_a, ob_a, group, group, total);
+        engine.admit_bao(ha, ra, ba).await.unwrap();
+
+        // Control: same shape, distinct hash, imported WITHOUT a tag (pre-#1607).
+        let (root_b, pt_b, ob_b) = synth_blob((total + group) as usize); // different len -> different root
+        let (hb, rb, bb) = bao_for(root_b, &pt_b, ob_b, group, group, total + group);
+        engine
+            .inner
+            .store
+            .blobs()
+            .import_bao_bytes(hb, rb, bb)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.inner.store.blobs().status(ha).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+        assert!(matches!(
+            engine.inner.store.blobs().status(hb).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+
+        // Poll for the control's reclaim rather than sleeping a fixed span:
+        // fails fast once GC sweeps (typically the first 200ms interval), and
+        // only fails if GC never reclaims the untagged control within a generous
+        // budget — robust on slow/loaded CI and independent of the exact GC
+        // interval. The control's `NotFound` gates the test, so a genuine GC
+        // failure still fails loud; it can never silently pass.
+        let deadline = std::time::Duration::from_secs(15);
+        let poll = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        loop {
+            let reclaimed = matches!(
+                engine.inner.store.blobs().status(hb).await.unwrap(),
+                BlobStatus::NotFound
+            );
+            if reclaimed {
+                break;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "control never reclaimed within {deadline:?}: GC did not run"
+            );
+            tokio::time::sleep(poll).await;
+        }
+
+        // The tagged partial must STILL be present after the control was swept —
+        // proving the tag (not timing) is what protected it.
+        assert!(
+            matches!(
+                engine.inner.store.blobs().status(ha).await.unwrap(),
+                BlobStatus::Partial { .. }
+            ),
+            "tagged partial survives GC"
+        );
     }
 }

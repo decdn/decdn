@@ -1,6 +1,6 @@
 [package]
 name = "decdn-e2e"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -61,6 +61,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# `test-util` exposes `ClientRangedStore::seed_checkpointed_prefix`, which the
+# resume e2e uses to construct a real new-model checkpointed on-disk state
+# (positioned `.partial` + `.obao4` outboard + `.ranges` record) instead of the
+# old raw-`.partial` seeding the gap-driven fetch no longer resumes from.
+decdn-client-pull = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

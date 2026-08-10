@@ -162,7 +162,7 @@ A dispute that raises the settlement amount (e.g., 50 → 80 payment-token units
 
 The governance token (TOKEN) is not used for delivery payments. It is reserved for operator capacity bonding (see [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) and governance (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
-**Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
+**Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. The governance-set delivery-rate floor is the only rate bound the protocol enforces. There is no governance ceiling. A requester that finds a rate too expensive refuses the response as local policy ([ADR 005 § Requester-side validation](005-protocol.md#requester-side-validation-optional)), and the wire constant `MAX_RATE_PER_MB` bounds the field from above. This creates a market with natural arbitrage dynamics:
 
 - Origin-backed nodes set a higher rate because they bear backend costs (storage + egress from their hidden backing store). They are the effective price ceiling for any blob they hold.
 - A cache-only node that pays an origin-backed node to pull a blob can then serve that blob to many clients at a markup, recouping the origin cost across multiple deliveries.
@@ -747,9 +747,9 @@ function reclaimNodeId(
 function getNode(bytes32 nodeId) external view returns (NodeInfo memory);
 function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
 function isActiveNode(bytes32 nodeId) external view returns (bool);
-function getActiveNodeCount() external view returns (uint256);
-function getActiveNodes(uint256 offset, uint256 limit)
-    external view returns (NodeInfo[] memory);
+function getRegisteredNodeCount() external view returns (uint256);
+function getRegisteredNodes(uint256 offset, uint256 limit)
+    external view returns (NodeInfo[] memory page, bool[] memory active);
 function firstBondedAt(address operator) external view returns (uint64);
 
 // State — per-nodeId nonce for ed25519 registration replay protection
@@ -799,7 +799,7 @@ A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-00
 
 Three tiers, from simplest to most scalable:
 
-1. **View functions.** `getActiveNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip)).
+1. **View functions.** `getRegisteredNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip)).
 
 2. **Event logs.** Clients index `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events (indexed by `nodeId`) to maintain a local cache. More efficient than repeated view calls for larger node sets.
 

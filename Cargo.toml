@@ -17,22 +17,37 @@ members = [
 exclude = ["contracts"]
 
 [workspace.package]
+# Every publishable crate inherits this. `cargo release` (shared-version) bumps
+# it here and rewrites the matching `version` on the internal
+# `[workspace.dependencies]` entries below in the same commit.
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
+repository = "https://github.com/decdn/decdn"
+homepage = "https://decdn.org"
+keywords = ["cdn", "p2p", "content-delivery", "iroh", "blake3"]
+categories = ["network-programming", "web-programming"]
+# `readme` is deliberately NOT here — not because inheritance would break
+# packaging (cargo copies a workspace-root readme into the .crate quite happily)
+# but because these are public crates.io landing pages and each one needs to
+# describe its own crate. Inheriting would put the same text on all eleven.
 
 [workspace.dependencies]
-# Internal crates
-decdn-protocol = { path = "crates/protocol" }
-decdn-config-types = { path = "crates/config-types" }
-decdn-bao-range = { path = "crates/bao-range" }
-decdn-cache = { path = "crates/cache" }
-decdn-incentive = { path = "crates/incentive" }
-decdn-reputation = { path = "crates/reputation" }
-decdn-gossip = { path = "crates/gossip" }
-decdn-common = { path = "crates/common" }
-decdn-client-pull = { path = "crates/client-pull" }
-decdn-node = { path = "crates/node" }
+# Internal crates. The `version` is what makes these publishable — cargo rejects
+# a path dependency with no version specifier, because a published crate has no
+# path to follow. Locally the `path` still wins; the version only applies to the
+# manifest cargo uploads.
+decdn-protocol = { path = "crates/protocol", version = "0.1.1" }
+decdn-config-types = { path = "crates/config-types", version = "0.1.1" }
+decdn-bao-range = { path = "crates/bao-range", version = "0.1.1" }
+decdn-cache = { path = "crates/cache", version = "0.1.1" }
+decdn-incentive = { path = "crates/incentive", version = "0.1.1" }
+decdn-reputation = { path = "crates/reputation", version = "0.1.1" }
+decdn-gossip = { path = "crates/gossip", version = "0.1.1" }
+decdn-common = { path = "crates/common", version = "0.1.1" }
+decdn-client-pull = { path = "crates/client-pull", version = "0.1.1" }
+decdn-node = { path = "crates/node", version = "0.1.1" }
 # No `decdn-cli` entry: it is a bin crate and a workspace *member*, but nothing
 # in the workspace depends on it, so it needs no `[workspace.dependencies]`
 # alias. Add one back only alongside a real dependant.

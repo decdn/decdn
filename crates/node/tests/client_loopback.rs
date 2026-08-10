@@ -5862,10 +5862,9 @@ impl decdn_cache::Origin for SlowOrigin {
 /// Drive one authorized owner request for a hash served only by a `SlowOrigin`
 /// taking `origin_delay`, with the handler's outer pull-through deadline set to
 /// `outer_deadline`. Returns whether the foreground pull completed and filled the
-/// store (probed via a cloned cache handle after the response settles). No
-/// background fill is wired, so this isolates the foreground outer-deadline
-/// behaviour (a background warm could otherwise fill the store after the fact and
-/// mask the broken case).
+/// store (probed via a cloned cache handle after the response settles). Only the
+/// foreground outer-deadline path can fill the store — there is no background warm
+/// (#1610) that could fill it after the fact and mask the broken case.
 async fn pull_through_fills_under_deadline(
     outer_deadline: Duration,
     origin_delay: Duration,

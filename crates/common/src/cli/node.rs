@@ -195,7 +195,7 @@ pub enum NodeCommand {
     /// file.
     RotateKey(RotateKeyArgs),
     /// Unpaid client-side discovery of active nodes via
-    /// `CapacityBond.getActiveNodes` (#1481). Maps node-ids/regions to
+    /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
     /// operator Ethereum addresses — the input `decdn channel open
     /// --provider-address` needs — without spending anything: it builds a
     /// signer-less read-only provider and never loads a keystore, unlike
@@ -836,7 +836,7 @@ pub struct DeregisterArgs {
 }
 
 /// `decdn node lookup` — unpaid client-side discovery of active nodes via
-/// `CapacityBond.getActiveNodes` (#1481). See [`NodeCommand::Lookup`] for the
+/// `CapacityBond.getRegisteredNodes` (#1481). See [`NodeCommand::Lookup`] for the
 /// full description.
 #[derive(Args, Debug)]
 pub struct LookupArgs {

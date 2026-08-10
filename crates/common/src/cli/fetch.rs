@@ -270,8 +270,7 @@ impl ClientFetchArgs {
     /// It cannot simply be removed, though, because inactivity is not liveness: the stall
     /// clock resets on ANY byte, so a provider trickling one byte per stall window would
     /// hang the fetch forever with no error. The default is therefore deliberately
-    /// generous — far above any honest transfer under `--max-blob-mb` — and mirrors the
-    /// node's own `BACKGROUND_FILL_HARD_CAP`.
+    /// generous — far above any honest transfer under `--max-blob-mb`.
     ///
     /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
     /// rejects a zero, so the cap is ALWAYS present on this path; the `Option` this used to

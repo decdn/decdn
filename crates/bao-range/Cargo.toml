@@ -1,16 +1,28 @@
 [package]
 name = "decdn-bao-range"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Leaf crate: iroh-blobs-free bao verified-range helpers (chunk-group alignment, encoded-size, range encode/verify) shared by decdn-cache (serve/import) and decdn-client-pull (receive). Depends only on bao-tree so the CLI's iroh-blobs-free invariant (#578) holds."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 bao-tree = { workspace = true }
 bytes = { workspace = true }
 positioned-io = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# Exposes the shared `RangedStore` conformance suite (`conformance::run_all`)
+# for downstream test suites. Gated behind a feature rather than `#[cfg(test)]`
+# because a cross-crate `cfg(test)` does not reach a dependency's test builds;
+# enabled by downstream crates via `dev-dependencies`.
+test-util = []
 
 [lints]
 workspace = true

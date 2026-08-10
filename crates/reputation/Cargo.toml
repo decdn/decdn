@@ -1,15 +1,22 @@
 [package]
 name = "decdn-reputation"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Gossip-based reputation scoring for deCDN nodes"
+description = "Local per-peer reputation scoring for deCDN nodes (ADR 008): EWMA over observed outcomes, with no gossip aggregation"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 decdn-protocol = { workspace = true }
+# `iroh` for `PublicKey` (the NodeId scores are keyed by). No `iroh-gossip`:
+# scoring is local-only (ADR 008), and the dependency was left over from the
+# removed network tier.
 iroh = { workspace = true }
-iroh-gossip = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

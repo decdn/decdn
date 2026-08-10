@@ -3,10 +3,17 @@
 //! Each [`KnownChain`] pairs a small hand-written descriptor (name, label,
 //! chain id, public RPC endpoint) with the on-disk deployment manifest embedded
 //! at compile time. Contract addresses are never written here — they are read
-//! from the manifest, the same `contracts/deployments/<chainId>.json` the
-//! Foundry `DeployProtocol` script writes. A redeploy that rewrites that file
-//! therefore flows into `config init` automatically, with no hand-syncing and
-//! no fourth copy of the addresses to drift.
+//! from the manifest the Foundry `DeployProtocol` script writes, so a redeploy
+//! flows into `config init` automatically with no addresses to hand-sync.
+//!
+//! The manifest is embedded from `crates/cli/deployments/`, not from
+//! `contracts/deployments/` where the deploy script writes it, because
+//! `include_str!` may not escape the package: a path outside the crate is
+//! unreachable from the published `.crate` and `cargo install decdn-cli` would
+//! fail to build. `contracts/deployments/` stays canonical and this is a
+//! byte-identical mirror — the `deployment-manifest-mirror` pre-commit hook and
+//! its CI counterpart `cmp` the two and fail on any drift, so re-copy the file
+//! as part of a redeploy.
 
 use std::collections::BTreeMap;
 
@@ -30,18 +37,16 @@ pub struct KnownChain {
     manifest_json: &'static str,
 }
 
-/// Every chain `config init` can target. Adding an entry here (plus its
-/// manifest under `contracts/deployments/`) is all it takes to offer a new
-/// network; today there is exactly one, so `--chain` may be omitted entirely.
+/// Every chain `config init` can target. Adding an entry here — plus its
+/// manifest under `contracts/deployments/` and a copy of that file in
+/// `crates/cli/deployments/` — is all it takes to offer a new network; today
+/// there is exactly one, so `--chain` may be omitted entirely.
 pub const KNOWN_CHAINS: &[KnownChain] = &[KnownChain {
     name: "arbitrum-sepolia",
     label: "Arbitrum Sepolia testnet",
     chain_id: 421_614,
     public_rpc: "https://sepolia-rollup.arbitrum.io/rpc",
-    manifest_json: include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../contracts/deployments/421614.json"
-    )),
+    manifest_json: include_str!("../deployments/421614.json"),
 }];
 
 /// Contract addresses read from a chain's manifest, mapped to `[blockchain]`

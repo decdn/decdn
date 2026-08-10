@@ -7,13 +7,13 @@
 //! `stream_fetch` verifies the delivery `slash_sig`
 //! recovers *to* it. This module resolves that binding from the same
 //! `CapacityBond` data [`crate::dht::chain_staker_set::ChainStakerSet`] already
-//! reads — `getActiveNodes()` returns `NodeInfo { nodeId, ethAddress, .. }` and
+//! reads — `getRegisteredNodes()` returns `NodeInfo { nodeId, ethAddress, .. }` and
 //! `NodeRegistered(nodeId, ethAddress, ..)` carries both — so no new contract
 //! surface is needed.
 //!
 //! This module owns the **projection** only. Because both views come from one
 //! contract, [`crate::dht::capacity_bond_registry`] does a single
-//! `getActiveNodes` enumeration and runs a single `eth_getLogs` loop feeding
+//! `getRegisteredNodes` enumeration and runs a single `eth_getLogs` loop feeding
 //! both, building this via `ChainNodeAddressDirectory::from_parts` (#1110).
 //!
 //! The binding is set at `registerNode` and cleared at `deregisterNode`; it is

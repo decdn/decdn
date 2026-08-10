@@ -9,6 +9,12 @@ the preimage of the on-chain `termsHash`: the registration clickwrap records
 guidance only. Keep all developer notes here, never inside `TERMS.md`, so that
 editing guidance can never perturb the terms hash.
 
+Both files live in `crates/cli/` rather than at the repo root because
+`crates/cli/src/commands/terms.rs` embeds `TERMS.md` with `include_str!`, which
+cannot reach outside its own package — from the repo root the path would be
+unreachable in the published `.crate` and `cargo install decdn-cli` would fail
+to build.
+
 ## Rules
 
 - **Any byte change to `TERMS.md` changes the hash.** A new version becomes
@@ -18,6 +24,8 @@ editing guidance can never perturb the terms hash.
 - **Do not paraphrase the terms in code or docs** — reference them by version.
 - Bump the `Version:` line in `TERMS.md` for any substantive change so the
   accepted version is self-identifying.
-- The embedding/clickwrap wiring (display + `keccak256` + signature) lands with
-  the node-software change; until then `TERMS.md` is the design-of-record text,
-  not yet wired into a running binary.
+- The embedding/clickwrap wiring (display + `keccak256` + acceptance) lives in
+  `crates/cli/src/commands/terms.rs`. A `#[test]` there locks the embedded hash
+  to a literal, so any edit to `TERMS.md` fails the test suite until that literal
+  is updated too — deliberately, since a terms change is a gated event that must
+  be paired with a governance `setCurrentTermsHash` bump.

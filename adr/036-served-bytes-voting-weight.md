@@ -1,18 +1,16 @@
 # ADR 036: Served-Bytes Voting Weight
 
 **Date:** 2026-05-27
-**Status:** Draft
+**Status:** Accepted
 
-## Amendment (2026-06-13, #847): window ends at the last fully-elapsed epoch
+## Vote window
 
-The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter.routeSettlement` only ever increments the *current* epoch's bucket, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violated the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could settle bytes mid-vote and raise its own already-counted weight, and two voters casting at different times saw different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — restores determinism with no change to `FeeRouter`.
+The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter.routeSettlement` only ever increments the *current* epoch's bucket, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violates the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could settle bytes mid-vote and raise its own already-counted weight, and two voters casting at different times would see different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — keeps voting deterministic with no change to `FeeRouter`.
 
-Consequences of the shift, both bounded by one epoch (≤ 1 week):
+Two effects follow, both bounded by one epoch (≤ 1 week):
 
-- **Served-byte / quorum lag.** The current in-progress epoch's bytes are excluded from vote weight and from the quorum denominator until that epoch elapses. This is the direct cure for the defect, not an incidental cost.
-- **Slash-immediacy lag for same-epoch slashes.** A slash stamped in the in-progress epoch no longer zeroes a proposal snapshotted earlier in that same epoch; it takes effect once the epoch elapses (the slash window tracks the byte window — both end at `endEpoch(t)`). Slashes from prior epochs zero immediately as before.
-
-The formula, slashing-zero-out bound, and pseudocode below are written in their amended (`endEpoch(t)`) form.
+- **Served-byte / quorum lag.** The current in-progress epoch's bytes are excluded from vote weight and from the quorum denominator until that epoch elapses.
+- **Slash-immediacy lag for same-epoch slashes.** A slash stamped in the in-progress epoch does not zero a proposal snapshotted earlier in that same epoch; it takes effect once the epoch elapses (the slash window tracks the byte window — both end at `endEpoch(t)`). Slashes from prior epochs zero immediately.
 
 ## Context
 
@@ -44,7 +42,7 @@ age_ramp(op, t) = min(
 )
 
 epoch(t)    = uint64(t / EPOCH_LENGTH)                  // EPOCH_LENGTH = 1 week, immutable
-endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1          // last fully-elapsed epoch (#847); ∅ ⇒ weight 0
+endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1          // last fully-elapsed epoch; ∅ ⇒ weight 0
 N           = windowEpochs                               // default 13 (~1 quarter)
 ```
 
@@ -59,7 +57,7 @@ Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, 
 
 ### Slashing zero-out
 
-On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp) + 1` (the `+1` reserves 0 for "unslashed" so an epoch-0 slash is not collapsed with the sentinel; the getter returns this raw, and `_getVotes` decodes `slashed = slashStamp - 1` before comparing). The Governor's `_getVotes(op, t)` returns zero whenever `endEpoch(t) - N + 1 <= slashed <= endEpoch(t)` — i.e. whenever the slash falls inside the trailing window of fully-elapsed epochs (#847). A slash in the in-progress epoch `epoch(t)` is above `endEpoch(t)`, so it zeroes the vote only once that epoch elapses (it tracks the byte window). Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
+On any slash invocation (`CapacityBond.slash`), `CapacityBond` stamps `slashedAtEpoch[op] = epoch(block.timestamp) + 1` (the `+1` reserves 0 for "unslashed" so an epoch-0 slash is not collapsed with the sentinel; the getter returns this raw, and `_getVotes` decodes `slashed = slashStamp - 1` before comparing). The Governor's `_getVotes(op, t)` returns zero whenever `endEpoch(t) - N + 1 <= slashed <= endEpoch(t)` — i.e. whenever the slash falls inside the trailing window of fully-elapsed epochs. A slash in the in-progress epoch `epoch(t)` is above `endEpoch(t)`, so it zeroes the vote only once that epoch elapses (it tracks the byte window). Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
 
 On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path (the path that determines the operator was wrongly slashed), `SlashAppeal` calls `CapacityBond.settleAppealGranted`, which refunds the escrowed TOKEN and **recomputes** `slashedAtEpoch[op]` (the internal `_recomputeSlashedAtEpoch`), clearing it to zero only when no slash stands. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the field stamped — the slash stands.
 
@@ -90,7 +88,7 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 
 ```solidity
 function _getVotes(address op, uint256 timepoint, bytes memory) override returns (uint256) {
-    // endEpoch is the last fully-elapsed epoch; cur == 0 ⇒ no window yet (#847).
+    // endEpoch is the last fully-elapsed epoch; cur == 0 ⇒ no window yet.
     uint64 cur = uint64(timepoint / EPOCH_LENGTH);
     if (cur == 0) return 0;
     uint64 endEpoch = cur - 1;
@@ -99,7 +97,7 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
     // (so an epoch-0 slash isn't collapsed with the sentinel). Decode the +1
     // before comparing. The decoded epoch is bounded above by `endEpoch` so a
     // future / in-progress-epoch slash does not retroactively zero an earlier
-    // snapshot (#847: the slash window tracks the byte window).
+    // snapshot (the slash window tracks the byte window).
     uint64 slashStamp = capacityBond.slashedAtEpoch(op);
     if (slashStamp != 0) {
         uint64 slashed = slashStamp - 1;
@@ -138,7 +136,7 @@ Cross-parameter invariant (informational, not enforced at the contract layer): `
 
 Bytes-weighted voting is gameable by operators self-paying for delivery. An attacker who controls a client wallet pays themselves to serve bytes; under the three-bucket FeeRouter split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), 60% of the per-byte USDC fee returns to the operator. The remaining 40% (30% burn + 10% treasury) is real USDC the attacker pays into the protocol with no offsetting revenue.
 
-This argument **depends on a minimum price-per-byte being enforced** — otherwise the attacker pays ~0 USDC per byte and the 40% non-refunded cost vanishes. That floor is the `PaymentChannel.deliveryFloor` settlement check ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement), #846): `_advanceClaimWatermark` rejects any voucher whose cumulative `amount / bytesDelivered` is below `deliveryFloor`, so each stamped byte costs `>= deliveryFloor` real USDC. Before that check the attack was near-free (`amount = 1` wei for `bytesDelivered = 2^200`), which the cost estimate below silently assumed away.
+This argument **depends on a minimum price-per-byte being enforced** — otherwise the attacker pays ~0 USDC per byte and the 40% non-refunded cost vanishes. That floor is the `PaymentChannel.deliveryFloor` settlement check ([ADR 003 § Rate-floor enforcement](003-payments.md#rate-floor-enforcement)): `_advanceClaimWatermark` rejects any voucher whose cumulative `amount / bytesDelivered` is below `deliveryFloor`, so each stamped byte costs `>= deliveryFloor` real USDC. Without that floor the attack is near-free (`amount = 1` wei for `bytesDelivered = 2^200`), which the cost estimate below assumes away.
 
 **Attack cost to reach the 5% cap from zero.** Let `R` be the network-wide USDC revenue per epoch. An attacker holding `cap` share of the trailing-window bytes generates `R × cap × N` revenue across the window (assuming the attacker pays the *market* per-byte rate). Wash-trading cost is `0.40 × R × cap × N` in attacker-paid USDC across the window. At `R = $25K/week`, `cap = 5%`, `N = 13`: the attacker burns `0.40 × $25K × 0.05 × 13 ≈ $6,500` per quarter to hold full 5% vote.
 

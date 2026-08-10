@@ -55,7 +55,7 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
 /// `NodeId` set or empty.
 ///
 /// The runtime wires the chain-backed `ChainStakerSet` (reads
-/// `CapacityBond.getActiveNodes()` once at startup, then follows the registry's
+/// `CapacityBond.getRegisteredNodes()` once at startup, then follows the registry's
 /// membership events via the shared `eth_getLogs` poll) — see
 /// `capacity_bond_registry::bootstrap`, #1110. This impl is what tests and
 /// explicit operator-supplied sets use: construct via [`Self::new`] with a known

@@ -79,7 +79,10 @@ use crate::selection::Candidate;
 /// a settle wait, both of which land on a client that is waiting.
 ///
 /// [`MAX_TOPUP_ATTEMPTS`]: decdn_client_pull::MAX_TOPUP_ATTEMPTS
-const MAX_REACTIVE_TOPUPS: u32 = 1;
+///
+/// `pub(crate)` so [`super::funder::NodeFunder`] reports the same bound through
+/// `Funder::max_topups` — one source of the #1530/#1603 budget, not two.
+pub(crate) const MAX_REACTIVE_TOPUPS: u32 = 1;
 
 /// One step of the post-top-up settle wait. Small enough that the common case
 /// (the upstream's watcher was already close to its next poll) costs little.
@@ -266,7 +269,10 @@ fn next_voucher_cost(interval_bytes: u64, rate_per_mb: u64) -> U256 {
 ///
 /// `saturating_sub` so an already-past expiry reads as `0` remaining (< any positive
 /// margin ⇒ near expiry), never wrapping.
-const fn near_expiry(expires_at: u64, now: u64, min_ttl: Duration) -> bool {
+///
+/// `pub(crate)` so [`super::funder::NodeFunder`] reuses this exact rule instead of
+/// re-deriving the #1603 margin arithmetic on its own — single source of truth.
+pub(crate) const fn near_expiry(expires_at: u64, now: u64, min_ttl: Duration) -> bool {
     if expires_at == NEVER_EXPIRES || min_ttl.is_zero() {
         return false;
     }
@@ -685,6 +691,9 @@ async fn open_leg(
         // unbounded here.
         effective_rate_ceiling(target.candidate.rate_per_mb, deps.config.max_rate_per_mb),
         deadlines,
+        // Whole-tail fetch; a bounded gap request is the gap-driven driver's
+        // (#1608) `source::PeerSource`, not this resume loop.
+        0,
     )
     .await
 }
