@@ -43,12 +43,14 @@
 
 mod admit_store;
 mod funder;
+mod pull_leg;
 mod resume;
 
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use admit_store::NodeAdmitStore;
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use funder::NodeFunder;
+pub(crate) use pull_leg::run_pull_leg;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -474,6 +476,16 @@ impl NodeOrigin {
         if self.deps.set(deps).is_err() {
             warn!("NodeOrigin provisioned more than once; keeping the first dependency set");
         }
+    }
+
+    /// A clone of the write-once dependency handle, for the off-task serve-miss pull
+    /// leg (#1621 B2 part 2): the pull runs on its OWN current-thread runtime (its
+    /// `drive` is non-`Send`, which the iroh `ProtocolHandler::accept` bound forbids
+    /// on the serve task), so it cannot borrow `&self`. It captures this `Arc` and
+    /// reads the deps via `get()` on the pull thread — the same handle
+    /// `SettleOnDrop::Shared` already carries across a drop.
+    pub(crate) fn deps_arc(&self) -> Arc<OnceLock<NodeOriginDeps>> {
+        Arc::clone(&self.deps)
     }
 
     /// Open a window-paced progressive pull for `hash` (#856), the streaming

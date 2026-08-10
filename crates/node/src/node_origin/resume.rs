@@ -86,7 +86,11 @@ pub(crate) const MAX_REACTIVE_TOPUPS: u32 = 1;
 
 /// One step of the post-top-up settle wait. Small enough that the common case
 /// (the upstream's watcher was already close to its next poll) costs little.
-const SETTLE_POLL_STEP: Duration = Duration::from_millis(500);
+///
+/// `pub(crate)` so the gap-driven pull leg ([`super::pull_leg::run_pull_leg`]) reuses
+/// it as its [`decdn_client_pull::driver::DriveConfig`] `settle_backoff`, keeping one source
+/// of the node's settle cadence.
+pub(crate) const SETTLE_POLL_STEP: Duration = Duration::from_millis(500);
 
 /// How many [`SETTLE_POLL_STEP`]s to spend waiting for the UPSTREAM's chain watcher
 /// to observe our just-landed `ChannelToppedUp` before treating its refusal as real.
@@ -113,7 +117,7 @@ const SETTLE_POLL_STEP: Duration = Duration::from_millis(500);
 /// (dial, signed request, verified response), so the true wall clock is
 /// `steps × (sleep + open RTT)`. Both halves are charged to `paid_wait` and excluded
 /// from the peer's delivery-speed score — none of it is the upstream serving slowly.
-fn settle_wait_budget(event_poll_interval: Duration) -> u32 {
+pub(crate) fn settle_wait_budget(event_poll_interval: Duration) -> u32 {
     let budget = event_poll_interval.saturating_mul(2).as_millis();
     let step = SETTLE_POLL_STEP.as_millis().max(1);
     u32::try_from(budget / step)

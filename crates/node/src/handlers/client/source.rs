@@ -1,50 +1,37 @@
-//! `ProgressiveSource` (#1130 Task 4): an enum wrapper over the two kinds of
-//! window-paced bao source the `cdn/client/v1` serve loop (#856) can drive —
-//! an upstream node-to-node pull ([`NodeProgressivePull`]) or a local
-//! stream-while-store pull from an already-held outboard
-//! ([`decdn_cache::LocalOutboardPull`], Task 3). Task 5 retypes the window
-//! serve loop to this enum so the same pump/finish/abandon call sites work
-//! for both.
+//! `ProgressiveSource` (#1130 Task 4): the window-paced bao source the retained
+//! fused `window_forward_loop` (`serve_via_local_outboard`, #1130) drives — a
+//! local stream-while-store pull from an already-held outboard
+//! ([`decdn_cache::LocalOutboardPull`], Task 3).
 //!
-//! [`LocalOutboardPull`] has no upstream provider to score, so its
-//! `finish`/`abandon`/`abandon_corrupt` carry no [`TeeVerdict`] / cause — the
-//! dispatch below simply drops those arguments on that arm.
+//! The upstream node-to-node variant (`NodeProgressivePull`) was retired here in
+//! #1621 B2 part 2: the node→node serve-miss now runs the gap-driven pull leg
+//! ([`crate::node_origin::run_pull_leg`]) instead of the fused loop, so
+//! only the local twin still drives this enum. [`LocalOutboardPull`] has no upstream
+//! provider to score, so its `finish`/`abandon`/`abandon_corrupt` carry no
+//! [`TeeVerdict`] / cause — the dispatch below simply drops those arguments.
 
 use bytes::Bytes;
 use decdn_cache::LocalOutboardPull;
 
-use crate::node_origin::{NodeProgressivePull, TeeVerdict};
+use crate::node_origin::TeeVerdict;
 
-/// A live window-paced bao source: either an upstream node-to-node pull or a
-/// local stream-while-store pull. See the module docs for the dispatch
-/// rationale.
-///
-/// `NodeProgressivePull` is the larger variant (it carries the settlement
-/// guard, watermark bookkeeping, and channel context a paid upstream pull
-/// needs); `LocalOutboardPull` is a thin bridge over two `mpsc` channels.
-/// Not boxed: this is the common, per-request path (every window pull-through
-/// fill constructs one), and boxing would still allocate on that path — it
-/// would just move the cost from "larger enum" to "one more heap alloc" for a
-/// same-sized value.
-#[allow(clippy::large_enum_variant)]
+/// A live window-paced bao source: a local stream-while-store pull. Retained for
+/// the [`ClientHandler::serve_via_local_outboard`](super::ClientHandler) twin, whose
+/// fused loop drives the same pump/finish/abandon call sites the node→node path used
+/// before it moved to the decoupled pull leg (#1621 B2 part 2).
 #[derive(Debug)]
 pub(crate) enum ProgressiveSource {
-    /// An upstream node's window-paced pull (#856): paid, scored, and
-    /// watermarked.
-    Node(NodeProgressivePull),
     /// A local pull streaming an already-held origin's plaintext through the
     /// bao encoder (#1130 Task 3): no upstream to pay or score.
     LocalOutboard(LocalOutboardPull),
 }
 
 impl ProgressiveSource {
-    /// The promised **wire** byte count of this pull, delegated to whichever
-    /// variant is live. See [`NodeProgressivePull::expected_wire_bytes`] /
+    /// The promised **wire** byte count of this pull. See
     /// [`LocalOutboardPull::expected_wire_bytes`].
     #[must_use]
     pub const fn expected_wire_bytes(&self) -> u64 {
         match self {
-            Self::Node(pull) => pull.expected_wire_bytes(),
             Self::LocalOutboard(pull) => pull.expected_wire_bytes(),
         }
     }
@@ -56,46 +43,39 @@ impl ProgressiveSource {
     /// Propagates the live variant's `next_chunk` error.
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         match self {
-            Self::Node(pull) => pull.next_chunk().await,
             Self::LocalOutboard(pull) => pull.next_chunk().await,
         }
     }
 
-    /// Finalize a cleanly-completed pull. The `Node` arm passes `tee_verdict`
-    /// through for reputation scoring ([`NodeProgressivePull::finish`]); the
-    /// `LocalOutboard` arm ignores it — a local pull has no upstream
-    /// provider to score, and its own encoder is the integrity check
+    /// Finalize a cleanly-completed pull. `_tee_verdict` is ignored — a local pull
+    /// has no upstream provider to score, and its own encoder is the integrity check
     /// ([`LocalOutboardPull::finish`]).
     ///
     /// # Errors
     ///
     /// Propagates the live variant's `finish` error.
-    pub async fn finish(self, tee_verdict: TeeVerdict) -> anyhow::Result<()> {
+    pub async fn finish(self, _tee_verdict: TeeVerdict) -> anyhow::Result<()> {
+        // A local pull has no upstream provider to score; its own encoder is the
+        // integrity check ([`LocalOutboardPull::finish`]), so the verdict is dropped.
         match self {
-            Self::Node(pull) => pull.finish(tee_verdict).await,
             Self::LocalOutboard(pull) => pull.finish().await,
         }
     }
 
     /// Abandon the pull (downstream dropped, underpaid, or a `next_chunk`
-    /// errored). The `Node` arm scores the provider when `cause` is
-    /// supplied ([`NodeProgressivePull::abandon`]); the `LocalOutboard` arm
-    /// ignores `cause` — there is no provider to score
-    /// ([`LocalOutboardPull::abandon`]).
-    pub fn abandon(self, cause: Option<&anyhow::Error>) {
+    /// errored). `_cause` is ignored — the local twin has no upstream provider to
+    /// score ([`LocalOutboardPull::abandon`]).
+    pub fn abandon(self, _cause: Option<&anyhow::Error>) {
+        // No upstream provider to score on the local twin — `cause` is dropped.
         match self {
-            Self::Node(pull) => pull.abandon(cause),
             Self::LocalOutboard(pull) => pull.abandon(),
         }
     }
 
     /// Abandon the pull because the teed bao stream failed verification
-    /// mid-fill, delegated to whichever variant is live. See
-    /// [`NodeProgressivePull::abandon_corrupt`] /
-    /// [`LocalOutboardPull::abandon_corrupt`].
+    /// mid-fill. See [`LocalOutboardPull::abandon_corrupt`].
     pub fn abandon_corrupt(self) {
         match self {
-            Self::Node(pull) => pull.abandon_corrupt(),
             Self::LocalOutboard(pull) => pull.abandon_corrupt(),
         }
     }

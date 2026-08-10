@@ -72,6 +72,24 @@ const CHUNK_BYTES: u64 = 1024;
 /// the pull leg's discover+open latency dominates in practice.
 const WATCH_OPEN_RETRY: Duration = Duration::from_millis(25);
 
+/// How long the gap wait keeps re-checking presence AFTER the pull leg reported
+/// success before it concludes a genuine hole.
+///
+/// A `pull_result` of `Ok` means every requested byte is authoritatively in the
+/// cache — the pull leg admitted and verified it before finishing. But the store's
+/// present-range view can lag the final chunk-group commit by a moment (the
+/// iroh-blobs present/observe gotcha): `present_ranges` is answered by the blob
+/// store actor, and the query racing `pull_ended` can be served just before the last
+/// commit is applied. Failing on that first transient miss aborts a fully-delivered
+/// blob with a spurious "still missing". So re-check for this long, converging as the
+/// actor applies the commit (microseconds in practice); only a real inconsistency (a
+/// drive that reported success without filling) still fails, at the cap.
+const PULL_OK_PRESENCE_CAP: Duration = Duration::from_secs(5);
+/// Poll step for [`PULL_OK_PRESENCE_CAP`]. Short enough to add no visible latency to
+/// the common case (presence is usually true within a poll or two), long enough not
+/// to spin the store actor.
+const PULL_OK_PRESENCE_POLL: Duration = Duration::from_millis(5);
+
 /// One ordered piece of the requested range against a present-range snapshot:
 /// either bytes the store holds now, or a gap the pull leg has yet to fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +108,18 @@ fn contiguous_byte_ranges(ranges: &ChunkRanges, total: u64) -> Vec<(u64, u64)> {
     let boundaries = ranges.boundaries();
     let mut out = Vec::new();
     let mut it = boundaries.iter();
-    while let (Some(a), Some(b)) = (it.next(), it.next()) {
+    while let Some(a) = it.next() {
         let start = a.0.saturating_mul(CHUNK_BYTES).min(total);
-        let end = b.0.saturating_mul(CHUNK_BYTES).min(total);
+        // A boundary with no matching close is an OPEN-ENDED present range `[a, ∞)`:
+        // a fully-present blob observes as `ChunkRanges{0..}`, a SINGLE (unpaired)
+        // boundary. Pairing `(a, b)` alone would silently drop that final unbounded
+        // run — reporting a complete blob as entirely absent, which stalls the serve
+        // on its own cached bytes. Clamp the open end to `total` (the ragged final
+        // group) so the completed tail is recognised as present.
+        let end = match it.next() {
+            Some(b) => b.0.saturating_mul(CHUNK_BYTES).min(total),
+            None => total,
+        };
         if end > start {
             out.push((start, end - start));
         }
@@ -342,16 +369,11 @@ impl<'a> SpanProducer<'a> {
                         "upstream pull failed before filling content offset {g} of the requested \
                          range; cannot deliver the gap: {msg}"
                     )),
-                    Ok(()) => {
-                        if self.present_covers(g).await? {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "upstream pull reported success but content offset {g} of the \
-                                 requested range is still missing"
-                            ))
-                        }
-                    }
+                    // The pull succeeded, so byte `g` is authoritatively cached. Re-check
+                    // presence with a bounded wait rather than failing on a first transient
+                    // miss — `present_ranges` can lag the pull's final commit by a moment
+                    // (see [`PULL_OK_PRESENCE_CAP`]). Only a genuine hole fails, at the cap.
+                    Ok(()) => self.await_present_after_pull(g).await,
                 };
             }
 
@@ -402,9 +424,39 @@ impl<'a> SpanProducer<'a> {
     }
 
     /// Does the store currently hold content byte `g`?
-    async fn present_covers(&self, g: u64) -> anyhow::Result<bool> {
+    ///
+    /// Takes `&mut self` (though it mutates nothing) so the future holds a
+    /// `&mut SpanProducer` rather than a `&SpanProducer` across the `present_ranges`
+    /// await: `SpanProducer` carries `Send`-but-not-`Sync` cache streams
+    /// ([`EncodeStream`] / [`PresentRangeWatch`]), so `&SpanProducer` is not `Send`
+    /// and would make the whole serve future non-`Send` — which the iroh
+    /// `ProtocolHandler::accept` bound forbids. `&mut SpanProducer` only needs
+    /// `SpanProducer: Send`, which holds.
+    async fn present_covers(&mut self, g: u64) -> anyhow::Result<bool> {
         let present = self.store.present_ranges().await?;
         Ok(byte_present(&present, g, self.total))
+    }
+
+    /// Confirm byte `g` is present after the pull leg reported success, tolerating
+    /// the store's present-range view lagging the pull's final commit
+    /// ([`PULL_OK_PRESENCE_CAP`]). Returns once `g` is present; fails only if it is
+    /// still missing at the cap — a genuine hole (a drive that reported success
+    /// without filling the range), which must not hang the serve.
+    async fn await_present_after_pull(&mut self, g: u64) -> anyhow::Result<()> {
+        let mut waited = Duration::ZERO;
+        loop {
+            if self.present_covers(g).await? {
+                return Ok(());
+            }
+            if waited >= PULL_OK_PRESENCE_CAP {
+                return Err(anyhow::anyhow!(
+                    "upstream pull reported success but content offset {g} of the requested \
+                     range is still missing {PULL_OK_PRESENCE_CAP:?} after completion"
+                ));
+            }
+            tokio::time::sleep(PULL_OK_PRESENCE_POLL).await;
+            waited = waited.saturating_add(PULL_OK_PRESENCE_POLL);
+        }
     }
 }
 
@@ -516,6 +568,12 @@ impl ClientHandler {
         let mut next_chunk = producer.next_frame().await?;
 
         loop {
+            // Progress trackers for the no-progress guard below (re-homed from
+            // `window_forward_loop`'s livelock guard). An iteration that delivers no
+            // new byte AND clears no voucher has stalled — the client stopped paying.
+            let delivered_at_iter_start = delivered;
+            let mut committed_this_iter = 0usize;
+
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
             // frame that crosses the threshold. ---
@@ -578,6 +636,7 @@ impl ClientHandler {
                         &deltas,
                     )
                     .await?;
+                committed_this_iter = outcome.committed;
                 // Advance `paid` by exactly the committed prefix's WIRE bytes.
                 let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
                 paid = paid.saturating_add(paid_bytes);
@@ -631,6 +690,22 @@ impl ClientHandler {
 
             if done {
                 break;
+            }
+
+            // No-progress guard (re-homed from `window_forward_loop`'s livelock
+            // guard, window.rs): an iteration that delivered no new byte (delivery
+            // blocked on the credit window, waiting for payment) AND cleared no
+            // voucher (the client stopped paying — `collect_voucher_batch` timed out
+            // with nothing committed) cannot make progress. The client has abandoned
+            // (#856 drop-after-fill): stop cleanly. The caller then cancels the pull
+            // leg, which bounds the upstream spend (#1610) and persists the buyer
+            // watermark (#852). Any delivery or payment this iteration resets it, so
+            // an honest-but-slow client (patience = one `collect_voucher_batch`
+            // read timeout) is never dropped early.
+            let made_delivery_progress = delivered > delivered_at_iter_start;
+            let made_payment_progress = committed_this_iter > 0;
+            if !made_delivery_progress && !made_payment_progress {
+                return Ok(());
             }
         }
 

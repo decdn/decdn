@@ -8604,8 +8604,15 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
         u64::try_from(*bytes).unwrap_or(u64::MAX)
     });
     let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
+    // The decoupled pull leg (#1621 B2) paces on the CONTENT frontier
+    // (`WindowPacer`, ADR 037), so its upstream WIRE spend is `one_window` of content
+    // plus the interleaved bao proof over that window (ADR 038) — a fraction under
+    // 0.5%, well within one chunk group. The fused loop bounded WIRE directly (a
+    // ~2-chunk overshoot); the group tolerance is the #1644-review bound the anvil
+    // proof (Task 14) also uses.
+    let group = 16 * (CHUNK_SIZE as u64);
     anyhow::ensure!(
-        upstream_bytes <= one_window + 2 * (CHUNK_SIZE as u64),
+        upstream_bytes <= one_window + group,
         "B's upstream spend ({upstream_bytes}) must be bounded to ~one window ({one_window}), \
          not the whole {total_bytes}-byte blob"
     );

@@ -1,7 +1,10 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 //! Bodies split from `mod.rs` (#1254).
 
+use std::sync::atomic::AtomicU64;
+
 use alloy::primitives::U256;
+use tokio::sync::Notify;
 
 use super::source::ProgressiveSource;
 use super::{
@@ -166,30 +169,23 @@ impl ClientHandler {
                 .await;
         }
 
-        // (3) Open the progressive upstream pull, bounded by the pull-through
-        // deadline so a slow/absent upstream can't pin the stream.
+        // (3) Discover an upstream, open a channel, and read the blob header — ONE
+        // discovery shared by both legs, with open-time candidate fallback preserved
+        // (`open_pull_leg`). Bounded by the pull-through deadline so a slow/absent
+        // upstream can't pin the stream. The namespace (ADR 005 §Namespace routing)
+        // drives the origin-directory fallback inside `discover` on a total DHT miss
+        // and is threaded onto the node-to-node leg so a directory-discovered cold
+        // origin's own pull-through gate resolves (#1401); big-endian to the on-chain
+        // `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
-        // The client's namespace routing hint (ADR 005 §Namespace routing). On this
-        // progressive serve path it drives the origin-directory fallback inside the
-        // pull's `discover` on a total DHT miss, and is threaded onto the resulting
-        // node-to-node leg so a directory-discovered cold origin's own pull-through
-        // gate resolves (#1401). (The pull-through authorized-origin gate in
-        // `dispatch` also reads `req.namespace_id`, upstream of this path.)
-        // `NO_NAMESPACE` (0) → no authorized origins (ADR 002 §Namespace 0).
-        // Converted big-endian to the on-chain `uint256` shape the directory keys on.
         let namespace_id = U256::from_be_bytes(req.namespace_id);
-        let (header, pull) =
-            match tokio::time::timeout(deadline, origin.open_progressive_pull(hash, namespace_id))
-                .await
-            {
-                Ok(Ok(pair)) => pair,
-                // No upstream provider could be opened. That is a clean miss on THIS
-                // tier — but if an earlier tier faulted, the request as a whole is
-                // still unresolved-by-fault, so honor that (#1129). The pull reports
-                // its OWN fault the same way (#1560): a walk that failed on a broken
-                // buyer key of ours is not evidence the blob is absent, so it joins
-                // the latch rather than signing a `NotFound` for content that may
-                // well exist upstream.
+        let target =
+            match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id)).await {
+                Ok(Ok(target)) => target,
+                // No upstream provider could be opened — a clean miss on THIS tier, or
+                // a latched earlier-tier / local fault honored per #1129 / #1560 (a
+                // walk that failed on our own broken buyer key is not evidence the blob
+                // is absent).
                 Ok(Err(miss)) => {
                     tee.abandon();
                     let reason = FillOutcome::miss_reason(fault_seen || miss.is_local_fault());
@@ -206,20 +202,20 @@ impl ClientHandler {
                         .await;
                 }
             };
-        let total_bytes = header.total_bytes;
+        let total_bytes = target.total_bytes;
 
-        // (4) Size gate on the upstream-claimed total.
+        // (4) Size gate on the upstream-claimed total. (`open_pull_leg` already refuses
+        // an oversized header via its `max_blob_size_bytes`; this is the belt-and-braces
+        // wire-reason parity with the old path.)
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            pull.abandon(None);
             tee.abandon();
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
         }
 
-        // (5) Voucher-interval negotiation (ADR 003), then sign + send the
-        // response up front — it commits to `total_bytes`, now known from the
-        // upstream header.
+        // (5) Voucher-interval negotiation (ADR 003), then sign + send the response up
+        // front — it commits to `total_bytes`, now known from the header handshake.
         let interval_mb = match ext.voucher_interval_mb {
             Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
             None => self.voucher_interval_mb,
@@ -237,33 +233,141 @@ impl ClientHandler {
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
-        // Frame the tee's verifying decoder now that the whole-blob content size
-        // is known from the upstream header (ADR 038) — the forwarded wire is
-        // header-less. `total_bytes` is the CONTENT size; the tee decodes the
-        // interleaved bao back to that many plaintext bytes.
-        let tee = tee.begin(total_bytes);
+        // (6) The two decoupled legs (ADR 037, #1621 B2 part 2, Strategy B). The SERVE
+        // leg runs HERE on the accept task — it MUST be `Send` (the iroh
+        // `ProtocolHandler::accept` bound), and it is (its cache streams are `Send`).
+        // The PULL leg's `drive` is non-`Send` (its `IngestStore` fill is, deliberately,
+        // Task 6), so it runs OFF this task on a dedicated current-thread runtime,
+        // coordinating only through `Send + Sync` shared state:
+        //   - `served_paid` — the client's PAID content frontier; the serve leg stores
+        //     it, the pull leg's `WindowPacer` reads it to bound `pulled − served_paid`.
+        //   - `served_paid_advanced` — notified on each advance, so a parked pull
+        //     re-decides exactly when payment clears.
+        //   - `pull_ended` + `pull_result` — the pull leg records its terminal outcome
+        //     then fires the notify; the serve leg races it against the present-range
+        //     watch so a pull that could not fill a gap fails the serve (no hang).
+        // `Notify` wakers + atomics are runtime-agnostic, so this coordination crosses
+        // the two runtimes safely; the cache-store actor and iroh endpoint are reached
+        // through their own channels. When the serve leg returns, the token is cancelled
+        // and the pull thread JOINED — never detached: an orphan pull would keep paying
+        // upstream for a blob no client waits on (#1610).
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // The pacing window: at least `pull_ahead_bytes` (the ADR 037 upstream exposure
+        // knob), the downstream `credit_window` (#1477), and one interval — the exact
+        // bound the fused `window_forward_loop` computed.
+        let window = self
+            .pull_ahead_bytes
+            .as_ref()
+            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
+            .max(interval_bytes)
+            .max(self.credit_window(interval_bytes));
 
-        // This open path is node-only for now (#1130 Task 6 wires the local
-        // stream-while-store arm); wrap here so the loop below can drive
-        // either source uniformly.
-        let pull = ProgressiveSource::Node(pull);
+        let served_paid = Arc::new(AtomicU64::new(0));
+        let served_paid_advanced = Arc::new(Notify::new());
+        let pull_ended = Arc::new(Notify::new());
+        let pull_result: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let cancel = tokio_util::sync::CancellationToken::new();
 
-        // (6) Fused window-paced loop. Boxed to keep the large loop future off
-        // this frame (clippy::large_futures).
-        Box::pin(self.window_forward_loop(
-            &mut send,
-            &mut recv,
-            hash,
-            channel_id,
-            &channel,
-            client_node_id,
-            rate_per_mb,
-            interval_mb,
-            total_bytes,
-            pull,
-            tee,
-        ))
-        .await
+        // The serve leg reads the cache the pull leg fills — same engine, same hash.
+        let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
+
+        // Spawn the off-task pull leg on its own current-thread runtime. All inputs are
+        // owned + `'static`; it shares only the coordination Arcs above.
+        let pull_thread = {
+            let deps_lock = origin.deps_arc();
+            let engine = self.cache.clone();
+            let served_paid = Arc::clone(&served_paid);
+            let served_paid_advanced = Arc::clone(&served_paid_advanced);
+            let pull_ended = Arc::clone(&pull_ended);
+            let pull_result = Arc::clone(&pull_result);
+            let cancel = cancel.clone();
+            let offset = req.byte_offset;
+            let len = req.byte_len;
+            std::thread::Builder::new()
+                .name("serve-miss-pull".to_string())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(crate::node_origin::run_pull_leg(
+                            deps_lock,
+                            target,
+                            engine,
+                            hash,
+                            offset,
+                            len,
+                            window,
+                            served_paid,
+                            served_paid_advanced,
+                            Arc::clone(&pull_ended),
+                            pull_result.clone(),
+                            cancel,
+                        )),
+                        Err(e) => {
+                            // The pull could not start: record a terminal error and wake
+                            // the serve leg so it fails a gap rather than hanging.
+                            if let Ok(mut guard) = pull_result.lock() {
+                                *guard = Some(Err(anyhow::anyhow!(
+                                    "serve-miss pull runtime build failed: {e}"
+                                )));
+                            }
+                            pull_ended.notify_waiters();
+                        }
+                    }
+                })
+        };
+        let pull_thread = match pull_thread {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The OS refused the thread: fail the serve cleanly (release the tee).
+                tee.abandon();
+                return Err(anyhow::anyhow!(
+                    "could not spawn serve-miss pull thread: {e}"
+                ));
+            }
+        };
+
+        // Run the serve leg on THIS (accept) task and await it. It owns termination.
+        let serve_result = self
+            .serve_leg(
+                &mut send,
+                &mut recv,
+                &serve_store,
+                &channel,
+                hash,
+                channel_id,
+                client_node_id,
+                rate_per_mb,
+                interval_mb,
+                req.byte_offset,
+                req.byte_len,
+                total_bytes,
+                window,
+                Arc::clone(&served_paid),
+                Arc::clone(&served_paid_advanced),
+                Arc::clone(&pull_ended),
+                Arc::clone(&pull_result),
+            )
+            .await;
+
+        // Teardown: cancel the pull (stop paying upstream for a blob the client no
+        // longer waits on, #1610), then JOIN — bounded, since cancellation makes
+        // `drive` drop promptly and the pull thread's `SettleOnDrop` persists the buyer
+        // watermark (#852). Joined off the async worker via `spawn_blocking`.
+        cancel.cancel();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = pull_thread.join();
+        })
+        .await;
+
+        // Release the in-flight coalescing slot: the `TeeReservation` was held only as
+        // the double-pull guard (the pull leg fills via the cache, not the tee), and its
+        // `abandon` fires the `Notify` any coalesced `InFlight` waiter is parked on
+        // (engine.rs:3975/3987 — the reservation's own teardown wakes waiters).
+        tee.abandon();
+        serve_result
     }
 
     /// Serve a cache miss by streaming the node's OWN configured fs/http/s3
