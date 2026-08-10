@@ -305,9 +305,11 @@ This is bounded, not a double-spend hole:
 
 #### Data withholding
 
-Node accepts a stream request, receives a voucher, then stops delivering bytes.
+Node accepts a stream request, receives the epoch voucher, then stops delivering bytes.
 
-Self-enforcing: the node cannot extract more payment than the last acknowledged voucher. The client resumes from `byte_offset` on a different node.
+**The signed voucher is worth nothing on its own.** Its `cumulative` is the epoch *base* — what the lane has already earned — and every unit above it requires a preimage, which the signer releases only for a chunk it has received and hash-verified. A node that takes a voucher and delivers nothing can only redeem at `chainIndex = 0`, which claims exactly that base: on a fresh lane the base is `0`, so the call pays nothing and reverts `NothingToRedeem`; on an established lane it is value the node could already have collected with the previous epoch's preimages. Opening an epoch therefore moves no money and grants no new claim — it fixes the price, the chunk size, and the ceiling, nothing more.
+
+So the payer's exposure stays at zero even though it signs first, and the node's stays at one chunk. A node that stops mid-stream keeps only what its preimages already cover, and the client resumes from `byte_offset` on a different node having paid for exactly the chunks it received.
 
 #### Corrupted delivery
 
