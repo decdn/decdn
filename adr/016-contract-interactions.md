@@ -668,7 +668,7 @@ Every state-mutating function that makes an external call is listed below with i
 | --- | --- | --- |
 | `openChannel(deposit)` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions. Names no provider — node-active gating is off-chain at node selection, not at open. |
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
-| `redeem(channelId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)` | `IERC20.safeTransfer()` (paid amount to FeeRouter), `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` (paid amount forwarded; FeeRouter performs the split internally) | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
+| `redeem(channelId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)` | `IERC20.safeTransfer()` (paid amount to FeeRouter), `FeeRouter.routeSettlement(operator, bytesPaid, paid)` where `paid = min(delta, remaining)` and `bytesPaid = mulDiv(bytesDelta, paid, delta)` — the **paid-proportional** byte count, so served bytes never outrun paid USDC in a partially-drained pool; FeeRouter performs the split internally | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
 | `reclaim()` / `reclaimExpired()` | `IERC20.safeTransfer()` (remainder to owner) | `nonReentrant`, checks-effects-interactions |
 
 #### CapacityBond

@@ -36,7 +36,7 @@ Three OP-Stack / Nitro L2s evaluated: **Arbitrum One**, **Base**, **OP Mainnet**
 |--------|--------------------|
 | Gas costs at current fee market | Affects redemption and slash-evidence gas; pool opens are rare and off the fetch path, so per-open cost is second-order ([ADR 003 § Deposit Economics](003-payments.md#deposit-economics)) |
 | Sequencer forced-inclusion delay | Hard lower-bound on the redemption grace window; must exceed this value ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)) |
-| Native USDC availability | Eliminates Circle bridge counterparty risk for payment channels |
+| Native USDC availability | Eliminates Circle bridge counterparty risk for the payment pool |
 | Balancer V3 deployment | [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) requires a Balancer V3 Weighted Pool for TOKEN/USDC POL |
 | Aggregator routing density | Affects buyback execution quality and CoW Swap solver availability ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)) |
 | DeFi ecosystem depth | Thin overall liquidity amplifies TOKEN/USDC pool slippage |
