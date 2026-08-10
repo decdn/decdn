@@ -1,58 +1,44 @@
-# Appendix: Permissionless Stale-Close Detection
+# Appendix: Permissionless Settlement Analysis
 
-> **This is an appendix, not a core protocol ADR.** It describes the operational role of running a stale-close detector — a permissionless side-effect of `closeChannel` / `disputeChannel` being open to any voucher holder.
+> **This is an appendix, not a core protocol ADR.** It describes the operational role of running an off-chain analyzer of on-chain settlement flows — a permissionless side-effect of the pool's redemption events being public.
 
 ## Context
 
-The protocol has one on-chain surface where a party can publish a falsified value and benefit if no third party objects within a bounded window — **`closeChannel` / `disputeChannel`** ([ADR 003](003-payments.md#adr-003-payment-model)): a client may close a channel with a stale (low-nonce) voucher — or with none at all, which closes at the channel's recorded watermark; the 48-hour dispute window settles at that value unless a higher-nonce voucher (signed by the channel's pinned `voucherSigner`) is submitted in time. Submitting is permissionless from the protocol's side — see Contract integration below.
+Under the shared payment pool ([ADR 003](003-payments.md#adr-003-payment-model)) there is **no stale-close vector**. Redemption is provider-only and final: a node redeems only its own `(signer, provider)` lane, and no party submits a competing value on its behalf. An owner's `closeChannel` only starts the redemption grace window — it moves no node's earnings and cannot understate a lane — and `reclaim` returns only the unspent remainder. So there is no on-chain surface where one party publishes a falsified value and benefits unless a third party disputes it, and therefore **no third-party dispute role**.
 
-The wash-trading defense is structural and lives elsewhere: per-byte settlement (60% operator base) is paid by real clients, and governance vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) (proven delivered bytes), so neither faked traffic nor over-declared capacity yields revenue or governance influence. There is no operator-asserted summary, no fraud-challenge mechanism, and no monitoring role for capacity-share. Permissionless off-chain analysis of on-chain settlement flows (operator-cluster / self-routing detection) is the soft layer informing governance threshold-tuning if persistent patterns surface.
+What remains permissionless is **off-chain analysis of public settlement flows**. The wash-trading defense is structural and lives elsewhere: per-byte payment (60% operator base) is paid by real clients from real pool deposits, and governance vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) (proven delivered bytes), so neither faked traffic nor over-declared capacity yields revenue or governance influence. There is no operator-asserted summary, no fraud-challenge mechanism, and no monitoring role for capacity-share. Permissionless analysis of on-chain redemption flows (operator-cluster / self-routing detection) is the soft layer informing governance threshold-tuning if persistent patterns surface.
 
 ## Role
 
-Anyone with the technical capacity to:
+Anyone with the technical capacity to subscribe to L2 RPC `eth_getLogs` for `PaymentChannel.ChannelRedeemed` and `FeeRouter.Settled` events can act as a settlement analyzer. No registration, registry, fees, or wire interface (see [Why this is an appendix](#why-this-is-an-appendix-not-an-adr)).
 
-- subscribe to L2 RPC `eth_getLogs` for `ChannelCloseInitiated` events, and
-- hold a hot wallet with enough gas to submit `disputeChannel`,
+The analyzer correlates the two events from the same transaction — `ChannelRedeemed(channelId, signer, provider, …)` and `Settled(operator, epoch, …)` — to recover the pool and lane context of each payout, then looks for self-routing patterns: a pool whose `owner` and redeeming `provider` are the same operator cluster, cycling USDC to inflate an operator's served bytes. The analysis recovers nothing from the protocol; its only output is evidence that governance may weigh when tuning the vote-cap and burn-share parameters.
 
-can act as a stale-close detector. No registration, registry, fees, or wire interface (see [Why this is an appendix](#why-this-is-an-appendix-not-an-adr)).
+This is fundamentally an informational layer, not a paid service or a protocol primitive.
 
-When `ChannelCloseInitiated(channelId, ..., nonce)` fires, the detector checks whether it holds a voucher with a higher nonce for that channel. If so, it submits `disputeChannel`.
+## Node self-protection (not a third-party role)
 
-The trigger is that single question — "do I hold a strictly-higher-nonce voucher?" — and nothing about the close itself. A close carrying the channel's current watermark is legitimate and common: either party may close without presenting a voucher at all (via `closeChannelWithoutVoucher`, or `closeChannel` with all-zero arguments), which advances no watermark and emits `ChannelCloseInitiated` at the recorded values. A detector that treated such an event as suspicious would alarm on routine channel teardown; a detector that asks only whether it can ratchet the watermark up is correct on both.
+A node protects its own earnings without any external actor:
 
-- A successful dispute updates on-chain `claimedAmount` / `claimedNonce` / `claimedBytes`.
-- The detector spends gas (~$0.05–$0.10 on the production L2 — see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)) and recovers nothing from the protocol — they must have an out-of-band reason to hold a higher voucher (i.e., they are the node operator, the operator's hot-spare infrastructure, or a counterparty).
+1. **In-process redemption monitor** ([ADR 003](003-payments.md#adr-003-payment-model)). A lightweight thread in the node binary watches the chain for `ChannelCloseInitiated` events on pools it holds vouchers against and redeems its highest voucher per lane before the grace window closes. Handles the common online case.
+2. **Expiry margin.** A node stops serving a signer before the capability's `expiry`, so it always holds redeemable vouchers with time to redeem.
 
-This is fundamentally a self-protection mechanism, not a paid service: the offline-for-the-full-48h case is an operational failure mode, not a protocol gap (the online-node case is handled automatically — see Defense in depth).
+Because `redeem` is provider-only (`provider == msg.sender`), no third party could redeem a node's lane even if it wanted to — self-protection is the only path, and it is fully in the node's own hands. A node offline for the full grace window forfeits its unredeemed vouchers; this is a node-operations failure mode, not a protocol gap.
 
 ## Contract integration
 
-Two contract-level requirements, already specified in their owning ADRs:
-
-1. **`disputeChannel` accepts submissions from any address** — the voucher's EIP-712 signature is the sole authorization (it must recover to `channel.voucherSigner`), no `msg.sender` access check ([ADR 003 § closeChannel/disputeChannel](003-payments.md#adr-003-payment-model)).
-2. **`ChannelCloseInitiated`, `ChannelDisputed`, `ChannelSettled` events are emitted** ([ADR 003](003-payments.md#adr-003-payment-model)).
-
-No `WatchtowerEscrow` contract, heartbeat protocol, per-channel registration, or `cdn/watchtower/v1` ALPN.
-
-## Defense in depth (stale-close)
-
-Three layers, with the first as the primary mechanism:
-
-1. **Local in-process dispute monitor** ([ADR 003](003-payments.md#adr-003-payment-model) Option C). A lightweight thread in the node binary that watches the chain for `ChannelCloseInitiated` events on its channels and auto-submits the latest voucher. Handles the common online case.
-2. **Operator-arranged redundancy.** Multi-instance node deployments sharing voucher state, hot-standby relays, or peer agreements to hold latest vouchers. The protocol defines no wire format for this; it is node-operations responsibility, like running redundant origin backends.
-3. **Dispute window** (48h PoC default, governable 48h–72h per [ADR 009](009-governance.md#adr-009-governance-model)). The time budget for layers 1 and 2 to respond. The baseline window sits above the L2 force-inclusion delay, preserving an effective response window even under L2 sequencer censorship — see [ADR 003](003-payments.md#adr-003-payment-model).
+One contract-level requirement, already specified in its owning ADR: **`PaymentChannel` emits `ChannelOpened`, `ChannelRedeemed`, `ChannelCloseInitiated`, and `ChannelReclaimed`, and `FeeRouter` emits `Settled`** ([ADR 003](003-payments.md#adr-003-payment-model)). No `WatchtowerEscrow` contract, heartbeat protocol, per-pool registration, or `cdn/watchtower/v1` ALPN.
 
 ## Privacy
 
-The detector consumes only public on-chain data — channel close events. No node-shared voucher state, no privileged access. Privacy considerations from [ADR 017](017-privacy.md#adr-017-privacy-analysis) apply to channel parties, not detectors.
+The analyzer consumes only public on-chain data — redemption and settlement events. No node-shared voucher state, no privileged access. Privacy considerations from [ADR 017](017-privacy.md#adr-017-privacy-analysis) apply to pool parties, not analyzers.
 
 ## Why this is an appendix, not an ADR
 
-A protocol decision establishes a participant role with a defined wire interface, on-chain registration, fee/payment economics, or off-chain coordination protocol. The fraud-detection layer has none — it is a permissionless side-effect of `disputeChannel` access from [ADR 003](003-payments.md#adr-003-payment-model), like [Observability](appendix-observability.md#appendix-observability-and-metrics): operationally relevant, but not a protocol primitive.
+A protocol decision establishes a participant role with a defined wire interface, on-chain registration, fee/payment economics, or off-chain coordination protocol. The settlement-analysis layer has none — it is a permissionless side-effect of public redemption events from [ADR 003](003-payments.md#adr-003-payment-model), like [Observability](appendix-observability.md#appendix-observability-and-metrics): operationally relevant, but not a protocol primitive.
 
 ## Cross-ADR Impact
 
-- [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C
-- [ADR 014 — On-chain Verification](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the two signature-dependent offenses
-- [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — gas-cost context for detector economics
+- [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — redemption and grace-window close, the in-process redemption monitor, self-routing skim
+- [ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — the wash-trading-as-vote-buying cost model the analysis informs
+- [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — gas-cost context

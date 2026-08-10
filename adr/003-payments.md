@@ -618,7 +618,7 @@ An earlier design considered a router bypass on the grounds that routing node-to
 
 - All `PaymentChannel` redemptions forward to `FeeRouter.routeSettlement` regardless of whether the counterparties are operators or end clients. Node-to-node bytes therefore **do** accumulate in the router's per-epoch byte counters and **do** count toward governance vote weight ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) sources vote weight from `FeeRouter.bytesInWindow`), bounded by the per-operator vote cap and the [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying) cost model.
 - The on-chain registry distinction — a pool is node-to-node when both the `owner` and the redeeming `provider` addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)) — still exists, but it drives **probe-acceptance priority** ([§ Admission and Priority](#admission-and-priority)), not routing. Redemption is routed the same way either way.
-- Permissionless fraud detectors ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)) observe node-to-node redemptions for self-routed-traffic / wash-trading patterns, feeding governance threshold-tuning — reinforcing, not replacing, the per-cycle skim cost.
+- Permissionless settlement analyzers ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)) observe node-to-node redemptions for self-routed-traffic / wash-trading patterns, feeding governance threshold-tuning — reinforcing, not replacing, the per-cycle skim cost.
 
 #### Redemption sequence
 

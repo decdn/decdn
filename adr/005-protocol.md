@@ -28,7 +28,7 @@ The iroh-gossip protocol carries multiple message types on distinct topics:
 | --- | --- | --- |
 | `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 
-All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for fraud monitoring — anyone may run an off-chain detector against the L2 chain ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)).
+All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for settlement monitoring — anyone may run an off-chain analyzer against the L2 chain ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)).
 
 ### Rate discovery
 

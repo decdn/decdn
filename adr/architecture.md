@@ -133,7 +133,7 @@ Appendices document patterns, reference implementations, and operational guidanc
 8. [Local Admin HTTP Surface](appendix-local-admin-http.md#appendix-local-admin-http-surface) — loopback-bound admin API for operator runbook automation
 9. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
 10. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) — tier-independent safe-restart drain procedure plus Tier 1/2 operator checklists for compatible in-version releases; Tier 3 migrations are defined with the concrete breaking change
-11. [Permissionless Fraud-Detection Layer](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection) — optional, anyone-can-run on-chain monitoring of stale closes and fraudulent epoch summaries via the existing `SlashJudge` bond mechanism
+11. [Permissionless Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis) — optional, anyone-can-run off-chain analysis of public redemption/settlement flows for self-routing and wash-trading patterns, feeding governance parameter-tuning
 
 ## Architectural Decisions
 
