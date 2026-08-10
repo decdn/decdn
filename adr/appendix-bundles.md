@@ -159,7 +159,7 @@ as `decdn fetch`):
   sibling path needs bytes).
 - **Concurrency** is bounded by `--jobs` (over distinct blobs). A payment pool's vouchers
   use a strictly increasing nonce, so fetches that share one provider's
-  channel are serialized by a per-provider lock (which also makes the
+  lane are serialized by a per-provider lock (which also makes the
   lazy open-or-reuse first-touch race-free); distinct providers proceed
   in parallel.
 - **Output** files are written under `-o <dir>` at each entry's relative

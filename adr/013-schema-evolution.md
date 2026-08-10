@@ -194,7 +194,7 @@ use postcard::take_from_bytes;
 struct StreamRequestBase {
     hash: Hash,
     namespace_id: U256,
-    channel_id: ChannelId,
+    pool_id: ChannelId,
     byte_offset: u64,
     byte_len: u64,
     timestamp_us: u64,
@@ -330,7 +330,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `pool_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
 | `NodeAnnounce` | `node_id`, `region`, `timestamp_us` | *(none currently — see implementation note)* |
 
 #### Implementation note — separating signed and unsigned fields

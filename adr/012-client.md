@@ -132,7 +132,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 | Compromised key | Impact | Response |
 | --- | --- | --- |
 | iroh Ed25519 | Attacker can impersonate client NodeId (connect to nodes) but cannot sign vouchers or move funds. | Generate new iroh key, reconnect |
-| Ethereum secp256k1 (voucher signer) | Attacker can sign vouchers up to this signer's remaining `spending_cap` — and no further. Vouchers for a different signer, and every asset the owner holds outside this pool, are untouched. | The owner stops serving this signer and lets its capability `expiry` lapse (native revocation), so the exposure is bounded by the cap and retired at expiry — no on-chain move is needed against already-signed vouchers, which nodes redeem within the grace window regardless ([ADR 003 § Revocation](003-payments.md#revocation)). The owner may then `closeChannel` and `reclaim` the unspent remainder, and issue a fresh capability to a new signer. |
+| Ethereum secp256k1 (voucher signer) | Attacker can sign vouchers up to this signer's remaining `spending_cap` — and no further. Vouchers for a different signer, and every asset the owner holds outside this pool, are untouched. | The owner stops serving this signer and lets its capability `expiry` lapse (native revocation), so the exposure is bounded by the cap and retired at expiry — no on-chain move is needed against already-signed vouchers, which nodes redeem within the grace window regardless ([ADR 003 § Revocation](003-payments.md#revocation)). The owner may then `closePool` and `reclaim` the unspent remainder, and issue a fresh capability to a new signer. |
 | Ethereum secp256k1 (owner) | Attacker can move the owner's balance, open pools in its name, and sign capabilities delegating any signer (including itself, the default). | Close and reclaim every pool from the owner key and move to a new owner address. |
 | Both | Full impersonation | Close and reclaim all pools immediately. Generate new iroh key. Use a new Ethereum address for future sessions. |
 
@@ -167,7 +167,7 @@ All client state resides under `~/.decdn/`, with the per-client data dir (`--dat
 ├── iroh_key                  # Ed25519 secret key (0600)
 └── client/                   # the resolved client data dir
     ├── keystore.json         # Encrypted Ethereum keystore (Web3 Secret Storage)
-    ├── buyer-channels.redb   # Buyer-side payment-channel store
+    ├── buyer-pools.redb   # Buyer-side payment-pool store
     └── peers.json            # Cached peer list from last registry query
 ```
 
@@ -181,7 +181,7 @@ file the node does, ignoring `[cache]`, `[payment]`, and the bond. `decdn fetch`
 of these values as a flag, so a client can run with no config file at all. The client-relevant shape,
 in current schema terms:
 
-- `[identity]` — `data_dir` (holds the buyer payment-channel store and, by default, the ETH
+- `[identity]` — `data_dir` (holds the buyer payment-pool store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
 - `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_channel_address` /
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for

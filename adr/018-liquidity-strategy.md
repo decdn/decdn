@@ -95,7 +95,7 @@ Permitted operations within these bounds:
 
 ### Buyback inflow source and rate (router-driven per [ADR 026](026-tokenomics.md#adr-026-tokenomics))
 
-`BuybackBurner` is router-fed. The `FeeRouter` contract receives the paid USDC from `PaymentChannel.redeem` at every redemption and atomically forwards **30% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other two buckets (60% operator, 10% treasury). The full router split is in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split).
+`BuybackBurner` is router-fed. The `FeeRouter` contract receives the paid USDC from `PaymentPool.redeem` at every redemption and atomically forwards **30% of routed USDC directly to `BuybackBurner` in the same transaction**, alongside the other two buckets (60% operator, 10% treasury). The full router split is in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split).
 
 **Implications for this ADR:**
 

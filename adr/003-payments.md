@@ -17,12 +17,12 @@ Three constraints shape the design:
 
 Payments use **off-chain vouchers backed by a shared on-chain pool, denominated in the payment token** — **USDC**, fixed at contract deployment (immutable constructor argument, 6 decimals). The text says "the payment token" for the pool-deposit / voucher / settlement currency and names USDC only where a USDC-specific property is load-bearing (decimals, Circle counterparty risk, on-chain identifiers, swap pairs, dollar-denominated constants).
 
-One funded **pool** backs payments from **many independent capped signers** to **many nodes**. A pool is one deposit in the `PaymentChannel` contract, opened once by its owner and reused. The pool replaces the per-pair channel: the owner opens a single pool and pays every node from it, and never opens a channel per node or per client.
+One funded **pool** backs payments from **many independent capped signers** to **many nodes**. A pool is one deposit in the `PaymentPool` contract, opened once by its owner and reused. The pool replaces the per-pair channel: the owner opens a single pool and pays every node from it, and never opens a channel per node or per client.
 
 The model uses two signed objects and an on-chain sharded register.
 
-- **Capability** — signed off-chain by the pool owner over `{ signer, spending_cap, channel_id, expiry }`. It authorizes `signer` to spend up to `spending_cap` from `channel_id` until `expiry`. It is **node-agnostic**: one capability is valid at every node.
-- **Voucher** — signed by the authorized `signer` over `{ channel_id, signer, provider, cumulative, bytes_delivered, nonce, token }`. It is **node-addressed**: it names the payee `provider`. `provider` is mandatory because `channel_id` no longer encodes the payee; without it the contract could not attribute a payment or keep independent per-node ordering, and one node could redeem a voucher meant for another.
+- **Capability** — signed off-chain by the pool owner over `{ signer, spending_cap, pool_id, expiry }`. It authorizes `signer` to spend up to `spending_cap` from `pool_id` until `expiry`. It is **node-agnostic**: one capability is valid at every node.
+- **Voucher** — signed by the authorized `signer` over `{ pool_id, signer, provider, cumulative, bytes_delivered, nonce, token }`. It is **node-addressed**: it names the payee `provider`. `provider` is mandatory because `pool_id` no longer encodes the payee; without it the contract could not attribute a payment or keep independent per-node ordering, and one node could redeem a voucher meant for another.
 
 The mechanism operates at two tiers, both on the same pool primitive:
 
@@ -38,15 +38,15 @@ Key parameters:
 - Voucher cadence: 1 MB delivered per voucher (default; negotiable up to the 1024 MB wire ceiling for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: none on-chain beyond non-zero. Deposit sizing is node-informed policy, not a contract floor (see [Deposit Economics](#deposit-economics))
 - Fee routing: each redemption forwards the paid amount to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`, and the three-bucket split (60% operator base, 30% buyback, 10% treasury) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
-- Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
+- Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the payment contract.
 
 ### Deposit Economics
 
 A pool is opened once and reused. There is no per-node, per-fetch, or per-client open, and no pool close on the client's fetch path. The on-chain footprint of a pool is one open plus occasional top-ups, independent of how many nodes it pays or how many signers it delegates. A node registers each new signer's capability once on first redemption; every later redemption for that signer is voucher-only. On-chain cost is therefore independent of client count: many clients collapse to one pool plus lazy per-`(signer, provider)` register slots for active pairs only.
 
-**Deposit sizing is node-informed policy, not a schedule.** The pool is oversubscribable — the sum of signer caps may exceed the deposit, which is what lets one signer draw heavily while others draw nothing. So the deposit is sized against a node-side exposure bound: `D ≥ Q_b · c`, the number of nodes a payer can reach inside its blind window (`Q_b`) times the per-node redemption credit window (`c`). Both quantities are node policy (see [Pool solvency and the redemption credit window](#pool-solvency-and-the-redemption-credit-window)); the contract enforces none of it and `openChannel` accepts any non-zero deposit. A single user opens a small pool (for example $10), makes its own key the sole signer, caps it at the deposit, and tops up when low. A client that fans out to many signers opens one larger pool and issues each signer a small capped capability.
+**Deposit sizing is node-informed policy, not a schedule.** The pool is oversubscribable — the sum of signer caps may exceed the deposit, which is what lets one signer draw heavily while others draw nothing. So the deposit is sized against a node-side exposure bound: `D ≥ Q_b · c`, the number of nodes a payer can reach inside its blind window (`Q_b`) times the per-node redemption credit window (`c`). Both quantities are node policy (see [Pool solvency and the redemption credit window](#pool-solvency-and-the-redemption-credit-window)); the contract enforces none of it and `openPool` accepts any non-zero deposit. A single user opens a small pool (for example $10), makes its own key the sole signer, caps it at the deposit, and tops up when low. A client that fans out to many signers opens one larger pool and issues each signer a small capped capability.
 
-**Top-up.** The owner adds funds with `topUp` when the pool balance runs low, rather than opening a second pool. `topUp` spends only its own transaction. A buyer that runs its pool short mid-fetch tops up and resumes at the paid frontier, so no delivered byte is skipped or paid for twice. `topUp` does not extend `expiresAt`. A network deposit minimum is unnecessary: service is bounded by what the deposit funds, and pool spam is bounded by gas — each `openChannel` costs gas and locks real funds refundable only to the owner — while a floor would create a hard barrier for development and testing where small pools are useful.
+**Top-up.** The owner adds funds with `topUp` when the pool balance runs low, rather than opening a second pool. `topUp` spends only its own transaction. A buyer that runs its pool short mid-fetch tops up and resumes at the paid frontier, so no delivered byte is skipped or paid for twice. A network deposit minimum is unnecessary: service is bounded by what the deposit funds, and pool spam is bounded by gas — each `openPool` costs gas and locks real funds refundable only to the owner — while a floor would create a hard barrier for development and testing where small pools are useful.
 
 #### Smart Account Support and Gasless Pool Opens
 
@@ -54,7 +54,7 @@ All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verificati
 
 Because a pool is opened rarely and off the fetch path, gas-abstraction standards are optional conveniences rather than hot-path requirements:
 
-- **ERC-2771 meta-transactions.** A relayer submits the `openChannel` transaction on behalf of the owner, paying gas and recouping it from the deposit or a sponsorship fund. Requires a trusted-forwarder check on the contract.
+- **ERC-2771 meta-transactions.** A relayer submits the `openPool` transaction on behalf of the owner, paying gas and recouping it from the deposit or a sponsorship fund. Requires a trusted-forwarder check on the contract.
 - **ERC-4337 account abstraction.** A smart-contract wallet batches payment-token approval + pool open into one user operation, with a paymaster sponsoring gas in the payment token. Works with unmodified contracts.
 
 Gas abstraction via ERC-2771 or ERC-4337 paymasters is targeted at production.
@@ -128,7 +128,7 @@ The contract enforces the per-signer cap, but the cap gives **isolation, not sol
 
 ### Concurrent Streams
 
-When multiple streams from the **same signer to the same node** run at once, they share that lane's **single cumulative voucher counter** (per `(channel_id, signer, provider)`). Streams to different nodes, or from different signers, are independent lanes. The rules within one lane:
+When multiple streams from the **same signer to the same node** run at once, they share that lane's **single cumulative voucher counter** (per `(pool_id, signer, provider)`). Streams to different nodes, or from different signers, are independent lanes. The rules within one lane:
 
 1. **Effective interval = minimum across all active streams.** If stream A negotiated 100 MB and stream B negotiated 1 MB, the lane operates at 1 MB cadence.
 2. **Aggregate byte counter.** The signer tracks total bytes received across all streams in the lane. A voucher is due whenever the aggregate crosses the next interval boundary.
@@ -137,17 +137,17 @@ When multiple streams from the **same signer to the same node** run at once, the
 
 **Example:** A signer has stream A (blob X, 100 MB interval) and stream B (blob Y, 1 MB interval) on the same lane. Effective interval is 1 MB. After receiving 1 MB total (e.g., 0.7 MB from A + 0.3 MB from B), the signer sends a cumulative voucher. If stream B ends, the effective interval rises to 100 MB for the remainder of stream A.
 
-See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#payment-channels-and-concurrent-streams) for wire-level details.
+See [ADR 005 — Payment lanes and concurrent streams](005-protocol.md#payment-lanes-and-concurrent-streams) for wire-level details.
 
 ### Redemption and Close
 
 > **Fee routing model.** A redemption does not skim a fee inline; it forwards the paid amount to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. Split details: [FeeRouter Integration](#feerouter-integration).
 
-**Redemption is the settlement primitive.** A node redeems a voucher on-chain whenever it chooses, while the pool is `Open` or in the grace window. Redemption is provider-only (`msg.sender == voucher.provider`) and final — it needs no dispute window, because a voucher is a signed, cumulative, monotone claim by a capped signer and the node redeems only its own lane. `redeem(channelId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)`:
+**Redemption is the settlement primitive.** A node redeems a voucher on-chain whenever it chooses, while the pool is `Open` or in the grace window. Redemption is provider-only (`msg.sender == voucher.provider`) and final — it needs no dispute window, because a voucher is a signed, cumulative, monotone claim by a capped signer and the node redeems only its own lane. `redeem(poolId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)`:
 
-1. **Register the signer once.** On the first redemption for `(channelId, signer)`, verify the owner's signature on `capability` and store `authorized[channelId][signer] = {cap, expiry, spent: 0}`. Every later redemption for that signer omits `capability` and rides the stored registration; a node reads `authorized[...]` by `eth_call` to confirm a signer and its cap without ever holding the capability. The owner-signature check happens once per signer, not per voucher.
-2. **Check expiry.** Reject if `block.timestamp >= authorized[channelId][signer].expiry`. This is the only time bound that gates settlement, and it is safe because the node holds `expiry` in advance and stops serving before it (see [Revocation](#revocation)).
-3. **Check payee and ordering.** Require `provider == msg.sender` and `nonce > watermark[channelId][signer][provider].nonce`.
+1. **Register the signer once.** On the first redemption for `(poolId, signer)`, verify the owner's signature on `capability` and store `authorized[poolId][signer] = {cap, expiry, spent: 0}`. Every later redemption for that signer omits `capability` and rides the stored registration; a node reads `authorized[...]` by `eth_call` to confirm a signer and its cap without ever holding the capability. The owner-signature check happens once per signer, not per voucher.
+2. **Check expiry.** Reject if `block.timestamp >= authorized[poolId][signer].expiry`. This is the only time bound that gates settlement, and it is safe because the node holds `expiry` in advance and stops serving before it (see [Revocation](#revocation)).
+3. **Check payee and ordering.** Require `provider == msg.sender` and `nonce > watermark[poolId][signer][provider].nonce`.
 4. **Check the cap.** Compute `delta = cumulative - watermark[...].amount`; require `spent + delta <= cap`. The floor check ([Rate-floor enforcement](#rate-floor-enforcement)) applies to `cumulative` / `bytesDelivered` here.
 5. **Pay `min(delta, remaining)`.** With `remaining = deposit - totalRedeemed`, `paid = min(delta, remaining)`, and `bytesDelta = bytesDelivered - watermark[...].bytesDelivered` (the pre-update value): set the lane watermark to `{amount: cumulative, bytesDelivered, nonce}`, advance `spent += delta` and `totalRedeemed += paid`, `safeTransfer` `paid` USDC to the `FeeRouter`, then call `FeeRouter.routeSettlement(provider, bytesPaid, paid)` where `bytesPaid = mulDiv(bytesDelta, paid, delta)` is the **paid-proportional** byte count. When the pool is solvent (`paid == delta`) `bytesPaid == bytesDelta`; when the pool is drained (`paid < delta`) only the paid fraction of bytes is counted, so served bytes never outrun the USDC actually paid.
 
@@ -155,10 +155,10 @@ See [ADR 005 — Payment channels and concurrent streams](005-protocol.md#paymen
 
 **The sharded register.** Two mappings, both written lazily on first touch:
 
-- `watermark[channelId][signer][provider]` — the monotone cumulative for that triple. This is the per-`(signer, node)` lane: independent ordering, replay safety, and `(payer, payee)` attribution. Each node redeems only its own lane, only vouchers naming it.
-- `authorized[channelId][signer] = {cap, expiry, spent}` — the signer's registration and running committed total across all nodes, so the per-signer cap is enforced in aggregate without iterating lanes.
+- `watermark[poolId][signer][provider]` — the monotone cumulative for that triple. This is the per-`(signer, node)` lane: independent ordering, replay safety, and `(payer, payee)` attribution. Each node redeems only its own lane, only vouchers naming it.
+- `authorized[poolId][signer] = {cap, expiry, spent}` — the signer's registration and running committed total across all nodes, so the per-signer cap is enforced in aggregate without iterating lanes.
 
-**Close and reclaim.** Redemption pays nodes; close returns the owner's unspent remainder. There is no adversarial close: the owner submits no vouchers on any node's behalf, so a close can never understate a node's earnings, and no third-party dispute path is needed. `closeChannel(channelId)` (owner only) sets status `Closing` and starts the grace window (`disputeDeadline = block.timestamp + disputeWindow`, default 48 hours). Nodes may still `redeem` during `Closing`. After `disputeDeadline`, `reclaim(channelId)` transfers `deposit - totalRedeemed` to the owner and sets status `Closed`. A node that has not redeemed by the deadline — or by `expiresAt` on a pool the owner never closes, via `reclaimExpired` — forfeits its outstanding vouchers. A diligent node redeems within its expiry-bounded serving window, so this is the node's own cash-flow choice, not a theft surface.
+**Close and reclaim.** Redemption pays nodes; close returns the owner's unspent remainder. There is no adversarial close: the owner submits no vouchers on any node's behalf, so a close can never understate a node's earnings, and no third-party dispute path is needed. `closePool(poolId)` (owner only) sets status `Closing` and starts the grace window (`disputeDeadline = block.timestamp + disputeWindow`, default 48 hours). Nodes may still `redeem` during `Closing`. After `disputeDeadline`, `reclaim(poolId)` transfers `deposit - totalRedeemed` to the owner and sets status `Closed`. A node that has not redeemed by the deadline forfeits its outstanding vouchers. A pool does not expire, so a node's only deadlines are the grace window (after an owner close) and each signer's capability `expiry`; a diligent node redeems within its capability-bounded serving window, so this is the node's own cash-flow choice, not a theft surface.
 
 **Served-bytes and vote weight are unaffected.** Each redemption forwards its paid-proportional byte count to `FeeRouter.routeSettlement`, which increments `bytesPerEpoch[operator][epoch]` — the trailing-window served-bytes accumulator read by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Redemptions still fire the same routing call, and counting only paid bytes keeps per-byte revenue and governance vote weight both derived from real, floor-priced client USDC even in the drained-pool case. Faking bytes does not increase revenue (the operator base is per-byte, paid by the pool), and over-declared capacity does not translate into governance influence.
 
@@ -191,15 +191,15 @@ Each rejection maps back to a redemption invariant it protects off-chain, saving
 | `VoucherRejectReason` | Off-chain trigger | On-chain invariant protected |
 |---|---|---|
 | `BadSignature` | Malformed signature bytes | EIP-712 `SignatureChecker` would revert at `redeem` (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) |
-| `WrongSigner` | Signature recovers to an address other than the voucher's `signer` | `redeem` would revert when the recovered signer ≠ the authorized `signer` for `channelId` |
-| `WrongChannel` | `voucher.channel_id` mismatch | EIP-712 domain binds the voucher to a specific `channelId`; off-pool vouchers authorize nothing |
+| `WrongSigner` | Signature recovers to an address other than the voucher's `signer` | `redeem` would revert when the recovered signer ≠ the authorized `signer` for `poolId` |
+| `WrongPool` | `voucher.pool_id` mismatch | EIP-712 domain binds the voucher to a specific `poolId`; off-pool vouchers authorize nothing |
 | `WrongProvider` | `voucher.provider` names another node | `redeem` requires `provider == msg.sender`; a node cannot redeem another node's lane (see [Redemption and Close](#redemption-and-close)) |
 | `WrongToken` | `voucher.token` mismatch | Cross-token replay defense (see [Replay attack on vouchers](#replay-attack-on-vouchers)) |
-| `StaleNonce` | `voucher.nonce ≤` this lane's watermark | `redeem` requires a strictly higher nonce than `watermark[channelId][signer][provider]` ([Voucher Nonce Convention](#voucher-nonce-convention)) |
+| `StaleNonce` | `voucher.nonce ≤` this lane's watermark | `redeem` requires a strictly higher nonce than `watermark[poolId][signer][provider]` ([Voucher Nonce Convention](#voucher-nonce-convention)) |
 | `AmountRegression` | `voucher.amount <` this lane's cumulative | `redeem` computes `delta = cumulative − watermark`; a regressing cumulative underflows the lane |
 | `BytesRegression` | `voucher.bytes_delivered <` this lane's cumulative bytes | Bytes are cumulative and monotone per lane, mirroring the amount check |
-| `CapExceeded` | `spent + delta > cap`, or the capability has expired | `redeem` enforces the per-signer cap and `expiry` from `authorized[channelId][signer]` |
-| `RetryLater` | Transient persist-write failure (`ChannelError::Store`) | none — node-side store fault, not a voucher defect; the client resends the **same** voucher unchanged on a fresh stream |
+| `CapExceeded` | `spent + delta > cap`, or the capability has expired | `redeem` enforces the per-signer cap and `expiry` from `authorized[poolId][signer]` |
+| `RetryLater` | Transient persist-write failure (`PoolError::Store`) | none — node-side store fault, not a voucher defect; the client resends the **same** voucher unchanged on a fresh stream |
 
 Surfacing these reasons off-chain saves both parties the gas of a doomed on-chain submission and gives the payer enough detail to recover (refresh state and re-sign for `StaleNonce`, ask the owner to top up or raise the cap for `CapExceeded`) instead of an opaque connection drop. A delegated signer — one issued a capped capability by a pool owner — holds no funds to `topUp` (owner-only) and cannot read its lane watermark from chain until a redemption records it, so the node attaches an authenticated watermark bundle to the regression rejections for self-heal, and defers a genuine top-up or cap raise to the owner (see [ADR 005 § `VoucherRejected` semantics](005-protocol.md#voucherrejected-semantics)). Riding in-band rather than via a QUIC stream reset preserves the reason for client retry logic without burning [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) application-error-code numbers for the structured-response case.
 
@@ -213,7 +213,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 - Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the wire ceiling (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — small against a node's redemption credit window (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - One fungible deposit backs every node, versus one earmarked deposit per node — capital-efficient, and wallet-less signers (ephemeral keys the owner delegates a capped capability to) never touch the chain
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
-- The `PaymentChannel` contract is functionally separated from the `CapacityBond`, keeping the audit surface for each contract's core logic bounded
+- The `PaymentPool` contract is functionally separated from the `CapacityBond`, keeping the audit surface for each contract's core logic bounded
 
 ### Negative
 
@@ -243,9 +243,9 @@ That bound applies to a *funded* lane. A request whose pool cannot cover even th
 
 There is no stale-close vector: the owner submits no vouchers on any node's behalf, so a close cannot understate a node's earnings. The only residual is timing — the owner closes the pool and reclaims the remainder before a node redeems its outstanding vouchers.
 
-The grace window covers this if the node is online: `closeChannel` starts a window (default 48 hours, sized above the force-inclusion delay; see [L2 sequencer censorship](#l2-sequencer-censorship) below) during which any node may still `redeem`, and only after the window does `reclaim` return the remainder to the owner. **Node defenses:**
+The grace window covers this if the node is online: `closePool` starts a window (default 48 hours, sized above the force-inclusion delay; see [L2 sequencer censorship](#l2-sequencer-censorship) below) during which any node may still `redeem`, and only after the window does `reclaim` return the remainder to the owner. **Node defenses:**
 
-1. **In-process redemption monitor.** A lightweight thread inside the node binary watches the chain for `ChannelCloseInitiated` events on pools it holds vouchers against and redeems its highest voucher per lane before the window closes. Zero-latency to the local voucher store; handles the common case where the node is online. A SHOULD for production node binaries.
+1. **In-process redemption monitor.** A lightweight thread inside the node binary watches the chain for `PoolCloseInitiated` events on pools it holds vouchers against and redeems its highest voucher per lane before the window closes. Zero-latency to the local voucher store; handles the common case where the node is online. A SHOULD for production node binaries.
 2. **Expiry margin.** A node stops serving a signer before the capability's `expiry`, so it always holds redeemable vouchers with time to redeem — the same discipline that makes expiry-based revocation safe (see [Revocation](#revocation)).
 
 A node offline for the full grace window forfeits its unredeemed vouchers; this is a node-operations responsibility, not a protocol gap.
@@ -301,7 +301,7 @@ Not an attack. A node redeeming its latest voucher before the owner reclaims is 
 
 A third party tries to force a pool from `Open` to `Closing` to disrupt it, or redeems a lane it does not own.
 
-**Resolved by access control.** `closeChannel` is owner-only, so a third party cannot start the grace window. `redeem` requires `provider == msg.sender`, so a node can only redeem vouchers naming it — a third party cannot redeem another node's lane even holding the voucher. On-path voucher interception is mitigated by QUIC transport (TLS 1.3); it does not address endpoint compromise.
+**Resolved by access control.** `closePool` is owner-only, so a third party cannot start the grace window. `redeem` requires `provider == msg.sender`, so a node can only redeem vouchers naming it — a third party cannot redeem another node's lane even holding the voucher. On-path voucher interception is mitigated by QUIC transport (TLS 1.3); it does not address endpoint compromise.
 
 #### Redemption while the pool is Open (no dispute window)
 
@@ -337,7 +337,7 @@ The core weakness is governance-token-price dependency: at $0.001/TOKEN, the 1 G
 
 - **Option A — Governance raises the 1 Gbps-tier bond via the `k`-bound mechanism in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).** The 1G-tier bond is governable within [10K, 200K TOKEN]; raising it lifts the whole curve. Governance is incentivised to do so when TOKEN price is low, since a sybil-dominated network reduces usage and TOKEN value. Reactive but aligned.
 - **Option B — Bond denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see the rate-floor discussion above). The same concerns apply here, but the impact of oracle failure is lower (new operators temporarily blocked, not payments broken).
-- **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
+- **Option C — Reputation as a second filter.** New nodes (low reputation, few settled pools) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
 
 #### Rate manipulation cartel
 
@@ -360,45 +360,44 @@ Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-trigger
 
 Attacker intercepts a signed voucher and attempts to replay it against a different pool, a different node, or after redemption.
 
-EIP-712 typed data over `{channelId, signer, provider, amount, bytesDelivered, nonce, token}` binds the voucher to a specific pool, signer, and payee. `provider` is what stops one node from redeeming a voucher meant for another. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different chains, contract upgrades, or test vs production environments. The monotone per-lane nonce (starting at 1; see [Voucher Nonce Convention](#voucher-nonce-convention)) prevents resubmission after redemption.
+EIP-712 typed data over `{poolId, signer, provider, amount, bytesDelivered, nonce, token}` binds the voucher to a specific pool, signer, and payee. `provider` is what stops one node from redeeming a voucher meant for another. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different chains, contract upgrades, or test vs production environments. The monotone per-lane nonce (starting at 1; see [Voucher Nonce Convention](#voucher-nonce-convention)) prevents resubmission after redemption.
 
 #### Off-chain voucher state persistence
 
 The on-chain protections in [Replay attack on vouchers](#replay-attack-on-vouchers) constrain only what the contract accepts at redemption. They do not prevent the **delivering node** from re-delivering bytes off-chain for a voucher it already honoured: a node holding voucher state only in memory will, after restart, re-accept any earlier-nonce voucher the signer (or any wire observer) resubmits and serve the bytes again.
 
-Required invariant: a node MUST persist `(last_nonce, last_amount, last_bytes_delivered)` **per `(channelId, signer, provider)` lane** and durably commit (fsync, on disk-backed implementations) **before** sending `VoucherAck` or delivering any further bytes for that voucher. After a restart, voucher acceptance MUST resume from the persisted state — never from `last_nonce = 0`. An absent entry is semantically identical to a never-seen lane (`last_nonce == 0`, per [Voucher Nonce Convention](#voucher-nonce-convention)); a record exists iff the node ever advanced past the initial sentinel. Entries are dropped only when the node has redeemed the lane's full cumulative and observed it on-chain.
+Required invariant: a node MUST persist `(last_nonce, last_amount, last_bytes_delivered)` **per `(poolId, signer, provider)` lane** and durably commit (fsync, on disk-backed implementations) **before** sending `VoucherAck` or delivering any further bytes for that voucher. After a restart, voucher acceptance MUST resume from the persisted state — never from `last_nonce = 0`. An absent entry is semantically identical to a never-seen lane (`last_nonce == 0`, per [Voucher Nonce Convention](#voucher-nonce-convention)); a record exists iff the node ever advanced past the initial sentinel. Entries are dropped only when the node has redeemed the lane's full cumulative and observed it on-chain.
 
 A failed persist write MUST surface as a voucher-acceptance failure — the node returns a transient-failure rejection through the [Off-chain Voucher Rejections (Wire Encoding)](#off-chain-voucher-rejections-wire-encoding) channel, and MUST NOT send `VoucherAck`. The wire code for transient persistence failures is `VoucherRejectReason::RetryLater`, carrying no on-chain-invariant meaning; the `StaleNonce` / `CapExceeded` codes are NOT appropriate substitutes because they would tell the signer to refresh state or ask for more headroom when in fact the same voucher should be retried unchanged. The node finishes the stream cleanly after the rejection (no QUIC reset), so the signer resends the same voucher on a fresh stream rather than treating an opaque connection drop as a permanent failure. Persisting after acknowledgement re-opens the same replay window for the crash interval between the two writes.
 
-Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `ChannelStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node`. The protocol fixes only the ordering above.
+Storage backend and trait shape are implementation concerns; the Rust implementation exposes a `PoolStateStore` seam in `crates/incentive` with a `redb`-backed persistent implementation in `crates/node`. The protocol fixes only the ordering above.
 
 ## Contract Interfaces
 
-### PaymentChannel
+### PaymentPool
 
-The `PaymentChannel` contract holds payment-token pools. The payment token is USDC; its address is fixed at deployment as an immutable constructor argument. A pool is one funded deposit that backs vouchers from many capped signers to many nodes. A two-dimensional sharded register records per-signer authorization and per-`(signer, provider)` redemption watermarks.
+The `PaymentPool` contract holds payment-token pools. The payment token is USDC; its address is fixed at deployment as an immutable constructor argument. A pool is one funded deposit that backs vouchers from many capped signers to many nodes. A two-dimensional sharded register records per-signer authorization and per-`(signer, provider)` redemption watermarks.
 
 **Pool state:**
 
 ```solidity
 struct Pool {
-    address owner;            // funder: deposits, receives the reclaim, owns the channelNonce sequence
+    address owner;            // funder: deposits, receives the reclaim, owns the poolNonce sequence
     uint64  openedAt;
     uint8   status;           // 0 = Open, 1 = Closing (grace window active), 2 = Closed
-    uint64  expiresAt;
     address token;            // USDC; set once at deployment (immutable)
     uint64  disputeDeadline;  // set when close is initiated; fixed for the grace window
     uint256 deposit;          // total escrowed, USDC base units (6 decimals)
     uint256 totalRedeemed;    // cumulative USDC paid out across all lanes; remaining = deposit − totalRedeemed
 }
 
-struct Authorization {        // authorized[channelId][signer]
+struct Authorization {        // authorized[poolId][signer]
     uint256 cap;              // per-signer spending cap, from the owner-signed capability
     uint64  expiry;           // capability expiry; gates redemption
     uint256 spent;            // cumulative committed by this signer across all providers
 }
 
-struct Lane {                 // watermark[channelId][signer][provider]
+struct Lane {                 // watermark[poolId][signer][provider]
     uint256 amount;          // cumulative USDC redeemed on this lane (monotone)
     uint256 bytesDelivered;  // cumulative bytes redeemed on this lane (monotone)
     uint256 nonce;           // highest redeemed voucher nonce on this lane
@@ -410,38 +409,37 @@ mapping(bytes32 => mapping(address => Authorization)) public authorized;
 mapping(bytes32 => mapping(address => mapping(address => Lane))) public watermark;
 ```
 
-Both register mappings are written lazily on first touch, so an inactive `(signer, provider)` pair costs no storage. The pool header carries no per-payee or per-signer field — those live in the register. "The lane watermark" refers to `watermark[channelId][signer][provider]`, whose `.amount`, `.bytesDelivered`, and `.nonce` all advance monotonically.
+Both register mappings are written lazily on first touch, so an inactive `(signer, provider)` pair costs no storage. The pool header carries no per-payee or per-signer field — those live in the register. "The lane watermark" refers to `watermark[poolId][signer][provider]`, whose `.amount`, `.bytesDelivered`, and `.nonce` all advance monotonically.
 
 **Roles.**
 
-- **`owner` — the funder.** Transfers the deposit in, receives the `deposit − totalRedeemed` reclaim, owns the `channelNonce` sequence the `channelId` derives from, is the only address that may `topUp` and `closeChannel`, signs capabilities, and is the address the [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) takedown and blacklist gates evaluate.
+- **`owner` — the funder.** Transfers the deposit in, receives the `deposit − totalRedeemed` reclaim, owns the `poolNonce` sequence the `poolId` derives from, is the only address that may `topUp` and `closePool`, signs capabilities, and is the address the [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) takedown and blacklist gates evaluate.
 - **`signer` — a delegated voucher authority.** Authorized by an owner-signed capability up to `cap` until `expiry`. Node-agnostic: one capability spends at every node. The owner may be its own sole signer (the single-user case) or delegate many capped signers.
 - **`provider` — a delivering node.** The only address that may `redeem` a given voucher (`provider == msg.sender`), the recipient of every routed payout, and the payee named in the voucher.
 
 There is no pinned per-channel `voucherSigner`. Signers are authorized off-chain by capability and registered lazily on first redemption. Because a capability carries a `spending_cap` and an `expiry`, a compromised or delegated signer is bounded by its cap and retired by its expiry — the revocation an immutable pin could not give (see [Revocation](#revocation)).
 
-**Pool ID:** `channelId = keccak256(abi.encodePacked(owner, channelNonce))` where `channelNonce` is a monotone per-owner counter stored as `ownerChannelNonce[msg.sender]`. Neither `provider` nor `signer` is an input — a pool is bound to no payee and no signer. **Ordering:** `openChannel` reads the current nonce, computes `channelId`, then increments. The owner pre-computes the next `channelId` off-chain by reading `ownerChannelNonce[owner]` before opening.
+**Pool ID:** `poolId = keccak256(abi.encodePacked(owner, poolNonce))` where `poolNonce` is a monotone per-owner counter stored as `ownerChannelNonce[msg.sender]`. Neither `provider` nor `signer` is an input — a pool is bound to no payee and no signer. **Ordering:** `openPool` reads the current nonce, computes `poolId`, then increments. The owner pre-computes the next `poolId` off-chain by reading `ownerChannelNonce[owner]` before opening.
 
-> **Terminology:** `channelNonce` (the pool creation counter) is distinct from the voucher `nonce` (the monotone per-lane sequence number in EIP-712 voucher signatures). The former identifies pools; the latter orders vouchers within a `(signer, provider)` lane.
+> **Terminology:** `poolNonce` (the pool creation counter) is distinct from the voucher `nonce` (the monotone per-lane sequence number in EIP-712 voucher signatures). The former identifies pools; the latter orders vouchers within a `(signer, provider)` lane.
 
 | Group | Function | Purpose |
 | --- | --- | --- |
-| Nonce | `ownerChannelNonce(owner) → uint256` | Per-owner monotone counter used in `channelId` derivation. |
-| Lifecycle | `openChannel(deposit) → channelId` | Open a pool; derives `channelId` from the current `ownerChannelNonce[msg.sender]` then increments it; escrows `deposit`; emits `ChannelOpened`. Names no provider and no signer. |
-| Lifecycle | `topUp(channelId, additionalDeposit)` | Owner-only: add funds to an open pool (does not extend `expiresAt`). |
-| Lifecycle | `redeem(channelId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)` | Provider-only (`provider == msg.sender`): register the signer on first use (verify the owner `capability`), then pay `min(delta, remaining)` of a monotone voucher; routes the paid amount through `FeeRouter` same-tx. No dispute window. See [Redemption and Close](#redemption-and-close). |
-| Lifecycle | `closeChannel(channelId)` | Owner-only: start the grace window so nodes may redeem outstanding vouchers before reclaim; sets status `Closing`; emits `ChannelCloseInitiated`. |
-| Lifecycle | `reclaim(channelId)` | After the grace window: transfer `deposit − totalRedeemed` to the owner; sets status `Closed`; emits `ChannelReclaimed`. Callable by anyone; the refund always goes to `owner`. |
-| Lifecycle | `reclaimExpired(channelId)` | After `expiresAt` on a pool the owner never closed: the same reclaim, for abandoned pools. |
-| View | `getPool(channelId) → Pool` | Read the on-chain `Pool` struct. |
-| View | `getAuthorization(channelId, signer) → Authorization` | Read a signer's `{cap, expiry, spent}`, so a later node confirms a signer and its cap without holding the capability. |
+| Nonce | `ownerChannelNonce(owner) → uint256` | Per-owner monotone counter used in `poolId` derivation. |
+| Lifecycle | `openPool(deposit) → poolId` | Open a pool; derives `poolId` from the current `ownerChannelNonce[msg.sender]` then increments it; escrows `deposit`; emits `PoolOpened`. Names no provider and no signer. |
+| Lifecycle | `topUp(poolId, additionalDeposit)` | Owner-only: add funds to an open pool. |
+| Lifecycle | `redeem(poolId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)` | Provider-only (`provider == msg.sender`): register the signer on first use (verify the owner `capability`), then pay `min(delta, remaining)` of a monotone voucher; routes the paid amount through `FeeRouter` same-tx. No dispute window. See [Redemption and Close](#redemption-and-close). |
+| Lifecycle | `closePool(poolId)` | Owner-only: start the grace window so nodes may redeem outstanding vouchers before reclaim; sets status `Closing`; emits `PoolCloseInitiated`. |
+| Lifecycle | `reclaim(poolId)` | After the grace window: transfer `deposit − totalRedeemed` to the owner; sets status `Closed`; emits `PoolReclaimed`. Callable by anyone; the refund always goes to `owner`. |
+| View | `getPool(poolId) → Pool` | Read the on-chain `Pool` struct. |
+| View | `getAuthorization(poolId, signer) → Authorization` | Read a signer's `{cap, expiry, spent}`, so a later node confirms a signer and its cap without holding the capability. |
 | View | `getRateBounds() → floor` | Current `deliveryFloor` in payment-token base units. |
 | View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
 | Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
 | Governance | `setDisputeWindow(seconds)` | Grace window (bounded 172800–259200 — 48h–72h). |
 | Governance | `setRateBounds(floor)` | Per-MB delivery-rate floor in payment-token base units. Capped at `MAX_RATE_PER_MB`. |
 
-Bucket shares (60/30/10) are governed on `FeeRouter`, not on `PaymentChannel`; the treasury share (10%) is configured on `FeeRouter`.
+Bucket shares (60/30/10) are governed on `FeeRouter`, not on `PaymentPool`; the treasury share (10%) is configured on `FeeRouter`.
 
 #### Governance setter: setFeeRouter
 
@@ -451,77 +449,76 @@ function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE);
 event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 ```
 
-`setFeeRouter` re-points the configured `FeeRouter` for future `redeem` and `reclaim` calls. Required because the audited contract surface is fixed at deploy time, yet the `FeeRouter` may need replacing (bug fix, structural upgrade) without redeploying `PaymentChannel` and forcing every open pool to re-issue vouchers.
+`setFeeRouter` re-points the configured `FeeRouter` for future `redeem` and `reclaim` calls. Required because the audited contract surface is fixed at deploy time, yet the `FeeRouter` may need replacing (bug fix, structural upgrade) without redeploying `PaymentPool` and forcing every open pool to re-issue vouchers.
 
 **Authority and timelock.** Only callable by `GOVERNANCE_ROLE` (held by the `TimelockController` post-deploy per [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)). `DecdnGovernor` proposals to replace the router execute through the standard 48h timelock per [ADR 009](009-governance.md#adr-009-governance-model). Calls outside that path revert.
 
 **Validation.** Reverts on `address(0)`, on the same address as the current `feeRouter`, and on a `newRouter` whose code size is zero (EOA / undeployed address) — the same `code.length` invariant the constructor enforces, because `_route` would otherwise advance pool state while `routeSettlement` silently no-ops, desyncing accounting and stranding paid USDC. Beyond that code-size check the new router is not further interrogated — the deeper cross-validation invariants in [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics) live on `FeeRouter` itself, so re-pointing at a wrong-but-deployed contract still surfaces at the next `redeem` rather than at the setter.
 
-**Open pools are unaffected.** Vouchers signed against this `PaymentChannel` remain valid because the EIP-712 domain separator hashes the contract's own address, not the configured `FeeRouter`. Carve-out documented in [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns): helper-contract addresses are not domain-separator inputs and may be re-pointed via governance without invalidating signatures.
+**Open pools are unaffected.** Vouchers signed against this `PaymentPool` remain valid because the EIP-712 domain separator hashes the contract's own address, not the configured `FeeRouter`. Carve-out documented in [ADR 016 § No proxy deployment patterns](016-contract-interactions.md#no-proxy-deployment-patterns): helper-contract addresses are not domain-separator inputs and may be re-pointed via governance without invalidating signatures.
 
 **Routing during the swap.** Redemptions beginning before the timelock executes use the previous router; those beginning after use the new one. `redeem` reads `feeRouter()` at call time, and `routeSettlement` is a single transaction, so no in-flight redemption splits across routers.
 
-> **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openChannel`, `topUp`, `redeem`, `reclaim`, `reclaimExpired` — MUST use `nonReentrant` guards and follow checks-effects-interactions. `redeem` additionally crosses the `FeeRouter` boundary, so the effects (lane watermark, `spent`, and `totalRedeemed` advances) MUST be committed before the `safeTransfer` + `routeSettlement` interaction.
+> **Reentrancy protection:** All state-mutating functions that perform external calls (ERC-20 transfers) — `openPool`, `topUp`, `redeem`, `reclaim` — MUST use `nonReentrant` guards and follow checks-effects-interactions. `redeem` additionally crosses the `FeeRouter` boundary, so the effects (lane watermark, `spent`, and `totalRedeemed` advances) MUST be committed before the `safeTransfer` + `routeSettlement` interaction.
 
-**`topUp` behavior:** `topUp(channelId, additionalDeposit)` adds funds to an open pool:
+**`topUp` behavior:** `topUp(poolId, additionalDeposit)` adds funds to an open pool:
 
-- **Status precondition:** MUST require status `Open` and `block.timestamp < expiresAt` (reverts on `Closing`, `Closed`, or expired).
+- **Status precondition:** MUST require status `Open` (reverts on `Closing` or `Closed`).
 - **Caller:** owner only (`require(msg.sender == pool.owner)`).
-- **Effects:** Transfers `additionalDeposit` from `msg.sender` to the contract via `safeTransferFrom`. Updates `pool.deposit += additionalDeposit`. Does NOT extend `expiresAt` (to prevent indefinite lock-in — the pool's utility is bounded by the initial `maxChannelDuration`).
+- **Effects:** Transfers `additionalDeposit` from `msg.sender` to the contract via `safeTransferFrom`. Updates `pool.deposit += additionalDeposit`.
 - **Modifiers:** `nonReentrant`.
-- **Emits:** `ChannelToppedUp(channelId, additionalDeposit, newDeposit)`.
+- **Emits:** `PoolToppedUp(poolId, additionalDeposit, newDeposit)`.
 
-**`redeem` behavior:** `redeem(channelId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)` pays a node against a monotone voucher **while the pool is `Open` or in the grace window**. It is safe without a dispute window because a voucher is a signed, cumulative claim by a capped signer and a node redeems only its own lane. The residual is the signing key itself — a compromised key can authorize up to its `spending_cap`, retired by the capability's `expiry` (see [Redemption while the pool is Open](#redemption-while-the-pool-is-open-no-dispute-window)).
+**`redeem` behavior:** `redeem(poolId, signer, provider, cumulative, bytesDelivered, nonce, voucherSig, capability)` pays a node against a monotone voucher **while the pool is `Open` or in the grace window**. It is safe without a dispute window because a voucher is a signed, cumulative claim by a capped signer and a node redeems only its own lane. The residual is the signing key itself — a compromised key can authorize up to its `spending_cap`, retired by the capability's `expiry` (see [Redemption while the pool is Open](#redemption-while-the-pool-is-open-no-dispute-window)).
 
 - **Status precondition:** status `Open` or `Closing` with `block.timestamp < disputeDeadline` (a node may redeem during the grace window). Reverts on `Closed`.
 - **Caller:** the payee (`require(provider == msg.sender)`).
-- **Register the signer once.** If `authorized[channelId][signer]` is unset, verify the owner's signature on `capability` (an EIP-712 `Capability` over `{signer, spending_cap, channelId, expiry}` recovered against `pool.owner`; see [EIP-712 Voucher Signature](#eip-712-voucher-signature)), then store `{cap: spending_cap, expiry, spent: 0}`. Later redemptions for that signer omit `capability`.
-- **Voucher validation.** Verify `voucherSig` against `signer` (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)); require `block.timestamp < authorized[channelId][signer].expiry`, `nonce > watermark[channelId][signer][provider].nonce`, and the [rate floor](#rate-floor-enforcement) on `cumulative` / `bytesDelivered`.
-- **Effects (checks-effects-interactions):** let `w = watermark[channelId][signer][provider]`; compute `delta = cumulative − w.amount` and `bytesDelta = bytesDelivered − w.bytesDelivered`, require `delta > 0` and `spent + delta ≤ cap`; set `w = {amount: cumulative, bytesDelivered, nonce}` and `spent += delta`; compute `paid = min(delta, deposit − totalRedeemed)` and `bytesPaid = mulDiv(bytesDelta, paid, delta)`, set `totalRedeemed += paid`; then `safeTransfer(feeRouter, paid)` and call `FeeRouter.routeSettlement(provider, bytesPaid, paid)` in the same transaction. `routeSettlement` is purely additive (`+=`); `bytesPaid` counts only paid bytes (`bytesPaid == bytesDelta` when the pool is solvent), so served bytes never outrun paid USDC and each paid byte and USDC unit is counted exactly once.
+- **Register the signer once.** If `authorized[poolId][signer]` is unset, verify the owner's signature on `capability` (an EIP-712 `Capability` over `{signer, spending_cap, poolId, expiry}` recovered against `pool.owner`; see [EIP-712 Voucher Signature](#eip-712-voucher-signature)), then store `{cap: spending_cap, expiry, spent: 0}`. Later redemptions for that signer omit `capability`.
+- **Voucher validation.** Verify `voucherSig` against `signer` (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)); require `block.timestamp < authorized[poolId][signer].expiry`, `nonce > watermark[poolId][signer][provider].nonce`, and the [rate floor](#rate-floor-enforcement) on `cumulative` / `bytesDelivered`.
+- **Effects (checks-effects-interactions):** let `w = watermark[poolId][signer][provider]`; compute `delta = cumulative − w.amount` and `bytesDelta = bytesDelivered − w.bytesDelivered`, require `delta > 0` and `spent + delta ≤ cap`; set `w = {amount: cumulative, bytesDelivered, nonce}` and `spent += delta`; compute `paid = min(delta, deposit − totalRedeemed)` and `bytesPaid = mulDiv(bytesDelta, paid, delta)`, set `totalRedeemed += paid`; then `safeTransfer(feeRouter, paid)` and call `FeeRouter.routeSettlement(provider, bytesPaid, paid)` in the same transaction. `routeSettlement` is purely additive (`+=`); `bytesPaid` counts only paid bytes (`bytesPaid == bytesDelta` when the pool is solvent), so served bytes never outrun paid USDC and each paid byte and USDC unit is counted exactly once.
 - **Modifiers:** `nonReentrant`.
-- **Emits:** `ChannelRedeemed(channelId, signer, provider, paid, bytesPaid, newCumulative)`.
+- **Emits:** `PoolRedeemed(poolId, signer, provider, paid, bytesPaid, newCumulative)`.
 
 `redeem` changes nothing about off-chain voucher exchange. Signers keep sending cumulative vouchers up to their cap, and the node keeps accepting them; the node reads the authoritative on-chain lane watermark and routes the delta of the highest voucher it holds. Deciding *when* to redeem is node operational policy, bounded only by the capability `expiry` and the grace window.
 
 #### Initial deployment values
 
-The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, admin)` per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory). Every governable parameter it exposes is a constructor argument; there are none it defaults. `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
+The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, deliveryFloor, admin)` per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory). Every governable parameter it exposes is a constructor argument; there are none it defaults. `disputeWindow` is a constructor argument validated against the hardcoded safety bounds (deployment default 48h — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). A pool does not expire, so it configures no duration parameter. The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
 Default deployment value for `disputeWindow` (the redemption grace window): **172800 seconds (48 hours)** — sized to guarantee a node time to redeem under sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 172800–259200 seconds (48h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the constructor carries no `feePercentage` / `discountedFeePercentage` / treasury-address parameters; bucket shares are governed on `FeeRouter`, and the treasury bucket is one of `FeeRouter`'s three buckets (see [FeeRouter Integration](#feerouter-integration)).
 
 #### L2 sequencer censorship
 
-An owner (or colluding sequencer) calls `closeChannel` and ensures a node's `redeem` transactions are censored for the full grace window, so the owner can `reclaim` the remainder before the node is paid. Counterparties fall back to L1 forced inclusion, but this takes up to ~24 hours on Arbitrum (similar paths on other OP-Stack chains). If the grace window is no longer than that delay, the node's forced-included redemption lands too late.
+An owner (or colluding sequencer) calls `closePool` and ensures a node's `redeem` transactions are censored for the full grace window, so the owner can `reclaim` the remainder before the node is paid. Counterparties fall back to L1 forced inclusion, but this takes up to ~24 hours on Arbitrum (similar paths on other OP-Stack chains). If the grace window is no longer than that delay, the node's forced-included redemption lands too late.
 
 **Mitigation — baseline grace window.** Censorship resistance comes solely from keeping the baseline grace window above the chain's maximum force-inclusion delay: the window default is **48 hours** (172800 seconds), which guarantees at least 24 hours of effective redemption time on any chain with a force-inclusion delay ≤ 24 hours. There is no on-chain forced-inclusion detection or deadline extension — a signed force-included `redeem` is indistinguishable on-chain from a sequencer-included one, so the window itself carries the guarantee. The setting is chain-agnostic and the governance floor equals the 48h default (bounds 48h–72h per [ADR 009](009-governance.md#adr-009-governance-model)), so the baseline can only be tightened upward and never dropped below the force-inclusion delay. A node also keeps a margin below the capability `expiry` (see [Revocation](#revocation)), so it is not depending on the grace window alone.
 
 #### Events
 
-All events use indexed `channelId` plus an indexed actor field where applicable.
+All events use indexed `poolId` plus an indexed actor field where applicable.
 
 | Event | Emitted by | Non-indexed fields |
 | --- | --- | --- |
-| `ChannelOpened(channelId, owner, …)` | `openChannel` | `deposit`, `expiresAt` |
-| `ChannelToppedUp(channelId, …)` | `topUp` | `additionalDeposit, newDeposit` |
-| `ChannelRedeemed(channelId, signer, provider, …)` | `redeem` | `paid` (USDC routed to `FeeRouter`), `bytesPaid` (paid-proportional bytes counted toward the operator's epoch byte counter), `newCumulative` (the lane watermark after this redemption) |
-| `ChannelCloseInitiated(channelId, owner, …)` | `closeChannel` | `disputeDeadline` |
-| `ChannelReclaimed(channelId, owner, …)` | `reclaim`, `reclaimExpired` | `ownerRefund` (= `deposit − totalRedeemed`) |
+| `PoolOpened(poolId, owner, …)` | `openPool` | `deposit` |
+| `PoolToppedUp(poolId, …)` | `topUp` | `additionalDeposit, newDeposit` |
+| `PoolRedeemed(poolId, signer, provider, …)` | `redeem` | `paid` (USDC routed to `FeeRouter`), `bytesPaid` (paid-proportional bytes counted toward the operator's epoch byte counter), `newCumulative` (the lane watermark after this redemption) |
+| `PoolCloseInitiated(poolId, owner, …)` | `closePool` | `disputeDeadline` |
+| `PoolReclaimed(poolId, owner, …)` | `reclaim` | `ownerRefund` (= `deposit − totalRedeemed`) |
 | `RateBoundsUpdated` | `setRateBounds` | `newDeliveryFloor` |
 
-`ChannelOpened` indexes `channelId` and `owner`, so an owner lists its pools via `eth_getLogs(topics=[ChannelOpened, *, paddedOwnerAddress])`; an indexer keys on `channelId`. `redeem`, `signer`, and `provider` are indexed on `ChannelRedeemed`, so a node can enumerate the lanes it has been paid on.
+`PoolOpened` indexes `poolId` and `owner`, so an owner lists its pools via `eth_getLogs(topics=[PoolOpened, *, paddedOwnerAddress])`; an indexer keys on `poolId`. `redeem`, `signer`, and `provider` are indexed on `PoolRedeemed`, so a node can enumerate the lanes it has been paid on.
 
-An owner reconciling its pools after a restart reads its own `ownerChannelNonce` and recomputes each `channelId` (ids are derived per nonce, so there is no separate counter to drift), then re-hydrates each via `getPool`. A node does not enumerate pools from chain state — a pool names no provider — so it reconstructs its lanes from its own persisted `ChannelStateStore` ([Off-chain voucher state persistence](#off-chain-voucher-state-persistence)) and confirms each on-chain via `watermark[channelId][signer][provider]`. A signer learns the `channelId` and its cap from the capability the owner issued it.
+An owner reconciling its pools after a restart reads its own `ownerChannelNonce` and recomputes each `poolId` (ids are derived per nonce, so there is no separate counter to drift), then re-hydrates each via `getPool`. A node does not enumerate pools from chain state — a pool names no provider — so it reconstructs its lanes from its own persisted `PoolStateStore` ([Off-chain voucher state persistence](#off-chain-voucher-state-persistence)) and confirms each on-chain via `watermark[poolId][signer][provider]`. A signer learns the `poolId` and its cap from the capability the owner issued it.
 
-`ChannelReclaimed` carries no `protocolFee` field, and `redeem` does not skim a fee inline. The bucket distribution emits its own events from `FeeRouter` (see [FeeRouter Integration](#feerouter-integration)).
+`PoolReclaimed` carries no `protocolFee` field, and `redeem` does not skim a fee inline. The bucket distribution emits its own events from `FeeRouter` (see [FeeRouter Integration](#feerouter-integration)).
 
-**Pool expiry:** `expiresAt = block.timestamp + maxChannelDuration` at open. `maxChannelDuration` defaults to 90 days and is governable within hardcoded bounds (minimum 7 days, maximum 365 days). Expiry protects the owner from indefinitely locked funds and bounds a node's serving window — a capability's `expiry` never exceeds the pool `expiresAt`.
+**No pool expiry.** A pool has no lifetime cap and never expires; it stays `Open` until the owner closes it. It configures no duration parameter and has no time-based reclaim. Owner funds are recoverable only by the owner (`closePool` then `reclaim`), so they are never stranded, and a node's serving window is bounded by each signer's capability `expiry` — the deadline `redeem` enforces per lane.
 
 **Close and reclaim lifecycle:**
 
-- `closeChannel(channelId)` → requires status `Open`. **Owner only** (`require(msg.sender == pool.owner)`). Sets status to `Closing`, sets `disputeDeadline = block.timestamp + disputeWindow`, emits `ChannelCloseInitiated`. No fund transfers. It only starts the grace window; it moves no node's earnings, so it needs no voucher and cannot understate a lane.
-- `redeem` → still callable while `Closing` and before `disputeDeadline`, so a node cashes outstanding vouchers after the owner closes. See [`redeem` behavior](#paymentchannel).
-- `reclaim(channelId)` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address; transfers `deposit − totalRedeemed` to `pool.owner`, sets status `Closed`, emits `ChannelReclaimed`. The router is not called — payouts already happened at each `redeem`.
-- `reclaimExpired(channelId)` → requires status `Open` and `block.timestamp >= expiresAt`. The same reclaim for a pool the owner never closed: returns `deposit − totalRedeemed` to `pool.owner`, sets status `Closed`, emits `ChannelReclaimed`. Callable by anyone; the refund always goes to the owner, so an unresponsive owner's abandoned pool can be cleaned up. A node MUST `redeem` before `expiresAt` (or before the grace window closes) to capture its outstanding vouchers; a diligent node holds a margin below the capability `expiry` and redeems in time.
+- `closePool(poolId)` → requires status `Open`. **Owner only** (`require(msg.sender == pool.owner)`). Sets status to `Closing`, sets `disputeDeadline = block.timestamp + disputeWindow`, emits `PoolCloseInitiated`. No fund transfers. It only starts the grace window; it moves no node's earnings, so it needs no voucher and cannot understate a lane.
+- `redeem` → still callable while `Closing` and before `disputeDeadline`, so a node cashes outstanding vouchers after the owner closes. See [`redeem` behavior](#paymentpool).
+- `reclaim(poolId)` → requires status `Closing` and `block.timestamp >= disputeDeadline`. Callable by any address; transfers `deposit − totalRedeemed` to `pool.owner`, sets status `Closed`, emits `PoolReclaimed`. The router is not called — payouts already happened at each `redeem`.
 
 **Safety bounds (hardcoded):**
 
@@ -529,9 +526,8 @@ An owner reconciling its pools after a restart reads its own `ownerChannelNonce`
 | --- | --- | --- |
 | Grace window (`disputeWindow`) | 172800 seconds (48 hours) | 259200 seconds (3 days) |
 | Rate floor | 1 base unit | `MAX_RATE_PER_MB` (10^12) |
-| Max pool duration (`maxChannelDuration`) | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
-`PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
+`PaymentPool` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
 **The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at redemption** (see [Rate-floor enforcement](#rate-floor-enforcement) below). There is no governance ceiling: a seller self-clamping its own advertised rate downward buys no on-chain safety — a seller never wants to charge less — and the buyer's protection is seeing the signed rate in `StreamResponse` before it pays. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above.
 
@@ -559,7 +555,7 @@ This binds served bytes to real USDC: stamping `B` bytes requires cumulatively c
 
 Nodes must keep their local copy of `deliveryFloor` current so an advertised `rate_per_mb` never falls below it. Staleness is a revenue risk rather than a safety one — a node quoting under a raised floor accepts vouchers the chain will reject at redemption — so the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
 
-**Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
+**Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentPool` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
 
 **Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour**), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but a stale rate floor only risks the node quoting below it and signing unredeemable vouchers.
 
@@ -596,11 +592,11 @@ All `set*` functions are governance-only behind a timelock.
 
 ### FeeRouter Integration
 
-Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentChannel.redeem` does not split fees inline. The paid amount is forwarded to a `FeeRouter` contract on each redemption, which applies the canonical three-bucket split (60% operator base / 30% buyback-and-burn / 10% treasury — full table and bounds in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) and [§ Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)). All three legs transfer in the same transaction as the redemption that fed them. This ADR specifies the `FeeRouter` interface only as it relates to the redemption path; the per-bucket details live in [ADR 026](026-tokenomics.md#adr-026-tokenomics).
+Under [ADR 026](026-tokenomics.md#adr-026-tokenomics), `PaymentPool.redeem` does not split fees inline. The paid amount is forwarded to a `FeeRouter` contract on each redemption, which applies the canonical three-bucket split (60% operator base / 30% buyback-and-burn / 10% treasury — full table and bounds in [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) and [§ Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds)). All three legs transfer in the same transaction as the redemption that fed them. This ADR specifies the `FeeRouter` interface only as it relates to the redemption path; the per-bucket details live in [ADR 026](026-tokenomics.md#adr-026-tokenomics).
 
 #### Redemption-path interface
 
-`PaymentChannel.redeem` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount)` in the same transaction as the payment-token `safeTransfer` to the router, passing the *paid* amount and the *paid-proportional* byte count for that redemption (`bytesPaid = mulDiv(bytesDelta, paid, delta)`, so a partially-paid draw counts only the bytes it paid for). The router pays the operator's 60% base share in that transaction, dispatches the 30% / 10% same-tx legs, derives the current epoch as `uint64(block.timestamp / EPOCH_LENGTH)`, and increments `bytesPerEpoch[operator][epoch]` by that paid-proportional byte count as the trailing-window served-bytes accumulator read by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) as the governance vote-weight source. The router's `+=` accounting makes the per-redemption deltas sum to each lane's cumulative with no double-counting. The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
+`PaymentPool.redeem` MUST invoke `FeeRouter.routeSettlement(address operator, uint256 bytesDelivered, uint256 amount)` in the same transaction as the payment-token `safeTransfer` to the router, passing the *paid* amount and the *paid-proportional* byte count for that redemption (`bytesPaid = mulDiv(bytesDelta, paid, delta)`, so a partially-paid draw counts only the bytes it paid for). The router pays the operator's 60% base share in that transaction, dispatches the 30% / 10% same-tx legs, derives the current epoch as `uint64(block.timestamp / EPOCH_LENGTH)`, and increments `bytesPerEpoch[operator][epoch]` by that paid-proportional byte count as the trailing-window served-bytes accumulator read by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) as the governance vote-weight source. The router's `+=` accounting makes the per-redemption deltas sum to each lane's cumulative with no double-counting. The full `IFeeRouter` interface is canonical in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model).
 
 #### Redemption-path invariants
 
@@ -616,13 +612,13 @@ Conservation and same-tx three-bucket invariants (60/30/10) live with the router
 
 An earlier design considered a router bypass on the grounds that routing node-to-node payments "double-charges" the same downstream bytes (once when B pays A, again when B's clients pay B). That bypass was **not adopted**: uniform routing keeps the contract surface minimal and is exactly what makes the structural wash-trading deterrent hold — a self-routed pool pays the 40% non-base skim (30% burn + 10% treasury) on every cycle (see [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying)).
 
-- All `PaymentChannel` redemptions forward to `FeeRouter.routeSettlement` regardless of whether the counterparties are operators or end clients. Node-to-node bytes therefore **do** accumulate in the router's per-epoch byte counters and **do** count toward governance vote weight ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) sources vote weight from `FeeRouter.bytesInWindow`), bounded by the per-operator vote cap and the [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying) cost model.
+- All `PaymentPool` redemptions forward to `FeeRouter.routeSettlement` regardless of whether the counterparties are operators or end clients. Node-to-node bytes therefore **do** accumulate in the router's per-epoch byte counters and **do** count toward governance vote weight ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) sources vote weight from `FeeRouter.bytesInWindow`), bounded by the per-operator vote cap and the [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying) cost model.
 - The on-chain registry distinction — a pool is node-to-node when both the `owner` and the redeeming `provider` addresses have a registered NodeId binding (see [NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)) — still exists, but it drives **probe-acceptance priority** ([§ Admission and Priority](#admission-and-priority)), not routing. Redemption is routed the same way either way.
 - Permissionless settlement analyzers ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)) observe node-to-node redemptions for self-routed-traffic / wash-trading patterns, feeding governance threshold-tuning — reinforcing, not replacing, the per-cycle skim cost.
 
 #### Redemption sequence
 
-End-to-end payment-token flow — client→node and node-to-node redemptions both use the same `PaymentChannel → FeeRouter.routeSettlement` path — is diagrammed in [ADR 016 § USDC Flow (Payments)](016-contract-interactions.md#usdc-flow-payments). This ADR documents only the `PaymentChannel ↔ FeeRouter` interface contract.
+End-to-end payment-token flow — client→node and node-to-node redemptions both use the same `PaymentPool → FeeRouter.routeSettlement` path — is diagrammed in [ADR 016 § USDC Flow (Payments)](016-contract-interactions.md#usdc-flow-payments). This ADR documents only the `PaymentPool ↔ FeeRouter` interface contract.
 
 The full three-bucket split applies to every network deployment from launch. Simplified launch configurations are expressed by setting non-active bucket shares to zero via `FeeRouter.setShares(...)` per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics), not by deploying a reduced-surface stub. The cross-validation invariant in that section ensures any non-zero share has a wired non-zero destination, so the launch share configuration alone determines which downstream contracts must be ready at deploy time.
 
@@ -642,7 +638,7 @@ bytes32 public immutable DOMAIN_SEPARATOR;
 constructor() {
     DOMAIN_SEPARATOR = keccak256(abi.encode(
         DOMAIN_TYPEHASH,
-        keccak256(bytes("PaymentChannel")),   // name
+        keccak256(bytes("PaymentPool")),   // name
         keccak256(bytes("1")),                      // version
         block.chainid,                              // chainId
         address(this)                               // verifyingContract
@@ -650,27 +646,27 @@ constructor() {
 }
 ```
 
-The domain separator binds every capability and voucher to a specific contract deployment on a specific chain. A signature made for one chain cannot be replayed on another, and one made for one `PaymentChannel` deployment cannot be replayed against a redeployed contract at a different address.
+The domain separator binds every capability and voucher to a specific contract deployment on a specific chain. A signature made for one chain cannot be replayed on another, and one made for one `PaymentPool` deployment cannot be replayed against a redeployed contract at a different address.
 
 **Capability type** (owner-signed, verified once per signer on first redemption):
 
 ```solidity
 bytes32 constant CAPABILITY_TYPEHASH = keccak256(
-    "Capability(address signer,uint256 spendingCap,bytes32 channelId,uint64 expiry)"
+    "Capability(address signer,uint256 spendingCap,bytes32 poolId,uint64 expiry)"
 );
 ```
 
-The capability names no provider — it is node-agnostic, valid at every node. `redeem` recovers it against `pool.owner` and stores `{cap: spendingCap, expiry, spent: 0}` in `authorized[channelId][signer]`.
+The capability names no provider — it is node-agnostic, valid at every node. `redeem` recovers it against `pool.owner` and stores `{cap: spendingCap, expiry, spent: 0}` in `authorized[poolId][signer]`.
 
 **Voucher type** (signer-signed, node-addressed):
 
 ```solidity
 bytes32 constant VOUCHER_TYPEHASH = keccak256(
-    "Voucher(bytes32 channelId,address signer,address provider,uint256 amount,uint256 bytesDelivered,uint256 nonce,address token)"
+    "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,uint256 nonce,address token)"
 );
 ```
 
-`signer` and `provider` are both in the signed payload: `signer` binds the voucher to the authorized key `redeem` validates against, and `provider` binds it to a single payee, so one node cannot redeem another node's voucher. `amount` and `bytesDelivered` are the lane's cumulatives. The voucher carries no epoch: per-operator-epoch attribution is derived by `FeeRouter.routeSettlement` at redemption time as `epoch = uint64(block.timestamp / EPOCH_LENGTH)`, so a redemption's bytes credit the epoch its transaction lands in. A node redeems whenever it chooses within the capability `expiry` and the grace window, so the practical bound on epoch-shifting is `maxChannelDuration` (default 90 days) — a second-order effect on emission share that shrinks as the active-operator set grows.
+`signer` and `provider` are both in the signed payload: `signer` binds the voucher to the authorized key `redeem` validates against, and `provider` binds it to a single payee, so one node cannot redeem another node's voucher. `amount` and `bytesDelivered` are the lane's cumulatives. The voucher carries no epoch: per-operator-epoch attribution is derived by `FeeRouter.routeSettlement` at redemption time as `epoch = uint64(block.timestamp / EPOCH_LENGTH)`, so a redemption's bytes credit the epoch its transaction lands in. A node redeems whenever it chooses within the capability `expiry` (the per-signer redemption deadline) and the grace window, so the practical bound on epoch-shifting is that `expiry` — a second-order effect on emission share that shrinks as the active-operator set grows.
 
 **Signature digests:**
 
@@ -678,13 +674,13 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 bytes32 voucherDigest = keccak256(abi.encodePacked(
     "\x19\x01",
     DOMAIN_SEPARATOR,
-    keccak256(abi.encode(VOUCHER_TYPEHASH, channelId, signer, provider, amount, bytesDelivered, nonce, token))
+    keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer, provider, amount, bytesDelivered, nonce, token))
 ));
 
 bytes32 capabilityDigest = keccak256(abi.encodePacked(
     "\x19\x01",
     DOMAIN_SEPARATOR,
-    keccak256(abi.encode(CAPABILITY_TYPEHASH, signer, spendingCap, channelId, expiry))
+    keccak256(abi.encode(CAPABILITY_TYPEHASH, signer, spendingCap, poolId, expiry))
 ));
 ```
 
@@ -694,7 +690,7 @@ The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immu
 
 ### Voucher Nonce Convention
 
-Voucher nonces within a `(channelId, signer, provider)` lane start at **1**. Nonce 0 is the sentinel meaning "no voucher redeemed on this lane" — the Solidity default for an untouched `watermark[channelId][signer][provider]` slot. The first signed voucher in a lane uses `nonce=1`, the second `nonce=2`, and so on. This convention ensures:
+Voucher nonces within a `(poolId, signer, provider)` lane start at **1**. Nonce 0 is the sentinel meaning "no voucher redeemed on this lane" — the Solidity default for an untouched `watermark[poolId][signer][provider]` slot. The first signed voucher in a lane uses `nonce=1`, the second `nonce=2`, and so on. This convention ensures:
 
 - A zero lane watermark reliably identifies a lane no voucher has ever advanced, distinguishing "nothing redeemed" from "redeemed zero".
 - Any real voucher (nonce ≥ 1) outranks a never-advanced lane, since `redeem` requires a strictly higher nonce than the lane watermark (see [Redemption and Close](#redemption-and-close)).
@@ -703,7 +699,7 @@ Voucher nonces within a `(channelId, signer, provider)` lane start at **1**. Non
 
 The on-chain registry of bonded nodes is part of the `CapacityBond` contract, not a separate contract. Bonding is a prerequisite for registration ([ADR 026 § Operator economics](026-tokenomics.md#operator-economics)), so co-locating them avoids cross-contract calls and simplifies the atomic bond-then-register flow.
 
-> **No on-channel fee-discount path.** Operator return is differentiated through the `CapacityBond` lock-to-capacity curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), not via a bond-multiple fee toggle on the channel contract. `getEffectiveFee`, `getBondMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `CapacityBond` carries the registration, bond-bookkeeping, and slashing responsibilities; the operator bond is `bond = k × Mbps^α` with defaults `k=12.6`, `α=1.2` (≈50K TOKEN at 1 Gbps) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve).
+> **No fee-discount path on the pool contract.** Operator return is differentiated through the `CapacityBond` lock-to-capacity curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), not via a bond-multiple fee toggle on the payment contract. `getEffectiveFee`, `getBondMultiple`, `DISCOUNT_MULTIPLE`, `feePercentage`, and `discountedFeePercentage` are not part of the interface. `CapacityBond` carries the registration, bond-bookkeeping, and slashing responsibilities; the operator bond is `bond = k × Mbps^α` with defaults `k=12.6`, `α=1.2` (≈50K TOKEN at 1 Gbps) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve).
 
 #### Data Structure
 
@@ -966,7 +962,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
-Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` by recovering the signer from the fixed 65-byte form and comparing it against the claimed address. Smart-account clients are rejected fail-closed: off-chain ERC-1271 verification is deferred to Production ([ADR 024](024-account-abstraction.md#off-chain-erc-1271-verification)). The verified address is cached for the connection's lifetime and acts as a gate, not as an attribution source: the node refuses a request whose voucher `signer` is not the bound address, before any bytes are delivered, since that signer's vouchers would fail verification against the address it authenticated as. The address a voucher must recover to is the capability-authorized `signer` for the pool ([§ PaymentChannel](#paymentchannel)). This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
+Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` by recovering the signer from the fixed 65-byte form and comparing it against the claimed address. Smart-account clients are rejected fail-closed: off-chain ERC-1271 verification is deferred to Production ([ADR 024](024-account-abstraction.md#off-chain-erc-1271-verification)). The verified address is cached for the connection's lifetime and acts as a gate, not as an attribution source: the node refuses a request whose voucher `signer` is not the bound address, before any bytes are delivered, since that signer's vouchers would fail verification against the address it authenticated as. The address a voucher must recover to is the capability-authorized `signer` for the pool ([§ PaymentPool](#paymentpool)). This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
 
 ### Binding Requirements by Role
 
@@ -986,10 +982,10 @@ USDC uses 6 decimals; TOKEN uses 18 decimals. All payment amounts in the `incent
 **Voucher format:**
 
 ```
-{channelId, signer, provider, amount, bytesDelivered, nonce, token, signature}
+{poolId, signer, provider, amount, bytesDelivered, nonce, token, signature}
 ```
 
-During delivery over `cdn/client/v1`, `{signature, amount, nonce}` are transmitted on the wire; the remaining fields are derived from stream context — `channelId` from the `StreamRequest`, `signer` the bound client key, `provider` the delivering node, `token` fixed at pool open, and `bytesDelivered` the node's per-lane cumulative byte counter. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a lane; 0 is the sentinel). See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
+During delivery over `cdn/client/v1`, `{signature, amount, nonce}` are transmitted on the wire; the remaining fields are derived from stream context — `poolId` from the `StreamRequest`, `signer` the bound client key, `provider` the delivering node, `token` fixed at pool open, and `bytesDelivered` the node's per-lane cumulative byte counter. The `nonce` is explicit to prevent desynchronization if a `VoucherAck` is dropped (it starts at 1 for the first voucher in a lane; 0 is the sentinel). See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
 
 The `token` field (ERC-20 address) is in the signed EIP-712 typed data to prevent cross-token replay; it is the USDC contract address, fixed at deployment. Full EIP-712 type definition and domain separator: [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
@@ -997,7 +993,7 @@ The `token` field (ERC-20 address) is in the signed EIP-712 typed data to preven
 
 `bytesDelivered` is a cumulative byte count signed alongside `amount` and `nonce`. It is the canonical served-bytes count carried in the `Voucher`, forwarded to `FeeRouter.routeSettlement` on each redemption, and aggregated into `bytesPerEpoch[operator][epoch]` (where `epoch` is derived from `block.timestamp` at redemption time) — the trailing-window served-bytes accumulator consumed by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) as the governance vote-weight source. Properties:
 
-- **Cumulative, monotonic per lane.** Like `amount` and `nonce`, `bytesDelivered` is strictly non-decreasing across vouchers within a `(channelId, signer, provider)` lane. `redeem` computes the byte delta against the lane's last redeemed cumulative.
+- **Cumulative, monotonic per lane.** Like `amount` and `nonce`, `bytesDelivered` is strictly non-decreasing across vouchers within a `(poolId, signer, provider)` lane. `redeem` computes the byte delta against the lane's last redeemed cumulative.
 - **Derivable from MB-denominated voucher cadence.** Voucher cadence is MB-denominated (default 1 MB; see [Voucher Interval Negotiation](#voucher-interval-negotiation)) and `rate_per_mb` is MB-denominated. Signers computing `amount` from `bytesDelivered` use `amount = ⌈bytesDelivered / 1_048_576⌉ × rate_per_mb` (1 MB = 1,048,576 bytes per [ADR 005](005-protocol.md#adr-005-wire-protocol)); equivalently, `bytesDelivered = mb_delivered × 1_048_576` when delivery boundaries align with MB intervals. The voucher carries the byte count directly so the contract does not re-derive it.
 - **Routed at redemption.** Forwarded as the paid-proportional byte count (`bytesPaid`) to `FeeRouter.routeSettlement` on each `redeem`; a fully-paid draw forwards the whole lane byte delta.
 - **Cross-pool consistency.** A voucher signed for one pool, signer, and provider is bound by its EIP-712 typed data; `bytesDelivered` is part of that signed payload and cannot be replayed against a different lane.
@@ -1008,7 +1004,7 @@ The router does not validate `bytesDelivered` against any oracle of physical del
 
 Slashing and pools are independent by design.
 
-**Slashing does not affect pool funds.** Slashing operates exclusively on TOKEN bond in the `CapacityBond` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers; slashed bond is held in escrow-on-slash and distributed at finality 50% challenger / 50% burn). Pool funds are owner deposits held in escrow — not bond, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): `PaymentChannel` never holds or moves TOKEN bond, cannot be called by `CapacityBond` to slash or reassign bond, and any `CapacityBond` interaction is read-only (e.g., resolving NodeId↔address bindings).
+**Slashing does not affect pool funds.** Slashing operates exclusively on TOKEN bond in the `CapacityBond` (schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — 5%/15%/50% escalation tiers; slashed bond is held in escrow-on-slash and distributed at finality 50% challenger / 50% burn). Pool funds are owner deposits held in escrow — not bond, never touched by slashing. This follows from the functional separation in [Consequences](#consequences): `PaymentPool` never holds or moves TOKEN bond, cannot be called by `CapacityBond` to slash or reassign bond, and any `CapacityBond` interaction is read-only (e.g., resolving NodeId↔address bindings).
 
 **Slashing can drop a node below its tier minimum bond while it holds vouchers.** Pool deposits being independent of the bond, a node can be slashed below the tier minimum (or to zero) while holding unredeemed vouchers. Redemption continues regardless of bonding status; a payout is purely a function of voucher and register state, not registry status.
 
@@ -1017,5 +1013,5 @@ Slashing and pools are independent by design.
 - Outstanding vouchers redeem normally. Owner funds are never trapped.
 - The ejected node cannot be selected for new service (clients verify node registration, and nodes verify counterparty status before accepting a `StreamRequest`).
 - The ejected node is removed from gossip routing, so it receives no new client connections.
-- `redeem` (provider only) remains callable on any pool it holds vouchers against — it checks pool and register state, not registry status, so a slashed or ejected operator can still redeem revenue it already earned. `closeChannel` / `reclaim` / `reclaimExpired` are unaffected on the owner side.
+- `redeem` (provider only) remains callable on any pool it holds vouchers against — it checks pool and register state, not registry status, so a slashed or ejected operator can still redeem revenue it already earned. `closePool` / `reclaim` are unaffected on the owner side.
 - The node must re-bond at the full tier minimum (`bond_required(declared_capacity)`) and re-register to resume operations.

@@ -16,7 +16,7 @@
 
 ## Context
 
-The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staking, channel settlements, and governance happen on this chain. This appendix selects the production L2.
+The PoC runs on **Arbitrum Sepolia**. TOKEN is canonical on one L2 — all staking, pool settlements, and governance happen on this chain. This appendix selects the production L2.
 
 The choice affects the criteria enumerated below. Dependent ADRs: **[ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)** gas estimates assume Arbitrum-class L2 fee markets; [ADR 003 § L2 sequencer
 censorship](003-payments.md#l2-sequencer-censorship) assumes
@@ -122,13 +122,13 @@ Balancer V3 CoW routing reaches Arbitrum parity; regulatory pressure shifts the
 token's liquidity centre to Base. **OP Mainnet** — not selected; DeFi ecosystem and
 aggregator coverage smaller than both for this protocol's needs.
 
-### No Cross-Chain Channels in v1
+### No Cross-Chain Pools in v1
 
-TOKEN is canonical on Arbitrum One; staking, channel settlements, and governance all
+TOKEN is canonical on Arbitrum One; staking, pool settlements, and governance all
 happen there. Other-chain users bridge assets to Arbitrum One via standard ERC-20
 bridges (Arbitrum native bridge, or LayerZero / Wormhole) before interacting.
-Cross-chain payment channels (spanning two L2s) are explicitly excluded from v1 —
-they would require atomic-swap or bridge-aware channel logic, out of scope for
+Cross-chain payment pools (spanning two L2s) are explicitly excluded from v1 —
+they would require atomic-swap or bridge-aware pool logic, out of scope for
 initial production.
 
 ## Consequences

@@ -34,9 +34,9 @@ StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, v
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
-- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`
+- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us, redirect}`
 
-`hash` and `channel_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (common case), it is encoded as `bytes32(0)`. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
+`hash` and `pool_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (common case), it is encoded as `bytes32(0)`. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
 
 #### EIP-712 Type Definitions
 
@@ -46,11 +46,11 @@ bytes32 constant PROBE_RESPONSE_TYPEHASH = keccak256(
 );
 
 bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
-    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs,bytes32 redirect)"
+    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs,bytes32 redirect)"
 );
 ```
 
-The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `CapacityBond` or `PaymentChannel`. This prevents cross-contract signature replay.
+The `SlashJudge` contract uses its own EIP-712 domain separator, not shared with `CapacityBond` or `PaymentPool`. This prevents cross-contract signature replay.
 
 ```solidity
 EIP712Domain({
@@ -258,7 +258,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - The slash key is the operator's Ethereum address, bound to the NodeId by `registerNode`; no additional identity field is required for attribution.
 - Exposes the region-scope read surface consumed by blacklist challenges (see [§ Blacklist violation](#blacklist-violation) item 7): `NodeInfo.regionHint`, `regionPrev`, `regionLastChanged`, and the governable `REGION_STABILITY_WINDOW`, read together through `ICapacityBondRegionView.regionScopeData(operator)`. A single narrow view keeps the scope predicate off `CapacityBond`'s own runtime-size budget.
 
-**PaymentChannel ([ADR 003](003-payments.md#adr-003-payment-model)):**
+**PaymentPool ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
 - No changes. Slashing and payment pools are independent by design.
 

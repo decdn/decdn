@@ -134,11 +134,11 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 #### Client NodeId Rotation (P-21)
 
-**Available capability:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents production rotation: generate a new iroh key, reconnect, and sign a fresh `BindNodeId` with the same Ethereum key. Open payment pools remain valid because they are keyed by `(owner_ethereum_address, channelNonce)`, not by NodeId. Rotation is not supported for PoC — deleting the key file and restarting generates a new identity, but that is a side effect, not a rotation procedure.
+**Available capability:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents production rotation: generate a new iroh key, reconnect, and sign a fresh `BindNodeId` with the same Ethereum key. Open payment pools remain valid because they are keyed by `(owner_ethereum_address, poolNonce)`, not by NodeId. Rotation is not supported for PoC — deleting the key file and restarting generates a new identity, but that is a side effect, not a rotation procedure.
 
 **Privacy effect:** Rotation replaces the stable transport identifier, obscuring cross-session correlation by non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery, and so never see a `StreamRequest`. It does not help against a T1 passive observer: P-21 is a T2 surface because the iroh identity is exchanged under TLS handshake encryption, leaving only the ALPN visible in the clear (P-04), so a passive observer correlates by IP regardless of rotation.
 
-**Limitation:** Rotation does not provide cross-session unlinkability. Every request carries `channel_id = keccak256(owner, channelNonce)` ([ADR 003](003-payments.md#adr-003-payment-model)) in the base `StreamRequest`, and the serving node must resolve the signer's Ethereum address to attribute vouchers and redeem them on-chain — from the on-chain binding for a registered client, or from the `ethereum_address` field in `StreamRequestExt` for an off-chain one ([ADR 005](005-protocol.md#adr-005-wire-protocol)). A T1 observer then correlates that address across public payment-pool activity. This limitation is scale-independent because every serving relationship exposes the stable payment identity regardless of node count.
+**Limitation:** Rotation does not provide cross-session unlinkability. Every request carries `pool_id = keccak256(owner, poolNonce)` ([ADR 003](003-payments.md#adr-003-payment-model)) in the base `StreamRequest`, and the serving node must resolve the signer's Ethereum address to attribute vouchers and redeem them on-chain — from the on-chain binding for a registered client, or from the `ethereum_address` field in `StreamRequestExt` for an off-chain one ([ADR 005](005-protocol.md#adr-005-wire-protocol)). A T1 observer then correlates that address across public payment-pool activity. This limitation is scale-independent because every serving relationship exposes the stable payment identity regardless of node count.
 
 **Disposition:** Accept. P-02 is what defeats rotation — the payment model requires a stable client address visible to both the serving node and any on-chain observer — and the remaining non-serving-prober benefit is already leaked as content demand through the accepted P-08 and P-10 surfaces. Production rotation remains an optional identity-lifecycle capability, not a privacy roadmap commitment.
 
@@ -160,7 +160,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 **Disposition:** Defer post-mainnet. Revisit only if content access pattern privacy becomes a product requirement.
 
-#### Payment Channel Mixing (Not Recommended)
+#### Payment Pool Mixing (Not Recommended)
 
 **Purpose:** Break the on-chain link between client and provider Ethereum addresses.
 
@@ -175,7 +175,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 | 1 | Client iroh key encryption ([§ Client iroh Key Encryption (P-18)](#client-iroh-key-encryption-p-18)) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
 | 2 | Operational RPC guidance ([§ Operational RPC Guidance (P-15)](#operational-rpc-guidance-p-15)) | Pre-mainnet | Minimal | Medium — documents trust boundary as privacy concern |
 | 3 | Dummy probes ([§ Dummy Probes (Not Recommended)](#dummy-probes-not-recommended)) | Post-mainnet | Medium | Low — probes are public by design |
-| 4 | Payment channel mixing ([§ Payment Channel Mixing (Not Recommended)](#payment-channel-mixing-not-recommended)) | Post-mainnet | High | Medium — requires regulatory analysis first |
+| 4 | Payment pool mixing ([§ Payment Pool Mixing (Not Recommended)](#payment-pool-mixing-not-recommended)) | Post-mainnet | High | Medium — requires regulatory analysis first |
 
 ## Consequences
 

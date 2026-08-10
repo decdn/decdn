@@ -121,8 +121,8 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Slash percentage (per offense) | CapacityBond | 5% | 50% |
 | Multiaddr update cooldown | CapacityBond | 0 (disabled) | 86400 seconds (1 day) |
 | Max multiaddr size | CapacityBond | 64 bytes | 1024 bytes |
-| Dispute window (default: 48h) | PaymentChannel | 48 hours | 72 hours (3 days) |
-| Rate floor | PaymentChannel | 1 base unit | `MAX_RATE_PER_MB` (10^12, the [ADR 005](005-protocol.md#adr-005-wire-protocol) wire cap) |
+| Dispute window (default: 48h) | PaymentPool | 48 hours | 72 hours (3 days) |
+| Rate floor | PaymentPool | 1 base unit | `MAX_RATE_PER_MB` (10^12, the [ADR 005](005-protocol.md#adr-005-wire-protocol) wire cap) |
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | CapacityBond | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
@@ -131,7 +131,7 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
 | Max evidence age | SlashJudge | 1 day | 30 days |
 
-There is no settlement-time fee skim or discount-stake mechanic on the channel contract. Burn is a fixed share of the `FeeRouter` split (governable within the burn-share bound above). There is no flat minimum-stake parameter; the only TOKEN-side requirement on operators is the capacity-bond curve.
+There is no settlement-time fee skim or discount-stake mechanic on the payment contract. Burn is a fixed share of the `FeeRouter` split (governable within the burn-share bound above). There is no flat minimum-stake parameter; the only TOKEN-side requirement on operators is the capacity-bond curve.
 
 The 7-day voting period balances responsiveness with participation. Combined with the 1-day voting delay and the 48-hour timelock, the total governance delay is ~10 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting operator-class participation cadence.
 
