@@ -275,15 +275,25 @@ impl StagedNodeKey {
     /// Returns the archive path if a prior key was moved aside, or `None` when
     /// there was nothing to archive (fresh install).
     ///
+    /// Takes `&mut self` rather than `self` **so a failed commit does not
+    /// destroy the key**. Consuming `self` meant the `?` below dropped the
+    /// stage with `committed == false`, and `Drop` deleted the temp — on a
+    /// caller path (`decdn node rotate-key`) that only reaches this call after
+    /// proving on-chain that the binding moved to this key. The caller must
+    /// stay able to [`Self::keep`] it instead. The cost is that a caller can
+    /// now observe a committed stage; `commit` is idempotent-safe in that a
+    /// second call would simply fail on the already-renamed temp.
+    ///
     /// # Errors
     ///
     /// Returns an error if archiving the prior key or the install rename fails.
     /// The commit is **fail-safe** via [`install_staged`]: if the install rename
     /// fails after the prior key was archived, the archive is restored
     /// (best-effort) so the old key stays live, and the error states whether the
-    /// restore succeeded or `node.secret` is now missing. On any error the staged
-    /// temp is removed by the `Drop` handler (`committed` stays `false`).
-    pub fn commit(mut self) -> anyhow::Result<Option<PathBuf>> {
+    /// restore succeeded or `node.secret` is now missing. On error `committed`
+    /// stays `false`, so the caller may still [`Self::keep`] the staged key —
+    /// and if it does not, `Drop` reclaims the temp.
+    pub fn commit(&mut self) -> anyhow::Result<Option<PathBuf>> {
         let bak = install_staged(&self.tmp, &self.final_path)?;
         self.committed = true;
         Ok(bak)
@@ -293,42 +303,54 @@ impl StagedNodeKey {
     /// `<data_dir>/node.secret.pending.<node_id>`. Returns the path it landed at.
     ///
     /// The third outcome, between [`Self::commit`] and the `Drop` that discards
-    /// an abandoned stage. It exists for one situation: a key-rotation
-    /// transaction was broadcast but its receipt could not be read, so whether
-    /// the chain now names this key is **unknown**. Discarding the secret there
-    /// is unrecoverable — if the transaction did land, the operator is bound to
-    /// an identity whose private key no longer exists anywhere, and the daemon
-    /// keeps serving under a key nothing binds. Installing it is equally wrong,
-    /// because the transaction may instead have failed.
+    /// an abandoned stage. It exists for one situation, reached three ways: a
+    /// key-rotation transaction may have taken effect, but the caller cannot
+    /// confirm the binding moved — the receipt could not be read at all, or it
+    /// mined carrying no matching `NodeIdBound`, or it mined and the install of
+    /// the confirmed key then failed. Whether the chain now names this key is
+    /// **unknown** in the first two, and *known* in the third — where the key is
+    /// even more valuable. Discarding the secret there is unrecoverable — if the
+    /// transaction did land, the operator is bound to an identity whose private
+    /// key no longer exists anywhere, and the daemon keeps serving under a key
+    /// nothing binds. Installing it is equally wrong, because the transaction
+    /// may instead have failed.
     ///
     /// So the key is parked under a name that is deliberately *not*
-    /// `node.secret`: no daemon will load it, and the operator can install it
-    /// once they have checked whether the transaction confirmed.
+    /// `node.secret`: no daemon will load it (`load_or_generate` reads exactly
+    /// `<data_dir>/node.secret`), and the operator can install it once they have
+    /// checked whether the transaction confirmed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the rename fails. On any error the `Drop` handler
-    /// still removes the temp — a key that could not be parked is no more
-    /// recoverable than one that was discarded, and leaving key material at an
-    /// unadvertised temp path would be worse than either.
+    /// Returns an error if the destination has no parent directory, or if the
+    /// rename fails. In **both** cases the staged temp is deliberately left in
+    /// place and its path is named in the error, rather than being reclaimed by
+    /// `Drop`: this is only ever called when the key may already be bound
+    /// on-chain, so an awkwardly-named surviving file beats an unrecoverable
+    /// identity. The caller is expected to print that path.
     pub fn keep(mut self) -> anyhow::Result<PathBuf> {
+        // Set FIRST, not after the rename: every exit from here on must leave
+        // the temp on disk. The success path renames it (so `Drop` must not
+        // chase the old path), and both failure paths need it preserved for the
+        // reason in the doc above. This is the inverse of `commit`, where a
+        // failure means the key is genuinely worthless.
+        self.committed = true;
         let parent = self.final_path.parent().ok_or_else(|| {
             anyhow!(
-                "staged key path has no parent directory: {}",
-                self.final_path.display()
+                "staged key path has no parent directory: {}; the staged key is at {}",
+                self.final_path.display(),
+                self.tmp.display()
             )
         })?;
         let dest = parent.join(format!("{KEY_FILE_NAME}.pending.{}", self.key.public()));
         fs::rename(&self.tmp, &dest).with_context(|| {
             format!(
-                "failed to park the staged node key at {} (it will be discarded)",
-                dest.display()
+                "failed to park the staged node key at {}; it has been LEFT IN PLACE at {} — \
+                 move it there yourself before starting the node",
+                dest.display(),
+                self.tmp.display()
             )
         })?;
-        // Only after the rename succeeds: `Drop` must still clean up the temp if
-        // the rename failed, and must NOT try to delete a path it no longer owns
-        // if it succeeded.
-        self.committed = true;
         Ok(dest)
     }
 }
@@ -595,6 +617,123 @@ mod tests {
         #[cfg(unix)]
         chmod(dir.path(), 0o700)?;
         Ok(dir)
+    }
+
+    /// Every `*.tmp.*` staging file left in `dir`.
+    fn tmp_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|e| {
+                let p = e.expect("dir entry").path();
+                let name = p.file_name()?.to_str()?.to_string();
+                name.contains(".tmp.").then_some(p)
+            })
+            .collect()
+    }
+
+    /// The core `keep()` contract, and the one that fails silently if the
+    /// `committed`-flag ordering ever regresses: `keep` would still return
+    /// `Ok(path)` and the caller would still print "preserved at …", pointing
+    /// at a file `Drop` had just deleted.
+    #[test]
+    fn keep_parks_the_key_and_it_survives_drop() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let staged = stage_node_key(dir.path())?;
+        let public = staged.public();
+
+        let parked = staged.keep()?;
+        // `staged` is consumed and dropped by here — this is the assertion.
+        assert!(parked.exists(), "the parked key must outlive the stage");
+        assert_eq!(
+            parked.file_name().and_then(|s| s.to_str()),
+            Some(format!("{KEY_FILE_NAME}.pending.{public}").as_str()),
+        );
+        assert!(
+            !key_path(dir.path()).exists(),
+            "parking must NOT install the key as node.secret — the whole point \
+             is that no daemon loads it"
+        );
+        assert!(tmp_files(dir.path()).is_empty(), "no staging litter");
+
+        // The parked bytes must be the secret for the id in the filename, or
+        // "move this over node.secret" bricks the node.
+        let bytes = fs::read(&parked)?;
+        let raw: [u8; KEY_LEN] = bytes.as_slice().try_into().expect("32 raw bytes");
+        assert_eq!(SecretKey::from_bytes(&raw).public(), public);
+        Ok(())
+    }
+
+    /// The inverse of `commit`'s policy: `keep` is only ever called when the key
+    /// may already be bound on-chain, so a failure must leave the material on
+    /// disk and name it, not reclaim it.
+    #[test]
+    fn keep_leaves_the_temp_in_place_when_the_rename_fails() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let staged = stage_node_key(dir.path())?;
+        let tmp = staged.tmp.clone();
+
+        // Make the destination un-renameable by putting a *directory* where the
+        // parked file would go. `fs::rename` of a file onto a non-empty dir path
+        // fails on every platform we target.
+        let dest = dir
+            .path()
+            .join(format!("{KEY_FILE_NAME}.pending.{}", staged.public()));
+        fs::create_dir(&dest)?;
+        fs::write(dest.join("occupied"), b"x")?;
+
+        let err = staged
+            .keep()
+            .expect_err("rename onto a non-empty dir fails");
+        assert!(
+            tmp.exists(),
+            "a key that may already be bound on-chain must not be deleted when parking fails"
+        );
+        assert!(
+            format!("{err:#}").contains(&tmp.display().to_string()),
+            "the error must name the surviving path: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// A stage that is neither committed nor kept must leave nothing behind —
+    /// the pre-existing `Drop` contract, stated directly now that there is a
+    /// third outcome it has to stay distinct from.
+    #[test]
+    fn an_abandoned_stage_leaves_nothing() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        drop(stage_node_key(dir.path())?);
+        assert!(tmp_files(dir.path()).is_empty());
+        assert!(!key_path(dir.path()).exists());
+        Ok(())
+    }
+
+    /// `commit` keeps the opposite policy to `keep`, and the difference is
+    /// deliberate: a failed install means the key was never bound on-chain, so
+    /// reclaiming it is right. Pinned so the two policies cannot be "unified"
+    /// by mistake — `keep`'s whole point is that it does NOT do this.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_commit_still_reclaims_the_temp() -> anyhow::Result<()> {
+        let dir = secure_tempdir()?;
+        let mut staged = stage_node_key(dir.path())?;
+        let tmp = staged.tmp.clone();
+        // A pre-existing `node.secret` forces `install_staged` through
+        // `move_aside` first, and a read-only data dir makes that archive
+        // rename fail — the realistic shape (a permissions problem), rather
+        // than deleting the temp, which would make the assertion vacuous.
+        fs::write(key_path(dir.path()), [0u8; KEY_LEN])?;
+        chmod(dir.path(), 0o500)?;
+
+        let failed = staged.commit();
+
+        // Restore write access BEFORE the drop, or `Drop`'s cleanup is the
+        // thing that fails and the assertion below tests the chmod, not the
+        // policy.
+        chmod(dir.path(), 0o700)?;
+        failed.expect_err("archiving into a read-only dir must fail");
+        drop(staged);
+        assert!(!tmp.exists(), "a never-bound key is reclaimed on drop");
+        Ok(())
     }
 
     #[test]

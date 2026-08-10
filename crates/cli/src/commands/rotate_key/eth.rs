@@ -140,13 +140,27 @@ pub(crate) async fn run(
     // "may have been broadcast — re-sending is not idempotent" warning in
     // favour of a broken-pipe message. The receipt is the less important of the
     // two, so it degrades to stderr and the real error survives.
-    {
-        let mut out = io::stdout().lock();
-        if let Err(err) = write_plan(&mut out, &plan, json, &outcome, false) {
-            eprintln!("failed to write the result receipt to stdout: {err}");
+    let mut out = io::stdout().lock();
+    let written = write_plan(&mut out, &plan, json, &outcome, false);
+    drop(out);
+    match (result, written) {
+        // A failed operation outranks a failed receipt: `?`-ing the write here
+        // would let piping into `head` replace "deregisterNode reverted (tx …)"
+        // with "Broken pipe".
+        (Err(op), written) => {
+            if let Err(err) = written {
+                eprintln!("failed to write the result receipt to stdout: {err}");
+            }
+            Err(op)
         }
+        // Nothing else to report, so the receipt IS the output — a lost one
+        // must not exit 0, or a wrapper records a phase that was never recorded.
+        (Ok(()), Err(err)) => Err(err).context(
+            "the phase completed but its receipt could not be written; re-run to re-read the \
+             phase from chain state before assuming anything about what landed",
+        ),
+        (Ok(()), Ok(())) => Ok(()),
     }
-    result
 }
 
 /// Which step of the migration this invocation performs, decided from chain
@@ -589,10 +603,7 @@ async fn reonboard(
     // transacts is not provably the one that was shown and agreed to. A file
     // swapped between the two reads would otherwise migrate the identity
     // somewhere the operator never saw.
-    anyhow::ensure!(
-        new_operator == planned_operator,
-        "--new-keystore now resolves to {new_operator:#x}, but {planned_operator:#x} is the          address this migration planned and disclosed. Nothing was submitted. Re-run to          re-plan against the current keystore."
-    );
+    ensure_planned_operator(planned_operator, new_operator)?;
 
     // ADR 019 § Terms Acceptance — re-registration from a new address is a
     // FRESH registration, so it re-accepts terms. (`--key iroh` never does: a
@@ -713,7 +724,7 @@ fn key_is_reusable(bound_to: Address) -> bool {
 /// branches of the reuse-or-mint decision in [`reonboard`] share one path to
 /// disk rather than duplicating the stage/commit/error-context sequence.
 fn stage_and_install_fresh_key(data_dir: &Path, key_path: &Path) -> anyhow::Result<B256> {
-    let staged = identity::stage_node_key(data_dir)
+    let mut staged = identity::stage_node_key(data_dir)
         .with_context(|| format!("failed to stage a new node key in {}", data_dir.display()))?;
     let id = B256::from_slice(staged.public().as_bytes());
     staged.commit().with_context(|| {
@@ -723,6 +734,23 @@ fn stage_and_install_fresh_key(data_dir: &Path, key_path: &Path) -> anyhow::Resu
         )
     })?;
     Ok(id)
+}
+
+/// Refuse a re-onboarding whose keystore no longer resolves to the address the
+/// plan disclosed and the operator confirmed.
+///
+/// Pure so both directions are testable without a chain or a keystore — which
+/// matters more than usual here: this guard sits behind a confirmation prompt
+/// and a keystore decrypt, so nothing else reaches it, and its message shipped
+/// once with mangled whitespace precisely because no test ever executed it.
+fn ensure_planned_operator(planned: Address, actual: Address) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        actual == planned,
+        "--new-keystore now resolves to {actual:#x}, but {planned:#x} is the address this \
+         migration planned and disclosed. Nothing was submitted. Re-run to re-plan against the \
+         current keystore."
+    );
+    Ok(())
 }
 
 /// Refuse a `--new-keystore` that resolves to the SAME address this
@@ -976,6 +1004,112 @@ mod tests {
     fn distinct_address_migration_is_allowed() {
         ensure_distinct_operator(Address::repeat_byte(0xAA), Address::repeat_byte(0xBB))
             .expect("a genuinely different address is the whole point of this path");
+    }
+
+    /// The guard behind the confirmation prompt. Its message shipped once with
+    /// mangled whitespace precisely because nothing executed this branch.
+    #[test]
+    fn a_keystore_that_changed_after_the_plan_is_refused() {
+        let planned = Address::repeat_byte(0xAA);
+        let swapped = Address::repeat_byte(0xBB);
+        let err = ensure_planned_operator(planned, swapped)
+            .expect_err("an address the operator never saw must not transact");
+        let msg = format!("{err}");
+        assert!(msg.contains("planned and disclosed"), "{msg}");
+        assert!(msg.contains("Nothing was submitted"), "{msg}");
+        // The whitespace regression this test exists to catch.
+        assert!(
+            !msg.contains("  "),
+            "message has collapsed indentation: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_planned_keystore_is_accepted() {
+        let a = Address::repeat_byte(0xAA);
+        ensure_planned_operator(a, a).expect("the disclosed address must proceed");
+    }
+
+    /// Every transaction slot must count toward `submitted` — a landed
+    /// `approve` reported next to `submitted=false` is a standing ERC-20
+    /// allowance the operator is told was never granted.
+    #[test]
+    fn submitted_is_true_for_every_transaction_slot() {
+        let h = B256::repeat_byte(0xAB);
+        let slots = [
+            (
+                "deregister",
+                Outcome {
+                    deregister: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+            (
+                "request",
+                Outcome {
+                    request: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+            (
+                "withdraw",
+                Outcome {
+                    withdraw: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+            (
+                "approve",
+                Outcome {
+                    approve: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+            (
+                "bond",
+                Outcome {
+                    bond: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+            (
+                "declare",
+                Outcome {
+                    declare: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+            (
+                "register",
+                Outcome {
+                    register: Some(h),
+                    ..Outcome::default()
+                },
+            ),
+        ];
+        for (name, o) in slots {
+            let s = rendered(&plan(reonboard_phase()), false, &o, false);
+            assert!(
+                s.contains("submitted=true"),
+                "a landed {name} must count as submitted: {s}"
+            );
+        }
+    }
+
+    /// The opposite direction, and the more dangerous one: `new_node_id` is set
+    /// BEFORE anything is sent, so counting it would make a polling wrapper mark
+    /// a run that submitted nothing as done.
+    #[test]
+    fn a_minted_node_id_alone_is_not_a_submission() {
+        let o = Outcome {
+            new_node_id: Some(B256::repeat_byte(0xCD)),
+            ..Outcome::default()
+        };
+        let s = rendered(&plan(reonboard_phase()), false, &o, false);
+        assert!(
+            s.contains("submitted=false"),
+            "an identity is not a tx: {s}"
+        );
     }
 
     /// The tier is destroyed by the call being confirmed and cannot be read

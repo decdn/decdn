@@ -58,7 +58,7 @@ pub fn key_gen(args: &cli::KeyGenArgs) -> anyhow::Result<()> {
     // COMMIT (archive-old + atomic rename), so a failure generating the second
     // secret leaves the first untouched rather than mismatched. If
     // `stage_keystore` fails, `staged_key` drops and its temp is cleaned up.
-    let staged_key = identity::stage_node_key(&output_dir)?;
+    let mut staged_key = identity::stage_node_key(&output_dir)?;
     let staged_keystore = eth_identity::stage_keystore(&output_dir, &password)?;
 
     // Commit phase: only fast metadata ops (archive + atomic rename) run here —

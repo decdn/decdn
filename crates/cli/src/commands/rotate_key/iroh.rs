@@ -82,7 +82,7 @@ pub(crate) async fn run(
     // Stage (or load, or preview-in-memory) the key BEFORE the nonce reads:
     // `registrationNonce` is keyed on the id being bound, so the id has to
     // exist first.
-    let new_key = NewKey::acquire(
+    let mut new_key = NewKey::acquire(
         &resolved.data_dir,
         args.bind_existing,
         args.chain.common.dry_run,
@@ -101,8 +101,16 @@ pub(crate) async fn run(
     let json = args.chain.common.json;
     if args.chain.common.dry_run {
         let mut out = io::stdout().lock();
-        write_plan(&mut out, &plan, json, None, None, true, false)
-            .context("failed to write dry-run output")?;
+        write_plan(
+            &mut out,
+            &plan,
+            json,
+            &RunOutcome {
+                dry_run: true,
+                ..RunOutcome::default()
+            },
+        )
+        .context("failed to write dry-run output")?;
         // `new_key` drops here. For `--bind-existing` nothing was ever staged;
         // otherwise it is a `Preview` that never touched disk in the first
         // place — so a preview leaves `node.secret` AND the data dir exactly
@@ -143,14 +151,16 @@ pub(crate) async fn run(
             // hash yet may still have reached the mempool. Whenever the bind may
             // have landed, the staged secret must survive — dropping it here is
             // what makes the failure unrecoverable rather than merely annoying.
-            let parked = park_key_if_effected(new_key, &outcome, &plan);
+            let parked = park_key_if_effected(&mut new_key, &outcome, &plan);
             report(
                 &plan,
                 json,
-                outcome.tx().as_ref(),
-                None,
-                parked.as_deref(),
-                false,
+                &RunOutcome {
+                    tx: outcome.tx().as_ref(),
+                    maybe_effected: outcome.maybe_effected(),
+                    parked: parked.as_deref(),
+                    ..RunOutcome::default()
+                },
             );
             return Err(err);
         }
@@ -161,72 +171,157 @@ pub(crate) async fn run(
     // the operator with nothing to check on a block explorer.
     let tx = receipt.transaction_hash;
 
+    let archived = gate_and_install(&receipt, &plan, json, tx, &mut new_key)?;
+
+    // The success path does NOT go through `report`, deliberately. `report`
+    // degrades a failed stdout write to stderr so it cannot bury an operation
+    // error — but here there is no operation error, and the receipt is the only
+    // output. Swallowing the write failure would exit 0 having lost `bind_tx`
+    // (the handle for reconciling the on-chain change) and `archived_key` (the
+    // rollback artifact the runbook §5 names), which is precisely the "reported
+    // success that was not recorded" this command must never produce.
+    let mut out = io::stdout().lock();
+    write_plan(
+        &mut out,
+        &plan,
+        json,
+        &RunOutcome {
+            tx: Some(&tx),
+            maybe_effected: true,
+            archived: archived.as_deref(),
+            key_installed: true,
+            ..RunOutcome::default()
+        },
+    )
+    .with_context(|| {
+        format!(
+            "the rotation COMPLETED (tx {tx:#x}, now bound to {:#x}) but its receipt could not \
+             be written; the on-chain change stands and is not recorded here",
+            plan.new_node_id,
+        )
+    })?;
+    Ok(())
+}
+
+/// Verify the receipt actually moved the binding, then install the key.
+///
+/// Extracted from `run` because both of its failure arms share one obligation
+/// that is easy to get wrong: the transaction has **mined**, so the key must be
+/// preserved rather than dropped, and the receipt must be written before the
+/// error propagates. Keeping them in one place is what stops the two arms from
+/// drifting apart — which is exactly how the commit arm ended up as the only
+/// post-send path that destroyed the key.
+///
+/// # Errors
+///
+/// Propagates the gate failure or the install failure, in both cases annotated
+/// with where the new key ended up.
+fn gate_and_install(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    plan: &Plan,
+    json: bool,
+    tx: B256,
+    new_key: &mut NewKey,
+) -> anyhow::Result<Option<PathBuf>> {
     // Runbook step 5 verifies the `NodeIdBound` event, and here that check is
     // load-bearing rather than ceremonial: it is the gate on replacing
     // `node.secret`. A receipt that mined without the log means the binding did
     // not move (or the deployed ABI drifted), and committing the key against it
     // is precisely how the daemon ends up unslashable.
-    if let Err(err) = confirm_bound(
-        &receipt,
-        plan.operator,
-        plan.new_node_id,
-        plan.capacity_bond,
-    ) {
+    if let Err(err) = confirm_bound(receipt, plan.operator, plan.new_node_id, plan.capacity_bond) {
         // The transaction MINED, so this is not the harmless "nothing happened"
-        // case. Either the binding did not move (log genuinely absent) or it did
-        // and the log failed to decode (ABI drift) — the two are not
-        // distinguishable from here, so park the key rather than discard a
-        // secret the chain may now be bound to.
-        let parked = park_key(new_key, &plan);
-        report(&plan, json, Some(&tx), None, parked.as_deref(), false);
-        return Err(err);
+        // case: the binding may or may not have moved. Park the key rather than
+        // discard a secret the chain may now be bound to.
+        let parked = park_key(new_key, plan);
+        report(
+            plan,
+            json,
+            &RunOutcome {
+                tx: Some(&tx),
+                maybe_effected: true,
+                parked: parked.as_deref(),
+                ..RunOutcome::default()
+            },
+        );
+        return Err(err).context(describe_key_fate(parked.as_deref(), new_key));
     }
 
-    let archived = match new_key.commit() {
-        Ok(archived) => archived,
+    match new_key.commit() {
+        Ok(archived) => Ok(archived),
         Err(err) => {
-            // The binding is confirmed moved. Report it as a real receipt — a
-            // `--json` consumer that gets empty stdout here cannot tell this
-            // from a config error that sent nothing.
-            report(&plan, json, Some(&tx), None, None, false);
-            return Err(err).with_context(|| {
-                format!(
-                    "the on-chain binding has ALREADY moved to {:#x} (tx {tx:#x}), but installing \
-                     the new node key failed. The daemon still holds the old key, which is now \
-                     unbound and cannot serve. Fix the cause below, then either re-run with \
-                     `--bind-existing` to bind whatever key is on disk, or restore the archived \
-                     key and bind that",
-                    plan.new_node_id,
-                )
-            });
+            // `confirm_bound` just PROVED `nodeIdToAddress[new_node_id] ==
+            // operator`, so this is the one post-send path where the chain
+            // definitely names this key — and it used to be the only one that
+            // destroyed it. Park it: recovery becomes a `mv` instead of a second
+            // `bindNodeId` and another binding nonce. That matters most in
+            // `install_staged`'s worst branch, which can leave `node.secret`
+            // MISSING — where `--bind-existing` would refuse for want of a key
+            // on disk.
+            let parked = park_key(new_key, plan);
+            report(
+                plan,
+                json,
+                &RunOutcome {
+                    tx: Some(&tx),
+                    maybe_effected: true,
+                    parked: parked.as_deref(),
+                    ..RunOutcome::default()
+                },
+            );
+            let fate = describe_key_fate(parked.as_deref(), new_key);
+            Err(err).context(format!(
+                "the on-chain binding has ALREADY moved to {:#x} (tx {tx:#x}), but installing the \
+                 new node key failed. The daemon still holds the old key, which is now unbound \
+                 and cannot serve. {fate}",
+                plan.new_node_id,
+            ))
         }
-    };
+    }
+}
 
-    report(&plan, json, Some(&tx), archived.as_deref(), None, true);
-    Ok(())
+/// One sentence saying where the new key ended up, for the error context on a
+/// post-send failure.
+///
+/// `None` is genuinely three different states, and conflating them is how an
+/// operator ends up hunting for a file that does not exist: under
+/// `--bind-existing` there was never a separate key to preserve, while a failed
+/// `park_key` means there WAS one and it could not be moved. The caller cannot
+/// tell them apart from the `Option` alone, so the key itself is consulted.
+fn describe_key_fate(parked: Option<&Path>, key: &NewKey) -> String {
+    match parked {
+        Some(p) => format!(
+            "The new key is preserved at {} — move it over `node.secret` to finish the rotation \
+             with no further transaction.",
+            p.display()
+        ),
+        None if !key.generated() => {
+            "No separate key was involved: `--bind-existing` binds the key already at \
+             `node.secret`, which is untouched."
+                .to_string()
+        }
+        None => "The new key could NOT be preserved (see stderr); re-run to bind a fresh one."
+            .to_string(),
+    }
 }
 
 /// Write the outcome to stdout, reporting a write failure to stderr rather than
 /// returning it.
 ///
-/// Every call site is on a path that already has something more important to
-/// say — a send error, a failed gate, a transaction that may be in flight. If
+/// Every call site is on a path that already carries an error — a failed send,
+/// a failed gate, a failed install. That is the precondition for this
+/// degradation, and it is why the success path deliberately does NOT use this
+/// helper: there the receipt is the only output, so losing it must fail the
+/// command rather than exit 0. If
 /// the stdout write is allowed to `?`, it *replaces* that error: piping this
 /// command into `head` is enough to turn "the transaction may have been
 /// broadcast; re-sending is not idempotent" into "Broken pipe". The receipt is
 /// the less important of the two, so it degrades and the real error survives.
-fn report(
-    plan: &Plan,
-    json: bool,
-    tx: Option<&B256>,
-    archived: Option<&Path>,
-    parked: Option<&Path>,
-    persisted: bool,
-) {
+fn report(plan: &Plan, json: bool, o: &RunOutcome<'_>) {
     let mut out = io::stdout().lock();
-    if let Err(err) = write_plan(&mut out, plan, json, tx, archived, false, persisted) {
+    if let Err(err) = write_plan(&mut out, plan, json, o) {
         eprintln!("failed to write the result receipt to stdout: {err}");
     }
+    let parked = o.parked;
     if let Some(path) = parked {
         eprintln!(
             "the newly generated node key was NOT installed, but has been preserved at {}. \
@@ -241,9 +336,12 @@ fn report(
 /// Park the staged key when the transaction may have taken effect; discard it
 /// (via `Drop`) when it definitively did not.
 ///
-/// A `Rejected` send never reached the mempool, so the key is genuinely
-/// worthless and preserving it would only litter the data dir with key material.
-fn park_key_if_effected(key: NewKey, outcome: &SendOutcome, plan: &Plan) -> Option<PathBuf> {
+/// `maybe_effected()` is false for `NotSent`, `Rejected` (never reached the
+/// mempool) and `Reverted` (mined, but moved no state — the sharper case, since
+/// it burned gas yet left `nodeIdToAddress` untouched). In all three the key is
+/// genuinely worthless, and preserving it would only litter the data dir with
+/// key material.
+fn park_key_if_effected(key: &mut NewKey, outcome: &SendOutcome, plan: &Plan) -> Option<PathBuf> {
     if !outcome.maybe_effected() {
         return None;
     }
@@ -252,9 +350,12 @@ fn park_key_if_effected(key: NewKey, outcome: &SendOutcome, plan: &Plan) -> Opti
 
 /// Preserve a generated-but-uninstalled key, reporting a failure to stderr.
 ///
-/// Returns `None` when there was nothing to preserve — `--bind-existing` binds a
-/// key that is already at `node.secret`, and a `Preview` never reaches a send.
-fn park_key(key: NewKey, plan: &Plan) -> Option<PathBuf> {
+/// Returns `None` in three distinguishable situations, which is why callers
+/// consult the key itself (see `describe_key_fate`) rather than this `Option`
+/// alone: `--bind-existing` binds a key already at `node.secret`, a `Preview`
+/// never reaches a send, and — the one that matters — parking may have *failed*,
+/// in which case there was something to preserve and the error is on stderr.
+fn park_key(key: &mut NewKey, plan: &Plan) -> Option<PathBuf> {
     match key.park() {
         Ok(path) => path,
         Err(err) => {
@@ -394,7 +495,7 @@ impl NewKey {
     /// `Preview` only exists on the `--dry-run` branch of `run`, which returns
     /// before this is ever called, so reaching this arm means that invariant
     /// broke — worth a clear error over an anti-panic-policy violation.
-    fn commit(self) -> anyhow::Result<Option<PathBuf>> {
+    fn commit(&mut self) -> anyhow::Result<Option<PathBuf>> {
         match self {
             Self::Staged(k) => k.commit(),
             Self::Existing(_) => Ok(None),
@@ -416,9 +517,24 @@ impl NewKey {
     /// # Errors
     ///
     /// Propagates a failure to rename the staged temp into place.
-    fn park(self) -> anyhow::Result<Option<PathBuf>> {
+    fn park(&mut self) -> anyhow::Result<Option<PathBuf>> {
         match self {
-            Self::Staged(k) => k.keep().map(Some),
+            // `keep` consumes the stage, so swap in a throwaway `Preview` to
+            // move it out. The enum is dropped by the caller immediately after;
+            // the placeholder exists only to satisfy ownership, and `Preview`
+            // is the arm with no side effects on drop.
+            Self::Staged(_) => {
+                let taken =
+                    std::mem::replace(self, Self::Preview(Box::new(identity::fresh_secret_key())));
+                match taken {
+                    Self::Staged(k) => k.keep().map(Some),
+                    // Unreachable: the outer match arm already proved `Staged`.
+                    other => {
+                        *self = other;
+                        Ok(None)
+                    }
+                }
+            }
             Self::Existing(_) | Self::Preview(_) => Ok(None),
         }
     }
@@ -581,7 +697,17 @@ fn confirm_bound(
     new_node_id: B256,
     capacity_bond: Address,
 ) -> anyhow::Result<()> {
-    let found = receipt
+    // Shape-matched but undecodable is a DIFFERENT diagnosis from absent, and
+    // the two imply opposite recoveries — so partition rather than filter. A log
+    // from this registry carrying this exact event signature that still fails to
+    // decode can only be ABI drift, and drift means the binding very likely DID
+    // move. Absence means it did not. Discarding the distinction (which the old
+    // `.filter_map(…ok())` did) forced the operator to go to a block explorer
+    // for something already in hand.
+    let mut shape_matched = 0usize;
+    let mut decode_error: Option<String> = None;
+    let mut found = false;
+    for log in receipt
         .inner
         .logs()
         .iter()
@@ -591,17 +717,45 @@ fn confirm_bound(
         // not good enough to install a key against.
         .filter(|log| log.address() == capacity_bond)
         .filter(|log| log.topic0() == Some(&CapacityBond::NodeIdBound::SIGNATURE_HASH))
-        .filter_map(|log| log.log_decode::<CapacityBond::NodeIdBound>().ok())
-        .any(|log| log.inner.data.ethAddress == operator && log.inner.data.nodeId == new_node_id);
-    anyhow::ensure!(
-        found,
-        "bindNodeId mined but its receipt carried no NodeIdBound log from {capacity_bond:#x} for \
-         {operator:#x} → {new_node_id}. Either the binding did not move, or the deployed \
-         CapacityBond ABI has drifted from this CLI — the two are not distinguishable from here, \
-         so the new node key was NOT installed and has been preserved separately. Check the \
-         transaction on a block explorer before retrying."
+    {
+        shape_matched += 1;
+        match log.log_decode::<CapacityBond::NodeIdBound>() {
+            Ok(decoded) => {
+                if decoded.inner.data.ethAddress == operator
+                    && decoded.inner.data.nodeId == new_node_id
+                {
+                    found = true;
+                    break;
+                }
+            }
+            Err(err) => {
+                decode_error.get_or_insert_with(|| err.to_string());
+            }
+        }
+    }
+    if found {
+        return Ok(());
+    }
+    let diagnosis = decode_error.map_or_else(
+        || {
+            "No NodeIdBound log was emitted at all, so the binding did NOT move — the key that \
+             was preserved can be deleted."
+                .to_string()
+        },
+        |err| {
+            format!(
+                "{shape_matched} NodeIdBound log(s) from this registry failed to decode ({err}), \
+                 which is an ABI drift between this CLI and the deployed CapacityBond — the \
+                 binding most likely DID move. Upgrade the CLI and re-check before deleting the \
+                 preserved key."
+            )
+        },
     );
-    Ok(())
+    anyhow::bail!(
+        "bindNodeId mined but its receipt carried no matching NodeIdBound log from \
+         {capacity_bond:#x} for {operator:#x} → {new_node_id}. {diagnosis} The new node key was \
+         NOT installed."
+    )
 }
 
 /// The consequence disclosure, pure so its wording is pinned by a test.
@@ -666,11 +820,16 @@ pub(crate) fn write_plan(
     w: &mut impl io::Write,
     p: &Plan,
     json: bool,
-    tx: Option<&B256>,
-    archived: Option<&Path>,
-    dry_run: bool,
-    key_persisted: bool,
+    o: &RunOutcome<'_>,
 ) -> io::Result<()> {
+    let RunOutcome {
+        tx,
+        maybe_effected,
+        archived,
+        parked,
+        dry_run,
+        key_installed,
+    } = *o;
     // "The id above names a key that is NOT this node's identity on disk."
     //
     // Derived from whether the key was actually persisted, NOT from `dry_run`:
@@ -681,12 +840,21 @@ pub(crate) fn write_plan(
     //
     // `--bind-existing` is never a preview: the key it names is already
     // `node.secret`, whether or not the transaction succeeded.
-    let preview_key = p.generated && !key_persisted;
+    let preview_key = p.generated && !key_installed;
+    // Three states, not two. `tx.is_some()` is false both for "never sent" and
+    // for `MaybeBroadcast` — a transport failure that may still have put the
+    // transaction in the mempool. Collapsing them told a `--json` wrapper
+    // "nothing happened" on the one path that also parks a key, inviting a
+    // re-run that double-submits over the same binding nonce.
+    let in_flight_unknown = maybe_effected && tx.is_none();
     let tx_hex = tx.map(|v| format!("{v:#x}"));
     let archived_str = archived.map(|a| a.display().to_string());
+    let parked_str = parked.map(|a| a.display().to_string());
     if json {
         let value = serde_json::json!({
             "submitted": tx.is_some(),
+            "maybe_broadcast": in_flight_unknown,
+            "parked_key": parked_str,
             "dry_run": dry_run,
             "key": "iroh",
             "capacity_bond": format!("{:#x}", p.capacity_bond),
@@ -721,13 +889,49 @@ pub(crate) fn write_plan(
     writeln!(w, "ed25519_sig=0x{}", alloy::hex::encode(&p.ed25519_sig))?;
     match tx_hex {
         Some(h) => writeln!(w, "bind_tx={h}")?,
+        // Deliberately not `skipped`: the transaction may be in the mempool.
+        None if in_flight_unknown => writeln!(w, "bind_tx=unknown")?,
         None => writeln!(w, "bind_tx=skipped")?,
     }
     match archived_str {
         Some(a) => writeln!(w, "archived_key={a}")?,
         None => writeln!(w, "archived_key=none")?,
     }
-    writeln!(w, "submitted={} dry_run={dry_run}", tx.is_some())
+    match parked_str {
+        Some(a) => writeln!(w, "parked_key={a}")?,
+        None => writeln!(w, "parked_key=none")?,
+    }
+    let submitted = if tx.is_some() {
+        "true"
+    } else if in_flight_unknown {
+        "unknown"
+    } else {
+        "false"
+    };
+    writeln!(w, "submitted={submitted} dry_run={dry_run}")
+}
+
+/// What actually happened, for the receipt renderer.
+///
+/// A struct rather than more positional parameters: the fields are all
+/// `Option`s and `bool`s of similar type, and the call sites differ from each
+/// other in exactly the ways that matter most to get right.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RunOutcome<'a> {
+    /// The transaction hash, when one is known.
+    pub(crate) tx: Option<&'a B256>,
+    /// `SendOutcome::maybe_effected()` — the send may have taken effect. NOT
+    /// the same as `tx.is_some()`: `MaybeBroadcast` is `true` here with no hash.
+    pub(crate) maybe_effected: bool,
+    /// Where the previous `node.secret` was archived, on a successful install.
+    pub(crate) archived: Option<&'a Path>,
+    /// Where a generated-but-uninstalled key was preserved.
+    pub(crate) parked: Option<&'a Path>,
+    pub(crate) dry_run: bool,
+    /// The new key is installed **as `node.secret`** — not merely written to
+    /// disk. A parked key is persisted and still not the node's identity, which
+    /// is why this is not called `key_persisted`.
+    pub(crate) key_installed: bool,
 }
 
 #[cfg(test)]
@@ -862,6 +1066,70 @@ mod tests {
             .expect("a matching log must be found even when others precede it");
     }
 
+    /// `stage_node_key` enforces a `0o700` data dir, and `tempfile` honours the
+    /// ambient umask (commonly `0o755`), so tests must tighten it first.
+    fn secure_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700");
+        }
+        dir
+    }
+
+    /// The decision that governs whether irreplaceable key material survives.
+    /// Inverting it — or letting a future `SendOutcome` variant drift into
+    /// `maybe_effected` — silently destroys the key for a real broadcast.
+    #[test]
+    fn park_preserves_the_key_exactly_when_the_send_may_have_landed() {
+        let h = B256::repeat_byte(0xAB);
+        let park = [
+            SendOutcome::MaybeBroadcast,
+            SendOutcome::InFlight(h),
+            SendOutcome::Confirmed(h),
+        ];
+        let discard = [
+            SendOutcome::NotSent,
+            SendOutcome::Rejected,
+            SendOutcome::Reverted(h),
+        ];
+
+        for outcome in park {
+            let tmp = secure_tempdir();
+            let mut key = NewKey::Staged(Box::new(
+                identity::stage_node_key(tmp.path()).expect("stage"),
+            ));
+            let parked = park_key_if_effected(&mut key, &outcome, &plan(true, true));
+            assert!(
+                parked.as_deref().is_some_and(Path::exists),
+                "{outcome:?} may have landed; the key must be parked and on disk"
+            );
+        }
+
+        for outcome in discard {
+            let tmp = secure_tempdir();
+            let mut key = NewKey::Staged(Box::new(
+                identity::stage_node_key(tmp.path()).expect("stage"),
+            ));
+            assert!(
+                park_key_if_effected(&mut key, &outcome, &plan(true, true)).is_none(),
+                "{outcome:?} definitively did not take effect; the key is worthless"
+            );
+        }
+    }
+
+    /// Both non-staged arms have nothing to preserve, for different reasons —
+    /// and neither is a failure.
+    #[test]
+    fn park_is_a_noop_for_a_key_that_was_never_staged() {
+        let mut existing = NewKey::Existing(Box::new(identity::fresh_secret_key()));
+        assert!(existing.park().expect("no-op").is_none());
+        let mut preview = NewKey::Preview(Box::new(identity::fresh_secret_key()));
+        assert!(preview.park().expect("no-op").is_none());
+    }
+
     /// A `--dry-run` preview of a fresh key must not create `data_dir`, let
     /// alone write into it — the bug the FS side effect was: `stage_node_key`
     /// eagerly creates the directory via `ensure_data_dir` even though its
@@ -886,7 +1154,7 @@ mod tests {
     /// because nothing should ever call `commit` on one.
     #[test]
     fn preview_key_refuses_to_commit() {
-        let key = NewKey::Preview(Box::new(identity::fresh_secret_key()));
+        let mut key = NewKey::Preview(Box::new(identity::fresh_secret_key()));
         // Signing must still work — a dry run's printed signatures are real.
         let _ = key.sign(b"digest");
         key.commit().expect_err("a preview must never be committed");
@@ -940,8 +1208,18 @@ mod tests {
         key_persisted: bool,
     ) -> String {
         let mut buf = Vec::new();
-        write_plan(&mut buf, p, json, tx, None, dry_run, key_persisted)
-            .expect("write to a Vec cannot fail");
+        write_plan(
+            &mut buf,
+            p,
+            json,
+            &RunOutcome {
+                tx,
+                dry_run,
+                key_installed: key_persisted,
+                ..RunOutcome::default()
+            },
+        )
+        .expect("write to a Vec cannot fail");
         String::from_utf8(buf).expect("output is ASCII")
     }
 

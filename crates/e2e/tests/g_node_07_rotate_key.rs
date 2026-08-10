@@ -357,7 +357,7 @@ async fn run_unbound() -> anyhow::Result<()> {
     // operator who ran `decdn key-gen --force` in a registered data dir does.
     // Staged-then-committed so the replaced key is archived, matching what the
     // real path leaves behind.
-    let staged =
+    let mut staged =
         identity::stage_node_key(node.data_dir()).context("stage a hand-swapped node key")?;
     let orphan_id = B256::from_slice(staged.public().as_bytes());
     staged.commit().context("commit the hand-swapped key")?;
@@ -521,6 +521,36 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
     .context("generate the new eth keystore")?;
     let new_keystore = decdn_incentive::eth_identity::keystore_path(new_home.path());
     chain.fund_eth(new_operator, 100).await?;
+
+    // ---- 0. A same-address `--new-keystore` is refused on the FIRST
+    // invocation, before anything is submitted.
+    //
+    // This is the whole point of validating the flag ahead of the phase
+    // branches: the guard used to sit past the early returns, so passing the
+    // node's own keystore was accepted silently here and only refused at the
+    // re-onboarding call — two weeks, a 14-day window and four transactions
+    // later, with the tier already cleared and nothing gained. Asserting the
+    // operator is still registered afterwards is what pins "refused *before*
+    // `deregisterNode`" rather than merely "refused".
+    let own_keystore = decdn_incentive::eth_identity::keystore_path(node.data_dir());
+    let same_address = run_eth_cli_raw(
+        &node,
+        &["--new-keystore", &own_keystore.display().to_string()],
+    )
+    .await?;
+    assert!(
+        !same_address.status.success(),
+        "migrating to the address being migrated away from must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&same_address.stderr).contains("SAME address"),
+        "the refusal must name the mistake: {}",
+        String::from_utf8_lossy(&same_address.stderr)
+    );
+    assert!(
+        chain.is_registered(old_operator).await?,
+        "the refusal must come BEFORE deregisterNode — nothing may have been submitted"
+    );
 
     // ---- 1. Deregister. The fixture never declared a tier, so the phase
     // reports 0 — which is exactly why the re-onboarding step below has to be

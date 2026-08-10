@@ -241,7 +241,7 @@ fn staged_commit_installs_the_staged_identity() {
     let tmp = TempDir::new().unwrap();
     fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
-    let staged_key = identity::stage_node_key(tmp.path()).unwrap();
+    let mut staged_key = identity::stage_node_key(tmp.path()).unwrap();
     let staged_keystore = eth_identity::stage_keystore(tmp.path(), TEST_PASSWORD).unwrap();
     let staged_node_id = staged_key.public();
     let staged_address = staged_keystore.address();
@@ -316,7 +316,7 @@ fn commit_restores_prior_node_key_when_install_rename_fails() {
     let node_path = tmp.path().join("node.secret");
     let original_node = fs::read(&node_path).unwrap();
 
-    let staged_key = identity::stage_node_key(tmp.path()).unwrap();
+    let mut staged_key = identity::stage_node_key(tmp.path()).unwrap();
     // Make the install rename fail (ENOENT) without touching dir perms, so the
     // best-effort restore can still succeed. `errno`-agnostic: the restore branch
     // runs on any install-rename error, so this faithfully exercises it.
