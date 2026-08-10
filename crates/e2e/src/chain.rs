@@ -2023,15 +2023,20 @@ async fn evm_revert_and_snapshot(
     evm_snapshot(provider).await
 }
 
-/// The canonical operator terms, embedded from the repo-root `TERMS.md`.
+/// The canonical operator terms, embedded from `crates/cli/TERMS.md` — the same
+/// file `decdn_cli::commands::terms::TERMS_TEXT` embeds.
 ///
-/// Duplicated from `decdn_cli::commands::terms::TERMS_TEXT` rather than shared:
-/// nothing may depend on `decdn-cli` (it is a binary sink), and moving the terms
-/// into `decdn-common` is a wider refactor than a fixture warrants. The
-/// duplication is of the *recipe*, and it is self-policing — a change to how the
-/// CLI derives its hash makes every CLI registration journey fail immediately,
-/// with the mismatch named in the error.
-const TERMS_TEXT: &str = include_str!("../../../TERMS.md");
+/// Reaching into another package's directory is legitimate here only because
+/// `decdn-e2e` is `publish = false`, which the packaging check exempts; a
+/// publishable crate doing this would ship a `.crate` missing the file.
+///
+/// Duplicated from the CLI rather than shared: nothing may depend on
+/// `decdn-cli` (it is a binary sink), and moving the terms into `decdn-common`
+/// is a wider refactor than a fixture warrants. The duplication is of the
+/// *recipe*, and it is self-policing — a change to how the CLI derives its hash
+/// makes every CLI registration journey fail immediately, with the mismatch
+/// named in the error.
+const TERMS_TEXT: &str = include_str!("../../cli/TERMS.md");
 
 /// `keccak256` of the embedded terms — the genesis `currentTermsHash` the
 /// fixture chain deploys with, and the value a CLI registration must match.
