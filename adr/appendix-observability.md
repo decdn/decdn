@@ -157,7 +157,7 @@ Metric identifiers retain the `channel` prefix (the `PaymentPool` contract name)
 | `decdn_preimages_received_total` | Counter | M | planned | Preimages accepted by this node as the payee. The per-chunk payment counter; divide by `decdn_vouchers_received_total` for the realised epoch depth. |
 | `decdn_preimages_rejected_total` | Counter | M | planned | Preimages rejected as the payee (bad chain walk, or a non-advancing index). A sustained non-zero rate means a buggy or hostile payer, not a transient fault. |
 | `decdn_lane_seed_from_chain_total` | Counter | M | planned | Lanes whose floor was seeded from the on-chain `watermark` because the local store had no record. Elevated after an unclean restart; sustained growth means the local store is not persisting. |
-| `decdn_lane_flush_lag_bytes` | Gauge | M | planned | Accepted-but-unflushed lane value, in payment-token base units, across all lanes. Bounded by one credit window by policy; a value above that means the flush is not keeping up and the replay surface has grown. |
+| `decdn_lane_flush_lag_bytes` | Gauge | M | planned | Accepted-but-unflushed delivered bytes, summed across all lanes. Policy bounds each lane at one credit window (also a byte quantity), so a reading above `credit_window_bytes` means the flush is not keeping up and the post-crash replay surface has grown past its design bound. |
 | `decdn_pool_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed claims. |
 
 #### Gossip Metrics
