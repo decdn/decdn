@@ -33,7 +33,7 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-02 | On-chain payment pools | Pool IDs, owner Ethereum address, signer and provider addresses (revealed at redemption), deposit amounts, redemption events | T1 | [003](003-payments.md#adr-003-payment-model) |
 | P-03 | On-chain staking registry | `nodeId`, `ethAddress`, `multiaddrs`, `regionHint`, registration timestamps | T1 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [architecture.md](architecture.md#architecture-overview) |
 | P-04 | ALPN protocol identification | QUIC TLS ClientHello reveals which ALPN is negotiated (`cdn/probe/v1`, `cdn/client/v1`) | T1 | [005](005-protocol.md#adr-005-wire-protocol) |
-| P-07 | Node earnings inference | Channel closures and settlement amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md#adr-003-payment-model) |
+| P-07 | Node earnings inference | Redemption and pool-close amounts are on-chain; node revenue is computable | T1 | [003](003-payments.md#adr-003-payment-model) |
 | P-08 | BLAKE3 hash as global identifier | Same content always produces the same hash; repeated requests for a hash are correlatable | T1 | [002](002-content-addressing.md#adr-002-content-addressing) |
 | P-09 | Probe content leakage | All probed nodes (the DHT-returned candidate set) learn which content hash the requester wants | T2 | [005](005-protocol.md#adr-005-wire-protocol) § Probe |
 | P-10 | Cache miss detection | Probes triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh) § Content Discovery |
@@ -63,7 +63,7 @@ On-chain data links a pool owner to the provider addresses it pays, revealed at 
 
 ##### Settlement volume leakage (P-22)
 
-At on-chain settlement the final voucher nonce and cumulative amount are public. Vouchers issued per MB (default cadence), so the nonce reveals the count of MB-sized increments. Combined with P-02 (client/provider address linkage) and public rate information, an observer computes the exact volume between a specific client-provider pair. Inherent to the on-chain dispute model — settlement amount must be public for dispute resolution.
+At each on-chain redemption the lane's cumulative amount and byte count are public. Vouchers issued per MB (default cadence), so the per-lane nonce reveals the count of MB-sized increments. Combined with P-02 (signer/provider address linkage) and public rate information, an observer computes the exact volume between a specific signer-provider pair. Inherent to on-chain settlement — redemption amounts must be public.
 
 ##### Protocol fingerprinting (P-04)
 
@@ -164,7 +164,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 **Purpose:** Break the on-chain link between client and provider Ethereum addresses.
 
-**Assessment:** Options: hub-and-spoke mixing via an intermediary, Tornado Cash-style pooling (significant regulatory risk), or disposable addresses funded from a mixer. On-chain channel data reveals less than it appears: channels are long-lived and amortized across many sessions ([ADR 003](003-payments.md#adr-003-payment-model)). The PoC is on testnet where on-chain privacy is not meaningful. Production mitigation requires regulatory analysis, out of scope for protocol design.
+**Assessment:** Options: hub-and-spoke mixing via an intermediary, Tornado Cash-style pooling (significant regulatory risk), or disposable addresses funded from a mixer. On-chain pool data reveals less than it appears: pools are long-lived and amortized across many sessions ([ADR 003](003-payments.md#adr-003-payment-model)). The PoC is on testnet where on-chain privacy is not meaningful. Production mitigation requires regulatory analysis, out of scope for protocol design.
 
 **Disposition:** Defer post-mainnet. Requires legal review before any design work.
 

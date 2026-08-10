@@ -142,17 +142,19 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 > they sit next to on an operator's dashboard. Documenting them twice is how the
 > two copies drifted apart.
 
-#### Payment Channel Metrics
+#### Payment Pool Metrics
+
+Metric identifiers retain the `channel` prefix (the `PaymentChannel` contract name); the descriptions below use the pool model.
 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
-| `decdn_channels_open` | Gauge | M | live | Currently open payment channels (as node — inbound from clients). |
-| `decdn_channels_settled_total` | Counter | M | planned | Channels settled on-chain. |
-| `decdn_channel_deposit_usdc` | Gauge | M | live | Total USDC deposited across all currently open inbound channels. Represents maximum on-chain recoverable value. |
+| `decdn_channels_open` | Gauge | M | live | Payment pools currently paying this node (inbound from clients — lanes with unredeemed vouchers). |
+| `decdn_channels_settled_total` | Counter | M | planned | On-chain redemptions by this node. |
+| `decdn_channel_deposit_usdc` | Gauge | M | live | Total USDC deposited in pools currently paying this node. Represents maximum on-chain recoverable value. |
 | `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-channel rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy channels from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
 | `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers signed by this node as the payee. |
 | `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |
-| `decdn_channel_disputes_total` | Counter | R | planned | Channels that entered the dispute window. |
+| `decdn_channel_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed vouchers. |
 
 #### Gossip Metrics
 

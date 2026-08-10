@@ -227,7 +227,7 @@ Levers, in order of preference:
 
 ## References
 
-- [ADR 003 — Payment Channels (BuybackBurner member surface)](003-payments.md#buybackburner)
+- [ADR 003 — Payment Model (BuybackBurner member surface)](003-payments.md#buybackburner)
 - [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
 - [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
 - [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics) — source of the three-bucket FeeRouter split (60/30/10), the 30% buyback share, the 10% POL allocation (group 3) within the 15% combined Liquidity-Provision category, and the POL governance bounds

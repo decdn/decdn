@@ -51,7 +51,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 | Survives rotation | Reason |
 |-------------------|--------|
 | Capacity bond | Keyed by Ethereum address ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) |
-| Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md#adr-003-payment-model)); Ethereum address unchanged |
+| Open lanes paying this node (inbound from clients) | Vouchers name the node's Ethereum `provider` address, unchanged by an iroh-key rotation; the pool id `keccak256(owner, channelNonce)` and the redemption lane are unaffected ([ADR 003](003-payments.md#adr-003-payment-model)) |
 | `firstBondedAt` | Write-once; never cleared by `deregisterNode` or auto-ejection, and `bindNodeId` does not touch it ([ADR 003 § Node Registry](003-payments.md#node-registry); [ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
 | `declaredMbps` | `bindNodeId` does not touch it, so the [§ iroh node-key rotation only](#iroh-node-key-rotation-only) path keeps the tier. The [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) path deregisters, which clears it — re-declare after re-registering ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) |
 

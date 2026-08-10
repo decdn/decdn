@@ -90,7 +90,7 @@ Clients manage two independent cryptographic keys.
 - **Storage (PoC):** File at `~/.decdn/iroh_key`, permissions `0600`. No encryption — the file contains the raw 32-byte secret key.
 - **Storage (production):** Platform keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service API).
 - **Rotation (PoC):** Not supported. Deleting the key file and restarting generates a new identity.
-- **Rotation (production):** Generate a new key, reconnect to all nodes. The old NodeId becomes unreachable. Open payment channels are unaffected — they are keyed by Ethereum address, not NodeId.
+- **Rotation (production):** Generate a new key, reconnect to all nodes. The old NodeId becomes unreachable. Open payment pools are unaffected — they are keyed by Ethereum address, not NodeId.
 
 #### Ethereum Key (secp256k1)
 
@@ -144,7 +144,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by a capability-authorized signer key. The owner controls how much it authorizes (the `spending_cap`) and — since it issues the capability — who may sign and until when (`expiry`).
 - **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. A rate mismatch vs. the probe response within 30 seconds is slashable ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
-- **Payment channel state:** On-chain, publicly verifiable. The client can always settle or dispute.
+- **Payment pool state:** On-chain, publicly verifiable. The owner can always close and reclaim; a node can always redeem its lanes.
 
 #### Trusted — the client relies on external guarantees
 
@@ -220,4 +220,4 @@ Splitting a large blob across multiple nodes and fetching byte ranges in paralle
 
 ## Download Resume
 
-A `decdn pull` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the original payment channel is still open on-chain, the client reuses it; if it is closing or settled, a new channel is opened sized for the remaining bytes only.
+A `decdn pull` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the client's pool is still open on-chain, it reuses it — the same deposit backs the resumed fetch; only if the pool is closing or closed does the client open a new one.

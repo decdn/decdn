@@ -18,7 +18,7 @@ Declared capacity (`CapacityBond.declaredMbps × age_ramp`) is operator-asserted
 
 The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
 
-The change is governance-only — no impact on payment-channel mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), on the three-bucket fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), on the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SlashAppeal` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
+The change is governance-only — no impact on payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), on the three-bucket fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), on the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), on `CapacityBond`'s registration / slashing semantics, or on `SlashAppeal` / `BuybackBurner`. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
 
 ## Decision
 

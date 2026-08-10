@@ -39,7 +39,7 @@ Before any on-chain or protocol activity:
 4. **Prepare Ethereum key.** The operator needs an Ethereum address (`ethAddress`) with sufficient funds:
    - **TOKEN:** at minimum **`k × declared_Mbps^α`** for the capacity bond ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). At defaults `k=12.6`, `α=1.2`: ~50K TOKEN for a 1 Gbps tier, ~795K TOKEN for 10 Gbps, ~12.6M TOKEN for 100 Gbps. Declared capacity must be at least `MIN_CAPACITY_PER_OPERATOR` (default 10 Mbps, ~200 TOKEN); a declaration below the floor reverts. There is no discount-stake threshold; operators do not earn additional yield by bonding above their declared capacity. Operators lacking the entry-tier bond may qualify for externally-funded operator-onboarding programs (see [ADR 026 § Bootstrap mechanism — pre-seed USDC](026-tokenomics.md#bootstrap-mechanism--pre-seed-usdc)).
    - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
-   - **Optional USDC:** only required if the operator intends to open outbound payment channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open inbound channels to the node without any USDC on the node side.
+   - **Optional USDC:** only required if the operator intends to open outbound payment pools immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open pools that pay the node without any USDC on the node side.
 
    - **Wallet, gas sponsorship, and session keys.** A plain EOA keystore is the documented default, and it is the only wallet that can sign `slash_sig` acceptably today — a paying client verifies the `StreamResponse` signature off-chain by recovering the signer against the node's registered address, so a Safe-addressed operator cannot complete a paid delivery. Production migrates the operator wallet to a Safe (2-of-3) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) for the optional EOA → Safe migration and its constraints.
 
@@ -201,7 +201,7 @@ A node satisfying all seven criteria is ready to:
 
 - Respond to `ProbeRequest` messages on `cdn/probe/v1`
 - Accept `StreamRequest` messages on `cdn/client/v1`
-- Earn USDC via voucher-based payment channels opened by clients and other nodes
+- Earn USDC via voucher-based payment pools opened by clients and other nodes
 
 **Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 peers=12`) once all seven criteria hold, so operators can confirm correct startup without grepping multiple log sources.
 
