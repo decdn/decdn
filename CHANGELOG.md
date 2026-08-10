@@ -28,6 +28,32 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Wire-breaking (design only, not yet implemented): per-chunk payment moves to
+  a hash chain, and the voucher becomes a per-epoch anchor.** ADR 003/005/013/016
+  now specify PayWord-style payment on each `(poolId, signer, provider)` lane. One
+  signed `Voucher` opens a **chain epoch** (default 1024 chunks × 64 KiB) and gains
+  four EIP-712 fields — `chainRoot`, `chainLength`, `chunkBytes`, `chunkPrice`. Each
+  chunk is then paid for by releasing a bare 32-byte `Preimage`: no signature, no
+  acknowledgement, no round trip, and nothing to commit durably. `redeem` takes
+  `(voucher, sig, chainIndex, preimage, capability)` and walks at most
+  `MAX_CHAIN_LENGTH` (1024) hashes to resolve the claim; the contract stores no
+  chain state. Wire changes: `ClientMessage::VoucherAck` is **removed** and
+  `Preimage` takes its slot (discriminant 4, renumbering the tail);
+  `voucher_interval_mb` is **removed** from `StreamRequest`/`StreamResponse` and
+  replaced by node-advertised `chunk_bytes`; `WatermarkBundle` and the
+  `VoucherRejected { bundle }` field are **removed** (a signer derives its own chain
+  index, so there is nothing to self-heal); `VoucherRejectReason` drops
+  `AmountRegression`, `BytesRegression`, and `RetryLater`, and adds `BadChainParams`,
+  `StaleEpoch`, `BadPreimage`, and `ChainExhausted`. Pre-launch, so this lands as a
+  single wire cut with no shim and no ALPN staging.
+- **Off-chain lane state is no longer durably committed before acceptance.** ADR 003
+  § Off-chain voucher state persistence replaces the fsync-before-`VoucherAck`
+  ordering rule with a best-effort buffered write flushed on a value bound (before the
+  un-flushed accepted value exceeds one credit window), plus a lazy per-lane floor
+  seeded from the on-chain `watermark[poolId][signer][provider]`. A persist failure is
+  now a metric, not a wire rejection. This removes the design basis for group-commit
+  batching, the `voucher_commit_interval_ms` knob, and the `RetryLater` path; the
+  credit window survives as a transport buffer rather than an economic parameter.
 - **Container image renamed to `decdn-node`, and now published to Docker Hub as
   well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
   the same image is published as `decdn/decdn-node` on Docker Hub. The image

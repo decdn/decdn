@@ -9,7 +9,7 @@ A decentralized CDN with two participant roles:
 
 - **Nodes** (providers) cache and serve content. They bond TOKEN proportional to declared capacity (`bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content. The **cache role** is permissionless — any bonded operator may pull cached blobs from authorized origins and re-serve them. The **origin role** is DAO-governed: governance vets a publisher wallet once and the vetted publisher then seats its own operators per namespace, while namespace 0 (content published without a namespace) has no authorized origins. No external origin URL is ever exposed.
 
-- **Clients** consume content. They pay nodes per MB via off-chain vouchers backed by a shared on-chain payment pool.
+- **Clients** consume content. They pay nodes per MB by releasing hash-chain preimages against off-chain vouchers, backed by a shared on-chain payment pool.
 
 ## System Diagram
 
@@ -45,7 +45,7 @@ graph TD
     N2 <-.->|"iroh-gossip<br/>NodeAnnounce"| N3
 ```
 
-Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay via off-chain payment vouchers (denominated in the payment token). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). When DHT returns no providers, the on-chain origin directory ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) is the deterministic last-resort fallback. Every byte delivered — whether client→node or node→node — is paid.
+Clients probe candidate nodes, pick the best by the unified selection score (see [ADR 001](001-network.md#node-selection-algorithm) for the full formula), stream over `cdn/client/v1`, and pay per chunk by releasing preimages against an off-chain voucher (denominated in the payment token). On a cache miss, a node performs a DHT FIND_VALUE lookup (`cdn/dht/v1`), probes the returned candidates via `cdn/probe/v1`, selects the best, and pulls via `cdn/client/v1` (paid). When DHT returns no providers, the on-chain origin directory ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) is the deterministic last-resort fallback. Every byte delivered — whether client→node or node→node — is paid.
 
 ## Reading Order
 
@@ -73,7 +73,7 @@ How a client or node finds the right peer for a given hash. The DHT is the prima
 
 ### Chapter 3 — Payments
 
-Off-chain vouchers for per-MB delivery, backed by a shared on-chain payment pool that a client opens once and redeems against per node. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
+Off-chain hash-chain payments for per-MB delivery: one signed voucher opens an epoch, and a 32-byte preimage pays for each chunk. Backed by a shared on-chain payment pool that a client opens once and a node redeems against per lane. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
 
 1. [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)
 2. [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)
@@ -142,7 +142,7 @@ Numeric per-ADR index.
 - **[ADR 000 — Language and Core Networking Stack](000-language.md#adr-000-language-and-core-networking-stack)** — Rust + iroh (1.0).
 - **[ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh)** — Flat peer mesh; gossip for node discovery; `cdn/dht/v1` (Kademlia subset) for content discovery, with the on-chain origin directory ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) as the deterministic last-resort fallback when DHT returns no providers.
 - **[ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing)** — BLAKE3 content-addressed blobs. Node backends are opaque to the network.
-- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)** — Off-chain vouchers backed by a shared on-chain payment pool (USDC, fixed at deployment): one deposit, many capped signers, node-addressed vouchers, per-lane redemption. Market-driven rates within governance-set bounds.
+- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)** — Off-chain hash-chain payments backed by a shared on-chain payment pool (USDC, fixed at deployment): one deposit, many capped signers, node-addressed vouchers opening chain epochs, unsigned per-chunk preimages, per-lane redemption. Market-driven rates within governance-set bounds.
 - **[ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol)** — Two core protocols (ALPN-negotiated) plus iroh-gossip. `cdn/client/v1` covers all paid delivery.
 - **[ADR 008 — Reputation System](008-reputation.md#adr-008-reputation-system)** — Local per-peer interaction-weighted scoring; no gossip propagation.
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)** — Admin key for PoC; bootstrap multisig phase post-launch; transition to served-bytes-weighted Governor (`FeeRouter.bytesInWindow × age_ramp` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) + Timelock via a one-shot transition the multisig executes when the operator set is broad enough.
@@ -172,7 +172,7 @@ Numeric per-ADR index.
 - A node cannot register without bonding — `CapacityBond` enforces `bond >= bond_required(declared_capacity_Mbps)` via the `bond = k × Mbps^α` curve before accepting a `register` call
 - A node cannot register without binding — `registerNode` atomically writes the NodeId-to-address mapping via EIP-712 signature, ensuring every active node is immediately slashable
 - A node cannot register a NodeId it does not control — `registerNode` verifies an ed25519 signature proving ownership of the NodeId's private key, preventing squatting ([ADR 003 § NodeId Ownership Verification](003-payments.md#nodeid-ownership-verification))
-- A payment pool amortizes on-chain costs across every node and signer it backs; per-MB payments are off-chain vouchers, redeemed per node
+- A payment pool amortizes on-chain costs across every node and signer it backs; per-MB payments are off-chain preimage releases against a signed epoch voucher, redeemed per lane
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md#adr-009-governance-model))
 - A node cannot serve a blacklisted hash after the compliance window — doing so is a slashable offense (see [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
 
@@ -182,9 +182,9 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 
 - **NTP availability and correctness.** Gossip validation depends on loose clock agreement: ±60 s for `NodeAnnounce` freshness ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). A compromised or unavailable NTP source could cause mesh partitions or cause nodes to reject valid gossip. Mitigation: nodes detect relative drift via peer timestamp comparison; the tolerance windows are generous enough to absorb typical NTP jitter.
 
-- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `PoolCloseInitiated` events from a node's in-process redemption monitor, so the node misses the grace window and forfeits outstanding vouchers, or return a fabricated node list to eclipse a client. Mitigation: multi-source bootstrap ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) Option B) and multiple independent RPC providers.
+- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `PoolCloseInitiated` events from a node's in-process redemption monitor, so the node misses the grace window and forfeits its outstanding claim, or return a fabricated node list to eclipse a client. Mitigation: multi-source bootstrap ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) Option B) and multiple independent RPC providers.
 
-- **Encrypted transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers only traverse encrypted authenticated channels between the relevant parties: client↔node and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
+- **Encrypted transport integrity for payment confidentiality.** Vouchers and preimages are bearer instruments — a leaked preimage pays its chunks regardless of how it was obtained, and it carries no signature to bind it to a sender. The system assumes both only traverse encrypted authenticated channels between the relevant parties: client↔node and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; neither is ever logged or persisted in plaintext. Endpoint compromise or debug output leaking a preimage remains an operational risk.
 
 - **Sequencer liveness.** The redemption grace window assumes forced-inclusion transactions complete within ~24 h ([ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)). If the sequencer censors a node's `redeem` beyond this window, the owner could reclaim before the node is paid. Mitigation: the grace window is 48 h (governable 48h–72h, floor equal to the default), providing at least 24 h of effective redemption time after worst-case sequencer censorship.
 

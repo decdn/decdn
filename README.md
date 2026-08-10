@@ -1,11 +1,11 @@
 # deCDN
 
-Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh](https://iroh.computer/) QUIC, and clients pay per-MB via off-chain USDC vouchers backed by a shared on-chain payment pool. Rust implementation targeting a PoC of tens of nodes on Arbitrum Sepolia testnet.
+Decentralized CDN where nodes cache and serve content-addressed blobs over [iroh](https://iroh.computer/) QUIC, and clients pay per-MB via off-chain USDC hash-chain payments backed by a shared on-chain payment pool. Rust implementation targeting a PoC of tens of nodes on Arbitrum Sepolia testnet.
 
 ## How It Works
 
 - **Nodes** bond TOKEN proportional to declared bandwidth capacity, cache content, and serve BLAKE3-addressed blobs over QUIC
-- **Clients** probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream content, and pay via off-chain USDC vouchers
+- **Clients** probe candidate nodes, pick the best by `rate_per_mb × rtt_ms`, stream content, and pay per chunk by releasing hash-chain preimages against an off-chain USDC voucher
 - On a **cache miss**, nodes pull from peers (paid), cache locally, and stream to the client simultaneously
 - All byte transfers are paid — client-to-node and node-to-node
 
@@ -72,7 +72,7 @@ crates/
   config-types/ — config-vocabulary value types shared by cache + common (leaf crate, #578)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   gossip/       — NodeAnnounce pub/sub over iroh-gossip
-  incentive/    — payment pools, staking, vouchers (alloy for Ethereum)
+  incentive/    — payment pools, staking, vouchers + preimage chains (alloy for Ethereum)
   reputation/   — reputation scoring (ADR 008): local EWMA now, gossip aggregation deferred
 contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace)
 ```

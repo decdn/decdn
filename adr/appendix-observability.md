@@ -148,13 +148,17 @@ Metric identifiers retain the `channel` prefix (the `PaymentPool` contract name)
 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
-| `decdn_channels_open` | Gauge | M | live | Payment pools currently paying this node (inbound from clients — lanes with unredeemed vouchers). |
+| `decdn_channels_open` | Gauge | M | live | Payment pools currently paying this node (inbound from clients — lanes with unredeemed claims). |
 | `decdn_pool_redemptions_total` | Counter | M | planned | On-chain redemptions by this node. |
 | `decdn_channel_deposit_usdc` | Gauge | M | live | Total USDC deposited in pools currently paying this node. Represents maximum on-chain recoverable value. |
 | `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
-| `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers signed by this node as the payee. |
-| `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |
-| `decdn_pool_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed vouchers. |
+| `decdn_vouchers_signed_total` | Counter | M | planned | Chain epochs opened by this node as the payer — one per voucher signed, not one per chunk paid. |
+| `decdn_vouchers_received_total` | Counter | R | planned | Chain epochs received by this node as the payee (inbound from clients, and from peers on node-to-node pulls). |
+| `decdn_preimages_received_total` | Counter | M | planned | Preimages accepted by this node as the payee. The per-chunk payment counter; divide by `decdn_vouchers_received_total` for the realised epoch depth. |
+| `decdn_preimages_rejected_total` | Counter | M | planned | Preimages rejected as the payee (bad chain walk, or a non-advancing index). A sustained non-zero rate means a buggy or hostile payer, not a transient fault. |
+| `decdn_lane_seed_from_chain_total` | Counter | M | planned | Lanes whose floor was seeded from the on-chain `watermark` because the local store had no record. Elevated after an unclean restart; sustained growth means the local store is not persisting. |
+| `decdn_lane_flush_lag_bytes` | Gauge | M | planned | Accepted-but-unflushed lane value, in payment-token base units, across all lanes. Bounded by one credit window by policy; a value above that means the flush is not keeping up and the replay surface has grown. |
+| `decdn_pool_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed claims. |
 
 #### Gossip Metrics
 

@@ -61,7 +61,7 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 #### `ChunkData` exemption
 
-`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
+`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the payment chunk size. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher`/`Preimage` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
 
 #### Gossip Framing
 
@@ -102,13 +102,16 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    StreamEnd,                        // 4
+    Preimage([u8; 32]),               // 4
+    StreamEnd,                        // 5
 }
 ```
 
 #### Variant ordering rule
 
 Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump.
+
+The removal of the former `VoucherAck` variant is exactly such a change — every variant after it shifts down one discriminant, so it re-numbers the whole tail rather than editing one slot. It lands pre-deployment as a single wire cut with no shim, per the pre-launch policy in `CLAUDE.md`; after the first deployment the same edit would require `cdn/client/v2`. `Preimage` occupies the freed slot rather than being appended, which is legal only under the same pre-launch carve-out.
 
 #### Unknown variant handling
 
@@ -202,7 +205,6 @@ struct StreamRequestBase {
 /// Extension fields — new optional fields are appended here via Tier 1.
 #[derive(Serialize, Deserialize, Default)]
 struct StreamRequestExt {
-    voucher_interval_mb: Option<u64>,
     binding: Option<ClientBinding>,
 }
 
@@ -265,7 +267,7 @@ fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) ->
 }
 ```
 
-Messages without extensions (e.g., `StreamEnd`, `ChunkData`) have no trailing bytes — the `take_from_bytes` remainder is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; two-phase logic lives in per-message-type application code.
+Messages without extensions (e.g., `Preimage`, `StreamEnd`, `ChunkData`) have no trailing bytes — the `take_from_bytes` remainder is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; two-phase logic lives in per-message-type application code.
 
 **Rules:**
 
@@ -274,7 +276,7 @@ Messages without extensions (e.g., `StreamEnd`, `ChunkData`) have no trailing by
 - New fields MUST NOT be included in any existing signature computation (see [Signed Field Freezing](#signed-field-freezing)).
 - The base struct is frozen at the protocol version that introduced it. Moving fields between base and extensions is a major change.
 
-This formalizes the pattern used for `voucher_interval_mb` and the optional client identity `binding` in `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) as the standard minor evolution mechanism. The frozen `StreamRequest` base and its separately encoded trailing extensions implement the two-phase layout.
+This formalizes the pattern used for the optional client identity `binding` in `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) as the standard minor evolution mechanism. The frozen `StreamRequest` base and its separately encoded trailing extensions implement the two-phase layout.
 
 #### Tier 2 — Medium (new message types, no ALPN bump)
 
@@ -294,7 +296,8 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    StreamEnd,                        // 4
+    Preimage([u8; 32]),               // 4
+    StreamEnd,                        // 5
     // Added via medium evolution
     Ping(PingRequest),                // 5
     Pong(PongResponse),              // 6
@@ -328,7 +331,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `pool_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `pool_id`, `timestamp_us`, `redirect` | `error`, `chunk_bytes` |
 | `NodeAnnounce` | `node_id`, `region`, `timestamp_us` | *(none currently — see implementation note)* |
 
 #### Implementation note — separating signed and unsigned fields

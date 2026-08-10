@@ -31,7 +31,7 @@ Proof overhead is `O(log n)` — on the order of a kilobyte of sibling hashes fo
 
 ### Wire format
 
-The `StreamResponse` / `Voucher` / `StreamEnd` envelope is unchanged. `ChunkData` payloads carry bao verified-stream bytes (interleaved data and proof nodes) instead of raw content. Vouchers remain interleaved as today: the bao stream is framed into `voucher_interval_mb`-sized pieces and the receiver reassembles them before feeding the decoder. The codec is the sole verifier, so wire framing boundaries are independent of chunk-group boundaries (the codec handles the partial final group and right-edge spine).
+The `StreamResponse` / `Voucher` / `Preimage` / `StreamEnd` envelope is unchanged. `ChunkData` payloads carry bao verified-stream bytes (interleaved data and proof nodes) instead of raw content. Payments remain interleaved as today: the bao stream is framed into `chunk_bytes`-sized pieces and the receiver reassembles them before feeding the decoder. The codec is the sole verifier, so wire framing boundaries are independent of chunk-group boundaries (the codec handles the partial final group and right-edge spine).
 
 `cdn/client/v1` is pre-finalisation (no testnet deployment), so the payload format changes **in place** — no version bump, no compatibility shim. The flat-hasher payload is replaced; the two formats do not coexist.
 
@@ -78,7 +78,7 @@ Range-addressed discovery — advertising "I hold bytes `[a, b)` of `H`" on `cdn
 ### Risks
 
 - **Codec coupling.** Verification depends on the bao encoding via `iroh-blobs`/`bao-tree`; a format change across dependency upgrades is a wire concern. Mitigated by pinning the dependency and treating its encoding as part of the protocol contract.
-- **Framing/grouping mismatch bugs.** Wire framing (`voucher_interval_mb` pieces) and bao chunk groups differ in size; incorrect reassembly before decoding fails verification. Mitigated by making the codec the sole verifier and testing reassembly (resumed range, corrupt tail, whole-blob equivalence).
+- **Framing/grouping mismatch bugs.** Wire framing (`chunk_bytes` pieces) and bao chunk groups differ in size; incorrect reassembly before decoding fails verification. Mitigated by making the codec the sole verifier and testing reassembly (resumed range, corrupt tail, whole-blob equivalence).
 
 ## Cross-ADR Impact
 
@@ -91,7 +91,7 @@ Range-addressed discovery — advertising "I hold bytes `[a, b)` of `H`" on `cdn
 
 1. A request beginning at `byte_offset > 0` verifies the received range against the requested content hash on its own, with no dependency on bytes before the offset; a corrupt tail is rejected.
 2. Verification is incremental: a corrupt chunk group is rejected at that group, not only at finalization.
-3. `ChunkData` carries the bao interleaved verified-stream encoding; the `StreamResponse` / `Voucher` / `StreamEnd` envelope and voucher cadence are unchanged, with vouchers interleaved by framing the bao stream into `voucher_interval_mb` pieces.
+3. `ChunkData` carries the bao interleaved verified-stream encoding; the `StreamResponse` / `Voucher` / `Preimage` / `StreamEnd` envelope and the payment cadence are unchanged, with preimages interleaved by framing the bao stream into `chunk_bytes` pieces.
 4. The serving node emits verified ranges from two proof sources, and both produce identical wire bytes. For a blob it holds, it reads the persisted outboard and re-hashes nothing. For a whole-blob serve of an unheld blob whose origin publishes `{H}.obao4`, it streams the origin bytes to the client and into its store at the same time, verifies each chunk group against the root as it streams, and commits no local copy when a group fails. The payload is always bao-encoded, with no raw-byte fallback. An origin that publishes no outboard makes the node import and build the outboard first, at a one-time import latency; a node-to-node pull stays pipelined.
 5. The publisher CLI is unchanged — it computes the flat BLAKE3 root, links no blob store, and the root matches the outboard a node derives on first import.
 6. Paid bytes equal the bytes delivered on the wire, inclusive of proof nodes; no separate metering path excludes proof bytes.
