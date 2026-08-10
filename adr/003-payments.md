@@ -147,6 +147,28 @@ When multiple streams from the **same signer to the same node** run at once, the
 
 See [ADR 005 — Payment lanes and concurrent streams](005-protocol.md#payment-lanes-and-concurrent-streams) for wire-level details.
 
+### Client Restart and Lane Resume
+
+A payer can crash, be killed, or go offline for a week. Nothing it owes is outstanding when it does — it has paid for every chunk it received and no more — so a client that never returns loses nothing, and abandons at worst an unspent chain that held no money. The only real question is how a client that *does* return resumes a lane it no longer remembers.
+
+**Deriving the chain, not storing it.** A signer SHOULD derive each epoch's chain seed deterministically rather than persist it:
+
+```
+seed = KDF(signer_secret, pool_id, provider, epoch_base, chunk_bytes, chunk_price, chain_length)
+```
+
+`provider` is in the derivation because chains MUST be independent per lane ([Chain-root reuse across lanes](#chain-root-reuse-across-lanes)). The remaining inputs are the epoch's own signed terms — `epoch_base` is the voucher's cumulative base, and the three chain parameters are what one index step is worth — so re-deriving the same epoch reproduces the same chain, and no two epochs that differ in base or in terms ever share one. Vouchers carry no nonce ([Voucher ordering](#voucher-ordering)), so the signed terms are what identifies an epoch. A signer that derives this way keeps **no per-lane secret at all** and can regenerate any chain it ever built from its long-term key.
+
+**Recovering the position.** What derivation cannot reconstruct is *how far the lane got* — the index the node holds. The node supplies it, and the answer authenticates itself:
+
+1. The signer opens the lane and, if it cannot place itself, is told the node's position: `{voucher, chain_index, preimage}` (see [ADR 005 § `VoucherRejected` semantics](005-protocol.md#voucherrejected-semantics)). The `voucher` is the epoch anchor the signer itself signed, so it carries every derivation input.
+2. The signer re-derives that epoch's chain from the voucher's terms, and checks that `chain_index` applications of `keccak256` to `preimage` reach the voucher's `chain_root`.
+3. It resumes at `chain_index + 1`, or opens the next epoch with its base set to that frontier.
+
+**Neither side can lie, and no signature gate is needed.** A node cannot overstate the position: claiming index `k` requires exhibiting preimage `k`, which it can only hold if the signer released it, and which it cannot compute from a lower one. Understating is possible but self-harming — it claims less than the node has earned. This is strictly stronger than the authenticated-watermark bundle a per-interval voucher scheme needs, which had to gate on the payer's own prior signature precisely because a bare cumulative number carries no proof of itself. A preimage *is* its own proof.
+
+**A node keeps no extra state for this.** The `{voucher, chain_index, preimage}` triple is exactly the lane state it already holds to accept payments and to redeem.
+
 ### Redemption and Close
 
 > **Fee routing model.** A redemption does not skim a fee inline; it forwards the paid amount to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. Split details: [FeeRouter Integration](#feerouter-integration).
@@ -231,7 +253,7 @@ Each reason below maps to an on-chain `redeem` outcome the node avoids by reject
 | `ChainExhausted` | the lane has consumed all `chain_length` chunks of the epoch | none — the node cannot be paid past the epoch, so it stops serving until the signer opens the next epoch |
 | `CapExceeded` | the claim would push the signer's paid total past `cap`, or the capability has expired | `redeem` caps `paid` at `cap − spent` and gates on `expiry` from `authorized[poolId][signer]` — a fully-uncoverable claim reverts `NothingToRedeem` |
 
-Surfacing these reasons off-chain saves both parties the gas of a doomed on-chain submission and gives the payer enough detail to recover (open a fresh epoch for `ChainExhausted`, ask the owner to top up or raise the cap for `CapExceeded`) instead of an opaque connection drop. A delegated signer — one issued a capped capability by a pool owner — holds no funds to `topUp` (owner-only), so it surfaces `CapExceeded` to the owner rather than acting on it. It needs no watermark self-heal: the signer derives its own chain index from the preimages it has released, so it can always reconstruct its position without asking the node or reading the chain. Riding in-band rather than via a QUIC stream reset preserves the reason for client retry logic without burning [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) application-error-code numbers for the structured-response case.
+Surfacing these reasons off-chain saves both parties the gas of a doomed on-chain submission and gives the payer enough detail to recover (open a fresh epoch for `ChainExhausted`, ask the owner to top up or raise the cap for `CapExceeded`) instead of an opaque connection drop. A delegated signer — one issued a capped capability by a pool owner — holds no funds to `topUp` (owner-only), so it surfaces `CapExceeded` to the owner rather than acting on it. A signer that still holds its state needs no help placing itself — its chain index is a function of the preimages it released. One that has lost its state recovers through the self-authenticating position exchange in [Client Restart and Lane Resume](#client-restart-and-lane-resume), which needs no signature gate because a preimage proves its own index. Riding in-band rather than via a QUIC stream reset preserves the reason for client retry logic without burning [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) application-error-code numbers for the structured-response case.
 
 ## Consequences
 

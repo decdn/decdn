@@ -40,9 +40,10 @@ since project inception and will roll into the first tagged release.
   chain state. Wire changes: `ClientMessage::VoucherAck` is **removed** and
   `Preimage` takes its slot (discriminant 4, renumbering the tail);
   `voucher_interval_mb` is **removed** from `StreamRequest`/`StreamResponse` and
-  replaced by node-advertised `chunk_bytes`; `WatermarkBundle` and the
-  `VoucherRejected { bundle }` field are **removed** (a signer derives its own chain
-  index, so there is nothing to self-heal); `VoucherRejectReason` drops
+  replaced by node-advertised `chunk_bytes`; `WatermarkBundle` is **replaced** by a
+  smaller `LanePosition { voucher, chain_index, preimage }` carried on `StaleEpoch`,
+  which needs no signature gates because a preimage proves its own index (it lets a
+  signer that lost its state resume a lane); `VoucherRejectReason` drops
   `AmountRegression`, `BytesRegression`, and `RetryLater`, and adds `BadChainParams`,
   `StaleEpoch`, `BadPreimage`, and `ChainExhausted`. Pre-launch, so this lands as a
   single wire cut with no shim and no ALPN staging.
