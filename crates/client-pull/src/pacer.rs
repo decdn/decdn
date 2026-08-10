@@ -23,6 +23,7 @@
 //! shipped predicates rather than reimplementing them.
 
 use alloy::primitives::U256;
+use decdn_bao_range::CHUNK_GROUP_BYTES;
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a
 /// [`Pacer`] needs and nothing it must fetch. Plain `Copy` data so a decision is
@@ -189,7 +190,17 @@ impl Pacer for WindowPacer {
         match BudgetPacer.decide(s) {
             PaceDecision::Draw { up_to_bytes } => {
                 let ahead = s.pulled_frontier.saturating_sub(s.served_paid_frontier);
+                // Floor the room to whole chunk groups. The driver's `align_range`
+                // rounds a draw's END up to a chunk-group boundary, so a room that is
+                // not group-aligned would let the open overshoot the window by up to
+                // one group. Flooring keeps `pulled_frontier - served_paid_frontier <=
+                // window_bytes` EXACT (ADR 037). `window_bytes` is always at least one
+                // voucher interval — orders of magnitude larger than a 16 KiB group —
+                // so a healthy window never floors to zero; only a sub-group remainder
+                // (the window all but full) floors to 0 -> `Wait`, which is correct:
+                // never draw a fraction that `align_range` would round past the window.
                 let room = self.window_bytes.saturating_sub(ahead);
+                let room = room - room % CHUNK_GROUP_BYTES;
                 if room == 0 {
                     PaceDecision::Wait
                 } else {
@@ -206,7 +217,7 @@ impl Pacer for WindowPacer {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
-    use super::{BudgetPacer, PaceDecision, PaceState, Pacer, WindowPacer};
+    use super::{BudgetPacer, CHUNK_GROUP_BYTES, PaceDecision, PaceState, Pacer, WindowPacer};
     use alloy::primitives::U256;
 
     /// A healthy mid-fetch snapshot: deposit covers the next voucher, range
@@ -316,11 +327,12 @@ mod tests {
 
     #[test]
     fn window_room_clamps_the_draw() {
-        // pulled 100, served_paid 40, window 100 -> room 40. BudgetPacer alone
-        // would draw the whole remainder (well over 40); WindowPacer must clamp.
+        // ahead = 3 groups, window = 4 groups -> room = 1 group. BudgetPacer alone
+        // would draw the whole remainder (far more than one group); WindowPacer must
+        // clamp to the group-aligned window room.
         let mut s = healthy();
-        s.pulled_frontier = 100;
-        s.served_paid_frontier = 40;
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
         assert_eq!(
             BudgetPacer::new().decide(&s),
             PaceDecision::Draw {
@@ -329,8 +341,31 @@ mod tests {
             "sanity: BudgetPacer would draw far more than the window room"
         );
         assert_eq!(
-            WindowPacer::new(100).decide(&s),
-            PaceDecision::Draw { up_to_bytes: 40 }
+            WindowPacer::new(4 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: CHUNK_GROUP_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn window_room_floors_to_whole_groups() {
+        // ahead = 3 groups, window = 3 groups + a sub-group remainder -> room is a
+        // fraction of a group, which floors to 0 -> Wait. Never draw a sub-group that
+        // `align_range` would round up past the window (ADR 037 bound stays exact).
+        let mut s = healthy();
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES + 5_000).decide(&s),
+            PaceDecision::Wait
+        );
+        // One byte over a full group of room -> still exactly one group is drawable.
+        assert_eq!(
+            WindowPacer::new(4 * CHUNK_GROUP_BYTES + 1).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: CHUNK_GROUP_BYTES
+            }
         );
     }
 
@@ -338,9 +373,12 @@ mod tests {
     fn window_full_waits() {
         // pulled - served_paid == window -> no room left, wait.
         let mut s = healthy();
-        s.pulled_frontier = 100;
-        s.served_paid_frontier = 40;
-        assert_eq!(WindowPacer::new(60).decide(&s), PaceDecision::Wait);
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Wait
+        );
     }
 
     #[test]
