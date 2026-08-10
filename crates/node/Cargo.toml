@@ -37,6 +37,14 @@ anvil-e2e = ["decdn-incentive/test-util"]
 decdn-protocol = { workspace = true }
 decdn-cache = { workspace = true }
 decdn-client-pull = { workspace = true }
+# `NodeAdmitStore` (`src/node_origin/admit_store.rs`, #1621 Task 10) implements
+# `decdn_bao_range::RangedStore` directly (delegating to `NodeRangedStore`), so
+# the trait/types must be named here rather than borrowed through a re-export.
+decdn-bao-range = { workspace = true }
+# `RangedStore::present_ranges`/`missing_ranges` return `bao_tree::ChunkRanges`
+# directly (the same signature `NodeRangedStore` uses), so `NodeAdmitStore`'s
+# delegating impl names the type — not just a dev/test dependency any more.
+bao-tree = { workspace = true }
 decdn-incentive = { workspace = true, features = ["buyer-store-core"] }
 decdn-reputation = { workspace = true }
 decdn-gossip = { workspace = true }
@@ -93,6 +101,9 @@ decdn-client-pull = { workspace = true, features = ["test-util"] }
 # shape as `decdn-client-pull` above.
 decdn-incentive = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+# `admit_store.rs`'s in-memory `BaoRangeReader` test double implements
+# `iroh_io::AsyncStreamReader` directly over a `Bytes` cursor.
+iroh-io = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):
 # xor_distance metric laws and the fixed-bucket / within-K invariants under
 # random insert/remove sequences. Mirrors the `proptest` usage already in
@@ -114,7 +125,8 @@ alloy-json-rpc = { workspace = true }
 # `tests/origin_range_pull.rs` builds the `{H}.obao4` pre-order outboard a
 # range-pull origin must publish, so the e2e test can verify the cold ranged
 # cdn/client/v1 path (#823/#990). Matches the cache crate's outboard codec.
-bao-tree = { workspace = true }
+# (Promoted to a normal dependency above, #1621 Task 10 — kept documented here
+# since this suite is still the reason it needs to be workspace-versioned.)
 # `tests/client_loopback.rs` constructs a real `ChannelReceiptSink` via
 # `receipt_log::spawn_receipt_writer` (which takes a `CancellationToken`) to
 # prove the paid-delivery hot path never blocks on receipt-log I/O (#803).

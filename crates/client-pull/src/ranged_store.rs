@@ -923,6 +923,20 @@ impl RangedStore for ClientRangedStore {
     }
 }
 
+impl crate::source::IngestStore for ClientRangedStore {
+    fn ingest_stream<'a, R>(
+        &'a self,
+        range: &'a AlignedRange,
+        reader: R,
+        on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+    where
+        R: crate::source::BaoRangeReader + 'a,
+    {
+        Box::pin(self.ingest_stream(range, reader, on_progress))
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

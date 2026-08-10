@@ -41,7 +41,14 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
+mod admit_store;
+mod funder;
 mod resume;
+
+#[allow(unused_imports, reason = "wired by Task 11's driver construction")]
+pub(crate) use admit_store::NodeAdmitStore;
+#[allow(unused_imports, reason = "wired by Task 11's driver construction")]
+pub(crate) use funder::NodeFunder;
 
 use std::collections::HashMap;
 use std::future::Future;

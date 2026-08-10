@@ -23,6 +23,7 @@
 //! shipped predicates rather than reimplementing them.
 
 use alloy::primitives::U256;
+use decdn_bao_range::CHUNK_GROUP_BYTES;
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a
 /// [`Pacer`] needs and nothing it must fetch. Plain `Copy` data so a decision is
@@ -60,6 +61,18 @@ pub struct PaceState {
     /// proactive (happy-path) query; a non-genuine reactive fault is handled by
     /// the driver's own reseed/terminal path, not here.
     pub exhaustion_confirmed: bool,
+    /// Content bytes the node's upstream pull leg has drawn so far (the pull-side
+    /// frontier). [`BudgetPacer`] never reads this field — it exists for
+    /// [`WindowPacer`] (ADR 037, Phase B), which bounds `pulled_frontier -
+    /// served_paid_frontier` by its window. On the client path (which always uses
+    /// `BudgetPacer`, never `WindowPacer`) this field is inert; callers may set it
+    /// to `0` or to the already-computed delivered frontier — either is safe.
+    pub pulled_frontier: u64,
+    /// Content bytes the node has already served AND been paid for on its
+    /// downstream (serve) leg. Paired with [`Self::pulled_frontier`] for
+    /// [`WindowPacer`]'s window check; ignored by [`BudgetPacer`]. Inert on the
+    /// client path, same as `pulled_frontier`.
+    pub served_paid_frontier: u64,
 }
 
 /// What the driver should do next for the current gap. See [`Pacer::decide`].
@@ -81,6 +94,11 @@ pub enum PaceDecision {
     /// Out of budget or attempts (deposit cannot cover the next voucher and either
     /// top-up is disabled/exhausted, or there is nothing left to add). Terminal.
     Refuse,
+    /// The pull leg has run its full window ahead of the downstream paid frontier
+    /// ([`WindowPacer`], ADR 037): pause and re-decide once `served_paid_frontier`
+    /// advances. [`BudgetPacer`] never returns this — only a window-bounded pacer
+    /// does, so it only appears on the node's pull leg, never on the client path.
+    Wait,
 }
 
 /// The pacing policy handed to the gap-driven driver. Pure: no I/O, no async.
@@ -141,10 +159,65 @@ impl Pacer for BudgetPacer {
     }
 }
 
+/// The node's pull-leg pacing policy (ADR 037, Phase B): reuse [`BudgetPacer`]'s
+/// money logic VERBATIM — a window pacer never overrides a money decision — and,
+/// only on a `Draw`, clamp `up_to_bytes` so the pull never runs more than
+/// `window_bytes` ahead of the downstream serve leg's paid frontier. When the
+/// window is already full, wait instead of drawing zero bytes.
+///
+/// Composition, not reimplementation: `WindowPacer::decide` calls
+/// `BudgetPacer::decide` and only touches the `Draw` arm. `Done` / `TopUp` /
+/// `Refuse` pass through unchanged, so the two pacers can never disagree about
+/// whether/how to pay — only about how much to pull in one pass.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowPacer {
+    /// Maximum content bytes the pull frontier may run ahead of the served-paid
+    /// frontier before the pacer waits.
+    window_bytes: u64,
+}
+
+impl WindowPacer {
+    /// Construct a window pacer bounded to `window_bytes` (ADR 037's per-pull
+    /// `pull_ahead_bytes`).
+    #[must_use]
+    pub const fn new(window_bytes: u64) -> Self {
+        Self { window_bytes }
+    }
+}
+
+impl Pacer for WindowPacer {
+    fn decide(&self, s: &PaceState) -> PaceDecision {
+        match BudgetPacer.decide(s) {
+            PaceDecision::Draw { up_to_bytes } => {
+                let ahead = s.pulled_frontier.saturating_sub(s.served_paid_frontier);
+                // Floor the room to whole chunk groups. The driver's `align_range`
+                // rounds a draw's END up to a chunk-group boundary, so a room that is
+                // not group-aligned would let the open overshoot the window by up to
+                // one group. Flooring keeps `pulled_frontier - served_paid_frontier <=
+                // window_bytes` EXACT (ADR 037). `window_bytes` is always at least one
+                // voucher interval — orders of magnitude larger than a 16 KiB group —
+                // so a healthy window never floors to zero; only a sub-group remainder
+                // (the window all but full) floors to 0 -> `Wait`, which is correct:
+                // never draw a fraction that `align_range` would round past the window.
+                let room = self.window_bytes.saturating_sub(ahead);
+                let room = room - room % CHUNK_GROUP_BYTES;
+                if room == 0 {
+                    PaceDecision::Wait
+                } else {
+                    PaceDecision::Draw {
+                        up_to_bytes: up_to_bytes.min(room),
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
-    use super::{BudgetPacer, PaceDecision, PaceState, Pacer};
+    use super::{BudgetPacer, CHUNK_GROUP_BYTES, PaceDecision, PaceState, Pacer, WindowPacer};
     use alloy::primitives::U256;
 
     /// A healthy mid-fetch snapshot: deposit covers the next voucher, range
@@ -159,6 +232,8 @@ mod tests {
             topups_used: 0,
             max_topups: 3,
             exhaustion_confirmed: false,
+            pulled_frontier: 0,
+            served_paid_frontier: 0,
         }
     }
 
@@ -248,5 +323,97 @@ mod tests {
                 up_to_bytes: s.requested_bytes - s.cleared_bytes
             }
         );
+    }
+
+    #[test]
+    fn window_room_clamps_the_draw() {
+        // ahead = 3 groups, window = 4 groups -> room = 1 group. BudgetPacer alone
+        // would draw the whole remainder (far more than one group); WindowPacer must
+        // clamp to the group-aligned window room.
+        let mut s = healthy();
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            BudgetPacer::new().decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: s.requested_bytes - s.cleared_bytes
+            },
+            "sanity: BudgetPacer would draw far more than the window room"
+        );
+        assert_eq!(
+            WindowPacer::new(4 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: CHUNK_GROUP_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn window_room_floors_to_whole_groups() {
+        // ahead = 3 groups, window = 3 groups + a sub-group remainder -> room is a
+        // fraction of a group, which floors to 0 -> Wait. Never draw a sub-group that
+        // `align_range` would round up past the window (ADR 037 bound stays exact).
+        let mut s = healthy();
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES + 5_000).decide(&s),
+            PaceDecision::Wait
+        );
+        // One byte over a full group of room -> still exactly one group is drawable.
+        assert_eq!(
+            WindowPacer::new(4 * CHUNK_GROUP_BYTES + 1).decide(&s),
+            PaceDecision::Draw {
+                up_to_bytes: CHUNK_GROUP_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn window_full_waits() {
+        // pulled - served_paid == window -> no room left, wait.
+        let mut s = healthy();
+        s.pulled_frontier = 5 * CHUNK_GROUP_BYTES;
+        s.served_paid_frontier = 2 * CHUNK_GROUP_BYTES;
+        assert_eq!(
+            WindowPacer::new(3 * CHUNK_GROUP_BYTES).decide(&s),
+            PaceDecision::Wait
+        );
+    }
+
+    #[test]
+    fn window_pacer_passes_through_done_topup_refuse() {
+        // Fully paid -> Done, identical to BudgetPacer, regardless of window state.
+        let mut s = healthy();
+        s.cleared_bytes = s.requested_bytes;
+        s.pulled_frontier = 1_000_000;
+        s.served_paid_frontier = 0;
+        assert_eq!(WindowPacer::new(10).decide(&s), PaceDecision::Done);
+        assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Done);
+
+        // Exhausted with attempts left -> TopUp, exactly BudgetPacer's amount; the
+        // window never overrides the money decision.
+        let mut s = healthy();
+        s.remaining_deposit = U256::from(4u64);
+        s.next_voucher_cost = U256::from(10u64);
+        s.pulled_frontier = 1_000_000;
+        s.served_paid_frontier = 0;
+        assert_eq!(
+            WindowPacer::new(10).decide(&s),
+            BudgetPacer::new().decide(&s)
+        );
+        match WindowPacer::new(10).decide(&s) {
+            PaceDecision::TopUp(_) => {}
+            other => panic!("expected TopUp, got {other:?}"),
+        }
+
+        // Exhausted with no attempts left -> Refuse, exactly BudgetPacer's.
+        let mut s = healthy();
+        s.remaining_deposit = U256::from(4u64);
+        s.topups_used = s.max_topups;
+        s.pulled_frontier = 1_000_000;
+        s.served_paid_frontier = 0;
+        assert_eq!(WindowPacer::new(10).decide(&s), PaceDecision::Refuse);
+        assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
     }
 }

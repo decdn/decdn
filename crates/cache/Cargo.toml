@@ -20,6 +20,10 @@ decdn-bao-range = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-metrics = { workspace = true }
+# `AsyncStreamReader` bound for `CacheEngine::admit_bao_stream` (Task 9,
+# #1621 B2): the upstream reader driving a range admit, kept independent of
+# any client-pull type so `cache` stays leaf w.r.t. `client-pull` (#578).
+iroh-io = { workspace = true }
 # bao verified-range codec for origin range-pull verification (#823): turn a
 # raw origin range `[a, b)` + the published `{H}.obao4` outboard into a
 # bao-encoded stream verified against the root `H`, ready for `import_bao_bytes`.

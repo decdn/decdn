@@ -35,6 +35,20 @@ impl NodeRangedStore {
             total_bytes,
         }
     }
+
+    /// The blob hash this store is scoped to.
+    #[must_use]
+    pub const fn hash(&self) -> Hash {
+        self.hash
+    }
+
+    /// The wrapped [`CacheEngine`] handle. Lets a node-crate wrapper (#1621 Task
+    /// 10, `NodeAdmitStore`) reach the engine's `admit_bao_stream` without
+    /// duplicating the `(engine, hash, total_bytes)` triple it already holds.
+    #[must_use]
+    pub const fn engine(&self) -> &CacheEngine {
+        &self.engine
+    }
 }
 
 fn backend<E: std::error::Error + Send + Sync + 'static>(e: E) -> RangedStoreError {
@@ -147,5 +161,37 @@ impl ServeStore for NodeRangedStore {
                 item.map_err(backend)
             })) as EncodeStream)
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests
+mod tests {
+    use super::NodeRangedStore;
+    use crate::engine::CacheEngine;
+    use iroh_blobs::Hash;
+
+    /// The `hash`/`engine` accessors (#1621 Task 10) round-trip the values
+    /// `new` was constructed with — the node-crate `NodeAdmitStore` wrapper
+    /// reaches `admit_bao_stream` through these rather than duplicating the
+    /// `(engine, hash, total_bytes)` triple.
+    #[tokio::test]
+    async fn node_ranged_store_accessors_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let hash = Hash::from([7u8; 32]);
+        let store = NodeRangedStore::new(engine, hash, 4096);
+        assert_eq!(store.hash(), hash);
+        // Round-trip a query through the accessor's engine handle to prove it
+        // is a live, queryable handle rather than just a structural copy.
+        assert!(
+            store
+                .engine()
+                .present_ranges(hash)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the accessor's engine handle is live and queryable"
+        );
     }
 }

@@ -21,6 +21,7 @@ use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
 use iroh_blobs::{Hash, HashAndFormat};
+use iroh_io::AsyncStreamReader;
 use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
@@ -2324,6 +2325,106 @@ impl CacheEngine {
         Ok(())
     }
 
+    /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
+    /// blob) off `reader` into the cache as a B0-tagged **partial**,
+    /// O(chunk-group), verifying against the root incrementally. Returns the
+    /// drained `reader` (for `BlobSource::finish`). This is the range analogue
+    /// of the whole-blob tee ([`TeeReservation::begin`]): a bounded mpsc
+    /// channel feeds a `ChannelRecvStream` that iroh-blobs
+    /// `import_bao_reader` decodes and verifies concurrently with the caller's
+    /// read loop, so memory stays O(one channel's worth of chunks) rather than
+    /// O(range size).
+    ///
+    /// The wire the caller forwards is header-less (ADR 038) — unlike
+    /// `import_bao_reader`'s own `recv_exact(&mut size)` convention, which
+    /// expects an 8-byte LE size prefix as the first bytes on the stream. This
+    /// method supplies that prefix itself, from the trusted `total_bytes`
+    /// (the signed whole-blob size), rather than reading it off `reader`.
+    ///
+    /// # Errors
+    ///
+    /// - [`CacheError::VerifyFailed`] — the decoder rejected a chunk group or
+    ///   parent hash against the root `hash`: the forwarded bytes are corrupt
+    ///   (a lying upstream). Nothing is admitted.
+    /// - [`CacheError::Store`] — a local store fault, an import-task join
+    ///   fault, or a read fault on `reader` itself (distinct from corruption —
+    ///   mirrors the transport/corruption split in `bao_decoded_source`).
+    pub async fn admit_bao_stream<R>(
+        &self,
+        hash: Hash,
+        chunk_ranges: ChunkRanges,
+        total_bytes: u64,
+        mut reader: R,
+    ) -> CacheResult<R>
+    where
+        R: AsyncStreamReader + Send,
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
+        let engine = self.clone();
+        let import = tokio::spawn(async move {
+            engine
+                .inner
+                .store
+                .blobs()
+                .import_bao_reader(hash, chunk_ranges, ChannelRecvStream::new(rx))
+                .await
+        });
+
+        // Inject the 8-byte LE size prefix `import_bao_reader` expects as the
+        // first thing its `RecvStream` yields — the wire itself carries no
+        // in-band header (ADR 038), so it comes from the signed `total_bytes`
+        // instead of a read off `reader`.
+        let mut read_err = None;
+        if tx
+            .send(Bytes::copy_from_slice(&total_bytes.to_le_bytes()))
+            .await
+            .is_ok()
+        {
+            loop {
+                match reader.read_bytes(ADMIT_STREAM_READ_LEN).await {
+                    Ok(chunk) if chunk.is_empty() => break,
+                    Ok(chunk) => {
+                        if tx.send(chunk).await.is_err() {
+                            // The import task ended before this chunk landed —
+                            // its outcome (awaited below) explains why.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        read_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+        // Drop the sender to end the fed stream (mirrors `TeeSink::finish`),
+        // whether the loop ended on EOF, a closed import task, or a read fault.
+        drop(tx);
+
+        let outcome = import.await.map_err(|e| {
+            CacheError::Store(anyhow::anyhow!(
+                "admit_bao_stream: import task join failed: {e}"
+            ))
+        })?;
+
+        if let Some(e) = read_err {
+            // A local fault reading `reader`, independent of the import
+            // task's outcome — surface it rather than whatever (likely
+            // truncated-feed) outcome the import task landed on.
+            return Err(CacheError::Store(
+                anyhow::Error::from(e).context("admit_bao_stream: reader read_bytes failed"),
+            ));
+        }
+
+        match outcome {
+            Ok(_drained) => {
+                self.protect_partial(hash).await?;
+                Ok(reader)
+            }
+            Err(e) => Err(classify_import_bao_reader_error(hash, e)),
+        }
+    }
+
     /// Best-effort total byte size of `hash` from the configured origins, for
     /// scoping a range pull ([`Self::pull_through_range`] needs the exact blob
     /// size to align + verify a sub-range against the root `H`, and the
@@ -3771,6 +3872,37 @@ enum StreamCommitOutcome {
 /// `cdn/client/v1` chunks), large enough that the store import and the network
 /// forward overlap rather than ping-ponging one chunk at a time.
 const TEE_SINK_CHANNEL_CAP: usize = 8;
+
+/// Read granularity [`CacheEngine::admit_bao_stream`] uses to drain its
+/// upstream `reader` into the feeder channel. Arbitrary — the
+/// [`ChannelRecvStream`]/decoder side re-buffers to whatever boundaries the
+/// bao tree needs (the same way [`TeeSink::write`]'s network-chunk-sized
+/// pushes already do) — chosen as a plain streaming-I/O size, not tied to
+/// `CHUNK_GROUP_BYTES`.
+const ADMIT_STREAM_READ_LEN: usize = 64 * 1024;
+
+/// Classify a [`iroh_blobs::api::RequestError`] from
+/// [`CacheEngine::admit_bao_stream`]'s `import_bao_reader` call. A genuine bao
+/// verify rejection (chunk-group or parent hash mismatch) is surfaced by
+/// `bao-tree`'s decoder as an `io::Error` of kind `InvalidData` (see
+/// `bao_tree::io::error::DecodeError`'s `From<DecodeError> for io::Error`); a
+/// truncated/short feed instead surfaces `UnexpectedEof`, and any other
+/// failure is a genuinely local store/transport fault. Walking the error
+/// chain (rather than pattern-matching the `#[stack_error]`-derived
+/// `RequestError`/`Error` shapes directly) is robust to how many wrapper
+/// layers iroh-blobs interposes.
+fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError) -> CacheError {
+    let err = anyhow::Error::from(e).context("admit_bao_stream: import_bao_reader failed");
+    let verify_failed = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::InvalidData);
+    if verify_failed {
+        CacheError::VerifyFailed { expected: hash }
+    } else {
+        CacheError::Store(err)
+    }
+}
 
 /// Result of [`CacheEngine::open_tee_sink`] (#856).
 #[derive(Debug)]
@@ -7274,6 +7406,73 @@ mod tests {
             count_tags_for(&engine, hash).await,
             1,
             "re-admit does not proliferate tags"
+        );
+    }
+
+    // -- Task 9: admit_bao_stream — O(chunk-group) streaming range admit --
+
+    #[tokio::test]
+    async fn admit_bao_stream_admits_a_partial_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+
+        // `bao_for` (via `encode_verified_range`) prepends the 8-byte LE size
+        // header the in-memory `import_bao_bytes` path expects. The wire
+        // `admit_bao_stream` consumes is header-less (ADR 038) — the size
+        // comes from `total_bytes` instead — so strip it here to synthesize
+        // that header-less wire for the reader.
+        assert!(bao.len() > 8, "bao_for output must carry the 8-byte header");
+        let header_less = bao.slice(8..);
+
+        let reader = engine
+            .admit_bao_stream(hash, ranges.clone(), total, header_less)
+            .await
+            .unwrap();
+        assert_eq!(reader.len(), 0, "the reader is fully drained");
+
+        let present = engine.present_ranges(hash).await.unwrap();
+        assert!(!present.is_complete(), "still partial");
+        assert!(!present.is_empty(), "the admitted range is present");
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "streaming admit creates exactly one protecting tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_bao_stream_rejects_corrupt_bao() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, group, group, total);
+        let mut corrupt = bao.slice(8..).to_vec();
+        let flip_at = corrupt.len() / 2;
+        let byte = corrupt.get_mut(flip_at).expect("non-empty header-less bao");
+        *byte ^= 0xFF;
+
+        let err = engine
+            .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+            "expected VerifyFailed, got {err:?}"
+        );
+        assert!(
+            engine.present_ranges(hash).await.unwrap().is_empty(),
+            "nothing admitted from a corrupt bao"
+        );
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            0,
+            "a rejected import must not tag a partial"
         );
     }
 

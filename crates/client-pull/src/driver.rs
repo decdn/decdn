@@ -14,7 +14,7 @@
 //! money-relevant branches but re-frames them around gaps:
 //!
 //! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
-//!   [`ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
+//!   [`crate::ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
 //!   then [`BlobSource::finish`] to drain the pull and recover the acked voucher
 //!   watermark. The store's checkpoints are what make a mid-gap fault re-enter
 //!   with a SMALLER gap, so a resume never re-pulls a checkpointed prefix — the
@@ -22,7 +22,7 @@
 //! - **Reactive top-up**: a genuine mid-fetch exhaustion (confirmed against our
 //!   OWN ledger via [`genuine_exhaustion`]) is funded through [`Funder::top_up`],
 //!   then the gap is retried at its PAID frontier — NOT its checkpointed
-//!   (delivered) frontier. [`ClientRangedStore::ingest_stream`] checkpoints
+//!   (delivered) frontier. [`crate::ClientRangedStore::ingest_stream`] checkpoints
 //!   delivered+verified bytes payment-agnostically (the ADR 003 credit window
 //!   lets the node stream a full interval before the voucher that pays for it is
 //!   due), so a mid-leg exhaustion can leave the store's present-range frontier
@@ -47,7 +47,7 @@
 //!
 //! - The **stale-foreign-partial restart-from-zero**. The CLI kept an opaque
 //!   `.partial` with no outboard, so an ambiguous `NotFound` could mean "this file
-//!   belongs to another blob" and it rewound to zero. A [`ClientRangedStore`] is
+//!   belongs to another blob" and it rewound to zero. A [`crate::ClientRangedStore`] is
 //!   keyed to `(root, total_bytes)` and only ever holds bao-verified ranges, so
 //!   there is no foreign-partial ambiguity to resolve — resume is always driven by
 //!   the verified present set.
@@ -58,27 +58,38 @@
 //!
 //! # Store abstraction
 //!
-//! The store is the concrete `&ClientRangedStore` for now — it is the only
-//! backend that exposes `missing_ranges` / `ingest_stream` / `finalize`. Phase B
-//! will abstract the store-plus-sink behind a trait once the node's tee sink
-//! exists; its shape is not known yet, so this does NOT pre-invent a `Sink` trait
-//! (YAGNI).
+//! The store is generic over [`crate::source::IngestStore`] (`RangedStore` +
+//! `ingest_stream`), not the concrete `&ClientRangedStore` — [`crate::ClientRangedStore`]
+//! is one implementer (the CLI/client backend, writing `.partial`/`.obao4`); a
+//! node backend (B2) admits to the cache and tees to its downstream client
+//! through the same seam.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::{RangedStore, align_range};
+use decdn_bao_range::align_range;
 use decdn_incentive::DepositOutcome;
 
 use crate::pacer::{PaceDecision, PaceState};
-use crate::source::{BlobSource, Funder};
+use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
-    ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, MAX_RESUME_ATTEMPTS, Pacer,
-    ProgressCallback, UpstreamPullHeader, genuine_exhaustion, resumable_watermark,
-    resume_may_be_stale,
+    ChannelContext, ChannelLedger, Cumulative, MAX_RESUME_ATTEMPTS, Pacer, ProgressCallback,
+    UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
 };
+
+/// The injected wait signal for [`PaceDecision::Wait`] (ADR 037, Phase B): the
+/// node hands in an implementor that resolves once its serve leg's paid frontier
+/// has advanced (so a re-decide has a chance of finding window room); the client
+/// path never needs one, since `BudgetPacer` never returns `Wait`.
+pub trait PacingWait: Send + Sync {
+    /// Resolve once the caller judges it worth re-deciding (e.g. the served-paid
+    /// frontier advanced, or a bounded poll interval elapsed).
+    fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
 
 /// Read the channel context's current deposit through the shared handle. A tiny
 /// helper so the driver never holds the lock across an `.await` — it locks,
@@ -207,7 +218,7 @@ fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
 ///    finishes the pull. A mid-gap fault re-enters with the checkpointed prefix
 ///    already held, so the re-open covers only the un-checkpointed tail.
 /// 3. When the request's gaps are all filled AND the whole blob is present,
-///    [`finalize`](ClientRangedStore::finalize) it (promoting `.partial` to its
+///    [`finalize`](decdn_bao_range::RangedStore::finalize) it (promoting `.partial` to its
 ///    final path). For a partial `R` that does not complete the blob, `drive`
 ///    returns `Ok(())` and leaves finalization to a later whole-blob fetch — the
 ///    store cannot promote a blob that is still missing bytes outside `R`.
@@ -218,8 +229,8 @@ fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
 /// fault that is neither a healable desync nor a fundable exhaustion, an escrowed-
 /// but-untracked top-up outcome, or a `finalize` failure.
 #[allow(clippy::too_many_arguments)]
-pub async fn drive<S, P, F>(
-    store: &ClientRangedStore,
+pub async fn drive<St, S, P, F>(
+    store: &St,
     source: &S,
     pacer: &P,
     funder: &F,
@@ -230,8 +241,11 @@ pub async fn drive<S, P, F>(
     len: u64,
     config: &DriveConfig,
     on_progress: Option<&ProgressCallback>,
+    pacing_wait: Option<&dyn PacingWait>,
+    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
 ) -> anyhow::Result<()>
 where
+    St: IngestStore,
     S: BlobSource,
     P: Pacer,
     F: Funder,
@@ -262,6 +276,8 @@ where
             config,
             &mut counters,
             on_progress,
+            pacing_wait,
+            served_paid,
         )
         .await?;
     }
@@ -286,8 +302,8 @@ where
 // terminal); splitting them out would separate those from the loop state they act
 // on, exactly as the CLI's `fetch_blob_streaming` keeps them together.
 #[allow(clippy::too_many_lines)]
-async fn fill_gap<S, P, F>(
-    store: &ClientRangedStore,
+async fn fill_gap<St, S, P, F>(
+    store: &St,
     source: &S,
     pacer: &P,
     funder: &F,
@@ -300,8 +316,11 @@ async fn fill_gap<S, P, F>(
     config: &DriveConfig,
     counters: &mut DriveCounters,
     on_progress: Option<&ProgressCallback>,
+    pacing_wait: Option<&dyn PacingWait>,
+    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
 ) -> anyhow::Result<()>
 where
+    St: IngestStore,
     S: BlobSource,
     P: Pacer,
     F: Funder,
@@ -377,10 +396,40 @@ where
             topups_used: counters.topups_used,
             max_topups: funder.max_topups(),
             exhaustion_confirmed,
+            // `pulled_frontier` is this leg's own admitted/present frontier —
+            // correct on BOTH the client and node pull legs, since it is always
+            // THIS leg's delivery progress, never the downstream client's. No
+            // seam needed.
+            pulled_frontier: delivered_frontier,
+            // `served_paid_frontier` is NOT this leg's own state — it is the
+            // DOWNSTREAM client's paid frontier, which only the node's serve leg
+            // (a separate, future task) can advance. On the client path
+            // (`served_paid == None`) there is no downstream leg, so this
+            // collapses to the inert local `paid_frontier`: harmless, because
+            // `BudgetPacer` never reads `served_paid_frontier`. The NODE pull leg
+            // MUST pass `Some(reader)` here, reading the shared downstream
+            // `served_paid` frontier, so its `WindowPacer` gates the pull against
+            // the downstream client's payment — not against this leg's own
+            // upstream paid frontier, which would be category-wrong (it would
+            // make the window track the node's own credit-window lag instead of
+            // the client it is serving).
+            served_paid_frontier: served_paid.map_or(paid_frontier, |f| f()),
         };
 
         match pacer.decide(&state) {
             PaceDecision::Done => return Ok(()),
+            PaceDecision::Wait => {
+                if let Some(hook) = pacing_wait {
+                    hook.wait().await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "gap [{gap_start}, +{gap_len}) of blob paced to Wait but no \
+                     PacingWait hook was supplied: this is unreachable on the client \
+                     path (BudgetPacer never returns Wait) — a WindowPacer caller \
+                     must pass a PacingWait"
+                );
+            }
             PaceDecision::Refuse => {
                 anyhow::bail!(
                     "gap [{gap_start}, +{gap_len}) of blob cannot be funded: the remaining \
@@ -420,14 +469,12 @@ where
                 settle_waits = 0;
                 exhaustion_confirmed = false;
             }
-            // TODO(#1608 Phase B): honor `up_to_bytes` by capping the open to it
-            // once a sub-gap pacer (the node's `WindowPacer`, ADR 037) ships.
-            // Today `BudgetPacer` returns the full gap remainder as `up_to_bytes`,
-            // so drawing the whole still-missing sub-range below is equivalent and
-            // this is a no-op — but a window pacer will return a tighter bound
-            // that MUST clamp `draw_len`/`aligned` before the open, or the window
-            // is not actually enforced.
-            PaceDecision::Draw { .. } => {
+            // Honors `up_to_bytes` (#1608 Phase B / driver.rs TODO, resolved):
+            // `BudgetPacer` returns the full gap remainder, so clamping to it is a
+            // no-op there; a `WindowPacer` returns a tighter bound, and clamping
+            // `draw_len`/`aligned` here is what actually enforces the window — the
+            // open below must never request more than the pacer authorized.
+            PaceDecision::Draw { up_to_bytes } => {
                 // Draw the UNPAID tail `[paid_frontier, gap_end)`. This is the
                 // still-missing part when payment tracks delivery, and additionally
                 // the delivered-but-unpaid span `[paid_frontier, delivered_frontier)`
@@ -440,7 +487,7 @@ where
                     return Ok(());
                 }
                 let resume_start = paid_frontier;
-                let draw_len = gap_end.saturating_sub(resume_start);
+                let draw_len = gap_end.saturating_sub(resume_start).min(up_to_bytes);
                 let aligned = align_range(resume_start, draw_len, total_bytes)?;
 
                 // Whole-blob content already present, so `ingest_stream`'s
@@ -590,7 +637,7 @@ mod tests {
     use decdn_incentive::DepositOutcome;
 
     use super::{DriveConfig, contiguous_byte_ranges, drive};
-    use crate::pacer::BudgetPacer;
+    use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
         ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, UpstreamPullHeader,
@@ -723,6 +770,8 @@ mod tests {
             0,
             &config(),
             None,
+            None,
+            None,
         )
         .await
         .expect("drive whole blob");
@@ -803,6 +852,8 @@ mod tests {
             0,
             &config(),
             None,
+            None,
+            None,
         )
         .await
         .expect("drive fully-held blob");
@@ -879,6 +930,8 @@ mod tests {
             0,
             &config(),
             None,
+            None,
+            None,
         )
         .await
         .expect_err("the mid-gap stall surfaces as a terminal error");
@@ -903,6 +956,8 @@ mod tests {
             0,
             0,
             &config(),
+            None,
+            None,
             None,
         )
         .await
@@ -971,6 +1026,8 @@ mod tests {
             GROUP,
             GROUP,
             &config(),
+            None,
+            None,
             None,
         )
         .await
@@ -1134,6 +1191,8 @@ mod tests {
             0,
             &drive_config,
             None,
+            None,
+            None,
         )
         .await
         .expect("drive completes after one reactive top-up");
@@ -1163,5 +1222,240 @@ mod tests {
         assert!(store.is_complete().await.expect("is_complete"));
         let got = store.read(0, 0).await.expect("read whole blob");
         assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    /// A [`Pacer`] stub for the `up_to_bytes` clamp test: `Draw { up_to_bytes }`
+    /// on its first call, `Done` on every call after — so a driver that ignores
+    /// the clamp and drains the whole gap in one open would still only see ONE
+    /// open, while a driver that honors it opens exactly `up_to_bytes` and then
+    /// (correctly) stops early, leaving the rest of the gap unfilled.
+    struct OnceDrawThenDone {
+        up_to_bytes: u64,
+        drawn: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::pacer::Pacer for OnceDrawThenDone {
+        fn decide(&self, _state: &PaceState) -> PaceDecision {
+            if self.drawn.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                PaceDecision::Done
+            } else {
+                PaceDecision::Draw {
+                    up_to_bytes: self.up_to_bytes,
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn draw_clamps_the_open_to_up_to_bytes() {
+        // A single 4-group gap; the pacer authorizes only ONE group's worth. The
+        // driver must open exactly GROUP bytes, not the whole 4*GROUP gap — this
+        // is the up_to_bytes clamp the driver.rs:464 TODO used to skip.
+        let total = 4 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let pacer = OnceDrawThenDone {
+            up_to_bytes: GROUP,
+            drawn: std::sync::atomic::AtomicBool::new(false),
+        };
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("drive stops cleanly once the stub pacer says Done");
+
+        assert_eq!(
+            source.opened_ranges(),
+            vec![(0, GROUP)],
+            "the driver must clamp the open to the pacer's up_to_bytes, not the \
+             whole gap"
+        );
+        assert!(
+            !store.is_complete().await.expect("is_complete"),
+            "only one group of four was authorized, so the blob stays incomplete"
+        );
+    }
+
+    /// A [`PacingWait`] stub that counts calls and resolves immediately.
+    struct CountingWait {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::PacingWait for CountingWait {
+        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    /// A [`Pacer`] stub for the `Wait` test: `Wait` on the first call, then
+    /// defers to [`BudgetPacer`] on every call after — modeling a window pacer
+    /// that frees up room only after the driver's injected wait hook fires.
+    struct WaitOnceThenBudget {
+        waited: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::pacer::Pacer for WaitOnceThenBudget {
+        fn decide(&self, state: &PaceState) -> PaceDecision {
+            if self.waited.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                BudgetPacer::new().decide(state)
+            } else {
+                PaceDecision::Wait
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_decision_awaits_the_pacing_hook_once_then_completes() {
+        let total = GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let pacer = WaitOnceThenBudget {
+            waited: std::sync::atomic::AtomicBool::new(false),
+        };
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        let wait_hook = CountingWait {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            Some(&wait_hook),
+            None,
+        )
+        .await
+        .expect("drive completes after the one scripted Wait");
+
+        assert_eq!(
+            wait_hook.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the driver must await the PacingWait hook exactly once for the \
+             single scripted Wait decision"
+        );
+        assert!(store.is_complete().await.expect("is_complete"));
+        let got = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    /// A [`PacingWait`] hook that simulates the downstream serve leg clearing one
+    /// window's worth of payment each time it is awaited: it bumps a shared
+    /// counter by `bump_bytes` and resolves immediately (no real sleep), so the
+    /// test stays deterministic. The SAME counter backs the `served_paid` reader
+    /// passed to `drive`, so this is the only thing that can unstick a
+    /// `WindowPacer::Wait`.
+    struct BumpServedPaidWait {
+        served_paid: Arc<std::sync::atomic::AtomicU64>,
+        bump_bytes: u64,
+    }
+
+    impl super::PacingWait for BumpServedPaidWait {
+        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.served_paid
+                .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn window_pacer_gates_on_injected_served_paid() {
+        // A 3-group gap with a WindowPacer window of exactly one group: the pull
+        // can only run one group ahead of `served_paid` before it must `Wait`.
+        // Nothing but the injected `served_paid` reader (bumped by the
+        // `PacingWait` hook, standing in for the downstream serve leg clearing
+        // payment) can let the drive make further progress — proving both the
+        // seam wiring (`served_paid` reaches `WindowPacer` via `PaceState`) and
+        // the `Wait` -> hook -> re-decide loop actually advances against it.
+        let total = 3 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let pacer = crate::pacer::WindowPacer::new(GROUP);
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        let served_paid_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let wait_hook = BumpServedPaidWait {
+            served_paid: Arc::clone(&served_paid_counter),
+            bump_bytes: GROUP,
+        };
+        let served_paid_reader = {
+            let counter = Arc::clone(&served_paid_counter);
+            move || counter.load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            Some(&wait_hook),
+            Some(&served_paid_reader),
+        )
+        .await
+        .expect("drive completes as served_paid advances one window at a time");
+
+        // The window forced at least the two `Wait`s a 3-group gap under a
+        // 1-group window needs (group 2 and group 3 each had to wait for the
+        // previous group's payment to clear downstream).
+        assert!(
+            served_paid_counter.load(std::sync::atomic::Ordering::SeqCst) >= 2 * GROUP,
+            "the injected served_paid reader must have been advanced by the wait \
+             hook for the drive to complete"
+        );
+
+        assert!(store.is_complete().await.expect("is_complete"));
+        let got = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(
+            got.as_ref(),
+            plaintext.as_slice(),
+            "byte-exact after a window-paced, served-paid-gated drive"
+        );
     }
 }
