@@ -1,5 +1,6 @@
 # ADR 036: Served-Bytes Voting Weight
 
+**Date:** 2026-05-27
 **Status:** Accepted
 
 ## Vote window
