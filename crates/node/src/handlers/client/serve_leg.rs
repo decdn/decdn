@@ -594,9 +594,15 @@ impl ClientHandler {
                 let frame = ChunkData::new(chunk.to_vec())
                     .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
                 // A downstream drop surfaces here as `Err` (#856 client-disconnect
-                // shape); propagate so the caller drops the pull leg.
-                self.write_message(send, &ClientMessage::ChunkData(frame))
-                    .await?;
+                // shape); meter the client-abandon, then propagate so the caller drops
+                // the pull leg.
+                if let Err(e) = self
+                    .write_message(send, &ClientMessage::ChunkData(frame))
+                    .await
+                {
+                    self.metrics.node_pull_through_client_abandoned();
+                    return Err(e);
+                }
                 delivered = delivered.saturating_add(clen);
                 unvouchered = unvouchered.saturating_add(clen);
                 if unvouchered >= interval_bytes {
@@ -629,7 +635,7 @@ impl ClientHandler {
                 // A transport drop or an underpayment bail surfaces as `Err`;
                 // propagate so the caller drops the pull leg (bounding the
                 // upstream spend and persisting the buyer watermark).
-                let outcome = self
+                let outcome = match self
                     .collect_voucher_batch(
                         send,
                         recv,
@@ -641,7 +647,18 @@ impl ClientHandler {
                         rate_per_mb,
                         &deltas,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        // A transport drop or an underpayment bail (#856/#857): meter
+                        // the client-abandon (parity with the fused
+                        // `abandon_window_serve`), then propagate so the caller drops
+                        // the pull leg and bounds the upstream spend.
+                        self.metrics.node_pull_through_client_abandoned();
+                        return Err(e);
+                    }
+                };
                 committed_this_iter = outcome.committed;
                 // Advance `paid` by exactly the committed prefix's WIRE bytes.
                 let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
@@ -670,8 +687,14 @@ impl ClientHandler {
                 match outcome.stop {
                     // A voucher was rejected (or the commit hit `RetryLater`): the
                     // rejection was already written and any valid prefix committed
-                    // + acked. Stop cleanly; the caller drops the pull leg.
-                    BatchStop::Rejected => return Ok(()),
+                    // + acked. Stop cleanly; the caller drops the pull leg. An
+                    // underpaid/rejected voucher is a client-abandon (#856) — meter it
+                    // so a node paying upstream for a client that won't pay is
+                    // alertable (parity with the fused `abandon_window_serve`).
+                    BatchStop::Rejected => {
+                        self.metrics.node_pull_through_client_abandoned();
+                        return Ok(());
+                    }
                     BatchStop::Continue => {}
                 }
             }
@@ -711,6 +734,9 @@ impl ClientHandler {
             let made_delivery_progress = delivered > delivered_at_iter_start;
             let made_payment_progress = committed_this_iter > 0;
             if !made_delivery_progress && !made_payment_progress {
+                // The client stopped paying (#856 drop-after-fill): meter the abandon
+                // (parity with the fused `abandon_window_serve`), then stop cleanly.
+                self.metrics.node_pull_through_client_abandoned();
                 return Ok(());
             }
         }

@@ -9534,8 +9534,12 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
             u64::try_from(*bytes).unwrap_or(u64::MAX)
         });
     let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
+    // The window bounds CONTENT bytes, but the upstream watermark meters WIRE bytes
+    // (bao content + interleaved proof, ADR 038), so one window of content costs one
+    // window + its proof overhead (~4 KiB on a 1 MiB window) plus up to a group of
+    // boundary overshoot. One chunk group of slack covers both.
     anyhow::ensure!(
-        upstream_bytes <= one_window + 2 * (CHUNK_SIZE as u64),
+        upstream_bytes <= one_window + decdn_cache::CHUNK_GROUP_BYTES,
         "B's upstream spend ({upstream_bytes}) must stay bounded to ~one window ({one_window})"
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
