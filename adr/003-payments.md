@@ -191,10 +191,10 @@ seed = KDF(signer_secret, pool_id, provider, epoch_base, chunk_bytes, chunk_pric
 | Redemption today, cold lane | 277,517 |
 | Redemption today, warm lane | 113,618 |
 | Walk of 1024, scratch-space assembly (~97/step) | 99,390 |
-| Walk of 1024, naive `keccak256(abi.encodePacked(...))` (~224/step) | 239,580 |
+| Walk of 1024, naive `keccak256(abi.encodePacked(...))` (~189/step) | 193,306 |
 | Walk of 256, assembly | 24,886 |
 
-A full-depth walk therefore adds up to **~99k gas to a ~114k warm redemption — an 87% increase in the worst case**, and roughly half that at a typical mid-epoch index. The implementation MUST hash from scratch space in assembly rather than round-tripping through `abi.encodePacked`, which allocates memory per iteration and costs 2.4× more for the same result.
+A full-depth walk therefore adds up to **~99k gas to a ~114k warm redemption — an 87% increase in the worst case**, and roughly half that at a typical mid-epoch index. The implementation MUST hash from scratch space in assembly rather than round-tripping through `abi.encodePacked`, which allocates memory per iteration and costs ~1.95× more for the same result. `abi.encode` and `bytes.concat` measure the same as `abi.encodePacked` here, so the saving comes from staying in scratch space, not from the choice of spelling.
 
 This is the real price of the design and it is a deliberate trade: on-chain gas rises so that per-chunk off-chain cost falls to one hash with no signature, no acknowledgement and no durable commit. It stays acceptable because redemption is **rare and amortized** — a node redeems once per lane per epoch at most, and one redemption settles every epoch that came before it, since the current voucher's `cumulative` already carries the earlier frontier. `MAX_CHAIN_LENGTH` is the knob that prices it: halving the ceiling quarters nothing and halves the walk, at the cost of twice the signatures.
 
