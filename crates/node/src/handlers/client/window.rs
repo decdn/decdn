@@ -76,7 +76,7 @@ impl ClientHandler {
         // owes both checks, because this is a spend-and-serve path.
         //
         // They cover the request, not the stream: a takedown landing after this
-        // point is caught per MB boundary inside `window_forward_loop` (ADR 011
+        // point is caught per MB boundary inside the serve leg (`serve_leg`, ADR 011
         // §On Blacklist Event, in-flight termination), which matters most here
         // because this path is simultaneously *acquiring* the blob upstream.
         //
@@ -108,7 +108,7 @@ impl ClientHandler {
         // never fully fail open, or disabling the size cap would silently disable
         // deposit protection and let a near-empty channel trigger an unbounded
         // speculative pull (#856). The window is `pull_ahead_bytes` floored at one
-        // voucher interval, matching `window_forward_loop`.
+        // voucher interval, matching the serve leg (`serve_leg`).
         //
         // `guard_bytes` is a CONTENT-byte ceiling while billing is in bao WIRE
         // bytes (the proof overhead makes wire slightly higher — a fraction that
@@ -251,7 +251,7 @@ impl ClientHandler {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
         // The pacing window: at least `pull_ahead_bytes` (the ADR 037 upstream exposure
         // knob), the downstream `credit_window` (#1477), and one interval — the exact
-        // bound the fused `window_forward_loop` computed.
+        // bound the two-leg serve/pull driver paces against.
         let window = self
             .pull_ahead_bytes
             .as_ref()

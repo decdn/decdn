@@ -30,11 +30,8 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
-use crate::local_outboard_pull::{LocalOutboardHeader, LocalOutboardPull};
 use crate::metrics::CacheMetrics;
-use crate::origin::{
-    Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
-};
+use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
@@ -47,8 +44,7 @@ use crate::{from_store_hash, to_store_hash};
 /// origin backend. Lookups hit the store first; on miss and when an origin is
 /// configured, bytes are pulled and BLAKE3-verified. Insert-before-return is a
 /// property of the buffered path ([`Self::get`] / [`Self::populate`]), not of
-/// this type: [`Self::open_local_outboard_pull`] streams and tees concurrently,
-/// and [`Self::pull_through_range`] commits only a verified sub-range.
+/// this type: [`Self::pull_through_range`] commits only a verified sub-range.
 #[derive(Debug, Clone)]
 pub struct CacheEngine {
     inner: Arc<Inner>,
@@ -2342,8 +2338,8 @@ impl CacheEngine {
     /// This is the Flow A serviceability probe: the node's own-origin serve-miss
     /// path (FA.3) confirms an origin can furnish the outboard for `H` before it
     /// signs a `StreamResponse` and spins up the two-leg driver, so a blob no
-    /// origin can prove is never advertised as serviceable. It is the standalone
-    /// outboard walk factored out of [`Self::open_local_outboard_pull`] — same
+    /// origin can prove is never advertised as serviceable. It is a standalone
+    /// outboard walk — same
     /// `outboard_max` derivation (`expected_outboard_len` plus a 64-byte slack
     /// for the final partial group), same "a per-origin decline or transport fault
     /// advances the chain" discipline. The returned outboard is UNTRUSTED until it
@@ -2602,88 +2598,6 @@ impl CacheEngine {
             }
         }
         Ok(None)
-    }
-
-    /// Open a [`LocalOutboardPull`] (#1130 stream-while-store): stream an
-    /// origin's PLAINTEXT bytes through the header-less bao encoder as they
-    /// arrive, verifying against a locally-fetched `{H}.obao4` outboard, so a
-    /// paying client's cache-miss serve can start before the whole blob has
-    /// finished pulling through — rather than waiting on a whole-blob
-    /// [`Self::populate`] first.
-    ///
-    /// Walks the origin chain twice, mirroring [`Self::origin_size`] /
-    /// [`Self::pull_through_range`]'s degrade discipline: first for the
-    /// blob's total size ([`Self::origin_size`]), then for the first origin
-    /// that serves the outboard ([`Origin::fetch_outboard`]). Any decline —
-    /// unknown size, no origin publishes the outboard, or the winning origin
-    /// no longer has the data itself — returns `Ok(None)` so the caller
-    /// degrades to [`Self::populate`] and serves from the store as usual.
-    /// This is never a correctness or availability failure, only a forgone
-    /// optimization (same contract as [`Self::pull_through_range`]).
-    ///
-    /// Unlike [`Self::populate_local`] the size probe carries no `local_only`
-    /// filter, so it relies on the node→node `Peer` origin overriding neither
-    /// [`Origin::size`] nor [`Origin::fetch_outboard`] (both default to
-    /// `Ok(None)` / `Unsupported`). That is what keeps a paid peer from
-    /// winning the outboard or setting the `total_bytes` the serving node
-    /// signs into its `StreamResponse`. Give `NodeOrigin` either impl and this
-    /// path needs an explicit local-only filter first.
-    ///
-    /// # Errors
-    ///
-    /// [`CacheError::NoOrigin`] is folded into `Ok(None)` (no origins
-    /// configured means nothing to stream — not an error on this
-    /// best-effort path). A genuine transport fault surfaced by
-    /// [`Self::origin_size`] or the winning origin's [`Origin::fetch`] call
-    /// propagates as `Err`.
-    pub async fn open_local_outboard_pull(
-        &self,
-        hash: Hash,
-    ) -> anyhow::Result<Option<(LocalOutboardHeader, LocalOutboardPull)>> {
-        let total_bytes = match self.origin_size(hash).await {
-            Ok(Some(n)) => n,
-            Ok(None) | Err(CacheError::NoOrigin { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-
-        let outboard_max = expected_outboard_len(total_bytes).saturating_add(64);
-        let mut winner: Option<(Arc<dyn Origin>, Bytes)> = None;
-        for origin in &self.inner.origins {
-            match origin.fetch_outboard(hash, outboard_max).await {
-                Ok(OutboardFetch::Found(ob)) => {
-                    winner = Some((Arc::clone(origin), ob));
-                    break;
-                }
-                Ok(OutboardFetch::NotFound | OutboardFetch::Unsupported) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        %hash,
-                        kind = ?origin.kind(),
-                        error = %e,
-                        "origin outboard fetch failed; trying next origin",
-                    );
-                }
-            }
-        }
-        let Some((origin, outboard)) = winner else {
-            return Ok(None);
-        };
-
-        let max_bytes = self.inner.max_blob_bytes;
-        let (stream, _size_hint) = match origin
-            .fetch(hash, max_bytes)
-            .await
-            .map_err(crate::error::OriginPullError::into_inner)?
-        {
-            OriginFetch::Found { stream, size_hint } => (stream, size_hint),
-            // Outboard published but the origin no longer has the data
-            // itself — degrade to a whole-blob populate, which will
-            // re-surface a persistent absence at its proper severity.
-            OriginFetch::NotFound => return Ok(None),
-        };
-
-        let pull = LocalOutboardPull::spawn(hash, total_bytes, outboard, stream);
-        Ok(Some((LocalOutboardHeader { total_bytes }, pull)))
     }
 
     /// Begin a node-driven *tee* fill of `hash` (#856): the caller pushes the bao
@@ -4722,7 +4636,7 @@ mod tests {
     }
 
     /// A stub origin that also answers [`Origin::size`] and
-    /// [`Origin::fetch_outboard`], for [`LocalOutboardPull`] tests. The
+    /// [`Origin::fetch_outboard`], for outboard-fetch tests. The
     /// outboard answer is configurable so a test can exercise the
     /// `NotFound`/`Unsupported` degrade.
     #[derive(Debug)]
@@ -7445,76 +7359,6 @@ mod tests {
     fn local_outboard_pull_test_blob() -> Vec<u8> {
         let size = 5 * crate::CHUNK_GROUP_BYTES + 123;
         (0..size).map(|i| (i % 251) as u8).collect()
-    }
-
-    #[tokio::test]
-    async fn local_outboard_pull_streams_full_wire() -> anyhow::Result<()> {
-        use bao_tree::io::outboard::PreOrderMemOutboard;
-
-        let data = local_outboard_pull_test_blob();
-        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
-        let root: [u8; 32] = *ob.root.as_bytes();
-        let outboard = Bytes::from(ob.data.clone());
-
-        let origin = OutboardStubOrigin::new(&data, Some(outboard.clone()));
-        let hash = Hash::new(&data);
-        let tmp = tempfile::tempdir()?;
-        let engine =
-            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
-
-        let Some((header, mut pull)) = engine.open_local_outboard_pull(hash).await? else {
-            anyhow::bail!("expected Some((header, pull)) — outboard + data are both served");
-        };
-        anyhow::ensure!(
-            header.total_bytes == data.len() as u64,
-            "header.total_bytes should be the plaintext length"
-        );
-        let expected_wire_bytes = pull.expected_wire_bytes();
-
-        let mut wire = Vec::new();
-        while let Some(chunk) = pull.next_chunk().await? {
-            wire.extend_from_slice(&chunk);
-        }
-        pull.finish().await?;
-
-        anyhow::ensure!(
-            wire.len() as u64 == expected_wire_bytes,
-            "sum(chunk.len()) should equal expected_wire_bytes(): got {} vs {}",
-            wire.len(),
-            expected_wire_bytes,
-        );
-
-        let mut reference = Vec::new();
-        decdn_bao_range::streaming::encode_whole_blob_headerless(
-            root,
-            data.len() as u64,
-            outboard,
-            &data[..],
-            &mut reference,
-        )?;
-        anyhow::ensure!(
-            wire == reference,
-            "streamed header-less bao wire should match the reference whole-blob encoding"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn local_outboard_pull_none_without_outboard() -> anyhow::Result<()> {
-        let data = local_outboard_pull_test_blob();
-        let hash = Hash::new(&data);
-        let origin = OutboardStubOrigin::new(&data, None);
-        let tmp = tempfile::tempdir()?;
-        let engine =
-            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
-
-        let result = engine.open_local_outboard_pull(hash).await?;
-        anyhow::ensure!(
-            result.is_none(),
-            "no origin serves the outboard; open_local_outboard_pull should degrade to Ok(None)"
-        );
-        Ok(())
     }
 
     // -- FA.1a: origin_encode_range / origin_fetch_outboard_bytes (Flow A) --
