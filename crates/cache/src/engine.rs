@@ -3684,13 +3684,6 @@ impl CacheEngine {
             StreamCommitOutcome::HashMismatch { actual } => {
                 Ok(PullThroughOutcome::HashMismatch { actual })
             }
-            // `VerifyFailed` has no producer on the origin pull-through path: it
-            // feeds raw bytes (not a bao verified-stream), so `is_bao_verify_marker`
-            // never matches. Map defensively to `Store` — if it ever does fire,
-            // that is a logic regression worth surfacing, not silent success.
-            StreamCommitOutcome::VerifyFailed => Ok(PullThroughOutcome::Store(anyhow::Error::msg(
-                "import_and_verify_stream returned VerifyFailed on the non-tee origin path",
-            ))),
             StreamCommitOutcome::BlobTooLarge => Ok(PullThroughOutcome::BlobTooLarge),
             StreamCommitOutcome::Store(err) => Ok(PullThroughOutcome::Store(err)),
         }
@@ -3750,15 +3743,6 @@ impl CacheEngine {
             // a generic `OriginError`.
             if is_blob_too_large_marker(&upstream) {
                 return Ok(StreamCommitOutcome::BlobTooLarge);
-            }
-            // A bao verify failure (#915): the teed verified-stream did not check
-            // out against the content root — a corrupt/lying upstream. Surface it
-            // as the dedicated verify-failure outcome so the window serve path
-            // scores it as an upstream-verify failure rather than a generic
-            // transport error. The failure is at an interior chunk group, so there
-            // is no meaningful whole-blob "actual" hash to report.
-            if is_bao_verify_marker(&upstream) {
-                return Ok(StreamCommitOutcome::VerifyFailed);
             }
             // Otherwise classify via the shared body-phase classifier: typed
             // `OriginError::*` inners surface as Permanent (decompression
@@ -3925,22 +3909,14 @@ enum PullThroughOutcome {
 }
 
 /// Outcome of [`CacheEngine::import_and_verify_stream`] — the commit-and-verify
-/// tail shared by origin pull-through and the tee sink (#856). Mirrors
-/// [`PullThroughOutcome`] minus the `Bytes`/`NotFound` arms: a stream import
-/// either commits, fails bao verification, hashes wrong, overruns the cap, or
-/// hits a store fault.
+/// tail of the origin pull-through. Mirrors [`PullThroughOutcome`] minus the
+/// `Bytes`/`NotFound` arms: a stream import either commits, hashes wrong,
+/// overruns the cap, or hits a store fault.
 #[derive(Debug)]
 enum StreamCommitOutcome {
     Committed,
     BlobTooLarge,
-    /// The teed bao verified-stream failed to decode against the content root —
-    /// a corrupt/lying upstream (#915). Distinct from [`Self::HashMismatch`]:
-    /// the failure is at an interior chunk group, so there is no meaningful
-    /// whole-blob "actual" hash to report.
-    VerifyFailed,
-    HashMismatch {
-        actual: Hash,
-    },
+    HashMismatch { actual: Hash },
     Store(anyhow::Error),
 }
 
@@ -4018,42 +3994,6 @@ impl Drop for TeeReservation {
         self.engine.inner.lock_inflight().remove(&self.hash);
         self.notify.notify_waiters();
     }
-}
-
-/// Typed marker: a bao verifying decoder rejected a
-/// chunk group (or the root) — the upstream forwarded bytes that do not verify
-/// against the content hash. Carries the decoder's own description of WHICH
-/// parent/leaf failed (the first question in a corruption postmortem), mirroring
-/// [`BlobTooLargeMarker`]'s payload-carrying shape. Wrapped in the import
-/// stream's `io::Error` so [`CacheEngine::import_and_verify_stream`] surfaces a
-/// corruption outcome ([`StreamCommitOutcome::VerifyFailed`]) instead of
-/// collapsing it into a generic transport [`OriginPullError`] (#915, ADR 038).
-/// Only genuine hash mismatches would carry this marker — a truncated feed
-/// (EOF, `*NotFound`) stays a transport-class error.
-#[derive(Debug)]
-struct BaoVerifyMarker {
-    /// The failing `DecodeError` rendered (`ParentHashMismatch(node)` /
-    /// `LeafHashMismatch(chunk)`).
-    detail: String,
-}
-
-impl std::fmt::Display for BaoVerifyMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "bao verified-stream decode failed (content did not verify against root): {}",
-            self.detail
-        )
-    }
-}
-
-impl std::error::Error for BaoVerifyMarker {}
-
-/// True when the import-stream `io::Error` wraps a [`BaoVerifyMarker`] — the teed
-/// bao failed verification against the content root (corrupt/lying upstream).
-fn is_bao_verify_marker(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BaoVerifyMarker>)
 }
 
 /// A [`RecvStream`] backed by the [`CacheEngine::admit_bao_stream`] feeder
