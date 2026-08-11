@@ -2349,6 +2349,14 @@ impl CacheEngine {
         total_bytes: u64,
     ) -> CacheResult<Option<Bytes>> {
         let outboard_max = expected_outboard_len(total_bytes).saturating_add(64);
+        // A genuine transport fault on an origin (as opposed to a clean
+        // `NotFound`/`Unsupported` decline) is remembered so it can be surfaced when
+        // NO origin serves the outboard. The serviceability caller latches this into
+        // `fault_seen` (#1129): an own-origin miss that fails because the operator's
+        // origin is degraded must terminate as `InternalError`, not a bare
+        // `NotFound`. A clean decline stays `Ok(None)` so the caller degrades
+        // silently (ADR 037 §"Fallback is always correct").
+        let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             match origin.fetch_outboard(hash, outboard_max).await {
                 Ok(OutboardFetch::Found(ob)) => return Ok(Some(ob)),
@@ -2360,10 +2368,20 @@ impl CacheEngine {
                         error = %e,
                         "origin outboard fetch failed; trying next origin",
                     );
+                    last_err = Some(CacheError::OriginError {
+                        hash,
+                        source: e.into_inner(),
+                    });
                 }
             }
         }
-        Ok(None)
+        // No origin served the outboard. If any errored on the way, that transport
+        // fault is the answer (degraded, not absent); otherwise it is a clean
+        // absence and the caller degrades to the buffered path.
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// Fetch `aligned`'s span from the configured origins and return the
@@ -6781,6 +6799,11 @@ mod tests {
         outboard: Option<Bytes>,
         size: u64,
         support_range: bool,
+        /// When true, [`Origin::fetch_outboard`] returns a transport
+        /// [`OriginPullError`] instead of a clean decline — the degraded-origin
+        /// case the serviceability probe must surface as a fault (#1129), not as a
+        /// clean `Ok(None)` absence.
+        fault_outboard: bool,
     }
 
     impl RangeStubOrigin {
@@ -6792,6 +6815,20 @@ mod tests {
                 outboard: Some(outboard),
                 size: u64::try_from(payload.len()).unwrap_or(u64::MAX),
                 support_range: true,
+                fault_outboard: false,
+            }
+        }
+
+        /// An origin that knows `hash`'s size but FAULTS its outboard fetch with a
+        /// transport error — a degraded own origin, distinct from a clean absence.
+        fn outboard_faulting(hash: Hash, size: u64) -> Self {
+            Self {
+                hash,
+                data: Bytes::new(),
+                outboard: None,
+                size,
+                support_range: false,
+                fault_outboard: true,
             }
         }
     }
@@ -6830,6 +6867,13 @@ mod tests {
             _outboard_max_bytes: u64,
         ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, crate::OriginPullError>> + Send + '_>>
         {
+            if self.fault_outboard && hash == self.hash {
+                return Box::pin(async move {
+                    Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                        "stub outboard transport fault"
+                    )))
+                });
+            }
             let result = match (&self.outboard, hash == self.hash) {
                 (Some(ob), true) => OutboardFetch::Found(ob.clone()),
                 _ => OutboardFetch::NotFound,
@@ -6933,6 +6977,7 @@ mod tests {
             outboard: Some(outboard),
             size: total,
             support_range: true,
+            fault_outboard: false,
         };
         let tmp = tempfile::tempdir()?;
         let engine =
@@ -6965,6 +7010,7 @@ mod tests {
             outboard: None,
             size: total,
             support_range: false,
+            fault_outboard: false,
         };
         let tmp = tempfile::tempdir()?;
         let engine =
@@ -7010,6 +7056,30 @@ mod tests {
                 .await?
                 .is_none(),
             "no origin publishes the outboard; must be Ok(None)"
+        );
+        Ok(())
+    }
+
+    /// A genuine transport fault fetching the outboard (a degraded own origin) is
+    /// surfaced as `Err`, NOT collapsed into a clean `Ok(None)` absence — so the
+    /// serviceability caller can latch it into `fault_seen` (#1129) and terminate a
+    /// resulting miss as `InternalError` rather than a bare `NotFound`.
+    #[tokio::test]
+    async fn origin_fetch_outboard_bytes_surfaces_a_transport_fault() -> anyhow::Result<()> {
+        let data = local_outboard_pull_test_blob();
+        let hash = Hash::new(&data);
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+
+        let faulting = RangeStubOrigin::outboard_faulting(hash, total);
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(faulting) as Arc<dyn Origin>], 64).await?;
+        anyhow::ensure!(
+            engine
+                .origin_fetch_outboard_bytes(hash, total)
+                .await
+                .is_err(),
+            "an outboard transport fault must surface as Err, not a clean Ok(None)"
         );
         Ok(())
     }

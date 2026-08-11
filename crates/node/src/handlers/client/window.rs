@@ -349,12 +349,18 @@ impl ClientHandler {
                         )),
                         Err(e) => {
                             // The pull could not start: record a terminal error and wake
-                            // the serve leg so it fails a gap rather than hanging.
-                            if let Ok(mut guard) = pull_result.lock() {
-                                *guard = Some(Err(anyhow::anyhow!(
-                                    "serve-miss pull runtime build failed: {e}"
-                                )));
-                            }
+                            // the serve leg so it fails a gap rather than hanging. Recover
+                            // a poisoned lock instead of skipping the write (`if let Ok`
+                            // would leave `pull_result` `None` while still firing
+                            // `pull_ended`, and `notify_waiters` stores no permit — the
+                            // serve encoder would then wait forever). `pull_result` MUST be
+                            // `Some(..)` before `pull_ended` fires; mirror the recover-poison
+                            // the pull legs use for the same reason.
+                            *pull_result
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(
+                                anyhow::anyhow!("serve-miss pull runtime build failed: {e}"),
+                            ));
                             pull_ended.notify_waiters();
                         }
                     }
@@ -702,11 +708,16 @@ impl ClientHandler {
                         Err(e) => {
                             // The pull could not start: record a terminal error and
                             // wake the serve leg so it fails a gap rather than hanging.
-                            if let Ok(mut guard) = pull_result.lock() {
-                                *guard = Some(Err(anyhow::anyhow!(
-                                    "serve-miss local pull runtime build failed: {e}"
-                                )));
-                            }
+                            // Recover a poisoned lock rather than skipping the write:
+                            // `pull_result` MUST be `Some(..)` before `pull_ended` fires
+                            // (`notify_waiters` stores no permit, so a late-waking serve
+                            // encoder that saw `None` would hang). Mirrors the
+                            // recover-poison the pull legs use.
+                            *pull_result
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(
+                                anyhow::anyhow!("serve-miss local pull runtime build failed: {e}"),
+                            ));
                             pull_ended.notify_waiters();
                         }
                     }
