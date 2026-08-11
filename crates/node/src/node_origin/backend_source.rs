@@ -81,6 +81,16 @@ impl BackendSource {
             self_pay,
         }
     }
+
+    /// The LOCAL completion-counter ledger this source advances on
+    /// [`BlobSource::finish`]. The pull leg MUST hand this SAME `Arc` to
+    /// [`decdn_client_pull::drive`] as its `ledger`, so the paid-frontier the gap
+    /// loop reads for completion is the one `finish` moves — the whole point of THE
+    /// CRUX in the module docs. Returned as a fresh handle onto the shared ledger,
+    /// never a second ledger.
+    pub(crate) fn ledger(&self) -> Arc<ChannelLedger> {
+        Arc::clone(&self.self_pay)
+    }
 }
 
 impl BlobSource for BackendSource {

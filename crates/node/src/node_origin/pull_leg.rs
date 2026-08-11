@@ -41,15 +41,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, B256, U256};
+use alloy::signers::local::PrivateKeySigner;
 use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
 use decdn_cache::{CacheEngine, CacheError, Hash};
 use decdn_client_pull::driver::DriveConfig;
+use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
     HashMismatch as ClientPullHashMismatch, PaceDecision, PaceState, Pacer, PacingWait, PeerSource,
     WindowPacer, drive,
 };
+use decdn_incentive::DepositOutcome;
 
 use crate::leech_governor::LeechGovernor;
 use decdn_reputation::Outcome;
@@ -59,6 +62,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::admit_store::NodeAdmitStore;
+use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
 use super::resume::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::{
@@ -730,4 +734,565 @@ pub(crate) async fn run_pull_leg(
     }
     pull_ended.notify_waiters();
     // `_settle` drops here, persisting the buyer watermark (#852).
+}
+
+// ===========================================================================
+// Flow A: the UNPAID own-origin twin of the pull leg (FA.2).
+// ===========================================================================
+
+/// The [`Funder`] for the UNPAID local leg. There is no channel to fund, so it
+/// permits zero reactive top-ups and its [`Funder::top_up`] is unreachable.
+///
+/// Rate 0 keeps `next_voucher_cost` at 0 and `DriveConfig::working_deposit` is
+/// [`U256::ZERO`], so the pacer's exhaustion arm never fires and never returns
+/// [`PaceDecision::TopUp`] — the only thing that would call `top_up`. It errs
+/// defensively (rather than escrow anything, which it could not do anyway) so a
+/// hypothetical future regression that reached it fails loudly instead of hanging.
+#[allow(dead_code, reason = "wired by FA.3a orchestration")]
+struct NullFunder;
+
+impl Funder for NullFunder {
+    fn max_topups(&self) -> u32 {
+        0
+    }
+
+    fn top_up(&self, _additional: U256) -> SourceFuture<'_, DepositOutcome> {
+        Box::pin(async {
+            Err(anyhow::anyhow!(
+                "local own-origin pull leg has no channel to top up \
+                 (unreachable: rate 0, working_deposit 0)"
+            ))
+        })
+    }
+}
+
+/// Build the benign LOCAL [`ChannelContext`] the driver carries as pure
+/// bookkeeping for the unpaid leg (THE CRUX).
+///
+/// It signs NOTHING: the [`BackendSource`] quotes rate 0, so `drive` never prices,
+/// issues, or sends a voucher, and the throwaway signer is never touched. The
+/// large `deposit` keeps the pacer's `remaining_deposit` (`deposit −
+/// committed.amount`, and `committed.amount` stays 0 at rate 0) permanently above
+/// `next_voucher_cost` (also 0), so [`crate::pacer` `BudgetPacer`] never reaches
+/// its exhaustion/top-up arm. Fresh nonce/amounts — there is no prior channel
+/// state to resume. `U256::MAX` is used, not a merely-large value, so no blob size
+/// can ever bring the gap headroom below the (zero) voucher cost.
+#[allow(dead_code, reason = "wired by FA.3a orchestration")]
+fn local_bookkeeping_ctx() -> ChannelContext {
+    ChannelContext {
+        channel_id: B256::ZERO,
+        token: Address::ZERO,
+        deposit: U256::MAX,
+        client_signer: Arc::new(PrivateKeySigner::random()),
+        // Chain 0 / zero contract: this domain is never used to sign, because rate
+        // 0 means no voucher is ever produced. It exists only to satisfy the struct.
+        voucher_domain: decdn_incentive::voucher_domain(0, Address::ZERO),
+        prior_nonce: U256::ZERO,
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+        client_binding: None,
+    }
+}
+
+/// Run the range-minimized OWN-ORIGIN pull for `[offset, offset + len)` of `hash`
+/// into `engine`'s cache via [`drive`] over an UNPAID [`BackendSource`], pacing the
+/// pull to within `window` of the downstream serve leg's paid frontier (ADR 037).
+/// Records the terminal outcome into `pull_result` and fires `pull_ended`. The
+/// local twin of [`run_pull_leg`] (Flow A, FA.2).
+///
+/// # What drops out relative to the paid [`run_pull_leg`]
+///
+/// This leg pulls from THIS node's own configured origin, reached through
+/// [`CacheEngine::origin_encode_range`] behind the [`BackendSource`]. There is no
+/// counterparty, so every paid-path axis is absent — and each absence is load-bearing,
+/// not an omission:
+///
+/// - **No discovery / channel open / [`PeerSource`] / [`NodeFunder`].** The bytes
+///   are already reachable locally, so there is nothing to dial, no channel to open,
+///   and nothing to pay. The source is handed in by the orchestration, already built.
+/// - **No provider scoring, no region accounting.** There is no provider and no
+///   remote region: a fault here is OUR own origin, never a peer to score or a
+///   region to credit. On a [`drive`] error we meter it as a LOCAL fault
+///   ([`crate::metrics::Metrics::node_pull_local_fault`]) and NEVER touch reputation.
+/// - **No [`SettleOnDrop`].** That guard persists a BUYER voucher watermark (#852);
+///   this leg issues no vouchers, so there is nothing to settle.
+///
+/// # Why the driver still needs a "ledger" — THE CRUX
+///
+/// [`drive`]'s per-gap completion is paid-frontier gated: a gap is `Done` only once
+/// the ledger's committed `bytes` reach the gap end. An unpaid source that never
+/// advanced a ledger would leave that frontier at zero and the gap loop would
+/// re-draw forever. So the [`BackendSource`] carries a LOCAL bookkeeping
+/// [`ChannelLedger`] and, on `finish`, advances its `bytes` by exactly the leg's
+/// drained wire (at amount 0). We hand `drive` that SAME ledger ([`BackendSource::ledger`])
+/// plus a benign [`local_bookkeeping_ctx`] and a [`NullFunder`], so the completion
+/// counter the source moves is the one the gap loop reads. This is NOT payment — no
+/// channel, no voucher, no chain, no counterparty; see the [`BackendSource`] module
+/// docs.
+///
+/// The downstream [`WindowPacer`] is KEPT (bound on `served_paid`): the pull still
+/// never runs more than `window` ahead of the real downstream client's paid frontier
+/// (#1610 — ingest only behind a waiting, paying client — and the storage/egress
+/// exposure bound).
+///
+/// # Off the accept task, on its own runtime
+///
+/// Like [`run_pull_leg`], `drive`'s future is non-`Send`, so the orchestration
+/// (FA.3a) `block_on`s this on a dedicated current-thread runtime. All inputs are
+/// therefore owned + `'static`; the shared coordination state
+/// ([`AtomicU64`] / [`Notify`] / [`StdMutex`]) crosses runtimes safely.
+#[allow(
+    clippy::too_many_arguments,
+    dead_code,
+    reason = "wired by FA.3a orchestration"
+)]
+pub(crate) async fn run_local_pull_leg(
+    metrics: Arc<crate::metrics::Metrics>,
+    engine: CacheEngine,
+    source: BackendSource,
+    hash: Hash,
+    offset: u64,
+    len: u64,
+    window: u64,
+    total_bytes: u64,
+    served_paid: Arc<AtomicU64>,
+    served_paid_advanced: Arc<Notify>,
+    pull_ended: Arc<Notify>,
+    pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
+    outboard_writer: super::serve_outboard::OutboardWriter,
+    leech_governor: Option<Arc<LeechGovernor>>,
+    client_peer: [u8; 32],
+    cancel: CancellationToken,
+) {
+    let hash_bytes = *hash.as_bytes();
+
+    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(outboard_writer));
+
+    // The LOCAL bookkeeping axes (THE CRUX). The `ledger` is the SAME `Arc` the
+    // source advances on `finish`, so the paid-frontier the gap loop reads for
+    // completion tracks the wire this leg actually drained. The `ctx` is a benign
+    // large-deposit / throwaway-signer context (never used to sign, rate 0), and the
+    // funder is a no-op — there is no channel to top up.
+    let ledger = source.ledger();
+    let ctx = Arc::new(std::sync::Mutex::new(local_bookkeeping_ctx()));
+    let null_funder = NullFunder;
+
+    // The window + seed-leech pacer (ADR 037), IDENTICAL to the paid leg's: keep the
+    // downstream `WindowPacer` bound on `served_paid` (#1610 + storage/egress
+    // exposure), so the unpaid pull is still throttled to the real client's paid
+    // frontier. `refused` latches a leech-cap stop so the outcome below can tell it
+    // from an origin fault.
+    let leech_refused = Arc::new(AtomicBool::new(false));
+    let leech_pacer = LeechPacer {
+        window: WindowPacer::new(window),
+        governor: leech_governor,
+        peer: client_peer,
+        last_pulled: AtomicU64::new(0),
+        refused: Arc::clone(&leech_refused),
+    };
+    // `working_deposit == ZERO` disables the pacer's reactive top-up arm entirely, so
+    // the settle-wait budget is inert here; keep the smallest sane values.
+    let config = DriveConfig {
+        working_deposit: U256::ZERO,
+        max_settle_waits: 0,
+        settle_backoff: SETTLE_POLL_STEP,
+    };
+    let served_paid_reader = {
+        let served_paid = Arc::clone(&served_paid);
+        move || served_paid.load(Ordering::Relaxed)
+    };
+    let pacing_wait = ServedPaidWait {
+        served_paid_advanced: Arc::clone(&served_paid_advanced),
+        metrics: Arc::clone(&metrics),
+    };
+
+    // Cooperative cancellation exactly as the paid leg: the serve leg finishing
+    // cancels the token, dropping the `drive` future. There is no provider to score
+    // and no watermark to persist, so a cancel simply stops the local pull.
+    let cancelled;
+    let result = tokio::select! {
+        biased;
+        r = drive(
+            &admit_store,
+            &source,
+            &leech_pacer,
+            &null_funder,
+            &ctx,
+            &ledger,
+            hash_bytes,
+            offset,
+            len,
+            &config,
+            None,
+            Some(&pacing_wait),
+            Some(&served_paid_reader),
+        ) => {
+            cancelled = false;
+            r
+        }
+        () = cancel.cancelled() => {
+            cancelled = true;
+            Ok(())
+        }
+    };
+
+    // Abandon drain (#1621 B2), for the same reason as the paid leg: a cancelled or
+    // errored `drive` returns without a graceful cooperative close, and the
+    // orchestration drops this pull-thread runtime the instant we return. There is no
+    // UPSTREAM iroh connection here (the origin fetch is an HTTP/S3/fs call inside the
+    // cache engine, which does not strand a QUIC driver on this runtime), so the drain
+    // is strictly a belt-and-braces yield; keep it identical to the paid twin so the
+    // two teardown shapes do not drift. Only the clean `Ok` path skips it.
+    if cancelled || result.is_err() {
+        tokio::time::sleep(ABANDON_DRAIN).await;
+    }
+
+    // A seed-leech stop is our own abuse cap firing (ADR 037 §Seed-leech caps), not a
+    // fault of the origin. Replace `drive`'s generic funding-refuse message with a
+    // clear one for the serve leg / logs — same latch as the paid leg.
+    let refused = leech_refused.load(Ordering::Relaxed);
+    let result = if refused {
+        Err(anyhow::anyhow!(
+            "serve-miss local pull refused: seed-leech cap denied further speculative pull \
+             with nothing to recoup"
+        ))
+    } else {
+        result
+    };
+
+    // Classify a terminal error. There is no upstream, so a fault is ALWAYS local
+    // (our own origin is corrupt/misconfigured, or a transport fault reaching it):
+    // meter it as a local fault and NEVER score a provider or a bao-corruption against
+    // an upstream that does not exist. Skipped on cancel (nobody waits) and on a leech
+    // stop (our own cap, not a fault).
+    if !cancelled
+        && !refused
+        && let Err(err) = &result
+    {
+        metrics.node_pull_local_fault();
+        tracing::warn!(
+            %hash,
+            error = %err,
+            "own-origin pull leg failed; local-origin fault (no upstream to score)"
+        );
+    }
+
+    // Record the terminal outcome BEFORE firing `pull_ended` (the serve leg reads
+    // `pull_result` after the notify to decide a gap it is waiting on).
+    {
+        let mut guard = pull_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(result);
+    }
+    pull_ended.notify_waiters();
+}
+
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "tests"
+)]
+#[cfg(test)]
+mod local_pull_leg_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    use bytes::Bytes;
+    use decdn_bao_range::IROH_BLOCK_SIZE;
+    use decdn_cache::{
+        CacheEngine, Hash, Origin, OriginFetch, OriginKind, OriginPullError, OriginRangeFetch,
+        OriginRangeRequest, OutboardFetch,
+    };
+    use decdn_client_pull::{ChannelLedger, Cumulative};
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+
+    use super::BackendSource;
+    use super::run_local_pull_leg;
+    use crate::node_origin::shared_outboard;
+
+    /// What a [`FakeOrigin`] does when its range is fetched.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// Serve the genuine bytes for `H` — a healthy own origin.
+        Serve,
+        /// Return a transport error from `fetch_range` — an origin the node cannot
+        /// reach (the FA.2 (b) no-hang-on-fault case).
+        Fault,
+        /// Serve length-matching bytes that do NOT hash to `H` — a
+        /// corrupt/misconfigured own origin (the FA.2 (c) local-verify case).
+        Corrupt,
+    }
+
+    /// A minimal own-origin double serving one blob's aligned ranges + its
+    /// `{H}.obao4` outboard, parameterized by [`Mode`]. Twin of the `FakeOrigin` in
+    /// `backend_source.rs`'s tests (kept local — test doubles don't cross module
+    /// test boundaries).
+    #[derive(Debug)]
+    struct FakeOrigin {
+        hash: Hash,
+        data: Bytes,
+        outboard: Bytes,
+        size: u64,
+        mode: FakeMode,
+    }
+
+    // A non-Copy Debug shim so `FakeOrigin` can derive `Debug` (Mode is internal).
+    #[derive(Debug, Clone, Copy)]
+    enum FakeMode {
+        Serve,
+        Fault,
+    }
+
+    impl FakeOrigin {
+        fn new(hash: Hash, data: &[u8], outboard: Bytes, mode: Mode) -> Self {
+            // `Corrupt` is expressed by feeding mismatched `data` under `Serve`; only
+            // `Fault` needs distinct fetch behaviour, so the stored mode is binary.
+            let fake_mode = match mode {
+                Mode::Serve | Mode::Corrupt => FakeMode::Serve,
+                Mode::Fault => FakeMode::Fault,
+            };
+            Self {
+                hash,
+                data: Bytes::from(data.to_vec()),
+                outboard,
+                size: data.len() as u64,
+                mode: fake_mode,
+            }
+        }
+    }
+
+    impl Origin for FakeOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
+        {
+            let result = if hash == self.hash {
+                Ok(OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+
+        fn size(
+            &self,
+            hash: Hash,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>>
+        {
+            let out = (hash == self.hash).then_some(self.size);
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn fetch_outboard(
+            &self,
+            hash: Hash,
+            _outboard_max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>>
+        {
+            let result = if hash == self.hash {
+                OutboardFetch::Found(self.outboard.clone())
+            } else {
+                OutboardFetch::NotFound
+            };
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn fetch_range(
+            &self,
+            hash: Hash,
+            req: OriginRangeRequest,
+            _outboard_max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>>
+        {
+            if matches!(self.mode, FakeMode::Fault) {
+                return Box::pin(async {
+                    Err(OriginPullError::Permanent(anyhow::anyhow!(
+                        "simulated own-origin transport fault"
+                    )))
+                });
+            }
+            let result = if hash == self.hash {
+                let s = req.fetch_start as usize;
+                let e = req.fetch_end as usize;
+                match self.data.get(s..e) {
+                    Some(span) => OriginRangeFetch::Ranged {
+                        data: Bytes::copy_from_slice(span),
+                        outboard: self.outboard.clone(),
+                    },
+                    None => OriginRangeFetch::NotFound,
+                }
+            } else {
+                OriginRangeFetch::Unsupported
+            };
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    /// A blob spanning several chunk groups plus a partial final group, so the bao
+    /// tree has real interior nodes.
+    fn test_blob() -> Vec<u8> {
+        let size = 5 * decdn_cache::CHUNK_GROUP_BYTES as usize + 123;
+        (0..size).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn fresh_ledger() -> Arc<ChannelLedger> {
+        Arc::new(ChannelLedger::new(Cumulative::default()))
+    }
+
+    /// Build an engine over one `FakeOrigin` in `mode`, plus the root/outboard/total
+    /// for the genuine blob. In `Corrupt` mode the origin serves `corrupt` bytes
+    /// (length-matched, different content) under the genuine `H`.
+    async fn engine_with_origin(
+        mode: Mode,
+    ) -> anyhow::Result<(CacheEngine, [u8; 32], u64, tempfile::TempDir)> {
+        let data = test_blob();
+        let ob = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+        let root: [u8; 32] = *ob.root.as_bytes();
+        let outboard = Bytes::from(ob.data.clone());
+        let hash = Hash::from(root);
+        let total = data.len() as u64;
+
+        let served: Vec<u8> = match mode {
+            Mode::Serve | Mode::Fault => data,
+            Mode::Corrupt => data.iter().map(|b| b ^ 0xFF).collect(),
+        };
+        let origin = FakeOrigin::new(hash, &served, outboard, mode);
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+        Ok((engine, root, total, tmp))
+    }
+
+    /// Drive `run_local_pull_leg` to termination under a hard timeout — a hang (the
+    /// failure mode THE CRUX must rule out) surfaces as the timeout error rather
+    /// than wedging the test runner. `served_paid` is pre-advanced to `total` so the
+    /// downstream `WindowPacer` never gates the pull (this test exercises the
+    /// completion path, not the window).
+    ///
+    /// Returns the recorded `pull_result`. The leg sets `pull_result`
+    /// UNCONDITIONALLY on the line immediately before it fires `pull_ended` and
+    /// returns, so — because we await the leg to full completion — a `Some`
+    /// `pull_result` is the non-racy proof that the leg both terminated and fired
+    /// `pull_ended` (a fresh `notified()` here would miss the already-sent
+    /// `notify_waiters`, which stores no permit, so we do not watch the notify).
+    async fn run_to_termination(
+        engine: &CacheEngine,
+        root: [u8; 32],
+        total: u64,
+    ) -> anyhow::Result<Option<anyhow::Result<()>>> {
+        let hash = Hash::from(root);
+        let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
+        let (ob_writer, _factory) = shared_outboard(bao_tree::blake3::Hash::from(root), total);
+
+        let served_paid = Arc::new(AtomicU64::new(total));
+        let served_paid_advanced = Arc::new(Notify::new());
+        let pull_ended = Arc::new(Notify::new());
+        let pull_result: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let cancel = CancellationToken::new();
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        // A window comfortably larger than the blob: with `served_paid == total`, the
+        // pull never waits, so this only has to admit the whole gap.
+        let window = total.saturating_mul(4).max(decdn_cache::CHUNK_GROUP_BYTES);
+
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            run_local_pull_leg(
+                metrics,
+                engine.clone(),
+                source,
+                hash,
+                0,
+                0,
+                window,
+                total,
+                served_paid,
+                served_paid_advanced,
+                Arc::clone(&pull_ended),
+                Arc::clone(&pull_result),
+                ob_writer,
+                None,
+                [7u8; 32],
+                cancel,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("run_local_pull_leg HUNG — the CRUX failed to terminate"))?;
+
+        let out = pull_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        Ok(out)
+    }
+
+    /// (a) THE CRUX: a full-miss whole-blob local pull TERMINATES, fills the cache
+    /// byte-exact, and records `pull_result == Some(Ok(()))`.
+    #[tokio::test]
+    async fn local_pull_leg_full_miss_terminates_and_fills() -> anyhow::Result<()> {
+        let (engine, root, total, _tmp) = engine_with_origin(Mode::Serve).await?;
+        let hash = Hash::from(root);
+
+        let result = run_to_termination(&engine, root, total)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("pull_result must be recorded (leg fired pull_ended)")
+            })?;
+        result.map_err(|e| anyhow::anyhow!("expected Ok, got Err: {e}"))?;
+
+        // The cache now holds the whole blob, byte-exact.
+        let want = test_blob();
+        assert_eq!(
+            engine.get(hash).await?.as_ref(),
+            want.as_slice(),
+            "the local pull must fill the cache byte-exact"
+        );
+        Ok(())
+    }
+
+    /// (b) A transport fault reaching the own origin records `pull_result ==
+    /// Some(Err(_))` and does NOT hang. Backstops FA.4c.
+    #[tokio::test]
+    async fn local_pull_leg_origin_fault_fails_without_hang() -> anyhow::Result<()> {
+        let (engine, root, total, _tmp) = engine_with_origin(Mode::Fault).await?;
+
+        let result = run_to_termination(&engine, root, total)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("pull_result must be recorded even on fault"))?;
+        assert!(
+            result.is_err(),
+            "an origin transport fault must terminate the leg with Err"
+        );
+        Ok(())
+    }
+
+    /// (c) A corrupt own origin (bytes don't hash to `H`) terminates with `Err` —
+    /// classified LOCAL (there is no upstream to score) — and does NOT hang.
+    #[tokio::test]
+    async fn local_pull_leg_corrupt_origin_fails_local_without_hang() -> anyhow::Result<()> {
+        let (engine, root, total, _tmp) = engine_with_origin(Mode::Corrupt).await?;
+
+        let result = run_to_termination(&engine, root, total)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("pull_result must be recorded even on corruption"))?;
+        assert!(
+            result.is_err(),
+            "a corrupt own origin must terminate the leg with a local Err"
+        );
+        Ok(())
+    }
 }

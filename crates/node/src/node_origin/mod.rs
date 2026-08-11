@@ -54,7 +54,8 @@ pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use funder::NodeFunder;
-pub(crate) use pull_leg::run_pull_leg;
+#[allow(unused_imports, reason = "wired by FA.3a orchestration")]
+pub(crate) use pull_leg::{run_local_pull_leg, run_pull_leg};
 pub(crate) use serve_outboard::{OutboardReader, shared_outboard};
 
 use std::collections::HashMap;
