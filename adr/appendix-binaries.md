@@ -11,7 +11,7 @@ A deCDN deployment has two unrelated jobs:
   systemd, reachable on QUIC `:4433` and metrics `:9090`), and
 - run one-shot human commands an operator or publisher types in a
   terminal — `probe`, `node peers`, `key-gen`, `config validate`, and
-  the deferred `pull`, `bundle …`, `fetch`, `publish`, `channel`,
+  the deferred `pull`, `bundle …`, `fetch`, `publish`, `pool`,
   `wallet`.
 
 Threat surface, dependency footprint, and update cadence differ
@@ -33,7 +33,7 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   human-facing CLI. Carries every command anyone types: `probe`,
   `node {peers,health,announce,drain,evict,reload}`, `key-gen`,
   `config {init,validate}`, and the deferred `pull`, `bundle …`,
-  `fetch`, `publish`, `channel`, `wallet`.
+  `fetch`, `publish`, `pool`, `wallet`.
 - **`decdn-common`** (`crates/common`) — shared types both binaries
   need: the TOML config schema and resolver, identity loading, the
   `AdminRpc` trait + DTOs, and clap argument structs. No runtime, no

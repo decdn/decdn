@@ -40,7 +40,7 @@ Several subsystems classify a failure into a small closed set of reasons. The co
 |--------|--------|
 | Connection dispatch rejection (`RejectReason`) | `decdn_dispatch_rejected_global_total`, `decdn_dispatch_rejected_per_source_total` |
 | Rate-limit rejection (`RejectLayer`, shared by the probe and DHT paths) | `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` and `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` |
-| Buyer `openChannel` failure (`ChannelOpenFailureReason`) | `decdn_channel_open_failures_insufficient_deposit_total`, `decdn_channel_open_failures_contract_revert_total`, `decdn_channel_open_failures_rpc_error_total` (plus the aggregate `decdn_node_pull_channel_open_failures_total`) |
+| Buyer pool-open failure (`ChannelOpenFailureReason`) | `decdn_channel_open_failures_insufficient_deposit_total`, `decdn_channel_open_failures_contract_revert_total`, `decdn_channel_open_failures_rpc_error_total` (plus the aggregate `decdn_node_pull_channel_open_failures_total`) |
 | Gossip envelope rejection (`AnnounceReject`) | `decdn_gossip_announces_rejected_total` (aggregate) + `decdn_gossip_messages_rejected_clock_skew_total` |
 
 Siblings are the default because each reason in these families has an **unrelated operator remedy**, so no single alert spans the family and a shared label buys nothing; a sibling also needs no typed `EncodeLabelSet` and no pre-materialization to keep a series exporting at zero.
@@ -142,17 +142,19 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 > they sit next to on an operator's dashboard. Documenting them twice is how the
 > two copies drifted apart.
 
-#### Payment Channel Metrics
+#### Payment Pool Metrics
+
+Metric identifiers retain the `channel` prefix (the `PaymentPool` contract name); the descriptions below use the pool model.
 
 | Metric | Type | Tier | Status | Description |
 |--------|------|------|--------|-------------|
-| `decdn_channels_open` | Gauge | M | live | Currently open payment channels (as node — inbound from clients). |
-| `decdn_channels_settled_total` | Counter | M | planned | Channels settled on-chain. |
-| `decdn_channel_deposit_usdc` | Gauge | M | live | Total USDC deposited across all currently open inbound channels. Represents maximum on-chain recoverable value. |
-| `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-channel rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy channels from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
+| `decdn_channels_open` | Gauge | M | live | Payment pools currently paying this node (inbound from clients — lanes with unredeemed vouchers). |
+| `decdn_pool_redemptions_total` | Counter | M | planned | On-chain redemptions by this node. |
+| `decdn_channel_deposit_usdc` | Gauge | M | live | Total USDC deposited in pools currently paying this node. Represents maximum on-chain recoverable value. |
+| `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
 | `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers signed by this node as the payee. |
 | `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |
-| `decdn_channel_disputes_total` | Counter | R | planned | Channels that entered the dispute window. |
+| `decdn_pool_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed vouchers. |
 
 #### Gossip Metrics
 
@@ -290,7 +292,7 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
 - **Log levels:**
   - `ERROR` — unrecoverable, needs operator intervention (startup failures, RPC unreachable after all retries).
   - `WARN` — recoverable degraded conditions (blacklist poll lag > 1 interval, startup clock skew > 10 s, probe hold slot saturation > 90%).
-  - `INFO` — significant lifecycle events (node ready, channel opened/settled, peer joined/left, `NodeAnnounce` published).
+  - `INFO` — significant lifecycle events (node ready, pool opened/redeemed, peer joined/left, `NodeAnnounce` published).
   - `DEBUG` — per-stream and per-probe events. Not for high-volume production.
 
 **Mandatory log fields** on every event:
@@ -321,7 +323,7 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 | `vouchers_signed` | `decdn_vouchers_signed_total` | architecture.md |
 | `vouchers_received` | `decdn_vouchers_received_total` | architecture.md |
 | `channels_open` | `decdn_channels_open` | architecture.md |
-| `channels_settled` | `decdn_channels_settled_total` | architecture.md |
+| `channels_settled` | `decdn_pool_redemptions_total` | architecture.md |
 | `cache_hits` | `decdn_cache_hits_total` | architecture.md |
 | `cache_misses` | `decdn_cache_misses_total` | architecture.md |
 | `cache_bytes` | `decdn_cache_bytes` | architecture.md |

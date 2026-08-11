@@ -7,7 +7,7 @@
 
 Nodes and clients communicate over QUIC connections established via iroh. This ADR defines what protocols run over those connections: how a client or node requests a blob and pays for it, and how content availability is broadcast across the network.
 
-The protocol layer is distinct from the transport layer (iroh/QUIC) and the payment layer (vouchers, channels) so each can evolve independently.
+The protocol layer is distinct from the transport layer (iroh/QUIC) and the payment layer (vouchers, pools) so each can evolve independently.
 
 ## Decision
 
@@ -28,7 +28,7 @@ The iroh-gossip protocol carries multiple message types on distinct topics:
 | --- | --- | --- |
 | `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 
-All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for fraud monitoring — anyone may run an off-chain detector against the L2 chain ([Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection)).
+All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for settlement monitoring — anyone may run an off-chain analyzer against the L2 chain ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)).
 
 ### Rate discovery
 
@@ -36,7 +36,7 @@ Nodes do not gossip rate changes. The current rate is included in every signed `
 
 ### `cdn/probe/v1` — latency probe
 
-Before opening a payment channel or sending a `StreamRequest`, a node probes candidates to measure round-trip latency and confirm the node has the blob:
+Before opening a payment pool or sending a `StreamRequest`, a node probes candidates to measure round-trip latency and confirm the node has the blob:
 
 ```mermaid
 sequenceDiagram
@@ -50,7 +50,7 @@ sequenceDiagram
     Note over R: Score = unified selection score (see ADR 001)
 ```
 
-`timestamp_us` is a requester-generated microsecond timestamp echoed back; RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. The protocol does not distinguish origin from cache at probe time — origin status is a publisher-level commitment recorded in `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) and discoverable off-chain via `OriginAssignment.getOrigins(namespaceId)`; the wire response describes only "I have the bytes and will serve them at this rate." Cache-only serving is permissionless and indistinguishable from origin serving over the wire — correct, since clients verify bytes via BLAKE3 regardless of who served them. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip. `total_bytes` is an optional unsigned field for the blob's total size in bytes, letting the requester estimate total cost before committing to a node or opening a payment channel; nodes SHOULD include it when the blob size is known. The field is not covered by `slash_sig` — it is not needed for any slashing mechanism and follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination).
+`timestamp_us` is a requester-generated microsecond timestamp echoed back; RTT is `receive_time - timestamp_us`. `has_blob` confirms the node has the content. The protocol does not distinguish origin from cache at probe time — origin status is a publisher-level commitment recorded in `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) and discoverable off-chain via `OriginAssignment.getOrigins(namespaceId)`; the wire response describes only "I have the bytes and will serve them at this rate." Cache-only serving is permissionless and indistinguishable from origin serving over the wire — correct, since clients verify bytes via BLAKE3 regardless of who served them. `rate_per_mb` lets the requester score candidates on both latency and price in a single round-trip. `total_bytes` is an optional unsigned field for the blob's total size in bytes, letting the requester estimate total cost before committing to a node or opening a payment pool; nodes SHOULD include it when the blob size is known. The field is not covered by `slash_sig` — it is not needed for any slashing mechanism and follows the Tier 1 minor evolution pattern from [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination).
 
 `slash_sig` is the candidate node's EIP-712 secp256k1 signature over `{hash, has_blob, rate_per_mb, timestamp_us}`, signed with the operator's Ethereum key registered in `CapacityBond` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change to this set is a Tier 3 ALPN bump. The signature makes the probe response cryptographically attributable to a registered node and underpins probe-derived slash evidence. It enables **rate manipulation slashing** — if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds) and the stream is a delivery (`ok: true`) at `stream_response.rate_per_mb > probe_response.rate_per_mb`, both signed messages constitute on-chain-verifiable evidence of bait-and-switch — and it also underpins **blacklist-violation** evidence, attributing service of a blacklisted hash to the registered node. Evidence age is bounded by the existing `Max evidence age` parameter ([ADR 009](009-governance.md#adr-009-governance-model)) so honest operators are never exposed to indefinite slash risk from old probes. Both `timestamp_us` values are requester-generated (the probe timestamp echoed in `ProbeResponse`; `StreamResponse` echoes a separate requester timestamp from `StreamRequest`), so the on-chain verifier computes the delta from a single clock with no wall-clock reference. **Submitting slash evidence requires a 100 TOKEN challenge bond** — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — returned if the challenge succeeds, forfeited if the node successfully counters, preventing zero-cost griefing via fabricated slash claims.
 
@@ -78,7 +78,7 @@ The same validation applies when the node signs a `StreamResponse` containing `r
 
 Requesters (clients and nodes performing cache-miss pulls) MAY reject `ProbeResponse` or `StreamResponse` messages whose `rate_per_mb` they consider too expensive. This is a local policy decision, not a protocol requirement — the buyer sees the signed rate before it pays anything, which is what makes a governance ceiling unnecessary.
 
-The rate floor is queried from the `PaymentChannel` contract via `getRateBounds()` and kept current via `RateBoundsUpdated` event subscription with periodic polling fallback. See [ADR 003 — Rate Bounds Refresh](003-payments.md#rate-bounds-refresh) for the refresh mechanism.
+The rate floor is queried from the `PaymentPool` contract via `getRateBounds()` and kept current via `RateBoundsUpdated` event subscription with periodic polling fallback. See [ADR 003 — Rate Bounds Refresh](003-payments.md#rate-bounds-refresh) for the refresh mechanism.
 
 The requester issues a `cdn/dht/v1` FIND_VALUE lookup for the target hash, then probes the returned candidate set concurrently via `cdn/probe/v1` (or checks the probe cache for recent results), collecting responses until a 500ms timeout, then selects the winner using the unified selection score (see [ADR 001, Node Selection Algorithm](001-network.md#node-selection-algorithm)). See [ADR 001, Content Discovery](001-network.md#content-discovery-dht--probe) and [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) for the full discovery flow. The 500ms ceiling accommodates inter-continental RTTs. This applies to clients picking nodes and nodes picking peers for a cache miss pull.
 
@@ -115,14 +115,13 @@ sequenceDiagram
     participant P as Payer
     participant D as Delivering Node
 
-    P->>D: StreamRequest {hash, namespace_id, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
+    P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us, voucher_interval_mb?}
     D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, voucher_interval_mb?, slash_sig}
 
     alt ok = true
         loop Every voucher_interval_mb (default 1 MB)
             D->>P: ChunkData {bytes} (1024-byte chunks)
-            P->>D: Voucher {sig, amt, nonce} (cumulative USDC)
-            D->>P: VoucherAck
+            P->>D: Voucher {sig, amt} (cumulative USDC)
         end
         P->>D: StreamEnd
     else redirect
@@ -138,7 +137,7 @@ For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see
 struct StreamRequest {
     hash: Hash,
     namespace_id: U256,  // 0 = no namespace (cache/DHT only); non-zero routes to that namespace's authorized origins
-    channel_id: ChannelId,
+    pool_id: PoolId,
     byte_offset: u64,
     byte_len: u64,       // 0 = to end-of-blob; else bound the range to [byte_offset, byte_offset + byte_len)
     timestamp_us: u64,
@@ -149,13 +148,11 @@ struct StreamRequest {
 }
 ```
 
-The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover` and caches the verified binding for the connection's lifetime. Voucher attribution does not come from the binding: the address a voucher must recover to is the `voucherSigner` the channel pinned on-chain ([ADR 003 § PaymentChannel](003-payments.md#paymentchannel)). The binding is a gate against it — a request naming a channel whose pinned signer is not the bound address is refused before any bytes are delivered, since its vouchers would fail verification anyway. Subsequent requests on the same connection may omit these fields. These are `Option` fields in the `StreamRequestExt` extensions struct, defaulting to `None` when absent via the two-phase deserialization pattern defined in [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination). Peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) produce frames without extension bytes, and the receiver fills `StreamRequestExt::default()` — no ALPN version bump is needed since this is defined before the first implementation.
+The client includes `ethereum_address` and `binding_signature` in the first `StreamRequest` on a connection. The node verifies the EIP-712 signature via `ecrecover` and caches the verified binding for the connection's lifetime. Voucher attribution does not come from the binding: the address a voucher must recover to is the capability-authorized `signer` for the pool ([ADR 003 § PaymentPool](003-payments.md#paymentpool)). The binding is a gate against it — a request whose voucher `signer` is not the bound address is refused before any bytes are delivered, since its vouchers would fail verification anyway. Subsequent requests on the same connection may omit these fields. These are `Option` fields in the `StreamRequestExt` extensions struct, defaulting to `None` when absent via the two-phase deserialization pattern defined in [ADR 013](013-schema-evolution.md#tier-1--minor-no-coordination). Peers that do not send them (e.g., nodes in node-to-node pulls where both sides have on-chain bindings) produce frames without extension bytes, and the receiver fills `StreamRequestExt::default()` — no ALPN version bump is needed since this is defined before the first implementation.
 
-`CooperativeCloseAuth` also carries a `last_signature` field: the client's own last-accepted voucher signature, echoed so a client whose persisted watermark lags can prove the node's declared tuple is one it already signed ([ADR 003 § Cooperative close](003-payments.md#adr-003-payment-model)). It is empty when the node holds no stored signature for the channel; a client that cannot verify the echo simply keeps the stricter refusal it would have made without it.
+**Voucher wire format:** `Voucher {sig, amt}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md#adr-003-payment-model): `{poolId, signer, provider, amount, bytesDelivered}`. The fields `signature` and `amount` are transmitted on the wire; the rest are derived from stream context — `pool_id` is in `StreamRequest`, `signer` is the requester's verified Ethereum address (from the ephemeral `StreamRequestExt` binding when present, otherwise from the requester's on-chain registration, as in node-to-node pulls), `provider` is the delivering node, and `bytesDelivered` is the node's per-lane cumulative byte counter. Vouchers carry no nonce — ordering and replay are handled by the monotone cumulative `amount` alone (see [ADR 003 § Voucher ordering](003-payments.md#voucher-ordering)). The receiver reconstructs the full typed data to verify the signature.
 
-**Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md#adr-003-payment-model): `{channelId, amount, nonce, bytesDelivered, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the rest are derived from stream context — `channel_id` is in `StreamRequest`, `token` is fixed at channel open, and `bytesDelivered` is the node's per-channel cumulative byte counter. Including `nonce` explicitly (rather than an implicit incrementing counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature.
-
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node — no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — `ok` and `redirect` are message-integrity fields that ensure a node cannot silently alter delivery status or routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds); the ordering check prevents unsigned integer underflow in the on-chain verifier, which computes this delta from the signed messages alone (both `timestamp_us` requester-generated) with no wall-clock reference, external time oracle, or clock-skew sensitivity. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node — no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us, redirect}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — `ok` and `redirect` are message-integrity fields that ensure a node cannot silently alter delivery status or routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds); the ordering check prevents unsigned integer underflow in the on-chain verifier, which computes this delta from the signed messages alone (both `timestamp_us` requester-generated) with no wall-clock reference, external time oracle, or clock-skew sensitivity. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
 
 #### Namespace routing
 
@@ -190,7 +187,7 @@ The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-th
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
-Delivery and payment are not lock-stepped at the interval, though. A node streams within a **credit window** of several intervals ([ADR 003 — Credit Window](003-payments.md#credit-window)): it keeps sending chunks while the unpaid balance stays within the window and pauses only when it would exceed it, rather than blocking a full round trip for a `VoucherAck` at each interval. The payer correspondingly issues its cumulative voucher at each interval and keeps receiving rather than waiting for the acknowledgement. The window is delivery-layer node policy — it appears in no wire field and is never negotiated — and it bounds the node's credit exposure to exactly one window of unbilled egress while leaving the payer's exposure at zero (vouchers remain cumulative over bytes already received). At a window of one interval this reduces to strict stop-and-wait, which is what keeps the two ends interoperable regardless of which pipelines.
+Delivery and payment are not lock-stepped at the interval, though. A node streams within a **credit window** of several intervals ([ADR 003 — Credit Window](003-payments.md#credit-window)): it keeps sending chunks while the unpaid balance stays within the window and pauses only when it would exceed it. There is no per-voucher acknowledgement on the wire — the payer sends a cumulative voucher at each interval and the node's continued delivery is the implicit acknowledgement; a voucher the node did not accept simply stops delivery, and the payer resends the (cumulative) voucher. The window is delivery-layer node policy — it appears in no wire field and is never negotiated — and it bounds the node's credit exposure to exactly one window of unbilled egress while leaving the payer's exposure at zero (vouchers remain cumulative over bytes already received). At a window of one interval this reduces to strict stop-and-wait, which is what keeps the two ends interoperable regardless of which pipelines.
 
 > **Relationship to iroh-blobs:** The `cdn/client/v1` protocol wraps iroh-blobs' verified streaming within its own message framing. iroh-blobs provides BLAKE3 tree-hash verification at the chunk level; `ChunkData` payloads carry the bao interleaved verified-stream encoding (chunk-group data with the proof nodes that anchor it to the root), alongside the payment and delivery control messages (`Voucher`, `StreamEnd`, `StreamError`) that iroh-blobs' native transfer protocol does not support. The BLAKE3 content hash in `StreamRequest` is the iroh-blobs hash, and verification uses iroh-blobs' incremental tree-hash mechanism — receivers need not buffer the full blob before confirming integrity, and a range beginning at any `byte_offset` is verifiable against the root on its own. See [ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1) for the verification model and wire encoding.
 
@@ -222,9 +219,9 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
 
-#### Payment channels and concurrent streams
+#### Payment lanes and concurrent streams
 
-A single `channel_id` can be shared across concurrent streams on the same connection. Vouchers are cumulative across **all** streams on the channel:
+A single `pool_id` can be shared across concurrent streams on the same connection. Vouchers are cumulative across **all** streams on the lane (one `(signer, provider)` pair):
 
 ```mermaid
 sequenceDiagram
@@ -234,25 +231,24 @@ sequenceDiagram
     Note over C,N: Single QUIC connection (cdn/client/v1)
 
     par Stream 1 (blob A)
-        C->>N: StreamRequest {hash_a, channel_id, byte_offset: 0, timestamp_us}
+        C->>N: StreamRequest {hash_a, pool_id, byte_offset: 0, timestamp_us}
         N->>C: StreamResponse + ChunkData…
     and Stream 2 (blob B)
-        C->>N: StreamRequest {hash_b, channel_id, byte_offset: 0, timestamp_us}
+        C->>N: StreamRequest {hash_b, pool_id, byte_offset: 0, timestamp_us}
         N->>C: StreamResponse + ChunkData…
     end
 
     Note over C: Aggregate byte counter crosses voucher interval boundary
-    C->>N: Voucher {sig, amt, nonce} (sent on any active stream)
-    N->>C: VoucherAck
+    C->>N: Voucher {sig, amt} (sent on any active stream)
 ```
 
-The payer maintains **one aggregate byte counter per channel**. When the counter crosses the next voucher interval boundary (default 1 MB; negotiable per-stream — see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), it issues the next cumulative voucher on any active stream sharing that channel. When streams on the same channel have different negotiated intervals, the effective interval for the channel is the **minimum** across all active streams. The delivering node tracks total bytes sent across all streams on the channel and **pauses all streams** once the unpaid balance reaches the channel's [credit window](003-payments.md#credit-window) — the self-enforcing threshold is applied collectively, not per-stream. (The window is at least one effective interval, so this generalizes the per-interval pause rather than replacing it: a node running stop-and-wait pauses at one interval of deficit.)
+The payer maintains **one aggregate byte counter per `(signer, provider)` lane** — the streams from one signer to one node. When the counter crosses the next voucher interval boundary (default 1 MB; negotiable per-stream — see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), it issues the next cumulative voucher on any active stream sharing that lane. When streams on the same lane have different negotiated intervals, the effective interval for the lane is the **minimum** across all active streams. The delivering node tracks total bytes sent across all streams on the lane and **pauses all of them** once the unpaid balance reaches its [credit window](003-payments.md#credit-window) — the self-enforcing threshold is applied collectively, not per-stream. (The window is at least one effective interval, so this generalizes the per-interval pause rather than replacing it: a node running stop-and-wait pauses at one interval of deficit.)
 
-Implementation constraint: the payer must have a single voucher-signing task per channel aggregating byte counts from all streams, not independent per-stream voucher logic.
+Implementation constraint: the payer must have a single voucher-signing task per lane aggregating byte counts from all its streams, not independent per-stream voucher logic.
 
 #### Connection lifetime
 
-- Connections remain open while any stream is active or any sent voucher is awaiting `VoucherAck` (on-chain channel closure does not affect connection lifetime).
+- Connections remain open while any stream is active (on-chain pool closure does not affect connection lifetime).
 - **Idle timeout:** 30 seconds after the last stream closes and no unacknowledged vouchers remain in flight. Endpoints SHOULD send periodic QUIC PING frames when otherwise idle, with a default interval of 10 seconds (below the idle timeout) to prevent NAT middleboxes from dropping the mapping.
 
 ### Error Handling and Retry Semantics
@@ -269,31 +265,26 @@ enum StreamError {
     VoucherRejected { reason: VoucherRejectReason, bundle: Option<WatermarkBundle> }, // Mid-stream payment-voucher rejection (carried in a StreamError message, not in the initial StreamResponse) — see VoucherRejected semantics below; `bundle` carries the node's true watermark on a gated regression/exhaustion reject
 }
 
-// Attached to a regression/exhaustion VoucherRejected so a client that cannot
-// reconstruct its watermark from chain (the on-chain claim watermark stays 0
-// until settlement — the delegated / publisher-pays case especially) can
-// self-heal. Present only when the rejected voucher's signature recovered to
-// the channel's pinned voucherSigner (below).
+// Attached to a regression/exhaustion VoucherRejected so a delegated signer that
+// cannot reconstruct its lane watermark from chain (a lane records nothing until
+// its first redemption) can self-heal. Present only when the rejected voucher's
+// signature recovered to the pool's authorized signer (below).
 struct WatermarkBundle {
-    amount: [u8; 32],          // node's cumulative accepted amount (channel watermark, NOT a blob byte position)
-    nonce: [u8; 32],           // node's last accepted nonce
+    amount: [u8; 32],          // node's cumulative accepted amount (lane watermark, NOT a blob byte position)
     bytes_delivered: [u8; 32], // node's cumulative accepted bytes_delivered
-    last_signature: Vec<u8>,   // r‖s‖v (65 bytes) of the client's own last-accepted voucher, echoed back for authentication
+    last_signature: Vec<u8>,   // r‖s‖v (65 bytes) of the signer's own last-accepted voucher, echoed back for authentication
 }
 
 enum VoucherRejectReason {
     BadSignature,         // VoucherError::InvalidSignature — signature is malformed: corrupted bytes, non-canonical `s`, or invalid recovery id
-    WrongSigner,          // VoucherError::WrongSigner — signature is well-formed but recovers to an address other than the channel's pinned voucherSigner
-    WrongChannel,         // ChannelError::WrongChannel — voucher.channel_id mismatch
-    WrongToken,           // ChannelError::WrongToken — cross-token replay defense (ADR 003)
-    StaleNonce,           // ChannelError::NonceNotIncreasing — voucher nonce not strictly increasing
-    AmountRegression,     // ChannelError::AmountDecreasing — cumulative amount regressed
-    BytesRegression,      // ChannelError::BytesDecreasing — cumulative bytes_delivered regressed
-    InsufficientDeposit,  // ChannelError::AmountExceedsDeposit — voucher amount exceeds channel deposit
-    RetryLater,           // Transient node-side persist-write failure (ChannelError::Store / RetrySignal) — voucher is valid; resend the same voucher. No validation-enum counterpart (ADR 003 §Off-chain voucher state persistence)
-    Expired,              // On-chain channel-expiry serve-gate refusal (#751) — channel passed expiresAt; stop streaming, reclaimExpired for the remainder. Handler-emitted; no validation-enum counterpart
-    CooperativeCloseSigned, // Node has signed a cooperative-close waiver ([ADR 003 §Cooperative close](003-payments.md#cooperative-close-fast-settle)) — channel is settling; stop streaming, submit the close. Handler-emitted; no validation-enum counterpart
-    RateFloorRaised,      // Live delivery floor (getRateBounds().deliveryFloor) rose above the stream's quoted rate after the signed StreamResponse (#1382) — voucher unredeemable at the quoted rate (PaymentChannel._advanceClaimWatermark → RateFloorViolation); re-probe/re-quote at the new floor. Handler-emitted; no validation-enum counterpart
+    WrongSigner,          // VoucherError::WrongSigner — signature is well-formed but recovers to an address other than the voucher's authorized signer
+    WrongPool,         // PoolError::WrongPool — voucher.pool_id mismatch
+    WrongProvider,        // PoolError::WrongProvider — voucher.provider names another node; a node redeems only its own lane
+    AmountRegression,     // PoolError::AmountNotIncreasing — cumulative amount did not advance on this lane (sole ordering/replay guard; vouchers carry no nonce)
+    BytesRegression,      // PoolError::BytesDecreasing — cumulative bytes_delivered regressed on this lane
+    CapExceeded,          // PoolError::CapExceeded — voucher exceeds the signer's remaining spending cap, or the capability has expired
+    RetryLater,           // Transient node-side persist-write failure (PoolError::Store / RetrySignal) — voucher is valid; resend the same voucher. No validation-enum counterpart (ADR 003 §Off-chain voucher state persistence)
+    RateFloorRaised,      // Live delivery floor (getRateBounds().deliveryFloor) rose above the stream's quoted rate after the signed StreamResponse — voucher unredeemable at the quoted rate (redeem → RateFloorViolation); re-probe/re-quote at the new floor. Handler-emitted; no validation-enum counterpart
 }
 ```
 
@@ -307,14 +298,14 @@ This error code is informational only (unsigned, like all error codes — see be
 
 The other `StreamError` variants (`NotFound`, `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`) are delivery-side and ride in the initial `StreamResponse { ok: false, error: ... }` (transitioning `AwaitingResponse → Failed`). `VoucherRejected` is the only variant scoped to the mid-stream `StreamError` message; this asymmetry is intentional — each rejection's lifecycle position determines which carrier message is available.
 
-The first eight `VoucherRejectReason` variants mirror the off-chain validation enums `ChannelError` / `VoucherError` (in `crates/incentive/`) one-to-one. Each of those corresponds to an on-chain `closeChannel` / `disputeChannel` revert that would otherwise cost gas (see [ADR 003 § Fee Routing on Disputed Closes](003-payments.md#fee-routing-on-disputed-closes) for the on-chain invariants and [ADR 003 § Off-chain Voucher Rejections](003-payments.md#off-chain-voucher-rejections-wire-encoding) for the per-reason mapping). The remaining variants have no validation-enum counterpart and are emitted by the `cdn/client/v1` handler directly: `RetryLater` signals a transient node-side persist-write failure (`ChannelError::Store`, surfaced as `RetrySignal`) where the voucher is valid and in-memory state did not advance, so the client resends the same voucher rather than refreshing state (see [ADR 003 § Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)); `Expired` is the on-chain channel-expiry serve-gate refusal (#751); `CooperativeCloseSigned` is the cooperative-close-waiver refusal ([ADR 003 §Cooperative close](003-payments.md#cooperative-close-fast-settle)); and `RateFloorRaised` is the honest-buyer re-quote signal when a governance delivery-floor raise lands between a stream's signed quote and its voucher (#1382) — the voucher is now unredeemable at the quoted rate (`PaymentChannel._advanceClaimWatermark` reads the live `deliveryFloor` with no per-channel snapshot), so refusing is the node's correct self-protection and the client must re-probe/re-quote at the new floor rather than resend.
+The first seven `VoucherRejectReason` variants mirror the off-chain validation enums `PoolError` / `VoucherError` (in `crates/incentive/`) one-to-one. Some (`BadSignature`, `WrongSigner`, `WrongPool`, `WrongProvider`, and an expired-capability `CapExceeded`) avoid an on-chain `redeem` revert; the ordering guards (`AmountRegression`, `BytesRegression`) have no on-chain counterpart — on-chain redemption is cumulative, so a stale voucher simply pays `0` — and exist to keep the node's own off-chain ledger consistent (see [ADR 003 § Redemption and Close](003-payments.md#redemption-and-close) and [ADR 003 § Off-chain Voucher Rejections](003-payments.md#off-chain-voucher-rejections-wire-encoding) for the per-reason mapping). The remaining variants have no validation-enum counterpart and are emitted by the `cdn/client/v1` handler directly: `RetryLater` signals a transient node-side persist-write failure (`PoolError::Store`, surfaced as `RetrySignal`) where the voucher is valid and in-memory state did not advance, so the signer resends the same voucher rather than refreshing state (see [ADR 003 § Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)); and `RateFloorRaised` is the honest-buyer re-quote signal when a governance delivery-floor raise lands between a stream's signed quote and its voucher — the voucher is now unredeemable at the quoted rate (`redeem` reads the live `deliveryFloor` with no per-lane snapshot), so refusing is the node's correct self-protection and the client must re-probe/re-quote at the new floor rather than resend.
 
-**Watermark bundle (self-heal on regression/exhaustion).** A client whose channel is signed by a delegate — the publisher-pays case, where the publisher funds the channel and pins the client's key as `voucherSigner` — cannot reconstruct its off-chain watermark from the contract: the on-chain claim watermark stays 0 until settlement. A `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit` rejection would otherwise be a dead end. On exactly those four reasons, the node attaches a `WatermarkBundle` carrying its true cumulative `amount`/`nonce`/`bytes_delivered` plus `last_signature` — the `r‖s‖v` of the client's own last-accepted voucher. Two signature gates keep the bundle from leaking a watermark or corrupting client state:
+**Watermark bundle (self-heal on regression/exhaustion).** A delegated signer — one issued a capped capability by a pool owner — cannot reconstruct its off-chain lane watermark from the contract: a lane records nothing until its first redemption. An `AmountRegression`/`BytesRegression`/`CapExceeded` rejection would otherwise be a dead end. On exactly those three reasons, the node attaches a `WatermarkBundle` carrying its true cumulative `amount`/`bytes_delivered` plus `last_signature` — the `r‖s‖v` of the signer's own last-accepted voucher. Two signature gates keep the bundle from leaking a watermark or corrupting signer state:
 
-- **Node attaches it only when the rejected voucher's signature recovers to the channel's pinned `voucherSigner`.** The regression checks fire before the signature check, so the node recovers the signature explicitly at the reject site; a party who merely guessed the chain-derivable `channelId` and sent an unsigned or wrong-key voucher gets no bundle. This keeps a channel's watermark private to the key that funds it.
-- **Client trusts it only when `last_signature` recovers to its own signing key** over the bundle's `(channelId, token, amount, nonce, bytes_delivered)`. The bundle rides in an unsigned mid-stream `StreamError`, so its numeric fields are otherwise attacker-controllable; without this gate a malicious upstream could return an inflated `amount` and induce the paying client to over-sign and drain the deposit. Because `last_signature` is the client's *own* prior signature, only a watermark the client itself already authorized passes.
+- **Node attaches it only when the rejected voucher's signature recovers to the pool's authorized `signer`.** The regression checks fire before the signature check, so the node recovers the signature explicitly at the reject site; a party who merely guessed the chain-derivable `poolId` and sent an unsigned or wrong-key voucher gets no bundle. This keeps a lane's watermark private to the key that signs it.
+- **Signer trusts it only when `last_signature` recovers to its own signing key** over the bundle's `(poolId, signer, provider, amount, bytes_delivered)`. The bundle rides in an unsigned mid-stream `StreamError`, so its numeric fields are otherwise attacker-controllable; without this gate a malicious upstream could return an inflated `amount` and induce the paying signer to over-sign toward its cap. Because `last_signature` is the signer's *own* prior signature, only a watermark the signer itself already authorized passes.
 
-On a passing bundle the client re-seeds its payment ledger to the node's watermark and re-signs from `nonce + 1`; the blob fetch resumes from its existing `byte_offset` (a per-blob position — distinct from the channel-cumulative `bytes_delivered`). Resumes are bounded per stream. A rejection with no bundle stays terminal.
+On a passing bundle the signer re-seeds its payment ledger to the node's lane watermark and re-signs from the next cumulative `amount`; the blob fetch resumes from its existing `byte_offset` (a per-blob position — distinct from the lane-cumulative `bytes_delivered`). Resumes are bounded per stream. A rejection with no bundle stays terminal.
 
 **Retry semantics by reason:**
 
@@ -322,16 +313,13 @@ On a passing bundle the client re-seeds its payment ledger to the node's waterma
 |---|---|
 | `BadSignature` | Client signing bug (e.g., signing library produced a non-canonical `s` or invalid recovery id), key mismatch, or wire corruption. Do not retry; surface to caller. |
 | `WrongSigner` | Client bug. Do not retry; surface to caller. |
-| `WrongChannel` | Client bug (channel_id mis-bind). Do not retry; surface to caller. |
-| `WrongToken` | Client bug or cross-token replay attempt (see [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers)). Do not retry; surface to caller. |
-| `StaleNonce` | Client-side bookkeeping desync (e.g., reconnect after crash, lost `VoucherAck`). If the reject carries a `WatermarkBundle` that authenticates (above), re-seed to the node's watermark and reissue from `nonce + 1` — this is the self-heal path for a delegated client that cannot refresh from chain. Otherwise refresh channel state from the contract or the last `VoucherAck` and reissue. **Bounded retries per stream.** |
-| `AmountRegression` | Client bug — cumulative `amount` regressed. Do not retry; surface to caller. |
+| `WrongPool` | Client bug (pool_id mis-bind). Do not retry; surface to caller. |
+| `WrongProvider` | Client bug — the voucher named a different node. Do not retry; surface to caller. |
+| `AmountRegression` | Cumulative `amount` did not advance — a client bug, or a bookkeeping desync (e.g., reconnect after crash). If the reject carries a `WatermarkBundle` that authenticates (above), re-seed to the node's lane watermark and reissue from the next cumulative `amount` — the self-heal path for a delegated signer that cannot refresh from chain. Otherwise refresh lane state from the node and reissue. **Bounded retries per stream.** |
 | `BytesRegression` | Client bug — cumulative `bytes_delivered` regressed. Do not retry; surface to caller. |
-| `InsufficientDeposit` | Channel funds exhausted ([ADR 003 invariant 1](003-payments.md#fee-routing-on-disputed-closes): `voucher.amount > channel.deposit`). A self-funded client tops up on-chain or opens a new channel. A delegated client cannot top up — `topUp` is funder-only — so it surfaces exhaustion to the application, which asks the funder (publisher) to top up before resuming. Do not retry on this channel until the deposit rises. |
-| `RetryLater` | Transient node-side store failure ([ADR 003 §Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)); the voucher was valid and unaccepted. Resend the **same** voucher (unchanged nonce/amount/bytes) on a fresh stream. **Bounded retries with backoff** (the node may be briefly degraded); after exhausting them, fall back to another provider. |
-| `Expired` | Channel passed its on-chain `expiresAt` (#751); any further delivery would be unpaid. Stop streaming on this channel; `reclaimExpired` refunds the remainder. Do not resend. |
-| `CooperativeCloseSigned` | Node signed a cooperative-close waiver ([ADR 003 §Cooperative close](003-payments.md#cooperative-close-fast-settle)); the channel is settling at the current watermark. Stop streaming and submit the cooperative close (or fall back to `closeChannel`). Do not resend. |
-| `RateFloorRaised` | A governance delivery-floor raise landed between the signed `StreamResponse` and this voucher (#1382); the voucher is unredeemable at the quoted rate. Not the buyer's fault. **Re-probe/re-quote** at the new floor and open a fresh stream — do NOT resend this voucher (it would be rejected identically) or top up. |
+| `CapExceeded` | The signer's remaining spending cap is exhausted, or its capability has expired ([ADR 003 § Redemption and Close](003-payments.md#redemption-and-close)). The signer cannot raise its own cap; it surfaces exhaustion to the application, which asks the pool owner to top up the pool or issue a fresh capability before resuming. Do not retry on this lane until the cap rises. |
+| `RetryLater` | Transient node-side store failure ([ADR 003 §Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)); the voucher was valid and unaccepted. Resend the **same** voucher (unchanged amount/bytes) on a fresh stream. **Bounded retries with backoff** (the node may be briefly degraded); after exhausting them, fall back to another provider. |
+| `RateFloorRaised` | A governance delivery-floor raise landed between the signed `StreamResponse` and this voucher; the voucher is unredeemable at the quoted rate. Not the buyer's fault. **Re-probe/re-quote** at the new floor and open a fresh stream — do NOT resend this voucher (it would be rejected identically). |
 
 These per-reason rules apply only to `VoucherRejected`. The delivery-side errors (`NotFound`, `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`) continue to follow the per-blob retry rules in **Retry behavior** below.
 
@@ -339,7 +327,7 @@ Like all `StreamError` codes, `VoucherRejected` is **unsigned** and is not used 
 
 **Schema-evolution constraints.** Adding a new `VoucherRejectReason` or new top-level `StreamError` variant is a Tier-2 minor evolution per [ADR 013](013-schema-evolution.md#adr-013-schema-evolution); old peers will close the stream with `0x01 UNSUPPORTED_MESSAGE` on the unknown discriminant rather than receive the new reason, so deployments MUST roll out client-side support before nodes start emitting it. The `VoucherRejected { reason, bundle }` frame is positional postcard with no extension-bytes tail, so its fields are append-only and a further field is a Tier-3 (major) change requiring an ALPN bump: a peer built against the two-field shape decodes a third field's bytes as a trailing frame error. The `bundle` field itself is append-only-compatible with a `reason`-only decoder only within a coordinated deploy — mixed one-field/two-field peers do not interoperate — which is why it is introduced as a single pre-deployment wire cut rather than a staged rollout.
 
-**Mirror obligation with `crates/incentive/`.** The first eight `VoucherRejectReason` variants are structurally mirrored to `ChannelError ∪ VoucherError` minus the `Signature` wrapper; `RetryLater` is exempt — it is the wire expression of the transient `RetrySignal`, not a validation variant, and is emitted by the handler directly rather than by the mirror conversion. Any new *permanent* `ChannelError` / `VoucherError` variant therefore requires (a) a corresponding `VoucherRejectReason` variant — Tier-2 per the rule above — and (b) a row in the retry-semantics table. The handler-side conversion `fn voucher_reject_reason(&ChannelError) -> Result<VoucherRejectReason, RetrySignal>` MUST `match` exhaustively without a wildcard arm, so adding a `ChannelError` variant fails to compile until the wire enum and this section are updated.
+**Mirror obligation with `crates/incentive/`.** The first six `VoucherRejectReason` variants are structurally mirrored to `PoolError ∪ VoucherError` minus the `Signature` wrapper; `RetryLater` is exempt — it is the wire expression of the transient `RetrySignal`, not a validation variant, and is emitted by the handler directly rather than by the mirror conversion. Any new *permanent* `PoolError` / `VoucherError` variant therefore requires (a) a corresponding `VoucherRejectReason` variant — Tier-2 per the rule above — and (b) a row in the retry-semantics table. The handler-side conversion `fn voucher_reject_reason(&PoolError) -> Result<VoucherRejectReason, RetrySignal>` MUST `match` exhaustively without a wildcard arm, so adding a `PoolError` variant fails to compile until the wire enum and this section are updated.
 
 **`BlobTooLarge` enforcement:** Nodes may configure a `max_blob_size` limit (recommended default: 10 GB), applied to individual blobs. When deciding whether to serve a blob, a node enforces `max_blob_size` against locally known blob metadata (its cache index or origin catalog); if the locally known size exceeds `max_blob_size`, the node returns `StreamResponse {ok: false, error: BlobTooLarge}`. On a cache-miss pull from an upstream node, the pulling node additionally enforces `max_blob_size` against `StreamResponse.total_bytes`: if the upstream `total_bytes` exceeds the pulling node's `max_blob_size`, the pulling node aborts the upstream stream and returns `BlobTooLarge` to the original requester.
 
@@ -376,14 +364,14 @@ AwaitingResponse ──StreamResponse{ok: true}──► Streaming
 
 **Transition rules:**
 
-- **Voucher-before-response:** Receiving a `Voucher` on a stream that has not yet received its own `StreamResponse` is a protocol error; that stream MUST be closed. Vouchers on other streams sharing the same `channel_id` are unaffected — the rule is per-stream, not per-channel.
+- **Voucher-before-response:** Receiving a `Voucher` on a stream that has not yet received its own `StreamResponse` is a protocol error; that stream MUST be closed. Vouchers on other streams sharing the same lane are unaffected — the rule is per-stream, not per-lane.
 - **Partial final chunk:** The last `ChunkData` before `StreamEnd` MAY be smaller than 1,024 bytes. Receivers MUST accept partial chunks at stream end.
 - **Non-empty chunk:** A `ChunkData` MUST carry at least one byte. "Partial" permits a *smaller* final chunk, never an *empty* one: senders MUST NOT emit a zero-length `ChunkData` (a blob with no bytes goes straight to `StreamEnd`), and receivers MUST reject one as a protocol error rather than ignoring it. The floor is what makes every frame a unit of progress — an empty frame advances neither the receiver's cumulative byte count nor its voucher accounting, so an unbounded run of them would drive a receive loop without delivering anything, never tripping the overrun guard. Requesters bound the streaming stage by *inactivity*, and that bound is sound only because "a frame arrived" and "bytes made progress" are the same statement; without the floor a peer could hold the deadline open indefinitely with padding, and a stalled-peer signal that can be spoofed cannot be allowed to affect reputation.
 - **Voucher pacing:** The node pauses delivery when outstanding (unvouchered) bytes exceed `voucher_interval_mb × 1,048,576` bytes (the MB value in bytes). Delivery resumes when the client sends a `Voucher` covering the outstanding balance.
 
-#### Per-channel voucher coordinator
+#### Per-lane voucher coordinator
 
-(one instance per `channel_id`, shared across streams):
+(one instance per `pool_id`, shared across streams):
 
 ```
 Active ──voucher deficit──► VoucherPending ──Voucher received──► Active
@@ -391,7 +379,7 @@ Active ──voucher deficit──► VoucherPending ──Voucher received─�
    └──── all streams done ────► Closed             └── timeout ──► Closed
 ```
 
-The byte counter is cumulative across all streams sharing a `channel_id`; each stream's delivered bytes contribute to the aggregate counter that triggers voucher requests.
+The byte counter is cumulative across all streams sharing a `pool_id`; each stream's delivered bytes contribute to the aggregate counter that triggers voucher requests.
 
 ### Serialization
 
@@ -402,21 +390,21 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 ### Positive
 
 - ALPN separation means a single iroh `Endpoint` dispatches all connection types without ambiguity
-- Probing in parallel before committing means no payment channel is opened with a slow or unresponsive node
+- Probing in parallel before committing means no payment pool is opened with a slow or unresponsive node
 - `cdn/client/v1` is reused for all paid delivery — no separate protocol needed for node→node pulls
 - `redirect` always points to a NodeId, never an external URL; the backend topology of origin-backed nodes is fully hidden from the network
 - The delivery protocol is self-enforcing — payment and data flow are coupled by design
 - `byte_offset` in `StreamRequest` makes failover transparent; the requester resumes without restarting the stream
 - QUIC stream multiplexing allows concurrent blob requests to the same node without additional connection overhead — one handshake cost regardless of how many blobs are fetched
-- A shared `channel_id` across concurrent streams amortizes on-chain channel costs: one channel per (client, node) pair regardless of request volume
+- A shared `pool_id` across concurrent streams amortizes on-chain channel costs: one channel per (client, node) pair regardless of request volume
 
 ### Negative
 
 - Probe RTT includes iroh's NAT traversal overhead on first connection, inflating the latency estimate. Reusing existing connections for probes gives a cleaner signal.
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (a separate system) provides the longer-term signal.
 - The `cdn/client/v1` voucher cadence (default 1 MB, negotiable up to ~1 GB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); payment and transfer layers operate at different tick rates, requiring a buffering layer between them
-- Concurrent streams sharing a `channel_id` require the payer to maintain a single aggregate byte counter and voucher-signing task per channel; per-stream independence is lost for payment tracking
-- The delivering node enforces the voucher deficit threshold across all streams collectively — a slow voucher on one stream pauses all streams on that channel
+- Concurrent streams sharing a `pool_id` require the payer to maintain a single aggregate byte counter and voucher-signing task per channel; per-stream independence is lost for payment tracking
+- The delivering node enforces the voucher deficit threshold across all streams collectively — a slow voucher on one stream pauses all streams on that lane
 - Different ALPNs require separate QUIC connections; probing via `cdn/probe/v1` then fetching via `cdn/client/v1` incurs two handshake costs to the same peer. Two connections per node interaction is acceptable at a smaller scale. **Future optimization:** investigate iroh ALPN multiplexing (negotiating multiple ALPNs on a single connection) or a unified `cdn/v2` ALPN combining probe and delivery as sub-protocols within one connection. The overhead is ~1 additional RTT per node interaction — significant for latency-sensitive clients but not a correctness issue
 - The `voucher_interval_mb` field in `StreamRequest`/`StreamResponse` is optional and defaults to 1 MB if absent, following the standard minor evolution mechanism defined in [ADR 013](013-schema-evolution.md#adr-013-schema-evolution); mandatory field additions require a major version bump (`cdn/client/v2`)
 - `StreamRequest` includes a requester-generated `timestamp_us` echoed by the node in `StreamResponse`. Rate manipulation is an **immediate offense** ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)): two signed messages from the same NodeId — `ProbeResponse{rate=R₁, timestamp_us=T}` and `StreamResponse{rate=R₂, timestamp_us=T+Δ}` — with `Δ < 30s` and `R₂ > R₁` are non-repudiable on-chain evidence. The node's last probe-quoted rate is binding for any stream opened within the 30-second window; legitimate rate increases require honoring old quotes for that window or pausing new connections during the propagation gap. Rate decreases (`R₂ < R₁`) are unconstrained — slashing is one-directional

@@ -455,7 +455,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 
 The publish-first ordering is critical: continuing to serve a blacklisted hash after the compliance window is a blacklist-violation slashing offense ([ADR 014 § SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract)), and a signed response for that hash is dispositive evidence. Disk eviction can be async; DHT-record and probe-response suppression must be synchronous.
 
-When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
+When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` whose pool is owned by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
 In-flight streams for a blacklisted hash — or on a channel funded by a newly blacklisted origin — are terminated at the next MB boundary, after the voucher for the bytes already delivered is collected. Termination is a stream reset with no `StreamEnd` sentinel, not an error frame: [ADR 005 § Stream errors](005-protocol.md#adr-005-wire-protocol) makes `VoucherRejected` the only `StreamError` that travels mid-stream, and the QUIC code is `NO_ERROR` so the client does not score the node as faulty for discharging a takedown ([ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)). A client that re-requests the hash gets the signed `HashBlacklisted` refusal from the open-time gate, and can request a refund of the unused channel balance.
 
@@ -493,7 +493,7 @@ The lists are hot-reloadable (`decdn node reload` / SIGHUP), which is load-beari
 enum StreamError {
     // ... existing errors ...
     HashBlacklisted,      // hash is on the governance blacklist or local denylist
-    OriginBlacklisted,    // the channel's operator address is blacklisted
+    OriginBlacklisted,    // the pool owner's operator address is blacklisted
 }
 ```
 
@@ -510,7 +510,7 @@ Serving a blacklisted hash after the compliance window is a slashable offense, s
 The challenger submits:
 
 - The `blake3Hash`
-- A `ProbeResponse` with `has_blob: true` for the blacklisted hash, timestamped after the compliance window. On-chain verification uses the `slash_sig` scheme from [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712): the EIP-712 secp256k1 `slash_sig` is verified via `ecrecover` and the recovered address mapped to the node's identity via `CapacityBond.nodeIdOf`. This is the primary evidence path. Alternatively, a `StreamResponse` with `ok: true` for the blacklisted hash (binding `hash` and `channel_id` in the signed data) is also sufficient. Client-signed vouchers alone are NOT sufficient — vouchers do not contain the hash and the `channel_id → hash` binding is not on-chain verifiable.
+- A `ProbeResponse` with `has_blob: true` for the blacklisted hash, timestamped after the compliance window. On-chain verification uses the `slash_sig` scheme from [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712): the EIP-712 secp256k1 `slash_sig` is verified via `ecrecover` and the recovered address mapped to the node's identity via `CapacityBond.nodeIdOf`. This is the primary evidence path. Alternatively, a `StreamResponse` with `ok: true` for the blacklisted hash (binding `hash` and `pool_id` in the signed data) is also sufficient. Client-signed vouchers alone are NOT sufficient — vouchers do not contain the hash and the `pool_id → hash` binding is not on-chain verifiable.
 - The `BlacklistEntry.effectiveAt` timestamp showing the compliance window had passed
 
 The `ContentBlacklist` contract verifies that `effectiveAt` is in the past relative to the delivery timestamp and that the hash is still on the blacklist. If the hash was subsequently removed, the slash is invalid.
