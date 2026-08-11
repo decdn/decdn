@@ -10,16 +10,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use bao_tree::io::BaoContentItem;
-use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
-use bao_tree::{BaoTree, ChunkRanges};
+use bao_tree::ChunkRanges;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
-use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
+use iroh_blobs::util::RecvStream;
 use iroh_blobs::{Hash, HashAndFormat};
 use iroh_io::AsyncStreamReader;
 use tokio::sync::{Notify, broadcast};
@@ -30,11 +28,8 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
-use crate::local_outboard_pull::{LocalOutboardHeader, LocalOutboardPull};
 use crate::metrics::CacheMetrics;
-use crate::origin::{
-    Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
-};
+use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
@@ -47,8 +42,7 @@ use crate::{from_store_hash, to_store_hash};
 /// origin backend. Lookups hit the store first; on miss and when an origin is
 /// configured, bytes are pulled and BLAKE3-verified. Insert-before-return is a
 /// property of the buffered path ([`Self::get`] / [`Self::populate`]), not of
-/// this type: [`Self::open_local_outboard_pull`] streams and tees concurrently,
-/// and [`Self::pull_through_range`] commits only a verified sub-range.
+/// this type: [`Self::pull_through_range`] commits only a verified sub-range.
 #[derive(Debug, Clone)]
 pub struct CacheEngine {
     inner: Arc<Inner>,
@@ -2237,31 +2231,13 @@ impl CacheEngine {
         aligned: &AlignedRange,
         req: OriginRangeRequest,
     ) -> CacheResult<RangePullOutcome> {
-        let outboard_max = expected_outboard_len(blob_size).saturating_add(64);
-        let (data, outboard) =
-            match origin
-                .fetch_range(hash, req, outboard_max)
-                .await
-                .map_err(|e| CacheError::OriginError {
-                    hash,
-                    source: e.into_inner(),
-                })? {
-                OriginRangeFetch::Ranged { data, outboard } => (data, outboard),
-                // Missing outboard / no range support / object absent → degrade.
-                OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => {
-                    return Ok(RangePullOutcome::Unsupported);
-                }
-            };
-
-        // Meter the actually-pulled bytes (span + outboard) as origin egress —
-        // the bytes really did leave an origin. This is what ADR 037 counts
-        // against the seed-leech caps: the pulled side, not the whole blob.
-        if let Some(m) = &self.inner.metrics {
-            let pulled = u64::try_from(data.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(u64::try_from(outboard.len()).unwrap_or(u64::MAX));
-            m.pull_through_bytes.inc_by(pulled);
-        }
+        let Some((data, outboard)) = self
+            .origin_fetch_range_bytes(&origin, hash, blob_size, req)
+            .await?
+        else {
+            // Missing outboard / no range support / object absent → degrade.
+            return Ok(RangePullOutcome::Unsupported);
+        };
 
         // Verify the untrusted range + outboard against the root `H` and
         // produce the bao interleaved encoding for `import_bao_bytes`. A
@@ -2303,6 +2279,180 @@ impl CacheEngine {
         Ok(RangePullOutcome::Served)
     }
 
+    /// Fetch one origin's chunk-group-aligned range span (`req`) plus its
+    /// sibling `{H}.obao4` outboard, and meter the pulled bytes as
+    /// `pull_through_bytes`. Returns the raw, still-UNVERIFIED `(data, outboard)`
+    /// on a hit, or `Ok(None)` for a per-origin decline
+    /// ([`OriginRangeFetch::Unsupported`] / [`OriginRangeFetch::NotFound`]) so the
+    /// caller can advance the fallback chain.
+    ///
+    /// Deliberately stops at the fetch+meter boundary and does NOT verify against
+    /// the root: the two callers apply OPPOSITE verify-failure policies over the
+    /// same fetched bytes, so the verify cannot be shared. [`Self::range_pull_attempt`]
+    /// DEGRADES a range that fails bao verification to a whole-blob pull (a single
+    /// misbehaving origin must not deny the range), while [`Self::origin_encode_range`]
+    /// treats the same failure as a HARD local-origin fault (Flow A has already
+    /// committed to serving under `H`, so there is no safe degrade). Sharing the
+    /// fetch keeps the origin transport / metering path DRY without forcing one
+    /// policy on both.
+    async fn origin_fetch_range_bytes(
+        &self,
+        origin: &Arc<dyn Origin>,
+        hash: Hash,
+        blob_size: u64,
+        req: OriginRangeRequest,
+    ) -> CacheResult<Option<(Bytes, Bytes)>> {
+        let outboard_max = expected_outboard_len(blob_size).saturating_add(64);
+        let (data, outboard) =
+            match origin
+                .fetch_range(hash, req, outboard_max)
+                .await
+                .map_err(|e| CacheError::OriginError {
+                    hash,
+                    source: e.into_inner(),
+                })? {
+                OriginRangeFetch::Ranged { data, outboard } => (data, outboard),
+                OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => return Ok(None),
+            };
+
+        // Meter the actually-pulled bytes (span + outboard) as origin egress —
+        // the bytes really did leave an origin. This is what ADR 037 counts
+        // against the seed-leech caps: the pulled side, not the whole blob.
+        if let Some(m) = &self.inner.metrics {
+            let pulled = u64::try_from(data.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(outboard.len()).unwrap_or(u64::MAX));
+            m.pull_through_bytes.inc_by(pulled);
+        }
+
+        Ok(Some((data, outboard)))
+    }
+
+    /// Fetch the sibling `{H}.obao4` outboard for `hash` (a `total_bytes`-byte
+    /// blob) from the first configured origin that publishes it, returning the raw
+    /// outboard bytes. `Ok(None)` when no origin serves it (or none are
+    /// configured) — the caller degrades exactly as with an unsupported range.
+    ///
+    /// This is the Flow A serviceability probe: the node's own-origin serve-miss
+    /// path (FA.3) confirms an origin can furnish the outboard for `H` before it
+    /// signs a `StreamResponse` and spins up the two-leg driver, so a blob no
+    /// origin can prove is never advertised as serviceable. It is a standalone
+    /// outboard walk — same
+    /// `outboard_max` derivation (`expected_outboard_len` plus a 64-byte slack
+    /// for the final partial group), same "a per-origin decline or transport fault
+    /// advances the chain" discipline. The returned outboard is UNTRUSTED until it
+    /// verifies against the root `H` (the range encode in
+    /// [`Self::origin_encode_range`] is where that happens).
+    pub async fn origin_fetch_outboard_bytes(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+    ) -> CacheResult<Option<Bytes>> {
+        let outboard_max = expected_outboard_len(total_bytes).saturating_add(64);
+        // A genuine transport fault on an origin (as opposed to a clean
+        // `NotFound`/`Unsupported` decline) is remembered so it can be surfaced when
+        // NO origin serves the outboard. The serviceability caller latches this into
+        // `fault_seen` (#1129): an own-origin miss that fails because the operator's
+        // origin is degraded must terminate as `InternalError`, not a bare
+        // `NotFound`. A clean decline stays `Ok(None)` so the caller degrades
+        // silently (ADR 037 §"Fallback is always correct").
+        let mut last_err: Option<CacheError> = None;
+        for origin in &self.inner.origins {
+            match origin.fetch_outboard(hash, outboard_max).await {
+                Ok(OutboardFetch::Found(ob)) => return Ok(Some(ob)),
+                Ok(OutboardFetch::NotFound | OutboardFetch::Unsupported) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        %hash,
+                        kind = ?origin.kind(),
+                        error = %e,
+                        "origin outboard fetch failed; trying next origin",
+                    );
+                    last_err = Some(CacheError::OriginError {
+                        hash,
+                        source: e.into_inner(),
+                    });
+                }
+            }
+        }
+        // No origin served the outboard. If any errored on the way, that transport
+        // fault is the answer (degraded, not absent); otherwise it is a clean
+        // absence and the caller degrades to the buffered path.
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch `aligned`'s span from the configured origins and return the
+    /// header-full interleaved bao **wire** for it, verified against the root `H`
+    /// — the raw-fetch half of a range pull WITHOUT the import
+    /// (`range_pull_attempt` imports; here the node's `NodeAdmitStore` sink
+    /// does). The returned bytes keep their leading 8-byte little-endian size
+    /// header (the shape [`encode_verified_range`] produces); the node-side
+    /// `decdn_client_pull::BlobSource` caller strips it before feeding the
+    /// header-less wire (ADR 038) to the driver.
+    ///
+    /// The first origin that SERVES the range wins. A per-origin decline
+    /// ([`OriginRangeFetch::Unsupported`] / [`OriginRangeFetch::NotFound`])
+    /// advances the chain; all origins exhausted → `Ok(None)`.
+    ///
+    /// # The load-bearing difference from `range_pull_attempt`
+    ///
+    /// A verify failure here is a HARD fault ([`CacheError::VerifyFailed`]), NOT a
+    /// degrade. `range_pull_attempt` can degrade a range that fails bao
+    /// verification to a whole-blob pull because it is only OPTIMIZING a cold miss
+    /// — the whole-blob path re-verifies against `H` and still serves correct
+    /// bytes. Flow A cannot: by the time this runs the node has signed a
+    /// `StreamResponse` committing to serve under `H`, so a corrupt or
+    /// misconfigured OWN origin is a local-origin fault to surface, not upstream
+    /// corruption to route around (there is no upstream, and no fallback still
+    /// honours `H`).
+    ///
+    /// # Errors
+    ///
+    /// - [`CacheError::VerifyFailed`] — the winning origin's range/outboard did
+    ///   not verify against the root `H` (a bad `{H}.obao4`, a corrupt span, a
+    ///   wrong-length body). Mapped from [`encode_verified_range`]'s
+    ///   [`RangeVerifyError`](decdn_bao_range::RangeVerifyError) — the same shape
+    ///   [`Self::admit_bao_stream`] reports on a mid-stream group mismatch.
+    /// - [`CacheError::OriginError`] — an origin transport fault while fetching the
+    ///   range (propagated from `origin_fetch_range_bytes`).
+    pub async fn origin_encode_range(
+        &self,
+        hash: Hash,
+        aligned: &AlignedRange,
+    ) -> CacheResult<Option<Bytes>> {
+        let root = *hash.as_bytes();
+        let req = OriginRangeRequest {
+            fetch_start: aligned.fetch_start(),
+            fetch_end: aligned.fetch_end(),
+        };
+        let blob_size = aligned.blob_size();
+        for origin in &self.inner.origins {
+            let Some((data, outboard)) = self
+                .origin_fetch_range_bytes(origin, hash, blob_size, req)
+                .await?
+            else {
+                continue;
+            };
+            return match encode_verified_range(root, aligned, &data, outboard) {
+                Ok(wire) => Ok(Some(wire)),
+                Err(err) => {
+                    tracing::warn!(
+                        %hash,
+                        kind = ?origin.kind(),
+                        error = %err,
+                        "own origin served a range that failed bao verification against H; \
+                         hard local-origin fault (no degrade — committed to serving under H)",
+                    );
+                    Err(CacheError::VerifyFailed { expected: hash })
+                }
+            };
+        }
+        Ok(None)
+    }
+
     /// Import an already-encoded interleaved bao range for `hash`, verified
     /// against the root on import (iroh-blobs `import_bao_bytes`). Thin
     /// wrapper over the same store call `pull_through_range` makes, exposed so
@@ -2328,8 +2478,7 @@ impl CacheEngine {
     /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
     /// blob) off `reader` into the cache as a B0-tagged **partial**,
     /// O(chunk-group), verifying against the root incrementally. Returns the
-    /// drained `reader` (for `BlobSource::finish`). This is the range analogue
-    /// of the whole-blob tee ([`TeeReservation::begin`]): a bounded mpsc
+    /// drained `reader` (for `BlobSource::finish`). A bounded mpsc
     /// channel feeds a `ChannelRecvStream` that iroh-blobs
     /// `import_bao_reader` decodes and verifies concurrently with the caller's
     /// read loop, so memory stays O(one channel's worth of chunks) rather than
@@ -2348,7 +2497,7 @@ impl CacheEngine {
     ///   (a lying upstream). Nothing is admitted.
     /// - [`CacheError::Store`] — a local store fault, an import-task join
     ///   fault, or a read fault on `reader` itself (distinct from corruption —
-    ///   mirrors the transport/corruption split in `bao_decoded_source`).
+    ///   see `classify_import_bao_reader_error`).
     pub async fn admit_bao_stream<R>(
         &self,
         hash: Hash,
@@ -2359,7 +2508,7 @@ impl CacheEngine {
     where
         R: AsyncStreamReader + Send,
     {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(ADMIT_STREAM_CHANNEL_CAP);
         let engine = self.clone();
         let import = tokio::spawn(async move {
             engine
@@ -2397,8 +2546,8 @@ impl CacheEngine {
                 }
             }
         }
-        // Drop the sender to end the fed stream (mirrors `TeeSink::finish`),
-        // whether the loop ended on EOF, a closed import task, or a read fault.
+        // Drop the sender to end the fed stream, whether the loop ended on EOF,
+        // a closed import task, or a read fault.
         drop(tx);
 
         let outcome = import.await.map_err(|e| {
@@ -2466,107 +2615,19 @@ impl CacheEngine {
         Ok(None)
     }
 
-    /// Open a [`LocalOutboardPull`] (#1130 stream-while-store): stream an
-    /// origin's PLAINTEXT bytes through the header-less bao encoder as they
-    /// arrive, verifying against a locally-fetched `{H}.obao4` outboard, so a
-    /// paying client's cache-miss serve can start before the whole blob has
-    /// finished pulling through — rather than waiting on a whole-blob
-    /// [`Self::populate`] first.
+    /// Take the coalescing claim for a node-driven fill of `hash` (#856, #305),
+    /// returning a [`TeeReservation`] that holds it. The peer serve-miss path
+    /// (`serve_via_window_pull_through`) holds this reservation while it drives
+    /// the upstream pull and downstream forward, admitting the pulled bytes into
+    /// the store via [`Self::admit_bao_stream`].
     ///
-    /// Walks the origin chain twice, mirroring [`Self::origin_size`] /
-    /// [`Self::pull_through_range`]'s degrade discipline: first for the
-    /// blob's total size ([`Self::origin_size`]), then for the first origin
-    /// that serves the outboard ([`Origin::fetch_outboard`]). Any decline —
-    /// unknown size, no origin publishes the outboard, or the winning origin
-    /// no longer has the data itself — returns `Ok(None)` so the caller
-    /// degrades to [`Self::populate`] and serves from the store as usual.
-    /// This is never a correctness or availability failure, only a forgone
-    /// optimization (same contract as [`Self::pull_through_range`]).
-    ///
-    /// Unlike [`Self::populate_local`] the size probe carries no `local_only`
-    /// filter, so it relies on the node→node `Peer` origin overriding neither
-    /// [`Origin::size`] nor [`Origin::fetch_outboard`] (both default to
-    /// `Ok(None)` / `Unsupported`). That is what keeps a paid peer from
-    /// winning the outboard or setting the `total_bytes` the serving node
-    /// signs into its `StreamResponse`. Give `NodeOrigin` either impl and this
-    /// path needs an explicit local-only filter first.
-    ///
-    /// # Errors
-    ///
-    /// [`CacheError::NoOrigin`] is folded into `Ok(None)` (no origins
-    /// configured means nothing to stream — not an error on this
-    /// best-effort path). A genuine transport fault surfaced by
-    /// [`Self::origin_size`] or the winning origin's [`Origin::fetch`] call
-    /// propagates as `Err`.
-    pub async fn open_local_outboard_pull(
-        &self,
-        hash: Hash,
-    ) -> anyhow::Result<Option<(LocalOutboardHeader, LocalOutboardPull)>> {
-        let total_bytes = match self.origin_size(hash).await {
-            Ok(Some(n)) => n,
-            Ok(None) | Err(CacheError::NoOrigin { .. }) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-
-        let outboard_max = expected_outboard_len(total_bytes).saturating_add(64);
-        let mut winner: Option<(Arc<dyn Origin>, Bytes)> = None;
-        for origin in &self.inner.origins {
-            match origin.fetch_outboard(hash, outboard_max).await {
-                Ok(OutboardFetch::Found(ob)) => {
-                    winner = Some((Arc::clone(origin), ob));
-                    break;
-                }
-                Ok(OutboardFetch::NotFound | OutboardFetch::Unsupported) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        %hash,
-                        kind = ?origin.kind(),
-                        error = %e,
-                        "origin outboard fetch failed; trying next origin",
-                    );
-                }
-            }
-        }
-        let Some((origin, outboard)) = winner else {
-            return Ok(None);
-        };
-
-        let max_bytes = self.inner.max_blob_bytes;
-        let (stream, _size_hint) = match origin
-            .fetch(hash, max_bytes)
-            .await
-            .map_err(crate::error::OriginPullError::into_inner)?
-        {
-            OriginFetch::Found { stream, size_hint } => (stream, size_hint),
-            // Outboard published but the origin no longer has the data
-            // itself — degrade to a whole-blob populate, which will
-            // re-surface a persistent absence at its proper severity.
-            OriginFetch::NotFound => return Ok(None),
-        };
-
-        let pull = LocalOutboardPull::spawn(hash, total_bytes, outboard, stream);
-        Ok(Some((LocalOutboardHeader { total_bytes }, pull)))
-    }
-
-    /// Begin a node-driven *tee* fill of `hash` (#856): the caller pushes the bao
-    /// verified-stream it forwards from an upstream node→node pull via
-    /// [`TeeSink::write`] (the header-less interleaved bao — ADR 038; the content
-    /// size goes to [`TeeReservation::begin`], not in band), while the engine
-    /// decodes + verifies it against
-    /// the content root and streams the plaintext into the store; [`TeeSink::finish`]
-    /// promotes the blob if every chunk group verified. This lets the
-    /// node's `cdn/client/v1` handler fuse the upstream pull with downstream
-    /// delivery — forwarding each chunk to the paying client as it arrives —
-    /// rather than buffering the whole blob via [`Self::populate`] before serving
-    /// (the prepay-the-whole-blob exposure of #856).
-    ///
-    /// Coalescing (#305): the tee participates in the SAME in-flight map as
+    /// Coalescing (#305): the claim participates in the SAME in-flight map as
     /// [`Self::populate`] / [`Self::get`]. If another fill for `hash` is already
     /// in progress this returns [`TeeOpen::InFlight`] and the caller MUST NOT open
     /// a second upstream pull (no double spend) — it can instead wait on the
     /// existing fill via `populate` and serve from the store. The returned
-    /// [`TeeSink`] holds the in-flight claim for `hash`; dropping it (via
-    /// `finish` / `abandon`, or an early return on the error path) releases the
+    /// [`TeeReservation`] holds the in-flight claim for `hash`; dropping it (via
+    /// [`TeeReservation::abandon`], or an early return on any path) releases the
     /// claim and wakes waiters.
     ///
     /// Unlike `populate`, this does NOT itself check `is_evicted` or `has`: the
@@ -2582,19 +2643,14 @@ impl CacheEngine {
         guard.insert(hash, Arc::clone(&notify));
         drop(guard);
 
-        // The in-flight claim is taken now (coalescing #305), but the verifying
-        // decoder can only be framed once the whole-blob size is known — the
-        // caller learns it from the upstream's signed `total_bytes` AFTER this
-        // point. So opening yields a [`TeeReservation`] holding the claim; the
-        // caller calls [`TeeReservation::begin`] with the content size to spawn
-        // the import task and get the writable [`TeeSink`]. Dropping the
-        // reservation (an upstream that failed before the size was known)
-        // releases the claim.
+        // The in-flight claim is taken now (coalescing #305). Opening yields a
+        // [`TeeReservation`] that holds the claim; the peer serve-miss path keeps
+        // it for the lifetime of the fill and drops/abandons it when the fill
+        // ends, which releases the claim and wakes waiters.
         TeeOpen::Owner(TeeReservation {
             engine: self.clone(),
             hash,
             notify,
-            active: true,
         })
     }
 
@@ -3646,13 +3702,6 @@ impl CacheEngine {
             StreamCommitOutcome::HashMismatch { actual } => {
                 Ok(PullThroughOutcome::HashMismatch { actual })
             }
-            // `VerifyFailed` is emitted only by the tee's bao-decoding source
-            // (`bao_decoded_source`); the origin pull-through feeds raw bytes, so
-            // it can never fire here. Map defensively to `Store` — if it ever does,
-            // that is a logic regression worth surfacing, not silent success.
-            StreamCommitOutcome::VerifyFailed => Ok(PullThroughOutcome::Store(anyhow::Error::msg(
-                "import_and_verify_stream returned VerifyFailed on the non-tee origin path",
-            ))),
             StreamCommitOutcome::BlobTooLarge => Ok(PullThroughOutcome::BlobTooLarge),
             StreamCommitOutcome::Store(err) => Ok(PullThroughOutcome::Store(err)),
         }
@@ -3660,23 +3709,16 @@ impl CacheEngine {
 
     /// Drive a chunk stream into the iroh-blobs store, capturing mid-stream
     /// errors via the side channel, verify the committed hash against `hash`,
-    /// and on match promote the temp tag to a named tag. This is the shared
-    /// commit-and-verify tail used by both the origin pull-through
-    /// ([`Self::pull_through_attempt`]) and the node-driven tee sink
-    /// ([`Self::open_tee_sink`], #856) — the only difference between the two is
-    /// the source of `stream` (an `Origin::fetch` stream vs. a caller-fed
-    /// channel). It does NOT broadcast the insert or read the bytes back; the
-    /// caller owns those (the tee broadcasts on `finish`, the pull-through
-    /// re-reads for its `Bytes` return).
+    /// and on match promote the temp tag to a named tag. This is the
+    /// commit-and-verify tail of the origin pull-through
+    /// ([`Self::pull_through_attempt`]); `stream` is an `Origin::fetch` stream.
+    /// It does NOT broadcast the insert or read the bytes back; the caller owns
+    /// those (the pull-through re-reads for its `Bytes` return).
     ///
     /// `count_and_cap_stream` enforces `max_blob_bytes` and bumps the
-    /// origin-egress metric per chunk, so a tee fill is metered as the upstream
-    /// egress it genuinely is (those bytes left an origin) without touching the
-    /// `get`-caller hit/returned counters. On the tee path `stream` is the
-    /// DECODED plaintext (`bao_decoded_source` strips the interleaved proof), so
-    /// `pull_through_bytes` here meters content bytes — slightly under the bao
-    /// wire that actually left the upstream (the proof overhead the buyer paid for
-    /// is counted on the receive side, not here).
+    /// origin-egress metric per chunk, so the pulled bytes are metered as the
+    /// upstream egress they genuinely are (those bytes left an origin) without
+    /// touching the `get`-caller hit/returned counters.
     async fn import_and_verify_stream<S>(
         &self,
         hash: Hash,
@@ -3719,15 +3761,6 @@ impl CacheEngine {
             // a generic `OriginError`.
             if is_blob_too_large_marker(&upstream) {
                 return Ok(StreamCommitOutcome::BlobTooLarge);
-            }
-            // A bao verify failure (#915): the teed verified-stream did not check
-            // out against the content root — a corrupt/lying upstream. Surface it
-            // as the dedicated verify-failure outcome so the window serve path
-            // scores it as an upstream-verify failure rather than a generic
-            // transport error. The failure is at an interior chunk group, so there
-            // is no meaningful whole-blob "actual" hash to report.
-            if is_bao_verify_marker(&upstream) {
-                return Ok(StreamCommitOutcome::VerifyFailed);
             }
             // Otherwise classify via the shared body-phase classifier: typed
             // `OriginError::*` inners surface as Permanent (decompression
@@ -3894,37 +3927,28 @@ enum PullThroughOutcome {
 }
 
 /// Outcome of [`CacheEngine::import_and_verify_stream`] — the commit-and-verify
-/// tail shared by origin pull-through and the tee sink (#856). Mirrors
-/// [`PullThroughOutcome`] minus the `Bytes`/`NotFound` arms: a stream import
-/// either commits, fails bao verification, hashes wrong, overruns the cap, or
-/// hits a store fault.
+/// tail of the origin pull-through. Mirrors [`PullThroughOutcome`] minus the
+/// `Bytes`/`NotFound` arms: a stream import either commits, hashes wrong,
+/// overruns the cap, or hits a store fault.
 #[derive(Debug)]
 enum StreamCommitOutcome {
     Committed,
     BlobTooLarge,
-    /// The teed bao verified-stream failed to decode against the content root —
-    /// a corrupt/lying upstream (#915). Distinct from [`Self::HashMismatch`]:
-    /// the failure is at an interior chunk group, so there is no meaningful
-    /// whole-blob "actual" hash to report.
-    VerifyFailed,
-    HashMismatch {
-        actual: Hash,
-    },
+    HashMismatch { actual: Hash },
     Store(anyhow::Error),
 }
 
-/// Backpressure bound on the [`TeeSink`] feeder channel: at most this many
-/// caller-pushed chunks may be in flight to the store-import task before
-/// [`TeeSink::write`] awaits. Small enough to cap resident memory (a handful of
-/// `cdn/client/v1` chunks), large enough that the store import and the network
-/// forward overlap rather than ping-ponging one chunk at a time.
-const TEE_SINK_CHANNEL_CAP: usize = 8;
+/// Backpressure bound on the [`CacheEngine::admit_bao_stream`] feeder channel:
+/// at most this many caller-pushed chunks may be in flight to the store-import
+/// task before the feed awaits. Small enough to cap resident memory (a handful
+/// of `cdn/client/v1` chunks), large enough that the store import and the
+/// network forward overlap rather than ping-ponging one chunk at a time.
+const ADMIT_STREAM_CHANNEL_CAP: usize = 8;
 
 /// Read granularity [`CacheEngine::admit_bao_stream`] uses to drain its
 /// upstream `reader` into the feeder channel. Arbitrary — the
 /// [`ChannelRecvStream`]/decoder side re-buffers to whatever boundaries the
-/// bao tree needs (the same way [`TeeSink::write`]'s network-chunk-sized
-/// pushes already do) — chosen as a plain streaming-I/O size, not tied to
+/// bao tree needs — chosen as a plain streaming-I/O size, not tied to
 /// `CHUNK_GROUP_BYTES`.
 const ADMIT_STREAM_READ_LEN: usize = 64 * 1024;
 
@@ -3954,8 +3978,8 @@ fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError
 /// Result of [`CacheEngine::open_tee_sink`] (#856).
 #[derive(Debug)]
 pub enum TeeOpen {
-    /// This caller owns the fill: name the content size via
-    /// [`TeeReservation::begin`] to get the writable [`TeeSink`].
+    /// This caller owns the fill: hold the [`TeeReservation`] for the lifetime
+    /// of the upstream pull, then abandon or drop it to release the claim.
     Owner(TeeReservation),
     /// Another task is already filling this hash (coalescing, #305). The caller
     /// MUST NOT open a competing upstream pull — wait on the existing fill via
@@ -3963,62 +3987,20 @@ pub enum TeeOpen {
     InFlight,
 }
 
-/// The in-flight claim for a tee fill, held between [`CacheEngine::open_tee_sink`]
-/// (which takes the claim for coalescing #305) and [`Self::begin`] (which frames
-/// the verifying decoder once the whole-blob size is known from the upstream's
-/// signed `total_bytes`). Dropping it without calling `begin` — an upstream that
-/// failed before the size was known — releases the claim and wakes waiters.
+/// The in-flight coalescing claim for a node-driven fill, taken by
+/// [`CacheEngine::open_tee_sink`] (#305) and held by the peer serve-miss path
+/// for the lifetime of the upstream pull. Dropping it — via [`Self::abandon`]
+/// or an early return on any path — releases the claim and wakes waiters.
 #[derive(Debug)]
 pub struct TeeReservation {
     engine: CacheEngine,
     hash: Hash,
     notify: Arc<Notify>,
-    /// Cleared by [`Self::begin`] so the produced [`TeeSink`] owns the claim and
-    /// this reservation's `Drop` becomes a no-op (no double release).
-    active: bool,
 }
 
 impl TeeReservation {
-    /// Frame the verifying decoder with `content_size` (the signed whole-blob
-    /// size) and spawn the store-import task, handing back the writable
-    /// [`TeeSink`]. The content size is passed here, at open, rather than as an
-    /// in-band header — the wire the caller forwards is the header-less bao
-    /// interleaved stream (ADR 038).
-    #[must_use]
-    pub fn begin(mut self, content_size: u64) -> TeeSink {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(TEE_SINK_CHANNEL_CAP);
-        // Decode + verify the forwarded header-less bao stream into plaintext,
-        // which the existing commit path imports — keeping the cap
-        // (`count_and_cap_stream`) and the `StreamCommitOutcome` taxonomy intact
-        // while verifying the cached copy against the root. The channel closing
-        // (all senders dropped) ends the stream — that is how `finish` / `abandon`
-        // signal end-of-blob.
-        let source: Pin<
-            Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync>,
-        > = Box::pin(bao_decoded_source(self.hash, content_size, rx));
-        let engine = self.engine.clone();
-        let hash = self.hash;
-        let max_blob_bytes = engine.inner.max_blob_bytes;
-        let import = tokio::spawn(async move {
-            engine
-                .import_and_verify_stream(hash, source, max_blob_bytes)
-                .await
-        });
-        // Transfer the in-flight claim to the sink; this reservation's Drop is now
-        // a no-op.
-        self.active = false;
-        TeeSink {
-            engine: self.engine.clone(),
-            hash: self.hash,
-            notify: Arc::clone(&self.notify),
-            tx: Some(tx),
-            import: Some(import),
-        }
-    }
-
-    /// Release the claim without ever framing a decoder (e.g. the upstream pull
-    /// failed before the size was known). Equivalent to dropping the reservation;
-    /// named for symmetry with [`TeeSink::abandon`] at the call sites.
+    /// Release the claim. Equivalent to dropping the reservation; named as a
+    /// self-documenting call site for the "pull failed / no longer wanted" path.
     pub fn abandon(self) {
         drop(self);
     }
@@ -4026,218 +4008,18 @@ impl TeeReservation {
 
 impl Drop for TeeReservation {
     fn drop(&mut self) {
-        // Only release if `begin` never consumed the claim; otherwise the
-        // produced `TeeSink` owns it and will release on its own drop.
-        if !self.active {
-            return;
-        }
+        // Release the in-flight claim and wake waiters (#305) on every exit.
         self.engine.inner.lock_inflight().remove(&self.hash);
         self.notify.notify_waiters();
     }
 }
 
-/// A caller-driven tee fill of one blob into the cache (#856). The owner pushes
-/// the header-less bao verified-stream via [`Self::write`] as it arrives from an
-/// upstream node→node pull (the content size was named at [`TeeReservation::begin`]
-/// — ADR 038); the engine decodes + verifies it against the content root and
-/// streams the plaintext into the store concurrently. [`Self::finish`] promotes
-/// the blob when every chunk group verified (making it a discoverable holder),
-/// and surfaces a [`CacheError::VerifyFailed`] when the forwarded bao failed
-/// verification (a corrupt/lying upstream); [`Self::abandon`] drops a partial
-/// fill (e.g. the downstream client disconnected). Either way — or on an early
-/// drop from any error path — the in-flight claim is released and waiters woken.
-#[derive(Debug)]
-pub struct TeeSink {
-    engine: CacheEngine,
-    hash: Hash,
-    /// The per-hash in-flight notifier (shared with [`CacheEngine::populate`]
-    /// waiters); woken on drop so a coalesced waiter re-checks presence.
-    notify: Arc<Notify>,
-    /// Feeder into the store-import task. `take`n / set to `None` by
-    /// `finish`/`abandon` to end the stream; dropping it closes the channel.
-    tx: Option<tokio::sync::mpsc::Sender<Bytes>>,
-    /// The spawned store-import task; `take`n by `finish` (awaited) or
-    /// `abandon`/`Drop` (aborted).
-    import: Option<tokio::task::JoinHandle<Result<StreamCommitOutcome, OriginPullError>>>,
-}
-
-impl TeeSink {
-    /// Push one chunk into the fill. Awaits if the bounded feeder channel is
-    /// full (store backpressure, which also paces the caller's downstream
-    /// forward). Errors if the import task has already ended — the caller should
-    /// then [`Self::abandon`].
-    ///
-    /// # Errors
-    ///
-    /// - [`CacheError::VerifyFailed`] — the import ended because the tee's bao
-    ///   decoder REJECTED a chunk group: the bytes being forwarded are corrupt
-    ///   (a lying upstream), not a local fault. Callers route this to their
-    ///   corruption handling, not their store-fault handling (#915).
-    /// - [`CacheError::BlobTooLarge`] / [`CacheError::OriginError`] — the import
-    ///   ended on the cap or a captured transport-class fault.
-    /// - [`CacheError::Store`] — the sink is already finished, or the import
-    ///   task ended/failed for a genuinely local reason.
-    pub async fn write(&mut self, chunk: &[u8]) -> CacheResult<()> {
-        let Some(tx) = self.tx.as_ref() else {
-            return Err(CacheError::Store(anyhow::anyhow!(
-                "tee sink write after finish/abandon"
-            )));
-        };
-        if tx.send(Bytes::copy_from_slice(chunk)).await.is_ok() {
-            return Ok(());
-        }
-        // The import task ended before this write landed — its outcome IS the
-        // reason the send failed, so surface it instead of a generic "store
-        // fault" (#915 review): a bao verify rejection mid-stream must classify
-        // as CORRUPTION (`CacheError::VerifyFailed`), not as a failing local
-        // disk, or the caller meters/scores the wrong party. After this the
-        // sink is spent; the caller should [`Self::abandon`] (a no-op then).
-        self.tx = None;
-        let Some(import) = self.import.take() else {
-            return Err(CacheError::Store(anyhow::anyhow!(
-                "tee sink import task ended before write completed"
-            )));
-        };
-        let outcome = import.await.map_err(|e| {
-            CacheError::Store(anyhow::anyhow!("tee sink import task join failed: {e}"))
-        })?;
-        match self.verdict(outcome) {
-            // A "clean" early exit with bytes still unwritten cannot be a real
-            // commit of the full blob — report the early termination itself.
-            Ok(()) => Err(CacheError::Store(anyhow::anyhow!(
-                "tee sink import task ended before write completed"
-            ))),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Map a finished import task's outcome to what the caller sees. Shared by
-    /// [`Self::finish`] (the normal verdict point) and [`Self::write`]'s
-    /// task-ended-early path, so a mid-stream bao rejection surfaces as the same
-    /// [`CacheError::VerifyFailed`] from either.
-    fn verdict(&self, outcome: Result<StreamCommitOutcome, OriginPullError>) -> CacheResult<()> {
-        match outcome {
-            Ok(StreamCommitOutcome::Committed) => Ok(()),
-            Ok(StreamCommitOutcome::VerifyFailed) => Err(CacheError::VerifyFailed {
-                expected: self.hash,
-            }),
-            Ok(StreamCommitOutcome::HashMismatch { actual }) => Err(CacheError::HashMismatch {
-                expected: self.hash,
-                actual,
-            }),
-            Ok(StreamCommitOutcome::BlobTooLarge) => Err(CacheError::BlobTooLarge {
-                hash: self.hash,
-                limit_bytes: self.engine.inner.max_blob_bytes,
-            }),
-            Ok(StreamCommitOutcome::Store(err)) => Err(CacheError::Store(err)),
-            Err(e) => Err(CacheError::OriginError {
-                hash: self.hash,
-                source: e.into_inner(),
-            }),
-        }
-    }
-
-    /// Close the stream and finalize: verify the committed hash and, on match,
-    /// promote the blob and announce the insert (ADR 022 §STORE Flow), so the
-    /// node becomes a discoverable holder for future requests.
-    ///
-    /// # Errors
-    ///
-    /// - [`CacheError::VerifyFailed`] — a forwarded chunk group did not verify
-    ///   against the content root (corrupt upstream); the blob is NOT promoted.
-    /// - [`CacheError::BlobTooLarge`] — the fill exceeded `max_blob_bytes`.
-    /// - [`CacheError::Store`] — store-write or import-task-join fault.
-    /// - [`CacheError::OriginError`] — a mid-stream transport error was captured.
-    pub async fn finish(mut self) -> CacheResult<()> {
-        // Drop the sender → the import stream ends → the task finalizes.
-        self.tx = None;
-        let Some(import) = self.import.take() else {
-            return Err(CacheError::Store(anyhow::anyhow!(
-                "tee sink finished twice"
-            )));
-        };
-        let outcome = import.await.map_err(|e| {
-            CacheError::Store(anyhow::anyhow!("tee sink import task join failed: {e}"))
-        })?;
-        let result = self.verdict(outcome);
-        if result.is_ok() {
-            // Announce the fresh commit to DHT-republish subscribers
-            // (ADR 022 §STORE Flow), mirroring the origin pull-through path.
-            // No active subscriber → `SendError`, the normal state; ignore.
-            let _ = self.engine.inner.inserts_tx.send(self.hash);
-            self.engine.touch(self.hash);
-        }
-        result
-        // `self` drops here → the in-flight claim is released AFTER the commit,
-        // so a coalesced waiter that wakes sees the blob present.
-    }
-
-    /// Drop a partial fill without promoting it (e.g. the downstream client
-    /// disconnected, so we stop pulling). The partial temp tag is reclaimed by
-    /// iroh-blobs GC; the in-flight claim releases on drop.
-    pub fn abandon(mut self) {
-        self.tx = None;
-        if let Some(import) = self.import.take() {
-            import.abort();
-        }
-    }
-}
-
-impl Drop for TeeSink {
-    fn drop(&mut self) {
-        // Release the in-flight claim and wake waiters (#305) on EVERY exit —
-        // `finish`, `abandon`, or an early drop on the caller's error path. If
-        // the import task is still live (dropped without finish/abandon), abort
-        // it so its partial temp tag becomes GC-eligible.
-        if let Some(import) = self.import.take() {
-            import.abort();
-        }
-        self.engine.inner.lock_inflight().remove(&self.hash);
-        self.notify.notify_waiters();
-    }
-}
-
-/// Typed marker: the bao verifying decoder driving a [`TeeSink`] fill rejected a
-/// chunk group (or the root) — the upstream forwarded bytes that do not verify
-/// against the content hash. Carries the decoder's own description of WHICH
-/// parent/leaf failed (the first question in a corruption postmortem), mirroring
-/// [`BlobTooLargeMarker`]'s payload-carrying shape. Wrapped in the import
-/// stream's `io::Error` so [`CacheEngine::import_and_verify_stream`] surfaces a
-/// corruption outcome ([`StreamCommitOutcome::VerifyFailed`]) instead of
-/// collapsing it into a generic transport [`OriginPullError`] (#915, ADR 038).
-/// Only genuine hash mismatches carry this marker — a truncated feed (EOF,
-/// `*NotFound`) stays a transport-class error; see [`bao_decoded_source`].
-#[derive(Debug)]
-struct BaoVerifyMarker {
-    /// The failing `DecodeError` rendered (`ParentHashMismatch(node)` /
-    /// `LeafHashMismatch(chunk)`).
-    detail: String,
-}
-
-impl std::fmt::Display for BaoVerifyMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "bao verified-stream decode failed (content did not verify against root): {}",
-            self.detail
-        )
-    }
-}
-
-impl std::error::Error for BaoVerifyMarker {}
-
-/// True when the import-stream `io::Error` wraps a [`BaoVerifyMarker`] — the teed
-/// bao failed verification against the content root (corrupt/lying upstream).
-fn is_bao_verify_marker(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BaoVerifyMarker>)
-}
-
-/// A [`RecvStream`] backed by the [`TeeSink`] feeder channel. The window
-/// pull-through producer writes the header-less bao interleaved stream it
-/// forwards from the upstream (the content size is passed at open, not in-band);
-/// this adapter hands those bytes to a [`ResponseDecoder`] so the tee verifies +
-/// decodes them to plaintext for the store import (#915, ADR 038 §Serve side).
+/// A [`RecvStream`] backed by the [`CacheEngine::admit_bao_stream`] feeder
+/// channel. The caller pushes the header-less bao interleaved stream it forwards
+/// from the upstream (the content size is supplied out of band as an 8-byte size
+/// prefix, ADR 038); this adapter hands those bytes to iroh-blobs'
+/// `import_bao_reader`, which verifies + decodes them to plaintext for the store
+/// import (#915, ADR 038 §Serve side).
 struct ChannelRecvStream {
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     buf: BytesMut,
@@ -4278,10 +4060,10 @@ impl RecvStream for ChannelRecvStream {
         }
         // A drained-and-closed channel yields a zero-length `Bytes`, which the
         // `bao-tree` reader reads as clean EOF (not an error) — the correct signal
-        // for a fill that ended (`finish`/`abandon` dropped all senders). A feed
+        // for a feed that ended (`admit_bao_stream` dropped its sender). A feed
         // that ends mid-tree surfaces as this same short read to the decoder, which
         // then fails with `ParentNotFound`/`LeafNotFound` — the transport-class
-        // `bao stream truncated mid-tree` path in `bao_decoded_source`, distinct
+        // truncated-mid-tree path (`classify_import_bao_reader_error`), distinct
         // from a genuine group hash mismatch.
         let take = self.buf.len().min(len);
         Ok(self.buf.split_to(take).freeze())
@@ -4316,86 +4098,6 @@ impl RecvStream for ChannelRecvStream {
     fn id(&self) -> u64 {
         0
     }
-}
-
-/// Build the plaintext byte stream a [`TeeSink`] imports from a window
-/// pull-through fill: drive a bao [`ResponseDecoder`] over the feeder channel,
-/// yielding each verified chunk-group's plaintext (proof `Parent` nodes are
-/// skipped). `content_size` — the signed whole-blob size passed to
-/// [`TeeReservation::begin`] once the upstream header is known — frames the bao
-/// tree, so the fed wire is the header-less interleaved stream (no in-band 8-byte
-/// size header). The error
-/// taxonomy matches the client-side decoder (ADR 038): a genuine group/parent
-/// hash mismatch surfaces as an `io::Error` wrapping [`BaoVerifyMarker`] (then
-/// the stream ends), so the import reports a CORRUPTION outcome; a truncated
-/// feed mid-tree (`ParentNotFound`/`LeafNotFound`) or a reader fault surfaces as
-/// a transport-class `io::Error` (`UnexpectedEof`/`Io`), which must NOT be
-/// blamed on the upstream as corruption. Feeding plaintext through the existing
-/// `import_and_verify_stream` keeps the `count_and_cap_stream` cap and the
-/// structured `StreamCommitOutcome` taxonomy intact (#915, ADR 038).
-fn bao_decoded_source(
-    hash: Hash,
-    content_size: u64,
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
-) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync {
-    enum State {
-        Decoding(ResponseDecoder<RecvStreamAsyncStreamReader<ChannelRecvStream>>),
-        Done,
-    }
-    let tree = BaoTree::new(content_size, crate::range_pull::IROH_BLOCK_SIZE);
-    let decoder = ResponseDecoder::new(
-        hash.into(),
-        ChunkRanges::all(),
-        tree,
-        RecvStreamAsyncStreamReader::new(ChannelRecvStream::new(rx)),
-    );
-    futures_util::stream::unfold(State::Decoding(decoder), move |state| async move {
-        let mut decoder = match state {
-            State::Decoding(d) => d,
-            State::Done => return None,
-        };
-        // Advance to the next leaf (yield its plaintext), a decode failure
-        // (yield a classified error, then end), or the end of the stream.
-        loop {
-            match decoder.next().await {
-                ResponseDecoderNext::More((rest, Ok(BaoContentItem::Leaf(leaf)))) => {
-                    return Some((Ok(leaf.data), State::Decoding(rest)));
-                }
-                ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(_)))) => {
-                    decoder = rest;
-                }
-                ResponseDecoderNext::More((_rest, Err(decode_err))) => {
-                    // Split the taxonomy exactly as the client-side decoder
-                    // does (decdn-client-pull `decode_verified_range`): only a
-                    // genuine hash mismatch is CORRUPTION (the marker →
-                    // `StreamCommitOutcome::VerifyFailed` → the upstream is
-                    // scored); an EOF mid-tree (`*NotFound`) or reader fault
-                    // (`Io`) is a TRUNCATED/faulted feed — transport-class, not
-                    // provably corruption — and must not tar the upstream as a
-                    // liar.
-                    use bao_tree::io::DecodeError;
-                    let err = match decode_err {
-                        DecodeError::ParentHashMismatch(_) | DecodeError::LeafHashMismatch(_) => {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                BaoVerifyMarker {
-                                    detail: decode_err.to_string(),
-                                },
-                            )
-                        }
-                        DecodeError::Io(io_err) => io_err,
-                        not_found @ (DecodeError::ParentNotFound(_)
-                        | DecodeError::LeafNotFound(_)) => std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("bao stream truncated mid-tree: {not_found}"),
-                        ),
-                    };
-                    return Some((Err(err), State::Done));
-                }
-                ResponseDecoderNext::Done(_reader) => return None,
-            }
-        }
-    })
 }
 
 /// True when the body-phase `io::Error` wraps a typed
@@ -4584,7 +4286,7 @@ mod tests {
     }
 
     /// A stub origin that also answers [`Origin::size`] and
-    /// [`Origin::fetch_outboard`], for [`LocalOutboardPull`] tests. The
+    /// [`Origin::fetch_outboard`], for outboard-fetch tests. The
     /// outboard answer is configurable so a test can exercise the
     /// `NotFound`/`Unsupported` degrade.
     #[derive(Debug)]
@@ -5239,234 +4941,6 @@ mod tests {
             TeeOpen::Owner(res) => Ok(res),
             TeeOpen::InFlight => Err(anyhow::anyhow!("expected Owner, got InFlight")),
         }
-    }
-
-    /// Strip the 8-byte LE size header `encode_verified_range` prepends, leaving
-    /// the header-less bao wire the window pull-through forwards (and the tee now
-    /// consumes, since the content size is passed at `begin`).
-    fn header_less(combined: &[u8]) -> anyhow::Result<&[u8]> {
-        combined
-            .get(8..)
-            .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its 8-byte header"))
-    }
-
-    #[tokio::test]
-    async fn tee_sink_commits_promotes_and_announces() -> anyhow::Result<()> {
-        // A teed fill (#856) must end up cached, hash-verified, and announced to
-        // DHT-republish subscribers exactly like an origin pull-through.
-        let tmp = tempfile::tempdir()?;
-        let payload: Vec<u8> = (0..200_000u32)
-            .map(|i| u8::try_from(i % 256).unwrap_or(0))
-            .collect();
-        let hash = Hash::new(&payload);
-
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-        let mut rx = engine.subscribe_inserts();
-
-        // The tee imports the header-less bao verified-stream (ADR 038): the
-        // content size is passed at `begin`, so feed the interleaved proof/data
-        // without the 8-byte size header — the shape `window_forward_loop`
-        // forwards, not the raw payload.
-        let blob_size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        let aligned = crate::range_pull::align_range(0, 0, blob_size)
-            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
-            &payload,
-            crate::range_pull::IROH_BLOCK_SIZE,
-        );
-        let combined = crate::range_pull::encode_verified_range(
-            *hash.as_bytes(),
-            &aligned,
-            &payload,
-            Bytes::from(ob.data),
-        )
-        .map_err(|e| anyhow::anyhow!("encode bao: {e}"))?;
-
-        let mut sink = owner(engine.open_tee_sink(hash))?.begin(blob_size);
-        for chunk in header_less(combined.as_ref())?.chunks(64 * 1024) {
-            sink.write(chunk).await?;
-        }
-        sink.finish().await?;
-
-        anyhow::ensure!(engine.has(hash).await?, "blob must be present after finish");
-        let got = engine.get(hash).await?;
-        anyhow::ensure!(
-            got.as_ref() == payload.as_slice(),
-            "served bytes must match"
-        );
-
-        let announced = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for tee insert announce"))?
-            .map_err(|e| anyhow::anyhow!("recv: {e}"))?;
-        anyhow::ensure!(
-            announced == hash,
-            "announced hash must equal committed hash"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tee_sink_verify_failure_does_not_promote() -> anyhow::Result<()> {
-        // Corrupt upstream (#853/#915): a WELL-FORMED bao stream of the WRONG
-        // content — a valid encoding, but of different bytes than the requested
-        // hash names — must fail the tee's verifying decoder with a genuine
-        // group hash mismatch, surface `CacheError::VerifyFailed` from `finish`,
-        // and never be promoted. (A truncated feed is a different failure class —
-        // see `tee_sink_truncated_feed_is_not_corruption`.)
-        let tmp = tempfile::tempdir()?;
-        let genuine: Vec<u8> = (0..200_000u32)
-            .map(|i| u8::try_from(i % 256).unwrap_or(0))
-            .collect();
-        let wanted = Hash::new(&genuine);
-        // Same length, different bytes: a valid bao encoding of OTHER content.
-        let wrong: Vec<u8> = (0..200_000u32)
-            .map(|i| u8::try_from((i + 7) % 251).unwrap_or(0))
-            .collect();
-        anyhow::ensure!(Hash::new(&wrong) != wanted, "fixtures must differ");
-        let blob_size = u64::try_from(wrong.len()).unwrap_or(u64::MAX);
-        let aligned = crate::range_pull::align_range(0, 0, blob_size)
-            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
-            &wrong,
-            crate::range_pull::IROH_BLOCK_SIZE,
-        );
-        let combined = crate::range_pull::encode_verified_range(
-            *Hash::new(&wrong).as_bytes(),
-            &aligned,
-            &wrong,
-            Bytes::from(ob.data),
-        )
-        .map_err(|e| anyhow::anyhow!("encode bao: {e}"))?;
-
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-        let mut sink = owner(engine.open_tee_sink(wanted))?.begin(blob_size);
-        let mut write_err = None;
-        for chunk in header_less(combined.as_ref())?.chunks(64 * 1024) {
-            if let Err(e) = sink.write(chunk).await {
-                // The decoder may reject mid-feed (the import ends and a later
-                // write fails) — that surfaced verdict must be the same
-                // VerifyFailed `finish` would report.
-                write_err = Some(e);
-                break;
-            }
-        }
-        let err = match write_err {
-            Some(e) => {
-                sink.abandon();
-                e
-            }
-            None => sink
-                .finish()
-                .await
-                .err()
-                .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?,
-        };
-        anyhow::ensure!(
-            matches!(err, CacheError::VerifyFailed { expected } if expected == wanted),
-            "expected VerifyFailed for {wanted}, got {err:?}"
-        );
-        anyhow::ensure!(
-            !engine.has(wanted).await?,
-            "mismatched bytes must not be promoted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tee_sink_empty_blob_commits_and_promotes() -> anyhow::Result<()> {
-        // A 0-byte blob teed through the window path (#1054): `content_size` 0 and
-        // zero wire bytes. `finish` must promote the empty blob under the empty
-        // root `Hash::new(&[])` — the window-forward loop's finalize on a size-0
-        // reservation.
-        let tmp = tempfile::tempdir()?;
-        let empty: Vec<u8> = Vec::new();
-        let hash = Hash::new(&empty);
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-
-        let sink = owner(engine.open_tee_sink(hash))?.begin(0);
-        // No writes: the empty blob has no chunk group. `finish` drops the feeder,
-        // closing the stream with no data.
-        sink.finish().await?;
-
-        anyhow::ensure!(
-            engine.has(hash).await?,
-            "empty blob must be present after finish"
-        );
-        let got = engine.get(hash).await?;
-        anyhow::ensure!(got.as_ref().is_empty(), "served empty bytes");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tee_sink_empty_claim_for_nonempty_hash_does_not_promote() -> anyhow::Result<()> {
-        // A lying upstream that claims `content_size == 0` (feeds nothing) for a
-        // NON-empty requested hash must NOT promote: the empty root must be proven,
-        // never accepted for an arbitrary hash (#1054, the tee's fail-closed leg).
-        let tmp = tempfile::tempdir()?;
-        let genuine: Vec<u8> = (0..200_000u32)
-            .map(|i| u8::try_from(i % 256).unwrap_or(0))
-            .collect();
-        let wanted = Hash::new(&genuine);
-        let empty: Vec<u8> = Vec::new();
-        anyhow::ensure!(Hash::new(&empty) != wanted, "fixtures must differ");
-
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-        let sink = owner(engine.open_tee_sink(wanted))?.begin(0);
-        let res = sink.finish().await;
-        anyhow::ensure!(
-            res.is_err(),
-            "an empty feed for a non-empty hash must fail closed, got Ok"
-        );
-        anyhow::ensure!(
-            !engine.has(wanted).await?,
-            "an empty feed for a non-empty hash must not be promoted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn tee_sink_truncated_feed_is_not_corruption() -> anyhow::Result<()> {
-        // A short feed: the decoder is framed (at `begin`) for a large blob but
-        // the stream ends mid-tree. This must FAIL (not commit a partial blob)
-        // and must NOT be branded a verify failure — `VerifyFailed` is reserved
-        // for a group that provably hashes wrong; a truncated feed is
-        // transport-class (EOF mid-tree), which must not tar the upstream as a
-        // liar (#915 review).
-        let tmp = tempfile::tempdir()?;
-        let payload: Vec<u8> = (0..200_000u32)
-            .map(|i| u8::try_from(i % 256).unwrap_or(0))
-            .collect();
-        let wanted = Hash::new(&payload);
-        let content_size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-
-        // Frame for a 200 KB blob, then feed only a few bytes and stop: the bao
-        // decoder starves mid-tree.
-        let mut sink = owner(engine.open_tee_sink(wanted))?.begin(content_size);
-        let write_result = sink
-            .write(b"only a few bytes, nowhere near a full tree")
-            .await;
-        let err = match write_result {
-            Err(e) => {
-                sink.abandon();
-                e
-            }
-            Ok(()) => sink
-                .finish()
-                .await
-                .err()
-                .ok_or_else(|| anyhow::anyhow!("expected a truncated feed to fail, got Ok"))?,
-        };
-        anyhow::ensure!(
-            !matches!(err, CacheError::VerifyFailed { .. }),
-            "a truncated feed must not classify as corruption, got {err:?}"
-        );
-        anyhow::ensure!(
-            !engine.has(wanted).await?,
-            "a truncated fill must not be promoted"
-        );
-        Ok(())
     }
 
     #[tokio::test]
@@ -7309,72 +6783,303 @@ mod tests {
         (0..size).map(|i| (i % 251) as u8).collect()
     }
 
+    // -- FA.1a: origin_encode_range / origin_fetch_outboard_bytes (Flow A) --
+
+    /// A test origin that serves chunk-group-aligned ranges plus a configurable
+    /// `{H}.obao4` outboard, so the Flow A raw fetch+encode surface can be
+    /// exercised without an HTTP/S3/fs backend. `data`/`outboard`/`size` are held
+    /// independently so a test can serve bytes that do NOT hash to `hash` (a
+    /// corrupt / misconfigured OWN origin, the local-origin-fault case).
+    /// `support_range == false` models an origin with no `206`/outboard support,
+    /// i.e. the [`OriginRangeFetch::Unsupported`] degrade.
+    #[derive(Debug)]
+    struct RangeStubOrigin {
+        hash: Hash,
+        data: Bytes,
+        outboard: Option<Bytes>,
+        size: u64,
+        support_range: bool,
+        /// When true, [`Origin::fetch_outboard`] returns a transport
+        /// [`OriginPullError`] instead of a clean decline — the degraded-origin
+        /// case the serviceability probe must surface as a fault (#1129), not as a
+        /// clean `Ok(None)` absence.
+        fault_outboard: bool,
+    }
+
+    impl RangeStubOrigin {
+        /// An origin that serves `payload` and its genuine outboard for `hash`.
+        fn serving(hash: Hash, payload: &[u8], outboard: Bytes) -> Self {
+            Self {
+                hash,
+                data: Bytes::from(payload.to_vec()),
+                outboard: Some(outboard),
+                size: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                support_range: true,
+                fault_outboard: false,
+            }
+        }
+
+        /// An origin that knows `hash`'s size but FAULTS its outboard fetch with a
+        /// transport error — a degraded own origin, distinct from a clean absence.
+        fn outboard_faulting(hash: Hash, size: u64) -> Self {
+            Self {
+                hash,
+                data: Bytes::new(),
+                outboard: None,
+                size,
+                support_range: false,
+                fault_outboard: true,
+            }
+        }
+    }
+
+    impl Origin for RangeStubOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
+            let result = if hash == self.hash {
+                Ok(OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+
+        fn size(
+            &self,
+            hash: Hash,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
+        {
+            let out = (hash == self.hash).then_some(self.size);
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn fetch_outboard(
+            &self,
+            hash: Hash,
+            _outboard_max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, crate::OriginPullError>> + Send + '_>>
+        {
+            if self.fault_outboard && hash == self.hash {
+                return Box::pin(async move {
+                    Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                        "stub outboard transport fault"
+                    )))
+                });
+            }
+            let result = match (&self.outboard, hash == self.hash) {
+                (Some(ob), true) => OutboardFetch::Found(ob.clone()),
+                _ => OutboardFetch::NotFound,
+            };
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn fetch_range(
+            &self,
+            hash: Hash,
+            req: OriginRangeRequest,
+            _outboard_max_bytes: u64,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<OriginRangeFetch, crate::OriginPullError>> + Send + '_>,
+        > {
+            let result = match (&self.outboard, hash == self.hash && self.support_range) {
+                (Some(ob), true) => {
+                    let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
+                    let e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
+                    match self.data.get(s..e) {
+                        Some(span) => OriginRangeFetch::Ranged {
+                            data: Bytes::copy_from_slice(span),
+                            outboard: ob.clone(),
+                        },
+                        None => OriginRangeFetch::NotFound,
+                    }
+                }
+                _ => OriginRangeFetch::Unsupported,
+            };
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    /// A correct origin: `origin_encode_range` yields header-full wire whose
+    /// header-less body `admit_bao_stream` accepts and stores under `H`.
     #[tokio::test]
-    async fn local_outboard_pull_streams_full_wire() -> anyhow::Result<()> {
+    async fn origin_encode_range_yields_admittable_wire() -> anyhow::Result<()> {
         use bao_tree::io::outboard::PreOrderMemOutboard;
 
         let data = local_outboard_pull_test_blob();
         let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
         let root: [u8; 32] = *ob.root.as_bytes();
         let outboard = Bytes::from(ob.data.clone());
+        let hash = Hash::from(root);
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
 
-        let origin = OutboardStubOrigin::new(&data, Some(outboard.clone()));
-        let hash = Hash::new(&data);
+        let origin = RangeStubOrigin::serving(hash, &data, outboard);
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
-        let Some((header, mut pull)) = engine.open_local_outboard_pull(hash).await? else {
-            anyhow::bail!("expected Some((header, pull)) — outboard + data are both served");
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+        let Some(combined) = engine.origin_encode_range(hash, &aligned).await? else {
+            anyhow::bail!("expected Some(wire) — the origin serves the range + outboard");
         };
         anyhow::ensure!(
-            header.total_bytes == data.len() as u64,
-            "header.total_bytes should be the plaintext length"
+            combined.len() > 8,
+            "origin_encode_range must return the header-full wire (8-byte size header intact)"
         );
-        let expected_wire_bytes = pull.expected_wire_bytes();
 
-        let mut wire = Vec::new();
-        while let Some(chunk) = pull.next_chunk().await? {
-            wire.extend_from_slice(&chunk);
-        }
-        pull.finish().await?;
-
+        // Round-trip: strip the header (the node-side caller's job) and admit the
+        // header-less wire into a FRESH engine, which verifies it against `H`.
+        let header_less = combined.slice(8..);
+        let tmp2 = tempfile::tempdir()?;
+        let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
+        let drained = engine2
+            .admit_bao_stream(hash, aligned.chunk_ranges().clone(), total, header_less)
+            .await?;
+        anyhow::ensure!(drained.is_empty(), "the wire is fully drained by admit");
         anyhow::ensure!(
-            wire.len() as u64 == expected_wire_bytes,
-            "sum(chunk.len()) should equal expected_wire_bytes(): got {} vs {}",
-            wire.len(),
-            expected_wire_bytes,
+            engine2.present_ranges(hash).await?.is_complete(),
+            "the whole-blob wire must reconstruct a complete blob under H"
         );
-
-        let mut reference = Vec::new();
-        decdn_bao_range::streaming::encode_whole_blob_headerless(
-            root,
-            data.len() as u64,
-            outboard,
-            &data[..],
-            &mut reference,
-        )?;
         anyhow::ensure!(
-            wire == reference,
-            "streamed header-less bao wire should match the reference whole-blob encoding"
+            engine2.get(hash).await?.as_ref() == data.as_slice(),
+            "the reconstructed content must be byte-exact"
         );
-
         Ok(())
     }
 
+    /// A corrupt own origin (bytes that do NOT hash to `H`, served with the
+    /// genuine outboard) is a HARD [`CacheError::VerifyFailed`] — never degraded.
     #[tokio::test]
-    async fn local_outboard_pull_none_without_outboard() -> anyhow::Result<()> {
-        let data = local_outboard_pull_test_blob();
-        let hash = Hash::new(&data);
-        let origin = OutboardStubOrigin::new(&data, None);
+    async fn origin_encode_range_hard_faults_on_mismatch() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let genuine = local_outboard_pull_test_blob();
+        let ob = PreOrderMemOutboard::create(&genuine, crate::range_pull::IROH_BLOCK_SIZE);
+        let root: [u8; 32] = *ob.root.as_bytes();
+        let outboard = Bytes::from(ob.data.clone());
+        let hash = Hash::from(root);
+        let total = u64::try_from(genuine.len()).unwrap_or(u64::MAX);
+
+        // Same length, different bytes: the served span will not verify against H.
+        let corrupt: Vec<u8> = genuine.iter().map(|b| b ^ 0xFF).collect();
+        anyhow::ensure!(Hash::new(&corrupt) != hash, "fixtures must differ");
+        let origin = RangeStubOrigin {
+            hash,
+            data: Bytes::from(corrupt),
+            outboard: Some(outboard),
+            size: total,
+            support_range: true,
+            fault_outboard: false,
+        };
         let tmp = tempfile::tempdir()?;
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
-        let result = engine.open_local_outboard_pull(hash).await?;
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+        let err = engine
+            .origin_encode_range(hash, &aligned)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected VerifyFailed, got Ok"))?;
         anyhow::ensure!(
-            result.is_none(),
-            "no origin serves the outboard; open_local_outboard_pull should degrade to Ok(None)"
+            matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+            "a corrupt own origin must be a hard VerifyFailed, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// An origin with no range support degrades to `Ok(None)` — the caller then
+    /// falls through to a whole-blob path.
+    #[tokio::test]
+    async fn origin_encode_range_none_when_unsupported() -> anyhow::Result<()> {
+        let data = local_outboard_pull_test_blob();
+        let hash = Hash::new(&data);
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let origin = RangeStubOrigin {
+            hash,
+            data: Bytes::from(data.clone()),
+            outboard: None,
+            size: total,
+            support_range: false,
+            fault_outboard: false,
+        };
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
+
+        let aligned = crate::range_pull::align_range(0, 0, total)
+            .map_err(|e| anyhow::anyhow!("align: {e}"))?;
+        anyhow::ensure!(
+            engine.origin_encode_range(hash, &aligned).await?.is_none(),
+            "an unsupported origin must degrade origin_encode_range to Ok(None)"
+        );
+        Ok(())
+    }
+
+    /// `origin_fetch_outboard_bytes` returns the outboard when an origin
+    /// publishes it, and `None` when none do.
+    #[tokio::test]
+    async fn origin_fetch_outboard_bytes_found_and_absent() -> anyhow::Result<()> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+
+        let data = local_outboard_pull_test_blob();
+        let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
+        let outboard = Bytes::from(ob.data.clone());
+        let hash = Hash::new(&data);
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+
+        let serving = RangeStubOrigin::serving(hash, &data, outboard.clone());
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(serving) as Arc<dyn Origin>], 64).await?;
+        anyhow::ensure!(
+            engine.origin_fetch_outboard_bytes(hash, total).await? == Some(outboard),
+            "a publishing origin must return its outboard bytes"
+        );
+
+        let bare = OutboardStubOrigin::new(&data, None);
+        let tmp2 = tempfile::tempdir()?;
+        let engine2 =
+            CacheEngine::open(tmp2.path(), vec![Arc::new(bare) as Arc<dyn Origin>], 64).await?;
+        anyhow::ensure!(
+            engine2
+                .origin_fetch_outboard_bytes(hash, total)
+                .await?
+                .is_none(),
+            "no origin publishes the outboard; must be Ok(None)"
+        );
+        Ok(())
+    }
+
+    /// A genuine transport fault fetching the outboard (a degraded own origin) is
+    /// surfaced as `Err`, NOT collapsed into a clean `Ok(None)` absence — so the
+    /// serviceability caller can latch it into `fault_seen` (#1129) and terminate a
+    /// resulting miss as `InternalError` rather than a bare `NotFound`.
+    #[tokio::test]
+    async fn origin_fetch_outboard_bytes_surfaces_a_transport_fault() -> anyhow::Result<()> {
+        let data = local_outboard_pull_test_blob();
+        let hash = Hash::new(&data);
+        let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
+
+        let faulting = RangeStubOrigin::outboard_faulting(hash, total);
+        let tmp = tempfile::tempdir()?;
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(faulting) as Arc<dyn Origin>], 64).await?;
+        anyhow::ensure!(
+            engine
+                .origin_fetch_outboard_bytes(hash, total)
+                .await
+                .is_err(),
+            "an outboard transport fault must surface as Err, not a clean Ok(None)"
         );
         Ok(())
     }

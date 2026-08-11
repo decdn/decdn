@@ -1185,7 +1185,7 @@ pub struct DecdnMetrics {
     /// origin (http/s3/fs) into the paying client while teeing the bytes into
     /// the local cache store — the stream-while-store path, entered only when
     /// the origin publishes a `{H}.obao4` pre-order outboard alongside the
-    /// object. Incremented once per entry into `serve_via_local_outboard`,
+    /// object. Incremented once per entry into `serve_via_backend_origin`,
     /// before any admission guard, so it also counts requests this tier later
     /// rejects (deposit/leech/size) — it marks which SERVE TIER fired, not
     /// whether the fill ultimately succeeded. A miss that instead falls back to
@@ -2213,7 +2213,7 @@ recorders! {
     /// client drop.
     node_pull_through_local_tee_failed => node_pull_through_local_tee_failed.inc();
 
-    /// The node entered `serve_via_local_outboard` — the stream-while-store
+    /// The node entered `serve_via_backend_origin` — the stream-while-store
     /// serve tier fired for this request (#1130). Counted at entry, before any
     /// admission guard; distinguishes this tier from the buffered
     /// `populate_local` fallback regardless of this request's eventual outcome.

@@ -32,7 +32,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{
     Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen,
-    TeeReservation, TeeSink,
+    TeeReservation,
 };
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
@@ -58,7 +58,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
-use crate::node_origin::{NodeOrigin, TeeVerdict};
+use crate::node_origin::NodeOrigin;
 use crate::receipt_log::{DownloadReceipt, ReceiptSink};
 use crate::region_accounting::RegionAccountant;
 
@@ -72,7 +72,6 @@ mod dispatch;
 mod fill;
 mod serve_encoder;
 mod serve_leg;
-mod source;
 mod voucher;
 mod window;
 mod wire;

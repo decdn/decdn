@@ -84,8 +84,7 @@ async fn encode_range_round_trips_to_wire_bao() -> anyhow::Result<()> {
 
     // Independently compute the expected header-less wire bao from the
     // plaintext + outboard directly (not via the store), matching the
-    // reference-encoding pattern at engine.rs's
-    // `local_outboard_pull_streams_full_wire` test.
+    // reference-encoding pattern of `decdn_bao_range::streaming`.
     let mut want = Vec::new();
     decdn_bao_range::streaming::encode_whole_blob_headerless(
         root,

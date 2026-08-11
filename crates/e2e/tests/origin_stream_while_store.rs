@@ -3,7 +3,7 @@
 //! A whole-blob cache miss whose origin publishes a `{H}.obao4` pre-order
 //! outboard is served by streaming straight from the origin into the paying
 //! client while teeing the bytes into the local store
-//! (`serve_via_local_outboard`, tried in `dispatch.rs` before the buffered
+//! (`serve_via_backend_origin`, tried in `dispatch.rs` before the buffered
 //! `try_local_populate` fallback). Three journeys prove the whole tier
 //! end to end, against a real anvil chain, a real `decdn-node` daemon, and a
 //! real paid `cdn/client/v1` fetch:
@@ -14,8 +14,8 @@
 //!    in its cache (teed) — proven by a second fetch that no longer needs the
 //!    origin at all.
 //! 2. **Falls back (no outboard).** Without a published outboard the node
-//!    cannot open the local-outboard pull (`open_local_outboard_pull` returns
-//!    `Ok(None)`), so the request degrades to the buffered `populate_local`
+//!    cannot open the stream-while-store serve tier (no `{H}.obao4` to prove
+//!    the range), so the request degrades to the buffered `populate_local`
 //!    fallback: the fetch still succeeds and is byte-correct, but the
 //!    stream-path counter never moves.
 //! 3. **Corrupt-safe.** A tampered `{H}.obao4` (a flipped byte in the middle,
@@ -163,10 +163,10 @@ async fn run_streams() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test B — no outboard is published: `open_local_outboard_pull` declines
-/// (`Ok(None)`), so the request must degrade to the buffered
-/// `try_local_populate` fallback. The fetch still succeeds and is
-/// byte-correct, but the stream-path counter must stay at zero.
+/// Test B — no outboard is published: the stream-while-store serve tier
+/// declines (no `{H}.obao4` to prove the range), so the request must degrade
+/// to the buffered `try_local_populate` fallback. The fetch still succeeds and
+/// is byte-correct, but the stream-path counter must stay at zero.
 async fn run_no_outboard_fallback() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

@@ -26,7 +26,7 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::BytesMut;
-use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range};
+use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use decdn_cache::{CacheEngine, Hash, HttpOrigin, Origin};
 use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore, Voucher,
@@ -41,8 +41,8 @@ use decdn_protocol::{
 };
 use iroh::EndpointAddr;
 use iroh::endpoint::SendStream;
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{header, header_exists, method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
 use support::{
@@ -864,6 +864,697 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     );
 
     client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Parse an inclusive-end HTTP byte-range header (`bytes=START-END`, the shape
+/// `HttpOrigin::fetch_range` emits) into `(start, end_inclusive)`.
+fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
+    let (a, b) = h.strip_prefix("bytes=")?.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// A WHOLE-BLOB cold miss whose own origin publishes the `{H}.obao4` outboard is
+/// served through the Flow A own-origin two-leg path (`serve_via_backend_origin`,
+/// FA.3a): dispatch confirms serviceability (origin size + published outboard),
+/// signs `ok:true`, and runs the local pull leg (fill the cache from origin)
+/// beside the serve leg (stream the filling cache to the paying client). This
+/// asserts the dispatch selection reaches `serve_via_backend_origin` — the
+/// `decdn_local_outboard_serves_total` tier counter fires once — and that the
+/// client receives a coherent, hash-verifying whole-blob delivery. There is no
+/// upstream, channel, or payment on the ingest side; the client still pays the
+/// downstream vouchers exactly as any paid delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // The whole-blob request aligns to [0, blob_size); compute the ranged span the
+    // local pull leg will fetch with the same helper the engine uses.
+    let aligned = align_range(0, 0, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) sibling outboard GET: the dispatch serviceability outboard probe AND the
+    //     pull leg's range-encode outboard fetch (may be hit more than once).
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // (3) ranged data GET → 206 with the whole aligned span (the single full-miss
+    //     gap the local pull leg draws).
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span.clone()))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x51);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Whole blob: byte_offset == 0 && byte_len == 0 — the exact gate dispatch uses
+    // to route to the own-origin two-leg path.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "whole-blob own-origin delivery mismatch: got {} bytes, want {}",
+        got.len(),
+        blob.len()
+    );
+
+    // The own-origin serve-miss tier fired exactly once — proof dispatch selected
+    // `serve_via_backend_origin` rather than a fallback tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire once"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// INTERIOR-HOLD own-origin serve-miss (Flow A). The node already holds an aligned
+/// INTERIOR range of the blob before the whole-blob request arrives; the local pull
+/// leg must draw ONLY the surrounding gaps from origin (never the held interior),
+/// the serve leg's coherent whole-range encoder must seed the shared outboard from
+/// the held range's proof nodes (without that seed it would park on the held span's
+/// proof node and hang), and the paying client must still receive the whole blob
+/// byte-exact and in order.
+///
+/// This is the key new coverage: it proves the range-minimized pull + the
+/// shared-outboard held-range SEED (`window.rs` `outboard_pairs` pre-seed) both work
+/// together, which the full-miss FA.3a test cannot exercise (a full miss holds
+/// nothing, so the seed is a no-op and every byte is pulled).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // The held interior spans a middle band of chunk groups: [64 KiB, 128 KiB) is
+    // 16 KiB-group aligned, so admitting it verbatim leaves real gaps on both sides
+    // — a prefix [0, 64 KiB) and a suffix [128 KiB, 200 KiB).
+    let held_off = 64 * 1024u64;
+    let held_len = 64 * 1024u64;
+    let held_aligned = align_range(held_off, held_len, blob_size)?;
+    let (held_start, held_end) = (held_aligned.fetch_start(), held_aligned.fetch_end());
+    let held_data = blob
+        .get(usize::try_from(held_start)?..usize::try_from(held_end)?)
+        .ok_or_else(|| anyhow::anyhow!("held span out of bounds"))?
+        .to_vec();
+
+    let server = MockServer::start().await;
+    // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) sibling outboard GET: the dispatch serviceability probe AND the pull
+    //     leg's range-encode outboard fetch.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // (3) ranged data GET → a DYNAMIC 206 that serves exactly whatever inclusive
+    //     byte range the origin asks for, sliced out of the blob. Using a dynamic
+    //     responder (rather than one exact-range mock per gap) means the assertion,
+    //     not the mock's match arms, decides which spans are legitimate — a request
+    //     that touched the held interior would still be recorded, then caught below.
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x52);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    // Seed the INTERIOR range into the same cache the handler serves from (the
+    // engine handle is shared), so the pull leg's `missing_ranges(0, 0)` returns
+    // only the two surrounding gaps. Mirrors how the cache's own `admit_bao` tests
+    // seed a partial: `encode_verified_range` yields the combined wire `admit_bao`
+    // imports under `H`.
+    let held_bao = encode_verified_range(
+        *hash.as_bytes(),
+        &held_aligned,
+        &held_data,
+        bytes::Bytes::from(outboard.clone()),
+    )
+    .map_err(|e| anyhow::anyhow!("encode held range: {e:?}"))?;
+    cache
+        .admit_bao(hash, held_aligned.chunk_ranges().clone(), held_bao)
+        .await?;
+    anyhow::ensure!(
+        !cache.present_ranges(hash).await?.is_complete(),
+        "the seeded interior range must leave the blob a partial, not complete"
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "an interior partial must not read as a full holder"
+    );
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Whole blob (offset == 0 && len == 0) → the own-origin two-leg path.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    // 1) The client got the WHOLE blob, byte-exact and in order — the held interior
+    //    (read locally + seeded into the shared outboard) and the pulled gaps
+    //    reassembled into one coherent, hash-verifying stream.
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "interior-hold whole-blob delivery mismatch: got {} bytes, want {}",
+        got.len(),
+        blob.len()
+    );
+
+    // 2) The origin served the GAPS and NOT the held interior. Any ranged GET whose
+    //    inclusive span `[s, e]` overlaps the held `[held_start, held_end)` is a
+    //    re-pull of bytes the node already had — the range-minimization bug this
+    //    test exists to catch.
+    let held_overlap_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .is_some_and(|(s, e)| s < held_end && e >= held_start)
+    })
+    .await?;
+    anyhow::ensure!(
+        held_overlap_gets == 0,
+        "the origin must never re-fetch the held interior range, saw {held_overlap_gets} \
+         overlapping ranged GET(s)"
+    );
+
+    // The prefix gap [0, held_start) and the suffix gap [held_end, blob_size) were
+    // each drawn from origin — proof the gaps really were pulled (not silently
+    // skipped, which would also produce zero held-overlap GETs).
+    let prefix_gap_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .is_some_and(|(s, _e)| s < held_start)
+    })
+    .await?;
+    let suffix_gap_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .is_some_and(|(s, _e)| s >= held_end)
+    })
+    .await?;
+    anyhow::ensure!(
+        prefix_gap_gets >= 1,
+        "the prefix gap [0, {held_start}) must be pulled from origin"
+    );
+    anyhow::ensure!(
+        suffix_gap_gets >= 1,
+        "the suffix gap [{held_end}, {blob_size}) must be pulled from origin"
+    );
+
+    // 3) Dispatch selected the own-origin two-leg tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire once"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
+/// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size +
+/// published outboard both succeed) and signs `ok:true`, but the ranged data GET the
+/// local pull leg draws returns `500` — so `origin_encode_range` errors, the pull
+/// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
+/// terminal against its present-range watch and FAILS the gap it is waiting on. The
+/// client must see a delivery error / stream reset, never a clean whole blob.
+///
+/// The whole `ranged_paid_pull` is wrapped in a hard `timeout`, so a genuine hang
+/// (the failure this test guards against) surfaces as a test failure rather than a
+/// stuck run. This is the integration-level twin of FA.2's `run_local_pull_leg`
+/// unit no-hang proof: it shows the pull-leg terminal signal propagates all the way
+/// through `serve_leg` to the paying client.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    // (1) HEAD → size probe SUCCEEDS (serviceability).
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) outboard GET SUCCEEDS (serviceability): dispatch proves the blob is
+    //     serviceable and signs `ok:true`, committing to the two-leg serve.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    // (3) the ranged data GET the local pull leg draws FAILS with a 500. The pull
+    //     leg's `origin_encode_range` errors; this is a local-origin fault, so the
+    //     serve must terminate with an error rather than wait forever.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x53);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // A hang is the failure mode under test: bound the whole exchange so it becomes
+    // a test failure, not a stuck run.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        ranged_paid_pull(
+            &client_ep,
+            target,
+            client_node_id,
+            &client_eth,
+            channel_id,
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        ),
+    )
+    .await;
+
+    let inner = outcome.map_err(|_| {
+        anyhow::anyhow!(
+            "own-origin serve HUNG on an origin fetch error — no terminal signal reached the client"
+        )
+    })?;
+    anyhow::ensure!(
+        inner.is_err(),
+        "an origin fetch failure must fail the serve; the client must not receive a clean whole blob"
+    );
+
+    // The dispatch tier still fired (serviceability passed, `ok:true` was signed) —
+    // this is a mid-serve failure of the committed two-leg path, not a fallback.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must have been selected before the origin fault"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Spawn a server that handles each inbound connection on its OWN task, so two
+/// concurrent `cdn/client/v1` requests are served in parallel. The default
+/// `support::spawn_server` awaits `handler.accept` INLINE in its accept loop, so a
+/// long-running first serve blocks the loop and the second connection's `connect`
+/// times out — which also means the second request would never reach
+/// `open_tee_sink` while the first still holds the reservation, defeating the
+/// coalescing this test exercises. Mirrors `spawn_server_concurrent` in
+/// `node_origin_pull.rs`.
+fn spawn_server_concurrent(
+    server_ep: iroh::Endpoint,
+    handler: Arc<ClientHandler>,
+) -> tokio::task::JoinHandle<()> {
+    use iroh::protocol::ProtocolHandler;
+    tokio::spawn(async move {
+        while let Some(incoming) = server_ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                let _ = handler.accept(conn).await;
+            });
+        }
+    })
+}
+
+/// Build a `ClientHandler` over an `HttpOrigin` with TWO independently-funded
+/// channels (one per concurrent client) and a node→node pull-through deadline
+/// wired so the coalescing `await_coalesced_fill` (→ `try_pull_through` →
+/// `populate`) can WAIT on the in-flight entry rather than doing a bare presence
+/// check. Two channels (not one) so each of the two concurrent deliveries has its
+/// own monotonic voucher accounting; coalescing keys on the HASH, not the channel.
+#[allow(clippy::too_many_arguments)]
+async fn handler_two_channels_over_http_origin(
+    origin_uri: &str,
+    owner_channel: B256,
+    client_a: Address,
+    waiter_channel: B256,
+    client_b: Address,
+    server_eth: &Arc<PrivateKeySigner>,
+    server_id: iroh::PublicKey,
+    pull_through: Option<Duration>,
+) -> anyhow::Result<(
+    Arc<ClientHandler>,
+    CacheEngine,
+    Arc<Metrics>,
+    tempfile::TempDir,
+)> {
+    let store = Arc::new(MemoryChannelStateStore::new());
+    for (id, client) in [(owner_channel, client_a), (waiter_channel, client_b)] {
+        store.record(&ChannelState::new(
+            id,
+            client,
+            client,
+            TOKEN,
+            U256::from(10_000_000u64),
+        ))?;
+    }
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(origin_uri)?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store;
+    let handler = build_handler_full_configured(
+        server_id,
+        server_eth,
+        &metrics,
+        limiter,
+        cache.clone(),
+        store_dyn,
+        RATE_PER_MB,
+        &domains(),
+        0,
+        16,
+        |deps| deps.pull_through = pull_through,
+    )?;
+    Ok((handler, cache, metrics, cache_dir))
+}
+
+/// TWO concurrent whole-blob own-origin misses for the SAME hash COALESCE to a
+/// single local pull / single origin ranged GET (Flow A whole-blob double-pull
+/// guard). Without the guard each request would open its own
+/// `serve_via_backend_origin` and draw the blob from origin twice; with it, the
+/// first request claims the in-flight `open_tee_sink` slot (`TeeOpen::Owner`) and
+/// the second parks on `TeeOpen::InFlight` → `await_coalesced_fill`, then serves
+/// the now-present blob from the store. The proof is on the ORIGIN side: exactly
+/// ONE ranged `206` data GET reaches the backend (not two), the own-origin serve
+/// tier fires ONCE (only the owner runs `serve_via_backend_origin`), and BOTH
+/// clients receive the whole blob byte-exact.
+///
+/// The race is forced deterministically: the origin's ranged data GET is delayed,
+/// so the first request holds the reservation across a wide window; the second is
+/// launched after a short stagger, guaranteeing it observes `InFlight`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let aligned = align_range(0, 0, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    // HEAD → canonical blob size (the dispatch serviceability size probe).
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // sibling outboard GET (serviceability probe + the pull leg's range-encode
+    // outboard fetch).
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // The ranged data GET — DELAYED so the owning request holds the in-flight
+    // reservation across a wide window while the second request parks on
+    // `TeeOpen::InFlight`. If the guard is absent, BOTH requests reach here and
+    // this mock records TWO matching GETs; the assertion below then fails.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .set_body_bytes(span.clone())
+                .set_delay(Duration::from_millis(1_200)),
+        )
+        .mount(&server)
+        .await;
+
+    // Two clients, two independently-funded channels: coalescing keys on the hash,
+    // and separate channels keep each delivery's vouchers monotonic.
+    let owner_channel = B256::repeat_byte(0x61);
+    let waiter_channel = B256::repeat_byte(0x62);
+    let owner_eth = Arc::new(PrivateKeySigner::random());
+    let waiter_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    // A generous pull-through deadline so the coalesced waiter WAITS on the
+    // in-flight entry (populate) instead of a bare presence check.
+    let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
+        &server.uri(),
+        owner_channel,
+        owner_eth.address(),
+        waiter_channel,
+        waiter_eth.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(10)),
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server_concurrent(server_ep.clone(), handler);
+
+    let owner_sk = fresh_key();
+    let owner_node_id = B256::from(*owner_sk.public().as_bytes());
+    let (owner_ep, _) = local_endpoint(owner_sk, vec![]).await?;
+    let waiter_sk = fresh_key();
+    let waiter_node_id = B256::from(*waiter_sk.public().as_bytes());
+    let (waiter_ep, _) = local_endpoint(waiter_sk, vec![]).await?;
+    let owner_target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let waiter_target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Request A (the owner) is launched first and, after a short stagger, request B
+    // — by then A holds the reservation and is blocked on the delayed origin GET, so
+    // B is guaranteed to observe `TeeOpen::InFlight`.
+    let owner_hash = hash;
+    let a = tokio::spawn(async move {
+        ranged_paid_pull(
+            &owner_ep,
+            owner_target,
+            owner_node_id,
+            &owner_eth,
+            owner_channel,
+            owner_hash,
+            0,
+            0,
+            RATE_PER_MB,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let got_waiter = ranged_paid_pull(
+        &waiter_ep,
+        waiter_target,
+        waiter_node_id,
+        &waiter_eth,
+        waiter_channel,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+    let got_owner = a.await??;
+
+    // Both clients received the whole blob, byte-exact.
+    anyhow::ensure!(
+        got_owner.as_slice() == blob.as_slice(),
+        "owner delivery mismatch: got {} bytes, want {}",
+        got_owner.len(),
+        blob.len()
+    );
+    anyhow::ensure!(
+        got_waiter.as_slice() == blob.as_slice(),
+        "coalesced delivery mismatch: got {} bytes, want {}",
+        got_waiter.len(),
+        blob.len()
+    );
+
+    // The coalescing proof: the origin served the whole-blob gap exactly ONCE. A
+    // second, non-coalesced own-origin pull would draw the same ranged span again.
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v == range_val)
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets == 1,
+        "expected exactly ONE origin ranged GET (coalesced), saw {ranged_gets}"
+    );
+
+    // Only the owner ran `serve_via_backend_origin`; the coalesced request served
+    // from the store via `await_coalesced_fill`, so the tier counter fires ONCE.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire exactly once (owner only)"
+    );
+
+    // The blob is fully present after both deliveries.
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "blob must be present after coalesced serve"
+    );
+
     server_ep.close().await;
     server_task.await?;
     Ok(())

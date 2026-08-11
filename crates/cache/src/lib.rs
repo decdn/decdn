@@ -4,10 +4,9 @@
 //! points ([`engine::CacheEngine::get`] / `populate`) fetch from a configured
 //! [`Origin`] backend on a cache miss, verify the BLAKE3 hash, and insert the
 //! bytes before returning them to the caller. The streaming entry points do
-//! not buffer whole-blob first: [`engine::CacheEngine::open_local_outboard_pull`]
-//! (#1130) streams origin bytes through a bao encoder while teeing them into
-//! the store, and [`engine::CacheEngine::pull_through_range`] (#823) pulls only
-//! a verified sub-range. Node-to-node pull-through is one such backend — the
+//! not buffer whole-blob first: [`engine::CacheEngine::pull_through_range`]
+//! (#823) pulls only a verified sub-range. Node-to-node pull-through is one
+//! such backend — the
 //! `node` crate supplies an [`Origin`] (`NodeOrigin`, #831) that pays a peer
 //! over `cdn/client/v1` — so this crate needs no knowledge of the paid path.
 //!
@@ -18,7 +17,6 @@
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
-pub mod local_outboard_pull;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
@@ -40,7 +38,7 @@ pub use circuit_breaker::{
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
     CacheEngine, EvictionCandidates, EvictionPreview, PresentRanges, RangePullOutcome, TeeOpen,
-    TeeReservation, TeeSink,
+    TeeReservation,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
@@ -51,7 +49,6 @@ pub use error::{CacheError, CacheResult, OriginError, OriginPullError, Supported
 /// [`decdn_config_types::Hash`]; [`to_store_hash`]/[`from_store_hash`]
 /// convert between the two (both are the same 32 bytes — issue #578).
 pub use iroh_blobs::Hash;
-pub use local_outboard_pull::{LocalOutboardHeader, LocalOutboardPull};
 pub use metrics::CacheMetrics;
 pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,

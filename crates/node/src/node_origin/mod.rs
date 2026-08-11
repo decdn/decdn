@@ -42,6 +42,7 @@
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
 mod admit_store;
+mod backend_source;
 mod funder;
 mod pull_leg;
 mod resume;
@@ -49,9 +50,12 @@ mod serve_outboard;
 
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use admit_store::NodeAdmitStore;
+#[allow(unused_imports, reason = "wired by FA.2/FA.3 orchestration")]
+pub(crate) use backend_source::BackendSource;
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use funder::NodeFunder;
-pub(crate) use pull_leg::run_pull_leg;
+#[allow(unused_imports, reason = "wired by FA.3a orchestration")]
+pub(crate) use pull_leg::{run_local_pull_leg, run_pull_leg};
 pub(crate) use serve_outboard::{OutboardReader, shared_outboard};
 
 use std::collections::HashMap;
