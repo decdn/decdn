@@ -44,7 +44,7 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-17 | Relay connection metadata | iroh relays see source/destination IP pairs and connection timing for relayed connections | T3 | [architecture.md](architecture.md#architecture-overview) § Trust Assumptions |
 | P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
 | P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
-| P-22 | On-chain settlement volume leakage | Cumulative amount and byte count at `redeem` reveal per-lane delivery volume; per-lane nonce spacing reveals session granularity | T1 | [003](003-payments.md#adr-003-payment-model) § Redemption and Close |
+| P-22 | On-chain settlement volume leakage | Cumulative amount and byte count at `redeem` reveal per-lane delivery volume; their spacing across redemptions reveals session granularity | T1 | [003](003-payments.md#adr-003-payment-model) § Redemption and Close |
 | P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on `ProbeResponse` with `has_blob: true` constitutes non-repudiable cryptographic proof that the node held specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) § slash_sig |
 
 ### Analysis by Adversary Tier
@@ -63,7 +63,7 @@ On-chain data links a pool owner to the provider addresses it pays, revealed at 
 
 ##### Settlement volume leakage (P-22)
 
-At each on-chain redemption the lane's cumulative amount and byte count are public. Vouchers issued per MB (default cadence), so the per-lane nonce reveals the count of MB-sized increments. Combined with P-02 (signer/provider address linkage) and public rate information, an observer computes the exact volume between a specific signer-provider pair. Inherent to on-chain settlement — redemption amounts must be public.
+At each on-chain redemption the lane's cumulative amount and byte count are public. Vouchers issued per MB (default cadence), so the cumulative amount reveals the count of MB-sized increments. Combined with P-02 (signer/provider address linkage) and public rate information, an observer computes the exact volume between a specific signer-provider pair. Inherent to on-chain settlement — redemption amounts must be public.
 
 ##### Protocol fingerprinting (P-04)
 

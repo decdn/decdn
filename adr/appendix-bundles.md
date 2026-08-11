@@ -158,7 +158,7 @@ as `decdn fetch`):
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
 - **Concurrency** is bounded by `--jobs` (over distinct blobs). A payment pool's vouchers
-  use a strictly increasing nonce, so fetches that share one provider's
+  use a strictly increasing cumulative amount, so fetches that share one provider's
   lane are serialized by a per-provider lock (which also makes the
   lazy open-or-reuse first-touch race-free); distinct providers proceed
   in parallel.
