@@ -127,6 +127,8 @@ The threshold `t` is a **gas knob**, not a security parameter: a larger `t` mean
 
 **`M` is node policy, not a contract field.** The contract holds the deposit and pays `min(desired, remaining)` regardless; nodes enforce `M` by watching the on-chain remaining balance (`deposit − totalRedeemed`) and refusing to serve past it. A pool MAY declare its expected fan-out as an off-chain hint so the nodes serving it size `M` consistently.
 
+**No per-node rate ramp — a fresh wallet serves at full speed.** Because the security bound is the reserved floor `M`, not a per-relationship earned window, a node does **not** throttle a brand-new pool: it serves at full link speed from the first byte, for as much volume as the deposit funds above `M`. Trust affects only redemption *cadence* (`t`, a gas concern), never delivery rate. The one thing an unproven pool cannot do is fan out *wide* at full speed all at once — that is the fan-out residual below, clamped by rate anomaly rather than by slowing any single stream. This is the cold-start improvement over a dynamic per-relationship window, which throttled every fresh `(node, pool)` pair until it earned history.
+
 **Residuals (honest):**
 
 - **Fan-out.** `M` gives a zero tail only up to fan-out `N = M/t`; a wider spread exceeds the reserve and the tail (and racing) return. Bounded by **rate-anomaly clamping** — a node refuses to serve a fresh pool whose spread implies aggregate bandwidth past `B`. It is not driven to zero by `M` alone.
