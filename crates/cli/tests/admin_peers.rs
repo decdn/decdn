@@ -1067,6 +1067,11 @@ async fn cli_drain_wait_treats_econnrefused_as_complete() -> anyhow::Result<()> 
                 "node_id": "00".repeat(32),
                 "uptime_s": 1,
                 "in_flight_streams": 1,
+                // `binding` carries no `serde(default)` (pre-deployment, so no
+                // compatibility shims — see CLAUDE.md), which makes this stub a
+                // real check that the DTO and its producers stay in step.
+                "binding": "unknown",
+                "bound_node_id": null,
             }))
         }
     })?;

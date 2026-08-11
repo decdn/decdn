@@ -21,7 +21,7 @@ use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash, Origin};
-use decdn_common::admin::AdminRpcClient;
+use decdn_common::admin::{AdminRpcClient, BindingStatus};
 use decdn_common::identity;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
@@ -112,9 +112,52 @@ impl NodeFixture {
     }
 
     /// The node's iroh identity (its `NodeId`), for clients to dial.
+    ///
+    /// **Frozen at launch.** A journey that rotates the node key (#1034) must
+    /// use [`Self::current_node_id`] afterwards — this returns the identity the
+    /// fixture onboarded, which is exactly the *retired* id post-rotation. That
+    /// is useful on its own (it is what a stale-id assertion dials), but it is
+    /// not what the daemon is serving under.
     #[must_use]
     pub const fn node_id(&self) -> iroh::PublicKey {
         self.node_id
+    }
+
+    /// The identity the daemon is serving under **right now**, read from
+    /// `admin_v1_health`.
+    ///
+    /// Asking the daemon rather than re-reading `node.secret` is the point: a
+    /// rotation is only real once the running process is using the new key, and
+    /// a file read would report the new key while the old process still holds
+    /// the old one in memory.
+    pub async fn current_node_id(&self) -> anyhow::Result<iroh::PublicKey> {
+        let health = self
+            .admin_client()?
+            .health()
+            .await
+            .context("admin_v1_health")?;
+        let bytes: [u8; 32] = alloy::primitives::hex::decode(&health.node_id)
+            .context("decode health node_id hex")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("health node_id is not 32 bytes: {}", health.node_id))?;
+        iroh::PublicKey::from_bytes(&bytes).with_context(|| {
+            format!(
+                "health node_id is not a valid ed25519 key: {}",
+                health.node_id
+            )
+        })
+    }
+
+    /// The daemon's bring-up verdict on whether its local key is the one bound
+    /// on-chain (#1034) — the signal that distinguishes a rotated node from an
+    /// unslashable one.
+    pub async fn binding_status(&self) -> anyhow::Result<BindingStatus> {
+        Ok(self
+            .admin_client()?
+            .health()
+            .await
+            .context("admin_v1_health")?
+            .binding)
     }
 
     /// QUIC bind port (loopback) the client dials.

@@ -732,6 +732,11 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
+    /// Bring-up node-id binding self-check (#1034), carried through to
+    /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
+    /// handle: the binding only moves by an explicit operator transaction, so
+    /// there is nothing live to keep.
+    binding_report: crate::binding_check::BindingReport,
 }
 
 /// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
@@ -1035,6 +1040,21 @@ async fn build_chain_and_handlers(
             "seeded live delivery-rate floor from on-chain getRateBounds()"
         );
     }
+
+    // Bring-up self-check: is the key we are about to serve under the one bound
+    // to this operator on-chain? A node that answers "no" is UNSLASHABLE
+    // (`SlashJudge` resolves the accused through `nodeIdOf`), and nothing else
+    // in the runtime would notice — so the check is here rather than left to an
+    // operator to think of. Advisory: it never blocks startup, because a daemon
+    // that refused to boot on a transient RPC failure could not be used to run
+    // the rotation that repairs the binding. See `crate::binding_check`.
+    let binding_report = crate::binding_check::check(
+        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        capacity_bond_addr,
+        infra.eth_signer.address(),
+        *infra.secret_key.public().as_bytes(),
+    )
+    .await;
 
     let voucher_domain =
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
@@ -1351,6 +1371,7 @@ async fn build_chain_and_handlers(
         blacklist_watcher,
         blacklist_ready_rx,
         rate_bounds_watcher,
+        binding_report,
     })
 }
 
@@ -2075,7 +2096,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {
             store: Arc::clone(&ch.slash_store),
-        });
+        })
+        // Bring-up node-id binding check (#1034), already logged during
+        // `build_chain_and_handlers`. Surfacing it here too is what lets an
+        // operator (or the G-NODE-07 journey) detect the unslashable state
+        // without scraping the daemon's log for a WARN line.
+        .with_binding(ch.binding_report);
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");

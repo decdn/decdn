@@ -19,9 +19,9 @@ use decdn_client_pull::discovery::{self, NodeCandidate, SELECT_K, select_candida
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, ChannelSnapshot, ChannelsResponse, DrainRequest,
-    DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView, PeersResponse,
-    RegionStatsResponse, ReloadResponse, StatusResponse,
+    AdminRpcClient, AnnounceResponse, BindingStatus, ChannelSnapshot, ChannelsResponse,
+    DrainRequest, DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView,
+    PeersResponse, RegionStatsResponse, ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -74,6 +74,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Bond(b) => crate::commands::bond::run(b, global_config).await,
         cli::NodeCommand::Unbond(u) => crate::commands::unbond::run(u, global_config).await,
         cli::NodeCommand::Deregister(d) => crate::commands::deregister::run(d, global_config).await,
+        cli::NodeCommand::RotateKey(r) => crate::commands::rotate_key::run(r, global_config).await,
         cli::NodeCommand::Lookup(l) => lookup(l, global_config).await,
     }
 }
@@ -106,13 +107,42 @@ pub async fn health(args: &cli::HealthArgs, global_config: Option<&Path>) -> any
             serde_json::to_string_pretty(&resp).context("failed to encode health as JSON")?;
         println!("{pretty}");
     } else {
-        // Two stable, grep-friendly lines so `decdn node health | grep
-        // node_id=` works in operator scripts without `--json`.
-        println!("node_id={}", resp.node_id);
-        println!("uptime_s={}", resp.uptime_s);
+        // Stable, grep-friendly lines so `decdn node health | grep node_id=`
+        // works in operator scripts without `--json`.
+        let mut out = io::stdout().lock();
+        write_health(&mut out, &resp).context("failed to write health output")?;
     }
 
     Ok(())
+}
+
+/// Render `admin_v1_health` as `key=value` lines. Pure (`&mut impl Write`) so
+/// the shape — in particular the binding lines, which an operator script keys
+/// on — is unit-testable without a running node.
+fn write_health(w: &mut impl io::Write, resp: &HealthResponse) -> io::Result<()> {
+    writeln!(w, "node_id={}", resp.node_id)?;
+    writeln!(w, "uptime_s={}", resp.uptime_s)?;
+    // Always printed, including `unknown`. An absent line would read as "fine"
+    // to a script grepping for a problem, and `unknown` means the opposite:
+    // the node's slashability was never verified (#1034).
+    writeln!(w, "binding={}", binding_label(resp.binding))?;
+    // Only meaningful when there IS a binding; on a mismatch this names the
+    // key to restore, which is the whole reason the field is carried.
+    if let Some(bound) = &resp.bound_node_id {
+        writeln!(w, "bound_node_id={bound}")?;
+    }
+    Ok(())
+}
+
+/// Wire spelling of [`BindingStatus`], matching its `snake_case` serde
+/// representation so the plain and `--json` renderings agree.
+const fn binding_label(status: BindingStatus) -> &'static str {
+    match status {
+        BindingStatus::Bound => "bound",
+        BindingStatus::Mismatch => "mismatch",
+        BindingStatus::Unbound => "unbound",
+        BindingStatus::Unknown => "unknown",
+    }
 }
 
 /// `decdn node evict`: call `admin_v1_evict` on the running node to
@@ -1422,6 +1452,77 @@ impl From<&LookupRow> for LookupJson {
 )]
 mod tests {
     use super::*;
+
+    fn health_response(binding: BindingStatus, bound: Option<&str>) -> HealthResponse {
+        HealthResponse {
+            node_id: "aa".repeat(32),
+            uptime_s: 42,
+            in_flight_streams: 0,
+            binding,
+            bound_node_id: bound.map(str::to_string),
+        }
+    }
+
+    fn health_lines(resp: &HealthResponse) -> String {
+        let mut buf = Vec::new();
+        write_health(&mut buf, resp).expect("write to a Vec cannot fail");
+        String::from_utf8(buf).expect("output is ASCII")
+    }
+
+    /// The pre-#1034 two-line contract still holds — operator scripts grep
+    /// these — and the binding line is additive.
+    #[test]
+    fn health_keeps_node_id_and_uptime_lines() {
+        let s = health_lines(&health_response(
+            BindingStatus::Bound,
+            Some(&"aa".repeat(32)),
+        ));
+        assert!(s.contains(&format!("node_id={}", "aa".repeat(32))), "{s}");
+        assert!(s.contains("uptime_s=42"), "{s}");
+    }
+
+    /// A mismatch is the unslashable state, and the bound id is what the
+    /// operator needs to act on it — printing the status without the id would
+    /// report a problem and withhold the fix.
+    #[test]
+    fn health_names_the_bound_id_on_a_mismatch() {
+        let bound = "bb".repeat(32);
+        let s = health_lines(&health_response(BindingStatus::Mismatch, Some(&bound)));
+        assert!(s.contains("binding=mismatch"), "{s}");
+        assert!(s.contains(&format!("bound_node_id={bound}")), "{s}");
+    }
+
+    /// `unknown` must print. Omitting the line for the not-checked case would
+    /// let a script that greps for `binding=mismatch` read "we never checked"
+    /// as "all clear" — the exact conflation the status enum exists to stop.
+    #[test]
+    fn health_prints_unknown_rather_than_omitting_the_line() {
+        let s = health_lines(&health_response(BindingStatus::Unknown, None));
+        assert!(s.contains("binding=unknown"), "{s}");
+        assert!(
+            !s.contains("bound_node_id="),
+            "there is no bound id to name: {s}"
+        );
+    }
+
+    /// The plain and `--json` renderings must spell the status the same way,
+    /// or an operator switching between them sees two vocabularies.
+    #[test]
+    fn binding_label_matches_the_serde_spelling() {
+        for status in [
+            BindingStatus::Bound,
+            BindingStatus::Mismatch,
+            BindingStatus::Unbound,
+            BindingStatus::Unknown,
+        ] {
+            let json = serde_json::to_string(&status).expect("status serializes");
+            assert_eq!(
+                json.trim_matches('"'),
+                binding_label(status),
+                "plain and JSON renderings disagree for {status:?}"
+            );
+        }
+    }
 
     /// `emit_drain_complete` JSON shape, polled-to-zero branch:
     /// `admin_closed=false`. Asserts the exact JSON object so

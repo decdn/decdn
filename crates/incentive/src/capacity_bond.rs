@@ -73,6 +73,29 @@ mod sol_types {
             /// `bytes32(0)` if the operator has no binding.
             function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
+            /// Raw `nodeId → operator` binding. `address(0)` when the nodeId is
+            /// unbound. Read by `decdn node rotate-key` to pre-check the
+            /// `NodeIdAlreadyBound` revert before spending gas — `nodeIdOf`
+            /// answers the opposite direction and cannot see a collision with a
+            /// *different* operator's binding.
+            function nodeIdToAddress(bytes32 nodeId) external view returns (address);
+
+            /// Raw `operator → nodeId` binding, the mapping slashability keys
+            /// on: `SlashJudge._checkRegistered` reads it through `nodeIdOf` and
+            /// deliberately ignores `active`, so a bound-but-deregistered
+            /// operator stays slashable (ADR 014). `bindNodeId` swaps it
+            /// atomically, which is why key rotation opens no un-slashable
+            /// window. `bytes32(0)` when the operator has no binding.
+            function addressToNodeId(address operator) external view returns (bytes32);
+
+            /// Unix timestamp of the operator's first bond, or `0` if never
+            /// bonded. Write-once — never cleared by `deregisterNode`,
+            /// auto-ejection, or `bindNodeId`. Read by `decdn node rotate-key`
+            /// to report the `age_ramp` anchor an Ethereum-key rotation
+            /// destroys and an iroh-key rotation preserves (ADR 026
+            /// § Governance).
+            function firstBondedAt(address operator) external view returns (uint64);
+
             /// On-chain escrow record for one slash (ADR 028 escrow-on-slash).
             /// Field order is ABI-significant — it mirrors `SlashEscrowLib`'s
             /// struct exactly, and a reordering here silently mis-decodes.
@@ -282,6 +305,29 @@ mod sol_types {
             /// the caller is currently registered.
             function deregisterNode() external;
 
+            /// Rebind the caller's operator address to `nodeId` — the iroh
+            /// node-key rotation path (`appendix-operator-key-rotation.md`
+            /// § iroh node-key rotation only), wrapped by `decdn node
+            /// rotate-key --key iroh`.
+            ///
+            /// Atomically deletes the old `nodeId → address` mapping (bumping
+            /// its `registrationNonce`) and writes the new one, so the operator
+            /// is never un-slashable mid-rotation. The bond, `declaredMbps`,
+            /// `firstBondedAt`, and every open payment channel survive
+            /// untouched — all of them key on the Ethereum address, which does
+            /// not change.
+            ///
+            /// `bindingSignature` covers `BindNodeId(nodeId,
+            /// bindingNonce[msg.sender])` — the terms-free typehash, NOT
+            /// `RegisterNode`: rebinding does not re-accept operator terms
+            /// (ADR 019 § enforcement at registration only). `ed25519Signature`
+            /// is the **new** node key's proof over
+            /// `node_register::ownership_message_digest`. Reverts
+            /// `NodeIdAlreadyBound` if a different operator holds `nodeId`,
+            /// `ZeroNodeId` on an all-zero id, and `InvalidBindingSignature` /
+            /// `InvalidEd25519Signature` on a mis-built digest.
+            function bindNodeId(bytes32 nodeId, bytes bindingSignature, bytes ed25519Signature) external;
+
             // -----------------------------------------------------------------
             // Events that mutate active-set membership
             // -----------------------------------------------------------------
@@ -298,6 +344,13 @@ mod sol_types {
 
             /// Node deactivated via `deregisterNode`. `nodeId`-indexed.
             event NodeDeregistered(bytes32 indexed nodeId);
+
+            /// A `nodeId ↔ operator` binding was written, by either
+            /// `registerNode` or `bindNodeId`. The confirmation
+            /// `decdn node rotate-key` looks for in the bind receipt.
+            /// `bindingNonce` is the nonce the accepted signature consumed, not
+            /// the post-increment value.
+            event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId, uint64 bindingNonce);
 
             /// Node deactivated by `slash` or `ejectNode` dropping
             /// bond below `minBond / 2`. `nodeId`-indexed.

@@ -589,9 +589,11 @@ impl ClientFixture {
             &bind_domain,
         )?);
         let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-        let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
-        ));
+        // Pinned into the session at open time, at the identity the daemon is
+        // serving under now. A session deliberately keeps that pin: its channel
+        // and voucher watermark belong to this connection, so it must not
+        // silently follow the node onto a new identity mid-life.
+        let target = Self::target(node).await?;
 
         Ok(ChannelSession {
             ctx,
@@ -630,13 +632,49 @@ impl ClientFixture {
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
         let (resp, _rtt) = decdn_client_pull::probe::probe_once(
             &self.endpoint,
-            Self::target(node),
+            Self::target(node).await?,
             *hash.as_bytes(),
             timestamp_us,
             Duration::from_secs(10),
         )
         .await
         .context("probe daemon")?;
+        Ok(resp)
+    }
+
+    /// Probe an **explicit** iroh identity at a loopback port, rather than
+    /// whichever id a [`NodeFixture`] recorded at launch (#1034).
+    ///
+    /// The key-rotation journey needs both directions of this: the retired id
+    /// must stop answering, and the new one must start. Neither is expressible
+    /// through [`Self::probe`], which dials `NodeFixture::node_id()` — a value
+    /// frozen at launch, and therefore the *old* id after a rotation.
+    ///
+    /// A failure here is a genuine "that identity is not reachable at this
+    /// socket": iroh authenticates the peer's public key during the QUIC
+    /// handshake, so dialing a retired id against the same address does not
+    /// silently connect to whoever is listening — it fails to establish.
+    pub async fn probe_node_id(
+        &self,
+        node_id: iroh::PublicKey,
+        port: u16,
+        hash: Hash,
+    ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
+        let target = EndpointAddr::new(node_id)
+            .with_ip_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
+        let (resp, _rtt) = decdn_client_pull::probe::probe_once(
+            &self.endpoint,
+            target,
+            *hash.as_bytes(),
+            TIMESTAMP_US,
+            // Shorter than `probe_at`'s 10s on purpose: the interesting call is
+            // the one that must NOT connect, and a retired id fails by timing
+            // out on a handshake nobody answers. Ten seconds of that per
+            // assertion is dead wall-clock.
+            Duration::from_secs(5),
+        )
+        .await
+        .context("probe explicit node id")?;
         Ok(resp)
     }
 
@@ -674,7 +712,7 @@ impl ClientFixture {
         let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
         let err = match stream_fetch_tracked(
             &self.endpoint,
-            Self::target(node),
+            Self::target(node).await?,
             &ctx,
             &slash_domain,
             node.operator_addr(),
@@ -723,12 +761,23 @@ impl ClientFixture {
         })
     }
 
-    /// The loopback dial target for `node`.
-    fn target(node: &NodeFixture) -> EndpointAddr {
-        EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            node.bind_port(),
-        )))
+    /// The loopback dial target for `node`, at the identity it is serving under
+    /// **right now**.
+    ///
+    /// Async because it asks the daemon (`admin_v1_health`) rather than reading
+    /// `NodeFixture::node_id()`, which is frozen at launch and therefore names
+    /// the retired key after a rotation (#1034). Every dial in this fixture goes
+    /// through here, so a rotation journey does not have to special-case the
+    /// paid path — and no other journey can quietly start dialing a stale id.
+    ///
+    /// The extra admin round trip is paid once per channel open or probe, all of
+    /// which already require a live daemon.
+    async fn target(node: &NodeFixture) -> anyhow::Result<EndpointAddr> {
+        Ok(
+            EndpointAddr::new(node.current_node_id().await?).with_ip_addr(SocketAddr::V4(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
+            )),
+        )
     }
 
     /// A [`ChannelContext`] bound to an existing `channel_id`, at a zero voucher

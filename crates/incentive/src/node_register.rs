@@ -12,9 +12,11 @@
 //! - [`pack_multiaddrs`] builds the on-chain `multiaddrs` `bytes` field:
 //!   a sequence of `(uint16 length, bytes data)` entries (ADR 019 §
 //!   Multiaddr encoding). The length prefix is big-endian, matching the
-//!   `uint16` reading of the ADR. No Rust reader consumes this field yet
-//!   (nodes learn addresses via gossip / iroh discovery), so the ADR is
-//!   the only authority for the format.
+//!   `uint16` reading of the ADR. Nodes learn addresses via gossip / iroh
+//!   discovery rather than from this field, so the ADR — not a consumer —
+//!   is the authority for the format. [`unpack_multiaddrs`] is its inverse,
+//!   read back only by `decdn node rotate-key --key eth` when it re-registers
+//!   an operator's existing addresses from a new Ethereum address.
 //!
 //! The EIP-712 `BindNodeId` half of registration lives in [`crate::bind_sig`]
 //! and is reused as-is — `binding_signing_hash` produces the digest the
@@ -73,6 +75,53 @@ pub fn pack_multiaddrs(addrs: &[String]) -> anyhow::Result<Vec<u8>> {
         })?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+/// Inverse of [`pack_multiaddrs`]: decode the on-chain `multiaddrs` `bytes`
+/// field back into the strings that produced it.
+///
+/// Needed by `decdn node rotate-key --key eth`, which re-registers an operator's
+/// existing multiaddrs from a new Ethereum address. Without this the migration
+/// would either silently drop them — leaving the node reachable only through
+/// relay/gossip discovery — or force the operator to retype a set the chain
+/// already holds.
+///
+/// # Errors
+///
+/// Returns an error if the buffer is truncated (a length prefix with no body,
+/// or a trailing odd byte) or if an entry is not UTF-8. Both mean the field was
+/// not produced by [`pack_multiaddrs`], and guessing at a repair would put an
+/// address the operator never registered back on-chain.
+pub fn unpack_multiaddrs(packed: &[u8]) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut rest = packed;
+    while !rest.is_empty() {
+        let (prefix, body) = rest.split_at_checked(2).ok_or_else(|| {
+            anyhow::anyhow!(
+                "truncated multiaddr length prefix ({} byte(s) left)",
+                rest.len()
+            )
+        })?;
+        // `split_at_checked` guarantees exactly 2 bytes, so the array conversion
+        // cannot fail; `get`/`try_into` keeps it out of the indexing lint.
+        let len =
+            usize::from(u16::from_be_bytes(prefix.try_into().map_err(|_| {
+                anyhow::anyhow!("multiaddr length prefix is not 2 bytes")
+            })?));
+        let (entry, tail) = body.split_at_checked(len).ok_or_else(|| {
+            anyhow::anyhow!(
+                "multiaddr entry claims {len} bytes but only {} remain",
+                body.len()
+            )
+        })?;
+        out.push(
+            std::str::from_utf8(entry)
+                .map_err(|e| anyhow::anyhow!("multiaddr entry is not UTF-8: {e}"))?
+                .to_string(),
+        );
+        rest = tail;
     }
     Ok(out)
 }
@@ -146,6 +195,37 @@ mod tests {
     #[test]
     fn pack_multiaddrs_empty_is_empty() {
         assert!(pack_multiaddrs(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpack_multiaddrs_round_trips() {
+        let addrs = vec![
+            "/ip4/203.0.113.10/udp/4433/quic-v1".to_string(),
+            "/ip6/2001:db8::1/udp/4433/quic-v1".to_string(),
+        ];
+        let packed = pack_multiaddrs(&addrs).unwrap();
+        assert_eq!(unpack_multiaddrs(&packed).unwrap(), addrs);
+    }
+
+    #[test]
+    fn unpack_multiaddrs_empty_is_empty() {
+        assert!(unpack_multiaddrs(&[]).unwrap().is_empty());
+    }
+
+    /// A truncated field must error rather than yield a short list: the eth
+    /// rotation path re-registers whatever this returns, so a silent drop would
+    /// put a node back on-chain missing an address it had.
+    #[test]
+    fn unpack_multiaddrs_rejects_truncation() {
+        // Length prefix with no body at all.
+        assert!(unpack_multiaddrs(&[0x00]).is_err());
+        // Prefix claims 4 bytes, only 2 follow.
+        assert!(unpack_multiaddrs(&[0x00, 0x04, b'a', b'b']).is_err());
+    }
+
+    #[test]
+    fn unpack_multiaddrs_rejects_non_utf8() {
+        assert!(unpack_multiaddrs(&[0x00, 0x01, 0xFF]).is_err());
     }
 
     #[test]
