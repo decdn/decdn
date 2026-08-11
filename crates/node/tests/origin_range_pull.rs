@@ -26,7 +26,7 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::BytesMut;
-use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range};
+use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use decdn_cache::{CacheEngine, Hash, HttpOrigin, Origin};
 use decdn_incentive::{
     ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore, Voucher,
@@ -41,8 +41,8 @@ use decdn_protocol::{
 };
 use iroh::EndpointAddr;
 use iroh::endpoint::SendStream;
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{header, header_exists, method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod support;
 use support::{
@@ -869,6 +869,13 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Parse an inclusive-end HTTP byte-range header (`bytes=START-END`, the shape
+/// `HttpOrigin::fetch_range` emits) into `(start, end_inclusive)`.
+fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
+    let (a, b) = h.strip_prefix("bytes=")?.split_once('-')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
 /// A WHOLE-BLOB cold miss whose own origin publishes the `{H}.obao4` outboard is
 /// served through the Flow A own-origin two-leg path (`serve_via_backend_origin`,
 /// FA.3a): dispatch confirms serviceability (origin size + published outboard),
@@ -970,6 +977,322 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     anyhow::ensure!(
         counter_value(&metrics, "local_outboard_serves_total")? == 1,
         "the own-origin two-leg serve tier must fire once"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// INTERIOR-HOLD own-origin serve-miss (Flow A). The node already holds an aligned
+/// INTERIOR range of the blob before the whole-blob request arrives; the local pull
+/// leg must draw ONLY the surrounding gaps from origin (never the held interior),
+/// the serve leg's coherent whole-range encoder must seed the shared outboard from
+/// the held range's proof nodes (without that seed it would park on the held span's
+/// proof node and hang), and the paying client must still receive the whole blob
+/// byte-exact and in order.
+///
+/// This is the key new coverage: it proves the range-minimized pull + the
+/// shared-outboard held-range SEED (`window.rs` `outboard_pairs` pre-seed) both work
+/// together, which the full-miss FA.3a test cannot exercise (a full miss holds
+/// nothing, so the seed is a no-op and every byte is pulled).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // The held interior spans a middle band of chunk groups: [64 KiB, 128 KiB) is
+    // 16 KiB-group aligned, so admitting it verbatim leaves real gaps on both sides
+    // — a prefix [0, 64 KiB) and a suffix [128 KiB, 200 KiB).
+    let held_off = 64 * 1024u64;
+    let held_len = 64 * 1024u64;
+    let held_aligned = align_range(held_off, held_len, blob_size)?;
+    let (held_start, held_end) = (held_aligned.fetch_start(), held_aligned.fetch_end());
+    let held_data = blob
+        .get(usize::try_from(held_start)?..usize::try_from(held_end)?)
+        .ok_or_else(|| anyhow::anyhow!("held span out of bounds"))?
+        .to_vec();
+
+    let server = MockServer::start().await;
+    // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) sibling outboard GET: the dispatch serviceability probe AND the pull
+    //     leg's range-encode outboard fetch.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // (3) ranged data GET → a DYNAMIC 206 that serves exactly whatever inclusive
+    //     byte range the origin asks for, sliced out of the blob. Using a dynamic
+    //     responder (rather than one exact-range mock per gap) means the assertion,
+    //     not the mock's match arms, decides which spans are legitimate — a request
+    //     that touched the held interior would still be recorded, then caught below.
+    let blob_for_resp = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .and_then(|(s, e)| Some((usize::try_from(s).ok()?, usize::try_from(e).ok()?)))
+                .and_then(|(s, e)| blob_for_resp.get(s..=e));
+            match span {
+                Some(body) => ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                None => ResponseTemplate::new(416),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x52);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    // Seed the INTERIOR range into the same cache the handler serves from (the
+    // engine handle is shared), so the pull leg's `missing_ranges(0, 0)` returns
+    // only the two surrounding gaps. Mirrors how the cache's own `admit_bao` tests
+    // seed a partial: `encode_verified_range` yields the combined wire `admit_bao`
+    // imports under `H`.
+    let held_bao = encode_verified_range(
+        *hash.as_bytes(),
+        &held_aligned,
+        &held_data,
+        bytes::Bytes::from(outboard.clone()),
+    )
+    .map_err(|e| anyhow::anyhow!("encode held range: {e:?}"))?;
+    cache
+        .admit_bao(hash, held_aligned.chunk_ranges().clone(), held_bao)
+        .await?;
+    anyhow::ensure!(
+        !cache.present_ranges(hash).await?.is_complete(),
+        "the seeded interior range must leave the blob a partial, not complete"
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "an interior partial must not read as a full holder"
+    );
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Whole blob (offset == 0 && len == 0) → the own-origin two-leg path.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    // 1) The client got the WHOLE blob, byte-exact and in order — the held interior
+    //    (read locally + seeded into the shared outboard) and the pulled gaps
+    //    reassembled into one coherent, hash-verifying stream.
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "interior-hold whole-blob delivery mismatch: got {} bytes, want {}",
+        got.len(),
+        blob.len()
+    );
+
+    // 2) The origin served the GAPS and NOT the held interior. Any ranged GET whose
+    //    inclusive span `[s, e]` overlaps the held `[held_start, held_end)` is a
+    //    re-pull of bytes the node already had — the range-minimization bug this
+    //    test exists to catch.
+    let held_overlap_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .is_some_and(|(s, e)| s < held_end && e >= held_start)
+    })
+    .await?;
+    anyhow::ensure!(
+        held_overlap_gets == 0,
+        "the origin must never re-fetch the held interior range, saw {held_overlap_gets} \
+         overlapping ranged GET(s)"
+    );
+
+    // The prefix gap [0, held_start) and the suffix gap [held_end, blob_size) were
+    // each drawn from origin — proof the gaps really were pulled (not silently
+    // skipped, which would also produce zero held-overlap GETs).
+    let prefix_gap_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .is_some_and(|(s, _e)| s < held_start)
+    })
+    .await?;
+    let suffix_gap_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range)
+                .is_some_and(|(s, _e)| s >= held_end)
+    })
+    .await?;
+    anyhow::ensure!(
+        prefix_gap_gets >= 1,
+        "the prefix gap [0, {held_start}) must be pulled from origin"
+    );
+    anyhow::ensure!(
+        suffix_gap_gets >= 1,
+        "the suffix gap [{held_end}, {blob_size}) must be pulled from origin"
+    );
+
+    // 3) Dispatch selected the own-origin two-leg tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire once"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
+/// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size +
+/// published outboard both succeed) and signs `ok:true`, but the ranged data GET the
+/// local pull leg draws returns `500` — so `origin_encode_range` errors, the pull
+/// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
+/// terminal against its present-range watch and FAILS the gap it is waiting on. The
+/// client must see a delivery error / stream reset, never a clean whole blob.
+///
+/// The whole `ranged_paid_pull` is wrapped in a hard `timeout`, so a genuine hang
+/// (the failure this test guards against) surfaces as a test failure rather than a
+/// stuck run. This is the integration-level twin of FA.2's `run_local_pull_leg`
+/// unit no-hang proof: it shows the pull-leg terminal signal propagates all the way
+/// through `serve_leg` to the paying client.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    // (1) HEAD → size probe SUCCEEDS (serviceability).
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) outboard GET SUCCEEDS (serviceability): dispatch proves the blob is
+    //     serviceable and signs `ok:true`, committing to the two-leg serve.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    // (3) the ranged data GET the local pull leg draws FAILS with a 500. The pull
+    //     leg's `origin_encode_range` errors; this is a local-origin fault, so the
+    //     serve must terminate with an error rather than wait forever.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header_exists("range"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x53);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // A hang is the failure mode under test: bound the whole exchange so it becomes
+    // a test failure, not a stuck run.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        ranged_paid_pull(
+            &client_ep,
+            target,
+            client_node_id,
+            &client_eth,
+            channel_id,
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        ),
+    )
+    .await;
+
+    let inner = outcome.map_err(|_| {
+        anyhow::anyhow!(
+            "own-origin serve HUNG on an origin fetch error — no terminal signal reached the client"
+        )
+    })?;
+    anyhow::ensure!(
+        inner.is_err(),
+        "an origin fetch failure must fail the serve; the client must not receive a clean whole blob"
+    );
+
+    // The dispatch tier still fired (serviceability passed, `ok:true` was signed) —
+    // this is a mid-serve failure of the committed two-leg path, not a fallback.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must have been selected before the origin fault"
     );
 
     client_ep.close().await;
