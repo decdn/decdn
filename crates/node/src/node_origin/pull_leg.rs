@@ -46,7 +46,9 @@ use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
 use decdn_cache::{CacheEngine, CacheError, Hash};
 use decdn_client_pull::driver::DriveConfig;
-use decdn_client_pull::{PacingWait, PeerSource, WindowPacer, drive};
+use decdn_client_pull::{
+    HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource, WindowPacer, drive,
+};
 use decdn_reputation::Outcome;
 use iroh::{EndpointAddr, PublicKey};
 use tokio::sync::Notify;
@@ -149,17 +151,43 @@ fn content_len(ranges: &ChunkRanges, total: u64) -> u64 {
     sum
 }
 
-/// Whether `err` (or anything in its chain) is a bao verification failure — the
-/// upstream served bytes that do not hash to the content root. Scored `Corruption`
-/// against the provider, distinct from a transport/refusal fault.
+/// Whether `err` (or anything in its chain) is a paid-but-corrupt UPSTREAM
+/// delivery — one that must be scored `Corruption` against the provider and
+/// metered `upstream_verify_failed`, as distinct from a transport/refusal fault or
+/// a buyer-side (local) fault. Honest providers never trip any arm here.
+///
+/// Three shapes reach the decoupled serve-miss pull leg, all provider corruption:
+///
+/// - [`CacheError::VerifyFailed`] / [`CacheError::HashMismatch`] — the node's cache
+///   decoder ([`NodeAdmitStore`] → `admit_bao_stream`) rejected a chunk group or
+///   the whole-blob root. This is how a wire-complete lie surfaces.
+/// - [`decdn_client_pull::HashMismatch`] — the client-pull decoder's typed
+///   content-addressing sentinel, matched defensively for the paths that surface it
+///   directly (it is also what [`super::pull_verdict`] downcasts to).
+/// - The client-pull streaming OVER-DELIVERY guards — the upstream sent more wire
+///   than the signed `total_bytes` promised ("… more than the … promised", "… after
+///   the promised total"). An honest upstream sends exactly the promised wire then
+///   `StreamEnd`, so over-delivery is unambiguous provider misbehaviour; a corrupt
+///   upstream desyncs the wire/plaintext accounting and trips it. These are bare
+///   `anyhow` strings (no typed sentinel to downcast), so they are matched by their
+///   stable text.
+///
+/// A SHORT/truncated stream ("… of … promised wire bytes before `StreamEnd`") is the
+/// deliberate NON-match: a stream that ends early is a transport fault, not
+/// corruption, and stays out of this predicate.
 fn is_bao_corruption(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
-        cause.downcast_ref::<CacheError>().is_some_and(|e| {
+        if cause.downcast_ref::<CacheError>().is_some_and(|e| {
             matches!(
                 e,
                 CacheError::VerifyFailed { .. } | CacheError::HashMismatch { .. }
             )
-        })
+        }) || cause.downcast_ref::<ClientPullHashMismatch>().is_some()
+        {
+            return true;
+        }
+        let msg = cause.to_string();
+        msg.contains("more than the") || msg.contains("after the promised total")
     })
 }
 
@@ -552,10 +580,13 @@ pub(crate) async fn run_pull_leg(
     // otherwise bounds to a few seconds — would wait forever (a hang that surfaces
     // whenever the endpoint is closed while an abandoned pull is in flight). Yield the
     // runtime briefly so the abandoned connection flushes its CONNECTION_CLOSE and
-    // drains on the runtime that owns it. A completed drive (`!cancelled`) already
-    // closed its connection gracefully inside `drive`, so this is cancel-only and adds
-    // no latency to the hot path.
-    if cancelled {
+    // drains on the runtime that owns it. A drive that returns `Err` strands its
+    // upstream connection the SAME way a cancel does — it returns without a graceful
+    // cooperative close (unlike the clean `Ok` path, which closes inside `drive`) —
+    // so the drain must cover it too, or `Endpoint::close()` hangs whenever a pull
+    // failed mid-serve (e.g. a corrupt upstream). Only the clean `Ok` path skips the
+    // drain and stays on the hot path with no added latency.
+    if cancelled || result.is_err() {
         tokio::time::sleep(ABANDON_DRAIN).await;
     }
 
@@ -583,6 +614,7 @@ pub(crate) async fn run_pull_leg(
                         "node pull leg: upstream served bao-corrupt bytes; scoring Corruption"
                     );
                     record_outcome(deps, pk, &Outcome::Corruption);
+                    deps.metrics.node_pull_through_upstream_verify_failed();
                 } else {
                     let _ = classify_pull_failure(
                         deps,
