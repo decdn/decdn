@@ -61,7 +61,7 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 #### `ChunkData` exemption
 
-`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher`/`VoucherAck` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
+`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
 
 #### Gossip Framing
 
@@ -102,8 +102,7 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    VoucherAck,                       // 4
-    StreamEnd,                        // 5
+    StreamEnd,                        // 4
 }
 ```
 
@@ -194,7 +193,7 @@ use postcard::take_from_bytes;
 struct StreamRequestBase {
     hash: Hash,
     namespace_id: U256,
-    channel_id: ChannelId,
+    pool_id: PoolId,
     byte_offset: u64,
     byte_len: u64,
     timestamp_us: u64,
@@ -266,7 +265,7 @@ fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) ->
 }
 ```
 
-Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have no trailing bytes — the `take_from_bytes` remainder is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; two-phase logic lives in per-message-type application code.
+Messages without extensions (e.g., `StreamEnd`, `ChunkData`) have no trailing bytes — the `take_from_bytes` remainder is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; two-phase logic lives in per-message-type application code.
 
 **Rules:**
 
@@ -295,11 +294,10 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    VoucherAck,                       // 4
-    StreamEnd,                        // 5
+    StreamEnd,                        // 4
     // Added via medium evolution
-    Ping(PingRequest),                // 6
-    Pong(PongResponse),              // 7
+    Ping(PingRequest),                // 5
+    Pong(PongResponse),              // 6
 }
 ```
 
@@ -330,7 +328,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `pool_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
 | `NodeAnnounce` | `node_id`, `region`, `timestamp_us` | *(none currently — see implementation note)* |
 
 #### Implementation note — separating signed and unsigned fields

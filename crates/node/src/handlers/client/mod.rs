@@ -70,6 +70,8 @@ use crate::region_accounting::RegionAccountant;
 mod delivery;
 mod dispatch;
 mod fill;
+mod serve_encoder;
+mod serve_leg;
 mod source;
 mod voucher;
 mod window;

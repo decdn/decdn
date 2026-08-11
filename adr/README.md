@@ -1,13 +1,13 @@
 # deCDN — Protocol Specification
 
-A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain payment-token channels with on-chain settlement; bonded operators compete on price and latency, with reputation, slashing, and capacity-bonded incentives keeping the mesh honest.
+A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain vouchers backed by a shared on-chain payment pool; bonded operators compete on price and latency, with reputation, slashing, and capacity-bonded incentives keeping the mesh honest.
 
 This directory is the protocol's canonical specification. Each numbered file is an Architecture Decision Record (ADR) covering one component or invariant of the design. [`architecture.md`](architecture.md) is the living overview — system diagram, ADR-by-ADR summaries, key invariants, trust assumptions, and the canonical reading order.
 
 ## Design principles
 
 - **Content-addressed, location-independent.** Every blob is identified by its BLAKE3 hash. Delivery verification is inherent: the receiver hashes received bytes and rejects mismatches. Nodes are interchangeable as long as the hash matches.
-- **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment-token channels settle on-chain.
+- **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment-token vouchers, backed by a shared on-chain pool, settle on-chain.
 - **Stake to participate, slash on misbehavior.** Nodes must stake TOKEN before joining the mesh. Misbehavior (rate manipulation, corruption, blacklist violation) is detectable on-chain and slashable. Challenge bonds prevent zero-cost griefing.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
 - **Operator return is differentiated by capacity commitment, not raw stake.** The `CapacityBond` lock-to-capacity curve `bond = k × Mbps^α` requires operators to bond TOKEN proportional to declared bandwidth, with super-linear pressure against concentration. No fee discounts, no passive yield to non-operators.
@@ -19,7 +19,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
 2. **Discovery** — DHT-based content lookup, regional proxy warming, multi-source fetch.
-3. **Payments** — channels, vouchers, client architecture, smart-wallet support.
+3. **Payments** — the shared payment pool, vouchers, client architecture, smart-wallet support.
 4. **Tokenomics & incentives** — work-token tokenomics, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.

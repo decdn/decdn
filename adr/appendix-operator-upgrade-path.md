@@ -42,7 +42,7 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 - Wire format stays compatible (postcard two-phase deserialization handles missing trailing extensions).
 - ALPN string unchanged.
 - Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing)) — slash evidence stays verifiable across versions.
-- Payment channels and on-chain bindings unaffected.
+- Payment pools and on-chain bindings unaffected.
 
 **Operator action:** Pull and restart at your normal cadence, following [§ Restarting a node safely](#restarting-a-node-safely). No flag day, no client coordination, and no upgrade-specific drain beyond the standing restart procedure. Skipping a Tier 1 release entirely keeps you interoperable indefinitely — peers on the new version just won't see the optional fields you don't emit.
 
@@ -57,7 +57,7 @@ A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepal
 3. **Watch the logs, not a metric — the fallback is unmetered.** A legacy peer rejecting the new variant closes with `UNSUPPORTED_MESSAGE` and the sender falls back; that path emits a `tracing::debug!` (e.g. `crates/node/src/dht/client.rs`'s batch-store fallback) and increments **no counter**. Expected and benign for legacy peers, but a sustained rate on your own outbound streams suggests config drift, so grep for the fallback line for one rolling window after restart. This step previously named `decdn_streams_failed_total{reason="protocol_error"}`, which the node has never exported ([`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics) now carries it as `planned`); a per-variant fallback counter is the missing piece.
 4. **Configure new metrics** in your dashboard if the release exposes them (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)).
 
-Payment channels and stake state are unaffected.
+Payment pools and stake state are unaffected.
 
 ## Tier 3 — major break (ALPN or topic bump)
 

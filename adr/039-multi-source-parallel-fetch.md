@@ -46,13 +46,13 @@ Re-dispatch is unit-scoped: only the failed unit is reassigned; verified units a
 
 At most one source owns a unit at a time. Because every delivered byte is paid, the scheduler bounds completion latency through source selection and deadline-based re-dispatch rather than speculative duplicate requests. Re-dispatch preempts a source that has stopped making verified progress; a source that keeps delivering, only slowly, holds its unit to completion.
 
-### Payment and channels
+### Payment
 
-Each source is paid over its own payment channel with cumulative per-channel vouchers ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)), and only for the verified bytes it delivered. Per admitted source, the client must hold a channel whose remaining deposit covers the bytes it expects to assign to that source. This mirrors the node-side pre-flight deposit guard ([ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856)) from the payer's side. Sources price independently via `rate_per_mb`. The selection preference for cheaper sources and the work-stealing bias toward faster ones together steer spend. There is no cross-source settlement — each channel is independent.
+Each source is paid from the client's single pool via node-addressed vouchers on its own `(signer, provider)` lane ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)), and only for the verified bytes it delivered. There is **no channel per source**: one deposit backs every source, so the payer holds no per-source deposit and there is no fragmentation to size. The pool must hold enough deposit to cover the value in flight across the whole source set at once; each source (a node) stops serving when the pool's remaining balance nears its reserved floor `M` ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)) — the payer-side counterpart of the node's pre-flight deposit guard ([ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856)). Sources price independently via `rate_per_mb`. The selection preference for cheaper sources and the work-stealing bias toward faster ones together steer spend. Each lane is redeemed independently — there is no cross-source settlement.
 
 ### Engagement gate
 
-Multi-source fetch engages only when it pays for itself: the blob's advertised `total_bytes` exceeds `multi_source_min_bytes` **and** at least two holders are admissible. Otherwise the client uses the single-source path unchanged. The gate keeps channel-setup and coordination overhead off small fetches, where one fast source is already optimal.
+Multi-source fetch engages only when it pays for itself: the blob's advertised `total_bytes` exceeds `multi_source_min_bytes` **and** at least two holders are admissible. Otherwise the client uses the single-source path unchanged. The gate keeps coordination overhead off small fetches, where one fast source is already optimal.
 
 ### Source diversity and reputation
 
@@ -76,7 +76,7 @@ Speculative duplicate requests are out of scope **by decision, not by sequencing
 | `max_inflight_units` | client-set | Global concurrency cap across all sources. |
 | `unit_deadline_ms` | client-set | Verified-progress deadline before a unit is re-dispatched. |
 
-Concrete defaults are modeled before locking. The load-bearing commitments are that `max_sources` and `max_inflight_units` are finite (bounding channel count and concurrency), and that `work_unit_bytes` is bao-group-aligned (so every unit is independently verifiable).
+Concrete defaults are modeled before locking. The load-bearing commitments are that `max_sources` and `max_inflight_units` are finite (bounding source count and concurrency), and that `work_unit_bytes` is bao-group-aligned (so every unit is independently verifiable).
 
 ## Consequences
 
@@ -90,7 +90,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 
 ### Negative
 
-- The client maintains a payment channel per admitted source, raising the number of open channels and the deposit spread for a single large fetch.
+- Per-source redemption from the shared pool raises the number of on-chain `redeem` calls for a single large fetch (one lane per source), though the deposit stays unified — there is no per-source channel or deposit spread.
 - Tail latency is bounded against stalled and failing sources, not against merely slow ones: `unit_deadline_ms` triggers on absent verified progress, so a source delivering steadily below the set's rate keeps its unit and sets the finish time of the last unit it owns.
 - Coordination state (work queue, per-source in-flight tracking, re-dispatch) is new always-on client complexity that the single-source path does not carry.
 - Restricting sources to full holders leaves warmed partial copies unused until range-addressed discovery lands.
@@ -99,13 +99,13 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 
 - **Parameter drift.** `max_sources` or `max_inflight_units` set too high wastes connections and deposit on marginal throughput. `work_unit_bytes` too small inflates proof overhead and request count; too large coarsens load-balancing and re-dispatch cost. Defaults are modeled and client-tunable.
 - **Source collusion / eclipse.** A set dominated by one operator concentrates failure and pricing power. The diversity preference mitigates this, but the client depends on accurate holder metadata to spread the set.
-- **Deposit fragmentation.** Spreading deposit across many channels can leave each too thin if assignment shifts. Mitigated by sizing channels to expected assignment and backfilling from the candidate set rather than over-committing up front.
+- **Under-sized pool.** One pool backs all sources, so there is no deposit fragmentation; the residual is that the single deposit must cover the value in flight across all sources at once (each source bounded by the node-side floor `M`). Mitigated by sizing the deposit to the admitted set and topping up rather than over-committing up front ([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m)).
 
 ## Cross-ADR Impact
 
 - [ADR 038 § Scope boundary](038-bao-verified-range-streaming.md#scope-boundary): this ADR is the multi-source scheduler that it names as its deferred follow-up; it consumes the per-range verification property and adds no verification logic of its own.
 - [ADR 005 § `cdn/client/v1`](005-protocol.md#cdnclientv1--paid-delivery-protocol): a client MAY drive several concurrent `cdn/client/v1` streams to distinct nodes for one blob, each a bounded sub-range obtained by requesting from an offset and ceasing vouchers at the unit boundary. The `StreamRequest` / `StreamResponse` / voucher surface is unchanged; no end-offset field is added.
-- [ADR 003 § Payment Model](003-payments.md#adr-003-payment-model): one cumulative-voucher channel per source, each settled independently; the payer sizes per-source deposit to expected assignment and pays only for verified delivered bytes.
+- [ADR 003 § Payment Model](003-payments.md#adr-003-payment-model): per-`(signer, provider)` lane vouchers from one shared pool, each lane redeemed independently; the payer sizes the single deposit to the sum of per-source credit windows and pays only for verified delivered bytes.
 - [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm): selection becomes set-valued for large blobs — the client admits and ranks a set of full holders rather than choosing one, using the same RTT, price, reputation, and diversity inputs.
 - [ADR 008 § Reputation System](008-reputation.md#adr-008-reputation-system): per-source verified-delivery, stall, drop, and verification-failure outcomes feed the local EWMA and the diversity preference.
 - [ADR 037 § Latency-Driven Proxy Warming](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality): complementary modes — proxy warming seeds the first regional copy through a near non-holder for locality; multi-source fetch parallelizes across existing full holders for throughput. A client engages warming when only distant holders exist and a near empty node can seed, and multi-source when enough acceptable full holders exist; both leave the wire unchanged.
