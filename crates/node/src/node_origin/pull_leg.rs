@@ -409,6 +409,7 @@ pub(crate) async fn run_pull_leg(
     served_paid_advanced: Arc<Notify>,
     pull_ended: Arc<Notify>,
     pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
+    outboard_writer: super::serve_outboard::OutboardWriter,
     cancel: CancellationToken,
 ) {
     let hash_bytes = *hash.as_bytes();
@@ -464,7 +465,7 @@ pub(crate) async fn run_pull_leg(
         ledger: Arc::clone(&ledger),
     };
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes);
+    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(outboard_writer));
     // Content bytes this provider will actually serve (the gaps), for scoring —
     // held ranges are not re-pulled, so this is below `total_bytes` on an interior
     // hold.

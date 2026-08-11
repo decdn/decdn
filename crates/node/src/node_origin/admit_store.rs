@@ -21,22 +21,57 @@ use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
 use decdn_cache::{CacheEngine, Hash, NodeRangedStore};
 use decdn_client_pull::{BaoRangeReader, IngestStore};
 
+use super::serve_outboard::OutboardWriter;
+
 /// The node's pull-leg store: [`RangedStore`] queries delegate to a
 /// [`NodeRangedStore`], and [`IngestStore::ingest_stream`] admits each gap via
-/// [`CacheEngine::admit_bao_stream`].
+/// [`CacheEngine::admit_bao_stream`]. When an [`OutboardWriter`] is present, each
+/// admitted range's proof nodes are captured into the serve leg's shared outboard
+/// (#1621 B2 part 2, ADR 038) so the serve leg can drive a coherent whole-range
+/// encode while the pull fills incrementally.
 #[allow(dead_code, reason = "wired by Task 11's driver construction")]
 pub(crate) struct NodeAdmitStore {
     inner: NodeRangedStore,
+    /// Serve-leg outboard capture sink. `None` when no serve leg reads beside this
+    /// pull (e.g. the admit-only unit tests).
+    outboard: Option<OutboardWriter>,
 }
 
 #[allow(dead_code, reason = "wired by Task 11's driver construction")]
 impl NodeAdmitStore {
-    /// Wrap `engine`'s view of `hash` (a `total_bytes`-byte blob) as the
-    /// node's pull-leg store.
-    pub(crate) const fn new(engine: CacheEngine, hash: Hash, total_bytes: u64) -> Self {
+    /// Wrap `engine`'s view of `hash` (a `total_bytes`-byte blob) as the node's
+    /// pull-leg store, capturing each admitted range's outboard proof nodes into
+    /// `outboard` (the serve leg's shared outboard) when one is wired.
+    pub(crate) const fn new(
+        engine: CacheEngine,
+        hash: Hash,
+        total_bytes: u64,
+        outboard: Option<OutboardWriter>,
+    ) -> Self {
         Self {
             inner: NodeRangedStore::new(engine, hash, total_bytes),
+            outboard,
         }
+    }
+
+    /// Capture the outboard proof `(node, pair)`s iroh-blobs emits for `chunk_ranges`
+    /// (a just-admitted or held range) into the shared outboard. A no-op without a
+    /// wired [`OutboardWriter`]. Fails only if `export_bao` itself faults — the data
+    /// was just admitted, so this reads the store we just wrote.
+    async fn capture_outboard(&self, chunk_ranges: &bao_tree::ChunkRanges) -> anyhow::Result<()> {
+        let Some(writer) = &self.outboard else {
+            return Ok(());
+        };
+        let pairs = self
+            .inner
+            .engine()
+            .outboard_pairs(self.inner.hash(), chunk_ranges)
+            .await
+            .map_err(anyhow::Error::from)?;
+        for (node, pair) in pairs {
+            writer.save(node, pair);
+        }
+        Ok(())
     }
 }
 
@@ -101,7 +136,8 @@ impl IngestStore for NodeAdmitStore {
         R: BaoRangeReader + 'a,
     {
         Box::pin(async move {
-            self.inner
+            let drained = self
+                .inner
                 .engine()
                 .admit_bao_stream(
                     self.inner.hash(),
@@ -110,7 +146,12 @@ impl IngestStore for NodeAdmitStore {
                     reader,
                 )
                 .await
-                .map_err(anyhow::Error::from)
+                .map_err(anyhow::Error::from)?;
+            // The range's data is now cached; capture its outboard proof nodes for
+            // the serve leg's shared outboard (no-op when no serve leg reads beside
+            // this pull). Front-to-back admits union to the whole tree.
+            self.capture_outboard(range.chunk_ranges()).await?;
+            Ok(drained)
         })
     }
 }
@@ -217,7 +258,7 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
         let (root, total, aligned, _ranges, wire) = interior_range_wire();
         let hash = decdn_cache::Hash::from(root);
-        let store = NodeAdmitStore::new(engine, hash, total);
+        let store = NodeAdmitStore::new(engine, hash, total, None);
 
         let reader = MemReader { wire };
         let mut drained = IngestStore::ingest_stream(&store, &aligned, reader, None)
@@ -245,7 +286,7 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
         let (root, total, aligned, ranges, wire) = interior_range_wire();
         let hash = decdn_cache::Hash::from(root);
-        let store = NodeAdmitStore::new(engine, hash, total);
+        let store = NodeAdmitStore::new(engine, hash, total, None);
 
         let before =
             RangedStore::missing_ranges(&store, aligned.fetch_start(), aligned.fetch_len())
@@ -267,6 +308,65 @@ mod tests {
         assert!(
             after.is_empty(),
             "after ingest, the just-admitted range must no longer be missing"
+        );
+    }
+
+    /// The capture invariant the coherent serve encoder relies on (#1621 B2 part 2,
+    /// ADR 038): admitting a blob feeds the shared outboard exactly the blob's true
+    /// pre-order outboard. Every interior node the encoder will `load` must match
+    /// `bao_tree`'s own outboard for the same content, so the re-encoded downstream
+    /// wire is byte-identical to a single whole-blob encode.
+    #[tokio::test]
+    async fn capture_reconstructs_the_true_outboard() {
+        use bao_tree::BaoTree;
+        use bao_tree::io::fsm::Outboard as FsmOutboard;
+        use bao_tree::io::sync::Outboard as SyncOutboard;
+
+        let group = decdn_cache::CHUNK_GROUP_BYTES;
+        let total = 5 * group + 321; // several groups plus a ragged tail
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let hash = decdn_cache::Hash::from(root);
+
+        let (writer, factory) = super::super::serve_outboard::shared_outboard(
+            bao_tree::blake3::Hash::from(root),
+            total,
+        );
+        let store = NodeAdmitStore::new(engine, hash, total, Some(writer));
+
+        // Admit the whole blob in one range → the capture unions to the whole tree.
+        let aligned = align_range(0, total, total).expect("align whole blob");
+        let combined =
+            encode_verified_range(root, &aligned, &plaintext, outboard).expect("encode whole blob");
+        let wire = combined.slice(8..);
+        IngestStore::ingest_stream(&store, &aligned, MemReader { wire }, None)
+            .await
+            .unwrap();
+
+        // Compare the captured outboard against the blob's true outboard, node by node.
+        let mut reader = factory.reader(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
+        let truth = PreOrderMemOutboard::create(&plaintext, IROH_BLOCK_SIZE);
+        let tree = BaoTree::new(total, IROH_BLOCK_SIZE);
+        let mut internal = 0u64;
+        for node in tree.pre_order_nodes_iter() {
+            if tree.pre_order_offset(node).is_some() {
+                internal += 1;
+                let got = FsmOutboard::load(&mut reader, node).await.unwrap();
+                let want = SyncOutboard::load(&truth, node).unwrap();
+                assert_eq!(
+                    got, want,
+                    "captured node {node:?} must match the true outboard"
+                );
+            }
+        }
+        assert!(
+            internal > 0,
+            "a multi-group blob has interior nodes to capture"
         );
     }
 }

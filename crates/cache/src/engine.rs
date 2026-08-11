@@ -3129,6 +3129,53 @@ impl CacheEngine {
         )))
     }
 
+    /// Collect the outboard `(node, (left, right))` hash pairs iroh-blobs emits for
+    /// `chunk_ranges` of `hash`, straight from the store's outboard — NO re-hashing.
+    ///
+    /// The decoupled serve leg's shared outboard (#1621 B2 part 2, ADR 038) is fed
+    /// from these so it can drive a coherent whole-range bao encode while the pull
+    /// fills the cache incrementally. Call it for each range as it is admitted (and
+    /// for the already-held ranges at serve start): `export_bao` emits every proof
+    /// `Parent` on the path to the range PLUS the right-siblings covering
+    /// still-absent content, so the union over a front-to-back admit sequence is the
+    /// whole tree's internal nodes. Leaf data and the size header are skipped.
+    ///
+    /// `chunk_ranges` must be PRESENT (a just-admitted or held range): the proof
+    /// nodes for absent siblings are emitted from the outboard regardless, but a
+    /// range whose own leaves are absent faults `export_bao`.
+    pub async fn outboard_pairs(
+        &self,
+        hash: Hash,
+        chunk_ranges: &bao_tree::ChunkRanges,
+    ) -> CacheResult<
+        Vec<(
+            bao_tree::TreeNode,
+            (bao_tree::blake3::Hash, bao_tree::blake3::Hash),
+        )>,
+    > {
+        let mut stream = self
+            .inner
+            .store
+            .blobs()
+            .export_bao(hash, chunk_ranges.clone())
+            .stream();
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                EncodedItem::Parent(parent) => out.push((parent.node, parent.pair)),
+                EncodedItem::Leaf(_) | EncodedItem::Size(_) => {}
+                EncodedItem::Done => break,
+                EncodedItem::Error(cause) => {
+                    return Err(CacheError::Store(
+                        anyhow::Error::from(cause)
+                            .context("outboard_pairs: export_bao stream failed"),
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether the origin chain has any origin `pull_through` would actually try
     /// for the given mode: any origin at all normally, or any non-`Peer` origin
     /// under `local_only` (#1116).

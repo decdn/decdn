@@ -269,6 +269,16 @@ impl ClientHandler {
             Arc::new(std::sync::Mutex::new(None));
         let cancel = tokio_util::sync::CancellationToken::new();
 
+        // The whole-tree bao outboard the two legs share (#1621 B2 part 2, ADR 038):
+        // the pull leg captures each admitted range's proof nodes into `ob_writer`,
+        // and the serve leg's coherent whole-range encoder reads them through a reader
+        // minted from `ob_factory`. The pull can start capturing before the serve leg
+        // wires its reader, which is why construction and reader-minting are split.
+        let (ob_writer, _ob_factory) = crate::node_origin::shared_outboard(
+            bao_tree::blake3::Hash::from(*hash.as_bytes()),
+            total_bytes,
+        );
+
         // The serve leg reads the cache the pull leg fills — same engine, same hash.
         let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
 
@@ -284,6 +294,7 @@ impl ClientHandler {
             let cancel = cancel.clone();
             let offset = req.byte_offset;
             let len = req.byte_len;
+            let outboard_writer = ob_writer;
             std::thread::Builder::new()
                 .name("serve-miss-pull".to_string())
                 .spawn(move || {
@@ -303,6 +314,7 @@ impl ClientHandler {
                             served_paid_advanced,
                             Arc::clone(&pull_ended),
                             pull_result.clone(),
+                            outboard_writer,
                             cancel,
                         )),
                         Err(e) => {

@@ -52,6 +52,7 @@ pub(crate) use admit_store::NodeAdmitStore;
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use funder::NodeFunder;
 pub(crate) use pull_leg::run_pull_leg;
+pub(crate) use serve_outboard::shared_outboard;
 
 use std::collections::HashMap;
 use std::future::Future;
