@@ -868,3 +868,112 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     server_task.await?;
     Ok(())
 }
+
+/// A WHOLE-BLOB cold miss whose own origin publishes the `{H}.obao4` outboard is
+/// served through the Flow A own-origin two-leg path (`serve_via_backend_origin`,
+/// FA.3a): dispatch confirms serviceability (origin size + published outboard),
+/// signs `ok:true`, and runs the local pull leg (fill the cache from origin)
+/// beside the serve leg (stream the filling cache to the paying client). This
+/// asserts the dispatch selection reaches `serve_via_backend_origin` — the
+/// `decdn_local_outboard_serves_total` tier counter fires once — and that the
+/// client receives a coherent, hash-verifying whole-blob delivery. There is no
+/// upstream, channel, or payment on the ingest side; the client still pays the
+/// downstream vouchers exactly as any paid delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    // The whole-blob request aligns to [0, blob_size); compute the ranged span the
+    // local pull leg will fetch with the same helper the engine uses.
+    let aligned = align_range(0, 0, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // (2) sibling outboard GET: the dispatch serviceability outboard probe AND the
+    //     pull leg's range-encode outboard fetch (may be hit more than once).
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // (3) ranged data GET → 206 with the whole aligned span (the single full-miss
+    //     gap the local pull leg draws).
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(span.clone()))
+        .mount(&server)
+        .await;
+
+    let channel_id = B256::repeat_byte(0x51);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        channel_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Whole blob: byte_offset == 0 && byte_len == 0 — the exact gate dispatch uses
+    // to route to the own-origin two-leg path.
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &client_eth,
+        channel_id,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+
+    anyhow::ensure!(
+        got.as_slice() == blob.as_slice(),
+        "whole-blob own-origin delivery mismatch: got {} bytes, want {}",
+        got.len(),
+        blob.len()
+    );
+
+    // The own-origin serve-miss tier fired exactly once — proof dispatch selected
+    // `serve_via_backend_origin` rather than a fallback tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire once"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}

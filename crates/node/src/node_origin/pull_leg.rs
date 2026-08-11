@@ -1,8 +1,8 @@
 //! The gap-driven, range-minimized **pull leg** of the node serve-miss (#1621 B2
 //! part 2, ADR 037).
 //!
-//! The fused `window_forward_loop` (retained for the local-outboard twin) pulls
-//! the WHOLE blob and tees it. This module instead drives the shared
+//! The retired fused serve path pulled the WHOLE blob and teed it. This module
+//! instead drives the shared
 //! [`decdn_client_pull::drive`] loop over a node sink, so a serve-miss pulls and
 //! pays UPSTREAM for only the ranges the cache is missing — held ranges are read
 //! locally, never re-pulled or re-paid. It is the buyer half of the two concurrent

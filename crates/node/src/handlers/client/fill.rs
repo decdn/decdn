@@ -298,14 +298,6 @@ impl ClientHandler {
             .is_none_or(|g| g.poll_admission(peer))
     }
 
-    /// Account `bytes` speculatively pulled for `peer` under the seed-leech caps
-    /// (#856). No-op when no governor is wired.
-    pub(super) fn leech_record_pulled(&self, peer: &[u8; 32], bytes: u64) {
-        if let Some(g) = self.leech_governor.as_ref() {
-            g.record_pulled(peer, bytes);
-        }
-    }
-
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
     /// it landed in the store in the race; otherwise meters the abandoned pull and
     /// reports the miss.
