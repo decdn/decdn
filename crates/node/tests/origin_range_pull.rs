@@ -1300,3 +1300,262 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
     server_task.await?;
     Ok(())
 }
+
+/// Spawn a server that handles each inbound connection on its OWN task, so two
+/// concurrent `cdn/client/v1` requests are served in parallel. The default
+/// `support::spawn_server` awaits `handler.accept` INLINE in its accept loop, so a
+/// long-running first serve blocks the loop and the second connection's `connect`
+/// times out — which also means the second request would never reach
+/// `open_tee_sink` while the first still holds the reservation, defeating the
+/// coalescing this test exercises. Mirrors `spawn_server_concurrent` in
+/// `node_origin_pull.rs`.
+fn spawn_server_concurrent(
+    server_ep: iroh::Endpoint,
+    handler: Arc<ClientHandler>,
+) -> tokio::task::JoinHandle<()> {
+    use iroh::protocol::ProtocolHandler;
+    tokio::spawn(async move {
+        while let Some(incoming) = server_ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                let _ = handler.accept(conn).await;
+            });
+        }
+    })
+}
+
+/// Build a `ClientHandler` over an `HttpOrigin` with TWO independently-funded
+/// channels (one per concurrent client) and a node→node pull-through deadline
+/// wired so the coalescing `await_coalesced_fill` (→ `try_pull_through` →
+/// `populate`) can WAIT on the in-flight entry rather than doing a bare presence
+/// check. Two channels (not one) so each of the two concurrent deliveries has its
+/// own monotonic voucher accounting; coalescing keys on the HASH, not the channel.
+#[allow(clippy::too_many_arguments)]
+async fn handler_two_channels_over_http_origin(
+    origin_uri: &str,
+    owner_channel: B256,
+    client_a: Address,
+    waiter_channel: B256,
+    client_b: Address,
+    server_eth: &Arc<PrivateKeySigner>,
+    server_id: iroh::PublicKey,
+    pull_through: Option<Duration>,
+) -> anyhow::Result<(
+    Arc<ClientHandler>,
+    CacheEngine,
+    Arc<Metrics>,
+    tempfile::TempDir,
+)> {
+    let store = Arc::new(MemoryChannelStateStore::new());
+    for (id, client) in [(owner_channel, client_a), (waiter_channel, client_b)] {
+        store.record(&ChannelState::new(
+            id,
+            client,
+            client,
+            TOKEN,
+            U256::from(10_000_000u64),
+        ))?;
+    }
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(origin_uri)?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store;
+    let handler = build_handler_full_configured(
+        server_id,
+        server_eth,
+        &metrics,
+        limiter,
+        cache.clone(),
+        store_dyn,
+        RATE_PER_MB,
+        &domains(),
+        0,
+        16,
+        |deps| deps.pull_through = pull_through,
+    )?;
+    Ok((handler, cache, metrics, cache_dir))
+}
+
+/// TWO concurrent whole-blob own-origin misses for the SAME hash COALESCE to a
+/// single local pull / single origin ranged GET (Flow A whole-blob double-pull
+/// guard). Without the guard each request would open its own
+/// `serve_via_backend_origin` and draw the blob from origin twice; with it, the
+/// first request claims the in-flight `open_tee_sink` slot (`TeeOpen::Owner`) and
+/// the second parks on `TeeOpen::InFlight` → `await_coalesced_fill`, then serves
+/// the now-present blob from the store. The proof is on the ORIGIN side: exactly
+/// ONE ranged `206` data GET reaches the backend (not two), the own-origin serve
+/// tier fires ONCE (only the owner runs `serve_via_backend_origin`), and BOTH
+/// clients receive the whole blob byte-exact.
+///
+/// The race is forced deterministically: the origin's ranged data GET is delayed,
+/// so the first request holds the reservation across a wide window; the second is
+/// launched after a short stagger, guaranteeing it observes `InFlight`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+
+    let aligned = align_range(0, 0, blob_size)?;
+    let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+    let span = blob
+        .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+        .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+        .to_vec();
+    let range_val = format!("bytes={a_start}-{}", a_end - 1);
+
+    let server = MockServer::start().await;
+    // HEAD → canonical blob size (the dispatch serviceability size probe).
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    // sibling outboard GET (serviceability probe + the pull leg's range-encode
+    // outboard fetch).
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+        .mount(&server)
+        .await;
+    // The ranged data GET — DELAYED so the owning request holds the in-flight
+    // reservation across a wide window while the second request parks on
+    // `TeeOpen::InFlight`. If the guard is absent, BOTH requests reach here and
+    // this mock records TWO matching GETs; the assertion below then fails.
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .and(header("range", range_val.as_str()))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .set_body_bytes(span.clone())
+                .set_delay(Duration::from_millis(1_200)),
+        )
+        .mount(&server)
+        .await;
+
+    // Two clients, two independently-funded channels: coalescing keys on the hash,
+    // and separate channels keep each delivery's vouchers monotonic.
+    let owner_channel = B256::repeat_byte(0x61);
+    let waiter_channel = B256::repeat_byte(0x62);
+    let owner_eth = Arc::new(PrivateKeySigner::random());
+    let waiter_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    // A generous pull-through deadline so the coalesced waiter WAITS on the
+    // in-flight entry (populate) instead of a bare presence check.
+    let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
+        &server.uri(),
+        owner_channel,
+        owner_eth.address(),
+        waiter_channel,
+        waiter_eth.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(10)),
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server_concurrent(server_ep.clone(), handler);
+
+    let owner_sk = fresh_key();
+    let owner_node_id = B256::from(*owner_sk.public().as_bytes());
+    let (owner_ep, _) = local_endpoint(owner_sk, vec![]).await?;
+    let waiter_sk = fresh_key();
+    let waiter_node_id = B256::from(*waiter_sk.public().as_bytes());
+    let (waiter_ep, _) = local_endpoint(waiter_sk, vec![]).await?;
+    let owner_target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let waiter_target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Request A (the owner) is launched first and, after a short stagger, request B
+    // — by then A holds the reservation and is blocked on the delayed origin GET, so
+    // B is guaranteed to observe `TeeOpen::InFlight`.
+    let owner_hash = hash;
+    let a = tokio::spawn(async move {
+        ranged_paid_pull(
+            &owner_ep,
+            owner_target,
+            owner_node_id,
+            &owner_eth,
+            owner_channel,
+            owner_hash,
+            0,
+            0,
+            RATE_PER_MB,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let got_waiter = ranged_paid_pull(
+        &waiter_ep,
+        waiter_target,
+        waiter_node_id,
+        &waiter_eth,
+        waiter_channel,
+        hash,
+        0,
+        0,
+        RATE_PER_MB,
+    )
+    .await?;
+    let got_owner = a.await??;
+
+    // Both clients received the whole blob, byte-exact.
+    anyhow::ensure!(
+        got_owner.as_slice() == blob.as_slice(),
+        "owner delivery mismatch: got {} bytes, want {}",
+        got_owner.len(),
+        blob.len()
+    );
+    anyhow::ensure!(
+        got_waiter.as_slice() == blob.as_slice(),
+        "coalesced delivery mismatch: got {} bytes, want {}",
+        got_waiter.len(),
+        blob.len()
+    );
+
+    // The coalescing proof: the origin served the whole-blob gap exactly ONCE. A
+    // second, non-coalesced own-origin pull would draw the same ranged span again.
+    let ranged_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && r.headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v == range_val)
+    })
+    .await?;
+    anyhow::ensure!(
+        ranged_gets == 1,
+        "expected exactly ONE origin ranged GET (coalesced), saw {ranged_gets}"
+    );
+
+    // Only the owner ran `serve_via_backend_origin`; the coalesced request served
+    // from the store via `await_coalesced_fill`, so the tier counter fires ONCE.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "the own-origin two-leg serve tier must fire exactly once (owner only)"
+    );
+
+    // The blob is fully present after both deliveries.
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "blob must be present after coalesced serve"
+    );
+
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}

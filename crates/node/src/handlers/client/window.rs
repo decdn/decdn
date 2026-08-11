@@ -433,13 +433,16 @@ impl ClientHandler {
     /// caller has proven channel ownership (`pull_authorized`). Terminal: consumes
     /// `send`/`recv`.
     ///
-    /// The one structural simplification vs the peer twin: there is NO
-    /// [`TeeReservation`] to hold or abandon. The peer path holds the tee only as a
-    /// double-pull coalescing guard; the local pull fills exclusively via the cache
-    /// (`NodeAdmitStore`), never a tee, so nothing here claims or releases one. B3
-    /// (a later PR) owns range-aware coalescing for own-origin misses — until then a
-    /// second concurrent whole-blob own-origin miss simply opens its own local pull,
-    /// which is correct if wasteful, matching how the peer path already behaves.
+    /// Like the peer twin, this holds a [`TeeReservation`] purely as the
+    /// whole-blob double-pull coalescing guard: dispatch opens it
+    /// (`open_tee_sink` → `TeeOpen::Owner`) and hands it in, and this function
+    /// `abandon`s it on every early return and at teardown — waking any second
+    /// same-hash own-origin miss that parked on the `InFlight` arm. The local pull
+    /// fills exclusively via the cache (`NodeAdmitStore`), never through the tee; the
+    /// reservation is only the claim that stops two concurrent misses from each
+    /// spawning a local pull and admitting the same hash concurrently (double origin
+    /// egress). B3 (a later PR) owns RANGE-aware coalescing for own-origin misses —
+    /// until then this whole-blob guard matches exactly what the peer path already has.
     ///
     /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
     /// populate) hit a backend fault for this request (#1129), so the leech shed
@@ -463,6 +466,7 @@ impl ClientHandler {
         hash: Hash,
         client_node_id: B256,
         total_bytes: u64,
+        tee: TeeReservation,
         fault_seen: bool,
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
@@ -477,6 +481,7 @@ impl ClientHandler {
         // voucher collection.
         let channel_id = ChannelId::from(req.channel_id);
         let Some(channel) = self.channels.lock().await.get(&channel_id).cloned() else {
+            tee.abandon();
             return self
                 .respond_error(
                     &mut send,
@@ -514,6 +519,7 @@ impl ClientHandler {
         let headroom = deposit.saturating_sub(last_amount);
         if headroom < ceiling {
             self.log_deposit_refusal(channel_id, hash, headroom, ceiling);
+            tee.abandon();
             return self
                 .respond_error(
                     &mut send,
@@ -529,6 +535,7 @@ impl ClientHandler {
         // not a client fault, so it honors an earlier-tier fault (#1129).
         let peer = client_node_id.0;
         if !self.leech_admit(&peer) {
+            tee.abandon();
             let reason = FillOutcome::miss_reason(fault_seen);
             return self
                 .respond_error(&mut send, req, reason, rate_per_mb)
@@ -539,6 +546,7 @@ impl ClientHandler {
         // `origin_size` probe already produced `total_bytes`; refuse an oversized
         // blob with the wire-parity reason before signing anything).
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
+            tee.abandon();
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
@@ -707,8 +715,9 @@ impl ClientHandler {
         let pull_thread = match pull_thread {
             Ok(handle) => handle,
             Err(e) => {
-                // The OS refused the thread: fail the serve cleanly. There is no tee
-                // to release on the local path.
+                // The OS refused the thread: fail the serve cleanly (release the tee
+                // so a coalesced waiter is not stranded).
+                tee.abandon();
                 return Err(anyhow::anyhow!(
                     "could not spawn serve-miss local pull thread: {e}"
                 ));
@@ -747,13 +756,17 @@ impl ClientHandler {
         // Teardown: cancel the pull (stop draining our own origin for a blob the
         // client no longer waits on, #1610), then JOIN — bounded, since cancellation
         // makes `drive` drop promptly. Joined off the async worker via
-        // `spawn_blocking`. There is NO tee to abandon on the local path.
+        // `spawn_blocking`.
         cancel.cancel();
         let _ = tokio::task::spawn_blocking(move || {
             let _ = pull_thread.join();
         })
         .await;
 
+        // Release the in-flight coalescing slot: the `TeeReservation` was held only as
+        // the whole-blob double-pull guard (the local pull fills via the cache, not the
+        // tee), and its `abandon` wakes any coalesced `InFlight` waiter parked on it.
+        tee.abandon();
         serve_result
     }
 }
