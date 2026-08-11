@@ -22,7 +22,7 @@ One funded **pool** backs payments from **many independent capped signers** to *
 The model uses two signed objects and an on-chain sharded register.
 
 - **Capability** — signed off-chain by the pool owner over `{ signer, spending_cap, pool_id, expiry }`. It authorizes `signer` to spend up to `spending_cap` from `pool_id` until `expiry`. It is **node-agnostic**: one capability is valid at every node.
-- **Voucher** — signed by the authorized `signer` over `{ pool_id, signer, provider, cumulative, bytes_delivered, token }`. It is **node-addressed**: it names the payee `provider`. `provider` is mandatory because `pool_id` no longer encodes the payee; without it the contract could not attribute a payment or keep independent per-node ordering, and one node could redeem a voucher meant for another.
+- **Voucher** — signed by the authorized `signer` over `{ pool_id, signer, provider, cumulative, bytes_delivered }`. It is **node-addressed**: it names the payee `provider`. `provider` is mandatory because `pool_id` no longer encodes the payee; without it the contract could not attribute a payment or keep independent per-node ordering, and one node could redeem a voucher meant for another.
 
 The mechanism operates at two tiers, both on the same pool primitive:
 
@@ -204,7 +204,6 @@ Some reasons map to an on-chain `redeem` revert the node avoids by rejecting ear
 | `WrongSigner` | Signature recovers to an address other than the voucher's `signer` | `redeem` would revert when the recovered signer ≠ the authorized `signer` for `poolId` |
 | `WrongPool` | `voucher.pool_id` mismatch | EIP-712 domain binds the voucher to a specific `poolId`; off-pool vouchers authorize nothing |
 | `WrongProvider` | `voucher.provider` names another node | `redeem` requires `provider == msg.sender`; a node cannot redeem another node's lane (see [Redemption and Close](#redemption-and-close)) |
-| `WrongToken` | `voucher.token` mismatch | Cross-token replay defense (see [Replay attack on vouchers](#replay-attack-on-vouchers)) |
 | `AmountRegression` | `voucher.amount ≤` the node's accepted cumulative | none on-chain (`redeem` pays `cumulative − paid`, so a stale voucher pays `0`) — the sole off-chain ordering/replay guard now that vouchers carry no nonce; keeps the node's own ledger consistent |
 | `BytesRegression` | `voucher.bytes_delivered <` the node's accepted cumulative bytes | as for `AmountRegression`, on the byte axis |
 | `CapExceeded` | the voucher would push the signer's paid total past `cap`, or the capability has expired | `redeem` caps `paid` at `cap − spent` and gates on `expiry` from `authorized[poolId][signer]` — a fully-uncoverable voucher reverts `NothingToRedeem` |
@@ -369,7 +368,7 @@ Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-trigger
 
 Attacker intercepts a signed voucher and attempts to replay it against a different pool, a different node, or after redemption.
 
-EIP-712 typed data over `{poolId, signer, provider, amount, bytesDelivered, token}` binds the voucher to a specific pool, signer, and payee. `provider` is what stops one node from redeeming a voucher meant for another. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different chains, contract upgrades, or test vs production environments. Resubmission after redemption is neutralized by the cumulative accounting, not the nonce: `redeem` pays `cumulative − paid`, so an already-redeemed voucher pays `0` and moves no funds.
+EIP-712 typed data over `{poolId, signer, provider, amount, bytesDelivered}` binds the voucher to a specific pool, signer, and payee. `provider` is what stops one node from redeeming a voucher meant for another. The EIP-712 domain separator (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)) further binds each voucher to a specific chain and contract deployment, preventing replay across different chains, contract upgrades, or test vs production environments. The contract settles in a single token fixed at deployment, so a voucher can only ever pay in that token — cross-token replay does not arise, and the voucher carries no token field. Resubmission after redemption is neutralized by the cumulative accounting: `redeem` pays `cumulative − paid`, so an already-redeemed voucher pays `0` and moves no funds.
 
 #### Off-chain voucher state persistence
 
@@ -673,7 +672,7 @@ The capability names no provider — it is node-agnostic, valid at every node. `
 
 ```solidity
 bytes32 constant VOUCHER_TYPEHASH = keccak256(
-    "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,address token)"
+    "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered)"
 );
 ```
 
@@ -685,7 +684,7 @@ bytes32 constant VOUCHER_TYPEHASH = keccak256(
 bytes32 voucherDigest = keccak256(abi.encodePacked(
     "\x19\x01",
     DOMAIN_SEPARATOR,
-    keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer, provider, amount, bytesDelivered, token))
+    keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer, provider, amount, bytesDelivered))
 ));
 
 bytes32 capabilityDigest = keccak256(abi.encodePacked(
@@ -990,12 +989,12 @@ USDC uses 6 decimals; TOKEN uses 18 decimals. All payment amounts in the `incent
 **Voucher format:**
 
 ```
-{poolId, signer, provider, amount, bytesDelivered, token, signature}
+{poolId, signer, provider, amount, bytesDelivered, signature}
 ```
 
-During delivery over `cdn/client/v1`, `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context — `poolId` from the `StreamRequest`, `signer` the bound client key, `provider` the delivering node, `token` fixed at pool open, and `bytesDelivered` the node's per-lane cumulative byte counter. See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
+During delivery over `cdn/client/v1`, `{signature, amount}` are transmitted on the wire; the remaining fields are derived from stream context — `poolId` from the `StreamRequest`, `signer` the bound client key, `provider` the delivering node, and `bytesDelivered` the node's per-lane cumulative byte counter. See [ADR 005](005-protocol.md#adr-005-wire-protocol) for wire protocol details.
 
-The `token` field (ERC-20 address) is in the signed EIP-712 typed data to prevent cross-token replay; it is the USDC contract address, fixed at deployment. Full EIP-712 type definition and domain separator: [EIP-712 Voucher Signature](#eip-712-voucher-signature).
+Full EIP-712 type definition and domain separator: [EIP-712 Voucher Signature](#eip-712-voucher-signature).
 
 ### Voucher Bytes-Delivered Field
 
