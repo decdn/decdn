@@ -81,6 +81,19 @@ is adequate and no [ADR 003](003-payments.md#adr-003-payment-model) parameter ch
 (48 h–72 h) apply identically; the 48-hour floor equals the default, so the baseline
 window can only be tightened upward and never dropped below the forced-inclusion delay (≤ 24 h).
 
+### Detection delay and the node-side floor `M`
+
+The node-side minimum-remaining-deposit `M` that keeps a pool solvent
+([ADR 003 § Pool solvency and the refundable floor `M`](003-payments.md#pool-solvency-and-the-refundable-floor-m))
+is sized as `M = k · ρ · B · Δ`, where `Δ` is the **detection delay** — how quickly the
+nodes serving a pool observe its on-chain remaining balance cross `M` and stop serving.
+`Δ` scales `M` linearly and is chain-dependent: on a fast-finality L2 a node sees the
+balance move within seconds, so `Δ` and therefore the locked `M` are small; on an L1 with
+minute-scale finality both are larger. Fast detection — hence a smaller idle reserve — is
+a concrete benefit of fast finality. `Δ` is a sizing input to node policy, not a protocol
+parameter, and it does **not** bind the chain choice: the payment model is chain-agnostic
+and this appendix's selection turns on the criteria above, not on `Δ`.
+
 ### Balancer V3 and Liquidity
 
 Balancer V3 is deployed on all three; Arbitrum is preferred because [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) already
