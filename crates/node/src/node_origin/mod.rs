@@ -45,6 +45,7 @@ mod admit_store;
 mod funder;
 mod pull_leg;
 mod resume;
+mod serve_outboard;
 
 #[allow(unused_imports, reason = "wired by Task 11's driver construction")]
 pub(crate) use admit_store::NodeAdmitStore;
