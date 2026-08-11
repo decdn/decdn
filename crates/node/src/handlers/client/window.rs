@@ -262,7 +262,14 @@ impl ClientHandler {
             .max(interval_bytes)
             .max(self.credit_window(interval_bytes));
 
-        let served_paid = Arc::new(AtomicU64::new(0));
+        // The PAID content frontier the pull leg's `WindowPacer` bounds against
+        // (`pulled_frontier − served_paid_frontier ≤ window`). `pulled_frontier` is an
+        // ABSOLUTE content offset, so seed this to the request's content start —
+        // `req.byte_offset` — not a bare 0, or a non-zero-offset request would show a
+        // full window of phantom lead and immediately `Wait`/stall. Dispatch currently
+        // gates this path to `byte_offset == 0` (so this is 0 today), but the
+        // absolute-frontier invariant is made explicit here rather than relying on that.
+        let served_paid = Arc::new(AtomicU64::new(req.byte_offset));
         let served_paid_advanced = Arc::new(Notify::new());
         let pull_ended = Arc::new(Notify::new());
         let pull_result: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> =
@@ -278,6 +285,26 @@ impl ClientHandler {
             bao_tree::blake3::Hash::from(*hash.as_bytes()),
             total_bytes,
         );
+        // Seed the outboard with proof nodes for ranges B ALREADY holds. The pull leg
+        // only captures ranges it ADMITS, but a range-minimized serve-miss can start
+        // with bytes already present (ADR 037 §held ranges read locally) — without
+        // this seed the coherent encoder would `load` a held span's proof node that
+        // was never captured, park until `pull_ended`, then fail "outboard node never
+        // captured". `outboard_pairs` over the present ranges emits exactly those
+        // nodes (plus the right-spine). Best-effort: on a full miss `present` is empty
+        // and this is a no-op; a seed error just leaves those nodes for the pull to
+        // re-capture as it re-verifies.
+        if let Ok(present) = self.cache.present_ranges(hash).await
+            && !present.chunk_ranges().is_empty()
+            && let Ok(pairs) = self
+                .cache
+                .outboard_pairs(hash, present.chunk_ranges())
+                .await
+        {
+            for (node, pair) in pairs {
+                ob_writer.save(node, pair);
+            }
+        }
 
         // The serve leg reads the cache the pull leg fills — same engine, same hash.
         let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);

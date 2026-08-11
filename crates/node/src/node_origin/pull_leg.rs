@@ -196,13 +196,21 @@ impl Pacer for LeechPacer {
 }
 
 /// Total content bytes a chunk-unit [`ChunkRanges`] covers, clamped to `total`.
+///
+/// A boundary with no matching close is an OPEN-ENDED run `[a, ∞)`: a fully-present
+/// blob observes as `ChunkRanges{0..}` (a single unpaired boundary). Pairing `(a, b)`
+/// alone would drop that final run and undercount a complete blob to 0, skewing
+/// provider scoring and region accounting. Clamp the open end to `total`.
 fn content_len(ranges: &ChunkRanges, total: u64) -> u64 {
     let boundaries = ranges.boundaries();
     let mut it = boundaries.iter();
     let mut sum = 0u64;
-    while let (Some(a), Some(b)) = (it.next(), it.next()) {
+    while let Some(a) = it.next() {
         let start = a.0.saturating_mul(CHUNK_BYTES).min(total);
-        let end = b.0.saturating_mul(CHUNK_BYTES).min(total);
+        let end = match it.next() {
+            Some(b) => b.0.saturating_mul(CHUNK_BYTES).min(total),
+            None => total,
+        };
         sum = sum.saturating_add(end.saturating_sub(start));
     }
     sum
