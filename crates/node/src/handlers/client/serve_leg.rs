@@ -497,7 +497,8 @@ impl ClientHandler {
         &self,
         send: &mut SendStream,
         recv: &mut RecvStream,
-        store: &NodeRangedStore,
+        store: NodeRangedStore,
+        outboard: crate::node_origin::OutboardReader,
         channel: &Arc<Mutex<ChannelDeliveryState>>,
         hash: Hash,
         channel_id: ChannelId,
@@ -554,8 +555,13 @@ impl ClientHandler {
         // are not lost.
         let mut reader = BufferedVoucherReader::default();
 
-        let mut producer = SpanProducer::new(
+        // The coherent whole-range bao encoder (#1621 B2 part 2, ADR 038): ONE
+        // verified stream for `R`, produced incrementally — leaf data awaited from
+        // the cache the pull fills, proof nodes from the shared `outboard` the pull
+        // captures. Replaces the incoherent piece-wise `encode_range` producer.
+        let mut producer = super::serve_encoder::CoherentFrameProducer::new(
             store,
+            outboard,
             offset,
             end,
             total_bytes,

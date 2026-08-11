@@ -274,7 +274,7 @@ impl ClientHandler {
         // and the serve leg's coherent whole-range encoder reads them through a reader
         // minted from `ob_factory`. The pull can start capturing before the serve leg
         // wires its reader, which is why construction and reader-minting are split.
-        let (ob_writer, _ob_factory) = crate::node_origin::shared_outboard(
+        let (ob_writer, ob_factory) = crate::node_origin::shared_outboard(
             bao_tree::blake3::Hash::from(*hash.as_bytes()),
             total_bytes,
         );
@@ -341,12 +341,17 @@ impl ClientHandler {
             }
         };
 
+        // Mint the serve leg's outboard reader from the shared factory, bound to the
+        // pull's terminal signals for the coherent encoder's no-hang guarantee.
+        let outboard_reader = ob_factory.reader(Arc::clone(&pull_ended), Arc::clone(&pull_result));
+
         // Run the serve leg on THIS (accept) task and await it. It owns termination.
         let serve_result = self
             .serve_leg(
                 &mut send,
                 &mut recv,
-                &serve_store,
+                serve_store,
+                outboard_reader,
                 &channel,
                 hash,
                 channel_id,
