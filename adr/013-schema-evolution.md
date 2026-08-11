@@ -61,7 +61,7 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 #### `ChunkData` exemption
 
-`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher`/`VoucherAck` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
+`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
 
 #### Gossip Framing
 
@@ -102,8 +102,7 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    VoucherAck,                       // 4
-    StreamEnd,                        // 5
+    StreamEnd,                        // 4
 }
 ```
 
@@ -266,7 +265,7 @@ fn serialize_stream_request(base: &StreamRequestBase, ext: &StreamRequestExt) ->
 }
 ```
 
-Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have no trailing bytes — the `take_from_bytes` remainder is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; two-phase logic lives in per-message-type application code.
+Messages without extensions (e.g., `StreamEnd`, `ChunkData`) have no trailing bytes — the `take_from_bytes` remainder is empty. The framing helpers (`read_frame`/`write_frame`) are agnostic to extensions; two-phase logic lives in per-message-type application code.
 
 **Rules:**
 
@@ -295,11 +294,10 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    VoucherAck,                       // 4
-    StreamEnd,                        // 5
+    StreamEnd,                        // 4
     // Added via medium evolution
-    Ping(PingRequest),                // 6
-    Pong(PongResponse),              // 7
+    Ping(PingRequest),                // 5
+    Pong(PongResponse),              // 6
 }
 ```
 
