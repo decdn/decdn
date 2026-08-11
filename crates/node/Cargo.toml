@@ -45,6 +45,10 @@ decdn-bao-range = { workspace = true }
 # directly (the same signature `NodeRangedStore` uses), so `NodeAdmitStore`'s
 # delegating impl names the type — not just a dev/test dependency any more.
 bao-tree = { workspace = true }
+# `iroh_io::{AsyncSliceReader, AsyncStreamWriter}` — the reader/writer axes the
+# coherent serve-miss encoder (`serve_encoder.rs`) hands to `bao_tree`'s async
+# `encode_ranges_validated`. Promoted from dev to a normal dep for that path.
+iroh-io = { workspace = true }
 decdn-incentive = { workspace = true, features = ["buyer-store-core"] }
 decdn-reputation = { workspace = true }
 decdn-gossip = { workspace = true }
@@ -101,9 +105,6 @@ decdn-client-pull = { workspace = true, features = ["test-util"] }
 # shape as `decdn-client-pull` above.
 decdn-incentive = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
-# `admit_store.rs`'s in-memory `BaoRangeReader` test double implements
-# `iroh_io::AsyncStreamReader` directly over a `Bytes` cursor.
-iroh-io = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):
 # xor_distance metric laws and the fixed-bucket / within-K invariants under
 # random insert/remove sequences. Mirrors the `proptest` usage already in
