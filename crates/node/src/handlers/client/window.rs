@@ -295,6 +295,10 @@ impl ClientHandler {
             let offset = req.byte_offset;
             let len = req.byte_len;
             let outboard_writer = ob_writer;
+            // Seed-leech cap (ADR 037): re-homed into the pull leg's pacer. The served
+            // client is the accounting key.
+            let leech_governor = self.leech_governor.clone();
+            let client_peer = client_node_id.0;
             std::thread::Builder::new()
                 .name("serve-miss-pull".to_string())
                 .spawn(move || {
@@ -315,6 +319,8 @@ impl ClientHandler {
                             Arc::clone(&pull_ended),
                             pull_result.clone(),
                             outboard_writer,
+                            leech_governor,
+                            client_peer,
                             cancel,
                         )),
                         Err(e) => {

@@ -37,7 +37,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -47,8 +47,11 @@ use decdn_bao_range::RangedStore;
 use decdn_cache::{CacheEngine, CacheError, Hash};
 use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::{
-    HashMismatch as ClientPullHashMismatch, PacingWait, PeerSource, WindowPacer, drive,
+    HashMismatch as ClientPullHashMismatch, PaceDecision, PaceState, Pacer, PacingWait, PeerSource,
+    WindowPacer, drive,
 };
+
+use crate::leech_governor::LeechGovernor;
 use decdn_reputation::Outcome;
 use iroh::{EndpointAddr, PublicKey};
 use tokio::sync::Notify;
@@ -135,6 +138,60 @@ impl PacingWait for ServedPaidWait {
     fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.metrics.node_pull_through_window_paused();
         Box::pin(async move { self.served_paid_advanced.notified().await })
+    }
+}
+
+/// The pull leg's [`Pacer`]: a [`WindowPacer`] (ADR 037 window) plus the ADR 037
+/// §Seed-leech admission cap. The fused `window_forward_loop` re-checked the leech
+/// cap per interval; the decoupled pull re-homes it here so an abusive peer's
+/// speculative UPSTREAM spend is bounded the same way.
+///
+/// On each pacing decision it accounts the newly-pulled content bytes into the
+/// [`LeechGovernor`] (from the driver's `pulled_frontier`, so no per-chunk hook is
+/// needed), then, if the window would draw more, consults
+/// [`LeechGovernor::poll_admission`]. A denial (the peer is over its share-ratio
+/// allowance with nothing to recoup — the metric fires inside `poll_admission`)
+/// returns [`PaceDecision::Refuse`], which `drive` turns into a terminal stop: the
+/// partial fill is never finalized (so it does not promote), and `refused` is
+/// latched so [`run_pull_leg`] SKIPS provider scoring — a leech stop is our own
+/// abuse cap, not provider misbehaviour (mirrors the fused loop's
+/// `pull.abandon(None)`).
+///
+/// With no governor wired (`governor == None`) it is a pass-through `WindowPacer`.
+struct LeechPacer {
+    window: WindowPacer,
+    governor: Option<Arc<LeechGovernor>>,
+    /// The served DOWNSTREAM client's node id — the seed-leech accounting key.
+    peer: [u8; 32],
+    /// The `pulled_frontier` seen at the last decision, so each decision records
+    /// only the newly-pulled delta.
+    last_pulled: AtomicU64,
+    /// Latched when this pacer refuses on the leech cap, so `run_pull_leg` can tell a
+    /// leech stop from a provider fault and skip scoring.
+    refused: Arc<AtomicBool>,
+}
+
+impl Pacer for LeechPacer {
+    fn decide(&self, state: &PaceState) -> PaceDecision {
+        let Some(governor) = self.governor.as_ref() else {
+            return self.window.decide(state);
+        };
+        // Account the content bytes pulled since the last decision (the speculative
+        // upstream spend the cap governs).
+        let last = self
+            .last_pulled
+            .swap(state.pulled_frontier, Ordering::Relaxed);
+        let delta = state.pulled_frontier.saturating_sub(last);
+        if delta > 0 {
+            governor.record_pulled(&self.peer, delta);
+        }
+        let base = self.window.decide(state);
+        // Only gate an actual draw: Done/Wait/Refuse/TopUp pass through unchanged.
+        if matches!(base, PaceDecision::Draw { .. }) && !governor.poll_admission(&self.peer) {
+            self.refused.store(true, Ordering::Relaxed);
+            return PaceDecision::Refuse;
+        }
+        base
     }
 }
 
@@ -438,6 +495,8 @@ pub(crate) async fn run_pull_leg(
     pull_ended: Arc<Notify>,
     pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
     outboard_writer: super::serve_outboard::OutboardWriter,
+    leech_governor: Option<Arc<LeechGovernor>>,
+    client_peer: [u8; 32],
     cancel: CancellationToken,
 ) {
     let hash_bytes = *hash.as_bytes();
@@ -514,7 +573,16 @@ pub(crate) async fn run_pull_leg(
         rate_ceiling,
         deadlines,
     );
-    let window_pacer = WindowPacer::new(window);
+    // The window + seed-leech pacer (ADR 037). `refused` is latched by the pacer on a
+    // leech stop so the scoring below can skip it.
+    let leech_refused = Arc::new(AtomicBool::new(false));
+    let leech_pacer = LeechPacer {
+        window: WindowPacer::new(window),
+        governor: leech_governor,
+        peer: client_peer,
+        last_pulled: AtomicU64::new(0),
+        refused: Arc::clone(&leech_refused),
+    };
     let node_funder = NodeFunder::new(
         Arc::clone(&deps.buyer),
         provider_addr,
@@ -548,7 +616,7 @@ pub(crate) async fn run_pull_leg(
         r = drive(
             &admit_store,
             &peer_source,
-            &window_pacer,
+            &leech_pacer,
             &node_funder,
             &ctx,
             &ledger,
@@ -590,9 +658,23 @@ pub(crate) async fn run_pull_leg(
         tokio::time::sleep(ABANDON_DRAIN).await;
     }
 
+    // A seed-leech stop is our own abuse cap firing (ADR 037 §Seed-leech caps), not
+    // the provider misbehaving. Replace `drive`'s generic funding-refuse message with
+    // a clear one for the serve leg / logs, and skip provider scoring below — exactly
+    // as the fused loop's `pull.abandon(None)` did.
+    let refused = leech_refused.load(Ordering::Relaxed);
+    let result = if refused {
+        Err(anyhow::anyhow!(
+            "serve-miss pull refused: seed-leech cap denied further speculative pull with \
+             nothing to recoup"
+        ))
+    } else {
+        result
+    };
+
     // Re-homed reputation + region accounting (from `NodeProgressivePull::finish`),
-    // skipped on cancel.
-    if !cancelled {
+    // skipped on cancel and on a leech stop.
+    if !cancelled && !refused {
         match &result {
             Ok(()) => {
                 record_outcome(
