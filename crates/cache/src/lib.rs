@@ -38,7 +38,7 @@ pub use circuit_breaker::{
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
     CacheEngine, EvictionCandidates, EvictionPreview, PresentRanges, RangePullOutcome, TeeOpen,
-    TeeReservation, TeeSink,
+    TeeReservation,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
