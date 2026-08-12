@@ -1,6 +1,6 @@
-//! Failure-class taxonomy for the buyer-side `openChannel` path (#966).
+//! Failure-class taxonomy for the buyer-side `openPool` path (#966).
 //!
-//! The buyer `open_channel` kernel (`decdn-client-pull`) can fail three ways
+//! The buyer `open_pool` kernel (`decdn-client-pull`) can fail three ways
 //! that an operator must triage differently:
 //!
 //! - **`InsufficientDeposit`** — a *misconfiguration*: the node's USDC balance
@@ -11,15 +11,16 @@
 //!   load, so the reachable zero here is the received-delta one, or a hand-passed
 //!   CLI `--initial-deposit-micro-usdc 0`.) The fix is operator-side (fund the
 //!   the deposit), not infrastructure.
-//! - **`ContractRevert`** — any *other* deterministic on-chain revert (provider
-//!   not active, a paused contract, a future revert reason). The deposit was
-//!   not escrowed; the cause is on-chain state, not this node's wallet or RPC.
-//! - **`RpcError`** — a *transient* transport/RPC fault (connectivity, a timed
-//!   out receipt wait, a nonce blip). Retrying typically clears it; the fix is
-//!   infrastructure-side.
+//! - **`ContractRevert`** — any *other* deterministic on-chain revert (a
+//!   paused contract, a future revert reason). The deposit was not escrowed;
+//!   the cause is on-chain state, not this node's wallet or RPC.
+//! - **`RpcError`** — a *transient* transport/RPC fault (connectivity, a
+//!   timed out receipt wait, a transaction-nonce blip — the sender's tx
+//!   sequence number, unrelated to a voucher). Retrying typically clears it;
+//!   the fix is infrastructure-side.
 //!
 //! Splitting these lets the node bump the matching
-//! `decdn_channel_open_failures_{insufficient_deposit,contract_revert,rpc_error}_total`
+//! `decdn_pool_open_failures_{insufficient_deposit,contract_revert,rpc_error}_total`
 //! sibling counter (a plain counter field carries no label dimension, so each class is its own
 //! counter rather than one labeled `{reason=…}` series) and emit the same
 //! `reason` token as a structured-log field, so a dashboard distinguishes "the
@@ -36,33 +37,33 @@ use alloy::sol;
 use alloy::sol_types::SolError;
 
 sol! {
-    /// `PaymentChannel.openChannel` reverts this when the requested deposit — or
-    /// the balance delta actually received, under a fee-on-transfer token — is
-    /// zero. Declared here only for its 4-byte selector, so the classifier needs
-    /// no live contract binding.
+    /// `PaymentPool.openPool` reverts this when the requested deposit — or
+    /// the balance delta actually received, under a fee-on-transfer token —
+    /// is zero. Declared here only for its 4-byte selector, so the
+    /// classifier needs no live contract binding.
     ///
-    /// Unlike the `DepositBelowMinimum` it replaced, this selector is NOT unique
-    /// to `openChannel`: `PaymentChannel.topUp` reverts it too, and `FeeRouter`,
-    /// `CapacityBond` and `BuybackBurner` each declare the identical
-    /// argument-less signature, so all five share one 4-byte selector. Safe here
-    /// only because [`ChannelOpenFailureReason::classify_revert_data`] is called
-    /// on the open path alone; widening its use would need this checked.
+    /// This selector is NOT unique to `openPool`: `PaymentPool.topUp`
+    /// reverts it too, and `FeeRouter`, `CapacityBond` and `BuybackBurner`
+    /// each declare the identical argument-less signature, so all five
+    /// share one 4-byte selector. Safe here only because
+    /// [`PoolOpenFailureReason::classify_revert_data`] is called on the
+    /// open path alone; widening its use would need this checked.
     error ZeroAmount();
 
     /// `OpenZeppelin` v5 `ERC20`: the spender's balance is below the transfer
-    /// amount. `openChannel`'s `safeTransferFrom` bubbles this up verbatim when
+    /// amount. `openPool`'s `safeTransferFrom` bubbles this up verbatim when
     /// the node's USDC balance cannot cover the deposit.
     error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed);
 
     /// `OpenZeppelin` v5 `ERC20`: the standing allowance is below the transfer
     /// amount. Surfaces when the one-time `approve` never ran (or was set too
-    /// low) for the `PaymentChannel` spender.
+    /// low) for the `PaymentPool` spender.
     error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
 }
 
-/// Which class of failure aborted a buyer `openChannel` attempt (#966). Carried
+/// Which class of failure aborted a buyer `openPool` attempt (#966). Carried
 /// through the `anyhow` error chain as typed context so the metrics layer can
-/// bump the matching `decdn_channel_open_failures_{reason}_total` sibling
+/// bump the matching `decdn_pool_open_failures_{reason}_total` sibling
 /// counter (one counter per class — a plain counter field carries no label dimension) and
 /// attach a structured `reason` log field, while the human-readable message is
 /// preserved for logs.
@@ -70,11 +71,11 @@ sol! {
 /// The sibling-counter shape is the settled convention (#1475), not a stopgap:
 /// these three classes have unrelated operator remedies (fund the wallet / fix
 /// the contract call / chase the RPC) *and* no meaningful aggregate — "how many
-/// channel opens failed" is not a question with one answer or one response. `decdn_probe_hold_unavailable_total` is the one
+/// pool opens failed" is not a question with one answer or one response. `decdn_probe_hold_unavailable_total` is the one
 /// labeled reason split, and it is labeled precisely because its values *do*
 /// share one aggregate and one budget axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChannelOpenFailureReason {
+pub enum PoolOpenFailureReason {
     /// The node's USDC balance/allowance cannot cover the deposit, or the
     /// deposit is zero — as requested, or as the received balance delta under a
     /// fee-on-transfer token. An operator misconfiguration either way. Metric
@@ -88,9 +89,9 @@ pub enum ChannelOpenFailureReason {
     RpcError,
 }
 
-impl ChannelOpenFailureReason {
+impl PoolOpenFailureReason {
     /// The metric/label and structured-log `reason` token for this class —
-    /// the `{reason}` slug in the `decdn_channel_open_failures_{reason}_total`
+    /// the `{reason}` slug in the `decdn_pool_open_failures_{reason}_total`
     /// sibling counter name and the value of the structured-log `reason` field.
     #[must_use]
     pub const fn as_label(self) -> &'static str {
@@ -101,7 +102,7 @@ impl ChannelOpenFailureReason {
         }
     }
 
-    /// Classify the revert data (if any) attached to an `openChannel` *submit*
+    /// Classify the revert data (if any) attached to an `openPool` *submit*
     /// (`send()`) error. `None` revert data is a transport/RPC fault; present
     /// revert data is decoded against the insufficient-deposit error selectors
     /// to split `InsufficientDeposit` from a generic `ContractRevert`.
@@ -113,7 +114,7 @@ impl ChannelOpenFailureReason {
     pub fn classify_revert_data(revert_data: Option<&Bytes>) -> Self {
         let Some(data) = revert_data else {
             // No revert payload → the call never reached deterministic execution
-            // (connectivity, nonce, a timed-out estimate): a transport fault.
+            // (connectivity, tx-nonce, a timed-out estimate): a transport fault.
             return Self::RpcError;
         };
         if is_insufficient_deposit_selector(data) {
@@ -124,9 +125,9 @@ impl ChannelOpenFailureReason {
     }
 }
 
-impl std::fmt::Display for ChannelOpenFailureReason {
+impl std::fmt::Display for PoolOpenFailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "channel-open failure reason: {}", self.as_label())
+        write!(f, "pool-open failure reason: {}", self.as_label())
     }
 }
 
@@ -151,8 +152,8 @@ mod tests {
     #[test]
     fn no_revert_data_is_rpc_error() {
         assert_eq!(
-            ChannelOpenFailureReason::classify_revert_data(None),
-            ChannelOpenFailureReason::RpcError
+            PoolOpenFailureReason::classify_revert_data(None),
+            PoolOpenFailureReason::RpcError
         );
     }
 
@@ -160,8 +161,8 @@ mod tests {
     fn zero_amount_is_insufficient_deposit() {
         let data = Bytes::from(ZeroAmount {}.abi_encode());
         assert_eq!(
-            ChannelOpenFailureReason::classify_revert_data(Some(&data)),
-            ChannelOpenFailureReason::InsufficientDeposit
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::InsufficientDeposit
         );
     }
 
@@ -176,8 +177,8 @@ mod tests {
             .abi_encode(),
         );
         assert_eq!(
-            ChannelOpenFailureReason::classify_revert_data(Some(&data)),
-            ChannelOpenFailureReason::InsufficientDeposit
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::InsufficientDeposit
         );
     }
 
@@ -192,8 +193,8 @@ mod tests {
             .abi_encode(),
         );
         assert_eq!(
-            ChannelOpenFailureReason::classify_revert_data(Some(&data)),
-            ChannelOpenFailureReason::InsufficientDeposit
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::InsufficientDeposit
         );
     }
 
@@ -203,8 +204,8 @@ mod tests {
         // errors (e.g. `ProviderNotActive`) → generic contract revert.
         let data = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]);
         assert_eq!(
-            ChannelOpenFailureReason::classify_revert_data(Some(&data)),
-            ChannelOpenFailureReason::ContractRevert
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::ContractRevert
         );
     }
 
@@ -214,21 +215,21 @@ mod tests {
         // and falls through to the generic revert class.
         let data = Bytes::from(vec![0x01, 0x02]);
         assert_eq!(
-            ChannelOpenFailureReason::classify_revert_data(Some(&data)),
-            ChannelOpenFailureReason::ContractRevert
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::ContractRevert
         );
     }
 
     #[test]
     fn labels_are_the_documented_reason_tokens() {
         assert_eq!(
-            ChannelOpenFailureReason::InsufficientDeposit.as_label(),
+            PoolOpenFailureReason::InsufficientDeposit.as_label(),
             "insufficient_deposit"
         );
         assert_eq!(
-            ChannelOpenFailureReason::ContractRevert.as_label(),
+            PoolOpenFailureReason::ContractRevert.as_label(),
             "contract_revert"
         );
-        assert_eq!(ChannelOpenFailureReason::RpcError.as_label(), "rpc_error");
+        assert_eq!(PoolOpenFailureReason::RpcError.as_label(), "rpc_error");
     }
 }

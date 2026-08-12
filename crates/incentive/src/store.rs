@@ -17,7 +17,7 @@ use std::sync::Mutex;
 
 use alloy::primitives::B256;
 
-use crate::lane::{ChannelId, LaneKey, LaneState};
+use crate::lane::{LaneKey, LaneState, PoolId};
 
 /// Durable backing store for [`LaneState`], keyed by [`LaneKey`].
 ///
@@ -253,11 +253,11 @@ pub enum StoreError {
     /// Record bytes are structurally invalid — missing magic, truncated, or
     /// otherwise unparseable. Includes the affected id (when it can be
     /// recovered) and a free-form detail.
-    #[error("corrupt record for {channel_id:?}: {detail}")]
+    #[error("corrupt record for {pool_id:?}: {detail}")]
     Corrupt {
         /// Id of the corrupt record, or `None` if the corruption is at the
         /// table / file level and no key could be recovered.
-        channel_id: Option<ChannelId>,
+        pool_id: Option<PoolId>,
         /// Human-readable detail for the operator log.
         detail: String,
     },

@@ -21,10 +21,11 @@ use alloy::primitives::{Address, B256, U256};
 use crate::store::{PoolStateStore, StoreError};
 use crate::voucher::{SignedVoucher, VoucherError};
 
-/// An opaque 32-byte identifier shared with the buyer-side channel bookkeeping.
-/// The buyer modules key their per-provider deposit state by this type; the
-/// seller-side lane keys off [`LaneKey`] instead.
-pub type ChannelId = B256;
+/// An opaque 32-byte pool identifier — the on-chain `PaymentPool` deposit id
+/// (`keccak256(owner, ownerPoolNonce)`). The buyer modules key their
+/// per-owner pool state by this type; the seller-side lane keys off
+/// [`LaneKey`] instead.
+pub type PoolId = B256;
 
 /// Identifies one voucher lane: a `(pool_id, signer, provider)` triple. This is
 /// the seller-side persistence key — one accepted-voucher watermark per lane.
