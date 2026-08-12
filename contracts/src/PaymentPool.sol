@@ -353,6 +353,56 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         if (paid == 0) revert NothingToRedeem();
     }
 
+    /// @notice One `capabilities` entry to register, mirroring `redeem`'s
+    ///         decoded `(spendingCap, expiry, ownerSig)` capability tuple plus
+    ///         the `poolId`/`signer` it names.
+    struct CapabilityReg {
+        bytes32 poolId;
+        address signer;
+        uint256 spendingCap;
+        uint64 expiry;
+        bytes ownerSig;
+    }
+
+    /// @notice One `vouchers` entry to redeem, mirroring `redeem`'s voucher
+    ///         parameters plus the `poolId` it names.
+    struct RedeemVoucher {
+        bytes32 poolId;
+        address signer;
+        address provider;
+        uint256 cumulative;
+        uint256 bytesDelivered;
+        bytes voucherSig;
+    }
+
+    /// @notice Register every capability, then redeem every voucher, in one
+    ///         transaction (ADR 003 § Batch redemption). A node registers the
+    ///         signers it needs and redeems all its lanes at once. The two
+    ///         loops are decoupled: registration never depends on whether any
+    ///         voucher in the batch pays. `_registerCapability` is idempotent
+    ///         (a duplicate or already-registered signer is a no-op) and
+    ///         reverts on a bad owner signature; `_redeemVoucher` returns 0 on
+    ///         every transient-empty voucher (including one whose signer is
+    ///         covered by neither this call's `capabilities` nor a prior
+    ///         registration), which this loop simply skips, and reverts on a
+    ///         structural error (bad voucher signature, wrong provider,
+    ///         closed pool, sub-floor rate) that rolls back the whole batch.
+    function redeemMany(CapabilityReg[] calldata capabilities, RedeemVoucher[] calldata vouchers)
+        external
+        nonReentrant
+        returns (uint256 totalPaid)
+    {
+        for (uint256 i = 0; i < capabilities.length; i++) {
+            CapabilityReg calldata c = capabilities[i];
+            _registerCapability(c.poolId, c.signer, c.spendingCap, c.expiry, c.ownerSig);
+        }
+
+        for (uint256 i = 0; i < vouchers.length; i++) {
+            RedeemVoucher calldata v = vouchers[i];
+            totalPaid += _redeemVoucher(v.poolId, v.signer, v.provider, v.cumulative, v.bytesDelivered, v.voucherSig);
+        }
+    }
+
     // -----------------------------------------------------------------
     // Views
     // -----------------------------------------------------------------

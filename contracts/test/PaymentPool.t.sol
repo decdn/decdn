@@ -1002,6 +1002,312 @@ contract PaymentPoolTest is Test {
             assertEq(wAmount, amount);
         }
     }
+
+    // -----------------------------------------------------------------
+    // redeemMany — register-batch then redeem-batch (ADR 003 § Batch redemption)
+    // -----------------------------------------------------------------
+
+    function test_redeemMany_registersCapabilitiesThenRedeemsVouchers() public {
+        bytes32 id = _open();
+        address provider2 = address(0xCAFE);
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            poolId: id,
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+
+        PaymentPool.RedeemVoucher[] memory vouchers1 = new PaymentPool.RedeemVoucher[](1);
+        vouchers1[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 200e6,
+            bytesDelivered: 20_000_000,
+            voucherSig: _voucher(id, 200e6, 20_000_000)
+        });
+
+        vm.prank(provider);
+        uint256 totalPaid1 = pool.redeemMany(caps, vouchers1);
+        assertEq(totalPaid1, 200e6, "capability registers signer; voucher pays in the same call");
+
+        // A second call from the other provider, empty `capabilities` since
+        // `signer` is already registered, pays its own lane.
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.RedeemVoucher[] memory vouchers2 = new PaymentPool.RedeemVoucher[](1);
+        vouchers2[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider2,
+            cumulative: 150e6,
+            bytesDelivered: 15_000_000,
+            voucherSig: _signVoucherFor(address(pool), id, signer, provider2, 150e6, 15_000_000, SIGNER_PK)
+        });
+
+        vm.prank(provider2);
+        uint256 totalPaid2 = pool.redeemMany(noCaps, vouchers2);
+        assertEq(totalPaid2, 150e6);
+        assertEq(totalPaid1 + totalPaid2, 350e6, "totalPaid sums across the two lanes");
+    }
+
+    function test_redeemMany_redeemsWithEmptyCapabilitiesWhenAlreadyRegistered() public {
+        bytes32 id = _open();
+        // A prior single `redeem` registers `signer`.
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](1);
+        vouchers[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 300e6,
+            bytesDelivered: 30_000_000,
+            voucherSig: _voucher(id, 300e6, 30_000_000)
+        });
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(noCaps, vouchers);
+        assertEq(totalPaid, 100e6, "empty capabilities still redeems an already-registered signer");
+    }
+
+    function test_redeemMany_skipsUncoveredSignerVoucher() public {
+        bytes32 id = _open();
+        // `signer` is registered and funded via a normal `redeem`.
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        // `stranger` is never registered and is not in this batch's
+        // `capabilities` either; `_redeemVoucher` returns 0 for an
+        // unregistered signer before it even checks the voucher signature,
+        // so a garbage `voucherSig` here is enough.
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](2);
+        vouchers[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: stranger,
+            provider: provider,
+            cumulative: 100e6,
+            bytesDelivered: 10_000_000,
+            voucherSig: hex"00"
+        });
+        vouchers[1] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 300e6,
+            bytesDelivered: 30_000_000,
+            voucherSig: _voucher(id, 300e6, 30_000_000)
+        });
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(noCaps, vouchers);
+        assertEq(totalPaid, 100e6, "uncovered-signer voucher skips; the covered voucher still pays");
+    }
+
+    function test_redeemMany_skipsEmptyLane_doesNotRevert() public {
+        bytes32 id = _open();
+        // Register + pay once via a single `redeem` so a later replay of the
+        // same cumulative is stale (transient-empty, not structural).
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        uint256 signer2Pk = 0xBEEF2;
+        address signer2 = vm.addr(signer2Pk);
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            poolId: id,
+            signer: signer2,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer2, SPENDING_CAP, expiry, OWNER_PK)
+        });
+
+        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](2);
+        // Stale replay of the already-paid cumulative: pays 0, skipped.
+        vouchers[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 200e6,
+            bytesDelivered: 20_000_000,
+            voucherSig: _voucher(id, 200e6, 20_000_000)
+        });
+        // Freshly registered signer pays.
+        vouchers[1] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer2,
+            provider: provider,
+            cumulative: 100e6,
+            bytesDelivered: 10_000_000,
+            voucherSig: _signVoucherFor(address(pool), id, signer2, provider, 100e6, 10_000_000, signer2Pk)
+        });
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(caps, vouchers);
+        assertEq(totalPaid, 100e6, "stale lane skipped without reverting; the fresh signer's voucher still pays");
+    }
+
+    function test_redeemMany_revertsOnBadVoucherSignature() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](1);
+        vouchers[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 300e6,
+            bytesDelivered: 30_000_000,
+            voucherSig: _voucher(id, 299e6, 30_000_000) // signed over a different amount
+        });
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.InvalidVoucherSignature.selector);
+        pool.redeemMany(noCaps, vouchers);
+    }
+
+    function test_redeemMany_revertsOnWrongProviderEntry() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](1);
+        vouchers[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 300e6,
+            bytesDelivered: 30_000_000,
+            voucherSig: _voucher(id, 300e6, 30_000_000)
+        });
+
+        // Caller is not the `provider` named in the voucher entry.
+        vm.prank(stranger);
+        vm.expectRevert(PaymentPool.NotProvider.selector);
+        pool.redeemMany(noCaps, vouchers);
+    }
+
+    function test_redeemMany_revertsOnBadCapabilityOwnerSig() public {
+        bytes32 id = _open();
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            poolId: id,
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            // Signed over a different cap than advertised → recovery misses the owner.
+            ownerSig: _signCapabilityFor(address(pool), id, signer, 999e6, expiry, OWNER_PK)
+        });
+        PaymentPool.RedeemVoucher[] memory noVouchers = new PaymentPool.RedeemVoucher[](0);
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.InvalidCapabilitySignature.selector);
+        pool.redeemMany(caps, noVouchers);
+    }
+
+    function test_redeemMany_registersSignerOncePerNewSigner() public {
+        bytes32 id = _open();
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](2);
+        caps[0] = PaymentPool.CapabilityReg({
+            poolId: id,
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        // A duplicate entry for the same signer, advertising a different
+        // cap/expiry and a signature that would fail if re-verified. The
+        // second registration is a no-op, so it is never evaluated.
+        caps[1] =
+            PaymentPool.CapabilityReg({ poolId: id, signer: signer, spendingCap: 1, expiry: 1, ownerSig: hex"00" });
+        PaymentPool.RedeemVoucher[] memory noVouchers = new PaymentPool.RedeemVoucher[](0);
+
+        vm.prank(provider);
+        pool.redeemMany(caps, noVouchers);
+
+        (uint256 cap, uint64 exp,) = pool.authorized(id, signer);
+        assertEq(cap, SPENDING_CAP, "first registration wins");
+        assertEq(uint256(exp), uint256(expiry));
+    }
+
+    function test_redeemMany_emitsPerPaidVoucher() public {
+        bytes32 id = _open();
+        uint256 signer2Pk = 0xBEEF3;
+        address signer2 = vm.addr(signer2Pk);
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](2);
+        caps[0] = PaymentPool.CapabilityReg({
+            poolId: id,
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        caps[1] = PaymentPool.CapabilityReg({
+            poolId: id,
+            signer: signer2,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer2, SPENDING_CAP, expiry, OWNER_PK)
+        });
+
+        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](2);
+        vouchers[0] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer,
+            provider: provider,
+            cumulative: 100e6,
+            bytesDelivered: 10_000_000,
+            voucherSig: _voucher(id, 100e6, 10_000_000)
+        });
+        vouchers[1] = PaymentPool.RedeemVoucher({
+            poolId: id,
+            signer: signer2,
+            provider: provider,
+            cumulative: 150e6,
+            bytesDelivered: 15_000_000,
+            voucherSig: _signVoucherFor(address(pool), id, signer2, provider, 150e6, 15_000_000, signer2Pk)
+        });
+
+        vm.prank(provider);
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit PoolRedeemed(id, signer, provider, 100e6, 10_000_000, 100e6);
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit PoolRedeemed(id, signer2, provider, 150e6, 15_000_000, 150e6);
+        uint256 totalPaid = pool.redeemMany(caps, vouchers);
+        assertEq(totalPaid, 250e6, "one PoolRedeemed per paid voucher; totalPaid sums both");
+    }
+
+    function test_redeemMany_bothArraysEmptyReturnsZeroNoRevert() public {
+        _open();
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.RedeemVoucher[] memory noVouchers = new PaymentPool.RedeemVoucher[](0);
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(noCaps, noVouchers);
+        assertEq(totalPaid, 0, "nothing structurally wrong with an empty/empty batch");
+    }
 }
 
 /// @notice Test-only subclass exposing a way to force a pool's `status`
