@@ -1305,8 +1305,8 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
 /// concurrent `cdn/client/v1` requests are served in parallel. The default
 /// `support::spawn_server` awaits `handler.accept` INLINE in its accept loop, so a
 /// long-running first serve blocks the loop and the second connection's `connect`
-/// times out — which also means the second request would never reach
-/// `open_tee_sink` while the first still holds the reservation, defeating the
+/// times out — which also means the second request would never reach the fill
+/// registry (`claim_fill`) while the first still owns the live fill, defeating the
 /// coalescing this test exercises. Mirrors `spawn_server_concurrent` in
 /// `node_origin_pull.rs`.
 fn spawn_server_concurrent(
@@ -1329,11 +1329,11 @@ fn spawn_server_concurrent(
 }
 
 /// Build a `ClientHandler` over an `HttpOrigin` with TWO independently-funded
-/// channels (one per concurrent client) and a node→node pull-through deadline
-/// wired so the coalescing `await_coalesced_fill` (→ `try_pull_through` →
-/// `populate`) can WAIT on the in-flight entry rather than doing a bare presence
-/// check. Two channels (not one) so each of the two concurrent deliveries has its
-/// own monotonic voucher accounting; coalescing keys on the HASH, not the channel.
+/// channels (one per concurrent client). Two channels (not one) so each of the two
+/// concurrent deliveries has its own monotonic voucher accounting; the fill
+/// registry keys coalescing on the HASH, not the channel. The pull-through deadline
+/// is threaded through unchanged (own-origin coalescing does not use it, but the
+/// helper is shared).
 #[allow(clippy::too_many_arguments)]
 async fn handler_two_channels_over_http_origin(
     origin_uri: &str,
@@ -1385,19 +1385,20 @@ async fn handler_two_channels_over_http_origin(
 }
 
 /// TWO concurrent whole-blob own-origin misses for the SAME hash COALESCE to a
-/// single local pull / single origin ranged GET (Flow A whole-blob double-pull
-/// guard). Without the guard each request would open its own
-/// `serve_via_backend_origin` and draw the blob from origin twice; with it, the
-/// first request claims the in-flight `open_tee_sink` slot (`TeeOpen::Owner`) and
-/// the second parks on `TeeOpen::InFlight` → `await_coalesced_fill`, then serves
-/// the now-present blob from the store. The proof is on the ORIGIN side: exactly
-/// ONE ranged `206` data GET reaches the backend (not two), the own-origin serve
-/// tier fires ONCE (only the owner runs `serve_via_backend_origin`), and BOTH
-/// clients receive the whole blob byte-exact.
+/// single origin ranged GET (#1621 B3, `CacheEngine::claim_fill`). Both requests
+/// enter `serve_via_backend_origin`; under one registry lock the first OWNS the
+/// local origin pull and the second ATTACHES as an observer, streaming the SAME
+/// filling cache to its own client. So the node eats the S3 egress ONCE — the
+/// headline own-origin saving — while running TWO live serve legs (DECISION-A:
+/// "one S3 fetch + two live serve legs", replacing the old sequential
+/// park-and-wait). The proof is on the ORIGIN side: exactly ONE ranged `206` data
+/// GET reaches the backend (not two), and BOTH clients receive the whole blob
+/// byte-exact on their own channels. The own-origin serve tier therefore fires
+/// TWICE now (both legs genuinely serve via the backend-origin path), not once.
 ///
 /// The race is forced deterministically: the origin's ranged data GET is delayed,
-/// so the first request holds the reservation across a wide window; the second is
-/// launched after a short stagger, guaranteeing it observes `InFlight`.
+/// so the owner holds the fill across a wide window; the second is launched after a
+/// short stagger, guaranteeing it observes the live fill and attaches.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyhow::Result<()> {
@@ -1429,10 +1430,10 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    // The ranged data GET — DELAYED so the owning request holds the in-flight
-    // reservation across a wide window while the second request parks on
-    // `TeeOpen::InFlight`. If the guard is absent, BOTH requests reach here and
-    // this mock records TWO matching GETs; the assertion below then fails.
+    // The ranged data GET — DELAYED so the owning request holds the live fill
+    // across a wide window while the second request attaches to it. If coalescing
+    // is absent, BOTH requests reach here and this mock records TWO matching GETs;
+    // the assertion below then fails.
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -1480,8 +1481,8 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
     let waiter_target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     // Request A (the owner) is launched first and, after a short stagger, request B
-    // — by then A holds the reservation and is blocked on the delayed origin GET, so
-    // B is guaranteed to observe `TeeOpen::InFlight`.
+    // — by then A holds the `claim_fill` Owner claim and is blocked on the delayed
+    // origin GET, so B is guaranteed to Attach to A's in-flight fill.
     let owner_hash = hash;
     let a = tokio::spawn(async move {
         ranged_paid_pull(
@@ -1542,17 +1543,207 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
         "expected exactly ONE origin ranged GET (coalesced), saw {ranged_gets}"
     );
 
-    // Only the owner ran `serve_via_backend_origin`; the coalesced request served
-    // from the store via `await_coalesced_fill`, so the tier counter fires ONCE.
+    // BOTH requests ran `serve_via_backend_origin` (owner + attached observer), so
+    // the own-origin serve tier fires TWICE — the second is a live serve leg over
+    // the shared fill, not a park-and-wait. The coalescing win is the origin count
+    // above (ONE fetch), not the serve-tier count.
     anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 1,
-        "the own-origin two-leg serve tier must fire exactly once (owner only)"
+        counter_value(&metrics, "local_outboard_serves_total")? == 2,
+        "both misses run the own-origin two-leg serve tier (owner + attached observer)"
     );
 
     // The blob is fully present after both deliveries.
     anyhow::ensure!(
         cache.has(hash).await?,
         "blob must be present after coalesced serve"
+    );
+
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Two concurrent own-origin misses for DISJOINT content (two DIFFERENT hashes)
+/// must NOT be wedged onto one fill by the coalescing registry: each opens its own
+/// origin fetch, both serve byte-exact, and neither hangs. This is the disjoint
+/// twin of `concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull`.
+///
+/// Own-origin serving is whole-blob-gated today, so disjoint RANGES of one hash are
+/// not expressible through dispatch; two distinct hashes are the integration-level
+/// stand-in (per B3.4c's adaptation note). The disjoint-RANGE case is covered at
+/// the registry layer by `fill_session.rs`'s `claim_disjoint_both_own` /
+/// `disjoint_halves_do_not_attach`. The proof here: the origin serves EACH hash's
+/// ranged span exactly once (TWO fetches, one per hash — not one shared, not
+/// double), both clients receive their whole blob byte-exact, and the whole race
+/// completes inside a hard timeout (no wedge / no deadlock).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> anyhow::Result<()> {
+    // Two DISTINCT blobs → two distinct hashes (different length + pattern).
+    let (blob_a, outboard_a, hash_a) = blob_with_outboard();
+    let blob_b: Vec<u8> = (0..190 * 1024u32)
+        .map(|i| u8::try_from((i % 251).wrapping_add(7)).unwrap_or(0))
+        .collect();
+    let ob_b = PreOrderMemOutboard::create(&blob_b, IROH_BLOCK_SIZE);
+    let hash_b = Hash::from_bytes(*ob_b.root.as_bytes());
+    let outboard_b = ob_b.data;
+    anyhow::ensure!(hash_a != hash_b, "the two blobs must have distinct hashes");
+
+    let server = MockServer::start().await;
+    // Mount HEAD + sibling-outboard GET + a DELAYED ranged data GET for each hash,
+    // so both fills are in flight concurrently.
+    let mut range_vals = Vec::new();
+    for (blob, outboard, hash) in [
+        (&blob_a, &outboard_a, hash_a),
+        (&blob_b, &outboard_b, hash_b),
+    ] {
+        let size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+        let hex = hash.to_hex();
+        let aligned = align_range(0, 0, size)?;
+        let (a_start, a_end) = (aligned.fetch_start(), aligned.fetch_end());
+        let span = blob
+            .get(usize::try_from(a_start)?..usize::try_from(a_end)?)
+            .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
+            .to_vec();
+        let range_val = format!("bytes={a_start}-{}", a_end - 1);
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{hex}")))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("Content-Length", size.to_string()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}.obao4")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}")))
+            .and(header("range", range_val.as_str()))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(span)
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        range_vals.push((hex, range_val));
+    }
+
+    let channel_a = B256::repeat_byte(0x71);
+    let channel_b = B256::repeat_byte(0x72);
+    let eth_a = Arc::new(PrivateKeySigner::random());
+    let eth_b = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
+        &server.uri(),
+        channel_a,
+        eth_a.address(),
+        channel_b,
+        eth_b.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(10)),
+    )
+    .await?;
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server_concurrent(server_ep.clone(), handler);
+
+    let sk_a = fresh_key();
+    let node_a = B256::from(*sk_a.public().as_bytes());
+    let (ep_a, _) = local_endpoint(sk_a, vec![]).await?;
+    let sk_b = fresh_key();
+    let node_b = B256::from(*sk_b.public().as_bytes());
+    let (ep_b, _) = local_endpoint(sk_b, vec![]).await?;
+    let target_a = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let target_b = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Launch both concurrently — distinct hashes never coalesce, so no stagger.
+    let first_signer = Arc::clone(&eth_a);
+    let a = tokio::spawn(async move {
+        ranged_paid_pull(
+            &ep_a,
+            target_a,
+            node_a,
+            &first_signer,
+            channel_a,
+            hash_a,
+            0,
+            0,
+            RATE_PER_MB,
+        )
+        .await
+    });
+    let second_signer = Arc::clone(&eth_b);
+    let b = tokio::spawn(async move {
+        ranged_paid_pull(
+            &ep_b,
+            target_b,
+            node_b,
+            &second_signer,
+            channel_b,
+            hash_b,
+            0,
+            0,
+            RATE_PER_MB,
+        )
+        .await
+    });
+
+    // Hard timeout: a coalescing bug that wedged these two disjoint fills onto one
+    // shared session would deadlock — the timeout turns that into a readable failure
+    // instead of a CI-timeout hang.
+    let (got_a, got_b) = tokio::time::timeout(Duration::from_secs(30), async {
+        anyhow::Ok((a.await??, b.await??))
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("disjoint concurrent serves did not complete — possible wedge")
+    })??;
+
+    anyhow::ensure!(
+        got_a.as_slice() == blob_a.as_slice(),
+        "hash A delivery mismatch: got {} bytes, want {}",
+        got_a.len(),
+        blob_a.len()
+    );
+    anyhow::ensure!(
+        got_b.as_slice() == blob_b.as_slice(),
+        "hash B delivery mismatch: got {} bytes, want {}",
+        got_b.len(),
+        blob_b.len()
+    );
+
+    // Each hash was fetched from origin exactly once — TWO fetches total, proving
+    // the fills did NOT coalesce (that would be one) and did NOT double-fetch.
+    for (hex, range_val) in &range_vals {
+        let gets = count_requests(&server, |r| {
+            r.method.as_str() == "GET"
+                && r.url.path() == format!("/{hex}")
+                && r.headers
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v == range_val.as_str())
+        })
+        .await?;
+        anyhow::ensure!(
+            gets == 1,
+            "hash /{hex} must be fetched exactly once (own pull), saw {gets}"
+        );
+    }
+
+    // Both misses ran the own-origin two-leg serve tier.
+    anyhow::ensure!(
+        counter_value(&metrics, "local_outboard_serves_total")? == 2,
+        "both disjoint misses run the own-origin serve tier"
+    );
+    anyhow::ensure!(
+        cache.has(hash_a).await? && cache.has(hash_b).await?,
+        "both blobs must be present after their serves"
     );
 
     server_ep.close().await;

@@ -58,10 +58,6 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
-# Incremental whole-blob BLAKE3 for the window-paced pull-through (#856): the
-# fused pull-and-forward path hashes chunks as they stream rather than buffering
-# the blob to call `Hash::new`. Same BLAKE3 iroh-blobs addresses with.
-blake3 = { workspace = true }
 iroh-gossip = { workspace = true }
 iroh-metrics = { workspace = true }
 tokio = { workspace = true }
@@ -105,6 +101,9 @@ decdn-client-pull = { workspace = true, features = ["test-util"] }
 # shape as `decdn-client-pull` above.
 decdn-incentive = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+# `blake3::hash` derives the gossip topic id in `tests/self_hosted_discovery.rs`;
+# the node's own code hashes content via `bao_tree::blake3`, so this is test-only.
+blake3 = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):
 # xor_distance metric laws and the fixed-bucket / within-K invariants under
 # random insert/remove sequences. Mirrors the `proptest` usage already in

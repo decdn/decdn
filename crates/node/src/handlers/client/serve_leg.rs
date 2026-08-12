@@ -1,5 +1,5 @@
-//! The decoupled downstream **serve leg** of the node serve-miss driver (#1621
-//! B2 part 2, ADR 037).
+//! The decoupled downstream **serve leg** of the node serve-miss driver (ADR
+//! 037).
 //!
 //! [`ClientHandler::serve_leg`] is the seller half of the two-leg serve-miss.
 //! It walks the requested range `R = [offset, offset + len)` in order and
@@ -9,9 +9,9 @@
 //! store's present-range frontier when a span has not landed yet — and proof nodes
 //! from the shared outboard the pull captures, so the whole range is ONE coherent
 //! verified stream. Billing, the credit window, takedown, and client-disconnect
-//! handling are lifted verbatim from the fused `window_forward_loop`; only the byte
-//! SOURCE changes — from an upstream pull tee'd through this task to the cache the
-//! pull leg fills beside it.
+//! handling run over the cache the pull leg fills beside this task: the byte source
+//! is the local store, read as a coherent verified stream, not an upstream
+//! connection.
 //!
 //! # Coordination with the pull leg (shared, single-task state)
 //!
@@ -34,29 +34,25 @@
 //! The serve leg owns termination: it is what fulfils `R` for the client, so its
 //! completion (or error) ends the serve and drops the pull leg.
 
-use std::sync::Mutex as StdMutex;
-
-use decdn_cache::NodeRangedStore;
+use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
-use tokio::sync::Notify;
 
 use super::{
-    Arc, AtomicU64, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
-    ChunkData, ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, Ordering, RecvStream,
-    SendStream, VecDeque,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId, ChunkData,
+    ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, Ordering, RecvStream, SendStream,
+    VecDeque,
 };
 
 impl ClientHandler {
     /// Deliver the requested range `R = [offset, offset + len)` to the paying
     /// client from the cache, awaiting a concurrent pull leg to fill any gaps —
-    /// the downstream (seller) half of the decoupled serve-miss (#1621 B2, ADR
+    /// the downstream (seller) half of the decoupled serve-miss (ADR
     /// 037). `len == 0` means "to the end of the blob".
     ///
     /// Delivery, billing, the credit window, group-commit voucher batching, the
-    /// in-flight takedown boundary, and client-disconnect handling are lifted from
-    /// `window_forward_loop`; the source is the cache (a coherent whole-range bao
-    /// encoder reading the cache the pull leg fills) instead of an upstream pull
-    /// tee'd through this task. The caller (orchestration) has
+    /// in-flight takedown boundary, and client-disconnect handling all read from
+    /// the cache: a coherent whole-range bao encoder reads the cache the pull leg
+    /// fills. The caller (orchestration) has
     /// already proven channel ownership, run the pre-flight gates, negotiated
     /// `interval_mb`, and signed + sent the `StreamResponse`; the pull leg fills
     /// the store beside this call. Consumes neither stream — the caller does.
@@ -66,7 +62,7 @@ impl ClientHandler {
     /// `served_paid` is the PAID *content* frontier; completion gates on payment
     /// (every delivered interval vouchered), never on delivery, so the
     /// credit-window tail the client received ahead of its voucher is always
-    /// billed before `StreamEnd` (the Phase-A under-pay lesson, seller side).
+    /// billed before `StreamEnd`.
     /// Vouchers meter WIRE bytes (content plus interleaved bao proof, ADR 038), so
     /// the internal `delivered`/`paid` counters and the `window` gate are wire
     /// quantities; the shared `served_paid` frontier the pull leg paces against is
@@ -84,7 +80,7 @@ impl ClientHandler {
         send: &mut SendStream,
         recv: &mut RecvStream,
         store: NodeRangedStore,
-        outboard: crate::node_origin::OutboardReader,
+        session: Arc<FillSession>,
         channel: &Arc<Mutex<ChannelDeliveryState>>,
         hash: Hash,
         channel_id: ChannelId,
@@ -95,10 +91,6 @@ impl ClientHandler {
         len: u64,
         total_bytes: u64,
         window: u64,
-        served_paid: Arc<AtomicU64>,
-        served_paid_advanced: Arc<Notify>,
-        pull_ended: Arc<Notify>,
-        pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
     ) -> anyhow::Result<()> {
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
         // convention); otherwise clamp to the tree size.
@@ -111,8 +103,7 @@ impl ClientHandler {
 
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
         // Backpressure bound, floored at one interval so the loop can always make
-        // progress (deliver a full interval, then recoup its voucher). Mirrors the
-        // fused loop's window floor.
+        // progress (deliver a full interval, then recoup its voucher).
         let window = window.max(interval_bytes);
         // Group-commit cap (#1483): at most this many vouchers share one fsync,
         // bounded by how many intervals fit in the window.
@@ -141,18 +132,15 @@ impl ClientHandler {
         // are not lost.
         let mut reader = BufferedVoucherReader::default();
 
-        // The coherent whole-range bao encoder (#1621 B2 part 2, ADR 038): ONE
-        // verified stream for `R`, produced incrementally — leaf data awaited from
-        // the cache the pull fills, proof nodes from the shared `outboard` the pull
-        // captures. Replaces the incoherent piece-wise `encode_range` producer.
+        // The coherent whole-range bao encoder (ADR 038): ONE verified stream for
+        // `R`, produced incrementally — leaf data awaited from the cache the pull
+        // fills, proof nodes from the shared `outboard` the pull captures.
         let mut producer = super::serve_encoder::CoherentFrameProducer::new(
             store,
-            outboard,
+            Arc::clone(&session),
             offset,
             end,
             total_bytes,
-            Arc::clone(&pull_ended),
-            Arc::clone(&pull_result),
         );
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
@@ -160,9 +148,9 @@ impl ClientHandler {
         let mut next_chunk = producer.next_frame().await?;
 
         loop {
-            // Progress trackers for the no-progress guard below (re-homed from
-            // `window_forward_loop`'s livelock guard). An iteration that delivers no
-            // new byte AND clears no voucher has stalled — the client stopped paying.
+            // Progress trackers for the no-progress guard below: an iteration that
+            // delivers no new byte AND clears no voucher has stalled — the client
+            // stopped paying.
             let delivered_at_iter_start = delivered;
             let mut committed_this_iter = 0usize;
 
@@ -238,8 +226,7 @@ impl ClientHandler {
                     Ok(outcome) => outcome,
                     Err(e) => {
                         // A transport drop or an underpayment bail (#856/#857): meter
-                        // the client-abandon (parity with the fused
-                        // `abandon_window_serve`), then propagate so the caller drops
+                        // the client-abandon, then propagate so the caller drops
                         // the pull leg and bounds the upstream spend.
                         self.metrics.node_pull_through_client_abandoned();
                         return Err(e);
@@ -257,8 +244,15 @@ impl ClientHandler {
                     // window). One contiguous delivery from `offset`, so `offset`
                     // is the single fetch-start.
                     let served = content_paid_frontier(offset, total_bytes, paid);
-                    served_paid.store(served, Ordering::Relaxed);
-                    served_paid_advanced.notify_waiters();
+                    // `fetch_max`, not `store`: N observers advance the SHARED frontier
+                    // and the pull's `WindowPacer` binds on the MAX-over-observers paid
+                    // frontier (DECISION-B), so a slower observer must not regress a
+                    // faster one. Behavior-preserving for N=1 (a single contiguous
+                    // delivery is already monotone, so `fetch_max == store`).
+                    session
+                        .served_frontier()
+                        .fetch_max(served, Ordering::Relaxed);
+                    session.served_advanced().notify_waiters();
                 }
                 // Re-queue deltas the client had not paid yet (a short batch),
                 // preserving order at the front.
@@ -276,7 +270,7 @@ impl ClientHandler {
                     // + acked. Stop cleanly; the caller drops the pull leg. An
                     // underpaid/rejected voucher is a client-abandon (#856) — meter it
                     // so a node paying upstream for a client that won't pay is
-                    // alertable (parity with the fused `abandon_window_serve`).
+                    // alertable.
                     BatchStop::Rejected => {
                         self.metrics.node_pull_through_client_abandoned();
                         return Ok(());
@@ -307,8 +301,7 @@ impl ClientHandler {
                 break;
             }
 
-            // No-progress guard (re-homed from `window_forward_loop`'s livelock
-            // guard, window.rs): an iteration that delivered no new byte (delivery
+            // No-progress guard: an iteration that delivered no new byte (delivery
             // blocked on the credit window, waiting for payment) AND cleared no
             // voucher (the client stopped paying — `collect_voucher_batch` timed out
             // with nothing committed) cannot make progress. The client has abandoned
@@ -320,8 +313,8 @@ impl ClientHandler {
             let made_delivery_progress = delivered > delivered_at_iter_start;
             let made_payment_progress = committed_this_iter > 0;
             if !made_delivery_progress && !made_payment_progress {
-                // The client stopped paying (#856 drop-after-fill): meter the abandon
-                // (parity with the fused `abandon_window_serve`), then stop cleanly.
+                // The client stopped paying (#856 drop-after-fill): meter the abandon,
+                // then stop cleanly.
                 self.metrics.node_pull_through_client_abandoned();
                 return Ok(());
             }

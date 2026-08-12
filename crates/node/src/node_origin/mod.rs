@@ -46,17 +46,21 @@ mod backend_source;
 mod funder;
 mod pull_leg;
 mod resume;
-mod serve_outboard;
 
-#[allow(unused_imports, reason = "wired by Task 11's driver construction")]
+#[allow(unused_imports, reason = "wired by the serve-miss pull driver")]
 pub(crate) use admit_store::NodeAdmitStore;
-#[allow(unused_imports, reason = "wired by FA.2/FA.3 orchestration")]
+#[allow(
+    unused_imports,
+    reason = "wired by the own-origin serve-miss orchestration"
+)]
 pub(crate) use backend_source::BackendSource;
-#[allow(unused_imports, reason = "wired by Task 11's driver construction")]
+#[allow(unused_imports, reason = "wired by the serve-miss pull driver")]
 pub(crate) use funder::NodeFunder;
-#[allow(unused_imports, reason = "wired by FA.3a orchestration")]
+#[allow(
+    unused_imports,
+    reason = "wired by the own-origin serve-miss orchestration"
+)]
 pub(crate) use pull_leg::{run_local_pull_leg, run_pull_leg};
-pub(crate) use serve_outboard::{OutboardReader, shared_outboard};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -897,7 +901,7 @@ impl NodeProgressivePull {
     /// so the caller passes the tee's verdict in and the score reflects it:
     /// `Delivered` + region accounting for a verified fill, `Corruption` for a
     /// wire-complete stream whose bytes failed bao verification (the
-    /// paid-but-corrupt case the old whole-blob hasher used to catch here).
+    /// paid-but-corrupt case).
     ///
     /// # Errors
     ///
@@ -1129,7 +1133,7 @@ impl Origin for NodeOrigin {
             // This is the generic `Origin::fetch` path (the buffered `populate` fill),
             // a hash-only pull with no client namespace, so it takes no on-chain
             // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
-            // client-serve path is `open_progressive_pull`.
+            // client-serve serve-miss path is `open_pull_leg`.
             let providers = discover(deps, hash_bytes, U256::ZERO).await;
             if providers.is_empty() {
                 // `node_pull_no_providers` means "the blob is unavailable on the

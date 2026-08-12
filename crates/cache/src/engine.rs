@@ -28,6 +28,7 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
+use crate::fill_session::{FillClaim, FillPlan, FillRegistry, FillSession, ObserverLease};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
@@ -268,6 +269,13 @@ struct Inner {
     /// reading party.
     #[allow(dead_code)]
     gc_store_handle: Option<Arc<OnceLock<FsStore>>>,
+    /// Range-aware in-flight fill registry (#1621 B3.2). Coalesces concurrent
+    /// serve-misses for the same hash: a request whose range an in-flight pull
+    /// already covers attaches an observer instead of opening a duplicate pull.
+    /// Purely synchronous range math; holds no blob bytes. Consulted by
+    /// [`CacheEngine::fill_plan`] and populated by [`CacheEngine::register_fill`]
+    /// (the live-pull wiring lands in B3.4).
+    fill_registry: Arc<FillRegistry>,
 }
 
 impl Inner {
@@ -281,7 +289,7 @@ impl Inner {
     /// the rest of the process. On a metered `http`/`s3` origin that is an
     /// unbounded multiplier on the egress bill; on the `Peer` origin
     /// reached via `populate` it is a double-spend of USDC vouchers to
-    /// upstream nodes — the hazard [`TeeOpen::InFlight`] exists to prevent.
+    /// upstream nodes — the hazard the in-flight coalescing map exists to prevent.
     /// Recovering the guard keeps that invariant intact, and matches the
     /// reasoning already written down for `evicted` (see
     /// [`CacheEngine::evict`] and [`CacheEngine::is_evicted`]).
@@ -1025,8 +1033,46 @@ impl CacheEngine {
                 // the lag to actually fire.
                 inserts_tx: broadcast::channel(1024).0,
                 gc_store_handle,
+                fill_registry: Arc::new(FillRegistry::new()),
             }),
         })
+    }
+
+    /// Plan a serve-miss of `[offset, offset+len)` (`len == 0` = to end) of the
+    /// `total`-byte blob `hash` against the in-flight fills: split it into `attach`
+    /// (an in-flight pull already covers these bytes — attach an observer) and
+    /// `remainder` (fetch these). See [`FillRegistry::fill_plan`]. The live-pull
+    /// wiring that consumes this lands in B3.4.
+    #[must_use]
+    pub fn fill_plan(&self, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
+        self.inner.fill_registry.fill_plan(hash, offset, len, total)
+    }
+
+    /// Publish a new pull's [`FillSession`] (already scoped via
+    /// [`FillSession::set_covered`]) so later serve-misses can coalesce onto it,
+    /// returning the owner [`ObserverLease`]. See [`FillRegistry::register_fill`].
+    pub fn register_fill(&self, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
+        self.inner.fill_registry.register_fill(hash, session)
+    }
+
+    /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
+    /// of the `total`-byte blob `hash`: decide attach-vs-own AND register under one
+    /// map-lock acquisition, closing the [`Self::fill_plan`] + [`Self::register_fill`]
+    /// TOCTOU race. Returns [`FillClaim::Attach`] to coalesce onto a live pull (no new
+    /// pull) or [`FillClaim::Owner`] with a freshly-registered session the caller must
+    /// drive a pull for. `make_session` builds the session only on the owner branch
+    /// (never built-and-dropped on attach). See [`FillRegistry::claim`].
+    pub fn claim_fill(
+        &self,
+        hash: Hash,
+        offset: u64,
+        len: u64,
+        total: u64,
+        make_session: impl FnOnce() -> Arc<FillSession>,
+    ) -> FillClaim {
+        self.inner
+            .fill_registry
+            .claim(hash, offset, len, total, make_session)
     }
 
     /// Subscribe to a stream of `Hash`es announcing every blob that
@@ -2504,10 +2550,15 @@ impl CacheEngine {
         chunk_ranges: ChunkRanges,
         total_bytes: u64,
         mut reader: R,
+        session: Option<&Arc<crate::FillSession>>,
     ) -> CacheResult<R>
     where
         R: AsyncStreamReader + Send,
     {
+        // Retain the admitted ranges so the serve-leg outboard capture below can
+        // re-read exactly the proof nodes iroh-blobs emitted for them (the import
+        // moves `chunk_ranges` into the store task).
+        let capture_ranges = session.is_some().then(|| chunk_ranges.clone());
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(ADMIT_STREAM_CHANNEL_CAP);
         let engine = self.clone();
         let import = tokio::spawn(async move {
@@ -2568,6 +2619,16 @@ impl CacheEngine {
         match outcome {
             Ok(_drained) => {
                 self.protect_partial(hash).await?;
+                // The range's data is now cached; capture its outboard proof nodes
+                // into the serve leg's shared session (no-op when no serve leg reads
+                // beside this pull). Front-to-back admits union to the whole tree.
+                // The bytes were just admitted, so this reads the store we just wrote;
+                // an `export_bao` fault here is a genuine store fault, surfaced as one.
+                if let (Some(session), Some(ranges)) = (session, capture_ranges.as_ref()) {
+                    for (node, pair) in self.outboard_pairs(hash, ranges).await? {
+                        session.capture(node, pair);
+                    }
+                }
                 Ok(reader)
             }
             Err(e) => Err(classify_import_bao_reader_error(hash, e)),
@@ -2613,45 +2674,6 @@ impl CacheEngine {
             }
         }
         Ok(None)
-    }
-
-    /// Take the coalescing claim for a node-driven fill of `hash` (#856, #305),
-    /// returning a [`TeeReservation`] that holds it. The peer serve-miss path
-    /// (`serve_via_window_pull_through`) holds this reservation while it drives
-    /// the upstream pull and downstream forward, admitting the pulled bytes into
-    /// the store via [`Self::admit_bao_stream`].
-    ///
-    /// Coalescing (#305): the claim participates in the SAME in-flight map as
-    /// [`Self::populate`] / [`Self::get`]. If another fill for `hash` is already
-    /// in progress this returns [`TeeOpen::InFlight`] and the caller MUST NOT open
-    /// a second upstream pull (no double spend) — it can instead wait on the
-    /// existing fill via `populate` and serve from the store. The returned
-    /// [`TeeReservation`] holds the in-flight claim for `hash`; dropping it (via
-    /// [`TeeReservation::abandon`], or an early return on any path) releases the
-    /// claim and wakes waiters.
-    ///
-    /// Unlike `populate`, this does NOT itself check `is_evicted` or `has`: the
-    /// `cdn/client/v1` miss path that calls it has already gated on both. The
-    /// caller owns the upstream pull, so the engine stays payment-agnostic.
-    #[must_use]
-    pub fn open_tee_sink(&self, hash: Hash) -> TeeOpen {
-        let mut guard = self.inner.lock_inflight();
-        if guard.contains_key(&hash) {
-            return TeeOpen::InFlight;
-        }
-        let notify = Arc::new(Notify::new());
-        guard.insert(hash, Arc::clone(&notify));
-        drop(guard);
-
-        // The in-flight claim is taken now (coalescing #305). Opening yields a
-        // [`TeeReservation`] that holds the claim; the peer serve-miss path keeps
-        // it for the lifetime of the fill and drops/abandons it when the fill
-        // ends, which releases the claim and wakes waiters.
-        TeeOpen::Owner(TeeReservation {
-            engine: self.clone(),
-            hash,
-            notify,
-        })
     }
 
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
@@ -3975,45 +3997,6 @@ fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError
     }
 }
 
-/// Result of [`CacheEngine::open_tee_sink`] (#856).
-#[derive(Debug)]
-pub enum TeeOpen {
-    /// This caller owns the fill: hold the [`TeeReservation`] for the lifetime
-    /// of the upstream pull, then abandon or drop it to release the claim.
-    Owner(TeeReservation),
-    /// Another task is already filling this hash (coalescing, #305). The caller
-    /// MUST NOT open a competing upstream pull — wait on the existing fill via
-    /// [`CacheEngine::populate`] / [`CacheEngine::get`] and serve from the store.
-    InFlight,
-}
-
-/// The in-flight coalescing claim for a node-driven fill, taken by
-/// [`CacheEngine::open_tee_sink`] (#305) and held by the peer serve-miss path
-/// for the lifetime of the upstream pull. Dropping it — via [`Self::abandon`]
-/// or an early return on any path — releases the claim and wakes waiters.
-#[derive(Debug)]
-pub struct TeeReservation {
-    engine: CacheEngine,
-    hash: Hash,
-    notify: Arc<Notify>,
-}
-
-impl TeeReservation {
-    /// Release the claim. Equivalent to dropping the reservation; named as a
-    /// self-documenting call site for the "pull failed / no longer wanted" path.
-    pub fn abandon(self) {
-        drop(self);
-    }
-}
-
-impl Drop for TeeReservation {
-    fn drop(&mut self) {
-        // Release the in-flight claim and wake waiters (#305) on every exit.
-        self.engine.inner.lock_inflight().remove(&self.hash);
-        self.notify.notify_waiters();
-    }
-}
-
 /// A [`RecvStream`] backed by the [`CacheEngine::admit_bao_stream`] feeder
 /// channel. The caller pushes the header-less bao interleaved stream it forwards
 /// from the upstream (the content size is supplied out of band as an 8-byte size
@@ -4935,43 +4918,6 @@ mod tests {
         Ok(())
     }
 
-    /// Unwrap a [`TeeOpen::Owner`], failing the test on `InFlight`.
-    fn owner(open: TeeOpen) -> anyhow::Result<TeeReservation> {
-        match open {
-            TeeOpen::Owner(res) => Ok(res),
-            TeeOpen::InFlight => Err(anyhow::anyhow!("expected Owner, got InFlight")),
-        }
-    }
-
-    #[tokio::test]
-    async fn tee_sink_coalesces_concurrent_fills() -> anyhow::Result<()> {
-        // Two concurrent fills for the same hash: the first owns it, the second
-        // is told it is in flight (no double upstream pull, #305). Releasing the
-        // owner lets a later caller own it again.
-        let tmp = tempfile::tempdir()?;
-        let hash = Hash::new(b"coalesce me");
-        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-
-        let first = owner(engine.open_tee_sink(hash))?;
-        anyhow::ensure!(
-            matches!(engine.open_tee_sink(hash), TeeOpen::InFlight),
-            "second concurrent fill must report InFlight"
-        );
-
-        // Abandon the owner (e.g. downstream client dropped) → claim released.
-        first.abandon();
-        // Drop runs synchronously on `abandon`'s move; the claim is now free.
-        anyhow::ensure!(
-            matches!(engine.open_tee_sink(hash), TeeOpen::Owner(_)),
-            "after abandon, a new fill must be able to own the hash"
-        );
-        anyhow::ensure!(
-            !engine.has(hash).await?,
-            "an abandoned fill must not have committed the blob"
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     async fn second_get_updates_access_time() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -5497,7 +5443,7 @@ mod tests {
     /// `populate_local`) walks the `Peer` origin, so a lost claim here is the
     /// duplicate *paid* upstream pull — the USDC double-spend #1517 names.
     /// `get`, by contrast, has no production caller in the daemon; the serve
-    /// path fills via `populate`/`populate_local` and `open_tee_sink`.
+    /// path fills via `populate`/`populate_local`.
     #[tokio::test]
     async fn poisoned_populate_still_coalesces_into_one_fill() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -5543,59 +5489,6 @@ mod tests {
         let bumps = cm.inflight_mutex_poisoned.get();
         anyhow::ensure!(bumps == 1, "one poisoning, one bump; got {bumps}");
         anyhow::ensure!(inflight_len(&engine) == 0, "the claim must be released");
-        Ok(())
-    }
-
-    /// The cross-path case, and the one that maps most directly onto the USDC
-    /// hazard: `open_tee_sink` answers `TeeOpen::InFlight` off the *same* map
-    /// that `populate`/`get` claim into.
-    ///
-    /// `open_tee_sink` itself already recovered poison before #1517, so it was
-    /// never broken from its own side — it was defeated from the other. A
-    /// poisoned `populate` fell through to a direct pull **without inserting the
-    /// entry**; a concurrent `open_tee_sink` then saw an empty map, returned
-    /// `Owner`, and opened a second paid upstream pull. Neither site alone
-    /// exhibits that, which is why it needs its own test.
-    #[tokio::test]
-    async fn poisoned_claim_is_still_visible_to_the_tee_path() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let payload = b"tee sees the claim";
-        let hash = Hash::new(payload);
-        let origin = Arc::new(SlowCountingOrigin::new(
-            payload,
-            std::time::Duration::from_secs(10),
-        ));
-
-        let engine =
-            CacheEngine::open(tmp.path(), vec![origin.clone() as Arc<dyn Origin>], 10).await?;
-
-        poison_inflight(&engine);
-
-        // Claim the hash from the populate side and leave it in flight.
-        let filler = engine.clone();
-        let owner = tokio::spawn(async move { filler.populate(hash).await });
-        // Wait for the claim to land rather than sleeping a fixed interval —
-        // but with a deadline. An unbounded spin here would *hang* under the
-        // very regression this test exists to catch (a poisoned `populate` that
-        // never inserts the claim), and a hung test blocks CI instead of
-        // reporting. Fail fast and say which it was.
-        let deadline = std::time::Duration::from_secs(5);
-        tokio::time::timeout(deadline, async {
-            while inflight_len(&engine) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("populate never claimed the hash within {deadline:?} under poison")
-        })?;
-
-        anyhow::ensure!(
-            matches!(engine.open_tee_sink(hash), TeeOpen::InFlight),
-            "a claim taken under poison must still block a second paid upstream pull"
-        );
-
-        owner.abort();
         Ok(())
     }
 
@@ -6941,7 +6834,13 @@ mod tests {
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let drained = engine2
-            .admit_bao_stream(hash, aligned.chunk_ranges().clone(), total, header_less)
+            .admit_bao_stream(
+                hash,
+                aligned.chunk_ranges().clone(),
+                total,
+                header_less,
+                None,
+            )
             .await?;
         anyhow::ensure!(drained.is_empty(), "the wire is fully drained by admit");
         anyhow::ensure!(
@@ -7181,7 +7080,7 @@ mod tests {
         let header_less = bao.slice(8..);
 
         let reader = engine
-            .admit_bao_stream(hash, ranges.clone(), total, header_less)
+            .admit_bao_stream(hash, ranges.clone(), total, header_less, None)
             .await
             .unwrap();
         assert_eq!(reader.len(), 0, "the reader is fully drained");
@@ -7210,7 +7109,7 @@ mod tests {
         *byte ^= 0xFF;
 
         let err = engine
-            .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt))
+            .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt), None)
             .await
             .unwrap_err();
         assert!(

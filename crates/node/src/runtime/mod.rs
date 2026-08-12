@@ -517,7 +517,7 @@ async fn build_infra(
     // `NodeOrigin` is `Clone` over an `Arc<OnceLock<deps>>`, so this clone sees
     // the dependencies `provision`ed (below) on the chain's copy. Held so the
     // client handler can drive progressive pulls directly, bypassing the buffered
-    // `populate` for the fused pull-and-forward path.
+    // `populate` for the serve-miss pull-through path.
     let pull_through_origin = node_origin.clone().map(Arc::new);
     let cache = build_cache(
         cfg,

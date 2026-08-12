@@ -30,10 +30,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{
-    Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen,
-    TeeReservation,
-};
+use decdn_cache::{Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
@@ -461,7 +458,7 @@ impl ClientHandlerDeps {
 
     /// Wire the window-paced pull-through provider and its companion window size
     /// together (#856). The two are only meaningful as a pair — the serve path
-    /// gates the fused pull-and-forward on `pull_through_origin` being `Some` and
+    /// gates the serve-miss pull-through on `pull_through_origin` being `Some` and
     /// reads `pull_ahead_bytes` as the pipeline window — so setting them through
     /// one call keeps a caller from half-wiring the window path.
     pub fn set_window_pull_through(&mut self, origin: Arc<NodeOrigin>, pull_ahead_bytes: Bytes) {

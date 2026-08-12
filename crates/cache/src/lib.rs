@@ -17,6 +17,7 @@
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
+pub mod fill_session;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
@@ -37,10 +38,12 @@ pub use circuit_breaker::{
 /// under-reserves by up to two groups.
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
-    CacheEngine, EvictionCandidates, EvictionPreview, PresentRanges, RangePullOutcome, TeeOpen,
-    TeeReservation,
+    CacheEngine, EvictionCandidates, EvictionPreview, PresentRanges, RangePullOutcome,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
+pub use fill_session::{
+    FillClaim, FillError, FillPlan, FillRegistry, FillSession, ObserverLease, SessionOutboardReader,
+};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
 /// `iroh_blobs::Hash` (the BLAKE3 digest the iroh-blobs store keys on)
 /// so every existing `decdn_cache::Hash` path in `decdn-node` and the

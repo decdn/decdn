@@ -16,62 +16,42 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore};
-use decdn_cache::{CacheEngine, Hash, NodeRangedStore};
+use decdn_cache::{CacheEngine, FillSession, Hash, NodeRangedStore};
 use decdn_client_pull::{BaoRangeReader, IngestStore};
-
-use super::serve_outboard::OutboardWriter;
 
 /// The node's pull-leg store: [`RangedStore`] queries delegate to a
 /// [`NodeRangedStore`], and [`IngestStore::ingest_stream`] admits each gap via
-/// [`CacheEngine::admit_bao_stream`]. When an [`OutboardWriter`] is present, each
-/// admitted range's proof nodes are captured into the serve leg's shared outboard
-/// (#1621 B2 part 2, ADR 038) so the serve leg can drive a coherent whole-range
-/// encode while the pull fills incrementally.
+/// [`CacheEngine::admit_bao_stream`]. When a [`FillSession`] is present, the cache's
+/// admit path captures each admitted range's proof nodes into the serve leg's shared
+/// outboard (#1621 B3, ADR 038) so the serve leg can drive a coherent whole-range
+/// encode while the pull fills incrementally — the node just threads the session in.
 #[allow(dead_code, reason = "wired by Task 11's driver construction")]
 pub(crate) struct NodeAdmitStore {
     inner: NodeRangedStore,
-    /// Serve-leg outboard capture sink. `None` when no serve leg reads beside this
-    /// pull (e.g. the admit-only unit tests).
-    outboard: Option<OutboardWriter>,
+    /// Serve-leg fill session. `None` when no serve leg reads beside this pull (e.g.
+    /// the admit-only unit tests). Passed to [`CacheEngine::admit_bao_stream`], which
+    /// captures the admitted range's outboard proof nodes into it cache-side.
+    session: Option<Arc<FillSession>>,
 }
 
 #[allow(dead_code, reason = "wired by Task 11's driver construction")]
 impl NodeAdmitStore {
     /// Wrap `engine`'s view of `hash` (a `total_bytes`-byte blob) as the node's
-    /// pull-leg store, capturing each admitted range's outboard proof nodes into
-    /// `outboard` (the serve leg's shared outboard) when one is wired.
+    /// pull-leg store. When `session` is wired, the cache's admit path captures each
+    /// admitted range's outboard proof nodes into it (the serve leg's shared outboard).
     pub(crate) const fn new(
         engine: CacheEngine,
         hash: Hash,
         total_bytes: u64,
-        outboard: Option<OutboardWriter>,
+        session: Option<Arc<FillSession>>,
     ) -> Self {
         Self {
             inner: NodeRangedStore::new(engine, hash, total_bytes),
-            outboard,
+            session,
         }
-    }
-
-    /// Capture the outboard proof `(node, pair)`s iroh-blobs emits for `chunk_ranges`
-    /// (a just-admitted or held range) into the shared outboard. A no-op without a
-    /// wired [`OutboardWriter`]. Fails only if `export_bao` itself faults — the data
-    /// was just admitted, so this reads the store we just wrote.
-    async fn capture_outboard(&self, chunk_ranges: &bao_tree::ChunkRanges) -> anyhow::Result<()> {
-        let Some(writer) = &self.outboard else {
-            return Ok(());
-        };
-        let pairs = self
-            .inner
-            .engine()
-            .outboard_pairs(self.inner.hash(), chunk_ranges)
-            .await
-            .map_err(anyhow::Error::from)?;
-        for (node, pair) in pairs {
-            writer.save(node, pair);
-        }
-        Ok(())
     }
 }
 
@@ -136,6 +116,10 @@ impl IngestStore for NodeAdmitStore {
         R: BaoRangeReader + 'a,
     {
         Box::pin(async move {
+            // `admit_bao_stream` verifies + admits the range and, when a
+            // [`FillSession`] is wired, captures its outboard proof nodes into it
+            // cache-side (no-op when no serve leg reads beside this pull).
+            // Front-to-back admits union to the whole tree.
             let drained = self
                 .inner
                 .engine()
@@ -144,13 +128,10 @@ impl IngestStore for NodeAdmitStore {
                     range.chunk_ranges().clone(),
                     self.inner.total_bytes(),
                     reader,
+                    self.session.as_ref(),
                 )
                 .await
                 .map_err(anyhow::Error::from)?;
-            // The range's data is now cached; capture its outboard proof nodes for
-            // the serve leg's shared outboard (no-op when no serve leg reads beside
-            // this pull). Front-to-back admits union to the whole tree.
-            self.capture_outboard(range.chunk_ranges()).await?;
             Ok(drained)
         })
     }
@@ -330,11 +311,8 @@ mod tests {
         let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
         let hash = decdn_cache::Hash::from(root);
 
-        let (writer, factory) = super::super::serve_outboard::shared_outboard(
-            bao_tree::blake3::Hash::from(root),
-            total,
-        );
-        let store = NodeAdmitStore::new(engine, hash, total, Some(writer));
+        let session = decdn_cache::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        let store = NodeAdmitStore::new(engine, hash, total, Some(std::sync::Arc::clone(&session)));
 
         // Admit the whole blob in one range → the capture unions to the whole tree.
         let aligned = align_range(0, total, total).expect("align whole blob");
@@ -346,10 +324,7 @@ mod tests {
             .unwrap();
 
         // Compare the captured outboard against the blob's true outboard, node by node.
-        let mut reader = factory.reader(
-            std::sync::Arc::new(tokio::sync::Notify::new()),
-            std::sync::Arc::new(std::sync::Mutex::new(None)),
-        );
+        let mut reader = session.outboard_reader();
         let truth = PreOrderMemOutboard::create(&plaintext, IROH_BLOCK_SIZE);
         let tree = BaoTree::new(total, IROH_BLOCK_SIZE);
         let mut internal = 0u64;
