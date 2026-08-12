@@ -422,8 +422,12 @@ mod tests {
         Ok(())
     }
 
-    /// (c) `finish` returns a cumulative whose `bytes` advanced by the leg's wire
-    /// (at amount 0), so a `drive` over this source could reach completion.
+    /// (c) `finish` advances the shared ledger's committed `bytes` by the leg's
+    /// wire (at amount 0), so a `drive` over this source reaches completion — the
+    /// driver reads `ledger.committed().bytes` for the paid frontier and discards
+    /// `finish`'s returned progress. That progress is amount-keyed for buyer
+    /// voucher persistence, so a rate-0 self-pay reports no advance (`None`):
+    /// there is nothing to pay yourself, and nothing to persist.
     #[tokio::test]
     async fn backend_source_finish_advances_completion_counter() -> anyhow::Result<()> {
         let data = test_blob();
@@ -446,16 +450,14 @@ mod tests {
         assert!(expected_wire > 0, "a non-empty blob has non-zero wire");
 
         let progress: VoucherProgress = source.finish(reader).await?;
-        let (bytes, amount) = progress
-            .advanced()
-            .ok_or_else(|| anyhow::anyhow!("finish must report an advanced cumulative"))?;
-        assert_eq!(
-            bytes,
-            U256::from(expected_wire),
-            "committed bytes advance by the leg's wire (completion frontier)"
+        // A rate-0 self-pay is not a payment: amount did not rise past the seed,
+        // so there is nothing to persist as a buyer voucher.
+        assert!(
+            progress.advanced().is_none(),
+            "own-origin self-pay never advances the payment watermark"
         );
-        assert_eq!(amount, U256::ZERO, "rate 0 — never a payment");
-        // The shared ledger reflects the same advance.
+        // The completion frontier the driver actually reads: the shared ledger's
+        // committed bytes advanced by the leg's wire, at amount 0.
         assert_eq!(ledger.committed().bytes, U256::from(expected_wire));
         assert_eq!(ledger.committed().amount, U256::ZERO);
         Ok(())

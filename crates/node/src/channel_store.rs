@@ -114,6 +114,45 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
 const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("watcher_checkpoint_v1");
 
+/// Byte width of a capability key on disk: `pool_id ‖ signer` = `32 + 20`. A
+/// capability authorizes one signer under one pool for every provider, so it is
+/// keyed by the `(pool_id, signer)` pair — not the full lane triple.
+const CAPABILITY_KEY_LEN: usize = 52;
+
+/// redb table holding the owner-signed capability material the seller
+/// voucher-intake path persists so the redeemer can register a signer on its
+/// first on-chain redemption (ADR 003 §Capability delegation). The lane's
+/// [`LaneState`] carries the signer's `cap` and `expiry`, but not the owner's
+/// signature over the EIP-712 `Capability`; this table holds that signature
+/// alongside a copy of the cap/expiry so the redeemer builds the registration
+/// payload without a chain read. Lives in the same `lanes.redb` file as
+/// [`LANE_TABLE`].
+///
+/// Key: `pool_id ‖ signer` (`[u8; 52]`). Value: postcard-encoded
+/// [`StoredCapability`].
+const CAPABILITY_TABLE: TableDefinition<&[u8; CAPABILITY_KEY_LEN], &[u8]> =
+    TableDefinition::new("capability_v1");
+
+/// Encode a `(pool_id, signer)` pair into its `[u8; 52]` capability-table key.
+fn capability_key_bytes(pool_id: B256, signer: Address) -> [u8; CAPABILITY_KEY_LEN] {
+    let mut out = [0u8; CAPABILITY_KEY_LEN];
+    out[..32].copy_from_slice(pool_id.as_slice());
+    out[32..].copy_from_slice(signer.as_slice());
+    out
+}
+
+/// On-disk owner-signed capability record. The `(pool_id, signer)` identity is
+/// the table key, so the value carries only the cap/expiry and the owner
+/// signature. `spending_cap` is a fixed-width big-endian array (identical to the
+/// on-chain representation); `owner_sig` is the raw EIP-712 signature (65-byte
+/// ECDSA, or an ERC-1271 payload) verbatim.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredCapability {
+    spending_cap: [u8; 32],
+    expiry: u64,
+    owner_sig: Vec<u8>,
+}
+
 /// Encode a [`LaneKey`] into its `[u8; 72]` table key: `pool_id ‖ signer ‖
 /// provider`.
 fn lane_key_bytes(key: &LaneKey) -> [u8; LANE_KEY_LEN] {
@@ -596,6 +635,137 @@ impl PoolStateStore for PersistentPoolStateStore {
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability store (seller first-redemption registration material)
+// ---------------------------------------------------------------------------
+
+impl PersistentPoolStateStore {
+    /// Persist the owner-signed capability material for `(pool_id, signer)` so
+    /// the redeemer can register the signer on its first on-chain redemption.
+    /// Idempotent: a repeated intake of the same capability overwrites with an
+    /// identical value. Fsynced on commit like every other write here.
+    ///
+    /// # Errors
+    ///
+    /// On a redb backend or postcard-encode failure.
+    pub fn put_capability(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        spending_cap: U256,
+        expiry: u64,
+        owner_sig: &[u8],
+    ) -> Result<(), StoreError> {
+        let record = StoredCapability {
+            spending_cap: spending_cap.to_be_bytes(),
+            expiry,
+            owner_sig: owner_sig.to_vec(),
+        };
+        let encoded = postcard::to_allocvec(&record)
+            .map_err(|err| StoreError::Codec(format!("capability postcard encode: {err}")))?;
+        let key_bytes = capability_key_bytes(pool_id, signer);
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(CAPABILITY_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .insert(&key_bytes, encoded.as_slice())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
+    /// Read the persisted capability material for `(pool_id, signer)`, or `None`
+    /// if this node holds no capability for it.
+    ///
+    /// # Errors
+    ///
+    /// On a redb backend or postcard-decode failure.
+    fn get_capability(
+        &self,
+        pool_id: B256,
+        signer: Address,
+    ) -> Result<Option<StoredCapability>, StoreError> {
+        let key_bytes = capability_key_bytes(pool_id, signer);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(CAPABILITY_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let Some(value_guard) = table
+            .get(&key_bytes)
+            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+        else {
+            return Ok(None);
+        };
+        let record: StoredCapability = postcard::from_bytes(value_guard.value())
+            .map_err(|err| StoreError::Codec(format!("capability postcard decode: {err}")))?;
+        Ok(Some(record))
+    }
+}
+
+/// [`CapabilitySource`](crate::payment_settlement::CapabilitySource) backed by
+/// the persisted [`CAPABILITY_TABLE`]. The seller voucher-intake path persists a
+/// signer's owner-signed capability on first sight; the redeemer reads it here
+/// to register the signer on its first on-chain redemption. A signer with no
+/// persisted capability yields `None` and is safely skipped by the redeemer.
+#[derive(Debug)]
+pub struct StoredCapabilitySource {
+    inner: std::sync::Arc<PersistentPoolStateStore>,
+}
+
+impl StoredCapabilitySource {
+    /// Wrap the concrete store. The same `lanes.redb` file backs both the lane
+    /// records and the capability table.
+    #[must_use]
+    pub const fn new(inner: std::sync::Arc<PersistentPoolStateStore>) -> Self {
+        Self { inner }
+    }
+}
+
+impl crate::payment_settlement::CapabilitySource for StoredCapabilitySource {
+    fn registration_material(
+        &self,
+        key: &LaneKey,
+    ) -> Option<crate::payment_settlement::CapabilityMaterial> {
+        match self.inner.get_capability(key.pool_id, key.signer) {
+            Ok(Some(record)) => Some(crate::payment_settlement::CapabilityMaterial {
+                spending_cap: U256::from_be_bytes(record.spending_cap),
+                expiry: record.expiry,
+                owner_sig: alloy::primitives::Bytes::from(record.owner_sig),
+            }),
+            Ok(None) => None,
+            Err(err) => {
+                // A read fault here is not fatal: the redeemer skips a signer with
+                // no material, so the lane simply waits for the next redemption
+                // attempt rather than registering against a bad payload.
+                tracing::warn!(
+                    pool_id = %key.pool_id,
+                    signer = %key.signer,
+                    error = %err,
+                    "capability store read failed; skipping first-redemption registration"
+                );
+                None
+            }
+        }
     }
 }
 

@@ -11,7 +11,7 @@ use std::time::Instant;
 use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_cache::CacheMetrics;
-use decdn_incentive::ChannelOpenFailureReason;
+use decdn_incentive::PoolOpenFailureReason;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -1594,15 +1594,15 @@ impl Metrics {
     /// [`Self::node_pull_channel_open_failure`], the unlabeled total (which also
     /// counts store/expired-reclaim causes that never reach the `openChannel`
     /// tx).
-    pub fn channel_open_failure_by_reason(&self, reason: ChannelOpenFailureReason) {
+    pub fn channel_open_failure_by_reason(&self, reason: PoolOpenFailureReason) {
         match reason {
-            ChannelOpenFailureReason::InsufficientDeposit => {
+            PoolOpenFailureReason::InsufficientDeposit => {
                 self.decdn.channel_open_failures_insufficient_deposit.inc();
             }
-            ChannelOpenFailureReason::ContractRevert => {
+            PoolOpenFailureReason::ContractRevert => {
                 self.decdn.channel_open_failures_contract_revert.inc();
             }
-            ChannelOpenFailureReason::RpcError => {
+            PoolOpenFailureReason::RpcError => {
                 self.decdn.channel_open_failures_rpc_error.inc();
             }
         }
@@ -4285,12 +4285,12 @@ mod tests {
 
         // Bump each reason a distinct number of times so a cross-wired counter
         // is caught by the mismatched count, not just a nonzero value.
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::InsufficientDeposit);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::InsufficientDeposit);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::ContractRevert);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::RpcError);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::RpcError);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::RpcError);
+        metrics.channel_open_failure_by_reason(PoolOpenFailureReason::InsufficientDeposit);
+        metrics.channel_open_failure_by_reason(PoolOpenFailureReason::InsufficientDeposit);
+        metrics.channel_open_failure_by_reason(PoolOpenFailureReason::ContractRevert);
+        metrics.channel_open_failure_by_reason(PoolOpenFailureReason::RpcError);
+        metrics.channel_open_failure_by_reason(PoolOpenFailureReason::RpcError);
+        metrics.channel_open_failure_by_reason(PoolOpenFailureReason::RpcError);
 
         let text = metrics.encode().unwrap();
         for (name, expected) in [

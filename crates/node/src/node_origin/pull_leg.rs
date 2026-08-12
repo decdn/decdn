@@ -523,11 +523,16 @@ pub(crate) async fn run_pull_leg(
         deadlines,
     } = target;
 
-    // Read the pool id once (quick std-lock, never held across await).
-    let pool_id = ctx
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pool_id;
+    // Read the pool id + lane seed once (quick std-lock, never held across
+    // await). `prior_amount` is the cumulative the lane started from, so the
+    // settle-on-drop can tell whether this stream advanced the watermark past
+    // its seed before persisting.
+    let (pool_id, prior_amount) = {
+        let guard = ctx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard.pool_id, guard.prior_amount)
+    };
 
     let Some(deps) = deps_lock.get() else {
         // Unprovisioned under us (cannot happen — we discovered via deps): still
@@ -546,6 +551,7 @@ pub(crate) async fn run_pull_leg(
         deps: SettleDeps::Shared(Arc::clone(&deps_lock)),
         provider_addr,
         pool_id,
+        prior_amount,
         ledger: Arc::clone(&ledger),
     };
 

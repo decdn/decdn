@@ -26,7 +26,7 @@ use decdn_common::admin::{
     parse_hash_arg,
 };
 use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
-use decdn_incentive::{ChannelState, ChannelStateStore, VoucherActivity};
+use decdn_incentive::{LaneState, PoolStateStore, VoucherActivity};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -138,7 +138,7 @@ pub struct ChannelStatusHandles {
     /// Persistent per-channel voucher state (same handle the client
     /// handler commits accepted vouchers to). Read via `load_all` to
     /// build the snapshot — the freshest committed `last_*` per channel.
-    pub channel_store: Arc<dyn ChannelStateStore>,
+    pub channel_store: Arc<dyn PoolStateStore>,
     /// In-memory last-voucher clock (same handle the client handler
     /// stamps on each accepted voucher). Read for
     /// `seconds_since_last_voucher`; `None` per channel until this
@@ -151,7 +151,7 @@ pub struct ChannelStatusHandles {
 }
 
 // `AdminState` derives `Debug`, so the bundled handles must too. The
-// trait-object `Arc<dyn ChannelStateStore>` carries no `Debug` bound, so
+// trait-object `Arc<dyn PoolStateStore>` carries no `Debug` bound, so
 // hand-roll a terse impl that names the struct without formatting the handles.
 impl std::fmt::Debug for ChannelStatusHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -841,7 +841,7 @@ impl AdminRpcServer for AdminRpcImpl {
 /// micro-USDC via `try_from(...).unwrap_or(u64::MAX)`; a real channel is
 /// bounded by its on-chain deposit so the saturation arm is unreachable.
 fn build_channel_snapshots(
-    states: &[ChannelState],
+    states: &[LaneState],
     threshold: U256,
     activity: &VoucherActivity,
 ) -> Vec<ChannelSnapshot> {
@@ -850,13 +850,20 @@ fn build_channel_snapshots(
         .map(|state| {
             let outstanding = state.last_amount();
             ChannelSnapshot {
-                channel_id: state.channel_id.to_string(),
-                counterparty: state.client.to_string(),
-                voucher_signer: state.voucher_signer.to_string(),
-                last_nonce: u64::try_from(state.last_nonce()).unwrap_or(u64::MAX),
+                // A lane is keyed by `(pool_id, signer, provider)`. The admin
+                // surface reports the pool id as the channel id; the signer as
+                // both counterparty and voucher signer (the shared-pool model
+                // has no separate delegate). There is no per-voucher nonce —
+                // cumulative amount is the sole ordering key — so `last_nonce`
+                // reports 0, and the pool-level deposit is not carried per lane
+                // so `deposit_micro_usdc` reports 0.
+                channel_id: state.pool_id.to_string(),
+                counterparty: state.signer.to_string(),
+                voucher_signer: state.signer.to_string(),
+                last_nonce: 0,
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
-                deposit_micro_usdc: u64::try_from(state.deposit).unwrap_or(u64::MAX),
-                seconds_since_last_voucher: activity.seconds_since(state.channel_id),
+                deposit_micro_usdc: 0,
+                seconds_since_last_voucher: activity.seconds_since(state.key()),
                 // Upper-bound eligibility: the admin surface doesn't read
                 // the on-chain `withdrawnAmount`, so it compares the full
                 // accrued claim against the threshold (documented on the
@@ -2088,59 +2095,50 @@ mod tests {
 
     // ---- admin_v1_channels (issue #749) ----
 
-    use alloy::primitives::{Address, address};
-    use decdn_incentive::MemoryChannelStateStore;
+    use alloy::primitives::Address;
+    use decdn_incentive::MemoryPoolStateStore;
 
-    const CHANNEL_TOKEN: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-
-    /// Build a hydrated `ChannelState` with the given identity + voucher
-    /// figures. `last_amount` doubles as the outstanding claim.
-    fn mk_channel(
-        id_byte: u8,
-        client_byte: u8,
-        deposit: u64,
-        last_amount: u64,
-        last_nonce: u64,
-    ) -> ChannelState {
+    /// Build a hydrated [`LaneState`] with the given identity + outstanding
+    /// claim. `pool_byte` seeds the pool id, `signer_byte` the signer (which is
+    /// also the reported counterparty in the shared-pool model); `last_amount`
+    /// is the lane's cumulative claim. The provider is a fixed non-signer
+    /// address so a signer/provider transposition would be caught.
+    fn mk_channel(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
         let mut id = [0u8; 32];
-        id[31] = id_byte;
-        let mut client = [0u8; 20];
-        client[19] = client_byte;
-        ChannelState::hydrate(
+        id[31] = pool_byte;
+        let mut signer = [0u8; 20];
+        signer[19] = signer_byte;
+        let provider = Address::repeat_byte(0xEE);
+        LaneState::hydrate(
             id.into(),
-            Address::from(client),
-            Address::from(client),
-            CHANNEL_TOKEN,
-            U256::from(deposit),
+            Address::from(signer),
+            provider,
+            U256::from(1_000_000_000u64), // cap — irrelevant to the snapshot
+            0,                            // expiry — untracked
             U256::from(last_amount),
-            U256::from(last_nonce),
             U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
             None,
-            0,
-            false,
         )
     }
 
-    /// `build_channel_snapshots` maps each `ChannelState` to its wire DTO:
-    /// hex ids, narrowed amounts, and threshold-based eligibility. A
-    /// channel at/above the threshold is eligible; one below is not.
+    /// `build_channel_snapshots` maps each [`LaneState`] to its wire DTO:
+    /// hex ids, narrowed amounts, and threshold-based eligibility. A lane
+    /// at/above the threshold is eligible; one below is not. In the shared-pool
+    /// model the per-lane deposit and nonce are not tracked, so both report 0.
     #[test]
     fn build_channel_snapshots_maps_fields_and_eligibility() {
-        let states = vec![
-            mk_channel(1, 0xAA, 10_000_000, 2_500_000, 7),
-            mk_channel(2, 0xBB, 5_000_000, 500_000, 3),
-        ];
+        let states = vec![mk_channel(1, 0xAA, 2_500_000), mk_channel(2, 0xBB, 500_000)];
         let activity = VoucherActivity::new();
         let threshold = U256::from(1_000_000u64);
         let snaps = build_channel_snapshots(&states, threshold, &activity);
         assert_eq!(snaps.len(), 2);
         // No activity recorded → both have `None`; within the `None`
         // group ordering is by descending outstanding, so the
-        // 2_500_000-claim channel comes first.
+        // 2_500_000-claim lane comes first.
         let first = snaps.first().expect("first snapshot");
         assert_eq!(first.outstanding_micro_usdc, 2_500_000);
-        assert_eq!(first.deposit_micro_usdc, 10_000_000);
-        assert_eq!(first.last_nonce, 7);
+        assert_eq!(first.deposit_micro_usdc, 0);
+        assert_eq!(first.last_nonce, 0);
         assert!(
             first.channel_id.starts_with("0x"),
             "channel_id must be 0x-hex: {}",
@@ -2168,7 +2166,7 @@ mod tests {
     /// eligible (`>=`), matching the redeemer's `< threshold` short-circuit.
     #[test]
     fn build_channel_snapshots_threshold_is_inclusive() {
-        let states = vec![mk_channel(1, 0xAA, 10_000_000, 1_000_000, 1)];
+        let states = vec![mk_channel(1, 0xAA, 1_000_000)];
         let activity = VoucherActivity::new();
         let snaps = build_channel_snapshots(&states, U256::from(1_000_000u64), &activity);
         assert!(
@@ -2181,10 +2179,10 @@ mod tests {
     /// none, and reports `Some(age)`.
     #[test]
     fn build_channel_snapshots_orders_active_channels_first() {
-        let active = mk_channel(1, 0xAA, 10_000_000, 100, 1);
-        let idle = mk_channel(2, 0xBB, 10_000_000, 9_000_000, 1);
+        let active = mk_channel(1, 0xAA, 100);
+        let idle = mk_channel(2, 0xBB, 9_000_000);
         let activity = VoucherActivity::new();
-        activity.touch(active.channel_id);
+        activity.touch(active.key());
         // `idle` has a much larger outstanding, but no activity — the
         // active channel must still sort first (recency beats size).
         let snaps = build_channel_snapshots(&[idle, active], U256::from(1_000_000u64), &activity);
@@ -2249,13 +2247,13 @@ mod tests {
     /// computed against it.
     #[tokio::test]
     async fn channels_rpc_reports_seeded_store() -> anyhow::Result<()> {
-        let store = Arc::new(MemoryChannelStateStore::new());
-        store.record(&mk_channel(1, 0xAA, 10_000_000, 2_000_000, 5))?;
-        store.record(&mk_channel(2, 0xBB, 5_000_000, 100_000, 2))?;
+        let store = Arc::new(MemoryPoolStateStore::new());
+        store.record(&mk_channel(1, 0xAA, 2_000_000))?;
+        store.record(&mk_channel(2, 0xBB, 100_000))?;
 
         let (state, _tmp) = state_with(vec![]).await;
         let handles = ChannelStatusHandles {
-            channel_store: store as Arc<dyn ChannelStateStore>,
+            channel_store: store as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::new(VoucherActivity::new()),
             redeem_threshold_micro_usdc: 1_000_000,
         };
@@ -2287,13 +2285,13 @@ mod tests {
     /// and that the active channel sorts ahead of the idle one (recency).
     #[tokio::test]
     async fn channels_rpc_reflects_touch_through_shared_activity_arc() -> anyhow::Result<()> {
-        let store = Arc::new(MemoryChannelStateStore::new());
+        let store = Arc::new(MemoryPoolStateStore::new());
         // `active` has the smaller claim; `idle` the larger. Without a touch,
         // `idle` would sort first (descending outstanding). A touch on
         // `active` must flip that — proving the reader sees the write.
-        let active = mk_channel(1, 0xAA, 10_000_000, 100, 1);
-        let idle = mk_channel(2, 0xBB, 10_000_000, 9_000_000, 1);
-        let active_id = active.channel_id;
+        let active = mk_channel(1, 0xAA, 100);
+        let idle = mk_channel(2, 0xBB, 9_000_000);
+        let active_id = active.key();
         store.record(&active)?;
         store.record(&idle)?;
 
@@ -2303,7 +2301,7 @@ mod tests {
 
         let (state, _tmp) = state_with(vec![]).await;
         let handles = ChannelStatusHandles {
-            channel_store: store as Arc<dyn ChannelStateStore>,
+            channel_store: store as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::clone(&activity),
             redeem_threshold_micro_usdc: 1_000_000,
         };
@@ -2331,28 +2329,28 @@ mod tests {
     /// [`CHANNEL_STORE_ERROR_CODE`] rather than a generic transport fault.
     #[tokio::test]
     async fn channels_rpc_surfaces_store_load_failure() {
-        use decdn_incentive::{ChannelId, StoreError};
+        use decdn_incentive::{LaneKey, StoreError};
 
         #[derive(Debug)]
         struct FailingStore;
-        impl ChannelStateStore for FailingStore {
-            fn load_all(&self) -> Result<Vec<ChannelState>, StoreError> {
+        impl PoolStateStore for FailingStore {
+            fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
                 Err(StoreError::Backend("simulated load failure".to_string()))
             }
-            fn record(&self, _state: &ChannelState) -> Result<(), StoreError> {
+            fn record(&self, _state: &LaneState) -> Result<(), StoreError> {
                 Ok(())
             }
-            fn forget(&self, _channel_id: ChannelId) -> Result<(), StoreError> {
+            fn forget(&self, _key: LaneKey) -> Result<(), StoreError> {
                 Ok(())
             }
-            fn get(&self, _channel_id: ChannelId) -> Result<Option<ChannelState>, StoreError> {
+            fn get(&self, _key: LaneKey) -> Result<Option<LaneState>, StoreError> {
                 Ok(None)
             }
         }
 
         let (state, _tmp) = state_with(vec![]).await;
         let handles = ChannelStatusHandles {
-            channel_store: Arc::new(FailingStore) as Arc<dyn ChannelStateStore>,
+            channel_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::new(VoucherActivity::new()),
             redeem_threshold_micro_usdc: 1_000_000,
         };
