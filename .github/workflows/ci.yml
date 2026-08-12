@@ -695,7 +695,14 @@ jobs:
 
   anvil-e2e-journeys:
     name: anvil e2e (journeys)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # 8 vCPU (not the 4 vCPU the rest of the matrix uses): this job's cost is
+    # test EXECUTION, not build or cache — a warm-cache run spends ~248s of its
+    # ~5-8m inside `Run cross-layer e2e journeys` and only ~7s restoring the
+    # cache and ~35s building. The journeys are independent (each spawns its own
+    # anvil + forge deploy + daemon[s]), so the bound is core count against
+    # `--test-threads`. Doubling the cores lets the run below go to 4 threads and
+    # roughly halves that 248s; caching changes would not have touched it.
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     # Bound derived from OBSERVED job duration, not from a sum of per-test
     # ceilings. That sum-of-ceilings model assumed every test simultaneously
     # burned its full budget — which cannot happen — and went stale four times as
@@ -775,11 +782,15 @@ jobs:
         run: cargo build -p decdn-node -p decdn-cli
       # Cross-layer journeys (smoke + G-NODE-04 blacklist compliance, #1031 +
       # G-NODE-05 slash appeal, #1032).
-      # --test-threads 2: each journey runs its own anvil + forge deploy +
-      # daemon(s); more at once oversubscribes the 4-core runner and turns
-      # poll-based assertions flaky, so cap concurrency at two.
+      # --test-threads 4: each journey runs its own anvil + forge deploy +
+      # daemon(s), so concurrency is bounded by cores. This job runs on an 8 vCPU
+      # runner (see runs-on above) precisely so this can be 4 without
+      # oversubscribing — each journey's anvil + daemons then have ~2 cores.
+      # Raising it past the core budget starved the poll-based assertions and
+      # turned them flaky at 4 threads on the old 4-core runner, so keep threads
+      # and vCPU moving together: never set this above vCPU/2.
       - name: Run cross-layer e2e journeys
-        run: cargo nextest run -p decdn-e2e --features anvil-e2e --test-threads 2
+        run: cargo nextest run -p decdn-e2e --features anvil-e2e --test-threads 4
 
   # ----- Solidity contracts ----------------------------------------------
   # The contracts pipeline mirrors the Rust split (one concern per job).
