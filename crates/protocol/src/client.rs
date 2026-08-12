@@ -11,7 +11,7 @@
 //! The two signed artifacts on this protocol are produced/verified by
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
-//!     signed body fields `{hash, ok, rate_per_mb, total_bytes, channel_id,
+//!     signed body fields `{hash, ok, rate_per_mb, total_bytes, pool_id,
 //!     timestamp_us, redirect}` (ADR 014 §1), produced by the stream-response
 //!     slash signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
 //!     `error` and `voucher_interval_mb` are unsigned (ADR 005 §Voucher interval
@@ -205,13 +205,13 @@ pub struct StreamRequest {
     /// not a trust anchor** — returned bytes are verified against `hash`
     /// independently, so a wrong/hostile value can only fail the fetch, never
     /// corrupt delivery. The node layer converts this to an alloy `U256`;
-    /// keeping it `[u8; 32]` here (like `hash`/`channel_id`) leaves `protocol`
+    /// keeping it `[u8; 32]` here (like `hash`/`pool_id`) leaves `protocol`
     /// alloy-free. Billing-agnostic but load-bearing for routing, so it lives in
     /// the frozen base — every node reads it for origin routing (a node with no
     /// chain origin directory configured resolves nothing from it).
     pub namespace_id: [u8; 32],
-    /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
-    pub channel_id: [u8; 32],
+    /// `poolId = keccak256(owner, poolNonce)` (ADR 005).
+    pub pool_id: [u8; 32],
     /// Resume position in bytes; `0` for a full-blob fetch.
     pub byte_offset: u64,
     /// Upper bound on the requested range: the request covers the half-open span
@@ -400,9 +400,9 @@ pub struct StreamResponseBody {
     /// Total blob size in bytes (used for `BlobTooLarge` enforcement on
     /// cache-miss pulls — ADR 005 §`BlobTooLarge` enforcement).
     pub total_bytes: u64,
-    /// `channel_id` echoed from the [`StreamRequest`] (signed, so a node cannot
-    /// silently re-bind the response to a different channel).
-    pub channel_id: [u8; 32],
+    /// `pool_id` echoed from the [`StreamRequest`] (signed, so a node cannot
+    /// silently re-bind the response to a different pool).
+    pub pool_id: [u8; 32],
     /// Requester-generated microsecond timestamp from the [`StreamRequest`],
     /// echoed back unchanged.
     pub timestamp_us: u64,
@@ -970,7 +970,7 @@ mod tests {
             ok: true,
             rate_per_mb: 10,
             total_bytes: 4096,
-            channel_id: [9u8; 32],
+            pool_id: [9u8; 32],
             timestamp_us: 1_700_000_000_000_000,
             redirect: None,
         }
@@ -989,7 +989,7 @@ mod tests {
         StreamRequest {
             hash: [1u8; 32],
             namespace_id: [3u8; 32],
-            channel_id: [2u8; 32],
+            pool_id: [2u8; 32],
             byte_offset: 0,
             byte_len: 0,
             timestamp_us: 0xdead_beef,
@@ -1371,7 +1371,7 @@ mod tests {
                 ok: true,
                 rate_per_mb: 4,
                 total_bytes: 5,
-                channel_id: [6u8; 32],
+                pool_id: [6u8; 32],
                 timestamp_us: 7,
                 redirect: None,
             },
@@ -1385,7 +1385,7 @@ mod tests {
         expected.push(1u8); // body.ok = true
         expected.push(4u8); // body.rate_per_mb varint
         expected.push(5u8); // body.total_bytes varint
-        expected.extend_from_slice(&[6u8; 32]); // body.channel_id
+        expected.extend_from_slice(&[6u8; 32]); // body.pool_id
         expected.push(7u8); // body.timestamp_us varint
         expected.push(0u8); // body.redirect = None
         expected.push(0u8); // error = None
