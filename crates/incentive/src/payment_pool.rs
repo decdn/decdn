@@ -283,22 +283,88 @@ mod sol_types {
 pub use sol_types::PaymentPool;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    use alloy::primitives::{Address, B256, U256};
     use alloy::sol_types::SolEvent;
 
     use super::PaymentPool;
 
     /// Pins the `PoolRedeemed` event signature (and therefore its topic-0
-    /// selector) to `contracts/src/PaymentPool.sol`'s field list and
-    /// indexed-ness, so a drift between the Solidity source and this
-    /// binding fails the build instead of silently mis-decoding a node's
-    /// settlement log.
+    /// selector) to `contracts/src/PaymentPool.sol`'s field list, so a drift
+    /// between the Solidity source and this binding fails the build instead
+    /// of silently mis-decoding a node's settlement log.
+    ///
+    /// The ABI signature string does not encode which params are `indexed`
+    /// — see `pool_redeemed_indexed_layout_matches_contract` below for the
+    /// companion pin on topic/data placement.
     #[test]
     fn pool_redeemed_signature_matches_contract() {
         assert_eq!(
             PaymentPool::PoolRedeemed::SIGNATURE,
             "PoolRedeemed(bytes32,address,address,uint256,uint256,uint256)"
         );
+    }
+
+    /// Pins which `PoolRedeemed` params are `indexed`: `poolId`, `signer`,
+    /// and `provider` land in the log's topics (topic0 is the selector,
+    /// topics 1-3 the indexed params); `paid`, `bytesPaid`, and
+    /// `newPaidCumulative` land in the log data. The signature-string pin
+    /// above is blind to this split, so a future edit that moves `indexed`
+    /// onto the wrong param (e.g. onto `paid` instead of `provider`) would
+    /// pass that test while silently breaking a node's `provider`-topic
+    /// filter for its settlement watcher. This test constructs the event
+    /// with distinct sentinel values and checks each field landed in the
+    /// slot the ABI encoding independently computes for it.
+    #[test]
+    fn pool_redeemed_indexed_layout_matches_contract() {
+        let pool_id = B256::repeat_byte(0x11);
+        let signer = Address::repeat_byte(0x22);
+        let provider = Address::repeat_byte(0x33);
+        let paid = U256::from(1_000_u64);
+        let bytes_paid = U256::from(2_000_u64);
+        let new_paid_cumulative = U256::from(3_000_u64);
+
+        let event = PaymentPool::PoolRedeemed {
+            poolId: pool_id,
+            signer,
+            provider,
+            paid,
+            bytesPaid: bytes_paid,
+            newPaidCumulative: new_paid_cumulative,
+        };
+        let log = event.encode_log_data();
+
+        // topic0 (selector) + exactly the 3 indexed params.
+        assert_eq!(log.topics().len(), 4);
+        assert_eq!(
+            log.topics().first(),
+            Some(&PaymentPool::PoolRedeemed::SIGNATURE_HASH)
+        );
+        // Each indexed param lands in its own topic slot, address-padded
+        // into a word the same way the ABI encoder does it independently
+        // of the sol! macro's own topic-encoding path.
+        assert_eq!(log.topics().get(1), Some(&pool_id));
+        assert_eq!(log.topics().get(2), Some(&signer.into_word()));
+        assert_eq!(log.topics().get(3), Some(&provider.into_word()));
+
+        // The 3 non-indexed params are ABI-tuple-encoded into the data,
+        // in declaration order, and none of the indexed sentinels leak in.
+        let mut expected_data = Vec::new();
+        expected_data.extend_from_slice(paid.to_be_bytes::<32>().as_slice());
+        expected_data.extend_from_slice(bytes_paid.to_be_bytes::<32>().as_slice());
+        expected_data.extend_from_slice(new_paid_cumulative.to_be_bytes::<32>().as_slice());
+        assert_eq!(log.data.as_ref(), expected_data.as_slice());
+
+        // Round-trip through the decoder recovers the same struct, proving
+        // the topic/data split above is exactly what a real watcher decodes.
+        let decoded = PaymentPool::PoolRedeemed::decode_log_data(&log).unwrap();
+        assert_eq!(decoded.poolId, pool_id);
+        assert_eq!(decoded.signer, signer);
+        assert_eq!(decoded.provider, provider);
+        assert_eq!(decoded.paid, paid);
+        assert_eq!(decoded.bytesPaid, bytes_paid);
+        assert_eq!(decoded.newPaidCumulative, new_paid_cumulative);
     }
 
     /// Same pin for the other four ABI-tuple-carrying events consumed by
