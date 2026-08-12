@@ -14,7 +14,7 @@ use thiserror::Error;
 
 const DEFAULT_ALPHA: f64 = 0.1;
 const DEFAULT_INITIAL_SCORE: f64 = 0.5;
-const DEFAULT_EXPECTED_BPS: u64 = 1024 * 1024 * 1024; // 1 GiB/s log reference (~1.0)
+const DEFAULT_REFERENCE_BPS: u64 = 1024 * 1024 * 1024; // 1 GiB/s log reference (~1.0)
 const DEFAULT_SPEED_WEIGHT: f64 = 0.4;
 const DEFAULT_CORRECTNESS_WEIGHT: f64 = 0.4;
 const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
@@ -53,8 +53,8 @@ pub const LOCAL_SCORE_MAX_DELTA_PER_REPORT: f64 = 0.05;
 pub enum ConfigError {
     #[error("{field} must be a finite number in [0.0, 1.0], got {value}")]
     OutOfUnitInterval { field: &'static str, value: f64 },
-    #[error("expected_bps must be > 0")]
-    ZeroExpectedBps,
+    #[error("reference_bps must be > 0")]
+    ZeroReferenceBps,
     #[error(
         "weights must sum to 1.0; got speed={speed} + correctness={correctness} \
          + reachability={reachability} = {sum}"
@@ -113,7 +113,7 @@ pub struct LocalReputationConfig {
     pub initial_score: f64,
     /// Reference throughput scoring ~1.0 under the log speed curve (was the
     /// flat saturation baseline).
-    pub expected_bps: u64,
+    pub reference_bps: u64,
     pub speed_weight: f64,
     pub correctness_weight: f64,
     pub reachability_weight: f64,
@@ -128,7 +128,7 @@ impl Default for LocalReputationConfig {
         Self {
             alpha: DEFAULT_ALPHA,
             initial_score: DEFAULT_INITIAL_SCORE,
-            expected_bps: DEFAULT_EXPECTED_BPS,
+            reference_bps: DEFAULT_REFERENCE_BPS,
             speed_weight: DEFAULT_SPEED_WEIGHT,
             correctness_weight: DEFAULT_CORRECTNESS_WEIGHT,
             reachability_weight: DEFAULT_REACHABILITY_WEIGHT,
@@ -339,7 +339,7 @@ impl LocalReputation {
             Outcome::Corruption => crate::interaction::interaction_score(w, 0.0, 0.0, 1.0),
             // correctly delivered: full correctness + reachability, scaled speed
             Outcome::Delivered { bytes, elapsed } => {
-                let speed = speed_score(bytes, elapsed, self.config.expected_bps);
+                let speed = speed_score(bytes, elapsed, self.config.reference_bps);
                 crate::interaction::interaction_score(w, speed, 1.0, 1.0)
             }
         }
@@ -357,8 +357,8 @@ impl LocalReputation {
 
 // Thin wrapper over the shared formula so local and network paths cannot
 // drift (see [`crate::interaction`]).
-fn speed_score(bytes: u64, elapsed: Duration, expected_bps: u64) -> f64 {
-    crate::interaction::speed_score_from_transfer(bytes, elapsed, expected_bps)
+fn speed_score(bytes: u64, elapsed: Duration, reference_bps: u64) -> f64 {
+    crate::interaction::speed_score_from_transfer(bytes, elapsed, reference_bps)
 }
 
 fn validate(c: &LocalReputationConfig) -> Result<(), ConfigError> {
@@ -368,8 +368,8 @@ fn validate(c: &LocalReputationConfig) -> Result<(), ConfigError> {
     require_unit_interval(c.correctness_weight, "correctness_weight")?;
     require_unit_interval(c.reachability_weight, "reachability_weight")?;
     require_unit_interval(c.max_delta_per_update, "max_delta_per_update")?;
-    if c.expected_bps == 0 {
-        return Err(ConfigError::ZeroExpectedBps);
+    if c.reference_bps == 0 {
+        return Err(ConfigError::ZeroReferenceBps);
     }
     let sum = c.speed_weight + c.correctness_weight + c.reachability_weight;
     if (sum - 1.0).abs() > 1e-9 {
@@ -475,7 +475,7 @@ mod tests {
         ensure!(approx(c.speed_weight, 0.4));
         ensure!(approx(c.correctness_weight, 0.4));
         ensure!(approx(c.reachability_weight, 0.2));
-        ensure!(c.expected_bps == 1024 * 1024 * 1024);
+        ensure!(c.reference_bps == 1024 * 1024 * 1024);
         // §14a defers clamping; default is no-op (1.0).
         ensure!(approx(c.max_delta_per_update, 1.0));
         // §Score Decay: half-life default is 3 days.
@@ -501,12 +501,12 @@ mod tests {
         ));
 
         let bad = LocalReputationConfig {
-            expected_bps: 0,
+            reference_bps: 0,
             ..LocalReputationConfig::default()
         };
         assert!(matches!(
             LocalReputation::new(bad),
-            Err(ConfigError::ZeroExpectedBps)
+            Err(ConfigError::ZeroReferenceBps)
         ));
 
         let bad = LocalReputationConfig {
@@ -681,9 +681,9 @@ mod tests {
     }
 
     #[test]
-    fn expected_bps_override_changes_speed_baseline() -> anyhow::Result<()> {
+    fn reference_bps_override_changes_speed_baseline() -> anyhow::Result<()> {
         let cfg = LocalReputationConfig {
-            expected_bps: 1024 * 1024, // 1 MiB/s baseline
+            reference_bps: 1024 * 1024, // 1 MiB/s baseline
             ..LocalReputationConfig::default()
         };
         let r = LocalReputation::new(cfg)?;

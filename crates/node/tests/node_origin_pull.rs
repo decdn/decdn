@@ -13018,7 +13018,7 @@ async fn top_up_fixture_multi(
 
 /// [`top_up_fixture_multi`] with the buyer's local reputation configured explicitly,
 /// so the delivery-speed regression can read a single delivery's speed off the score
-/// (`alpha = 1.0`, no EWMA blend) against a known `expected_bps`.
+/// (`alpha = 1.0`, no EWMA blend) against a known `reference_bps`.
 async fn top_up_fixture_multi_rep(
     payloads: Vec<Arc<Vec<u8>>>,
     setup: TopUpSetup,
@@ -13211,13 +13211,13 @@ async fn a_pull_larger_than_the_initial_deposit_tops_up_once_and_completes() -> 
 ///
 /// The reputation is configured so ONE delivery's speed reads straight off the score:
 /// `alpha = 1.0` drops the EWMA blend, so `score == 0.4·speed + 0.6` with the
-/// log-normalized `speed = clamp(ln(1+bytes_per_sec) / ln(1+expected_bps), 0, 1)`
+/// log-normalized `speed = clamp(ln(1+bytes_per_sec) / ln(1+reference_bps), 0, 1)`
 /// (ADR 008 §Local Score Calculation). The upstream is throttled to serve the resume
 /// leg over [`SLOW_RESUME`], so the honest `elapsed` spans at least that:
 ///
 /// - CORRECT: the whole ~3,146,505-byte payload crosses over the throttled
 ///   `SLOW_RESUME = 3 s`, so `bytes_per_sec ≈ 1,048,835` (~1 MiB/s). At
-///   `expected_bps = 1 GiB/s` (`1,073,741,824`, chosen — as the log curve
+///   `reference_bps = 1 GiB/s` (`1,073,741,824`, chosen — as the log curve
 ///   recommends — well above the throttled rate so the log gap is legible), that is
 ///   `speed = ln(1,048,836) / ln(1,073,741,825) ≈ 13.86319 / 20.79442 ≈ 0.66668`, so
 ///   `score ≈ 0.4·0.66668 + 0.6 ≈ 0.86667` — comfortably under the bound below.
@@ -13234,18 +13234,18 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
     /// Long enough that the resumed leg's transfer dominates `elapsed`, so a score that
     /// still reads "fast" can only mean the transfer was wrongly charged to `paid_wait`.
     const SLOW_RESUME: Duration = Duration::from_secs(3);
-    /// 1 GiB/s — the production default reference (`DEFAULT_EXPECTED_BPS`), set
+    /// 1 GiB/s — the production default reference (`DEFAULT_REFERENCE_BPS`), set
     /// explicitly here for a self-contained derivation. Picked well above the
     /// throttled resume's ~1 MiB/s so the log curve's gap between "throttled" and
     /// "saturated" reads clearly (see the derivation above).
-    const EXPECTED_BPS: u64 = 1024 * 1024 * 1024;
+    const REFERENCE_BPS: u64 = 1024 * 1024 * 1024;
 
     let payload = multi_interval_payload();
     let mut rep_config = LocalReputationConfig::default();
     // One delivery must move the score to exactly its interaction sample, so the speed
     // term is legible; the default 0.1 EWMA would compress both cases against neutral.
     rep_config.alpha = 1.0;
-    rep_config.expected_bps = EXPECTED_BPS;
+    rep_config.reference_bps = REFERENCE_BPS;
 
     let mut setup = TopUpSetup::honest(2 * RATE, 200 * RATE, true);
     setup.resume_delay = SLOW_RESUME;
