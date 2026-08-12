@@ -586,22 +586,23 @@ impl ChunkData {
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
 ///
-/// Only `{signature, amount, nonce}` travel on the wire; the receiver
-/// reconstructs the full EIP-712 typed data `{channelId, amount, nonce,
-/// bytesDelivered, token}` from stream context (`channel_id` from the
-/// [`StreamRequest`], `token` fixed at channel open, `bytesDelivered` the node's
-/// per-channel cumulative counter). `amount` and `nonce` are 256-bit values in
-/// big-endian bytes — the protocol crate has no `U256`, and truncating to
-/// `u64` would break channels whose on-chain nonce exceeds `u64::MAX`.
+/// Only `{signature, amount}` travel on the wire; the receiver reconstructs
+/// the full EIP-712 typed data `{poolId, signer, provider, amount,
+/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed
+/// for the stream, `bytesDelivered` the node's per-pool cumulative counter).
+/// There is no nonce: `amount` is monotone cumulative spend within the pool,
+/// and it alone orders vouchers and rejects replays — a voucher with an
+/// `amount` no greater than the highest one already accepted is stale.
+/// `amount` is a 256-bit value in big-endian bytes — the protocol crate has
+/// no `U256`, and truncating to `u64` would break pools whose cumulative
+/// spend exceeds `u64::MAX`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).
     pub signature: Vec<u8>,
-    /// Cumulative payment in token base units, big-endian `uint256`.
+    /// Cumulative payment in token base units, big-endian `uint256`. The sole
+    /// ordering and replay key.
     pub amount: [u8; 32],
-    /// Voucher sequence number within the channel (starts at 1), big-endian
-    /// `uint256`.
-    pub nonce: [u8; 32],
 }
 
 impl Voucher {
@@ -1013,7 +1014,6 @@ mod tests {
         Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x11u8; 32],
-            nonce: [0x22u8; 32],
         }
     }
 
@@ -1402,14 +1402,12 @@ mod tests {
         let v = Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x01u8; 32],
-            nonce: [0x02u8; 32],
         };
         let bytes = postcard::to_allocvec(&v)?;
         let mut expected = Vec::new();
         expected.push(VOUCHER_SIG_LEN as u8); // signature length prefix (65)
         expected.extend_from_slice(&[0xCDu8; VOUCHER_SIG_LEN]); // signature
         expected.extend_from_slice(&[0x01u8; 32]); // amount (no length prefix)
-        expected.extend_from_slice(&[0x02u8; 32]); // nonce (no length prefix)
         assert_eq!(bytes, expected);
         Ok(())
     }
