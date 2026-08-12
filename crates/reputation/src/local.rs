@@ -14,7 +14,7 @@ use thiserror::Error;
 
 const DEFAULT_ALPHA: f64 = 0.1;
 const DEFAULT_INITIAL_SCORE: f64 = 0.5;
-const DEFAULT_EXPECTED_BPS: u64 = 10 * 1024 * 1024;
+const DEFAULT_EXPECTED_BPS: u64 = 1024 * 1024 * 1024; // 1 GiB/s log reference (~1.0)
 const DEFAULT_SPEED_WEIGHT: f64 = 0.4;
 const DEFAULT_CORRECTNESS_WEIGHT: f64 = 0.4;
 const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
@@ -108,6 +108,8 @@ pub enum Outcome {
 pub struct LocalReputationConfig {
     pub alpha: f64,
     pub initial_score: f64,
+    /// Reference throughput scoring ~1.0 under the log speed curve (was the
+    /// flat saturation baseline).
     pub expected_bps: u64,
     pub speed_weight: f64,
     pub correctness_weight: f64,
@@ -454,7 +456,7 @@ mod tests {
 
     fn delivered_full() -> Outcome {
         Outcome::Delivered {
-            bytes: 10 * 1024 * 1024,
+            bytes: 1024 * 1024 * 1024, // reference throughput in 1s → speed 1.0
             elapsed: Duration::from_secs(1),
         }
     }
@@ -471,7 +473,7 @@ mod tests {
         ensure!(approx(c.speed_weight, 0.4));
         ensure!(approx(c.correctness_weight, 0.4));
         ensure!(approx(c.reachability_weight, 0.2));
-        ensure!(c.expected_bps == 10 * 1024 * 1024);
+        ensure!(c.expected_bps == 1024 * 1024 * 1024);
         // §14a defers clamping; default is no-op (1.0).
         ensure!(approx(c.max_delta_per_update, 1.0));
         // §Score Decay: 10% per idle week toward neutral.
@@ -535,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_at_baseline_speed_pulls_score_up() -> anyhow::Result<()> {
+    fn delivered_at_reference_speed_pulls_score_up() -> anyhow::Result<()> {
         let r = LocalReputation::new(LocalReputationConfig::default())?;
         let p = fresh_peer();
         // interaction = 0.4*1 + 0.4 + 0.2 = 1.0
@@ -543,7 +545,7 @@ mod tests {
         let next = r.record(
             p,
             Outcome::Delivered {
-                bytes: 10 * 1024 * 1024,
+                bytes: 1024 * 1024 * 1024,
                 elapsed: Duration::from_secs(1),
             },
         );
@@ -665,41 +667,12 @@ mod tests {
     }
 
     #[test]
-    fn speed_score_saturates_above_baseline() -> anyhow::Result<()> {
-        let r = LocalReputation::new(LocalReputationConfig::default())?;
-        let p1 = fresh_peer();
-        let p2 = fresh_peer();
-        let baseline = r.record(
-            p1,
-            Outcome::Delivered {
-                bytes: 10 * 1024 * 1024,
-                elapsed: Duration::from_secs(1),
-            },
-        );
-        let above = r.record(
-            p2,
-            Outcome::Delivered {
-                bytes: 100 * 1024 * 1024, // 10× baseline
-                elapsed: Duration::from_secs(1),
-            },
-        );
-        ensure!(approx(baseline, above), "baseline={baseline} above={above}");
-        // Anchor: rule out a "always returns initial" bug by pinning the
-        // saturated value (0.55 from EWMA of 0.5 ← 1.0 with α=0.1).
-        ensure!(
-            approx(baseline, 0.55),
-            "expected saturation to land at 0.55, got {baseline}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn speed_score_function_is_correct() {
-        let bps = 10 * 1024 * 1024;
+        let bps = 1024 * 1024 * 1024; // 1 GiB/s reference
         let one_sec = Duration::from_secs(1);
         assert!(approx(speed_score(bps, one_sec, bps), 1.0));
         assert!(approx(speed_score(2 * bps, one_sec, bps), 1.0));
-        assert!(approx(speed_score(bps / 10, one_sec, bps), 0.1));
+        assert!(speed_score(bps / 10, one_sec, bps) < speed_score(bps, one_sec, bps));
         assert!(approx(speed_score(0, one_sec, bps), 0.0));
         assert!(approx(speed_score(1, Duration::ZERO, bps), 0.0));
         assert!(approx(speed_score(1, one_sec, 0), 0.0));
@@ -733,7 +706,8 @@ mod tests {
         let r_full = LocalReputation::new(cfg)?;
         let p = fresh_peer();
         let corrupt = r_corrupt.record(p, Outcome::Corruption);
-        // ~10% of baseline → speed_score ≈ 0.1 → interaction ≈ 0.64
+        // 1 MiB/s vs. the 1 GiB/s reference: log curve still scores this well
+        // above zero but below a full-reference-speed delivery.
         let slow = r_slow.record(
             p,
             Outcome::Delivered {
@@ -762,7 +736,7 @@ mod tests {
             r.record(
                 p_good,
                 Outcome::Delivered {
-                    bytes: 10 * 1024 * 1024,
+                    bytes: 1024 * 1024 * 1024,
                     elapsed: Duration::from_secs(1),
                 },
             );
