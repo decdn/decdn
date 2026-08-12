@@ -43,7 +43,7 @@ Formula: `interaction_score = 0.4 * speed_score + 0.4 * correctness + 0.2 * reac
 
 > **¹ Why 40% for data correctness — same as delivery speed?** Reputation measures *service quality*, not *honesty*. Data correctness is one quality signal among several; the primary corruption deterrent is **economic** (no payment for failed delivery) **plus traffic loss** (reputation-driven node selection), not on-chain slashing. Content corruption is fully absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md#adr-002-content-addressing) / [ADR 005](005-protocol.md#adr-005-wire-protocol)) — a corrupt window yields no voucher, so the node is unpaid for the bandwidth shipping garbage; see [ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery). Reputation impact compounds on top: a single corruption event (a) zeros the correctness component (−0.4 on `interaction_score`), (b) drops `local_score` via EWMA, (c) degrades node selection via the quadratic reputation penalty (`1/max(reputation, 0.1)²` — [ADR 001](001-network.md#node-selection-algorithm)). Lost revenue plus the traffic-routing penalty make sustained corruption irrational. A higher reputation weight or an immediate local blacklist would over-penalize transient bao-pull failures that the EWMA already absorbs.
 
-Normalization: `speed_score = clamp(ln(1 + actual_bps) / ln(1 + reference_bps), 0.0, 1.0)`, where `reference_bps` is a node-local configurable throughput that scores ~1.0 (default: 1 GiB/s = 1,073,741,824 bytes/sec). The log curve does not saturate at a flat baseline: throughput above the old ~80 Mbps cutoff still scores strictly higher as it climbs, so a materially faster node earns a materially better speed score instead of tying with every other node above the cutoff.
+Normalization: `speed_score = clamp(ln(1 + actual_bps) / ln(1 + reference_bps), 0.0, 1.0)`, where `reference_bps` is a node-local configurable throughput that scores ~1.0 (default: 1 GiB/s = 1,073,741,824 bytes/sec). The log curve does not saturate at a flat baseline. Throughput above the old ~80 Mbps cutoff still scores strictly higher as it climbs, so a materially faster node earns a materially better speed score instead of tying with every other node above the cutoff.
 
 EWMA with alpha=0.1 means recent interactions matter more but old interactions still contribute.
 
@@ -62,7 +62,7 @@ Each half-life halves the distance between the score and neutral. `half_life_sec
 
 Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after roughly 4.3 half-lives (about 13 days at the default).
 
-The half-life is deliberately sub-weekly. A transiently dinged node re-enters selection within days rather than weeks, and no incumbent coasts on a stale high score for weeks after it stops delivering — both widen the serving set. [`Outcome::Unreachable`] reachability failures ride this same decay as an ordinary negative sample; there is no separate hard-crater penalty for a peer that becomes briefly unreachable.
+The half-life is deliberately sub-weekly. A transiently dinged node re-enters selection within days rather than weeks, and no incumbent coasts on a stale high score for weeks after it stops delivering — both widen the serving set. [`Outcome::Unreachable`] reachability failures ride this same decay as an ordinary negative sample. There is no separate hard-crater penalty for a peer that becomes briefly unreachable.
 
 | Parameter | Value |
 |-----------|-------|

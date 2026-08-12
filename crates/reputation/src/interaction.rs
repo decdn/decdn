@@ -43,9 +43,6 @@ pub(crate) fn speed_score_from_bps(bytes_per_sec: f64, reference_bps: u64) -> f6
         return 0.0;
     }
     let denom = (1.0 + reference_bps as f64).ln();
-    if denom <= 0.0 {
-        return 0.0;
-    }
     ((1.0 + bytes_per_sec).ln() / denom).clamp(0.0, 1.0)
 }
 

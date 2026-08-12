@@ -23,7 +23,8 @@ const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
 /// stale reputation, both of which widen the serving set (ADR 008 §Score Decay).
 const DEFAULT_DECAY_HALF_LIFE_SECS: u64 = 3 * 24 * 3600; // 259_200
 
-/// Seconds in a week — the decay unit (ADR 008 §Score Decay).
+/// Seconds in a week — used only to bound the eviction idle window (ADR 008
+/// §Score Decay).
 const SECONDS_PER_WEEK: f64 = 7.0 * 24.0 * 3600.0;
 
 /// Eviction candidates must be within this band of neutral (ADR 008
@@ -956,7 +957,7 @@ mod tests {
         r.record(recent, Outcome::Unreachable);
 
         // Preconditions the eviction predicate keys on: two are inside the band,
-        // one is not; ages are 40 wk / 24 wk / 0 wk respectively.
+        // one is not; idle ages are 40 wk / 10 wk / 0 wk respectively.
         ensure!(
             (r.score(evictable) - 0.5).abs() <= EVICT_NEUTRAL_BAND,
             "evictable not within band: {}",
