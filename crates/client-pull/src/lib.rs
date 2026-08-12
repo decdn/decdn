@@ -86,12 +86,12 @@ use bao_tree::io::{BaoContentItem, DecodeError};
 use bytes::{Bytes, BytesMut};
 use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
 use decdn_incentive::{
-    BuyerPoolState, EPHEMERAL_BINDING_NONCE, SignedVoucher, StreamSlashData, Voucher,
-    binding_signing_hash, signed_to_wire_voucher,
+    BuyerPoolState, EPHEMERAL_BINDING_NONCE, SignedCapability, SignedVoucher, StreamSlashData,
+    Voucher, binding_signing_hash, signed_to_wire_voucher,
 };
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    VoucherRejectReason, WatermarkBundle,
+    VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
     ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
@@ -140,6 +140,17 @@ pub struct PoolContext {
     /// origin (#1115). `None` ⇒ no binding is sent (an unconfigured
     /// `capacity_bond` on the client, or an on-chain/registered requester).
     pub client_binding: Option<ClientBinding>,
+    /// Optional pool owner capability delegating spend to `client_signer`
+    /// (ADR 003 §Capability delegation, D3 `issue_self_capability` /
+    /// `buyer_pool::open_pool`). Attached to every `cdn/client/v1` request's
+    /// `ext` alongside `client_binding` so the serving node can register the
+    /// signer on that signer's first on-chain redemption. Node-agnostic — the
+    /// same `SignedCapability` is valid at every node this context streams
+    /// from, since it grants spend against the pool rather than a specific
+    /// provider. `None` ⇒ no capability is sent (the signer is already
+    /// registered on-chain, or this stream reuses a lane a prior stream this
+    /// session already delivered the capability for).
+    pub capability: Option<SignedCapability>,
 }
 
 impl PoolContext {
@@ -167,6 +178,7 @@ impl PoolContext {
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,
+            capability: None,
         }
     }
 
@@ -196,6 +208,20 @@ impl PoolContext {
     #[must_use]
     pub fn with_client_binding(mut self, binding: ClientBinding) -> Self {
         self.client_binding = Some(binding);
+        self
+    }
+
+    /// Attach a pool owner capability so this context's `cdn/client/v1`
+    /// requests carry it to the serving node at session start, letting the
+    /// node register `client_signer` on that signer's first on-chain
+    /// redemption (ADR 003 §Capability delegation). Pass the
+    /// `SignedCapability` produced by `buyer_pool::open_pool` /
+    /// `issue_self_capability`; a capability whose `signer` doesn't match
+    /// `client_signer` or that fails owner-signature recovery only ever hurts
+    /// the caller itself, exactly like [`Self::with_client_binding`].
+    #[must_use]
+    pub const fn with_capability(mut self, capability: SignedCapability) -> Self {
+        self.capability = Some(capability);
         self
     }
 }
@@ -234,14 +260,24 @@ pub fn sign_client_binding(
 }
 
 /// Build the trailing [`StreamRequestExt`] carrying the context's client
-/// identity binding, or `None` when the context is unbound — in which case
-/// `encode_stream_request` appends no ext bytes, byte-for-byte the pre-#1115
-/// wire. Shared by `fetch_inner` and `open_progressive_pull`. `voucher_interval_mb`
+/// identity binding and/or owner capability, or `None` when the context
+/// carries neither — in which case `encode_stream_request` appends no ext
+/// bytes, byte-for-byte the pre-#1115 wire. Shared by `fetch_inner` and
+/// `open_progressive_pull` (both go through `open_stream`), so the capability
+/// rides the same session-start request as the binding. `voucher_interval_mb`
 /// stays `None` so both sides keep negotiating the default cadence.
 fn client_binding_ext(ctx: &PoolContext) -> Option<StreamRequestExt> {
-    ctx.client_binding.as_ref().map(|binding| StreamRequestExt {
+    if ctx.client_binding.is_none() && ctx.capability.is_none() {
+        return None;
+    }
+    Some(StreamRequestExt {
         voucher_interval_mb: None,
-        binding: Some(binding.clone()),
+        binding: ctx.client_binding.clone(),
+        capability: ctx.capability.as_ref().map(|signed| WireCapability {
+            spending_cap: signed.capability.spending_cap.to_be_bytes(),
+            expiry: signed.capability.expiry,
+            owner_signature: signed.signature.as_bytes().to_vec(),
+        }),
     })
 }
 
@@ -2924,6 +2960,7 @@ mod tests {
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,
+            capability: None,
         };
         // Unbound ⇒ no ext.
         anyhow::ensure!(
@@ -2943,6 +2980,39 @@ mod tests {
         anyhow::ensure!(
             ext.binding == Some(binding),
             "ext must carry the exact binding"
+        );
+        anyhow::ensure!(
+            ext.capability.is_none(),
+            "no capability attached ⇒ ext must carry none"
+        );
+
+        // Capability attached ⇒ ext carries the wire-mapped capability, alongside
+        // the still-present binding — the two fields are independent.
+        let owner = PrivateKeySigner::random();
+        let capability = decdn_incentive::Capability {
+            signer: signer.address(),
+            spending_cap: U256::from(10_000_000u64),
+            pool_id: B256::ZERO,
+            expiry: 1_900_000_000,
+        }
+        .sign(&owner, &domain)?;
+        let ctx = ctx.with_capability(capability.clone());
+        let ext = client_binding_ext(&ctx)
+            .ok_or_else(|| anyhow::anyhow!("ctx with capability must yield an ext"))?;
+        let wire_cap = ext
+            .capability
+            .ok_or_else(|| anyhow::anyhow!("ext must carry the capability"))?;
+        anyhow::ensure!(
+            wire_cap.spending_cap == capability.capability.spending_cap.to_be_bytes(),
+            "spending_cap must round-trip to wire form"
+        );
+        anyhow::ensure!(
+            wire_cap.expiry == capability.capability.expiry,
+            "expiry must round-trip unchanged"
+        );
+        anyhow::ensure!(
+            wire_cap.owner_signature == capability.signature.as_bytes().to_vec(),
+            "owner_signature must round-trip to wire bytes"
         );
         Ok(())
     }
@@ -2965,6 +3035,7 @@ mod tests {
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,
+            capability: None,
         }
     }
 
