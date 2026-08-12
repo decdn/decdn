@@ -529,7 +529,7 @@ impl ClientHandler {
                 // Spawn the off-task local pull leg on its own current-thread runtime.
                 // All inputs are owned + `'static`; it shares only the session Arc. Its
                 // cancel token is the SESSION's — lease-driven, not a fresh local token.
-                // The `BackendSource` carries a FRESH local bookkeeping `ChannelLedger`
+                // The `BackendSource` carries a FRESH local bookkeeping `PoolLedger`
                 // (seed ZERO) that `run_local_pull_leg` reads back via `source.ledger()`
                 // and hands to `drive` as the completion frontier (THE CRUX — a
                 // completion counter, never payment).
@@ -542,7 +542,7 @@ impl ClientHandler {
                     let len = req.byte_len;
                     let leech_governor = self.leech_governor.clone();
                     let client_peer = client_node_id.0;
-                    let ledger = Arc::new(decdn_client_pull::ChannelLedger::new(
+                    let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
                         decdn_client_pull::Cumulative::default(),
                     ));
                     let source = crate::node_origin::BackendSource::new(
