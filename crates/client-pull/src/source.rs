@@ -36,7 +36,7 @@ use decdn_incentive::DepositOutcome;
 use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::{PullReader, StashedFault};
-use crate::{ChannelContext, ChannelLedger, PullDeadlines, UpstreamPullHeader, VoucherProgress};
+use crate::{PoolContext, PoolLedger, PullDeadlines, UpstreamPullHeader, VoucherProgress};
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
 /// the same boxed-future async-trait shape [`decdn_bao_range::RangedStore`] and
@@ -153,7 +153,7 @@ pub trait Funder: Send + Sync {
     ///
     /// Returns the [`DepositOutcome`] of crediting the row: `Added(new_total)` on
     /// the clean path — the driver updates its channel deposit from it — or the
-    /// escrowed-but-untracked variants (`UnknownChannel` / `ChannelMismatch`),
+    /// escrowed-but-untracked variants (`UnknownPool` / `PoolMismatch`),
     /// which the driver treats as terminal (the USDC is on-chain but the local
     /// record is gone; reconcile against the tx).
     ///
@@ -192,10 +192,10 @@ fn micros_now() -> u64 {
 ///
 /// Borrows its `endpoint`/`slash_domain` (the driver, which owns these for the
 /// whole fetch, outlives every `open`/`finish` call), but holds the channel
-/// context behind a SHARED `Arc<Mutex<ChannelContext>>` rather than a `&'a`
+/// context behind a SHARED `Arc<Mutex<PoolContext>>` rather than a `&'a`
 /// borrow. That shared handle is what resolves the #1608 borrow conflict: the
 /// driver mutates the context (crediting a mid-fetch top-up's new deposit)
-/// while this source also reads it to open each pull. A `&'a ChannelContext`
+/// while this source also reads it to open each pull. A `&'a PoolContext`
 /// borrow would freeze it for the whole fetch and forbid the driver's `&mut`;
 /// the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to CLONE
 /// the context out (single-writer per fetch — the driver never opens a pull
@@ -204,8 +204,8 @@ fn micros_now() -> u64 {
 pub struct PeerSource<'a> {
     endpoint: &'a Endpoint,
     target: EndpointAddr,
-    ctx: Arc<Mutex<ChannelContext>>,
-    ledger: Arc<ChannelLedger>,
+    ctx: Arc<Mutex<PoolContext>>,
+    ledger: Arc<PoolLedger>,
     slash_domain: &'a Eip712Domain,
     expected_signer: Address,
     namespace_id: [u8; 32],
@@ -216,7 +216,7 @@ pub struct PeerSource<'a> {
 
 impl std::fmt::Debug for PeerSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `ChannelContext` (a signing key) and `Eip712Domain` are not `Debug`,
+        // `PoolContext` (a signing key) and `Eip712Domain` are not `Debug`,
         // so this prints only the non-sensitive routing/policy fields.
         f.debug_struct("PeerSource")
             .field("target", &self.target)
@@ -239,8 +239,8 @@ impl<'a> PeerSource<'a> {
     pub const fn new(
         endpoint: &'a Endpoint,
         target: EndpointAddr,
-        ctx: Arc<Mutex<ChannelContext>>,
-        ledger: Arc<ChannelLedger>,
+        ctx: Arc<Mutex<PoolContext>>,
+        ledger: Arc<PoolLedger>,
         slash_domain: &'a Eip712Domain,
         expected_signer: Address,
         namespace_id: [u8; 32],
@@ -274,7 +274,7 @@ impl BlobSource for PeerSource<'_> {
         Box::pin(async move {
             // Snapshot the shared context (single-writer per fetch, so this can
             // never race a top-up), then drop the guard before the await —
-            // `open_progressive_pull` needs `&ChannelContext` for its whole call,
+            // `open_progressive_pull` needs `&PoolContext` for its whole call,
             // and no std `Mutex` guard may be held across an `.await`.
             let ctx = {
                 self.ctx
@@ -358,7 +358,7 @@ mod doubles {
         /// that never advanced `committed` would leave the driver's paid frontier at
         /// zero and it would never complete. `None` keeps the pre-payment "unpaid
         /// double" behaviour for tests that do not drive `fill_gap` to completion.
-        ledger: Option<Arc<crate::ChannelLedger>>,
+        ledger: Option<Arc<crate::PoolLedger>>,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -396,9 +396,9 @@ mod doubles {
         /// watermark by the leg's drained WIRE bytes (at [`SCRIPTED_RATE_PER_MB`]),
         /// exactly as a real pull's acked vouchers do. Required by any test that
         /// drives a gap to completion, since the driver's `Done` is paid-frontier
-        /// based. Pass the SAME `Arc<ChannelLedger>` the driver is handed.
+        /// based. Pass the SAME `Arc<PoolLedger>` the driver is handed.
         #[must_use]
-        pub fn paying(mut self, ledger: Arc<crate::ChannelLedger>) -> Self {
+        pub fn paying(mut self, ledger: Arc<crate::PoolLedger>) -> Self {
             self.ledger = Some(ledger);
             self
         }
@@ -515,17 +515,16 @@ mod doubles {
                     // Unpaid double: no channel, nothing to drain, no watermark.
                     return Ok(VoucherProgress::default());
                 };
-                // Model the acked voucher for this leg's wire: issue then resolve,
+                // Model the committed voucher for this leg's wire: a successful
+                // issue commits optimistically (implicit acceptance, ADR 005),
                 // advancing `committed.bytes` by the drained WIRE bytes so the
-                // driver's paid frontier tracks payment (a real pull does this via
-                // the receive loop's per-interval vouchers + acks).
+                // driver's paid frontier tracks payment.
                 if reader.wire_len > 0 {
                     ledger
                         .issue(reader.wire_len, SCRIPTED_RATE_PER_MB, |_next| async {
                             Ok(())
                         })
                         .await?;
-                    let _ = ledger.resolve_ack();
                 }
                 Ok(VoucherProgress::from_cumulative(
                     ledger.committed(),

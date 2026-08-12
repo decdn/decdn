@@ -40,7 +40,7 @@
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
 //!   [`WatermarkBundle`](decdn_protocol::client::WatermarkBundle) that ADVANCES
 //!   our committed watermark is a healable desync — the driver reseeds the ledger
-//!   ([`ChannelLedger::reseed`]) and retries. This is driver-owned, NOT a
+//!   ([`PoolLedger::reseed`]) and retries. This is driver-owned, NOT a
 //!   [`PaceDecision`], exactly as `node_origin::resume::decide` orders it.
 //!
 //! # What is deliberately NOT here (deferred to A5 / the CLI)
@@ -52,7 +52,7 @@
 //!   there is no foreign-partial ambiguity to resolve — resume is always driven by
 //!   the verified present set.
 //! - **Progress reporting, deadlines, and durable watermark persistence** to a
-//!   `BuyerChannelStore`. The acked watermark lives in the [`ChannelLedger`] the
+//!   `BuyerChannelStore`. The acked watermark lives in the [`PoolLedger`] the
 //!   caller owns; persisting it across process restarts, and drawing a progress
 //!   bar, are CLI concerns (A5).
 //!
@@ -77,7 +77,7 @@ use decdn_incentive::DepositOutcome;
 use crate::pacer::{PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
-    ChannelContext, ChannelLedger, Cumulative, MAX_RESUME_ATTEMPTS, Pacer, ProgressCallback,
+    Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
     UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
 };
 
@@ -94,7 +94,7 @@ pub trait PacingWait: Send + Sync {
 /// Read the channel context's current deposit through the shared handle. A tiny
 /// helper so the driver never holds the lock across an `.await` — it locks,
 /// copies the `U256`, and drops the guard.
-fn locked_deposit(ctx: &Mutex<ChannelContext>) -> anyhow::Result<U256> {
+fn locked_deposit(ctx: &Mutex<PoolContext>) -> anyhow::Result<U256> {
     Ok(ctx
         .lock()
         .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
@@ -167,7 +167,7 @@ struct DriveCounters {
 }
 
 /// Price the next voucher from an upstream header, the exact formula
-/// [`ChannelLedger`]'s own `next_voucher` and the CLI's reactive branch use.
+/// [`PoolLedger`]'s own `next_voucher` and the CLI's reactive branch use.
 fn voucher_cost(header: &UpstreamPullHeader) -> U256 {
     U256::from(header.interval_bytes)
         .saturating_mul(U256::from(header.rate_per_mb))
@@ -234,8 +234,8 @@ pub async fn drive<St, S, P, F>(
     source: &S,
     pacer: &P,
     funder: &F,
-    ctx: &Arc<Mutex<ChannelContext>>,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &Arc<Mutex<PoolContext>>,
+    ledger: &Arc<PoolLedger>,
     hash: [u8; 32],
     offset: u64,
     len: u64,
@@ -307,8 +307,8 @@ async fn fill_gap<St, S, P, F>(
     source: &S,
     pacer: &P,
     funder: &F,
-    ctx: &Arc<Mutex<ChannelContext>>,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &Arc<Mutex<PoolContext>>,
+    ledger: &Arc<PoolLedger>,
     hash: [u8; 32],
     gap_start: u64,
     gap_len: u64,
@@ -446,18 +446,18 @@ where
                             .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
                             .deposit = new_deposit;
                     }
-                    DepositOutcome::UnknownChannel => {
+                    DepositOutcome::UnknownPool => {
                         anyhow::bail!(
                             "mid-fetch top-up of {additional} landed on-chain but no local \
                              record remains to credit it: the deposit is escrowed and \
                              untracked. Reconcile against the chain before retrying"
                         );
                     }
-                    DepositOutcome::ChannelMismatch => {
+                    DepositOutcome::PoolMismatch => {
                         anyhow::bail!(
                             "mid-fetch top-up of {additional} landed on-chain but the local \
-                             record now tracks a different channel: the deposit is escrowed \
-                             against the topped-up channel. Reconcile against the chain \
+                             record now tracks a different pool: the deposit is escrowed \
+                             against the topped-up pool. Reconcile against the chain \
                              before retrying"
                         );
                     }
@@ -640,7 +640,7 @@ mod tests {
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState};
     use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
     use crate::{
-        ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, UpstreamPullHeader,
+        ClientRangedStore, Cumulative, PoolContext, PoolLedger, UpstreamPullHeader,
         UpstreamVoucherRejected, VoucherProgress,
     };
     use decdn_protocol::client::VoucherRejectReason;
@@ -687,15 +687,14 @@ mod tests {
 
     /// A healthy buyer context: a huge deposit so the pacer never has to top up
     /// (the money assertions exercise the gap logic, not funding).
-    fn healthy_ctx() -> ChannelContext {
+    fn healthy_ctx() -> PoolContext {
         let signer = PrivateKeySigner::random();
-        ChannelContext {
-            channel_id: B256::ZERO,
-            token: Address::ZERO,
+        PoolContext {
+            pool_id: B256::ZERO,
+            provider: Address::ZERO,
             deposit: U256::from(u128::MAX),
             client_signer: Arc::new(signer),
             voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
-            prior_nonce: U256::ZERO,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,
@@ -749,7 +748,7 @@ mod tests {
         );
         let want_gap_bytes: u64 = want_gaps.iter().map(|(_, l)| *l).sum();
 
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -838,7 +837,7 @@ mod tests {
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
 
         drive(
             &store,
@@ -902,7 +901,7 @@ mod tests {
         // is already held, so < 5 MiB of wire remains) is under the threshold and
         // completes. One source instance across both drives, so `opened_ranges`
         // records both opens.
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .with_fault_after(5 * 1024 * 1024, || {
@@ -1007,7 +1006,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1088,7 +1087,7 @@ mod tests {
     }
 
     /// A [`BlobSource`] wrapper that fails its FIRST open with a scripted
-    /// upstream `InsufficientDeposit` voucher rejection — the shape a genuine
+    /// upstream `CapExceeded` voucher rejection — the shape a genuine
     /// mid-fetch exhaustion refusal takes — and delegates every later open to
     /// the inner [`ScriptedSource`]. Regression coverage for the pacer bug where
     /// `BudgetPacer` proactively returned `Wait` after every top-up, forcing the
@@ -1118,7 +1117,7 @@ mod tests {
                         interval_bytes: 1024 * 1024,
                     };
                     let fault = UpstreamVoucherRejected {
-                        reason: VoucherRejectReason::InsufficientDeposit,
+                        reason: VoucherRejectReason::CapExceeded,
                         bundle: None,
                     };
                     return Ok((
@@ -1144,7 +1143,7 @@ mod tests {
     #[tokio::test]
     async fn a_top_up_is_followed_by_an_immediate_reopen_not_a_settle_wait() {
         // The buyer starts under-deposited, so the first open's genuine
-        // `InsufficientDeposit` refusal is corroborated by the buyer's OWN
+        // `CapExceeded` refusal is corroborated by the buyer's OWN
         // ledger (0 remaining < any nonzero voucher cost) and the pacer tops
         // up. Before the fix, `BudgetPacer::decide` proactively returned `Wait`
         // right after that top-up, and the driver slept the WHOLE settle
@@ -1155,7 +1154,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let inner = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1255,7 +1254,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1331,7 +1330,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1405,7 +1404,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
