@@ -48,8 +48,8 @@ use decdn_common::address::parse_nonzero_address;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
 use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
+use decdn_incentive::PoolStateStore;
 use decdn_incentive::eth_identity::{self, PasswordSource};
-use decdn_incentive::{PendingSettleStore, PoolStateStore};
 
 /// Ceiling on how long we wait for spawned tasks to drain after the endpoint
 /// and metrics server have been signalled to stop. Sized comfortably larger
@@ -349,7 +349,6 @@ struct Infra {
     eth_signer: Arc<PrivateKeySigner>,
     concrete_channel_store: Arc<PersistentPoolStateStore>,
     channel_state_store: Arc<dyn PoolStateStore>,
-    pending_settle_store: Arc<dyn PendingSettleStore>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
     receipt_writer_shutdown: CancellationToken,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
@@ -423,7 +422,6 @@ async fn build_infra(
     // share one open file and one fsync discipline; `concrete_channel_store`
     // stays bound for the buyer handle built further below.
     let channel_state_store: Arc<dyn PoolStateStore> = concrete_channel_store.clone();
-    let pending_settle_store: Arc<dyn PendingSettleStore> = concrete_channel_store.clone();
     // Debounce the scan-checkpoint writes (#784, keyed in #1092): each persisted
     // watcher (settlement `ChannelOpened`, origin `Origin`) advances its cursor
     // once per completed `eth_getLogs` window — on the live tail, once per poll
@@ -586,7 +584,6 @@ async fn build_infra(
         eth_signer,
         concrete_channel_store,
         channel_state_store,
-        pending_settle_store,
         watcher_checkpoint_store,
         receipt_writer_shutdown,
         receipt_sink,
@@ -1211,6 +1208,21 @@ async fn build_chain_and_handlers(
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
     );
     client_deps.redeem_hint = Some(redeem_tx.clone());
+    // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
+    // gate persists a presented capability so the redeemer registers the signer
+    // on first redemption. Same redb file every lane record lives in.
+    client_deps.capability_sink =
+        Some(Arc::clone(&infra.concrete_channel_store)
+            as Arc<dyn crate::channel_store::CapabilitySink>);
+    // Cached `getPool` view (owner + remaining) for the floor-`M` solvency gate
+    // and the ADR 011 funder gate. Read-only provider — the serve gates never
+    // write — with a short TTL so a request burst against one pool costs at most
+    // one RPC per interval.
+    client_deps.pool_view = Some(Arc::new(crate::pool_view::ChainPoolView::new(
+        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        payment_pool_addr,
+        Duration::from_millis(cfg.blockchain.event_poll_interval_ms),
+    )) as Arc<dyn crate::pool_view::PoolView>);
     client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
     client_deps.region_accountant = Some(Arc::clone(&region_accountant));
     client_deps.local_populate = local_populate;

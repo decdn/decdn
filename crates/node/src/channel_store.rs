@@ -722,6 +722,39 @@ impl PersistentPoolStateStore {
     }
 }
 
+/// Write side of the capability table used by the seller voucher-intake path.
+/// Kept as a trait so the [`ClientHandler`](crate::handlers::client::ClientHandler)
+/// holds it behind an `Arc<dyn CapabilitySink>` and tests can pass `None` (an
+/// in-memory store has no capability table).
+pub trait CapabilitySink: Send + Sync + std::fmt::Debug {
+    /// Persist the owner-signed capability material for `(pool_id, signer)`.
+    ///
+    /// # Errors
+    ///
+    /// On a store backend or codec failure.
+    fn store_capability(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        spending_cap: U256,
+        expiry: u64,
+        owner_sig: &[u8],
+    ) -> Result<(), StoreError>;
+}
+
+impl CapabilitySink for PersistentPoolStateStore {
+    fn store_capability(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        spending_cap: U256,
+        expiry: u64,
+        owner_sig: &[u8],
+    ) -> Result<(), StoreError> {
+        self.put_capability(pool_id, signer, spending_cap, expiry, owner_sig)
+    }
+}
+
 /// [`CapabilitySource`](crate::payment_settlement::CapabilitySource) backed by
 /// the persisted [`CAPABILITY_TABLE`]. The seller voucher-intake path persists a
 /// signer's owner-signed capability on first sight; the redeemer reads it here

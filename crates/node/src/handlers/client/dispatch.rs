@@ -266,11 +266,45 @@ impl ClientHandler {
             Some(key) => self.lanes.lock().await.get(&key).cloned(),
             None => None,
         };
-        // BOUNDARY (E4): the serve-path origin-blacklist gate (ADR 011) keys on
-        // the pool FUNDER (`getPool.owner`), which is not carried on the per-lane
-        // [`LaneState`]. It is re-instated once E4 threads the cached pool owner
-        // to the handler; until then the open-time hash gates above and the
-        // hash-denylist re-check inside the serve loop carry compliance.
+
+        // Capability intake (ADR 003 §Capability delegation). A bound request
+        // whose extension carries a `capability` persists the owner-signed grant
+        // for `(pool_id, signer)`, so the redeemer can register the signer on its
+        // first on-chain redemption. Best-effort — it never gates serving.
+        if let (Some(signer), Some(capability)) = (verified_client, ext.capability.as_ref()) {
+            self.intake_capability(B256::from(req.pool_id), signer, capability)
+                .await;
+        }
+
+        // Cached `getPool` view (owner + remaining), read ONCE and reused by the
+        // funder gate here and the floor-`M` solvency gate below. `None` — no
+        // pool-view wired, an unknown pool, or a read fault — makes both gates
+        // fail open: a transient RPC blip must not refuse paying clients, and the
+        // open-time hash gates plus the first voucher's on-chain `redeem` still
+        // carry compliance and revenue.
+        let pool_status = match self.pool_view.as_ref() {
+            Some(view) => view.status(B256::from(req.pool_id)).await,
+            None => None,
+        };
+
+        // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
+        // pool whose FUNDER (`getPool.owner`) is on the operator's local
+        // `denied_origins` or the on-chain origin blacklist. The two questions are
+        // kept distinct — spend authority is a signer question, compliance a funder
+        // question — so a blacklisted funder is refused here even under a clean
+        // delegate signer.
+        if let Some(status) = pool_status
+            && self.content_deny.is_origin_denied(&status.owner)
+        {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::OriginDenied,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
@@ -763,13 +797,34 @@ impl ClientHandler {
         // chunk-group-aligned span (what `export_bao_range_stream` bills),
         // capped by the credit window.
         //
-        // BOUNDARY (E4): `remaining` is a `getPool` chain read the handler does
-        // not hold, so the refusal is completed once E4 threads the cached
-        // `getPool` view here (`self.pool_remaining_covers_window(remaining,
-        // guard_bytes, rate_per_mb)` → refuse `InsufficientDeposit` when false).
+        // `remaining` comes from the cached `getPool` view resolved above. When it
+        // is `Some`, refuse `InsufficientDeposit` if the pool's remaining minus the
+        // refundable floor `M` can no longer cover the reserved credit window; a
+        // `None` view fails open (see the gate's construction above).
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-        let _guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
+        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
             .min(self.credit_window(interval_bytes));
+        if let Some(status) = pool_status
+            && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
+        {
+            let headroom = status
+                .remaining
+                .saturating_sub(self.pool_min_remaining_deposit);
+            self.log_deposit_refusal(
+                B256::from(req.pool_id),
+                hash,
+                headroom,
+                decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+            );
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Build and sign the success response.
         let body = StreamResponseBody {

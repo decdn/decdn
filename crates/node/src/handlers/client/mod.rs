@@ -34,8 +34,8 @@ use decdn_cache::{Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, Range
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::{PoolStateStore, StoreError};
 use decdn_incentive::{
-    LaneKey, LaneState, RetrySignal, SignedVoucher, StreamSlashData, VoucherActivity,
-    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    Capability, LaneKey, LaneState, RetrySignal, SignedCapability, SignedVoucher, StreamSlashData,
+    VoucherActivity, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ChunkData, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
@@ -340,6 +340,13 @@ pub struct ClientHandlerDeps {
     pub bind_domain: Eip712Domain,
     pub channel_state_store: Arc<dyn PoolStateStore>,
     pub receipt_sink: Arc<dyn ReceiptSink>,
+    /// Optional durable sink for owner-signed capability material (ADR 003
+    /// §Capability delegation). `None` (tests) makes capability intake a no-op.
+    pub capability_sink: Option<Arc<dyn crate::channel_store::CapabilitySink>>,
+    /// Cached `getPool` view (owner + remaining), read by the floor-`M` solvency
+    /// gate and the ADR 011 funder gate. `None` (tests) disables both gates —
+    /// they fail open, exactly as before E4 wired the view.
+    pub pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
     /// Refundable minimum-remaining-deposit floor `M` (token base units). The
     /// seller refuses to serve a lane's pool once its on-chain remaining
     /// (`getPool.deposit − getPool.totalRedeemed`) minus this floor can no
@@ -436,6 +443,8 @@ impl ClientHandlerDeps {
             bind_domain,
             channel_state_store,
             receipt_sink,
+            capability_sink: None,
+            pool_view: None,
             pool_min_remaining_deposit,
             rate_per_mb,
             rate_bounds,
@@ -492,6 +501,17 @@ pub struct ClientHandler {
     /// paid delivery. A dropped receipt (queue full) is non-fatal — the payment
     /// already committed to the fsynced lane store.
     receipt_sink: Arc<dyn ReceiptSink>,
+    /// Durable sink for owner-signed capability material (ADR 003 §Capability
+    /// delegation), set at construction via [`ClientHandlerDeps`]. On a stream
+    /// whose [`StreamRequestExt`] carries a `capability`, the serve gate verifies
+    /// the owner signature and persists `{spending_cap, expiry, owner_sig}` for
+    /// `(pool_id, signer)` so the redeemer can register the signer on its first
+    /// on-chain redemption. `None` when no settlement surface is wired (tests) —
+    /// intake is then a no-op.
+    capability_sink: Option<Arc<dyn crate::channel_store::CapabilitySink>>,
+    /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
+    /// (tests) makes both gates fail open.
+    pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
     /// Per-lane state, hydrated from the store at construction. Outer mutex
     /// guards the map; each inner mutex serializes voucher application for one
     /// lane across its concurrent streams (ADR 003 §concurrent streams).
@@ -660,6 +680,8 @@ impl ClientHandler {
             channel_state_store: deps.channel_state_store,
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
+            capability_sink: deps.capability_sink,
+            pool_view: deps.pool_view,
             lanes: Arc::new(Mutex::new(map)),
             channel_metrics_refresh: Mutex::new(()),
             redeem_hint: deps.redeem_hint,
@@ -682,6 +704,77 @@ impl ClientHandler {
             deposit_refusal_suppressed: AtomicU64::new(0),
             idle_timeout: deps.idle_timeout,
         })
+    }
+
+    /// The pool's funder (`getPool.owner`) for the ADR 011 mid-stream takedown
+    /// re-check, or `None` when no pool-view is wired or the read faulted (the
+    /// re-check then falls back to the open-time gates and the hash-denylist
+    /// re-check). Cached, so a per-MB call is cheap.
+    pub(super) async fn pool_funder(&self, pool_id: B256) -> Option<Address> {
+        let view = self.pool_view.as_ref()?;
+        view.status(pool_id).await.map(|s| s.owner)
+    }
+
+    /// Persist an owner-signed capability presented at session start (ADR 003
+    /// §Capability delegation) so the redeemer can register the signer on its
+    /// first on-chain redemption. `signer` is the request's bound Ethereum
+    /// address; `pool_id` is [`StreamRequest::pool_id`].
+    ///
+    /// Best-effort and off the durability path: a failure here never fails the
+    /// stream — the client re-sends the capability on the next request, and the
+    /// on-chain `redeem` is the authoritative owner check (the contract recovers
+    /// the owner signature against the pool owner). For the common EOA case the
+    /// 65-byte owner signature is recovered off-chain first, so a malformed grant
+    /// is dropped before it reaches the redeemer; a longer ERC-1271 signature is
+    /// persisted as-is and verified on-chain. The `getPool.owner` equality
+    /// pre-check is deferred with the handler pool-view (see the E4 BOUNDARY in
+    /// `dispatch.rs`).
+    async fn intake_capability(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        capability: &decdn_protocol::client::WireCapability,
+    ) {
+        let Some(sink) = self.capability_sink.as_ref() else {
+            return;
+        };
+        let spending_cap = U256::from_be_bytes(capability.spending_cap);
+        let expiry = capability.expiry;
+        // Off-chain owner-signature recovery for the common EOA (65-byte) case.
+        if let Ok(sig_bytes) = <[u8; 65]>::try_from(capability.owner_signature.as_slice()) {
+            let Ok(signature) = alloy::primitives::Signature::from_raw(&sig_bytes) else {
+                tracing::debug!(%pool_id, %signer, "dropping capability: malformed owner signature");
+                return;
+            };
+            let grant = SignedCapability {
+                capability: Capability {
+                    signer,
+                    spending_cap,
+                    pool_id,
+                    expiry,
+                },
+                signature,
+            };
+            if let Err(e) = grant.recover_owner(&self.voucher_domain) {
+                tracing::debug!(%pool_id, %signer, error = %e, "dropping capability: owner recovery failed");
+                return;
+            }
+        }
+        let sink = Arc::clone(sink);
+        let owner_sig = capability.owner_signature.clone();
+        let write = tokio::task::spawn_blocking(move || {
+            sink.store_capability(pool_id, signer, spending_cap, expiry, &owner_sig)
+        })
+        .await;
+        match write {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(%pool_id, %signer, error = %e, "capability persist failed");
+            }
+            Err(e) => {
+                tracing::warn!(%pool_id, %signer, error = %e, "capability persist task join failed");
+            }
+        }
     }
 
     /// Register a lane so the voucher path accepts vouchers for it — its

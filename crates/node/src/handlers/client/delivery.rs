@@ -192,14 +192,10 @@ impl ClientHandler {
             .max(1);
 
         // The in-flight takedown re-check (ADR 011 compliance) keys on the pool
-        // FUNDER — the pool owner. In the shared-payment-pool model the owner is
-        // a chain quantity (`getPool.owner`), not carried on the per-lane
-        // [`LaneState`], so the funder is threaded to the mid-stream re-check by
-        // E4 (from the cached `getPool` view). Until then the per-lane loop
-        // passes `None`, so a mid-stream funder takedown is caught by the
-        // open-time gates and the hash-denylist re-check, not the funder
-        // re-check. BOUNDARY: E4 pool-owner threading.
-        let funder = None;
+        // FUNDER — the pool owner (`getPool.owner`), resolved from the cached
+        // pool-view. `None` (no view wired or a read fault) falls back to the
+        // open-time gates and the hash-denylist re-check.
+        let funder = self.pool_funder(lane_key.pool_id).await;
 
         // Bytes written to the wire, and bytes covered by an accepted voucher.
         // Their gap `delivered − paid` is the unrecouped credit the window caps.

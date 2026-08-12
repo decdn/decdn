@@ -111,11 +111,10 @@ impl ClientHandler {
             .max(1);
 
         // The in-flight takedown re-check (ADR 011) keys on the pool FUNDER (the
-        // pool owner), a chain quantity (`getPool.owner`) not carried on the
-        // per-lane [`LaneState`]. E4 threads it from the cached `getPool` view;
-        // until then this leg passes `None` and relies on the open-time gates +
-        // hash-denylist re-check. BOUNDARY: E4 pool-owner threading.
-        let funder: Option<super::Address> = None;
+        // pool owner, `getPool.owner`), resolved from the cached pool-view. `None`
+        // (no view wired or a read fault) falls back to the open-time gates + the
+        // hash-denylist re-check.
+        let funder: Option<super::Address> = self.pool_funder(lane_key.pool_id).await;
 
         // Bytes written to the wire, and bytes an accepted voucher covered — both
         // WIRE quantities (bao content + proof, ADR 038). Their gap
