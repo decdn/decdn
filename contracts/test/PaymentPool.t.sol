@@ -191,6 +191,13 @@ contract PaymentPoolTest is Test {
         uint256 newPaidCumulative
     );
 
+    /// @dev Mirrors for `vm.expectEmit` — close/reclaim + governance setters.
+    event PoolCloseInitiated(bytes32 indexed poolId, address indexed owner, uint256 disputeDeadline);
+    event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
+    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
+    event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
+    event RateBoundsUpdated(uint256 newDeliveryFloor);
+
     function setUp() public {
         owner = vm.addr(OWNER_PK);
         signer = vm.addr(SIGNER_PK);
@@ -769,8 +776,28 @@ contract PaymentPoolTest is Test {
         harness.redeem(id, signer, provider, 300e6, 30_000_000, sig, cap);
     }
 
-    // TODO(task-4): test_redeem_allowedDuringClosingBeforeDeadline needs
-    // `closePool` (which sets `disputeDeadline`); added when close/reclaim land.
+    function test_redeem_allowedDuringClosingBeforeDeadline() public {
+        bytes32 id = _open();
+
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 100e6, 10_000_000, _voucher(id, 100e6, 10_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        vm.prank(owner);
+        pool.closePool(id);
+
+        // Still inside the grace window: redeem succeeds.
+        vm.prank(provider);
+        pool.redeem(id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), "");
+        assertEq(pool.getPool(id).totalRedeemed, 200e6);
+
+        // Past the deadline: redeem reverts PoolClosed.
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.PoolClosed.selector);
+        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), "");
+    }
 
     // -----------------------------------------------------------------
     // redeem — bytes accounting + routing
@@ -1307,6 +1334,408 @@ contract PaymentPoolTest is Test {
         vm.prank(provider);
         uint256 totalPaid = pool.redeemMany(noCaps, noVouchers);
         assertEq(totalPaid, 0, "nothing structurally wrong with an empty/empty batch");
+    }
+
+    // -----------------------------------------------------------------
+    // closePool
+    // -----------------------------------------------------------------
+
+    function test_closePool_onlyOwner() public {
+        bytes32 id = _open();
+        vm.prank(stranger);
+        vm.expectRevert(PaymentPool.NotPoolOwner.selector);
+        pool.closePool(id);
+    }
+
+    function test_closePool_setsClosingAndDeadline() public {
+        bytes32 id = _open();
+        uint256 expectedDeadline = block.timestamp + DISPUTE_WINDOW;
+
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit PoolCloseInitiated(id, owner, expectedDeadline);
+        vm.prank(owner);
+        pool.closePool(id);
+
+        PaymentPool.Pool memory p = pool.getPool(id);
+        assertEq(uint256(p.status), uint256(PaymentPool.Status.Closing));
+        assertEq(uint256(p.disputeDeadline), expectedDeadline);
+    }
+
+    function test_closePool_revertsWhenNotOpen() public {
+        bytes32 id = _open();
+        vm.prank(owner);
+        pool.closePool(id);
+
+        vm.prank(owner);
+        vm.expectRevert(PaymentPool.PoolNotOpen.selector);
+        pool.closePool(id);
+    }
+
+    function test_closePool_movesNoFunds() public {
+        bytes32 id = _open();
+        uint256 balBefore = usdc.balanceOf(address(pool));
+
+        vm.prank(owner);
+        pool.closePool(id);
+
+        assertEq(usdc.balanceOf(address(pool)), balBefore, "closePool moves no funds");
+        assertEq(pool.getPool(id).deposit, DEPOSIT, "deposit untouched");
+    }
+
+    // -----------------------------------------------------------------
+    // reclaim
+    // -----------------------------------------------------------------
+
+    function test_reclaim_revertsBeforeDeadline() public {
+        bytes32 id = _open();
+        vm.prank(owner);
+        pool.closePool(id);
+
+        vm.expectRevert(PaymentPool.GraceWindowActive.selector);
+        pool.reclaim(id);
+    }
+
+    function test_reclaim_revertsWhenNotClosing() public {
+        bytes32 id = _open();
+        vm.expectRevert(PaymentPool.PoolNotClosing.selector);
+        pool.reclaim(id);
+    }
+
+    function test_reclaim_transfersRemainderAfterDeadline() public {
+        bytes32 id = _open();
+
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        vm.prank(owner);
+        pool.closePool(id);
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        uint256 expectedRefund = DEPOSIT - 300e6;
+
+        pool.reclaim(id);
+
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + expectedRefund);
+        assertEq(
+            usdc.balanceOf(address(pool)), 0, "the routed leg already left at redeem time; reclaim drains the rest"
+        );
+    }
+
+    function test_reclaim_callableByAnyoneRefundsOwner() public {
+        bytes32 id = _open();
+        vm.prank(owner);
+        pool.closePool(id);
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        uint256 ownerBalBefore = usdc.balanceOf(owner);
+        vm.prank(stranger);
+        pool.reclaim(id);
+
+        assertEq(usdc.balanceOf(owner), ownerBalBefore + DEPOSIT);
+    }
+
+    function test_reclaim_setsClosed() public {
+        bytes32 id = _open();
+        vm.prank(owner);
+        pool.closePool(id);
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        pool.reclaim(id);
+
+        assertEq(uint256(pool.getPool(id).status), uint256(PaymentPool.Status.Closed));
+    }
+
+    function test_reclaim_routerNotCalled() public {
+        bytes32 id = _open();
+        vm.prank(owner);
+        pool.closePool(id);
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        uint256 callsBefore = router.callCount();
+        pool.reclaim(id);
+        assertEq(router.callCount(), callsBefore, "reclaim never calls the router");
+    }
+
+    function test_reclaim_emitsPoolReclaimed() public {
+        bytes32 id = _open();
+        vm.prank(owner);
+        pool.closePool(id);
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit PoolReclaimed(id, owner, DEPOSIT);
+        pool.reclaim(id);
+    }
+
+    // -----------------------------------------------------------------
+    // getPools
+    // -----------------------------------------------------------------
+
+    function test_getPools_emptyBeforeAnyOpen() public view {
+        bytes32[] memory page = pool.getPools(owner, 0, 10);
+        assertEq(page.length, 0);
+    }
+
+    function test_getPools_recomputesIdsFromNonce_paged() public {
+        bytes32 id0 = _open();
+        bytes32 id1 = _open();
+        bytes32 id2 = _open();
+
+        bytes32[] memory page = pool.getPools(owner, 0, 10);
+        assertEq(page.length, 3);
+        assertEq(page[0], id0);
+        assertEq(page[1], id1);
+        assertEq(page[2], id2);
+
+        bytes32[] memory mid = pool.getPools(owner, 1, 1);
+        assertEq(mid.length, 1);
+        assertEq(mid[0], id1);
+    }
+
+    function test_getPools_paginationBoundaries() public {
+        _open();
+        _open();
+
+        // offset >= len returns empty.
+        assertEq(pool.getPools(owner, 2, 10).length, 0);
+        assertEq(pool.getPools(owner, 5, 10).length, 0);
+
+        // limit == 0 returns empty.
+        assertEq(pool.getPools(owner, 0, 0).length, 0);
+
+        // offset + limit clamped to len, no overflow with a huge limit.
+        bytes32[] memory page = pool.getPools(owner, 0, type(uint256).max);
+        assertEq(page.length, 2);
+
+        // an owner who never opened a pool gets an empty page, not a revert.
+        assertEq(pool.getPools(stranger, 0, 10).length, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // getAuthorization / getWatermark
+    // -----------------------------------------------------------------
+
+    function test_getAuthorization_returnsCapExpirySpent() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        PaymentPool.Authorization memory a = pool.getAuthorization(id, signer);
+        assertEq(a.cap, SPENDING_CAP);
+        assertEq(uint256(a.expiry), uint256(expiry));
+        assertEq(a.spent, 300e6);
+    }
+
+    function test_getWatermark_returnsLane() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        pool.redeem(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+
+        PaymentPool.Lane memory lane = pool.getWatermark(id, signer, provider);
+        assertEq(lane.amount, 300e6);
+        assertEq(lane.bytesDelivered, 30_000_000);
+    }
+
+    // -----------------------------------------------------------------
+    // getRateBounds
+    // -----------------------------------------------------------------
+
+    function test_getRateBounds_returnsDeliveryFloor() public view {
+        assertEq(pool.getRateBounds(), DELIVERY_FLOOR);
+    }
+
+    // -----------------------------------------------------------------
+    // Governance setters
+    // -----------------------------------------------------------------
+
+    function test_setFeeRouter_updatesTarget() public {
+        MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
+
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit FeeRouterUpdated(address(router), address(newRouter));
+        vm.prank(admin);
+        pool.setFeeRouter(address(newRouter));
+
+        assertEq(pool.feeRouter(), address(newRouter));
+    }
+
+    function test_setFeeRouter_revertsOnZero() public {
+        vm.prank(admin);
+        vm.expectRevert(PaymentPool.ZeroAddress.selector);
+        pool.setFeeRouter(address(0));
+    }
+
+    function test_setFeeRouter_revertsOnUnchanged() public {
+        vm.prank(admin);
+        vm.expectRevert(PaymentPool.RouterUnchanged.selector);
+        pool.setFeeRouter(address(router));
+    }
+
+    function test_setFeeRouter_revertsOnEoa() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterHasNoCode.selector, stranger));
+        pool.setFeeRouter(stranger);
+    }
+
+    function test_setFeeRouter_revertsOnMissingPausedView() public {
+        NoPauseRouter bad = new NoPauseRouter();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterMissingPausedView.selector, address(bad)));
+        pool.setFeeRouter(address(bad));
+    }
+
+    function test_setFeeRouter_onlyGovernance() public {
+        MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setFeeRouter(address(newRouter));
+    }
+
+    function test_setFeeRouter_openPoolsUnaffected() public {
+        // The domain separator hashes this contract's address, never the
+        // router, so a re-point invalidates no already-signed capability or
+        // voucher.
+        bytes32 id = _open();
+        bytes memory cap = _cap(id, SPENDING_CAP, expiry);
+        bytes memory voucher = _voucher(id, 300e6, 30_000_000);
+
+        MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
+        vm.prank(admin);
+        pool.setFeeRouter(address(newRouter));
+
+        vm.prank(provider);
+        pool.redeem(id, signer, provider, 300e6, 30_000_000, voucher, cap);
+        assertEq(pool.getPool(id).totalRedeemed, 300e6, "pre-signed voucher still redeems after re-point");
+        assertEq(newRouter.callCount(), 1, "the NEW router receives the routed settlement");
+    }
+
+    function test_setDisputeWindow_enforcesBounds() public {
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PaymentPool.ParamOutOfBounds.selector, uint256(1 hours), uint256(48 hours), uint256(72 hours)
+            )
+        );
+        pool.setDisputeWindow(1 hours);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PaymentPool.ParamOutOfBounds.selector, uint256(73 hours), uint256(48 hours), uint256(72 hours)
+            )
+        );
+        pool.setDisputeWindow(73 hours);
+
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit DisputeWindowUpdated(DISPUTE_WINDOW, 60 hours);
+        vm.prank(admin);
+        pool.setDisputeWindow(60 hours);
+        assertEq(pool.disputeWindow(), 60 hours);
+    }
+
+    function test_setDisputeWindow_onlyGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setDisputeWindow(60 hours);
+    }
+
+    function test_setRateBounds_enforcesWireCap() public {
+        uint256 badFloor = MAX_RATE_PER_MB + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.RateBoundsInvalid.selector, badFloor));
+        pool.setRateBounds(badFloor);
+    }
+
+    function test_setRateBounds_enforcesMin() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.RateBoundsInvalid.selector, uint256(0)));
+        pool.setRateBounds(0);
+    }
+
+    function test_setRateBounds_belowU64Cap() public pure {
+        // The daemon decodes the floor as `u64`; pin that the governable
+        // ceiling stays far below `type(uint64).max` so nothing in that gap
+        // is silently network-isolating.
+        assertLt(MAX_RATE_PER_MB, type(uint64).max);
+    }
+
+    function test_setRateBounds_updatesFloor() public {
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit RateBoundsUpdated(1000);
+        vm.prank(admin);
+        pool.setRateBounds(1000);
+        assertEq(pool.getRateBounds(), 1000);
+    }
+
+    function test_setters_onlyGovernance() public {
+        vm.startPrank(stranger);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setRateBounds(1000);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setDisputeWindow(60 hours);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setFeeRouter(address(router));
+
+        vm.stopPrank();
+    }
+
+    // -----------------------------------------------------------------
+    // Regression guards: the pairwise-channel surface stays removed
+    // -----------------------------------------------------------------
+
+    function test_reclaimExpired_removed() public {
+        (bool ok,) = address(pool).call(abi.encodeWithSignature("reclaimExpired(bytes32)", bytes32(0)));
+        assertFalse(ok, "reclaimExpired must not exist on PaymentPool");
+    }
+
+    function test_cooperativeClose_removed() public {
+        (bool ok,) = address(pool)
+            .call(
+                abi.encodeWithSignature(
+                    "cooperativeClose(bytes32,uint256,uint256,bytes,bytes)", bytes32(0), 0, 0, "", ""
+                )
+            );
+        assertFalse(ok, "cooperativeClose must not exist on PaymentPool");
+    }
+
+    function test_disputeChannel_removed() public {
+        (bool ok,) = address(pool)
+            .call(
+                abi.encodeWithSignature(
+                    "disputeChannel(bytes32,uint256,uint256,uint256,bytes)", bytes32(0), 0, 0, 0, ""
+                )
+            );
+        assertFalse(ok, "disputeChannel must not exist on PaymentPool");
+    }
+
+    function test_settleChannel_removed() public {
+        (bool ok,) = address(pool).call(abi.encodeWithSignature("settleChannel(bytes32)", bytes32(0)));
+        assertFalse(ok, "settleChannel must not exist on PaymentPool");
+    }
+
+    function test_maxChannelDuration_getterRemoved() public {
+        (bool ok,) = address(pool).call(abi.encodeWithSignature("maxChannelDuration()"));
+        assertFalse(ok, "maxChannelDuration must not exist on PaymentPool");
     }
 }
 

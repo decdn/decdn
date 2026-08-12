@@ -183,6 +183,18 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         uint256 newPaidCumulative
     );
 
+    /// @notice The owner started the grace-window close on `poolId`.
+    ///         `redeem` stays callable until `disputeDeadline`.
+    event PoolCloseInitiated(bytes32 indexed poolId, address indexed owner, uint256 disputeDeadline);
+
+    /// @notice `reclaim` refunded `ownerRefund` (`deposit − totalRedeemed`)
+    ///         to `owner` and the pool is now `Closed`.
+    event PoolReclaimed(bytes32 indexed poolId, address indexed owner, uint256 ownerRefund);
+
+    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
+    event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
+    event RateBoundsUpdated(uint256 newDeliveryFloor);
+
     // -----------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------
@@ -201,6 +213,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error InvalidCapabilitySignature();
     error RateFloorViolation(uint256 amount, uint256 bytesDelivered, uint256 deliveryFloor);
     error PoolClosed();
+    error PoolNotClosing();
+    error GraceWindowActive();
+    error RouterUnchanged();
 
     // -----------------------------------------------------------------
     // Constructor
@@ -317,6 +332,45 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     }
 
     // -----------------------------------------------------------------
+    // Close and reclaim (ADR 003 § Close and reclaim lifecycle)
+    // -----------------------------------------------------------------
+
+    /// @notice Owner-only: start the grace-window close on `poolId`. Moves no
+    ///         funds — `redeem` stays callable until `disputeDeadline`, so
+    ///         this cannot understate a lane. Only `reclaim`, after the
+    ///         window elapses, moves the residual.
+    function closePool(bytes32 poolId) external {
+        Pool storage p = pools[poolId];
+        if (p.status != Status.Open) revert PoolNotOpen();
+        if (msg.sender != p.owner) revert NotPoolOwner();
+
+        p.status = Status.Closing;
+        uint64 deadline = uint64(block.timestamp + disputeWindow);
+        p.disputeDeadline = deadline;
+
+        emit PoolCloseInitiated(poolId, p.owner, deadline);
+    }
+
+    /// @notice Callable by anyone once the grace window has elapsed:
+    ///         transfers `deposit − totalRedeemed` to the owner and closes
+    ///         the pool. The router is not called — every payout already
+    ///         happened at each `redeem`.
+    // slither-disable-next-line reentrancy-no-eth
+    function reclaim(bytes32 poolId) external nonReentrant {
+        Pool storage p = pools[poolId];
+        if (p.status != Status.Closing) revert PoolNotClosing();
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < p.disputeDeadline) revert GraceWindowActive();
+
+        uint256 ownerRefund = p.deposit - p.totalRedeemed;
+        p.status = Status.Closed;
+
+        if (ownerRefund != 0) usdc.safeTransfer(p.owner, ownerRefund);
+
+        emit PoolReclaimed(poolId, p.owner, ownerRefund);
+    }
+
+    // -----------------------------------------------------------------
     // Redemption
     // -----------------------------------------------------------------
 
@@ -409,6 +463,89 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     function getPool(bytes32 poolId) external view returns (Pool memory) {
         return pools[poolId];
+    }
+
+    function getAuthorization(bytes32 poolId, address signer) external view returns (Authorization memory) {
+        return authorized[poolId][signer];
+    }
+
+    function getWatermark(bytes32 poolId, address signer, address provider) external view returns (Lane memory) {
+        return watermark[poolId][signer][provider];
+    }
+
+    function getRateBounds() external view returns (uint256 floor) {
+        return deliveryFloor;
+    }
+
+    /// @notice A page of the pool ids `owner` has opened, oldest first.
+    /// @dev    Reconstructed rather than stored: a pool names no provider, so
+    ///         `poolId = keccak256(owner, nonce)` is recomputed for each
+    ///         `nonce` in `[offset, min(offset + limit, ownerPoolNonce[owner]))`
+    ///         rather than read from a stored id array. `ownerPoolNonce`
+    ///         (already public) is the count — there is no separate counter
+    ///         to drift from it. Never forms `offset + limit`, so
+    ///         `limit == type(uint256).max` clamps instead of overflowing.
+    function getPools(address owner, uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
+        uint256 len = ownerPoolNonce[owner];
+        if (offset >= len || limit == 0) {
+            return new bytes32[](0);
+        }
+        uint256 remaining = len - offset;
+        uint256 size = limit < remaining ? limit : remaining;
+        page = new bytes32[](size);
+        for (uint256 i = 0; i < size; i++) {
+            uint256 nonce = offset + i;
+            page[i] = keccak256(abi.encodePacked(owner, nonce));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Governance setters (GOVERNANCE_ROLE — Timelock post-deploy)
+    // -----------------------------------------------------------------
+
+    /// @notice Re-point the settlement router. Open pools keep their
+    ///         capabilities and vouchers valid — the EIP-712 domain hashes
+    ///         this contract, not the router (ADR 003 § Governance setter:
+    ///         setFeeRouter).
+    /// @dev    `_route` reads `feeRouter` live, so a redemption right after a
+    ///         re-point credits the new router. Intentional: a re-point is
+    ///         the recovery path out of a paused/broken router, and the new
+    ///         one is conformance-probed here.
+    function setFeeRouter(address newRouter) external onlyRole(GOVERNANCE_ROLE) {
+        if (newRouter == address(0)) revert ZeroAddress();
+        // Same invariant the constructor enforces: routing to an EOA would
+        // let `_route` advance pool state while `routeSettlement` no-ops,
+        // desyncing settlement accounting and stranding claimed USDC here.
+        if (newRouter.code.length == 0) revert FeeRouterHasNoCode(newRouter);
+        _requireRouterExposesPausedView(newRouter);
+        if (newRouter == feeRouter) revert RouterUnchanged();
+        address old = feeRouter;
+        // Drop any standing allowance to the outgoing router so a re-point
+        // can never leave it able to pull this contract's USDC afterward.
+        usdc.forceApprove(old, 0);
+        feeRouter = newRouter;
+        emit FeeRouterUpdated(old, newRouter);
+    }
+
+    function setDisputeWindow(uint256 newWindow) external onlyRole(GOVERNANCE_ROLE) {
+        if (newWindow < DISPUTE_WINDOW_FLOOR || newWindow > DISPUTE_WINDOW_CEILING) {
+            revert ParamOutOfBounds(newWindow, DISPUTE_WINDOW_FLOOR, DISPUTE_WINDOW_CEILING);
+        }
+        uint256 old = disputeWindow;
+        disputeWindow = newWindow;
+        emit DisputeWindowUpdated(old, newWindow);
+    }
+
+    function setRateBounds(uint256 newFloor) external onlyRole(GOVERNANCE_ROLE) {
+        // Cap at MAX_RATE_PER_MB, not `type(uint64).max`: the daemon decodes
+        // the floor as `u64` (#1383), but `u64` is ~18M× the wire cap, and
+        // every value in that gap is quietly network-isolating (see the
+        // constant).
+        if (newFloor < MIN_RATE_FLOOR || newFloor > MAX_RATE_PER_MB) {
+            revert RateBoundsInvalid(newFloor);
+        }
+        deliveryFloor = newFloor;
+        emit RateBoundsUpdated(newFloor);
     }
 
     // -----------------------------------------------------------------
