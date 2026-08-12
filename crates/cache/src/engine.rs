@@ -1038,6 +1038,16 @@ impl CacheEngine {
         })
     }
 
+    /// Peek the in-flight fill registry for a LIVE fill of `hash`, returning its
+    /// blob `total_bytes` if one runs. ADVISORY: the serve-miss path uses it to skip
+    /// the upstream header handshake when it will coalesce onto a live pull, but the
+    /// authoritative own-vs-attach decision stays in [`Self::claim_fill`]. See
+    /// [`FillRegistry::in_flight_total`].
+    #[must_use]
+    pub fn in_flight_total(&self, hash: Hash) -> Option<u64> {
+        self.inner.fill_registry.in_flight_total(hash)
+    }
+
     /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
     /// of the `total`-byte blob `hash`: decide attach/own/mixed AND register any new
     /// owner session under one map-lock acquisition (no plan-then-register TOCTOU
