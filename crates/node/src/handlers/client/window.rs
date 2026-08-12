@@ -316,9 +316,10 @@ impl ClientHandler {
                 let Some(target) = target else {
                     // Unreachable: step 6b secures a `target` on every Owner path. Fail
                     // the serve rather than panic (anti-panic policy) — the response has
-                    // been sent, so a mid-stream error is the honest outcome.
+                    // been sent, so a mid-stream error is the honest outcome. Carry the
+                    // hash + namespace so a real firing is debuggable in production.
                     return Err(anyhow::anyhow!(
-                        "serve-miss owner claim without a pull target"
+                        "serve-miss owner claim without a pull target (hash {hash}, namespace {namespace_id})"
                     ));
                 };
                 // Seed the shared outboard with proof for held ranges the pull never
