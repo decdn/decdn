@@ -478,7 +478,11 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // Drained pool or cap reached: transient-empty, retriable after a top-up.
         if (paid == 0) return 0;
 
-        uint256 bytesPaid = Math.mulDiv(bytesDelivered - w.bytesDelivered, paid, desired);
+        // A voucher whose bytesDelivered has not advanced settles its money
+        // with zero bytes credited; the byte watermark holds and recovers
+        // when a later voucher advances it.
+        uint256 bytesDelta = bytesDelivered > w.bytesDelivered ? bytesDelivered - w.bytesDelivered : 0;
+        uint256 bytesPaid = Math.mulDiv(bytesDelta, paid, desired);
 
         // Effects before interactions (checks-effects-interactions).
         w.amount += paid;

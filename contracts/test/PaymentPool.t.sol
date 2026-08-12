@@ -656,6 +656,49 @@ contract PaymentPoolTest is Test {
         assertEq(pool.getPool(id).totalRedeemed, redeemedBefore, "stale voucher writes no state");
     }
 
+    function test_redeem_bytesRegressionSettlesMoneyWithZeroBytes() public {
+        bytes32 id = _open();
+        // Voucher #1 sets the lane watermark at amount=300e6, bytesDelivered=30_000_000.
+        vm.prank(provider);
+        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
+
+        (uint256 wAmount1, uint256 wBytes1) = pool.watermark(id, signer, provider);
+        assertEq(wAmount1, 300e6);
+        assertEq(wBytes1, 30_000_000);
+        assertEq(router.totalRoutedPaid(), 300e6);
+        assertEq(router.totalBytes(), 30_000_000);
+
+        // Voucher #2 advances the amount (cumulative claim) but regresses
+        // bytesDelivered below the watermark. Neither the amount-regression
+        // guard nor the rate floor (an upper bound on bytes) catches this
+        // shape. The signer already signed the higher `amount`, so the money
+        // is owed and must settle; only the served-bytes credit is forfeited
+        // for this redemption — it does not revert or panic.
+        vm.prank(provider);
+        vm.expectEmit(true, true, true, true, address(pool));
+        emit PoolRedeemed(id, signer, provider, 100e6, 0, 400e6);
+        pool.redeem(id, signer, provider, 400e6, 10_000_000, _voucher(id, 400e6, 10_000_000), "");
+
+        (uint256 wAmount2, uint256 wBytes2) = pool.watermark(id, signer, provider);
+        assertEq(wAmount2, 400e6, "amount watermark advances to the new cumulative");
+        assertEq(wBytes2, 30_000_000, "bytes watermark holds; the regressed delta credits zero bytes");
+        assertEq(router.totalRoutedPaid(), 400e6, "money settles in full despite the bytes regression");
+        assertEq(router.totalBytes(), 30_000_000, "no additional bytes are credited for voucher #2");
+
+        // Voucher #3 advances bytesDelivered past the original watermark
+        // (30_000_000): byte accounting recovers across the gap left by #2.
+        vm.prank(provider);
+        pool.redeem(id, signer, provider, 500e6, 45_000_000, _voucher(id, 500e6, 45_000_000), "");
+
+        (uint256 wAmount3, uint256 wBytes3) = pool.watermark(id, signer, provider);
+        assertEq(wAmount3, 500e6);
+        assertEq(wBytes3, 45_000_000, "byte watermark recovers once bytesDelivered advances again");
+        assertEq(router.totalRoutedPaid(), 500e6);
+        assertEq(
+            router.totalBytes(), 45_000_000, "the full 15_000_000-byte gap since the original watermark is credited"
+        );
+    }
+
     // -----------------------------------------------------------------
     // redeem — structural reverts
     // -----------------------------------------------------------------
