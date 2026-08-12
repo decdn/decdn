@@ -31,6 +31,7 @@ struct VerifiedVoucher {
 
 /// Why the node-side verify half stopped the batch at a voucher (#1483). The
 /// valid prefix is committed before this is acted on.
+#[derive(Debug)]
 enum VerifyStop {
     /// Reject cleanly with this wire reason, then finish the stream (#751).
     /// The optional [`WatermarkBundle`] rides the wallet-less-resume path
@@ -565,6 +566,120 @@ mod tests {
             after.bytes_delivered_cumulative,
             U256::ZERO,
             "the cumulative byte counter must not advance on an un-durable batch"
+        );
+    }
+
+    /// #527 success twin of the store-failure test: a valid signed voucher
+    /// verifies against a fresh lane (advancing the in-memory CANDIDATE to its
+    /// cumulative amount/bytes without touching the store), and a successful
+    /// `commit_batch` then advances the LIVE lane's persisted watermark.
+    #[tokio::test]
+    async fn staged_voucher_advances_candidate_lane() {
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+            as Arc<dyn PoolStateStore>;
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        // `handler_over_store` builds all three EIP-712 domains from this literal,
+        // so the voucher signer must sign over the same one.
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let signer_key = PrivateKeySigner::random();
+        let signer = signer_key.address();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        // Seed a fresh lane at a zero watermark with an ample cap.
+        let lane_key = LaneKey {
+            pool_id,
+            signer,
+            provider,
+        };
+        let seed = LaneState::hydrate(
+            pool_id,
+            signer,
+            provider,
+            U256::MAX,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState {
+            state: seed,
+            bytes_delivered_cumulative: U256::ZERO,
+        }));
+        handler
+            .lanes
+            .lock()
+            .await
+            .insert(lane_key, Arc::clone(&lane));
+
+        // A cumulative voucher paying exactly one MB from zero, signed by the
+        // lane's pinned signer over the lane context.
+        let rate_per_mb = 1_000_000u64;
+        let delta = decdn_incentive::rate::BYTES_PER_MB;
+        let new_bytes = U256::from(delta);
+        let amount = decdn_incentive::min_payment(delta, rate_per_mb);
+        let signed = decdn_incentive::Voucher {
+            pool_id,
+            signer,
+            provider,
+            amount,
+            bytes_delivered: new_bytes,
+        }
+        .sign(&signer_key, &domain)
+        .expect("sign voucher");
+        let wire = decdn_protocol::client::Voucher {
+            signature: signed.signature.as_bytes().to_vec(),
+            amount: amount.to_be_bytes(),
+        };
+
+        // verify_voucher advances the CANDIDATE in memory only (no store write).
+        let snapshot = lane.lock().await.state.clone();
+        let verified = handler
+            .verify_voucher(&snapshot, U256::ZERO, &wire, rate_per_mb, delta)
+            .expect("a well-formed voucher verifies against a fresh lane");
+        assert_eq!(
+            verified.new_bytes, new_bytes,
+            "the candidate advances to the voucher's cumulative bytes"
+        );
+        assert_eq!(
+            verified.next_state.last_amount(),
+            amount,
+            "the candidate advances to the voucher's cumulative amount"
+        );
+
+        // A successful commit advances the LIVE lane's durable watermark.
+        let guard = lane.lock().await;
+        let outcome = handler
+            .commit_batch(
+                guard,
+                lane_key,
+                Hash::from_bytes([1u8; 32]),
+                B256::repeat_byte(0x66),
+                verified.next_state,
+                verified.new_bytes,
+                &[verified.staged],
+            )
+            .await
+            .expect("commit_batch returns Ok on a clean record");
+        assert!(
+            matches!(outcome, CommitOutcome::Committed),
+            "a clean record commits the batch"
+        );
+
+        let after = lane.lock().await;
+        assert_eq!(
+            after.state.last_amount(),
+            amount,
+            "the committed watermark advanced to the voucher amount"
+        );
+        assert_eq!(
+            after.bytes_delivered_cumulative, new_bytes,
+            "the cumulative byte counter advanced to the voucher's bytes"
         );
     }
 }
