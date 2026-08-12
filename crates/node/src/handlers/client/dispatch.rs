@@ -454,17 +454,18 @@ impl ClientHandler {
 
                 let mut locally_filled = false;
 
-                // Own-origin serve-miss via the two decoupled legs (Flow A, FA.3a).
+                // Own-origin serve-miss via the two decoupled legs.
                 // When the node's OWN configured fs/http/s3 origin can prove it
                 // serves `hash` — it knows the size AND publishes the {H}.obao4
                 // outboard — serve the whole blob by running the local pull leg (fill
                 // the cache from origin) beside the serve leg (stream the filling
                 // cache to the paying client), exactly like the node→node window path
                 // but with NO upstream, NO channel, and NO payment on the ingest side.
-                // Time-to-first-byte no longer waits for the whole blob to land.
+                // Time-to-first-byte does not wait for the whole blob to land.
                 //
-                // Whole-blob only (offset==0 && len==0): the serve leg streams and
-                // bills the whole blob, so a bounded request never routes here.
+                // Whole-blob only (offset==0 && len==0): ranged/resumed own-origin
+                // serve-miss is not yet wired through the two-leg spine, so a bounded
+                // request never routes here.
                 //
                 // Serviceability is confirmed by `origin_size` +
                 // `origin_fetch_outboard_bytes` (an origin publishes the outboard) —
@@ -472,18 +473,17 @@ impl ClientHandler {
                 // adapters (fs/http/s3) support Range whenever they publish an
                 // outboard, so this holds in practice; a custom Origin that publishes
                 // an outboard but refuses Range would sign `ok:true` then fail the
-                // stream. Acceptable for the shipped backends + Flow A's scope.
+                // stream. Acceptable for the shipped backends within this path's scope.
                 //
                 // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
                 // published outboard / no origin size / no origins => fall through to
-                // `try_local_populate` below, EXACTLY as the old path's Ok(None) did.
+                // `try_local_populate` below.
                 // Once serviceable, `serve_via_backend_origin` claims the fill itself
-                // (`CacheEngine::claim_fill`, #1621 B3): the first same-hash miss OWNS
+                // (`CacheEngine::claim_fill`): the first same-hash miss OWNS
                 // the local origin pull; a concurrent one ATTACHES as an observer and
                 // streams the same filling cache to its own client (no double origin
-                // egress). The registry is range-aware, so this is not limited to the
-                // whole-blob case as an earlier version of this `claim_fill`/coalescing
-                // guard was.
+                // egress). The registry is range-aware, so this coalescing is not
+                // limited to the whole-blob case.
                 if range_pulled_size.is_none()
                     && !locally_filled
                     && req.byte_offset == 0
@@ -515,8 +515,7 @@ impl ClientHandler {
                                 }
                                 // Size known but no published outboard — not
                                 // serviceable via the range encoder. Degrade to the
-                                // buffered local populate below, exactly as the old
-                                // Ok(None) arm.
+                                // buffered local populate below.
                                 Ok(None) => {}
                                 // A genuine origin transport fault while fetching the
                                 // outboard. Latch it (#1129) so a later-tier miss
@@ -579,20 +578,19 @@ impl ClientHandler {
                 // Window-paced pull-through (#856, ADR 037) is the preferred path
                 // when its provider is set: instead of buffering the whole
                 // blob via `populate` and only THEN serving (fronting 100% of the
-                // upstream cost before any downstream voucher), it fuses the
-                // upstream pull with downstream delivery so the per-request
-                // exposure is bounded to `pull_ahead_bytes`. It requires an
-                // offset-0 request (the tee imports the FULL-blob bao stream —
-                // its verifying decoder walks `ChunkRanges::all()` — and the
-                // window loop streams/bills the entire blob); a resumed miss
-                // falls back to the buffered path.
+                // upstream cost before any downstream voucher), it runs the pull
+                // leg (fill the cache from upstream) beside the serve leg (stream
+                // the filling cache to the paying client), so the per-request
+                // speculative exposure is bounded to `pull_ahead_bytes`.
                 //
-                // It also requires `byte_len == 0` (a whole-blob/whole-tail
-                // request): the window loop streams and bills the entire blob, so
-                // routing a *bounded* `byte_len > 0` request here (e.g. when the
-                // range pull declined for lack of an outboard) would over-deliver
-                // and over-bill the whole blob to a client that asked for a
-                // prefix. A bounded request whose range pull declines therefore
+                // It requires `byte_offset == 0 && byte_len == 0` (a whole-blob
+                // request). This is a conservative constraint on the ROUTING, not a
+                // limit of the serve leg: `serve_leg` clamps delivery to
+                // `[offset, offset + len)` and bills only the wire it delivers, and
+                // the pull leg is range-minimized (it pulls only
+                // `missing_ranges(offset, len)`), so the two-leg spine is
+                // range-correct. Ranged and resumed serve-miss through that spine is
+                // simply not yet wired end-to-end, so a bounded or resumed request
                 // falls to the buffered path below, which serves exactly the
                 // requested span via `export_range` (#823).
                 if range_pulled_size.is_some() || locally_filled {
@@ -606,7 +604,7 @@ impl ClientHandler {
                     && req.byte_len == 0
                     && self.pull_authorized(&req, verified_client).await
                 {
-                    // Boxed: the fused serve future is large; keep it off the
+                    // Boxed: the serve future is large; keep it off the
                     // `serve_stream` stack frame (clippy::large_futures). The
                     // orchestration claims the fill (owner-or-attach) internally after
                     // signing the response, so two concurrent same-hash misses share one
@@ -624,7 +622,7 @@ impl ClientHandler {
                     ))
                     .await;
                 } else {
-                    // Buffered pull-through (#831): the pre-#856 path, used when
+                    // Buffered pull-through (#831): used when
                     // the window provider is unset or for a resumed request.
                     let buffered = match self.pull_through {
                         Some(timeout) if self.pull_authorized(&req, verified_client).await => {

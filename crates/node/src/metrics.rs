@@ -1158,14 +1158,14 @@ pub struct DecdnMetrics {
     /// appends it.
     pub node_pull_through_tee_finalize_failed: Counter,
     /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
-    /// window-paced serve forwarded an upstream stream that was short of the
-    /// promised wire bytes, or whose teed bao stream failed verification against
-    /// the content root (ADR 038) — at finalization or mid-stream (the
-    /// bait-and-switch case). The teed blob is dropped (never cached), the
-    /// upstream is scored `Corruption` on the verify-failure arms, and the
+    /// serve-miss pull ingested upstream bytes that failed bao verification against
+    /// the content root (ADR 038) — a chunk group rejected mid-stream (the
+    /// bait-and-switch case), a whole-blob root mismatch, or an over-delivery past
+    /// the promised wire. The partial fill is never promoted, the
+    /// upstream is scored `Corruption`, and the
     /// client's own bao decoder rejects the forwarded bytes. Distinct from
-    /// `node_pull_corruption` (the buffered orchestration's own check) — this is
-    /// the fused serve path. A sustained rate means clients are being served
+    /// `node_pull_corruption` (the buffered orchestration's own check). A sustained
+    /// rate means clients are being served
     /// corrupt-upstream bytes through this node. Field has no `_total` suffix
     /// because the `OpenMetrics` encoder appends it.
     pub node_pull_through_upstream_verify_failed: Counter,
@@ -1182,8 +1182,8 @@ pub struct DecdnMetrics {
     pub node_pull_through_local_tee_failed: Counter,
     /// `decdn_local_outboard_serves_total` (#1130): times the node served a
     /// whole-blob cache miss by streaming straight from its own configured
-    /// origin (http/s3/fs) into the paying client while teeing the bytes into
-    /// the local cache store — the stream-while-store path, entered only when
+    /// origin (http/s3/fs) into the paying client while filling
+    /// the local cache store beside it — the stream-while-store path, entered only when
     /// the origin publishes a `{H}.obao4` pre-order outboard alongside the
     /// object. Incremented once per entry into `serve_via_backend_origin`,
     /// before any admission guard, so it also counts requests this tier later
@@ -2204,8 +2204,8 @@ recorders! {
     /// the local cache (#856).
     node_pull_through_tee_finalize_failed => node_pull_through_tee_finalize_failed.inc();
 
-    /// A window-paced serve forwarded an upstream stream that failed its whole-blob
-    /// hash check at finalization (#856).
+    /// A serve-miss pull ingested upstream bytes that failed bao verification
+    /// against the content root (#856/#915).
     node_pull_through_upstream_verify_failed => node_pull_through_upstream_verify_failed.inc();
 
     /// A window-paced serve aborted because a local cache-tee write of an

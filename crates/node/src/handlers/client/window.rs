@@ -1,5 +1,4 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
-//! Bodies split from `mod.rs` (#1254).
 
 use std::sync::atomic::Ordering;
 
@@ -12,12 +11,13 @@ use super::{
 };
 
 impl ClientHandler {
-    /// Serve a cache miss by fusing a window-paced upstream pull with downstream
-    /// delivery (#856, ADR 037): forward each upstream chunk to the paying client
-    /// and tee it into the cache, pacing the upstream spend by the downstream's
-    /// vouchers so per-request speculative exposure is bounded to
-    /// `pull_ahead_bytes` rather than the whole blob. The caller has already
-    /// proven channel ownership and confirmed `byte_offset == 0`. This path claims
+    /// Serve a cache miss by running the two decoupled serve-miss legs (#856, ADR
+    /// 037): the pull leg fills the cache from upstream for only the missing ranges
+    /// while the serve leg streams the filling cache to the paying client, pacing the
+    /// upstream spend by the downstream's vouchers so per-request speculative
+    /// exposure is bounded to `pull_ahead_bytes` rather than the whole blob. The
+    /// caller has already proven channel ownership and confirmed `byte_offset == 0`.
+    /// This path claims
     /// the fill itself (`CacheEngine::claim_fill`) after signing the response, so
     /// two concurrent same-hash misses share ONE upstream pull (the owner drives
     /// it; the second attaches as an observer). Terminal: consumes `send`/`recv`.
@@ -197,8 +197,8 @@ impl ClientHandler {
         let total_bytes = target.total_bytes;
 
         // (4) Size gate on the upstream-claimed total. (`open_pull_leg` already refuses
-        // an oversized header via its `max_blob_size_bytes`; this is the belt-and-braces
-        // wire-reason parity with the old path.)
+        // an oversized header via its `max_blob_size_bytes`; this is a belt-and-braces
+        // wire-reason check.)
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
@@ -224,7 +224,7 @@ impl ClientHandler {
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
-        // (6) The two decoupled legs (ADR 037, #1621 B2 part 2, Strategy B). The SERVE
+        // (6) The two decoupled legs (ADR 037). The SERVE
         // leg runs HERE on the accept task — it MUST be `Send` (the iroh
         // `ProtocolHandler::accept` bound), and it is (its cache streams are `Send`).
         // The PULL leg's `drive` is non-`Send`, so it runs OFF this task on a dedicated
@@ -244,7 +244,7 @@ impl ClientHandler {
             .max(interval_bytes)
             .max(self.credit_window(interval_bytes));
 
-        // (6a) Atomically claim the fill (#1621 B3, ADR 038): under one registry lock,
+        // (6a) Atomically claim the fill (ADR 038): under one registry lock,
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
         // observer to a live one. Two concurrent same-hash misses therefore share ONE
         // upstream pull (no double spend, #305) while each keeps its own per-channel
@@ -307,7 +307,7 @@ impl ClientHandler {
                     let cancel = session.cancel_token().clone();
                     let offset = req.byte_offset;
                     let len = req.byte_len;
-                    // Seed-leech cap (ADR 037): re-homed into the pull leg's pacer. The
+                    // Seed-leech cap (ADR 037): enforced in the pull leg's pacer. The
                     // served client is the accounting key.
                     let leech_governor = self.leech_governor.clone();
                     let client_peer = client_node_id.0;
@@ -429,14 +429,14 @@ impl ClientHandler {
     }
 
     /// Serve a cache miss from the node's OWN configured fs/http/s3 origin by
-    /// running the two decoupled serve-miss legs (Flow A, FA.3a) — the LOCAL twin
+    /// running the two decoupled serve-miss legs — the LOCAL twin
     /// of [`Self::serve_via_window_pull_through`] with every paid-upstream axis
     /// stripped. The local pull leg fetches + verifies + stores each missing range
     /// straight out of this node's origin ([`decdn_cache::CacheEngine::origin_encode_range`]
     /// behind a [`crate::node_origin::BackendSource`]) while the serve leg streams
     /// the filling cache to the paying client; there is no counterparty, no channel,
     /// and no payment on the ingest side, so no discovery, no `PeerSource`, no
-    /// `NodeFunder`, and no upstream tee.
+    /// `NodeFunder`, and no upstream counterparty.
     ///
     /// Whole-blob only (`byte_offset == 0 && byte_len == 0`): dispatch gates it
     /// there, and `total_bytes` is the origin-probe size the caller already
@@ -479,8 +479,8 @@ impl ClientHandler {
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
         // Mark that the own-origin serve-miss tier fired for this request, before
-        // any admission guard below — the tier-selection signal (#1130, reused
-        // unchanged by Flow A), not a success signal; an early reject still counts as
+        // any admission guard below — the tier-selection signal (#1130), not a
+        // success signal; an early reject still counts as
         // this tier having been entered.
         self.metrics.local_outboard_serve();
 
@@ -576,7 +576,7 @@ impl ClientHandler {
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
-        // (5) The two decoupled legs (ADR 037, Flow A FA.3a). Identical coordination
+        // (5) The two decoupled legs (ADR 037). Identical coordination
         // shape to the peer twin: the SERVE leg runs HERE on the accept task (it must
         // be `Send`, the iroh `ProtocolHandler::accept` bound, and it is); the LOCAL
         // pull leg's `drive` is non-`Send`, so it runs OFF this task on a dedicated
@@ -594,7 +594,7 @@ impl ClientHandler {
             .max(interval_bytes)
             .max(self.credit_window(interval_bytes));
 
-        // (5a) Atomically claim the fill (#1621 B3, ADR 038): under one registry lock,
+        // (5a) Atomically claim the fill (ADR 038): under one registry lock,
         // OWN a fresh local pull for `hash` or ATTACH as an observer to a live same-hash
         // fill (any source — a peer pull and an own-origin pull for the same hash
         // coalesce, the byte fetched once). Two concurrent whole-blob own-origin misses

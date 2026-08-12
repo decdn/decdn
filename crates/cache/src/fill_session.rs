@@ -1,5 +1,5 @@
 //! `FillSession` — the cache-resident fill-coordination primitive the decoupled
-//! serve-miss legs share (#1621 B3, ADR 038, Path A).
+//! serve-miss legs share (ADR 038).
 //!
 //! # Why this exists
 //!
@@ -131,7 +131,7 @@ pub struct FillSession {
     /// the last-out drop fires [`Self::cancel`] to stop ingest (#1610).
     observers: AtomicUsize,
     /// Cancels the pull when the last observer leaves before the pull ends. The
-    /// node's pull leg selects on it to abort ingest; the B0-tagged partial persists
+    /// node's pull leg selects on it to abort ingest; the tagged partial persists
     /// for a later resume.
     cancel: CancellationToken,
 }

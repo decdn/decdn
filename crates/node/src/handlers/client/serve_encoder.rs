@@ -1,11 +1,9 @@
 //! The coherent whole-range bao encoder that produces the decoupled serve leg's
-//! downstream wire (#1621 B2 part 2, ADR 038, Path A).
+//! downstream wire (ADR 038).
 //!
-//! Replaces the piece-wise `encode_range`-per-present-span producer (which
-//! concatenated incoherent, oversized sub-range encodes). Here a SINGLE
-//! [`bao_tree::io::fsm::encode_ranges_validated`] walks the requested range in
-//! pre-order and emits ONE coherent verified stream — byte-identical to a whole
-//! encode — while the pull leg fills the cache incrementally beside it:
+//! A SINGLE [`bao_tree::io::fsm::encode_ranges_validated`] walks the requested
+//! range in pre-order and emits ONE coherent verified stream — byte-identical to a
+//! whole encode — while the pull leg fills the cache incrementally beside it:
 //!
 //! - leaf DATA comes from [`AwaitingDataReader`], which blocks on the store's
 //!   present-range watch until the leaf's content lands (racing the pull's terminal
@@ -17,9 +15,9 @@
 //!
 //! The encode future and the frame consumer run CONCURRENTLY on the one serve task
 //! (the bounded channel backpressures the encoder), so `CoherentFrameProducer`
-//! exposes the same `next_frame()` shape the old producer did and the serve loop is
-//! otherwise unchanged. Everything here is `Send` (the iroh accept bound): the cache
-//! streams are `Send`, held only behind `&mut self`.
+//! exposes a `next_frame()` frame-pull interface to the serve loop. Everything here
+//! is `Send` (the iroh accept bound): the cache streams are `Send`, held only behind
+//! `&mut self`.
 
 use std::future::Future;
 use std::io;
@@ -38,8 +36,7 @@ use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::mpsc;
 
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
-/// first chunk group) before a present-range watch can be opened — mirrors the old
-/// producer's `WATCH_OPEN_RETRY`.
+/// first chunk group) before a present-range watch can be opened.
 const WATCH_OPEN_RETRY: Duration = Duration::from_millis(25);
 
 /// Bounded backpressure between the encoder and the frame consumer: the encoder
@@ -118,7 +115,7 @@ impl AsyncSliceReader for AwaitingDataReader {
                 });
             }
 
-            // Ensure a watch is open; it errors until the blob materializes (B1) —
+            // Ensure a watch is open; it errors until the blob materializes —
             // tolerate that with a bounded poll racing `pull_ended`, then retry.
             if self.watch.is_none() {
                 match self.store.observe().await {
@@ -191,7 +188,7 @@ impl AsyncStreamWriter for ChannelWriter {
 }
 
 /// Drives the coherent whole-range encode and re-cuts its output into `CHUNK_SIZE`
-/// frames. Drop-in for the old `SpanProducer`: [`Self::next_frame`] yields the next
+/// frames. [`Self::next_frame`] yields the next
 /// wire frame, `None` once the whole range is delivered, `Err` on an encode fault
 /// (a gap the pull could not fill, or a proof/verify error) — on which the serve
 /// leg must not send `StreamEnd`.
