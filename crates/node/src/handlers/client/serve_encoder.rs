@@ -11,7 +11,7 @@
 //!   present-range watch until the leaf's content lands (racing the pull's terminal
 //!   signal for the no-hang guarantee), then reads it;
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
-//!   [`OutboardReader`], fed by the pull leg's capture;
+//!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture;
 //! - the encoded bytes are pushed through a bounded channel ([`ChannelWriter`]) and
 //!   re-cut into `CHUNK_SIZE` `cdn/client/v1` frames by [`CoherentFrameProducer`].
 //!
@@ -24,20 +24,18 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bao_tree::ChunkRanges;
 use bao_tree::io::fsm::encode_ranges_validated;
 use bytes::{Bytes, BytesMut};
 use decdn_bao_range::{RangedStore, align_range};
-use decdn_cache::{NodeRangedStore, PresentRangeWatch, ServeStore};
+use decdn_cache::{FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
 use decdn_protocol::CHUNK_SIZE;
 use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
-use tokio::sync::{Notify, mpsc};
-
-use crate::node_origin::OutboardReader;
+use tokio::sync::mpsc;
 
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
 /// first chunk group) before a present-range watch can be opened — mirrors the old
@@ -49,19 +47,6 @@ const WATCH_OPEN_RETRY: Duration = Duration::from_millis(25);
 /// upstream-paced pull is never outrun by an unbounded local encode.
 const ENCODE_CHANNEL_CAP: usize = 8;
 
-/// Peek the pull leg's terminal outcome without holding a lock across an await.
-/// Twin of the serve leg / outboard readers' helper.
-fn pull_outcome(pull_result: &StdMutex<Option<anyhow::Result<()>>>) -> Option<Result<(), String>> {
-    match pull_result.lock() {
-        Ok(guard) => match &*guard {
-            None => None,
-            Some(Ok(())) => Some(Ok(())),
-            Some(Err(e)) => Some(Err(format!("{e:#}"))),
-        },
-        Err(_poisoned) => Some(Err("upstream pull result lock poisoned".to_string())),
-    }
-}
-
 /// An [`AsyncSliceReader`] over the cache that AWAITS the pull leg filling a leaf's
 /// content before reading it — the data axis of the coherent encode. Owns a
 /// [`NodeRangedStore`] (a cheap `CacheEngine` handle), so the encode future can take
@@ -71,23 +56,18 @@ struct AwaitingDataReader {
     total: u64,
     /// Live present-range watch, opened lazily once the blob materializes.
     watch: Option<PresentRangeWatch>,
-    pull_ended: Arc<Notify>,
-    pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
+    /// The shared fill session: its terminal signal races the present-range watch so
+    /// a pull that could not fill a gap fails the read rather than hanging.
+    session: Arc<FillSession>,
 }
 
 impl AwaitingDataReader {
-    fn new(
-        store: NodeRangedStore,
-        total: u64,
-        pull_ended: Arc<Notify>,
-        pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
-    ) -> Self {
+    fn new(store: NodeRangedStore, total: u64, session: Arc<FillSession>) -> Self {
         Self {
             store,
             total,
             watch: None,
-            pull_ended,
-            pull_result,
+            session,
         }
     }
 
@@ -118,13 +98,13 @@ impl AsyncSliceReader for AwaitingDataReader {
 
             // Register the pull-ended waiter BEFORE re-inspecting shared state, so a
             // terminal outcome recorded concurrently cannot slip past the check.
-            let pull_ended = Arc::clone(&self.pull_ended);
-            let mut ended = Box::pin(pull_ended.notified());
+            let session = Arc::clone(&self.session);
+            let mut ended = Box::pin(session.ended_signal().notified());
             ended.as_mut().enable();
 
             // Terminal pull outcome? A failed pull fails the read; a clean pull means
             // the bytes are authoritatively cached — one more check settles a lag.
-            if let Some(outcome) = pull_outcome(&self.pull_result) {
+            if let Some(outcome) = self.session.outcome() {
                 if self.present_covers(offset, need).await? {
                     break;
                 }
@@ -227,15 +207,13 @@ pub(super) struct CoherentFrameProducer {
 impl CoherentFrameProducer {
     /// Build the producer for request range `[offset, end)` of `hash` (a
     /// `total`-byte blob), reading data from `store` (awaiting the pull) and proof
-    /// nodes from `outboard`.
+    /// nodes from a [`decdn_cache::SessionOutboardReader`] minted from the shared `session`.
     pub(super) fn new(
         store: NodeRangedStore,
-        outboard: OutboardReader,
+        session: Arc<FillSession>,
         offset: u64,
         end: u64,
         total: u64,
-        pull_ended: Arc<Notify>,
-        pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
     ) -> Self {
         // The chunk-group-aligned ranges the client's verified stream covers (ADR
         // 038). `end == offset` (empty request) yields empty ranges — an empty
@@ -247,7 +225,8 @@ impl CoherentFrameProducer {
             ChunkRanges::empty()
         };
 
-        let data = AwaitingDataReader::new(store, total, pull_ended, pull_result);
+        let outboard = session.outboard_reader();
+        let data = AwaitingDataReader::new(store, total, session);
         let (tx, rx) = mpsc::channel(ENCODE_CHANNEL_CAP);
         let writer = ChannelWriter { tx };
 

@@ -17,6 +17,7 @@
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
+pub mod fill_session;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
@@ -41,6 +42,7 @@ pub use engine::{
     TeeReservation,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
+pub use fill_session::{FillError, FillSession, SessionOutboardReader};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
 /// `iroh_blobs::Hash` (the BLAKE3 digest the iroh-blobs store keys on)
 /// so every existing `decdn_cache::Hash` path in `decdn-node` and the

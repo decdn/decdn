@@ -34,16 +34,13 @@
 //! The serve leg owns termination: it is what fulfils `R` for the client, so its
 //! completion (or error) ends the serve and drops the pull leg.
 
-use std::sync::Mutex as StdMutex;
-
-use decdn_cache::NodeRangedStore;
+use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
-use tokio::sync::Notify;
 
 use super::{
-    Arc, AtomicU64, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
-    ChunkData, ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, Ordering, RecvStream,
-    SendStream, VecDeque,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId, ChunkData,
+    ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, Ordering, RecvStream, SendStream,
+    VecDeque,
 };
 
 impl ClientHandler {
@@ -84,7 +81,7 @@ impl ClientHandler {
         send: &mut SendStream,
         recv: &mut RecvStream,
         store: NodeRangedStore,
-        outboard: crate::node_origin::OutboardReader,
+        session: Arc<FillSession>,
         channel: &Arc<Mutex<ChannelDeliveryState>>,
         hash: Hash,
         channel_id: ChannelId,
@@ -95,10 +92,6 @@ impl ClientHandler {
         len: u64,
         total_bytes: u64,
         window: u64,
-        served_paid: Arc<AtomicU64>,
-        served_paid_advanced: Arc<Notify>,
-        pull_ended: Arc<Notify>,
-        pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
     ) -> anyhow::Result<()> {
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
         // convention); otherwise clamp to the tree size.
@@ -147,12 +140,10 @@ impl ClientHandler {
         // captures. Replaces the incoherent piece-wise `encode_range` producer.
         let mut producer = super::serve_encoder::CoherentFrameProducer::new(
             store,
-            outboard,
+            Arc::clone(&session),
             offset,
             end,
             total_bytes,
-            Arc::clone(&pull_ended),
-            Arc::clone(&pull_result),
         );
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
@@ -257,8 +248,8 @@ impl ClientHandler {
                     // window). One contiguous delivery from `offset`, so `offset`
                     // is the single fetch-start.
                     let served = content_paid_frontier(offset, total_bytes, paid);
-                    served_paid.store(served, Ordering::Relaxed);
-                    served_paid_advanced.notify_waiters();
+                    session.served_frontier().store(served, Ordering::Relaxed);
+                    session.served_advanced().notify_waiters();
                 }
                 // Re-queue deltas the client had not paid yet (a short batch),
                 // preserving order at the front.

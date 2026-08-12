@@ -20,8 +20,8 @@
 //!   switch is deferred, consistent with the resumable-pull design (#1530).
 //! - [`run_pull_leg`] — builds the driver axes ([`NodeAdmitStore`] sink,
 //!   [`PeerSource`], [`WindowPacer`], [`NodeFunder`]) and runs the drive, then scores
-//!   the provider and records its terminal outcome into the shared `pull_result`
-//!   before firing `pull_ended`. A [`SettleOnDrop`] guard persists the buyer
+//!   the provider and records its terminal outcome via the shared
+//!   [`decdn_cache::FillSession::mark_ended`]. A [`SettleOnDrop`] guard persists the buyer
 //!   watermark (#852) on EVERY exit — including a mid-drive cancellation when the
 //!   serve leg finishes first and drops this future (client disconnect / shutdown).
 //!
@@ -38,14 +38,14 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use bao_tree::ChunkRanges;
 use decdn_bao_range::RangedStore;
-use decdn_cache::{CacheEngine, CacheError, Hash};
+use decdn_cache::{CacheEngine, CacheError, FillError, FillSession, Hash};
 use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
@@ -473,7 +473,7 @@ impl NodeOrigin {
 /// Run the range-minimized upstream pull for `[offset, offset + len)` of `hash`
 /// into `engine`'s cache via [`drive`], paying only for the missing ranges and
 /// pacing the pull to within `window` of the downstream serve leg's paid frontier
-/// (ADR 037). Records the terminal outcome into `pull_result` and fires `pull_ended`
+/// (ADR 037). Records the terminal outcome via the shared [`FillSession::mark_ended`]
 /// on completion; a [`SettleOnDrop`] guard persists the buyer watermark (#852) on
 /// EVERY exit — clean completion, a terminal drive error, and a cooperative
 /// `cancel` (the serve leg finished, so the client no longer waits: stop the
@@ -489,7 +489,7 @@ impl NodeOrigin {
 /// OWNED + `'static` (no borrow crosses the thread): `deps_lock` is a clone of
 /// [`NodeOrigin::deps_arc`], read via `get()` HERE so `&deps.endpoint` /
 /// `&deps.slash_domain` are borrowed only within this runtime's scope. The shared
-/// coordination state ([`AtomicU64`] / [`Notify`] / [`StdMutex`]) crosses runtimes
+/// coordination state (the shared [`FillSession`]'s [`AtomicU64`] / [`Notify`]) crosses runtimes
 /// safely — atomics and `Notify` wakers are runtime-agnostic — and the
 /// [`CacheEngine`] store actor and iroh [`Endpoint`](iroh::Endpoint) are reached
 /// through their own channels, so a second runtime talking to them is fine.
@@ -502,11 +502,7 @@ pub(crate) async fn run_pull_leg(
     offset: u64,
     len: u64,
     window: u64,
-    served_paid: Arc<AtomicU64>,
-    served_paid_advanced: Arc<Notify>,
-    pull_ended: Arc<Notify>,
-    pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
-    outboard_writer: super::serve_outboard::OutboardWriter,
+    session: Arc<FillSession>,
     leech_governor: Option<Arc<LeechGovernor>>,
     client_peer: [u8; 32],
     cancel: CancellationToken,
@@ -540,15 +536,9 @@ pub(crate) async fn run_pull_leg(
     let Some(deps) = deps_lock.get() else {
         // Unprovisioned under us (cannot happen — we discovered via deps): still
         // record a terminal outcome so the serve leg does not hang.
-        {
-            let mut guard = pull_result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard = Some(Err(anyhow::anyhow!(
-                "node-origin pull leg lost its dependencies mid-serve"
-            )));
-        }
-        pull_ended.notify_waiters();
+        session.mark_ended(Err(FillError::new(
+            "node-origin pull leg lost its dependencies mid-serve",
+        )));
         return;
     };
 
@@ -564,7 +554,7 @@ pub(crate) async fn run_pull_leg(
         ledger: Arc::clone(&ledger),
     };
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(outboard_writer));
+    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)));
     // Content bytes this provider will actually serve (the gaps), for scoring —
     // held ranges are not re-pulled, so this is below `total_bytes` on an interior
     // hold.
@@ -608,11 +598,11 @@ pub(crate) async fn run_pull_leg(
         settle_backoff: SETTLE_POLL_STEP,
     };
     let served_paid_reader = {
-        let served_paid = Arc::clone(&served_paid);
+        let served_paid = Arc::clone(session.served_frontier());
         move || served_paid.load(Ordering::Relaxed)
     };
     let pacing_wait = ServedPaidWait {
-        served_paid_advanced: Arc::clone(&served_paid_advanced),
+        served_paid_advanced: Arc::clone(session.served_advanced()),
         metrics: Arc::clone(&deps.metrics),
     };
 
@@ -723,16 +713,12 @@ pub(crate) async fn run_pull_leg(
         }
     }
 
-    // Record the terminal outcome BEFORE firing `pull_ended` (the serve leg reads
-    // `pull_result` after the notify to decide a gap it is waiting on). On cancel the
-    // serve leg has already finished and nobody reads this, but set it regardless.
-    {
-        let mut guard = pull_result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(result);
-    }
-    pull_ended.notify_waiters();
+    // Record the terminal outcome so the serve leg can decide a gap it is waiting on
+    // (`mark_ended` sets the outcome then wakes waiters). On cancel the serve leg has
+    // already finished and nobody reads this, but set it regardless. `anyhow::Error`
+    // is not `Clone`, so flatten it into a `FillError` message (mirrors the old
+    // `pull_result` string-flatten the serve readers did on read).
+    session.mark_ended(result.map_err(|e| FillError::new(format!("{e:#}"))));
     // `_settle` drops here, persisting the buyer watermark (#852).
 }
 
@@ -797,7 +783,7 @@ fn local_bookkeeping_ctx() -> ChannelContext {
 /// Run the range-minimized OWN-ORIGIN pull for `[offset, offset + len)` of `hash`
 /// into `engine`'s cache via [`drive`] over an UNPAID [`BackendSource`], pacing the
 /// pull to within `window` of the downstream serve leg's paid frontier (ADR 037).
-/// Records the terminal outcome into `pull_result` and fires `pull_ended`. The
+/// Records the terminal outcome via the shared [`FillSession::mark_ended`]. The
 /// local twin of [`run_pull_leg`] (Flow A, FA.2).
 ///
 /// # What drops out relative to the paid [`run_pull_leg`]
@@ -840,7 +826,7 @@ fn local_bookkeeping_ctx() -> ChannelContext {
 /// Like [`run_pull_leg`], `drive`'s future is non-`Send`, so the orchestration
 /// (FA.3a) `block_on`s this on a dedicated current-thread runtime. All inputs are
 /// therefore owned + `'static`; the shared coordination state
-/// ([`AtomicU64`] / [`Notify`] / [`StdMutex`]) crosses runtimes safely.
+/// (the shared [`FillSession`]'s [`AtomicU64`] / [`Notify`]) crosses runtimes safely.
 #[allow(
     clippy::too_many_arguments,
     dead_code,
@@ -855,18 +841,14 @@ pub(crate) async fn run_local_pull_leg(
     len: u64,
     window: u64,
     total_bytes: u64,
-    served_paid: Arc<AtomicU64>,
-    served_paid_advanced: Arc<Notify>,
-    pull_ended: Arc<Notify>,
-    pull_result: Arc<StdMutex<Option<anyhow::Result<()>>>>,
-    outboard_writer: super::serve_outboard::OutboardWriter,
+    session: Arc<FillSession>,
     leech_governor: Option<Arc<LeechGovernor>>,
     client_peer: [u8; 32],
     cancel: CancellationToken,
 ) {
     let hash_bytes = *hash.as_bytes();
 
-    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(outboard_writer));
+    let admit_store = NodeAdmitStore::new(engine, hash, total_bytes, Some(Arc::clone(&session)));
 
     // The LOCAL bookkeeping axes (THE CRUX). The `ledger` is the SAME `Arc` the
     // source advances on `finish`, so the paid-frontier the gap loop reads for
@@ -898,11 +880,11 @@ pub(crate) async fn run_local_pull_leg(
         settle_backoff: SETTLE_POLL_STEP,
     };
     let served_paid_reader = {
-        let served_paid = Arc::clone(&served_paid);
+        let served_paid = Arc::clone(session.served_frontier());
         move || served_paid.load(Ordering::Relaxed)
     };
     let pacing_wait = ServedPaidWait {
-        served_paid_advanced: Arc::clone(&served_paid_advanced),
+        served_paid_advanced: Arc::clone(session.served_advanced()),
         metrics: Arc::clone(&metrics),
     };
 
@@ -977,15 +959,10 @@ pub(crate) async fn run_local_pull_leg(
         );
     }
 
-    // Record the terminal outcome BEFORE firing `pull_ended` (the serve leg reads
-    // `pull_result` after the notify to decide a gap it is waiting on).
-    {
-        let mut guard = pull_result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(result);
-    }
-    pull_ended.notify_waiters();
+    // Record the terminal outcome so the serve leg can decide a gap it is waiting on
+    // (`mark_ended` sets the outcome then wakes waiters). `anyhow::Error` is not
+    // `Clone`, so flatten it into a `FillError` message.
+    session.mark_ended(result.map_err(|e| FillError::new(format!("{e:#}"))));
 }
 
 #[allow(
@@ -1000,23 +977,21 @@ mod local_pull_leg_tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use bytes::Bytes;
     use decdn_bao_range::IROH_BLOCK_SIZE;
     use decdn_cache::{
-        CacheEngine, Hash, Origin, OriginFetch, OriginKind, OriginPullError, OriginRangeFetch,
-        OriginRangeRequest, OutboardFetch,
+        CacheEngine, FillError, FillSession, Hash, Origin, OriginFetch, OriginKind,
+        OriginPullError, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
     };
     use decdn_client_pull::{ChannelLedger, Cumulative};
-    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     use super::BackendSource;
     use super::run_local_pull_leg;
-    use crate::node_origin::shared_outboard;
 
     /// What a [`FakeOrigin`] does when its range is fetched.
     #[derive(Clone, Copy)]
@@ -1193,16 +1168,15 @@ mod local_pull_leg_tests {
         engine: &CacheEngine,
         root: [u8; 32],
         total: u64,
-    ) -> anyhow::Result<Option<anyhow::Result<()>>> {
+    ) -> anyhow::Result<Option<Result<(), FillError>>> {
         let hash = Hash::from(root);
         let source = BackendSource::new(engine.clone(), root, total, fresh_ledger());
-        let (ob_writer, _factory) = shared_outboard(bao_tree::blake3::Hash::from(root), total);
+        let session = FillSession::new(bao_tree::blake3::Hash::from(root), total);
+        // Pre-advance the served frontier to `total` so the downstream `WindowPacer`
+        // never gates the pull (this test exercises the completion path, not the
+        // window).
+        session.served_frontier().store(total, Ordering::Relaxed);
 
-        let served_paid = Arc::new(AtomicU64::new(total));
-        let served_paid_advanced = Arc::new(Notify::new());
-        let pull_ended = Arc::new(Notify::new());
-        let pull_result: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> =
-            Arc::new(std::sync::Mutex::new(None));
         let cancel = CancellationToken::new();
         let metrics = Arc::new(crate::metrics::Metrics::new());
         // A window comfortably larger than the blob: with `served_paid == total`, the
@@ -1220,11 +1194,7 @@ mod local_pull_leg_tests {
                 0,
                 window,
                 total,
-                served_paid,
-                served_paid_advanced,
-                Arc::clone(&pull_ended),
-                Arc::clone(&pull_result),
-                ob_writer,
+                Arc::clone(&session),
                 None,
                 [7u8; 32],
                 cancel,
@@ -1233,11 +1203,9 @@ mod local_pull_leg_tests {
         .await
         .map_err(|_| anyhow::anyhow!("run_local_pull_leg HUNG — the CRUX failed to terminate"))?;
 
-        let out = pull_result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        Ok(out)
+        // The leg records its terminal outcome unconditionally on its single exit, and
+        // we awaited it to completion, so `outcome()` is the non-racy proof it ran.
+        Ok(session.outcome())
     }
 
     /// (a) THE CRUX: a full-miss whole-blob local pull TERMINATES, fills the cache

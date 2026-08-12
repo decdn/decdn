@@ -2504,10 +2504,15 @@ impl CacheEngine {
         chunk_ranges: ChunkRanges,
         total_bytes: u64,
         mut reader: R,
+        session: Option<&Arc<crate::FillSession>>,
     ) -> CacheResult<R>
     where
         R: AsyncStreamReader + Send,
     {
+        // Retain the admitted ranges so the serve-leg outboard capture below can
+        // re-read exactly the proof nodes iroh-blobs emitted for them (the import
+        // moves `chunk_ranges` into the store task).
+        let capture_ranges = session.is_some().then(|| chunk_ranges.clone());
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(ADMIT_STREAM_CHANNEL_CAP);
         let engine = self.clone();
         let import = tokio::spawn(async move {
@@ -2568,6 +2573,16 @@ impl CacheEngine {
         match outcome {
             Ok(_drained) => {
                 self.protect_partial(hash).await?;
+                // The range's data is now cached; capture its outboard proof nodes
+                // into the serve leg's shared session (no-op when no serve leg reads
+                // beside this pull). Front-to-back admits union to the whole tree.
+                // The bytes were just admitted, so this reads the store we just wrote;
+                // an `export_bao` fault here is a genuine store fault, surfaced as one.
+                if let (Some(session), Some(ranges)) = (session, capture_ranges.as_ref()) {
+                    for (node, pair) in self.outboard_pairs(hash, ranges).await? {
+                        session.capture(node, pair);
+                    }
+                }
                 Ok(reader)
             }
             Err(e) => Err(classify_import_bao_reader_error(hash, e)),
@@ -6941,7 +6956,13 @@ mod tests {
         let tmp2 = tempfile::tempdir()?;
         let engine2 = CacheEngine::open(tmp2.path(), vec![], 64).await?;
         let drained = engine2
-            .admit_bao_stream(hash, aligned.chunk_ranges().clone(), total, header_less)
+            .admit_bao_stream(
+                hash,
+                aligned.chunk_ranges().clone(),
+                total,
+                header_less,
+                None,
+            )
             .await?;
         anyhow::ensure!(drained.is_empty(), "the wire is fully drained by admit");
         anyhow::ensure!(
@@ -7181,7 +7202,7 @@ mod tests {
         let header_less = bao.slice(8..);
 
         let reader = engine
-            .admit_bao_stream(hash, ranges.clone(), total, header_less)
+            .admit_bao_stream(hash, ranges.clone(), total, header_less, None)
             .await
             .unwrap();
         assert_eq!(reader.len(), 0, "the reader is fully drained");
@@ -7210,7 +7231,7 @@ mod tests {
         *byte ^= 0xFF;
 
         let err = engine
-            .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt))
+            .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt), None)
             .await
             .unwrap_err();
         assert!(

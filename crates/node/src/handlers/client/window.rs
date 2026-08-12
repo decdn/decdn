@@ -1,10 +1,9 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 //! Bodies split from `mod.rs` (#1254).
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use alloy::primitives::U256;
-use tokio::sync::Notify;
 
 use super::{
     Arc, B256, ChannelId, ClientHandler, ClientMessage, FillOutcome, Hash, MB_BYTES, NodeOrigin,
@@ -266,27 +265,32 @@ impl ClientHandler {
         // full window of phantom lead and immediately `Wait`/stall. Dispatch currently
         // gates this path to `byte_offset == 0` (so this is 0 today), but the
         // absolute-frontier invariant is made explicit here rather than relying on that.
-        let served_paid = Arc::new(AtomicU64::new(req.byte_offset));
-        let served_paid_advanced = Arc::new(Notify::new());
-        let pull_ended = Arc::new(Notify::new());
-        let pull_result: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> =
-            Arc::new(std::sync::Mutex::new(None));
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        // The whole-tree bao outboard the two legs share (#1621 B2 part 2, ADR 038):
-        // the pull leg captures each admitted range's proof nodes into `ob_writer`,
-        // and the serve leg's coherent whole-range encoder reads them through a reader
-        // minted from `ob_factory`. The pull can start capturing before the serve leg
-        // wires its reader, which is why construction and reader-minting are split.
-        let (ob_writer, ob_factory) = crate::node_origin::shared_outboard(
+        // The shared fill session the two legs coordinate on (#1621 B3, ADR 038): it
+        // owns the whole-tree bao outboard (the cache admit path captures each admitted
+        // range's proof nodes into it, the serve leg's coherent whole-range encoder
+        // reads them), the pull's terminal signal (`mark_ended`/`outcome`), and the
+        // shared PAID content frontier the pull leg's `WindowPacer` bounds against.
+        //
+        // `served_frontier` is an ABSOLUTE content offset, so seed it to the request's
+        // content start — `req.byte_offset` — not a bare 0, or a non-zero-offset
+        // request would show a full window of phantom lead and immediately `Wait`/stall.
+        // Dispatch currently gates this path to `byte_offset == 0` (so this is 0 today),
+        // but the absolute-frontier invariant is made explicit here rather than relying
+        // on that.
+        let session = decdn_cache::FillSession::new(
             bao_tree::blake3::Hash::from(*hash.as_bytes()),
             total_bytes,
         );
+        session
+            .served_frontier()
+            .store(req.byte_offset, Ordering::Relaxed);
         // Seed the outboard with proof nodes for ranges B ALREADY holds. The pull leg
         // only captures ranges it ADMITS, but a range-minimized serve-miss can start
         // with bytes already present (ADR 037 §held ranges read locally) — without
         // this seed the coherent encoder would `load` a held span's proof node that
-        // was never captured, park until `pull_ended`, then fail "outboard node never
+        // was never captured, park until the pull ends, then fail "outboard node never
         // captured". `outboard_pairs` over the present ranges emits exactly those
         // nodes (plus the right-spine). Best-effort: on a full miss `present` is empty
         // and this is a no-op; a seed error just leaves those nodes for the pull to
@@ -299,7 +303,7 @@ impl ClientHandler {
                 .await
         {
             for (node, pair) in pairs {
-                ob_writer.save(node, pair);
+                session.capture(node, pair);
             }
         }
 
@@ -311,14 +315,10 @@ impl ClientHandler {
         let pull_thread = {
             let deps_lock = origin.deps_arc();
             let engine = self.cache.clone();
-            let served_paid = Arc::clone(&served_paid);
-            let served_paid_advanced = Arc::clone(&served_paid_advanced);
-            let pull_ended = Arc::clone(&pull_ended);
-            let pull_result = Arc::clone(&pull_result);
+            let session = Arc::clone(&session);
             let cancel = cancel.clone();
             let offset = req.byte_offset;
             let len = req.byte_len;
-            let outboard_writer = ob_writer;
             // Seed-leech cap (ADR 037): re-homed into the pull leg's pacer. The served
             // client is the accounting key.
             let leech_governor = self.leech_governor.clone();
@@ -338,30 +338,19 @@ impl ClientHandler {
                             offset,
                             len,
                             window,
-                            served_paid,
-                            served_paid_advanced,
-                            Arc::clone(&pull_ended),
-                            pull_result.clone(),
-                            outboard_writer,
+                            Arc::clone(&session),
                             leech_governor,
                             client_peer,
                             cancel,
                         )),
                         Err(e) => {
                             // The pull could not start: record a terminal error and wake
-                            // the serve leg so it fails a gap rather than hanging. Recover
-                            // a poisoned lock instead of skipping the write (`if let Ok`
-                            // would leave `pull_result` `None` while still firing
-                            // `pull_ended`, and `notify_waiters` stores no permit — the
-                            // serve encoder would then wait forever). `pull_result` MUST be
-                            // `Some(..)` before `pull_ended` fires; mirror the recover-poison
-                            // the pull legs use for the same reason.
-                            *pull_result
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(
-                                anyhow::anyhow!("serve-miss pull runtime build failed: {e}"),
-                            ));
-                            pull_ended.notify_waiters();
+                            // the serve leg so it fails a gap rather than hanging.
+                            // `mark_ended` records the outcome before waking waiters, so
+                            // the serve encoder never sees a wake with no outcome set.
+                            session.mark_ended(Err(decdn_cache::FillError::new(format!(
+                                "serve-miss pull runtime build failed: {e}"
+                            ))));
                         }
                     }
                 })
@@ -377,17 +366,15 @@ impl ClientHandler {
             }
         };
 
-        // Mint the serve leg's outboard reader from the shared factory, bound to the
-        // pull's terminal signals for the coherent encoder's no-hang guarantee.
-        let outboard_reader = ob_factory.reader(Arc::clone(&pull_ended), Arc::clone(&pull_result));
-
         // Run the serve leg on THIS (accept) task and await it. It owns termination.
+        // It mints its outboard reader from the shared `session` and reads the pull's
+        // terminal signal off it for the coherent encoder's no-hang guarantee.
         let serve_result = self
             .serve_leg(
                 &mut send,
                 &mut recv,
                 serve_store,
-                outboard_reader,
+                Arc::clone(&session),
                 &channel,
                 hash,
                 channel_id,
@@ -398,10 +385,6 @@ impl ClientHandler {
                 req.byte_len,
                 total_bytes,
                 window,
-                Arc::clone(&served_paid),
-                Arc::clone(&served_paid_advanced),
-                Arc::clone(&pull_ended),
-                Arc::clone(&pull_result),
             )
             .await;
 
@@ -612,27 +595,27 @@ impl ClientHandler {
         // request's content start (`req.byte_offset`) rather than a bare 0 — dispatch
         // gates this path to `byte_offset == 0` today, but the absolute-frontier
         // invariant is made explicit here rather than relying on that.
-        let served_paid = Arc::new(AtomicU64::new(req.byte_offset));
-        let served_paid_advanced = Arc::new(Notify::new());
-        let pull_ended = Arc::new(Notify::new());
-        let pull_result: Arc<std::sync::Mutex<Option<anyhow::Result<()>>>> =
-            Arc::new(std::sync::Mutex::new(None));
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        // The whole-tree bao outboard the two legs share (ADR 038): the pull leg
-        // captures each admitted range's proof nodes into `ob_writer`, and the serve
-        // leg's coherent whole-range encoder reads them through a reader minted from
-        // `ob_factory`. Construction and reader-minting are split so the pull can
-        // start capturing before the serve leg wires its reader.
-        let (ob_writer, ob_factory) = crate::node_origin::shared_outboard(
+        // The shared fill session the two legs coordinate on (ADR 038): the cache
+        // admit path captures each admitted range's proof nodes into it, the serve
+        // leg's coherent whole-range encoder reads them, and the pull leg records its
+        // terminal signal + reads the shared PAID content frontier off it.
+        // `served_frontier` is an ABSOLUTE content offset, so seed it to the request's
+        // content start (`req.byte_offset`) rather than a bare 0 — dispatch gates this
+        // path to `byte_offset == 0` today, but the invariant is made explicit here.
+        let session = decdn_cache::FillSession::new(
             bao_tree::blake3::Hash::from(*hash.as_bytes()),
             total_bytes,
         );
+        session
+            .served_frontier()
+            .store(req.byte_offset, Ordering::Relaxed);
         // Seed the outboard with proof nodes for ranges this node ALREADY holds. The
         // pull leg only captures ranges it ADMITS, but a range-minimized serve-miss
         // can start with bytes already present (ADR 037 §held ranges read locally) —
         // without this seed the coherent encoder would `load` a held span's proof
-        // node that was never captured, park until `pull_ended`, then fail "outboard
+        // node that was never captured, park until the pull ends, then fail "outboard
         // node never captured". The same interior-hold seed as the peer twin;
         // best-effort (a full miss makes `present` empty and this a no-op).
         if let Ok(present) = self.cache.present_ranges(hash).await
@@ -643,7 +626,7 @@ impl ClientHandler {
                 .await
         {
             for (node, pair) in pairs {
-                ob_writer.save(node, pair);
+                session.capture(node, pair);
             }
         }
 
@@ -659,14 +642,10 @@ impl ClientHandler {
         let pull_thread = {
             let engine = self.cache.clone();
             let metrics = Arc::clone(&self.metrics);
-            let served_paid = Arc::clone(&served_paid);
-            let served_paid_advanced = Arc::clone(&served_paid_advanced);
-            let pull_ended = Arc::clone(&pull_ended);
-            let pull_result = Arc::clone(&pull_result);
+            let session = Arc::clone(&session);
             let cancel = cancel.clone();
             let offset = req.byte_offset;
             let len = req.byte_len;
-            let outboard_writer = ob_writer;
             // Seed-leech cap (ADR 037): re-homed into the pull leg's pacer. The served
             // client is the accounting key.
             let leech_governor = self.leech_governor.clone();
@@ -696,11 +675,7 @@ impl ClientHandler {
                             len,
                             window,
                             total_bytes,
-                            served_paid,
-                            served_paid_advanced,
-                            Arc::clone(&pull_ended),
-                            pull_result.clone(),
-                            outboard_writer,
+                            Arc::clone(&session),
                             leech_governor,
                             client_peer,
                             cancel,
@@ -708,17 +683,11 @@ impl ClientHandler {
                         Err(e) => {
                             // The pull could not start: record a terminal error and
                             // wake the serve leg so it fails a gap rather than hanging.
-                            // Recover a poisoned lock rather than skipping the write:
-                            // `pull_result` MUST be `Some(..)` before `pull_ended` fires
-                            // (`notify_waiters` stores no permit, so a late-waking serve
-                            // encoder that saw `None` would hang). Mirrors the
-                            // recover-poison the pull legs use.
-                            *pull_result
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(
-                                anyhow::anyhow!("serve-miss local pull runtime build failed: {e}"),
-                            ));
-                            pull_ended.notify_waiters();
+                            // `mark_ended` records the outcome before waking waiters, so
+                            // the serve encoder never sees a wake with no outcome set.
+                            session.mark_ended(Err(decdn_cache::FillError::new(format!(
+                                "serve-miss local pull runtime build failed: {e}"
+                            ))));
                         }
                     }
                 })
@@ -735,18 +704,16 @@ impl ClientHandler {
             }
         };
 
-        // Mint the serve leg's outboard reader from the shared factory, bound to the
-        // pull's terminal signals for the coherent encoder's no-hang guarantee.
-        let outboard_reader = ob_factory.reader(Arc::clone(&pull_ended), Arc::clone(&pull_result));
-
         // Run the serve leg on THIS (accept) task and await it. It owns termination —
-        // mid-stream takedown and client-disconnect are both handled inside it.
+        // mid-stream takedown and client-disconnect are both handled inside it. It
+        // mints its outboard reader from the shared `session` and reads the pull's
+        // terminal signal off it for the coherent encoder's no-hang guarantee.
         let serve_result = self
             .serve_leg(
                 &mut send,
                 &mut recv,
                 serve_store,
-                outboard_reader,
+                Arc::clone(&session),
                 &channel,
                 hash,
                 channel_id,
@@ -757,10 +724,6 @@ impl ClientHandler {
                 req.byte_len,
                 total_bytes,
                 window,
-                Arc::clone(&served_paid),
-                Arc::clone(&served_paid_advanced),
-                Arc::clone(&pull_ended),
-                Arc::clone(&pull_result),
             )
             .await;
 
