@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 
 use alloy::primitives::U256;
 
+use crate::node_origin::PullLegTarget;
+
 use super::{
     Arc, B256, ChannelId, ClientHandler, ClientMessage, FillOutcome, Hash, MB_BYTES, NodeOrigin,
     RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamRequestExt, StreamResponseBody,
@@ -163,66 +165,69 @@ impl ClientHandler {
                 .await;
         }
 
-        // (3) Discover an upstream, open a channel, and read the blob header — ONE
-        // discovery shared by both legs, with open-time candidate fallback preserved
-        // (`open_pull_leg`). Bounded by the pull-through deadline so a slow/absent
-        // upstream can't pin the stream. The namespace (ADR 005 §Namespace routing)
+        // (3) Learn the blob geometry. PEEK the in-flight fill registry first: if a
+        // live pull for this hash already runs, it already knows `total_bytes` from
+        // its own header handshake, so this miss can coalesce onto it and SKIP the
+        // expensive discovery + channel-open + header handshake (`open_pull_leg`)
+        // entirely. The peek is ADVISORY — the authoritative own-vs-attach decision
+        // stays in the atomic `claim_fill` below. A concurrent last observer can
+        // retire the peeked session between the peek and the claim, so `claim_fill`
+        // can still return `Owner`; that branch opens the pull leg LATE (step 6b) —
+        // it alone needs a `target`. The namespace (ADR 005 §Namespace routing)
         // drives the origin-directory fallback inside `discover` on a total DHT miss
         // and is threaded onto the node-to-node leg so a directory-discovered cold
         // origin's own pull-through gate resolves (#1401); big-endian to the on-chain
         // `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let namespace_id = U256::from_be_bytes(req.namespace_id);
-        let target =
-            match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id)).await {
-                Ok(Ok(target)) => target,
-                // No upstream provider could be opened — a clean miss on THIS tier, or
-                // a latched earlier-tier / local fault honored per #1129 / #1560 (a
-                // walk that failed on our own broken buyer key is not evidence the blob
-                // is absent).
-                Ok(Err(miss)) => {
-                    let reason = FillOutcome::miss_reason(fault_seen || miss.is_local_fault());
-                    return self
-                        .respond_error(&mut send, req, reason, rate_per_mb)
-                        .await;
+        let mut target: Option<PullLegTarget> = None;
+        let total_bytes = match self.cache.in_flight_total(hash) {
+            Some(total) => total,
+            None => {
+                // No live fill to coalesce onto — handshake upstream to learn the
+                // geometry and secure the pull target this miss will own. ONE discovery
+                // shared by both legs, open-time candidate fallback preserved.
+                match self
+                    .open_pull_leg_bounded(
+                        origin.as_ref(),
+                        hash,
+                        namespace_id,
+                        deadline,
+                        fault_seen,
+                    )
+                    .await
+                {
+                    Ok(opened) => {
+                        let total = opened.total_bytes;
+                        target = Some(opened);
+                        total
+                    }
+                    Err(reason) => {
+                        return self
+                            .respond_error(&mut send, req, reason, rate_per_mb)
+                            .await;
+                    }
                 }
-                Err(_elapsed) => {
-                    self.metrics.node_pull_through_timeout();
-                    let reason = FillOutcome::miss_reason(fault_seen);
-                    return self
-                        .respond_error(&mut send, req, reason, rate_per_mb)
-                        .await;
-                }
-            };
-        let total_bytes = target.total_bytes;
+            }
+        };
 
-        // (4) Size gate on the upstream-claimed total. (`open_pull_leg` already refuses
-        // an oversized header via its `max_blob_size_bytes`; this is a belt-and-braces
-        // wire-reason check.)
+        // (4) Size gate on the claimed total (peeked or upstream-handshaked).
+        // (`open_pull_leg` already refuses an oversized header via its
+        // `max_blob_size_bytes`; this is a belt-and-braces wire-reason check.)
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
         }
 
-        // (5) Voucher-interval negotiation (ADR 003), then sign + send the response up
-        // front — it commits to `total_bytes`, now known from the header handshake.
+        // (5) Voucher-interval negotiation (ADR 003). The signed response commits to
+        // `total_bytes` and is sent in step (7), AFTER the fill is claimed — so a
+        // peeked geometry that raced to `Owner` opens its pull leg (and can still
+        // cleanly refuse) before we promise `ok: true`.
         let interval_mb = match ext.voucher_interval_mb {
             Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
             None => self.voucher_interval_mb,
         };
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            channel_id: req.channel_id,
-            timestamp_us: req.timestamp_us,
-            redirect: None,
-        };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
-        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
-            .await?;
 
         // (6) The two decoupled legs (ADR 037). The SERVE
         // leg runs HERE on the accept task — it MUST be `Send` (the iroh
@@ -267,11 +272,56 @@ impl ClientHandler {
                 session
             });
 
+        // (6b) Owner-race repair: the advisory peek in step (3) planned to ATTACH and
+        // secured no `target`, but the peeked session retired before this claim, so the
+        // atomic decision came back OWNER — this miss must drive a fresh pull. Open the
+        // pull leg now, BEFORE signing `ok: true` (step 7), so a no-provider / deadline
+        // miss still refuses cleanly rather than committing to a stream it can't fill.
+        if matches!(claim, decdn_cache::FillClaim::Owner { .. }) && target.is_none() {
+            match self
+                .open_pull_leg_bounded(origin.as_ref(), hash, namespace_id, deadline, fault_seen)
+                .await
+            {
+                Ok(opened) => target = Some(opened),
+                Err(reason) => {
+                    return self
+                        .respond_error(&mut send, req, reason, rate_per_mb)
+                        .await;
+                }
+            }
+        }
+
+        // (7) Sign + send the response now that the fill mechanism is secured for both
+        // branches (attach: the owner fills; own: `target` is set by step 3 or 6b). It
+        // commits to `total_bytes`, known from the peek or the header handshake.
+        let body = StreamResponseBody {
+            hash: req.hash,
+            ok: true,
+            rate_per_mb,
+            total_bytes,
+            channel_id: req.channel_id,
+            timestamp_us: req.timestamp_us,
+            redirect: None,
+        };
+        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+            .await?;
+
         match claim {
             // OWNER: no live pull covers this hash — drive one. The pull selects on
             // `session.cancel_token()`; the last observer leaving (teardown below)
-            // cancels it (#1610). The freshly-handshaked `target` feeds the pull.
+            // cancels it (#1610). The `target` secured in step 3 (or the 6b late open)
+            // feeds the pull.
             decdn_cache::FillClaim::Owner { session, lease } => {
+                let Some(target) = target else {
+                    // Unreachable: step 6b secures a `target` on every Owner path. Fail
+                    // the serve rather than panic (anti-panic policy) — the response has
+                    // been sent, so a mid-stream error is the honest outcome. Carry the
+                    // hash + namespace so a real firing is debuggable in production.
+                    return Err(anyhow::anyhow!(
+                        "serve-miss owner claim without a pull target (hash {hash}, namespace {namespace_id})"
+                    ));
+                };
                 // Seed the shared outboard with proof for held ranges the pull never
                 // admits (`seed_held_outboard`). OUTSIDE the claim lock, so the awaits
                 // are safe.
@@ -390,9 +440,10 @@ impl ClientHandler {
                 serve_result
             }
             // ATTACH: a live pull already covers this hash. Run a serve leg over the
-            // shared session — NO new pull, NO thread. The `target` handshake opened
-            // above is now unused (a free handshake spent; a follow-up optimization can
-            // peek the registry before handshaking).
+            // shared session — NO new pull, NO thread. In the common case the step-3
+            // peek already saw this live fill and skipped the handshake, so `target` is
+            // `None`; only a peek-missed race (an empty peek that raced a registration)
+            // leaves a `target` here, dropped unused.
             decdn_cache::FillClaim::Attach { session, lease } => {
                 // Seed held-range proof so this observer's coherent encoder is
                 // self-sufficient, not dependent on the owner's seed-before-spawn
@@ -792,6 +843,41 @@ impl ClientHandler {
                     .await;
                 }
                 serve_result
+            }
+        }
+    }
+
+    /// Discover + open a bounded upstream pull leg for `hash`, classifying every
+    /// failure into the wire reject reason the caller must respond with. Factored out
+    /// so [`Self::serve_via_window_pull_through`] can open the leg from TWO points —
+    /// up front on a cold miss (step 3), or late when a peeked fill retired between
+    /// the advisory peek and the atomic `claim_fill` (step 6b) — without duplicating
+    /// the timeout + [`crate::node_origin::PullMiss`] classification.
+    ///
+    /// `Ok(target)` is the bound leg (its `total_bytes` is the header-handshaked blob
+    /// length). `Err(reason)` is:
+    /// - a clean miss on THIS tier, or a latched earlier-tier / local fault honored
+    ///   per #1129 / #1560 (a walk that failed on our own broken buyer key is not
+    ///   evidence the blob is absent) — [`FillOutcome::miss_reason`] of
+    ///   `fault_seen || miss.is_local_fault()`;
+    /// - the pull-through deadline elapsing (a slow/absent upstream must not pin the
+    ///   stream) — the timeout metric fires and the reason is `miss_reason(fault_seen)`.
+    async fn open_pull_leg_bounded(
+        &self,
+        origin: &NodeOrigin,
+        hash: Hash,
+        namespace_id: U256,
+        deadline: std::time::Duration,
+        fault_seen: bool,
+    ) -> Result<PullLegTarget, ServeRejectReason> {
+        match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id)).await {
+            Ok(Ok(target)) => Ok(target),
+            Ok(Err(miss)) => Err(FillOutcome::miss_reason(
+                fault_seen || miss.is_local_fault(),
+            )),
+            Err(_elapsed) => {
+                self.metrics.node_pull_through_timeout();
+                Err(FillOutcome::miss_reason(fault_seen))
             }
         }
     }
