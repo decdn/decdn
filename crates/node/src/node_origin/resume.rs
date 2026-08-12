@@ -54,14 +54,14 @@ use decdn_protocol::client::NO_NAMESPACE;
 use iroh::{EndpointAddr, PublicKey};
 use tracing::{debug, info, warn};
 
+use crate::client_requester::buyer_pool::issue_self_capability;
 use crate::client_requester::sink::{content_paid_frontier, pull_to_sink};
 use crate::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, LocalPullFault, MAX_RESUME_ATTEMPTS, PullDeadlines,
+    Cumulative, LocalPullFault, MAX_RESUME_ATTEMPTS, PoolContext, PoolLedger, PullDeadlines,
     ResumeOffsetPastEnd, UpstreamPull, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
     effective_rate_ceiling, genuine_exhaustion, open_progressive_pull as open_progressive_upstream,
     resumable_watermark,
 };
-use decdn_incentive::buyer_channel::NEVER_EXPIRES;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use super::{NodeOriginDeps, now_micros, persist_buyer_progress};
@@ -140,20 +140,15 @@ enum ResumeAction {
     /// A genuine ceiling hit, corroborated by our own ledger: raise the channel
     /// toward this target and resume at the paid frontier.
     TopUp(U256),
-    /// A genuine ceiling hit we WOULD have funded, but the channel is inside the
-    /// near-expiry margin — `topUp` cannot extend `expires_at` (the contract forbids
-    /// it), so escrowing a fresh working-deposit here would fund a channel that may
-    /// expire before the resumed leg can spend it. End the pull cleanly instead: the
-    /// caller returns the original exhaustion, which `classify_pull_failure` wedges as
-    /// `OurDeadChannel` — the row is KEPT (its escrowed deposit is refunded by the
-    /// reclaim sweep at expiry) and the provider is suppressed until that expiry, no
-    /// peer scoring. Since expiry is imminent, that suppression is short; the next
-    /// miss after it opens a fresh, full-lifetime channel.
-    ///
-    /// Its own variant, apart from [`Self::TopUp`], so the caller can METER it: a
-    /// channel opened too close to expiry for the blobs this node pulls is a distinct
-    /// signal from a healthy top-up, and from the adversarial [`Self::RefuseFunding`].
-    NearExpiry,
+    /// A genuine ceiling hit we would fund, but the node's self-issued capability
+    /// is inside its expiry margin. Because the node OWNS its pool, this is not a
+    /// refusal: the owner key re-signs the capability with a fresh expiry (no chain
+    /// tx) and the leg retries. The pool itself has no expiry, so funding it strands
+    /// nothing time-bound; only the delegating capability is time-boxed, and the
+    /// owner regenerates it at will. In practice the self-capability is signed to
+    /// never expire, so this arm is a defensive path a finite-expiry policy would
+    /// exercise; `decide` otherwise proceeds straight to [`Self::TopUp`].
+    RegenerateCapability,
     /// The upstream holds a voucher we do not — reseed the ledger and retry.
     Reseed,
     /// The upstream claimed `InsufficientDeposit` while OUR ledger still covers
@@ -185,13 +180,10 @@ struct ResumeBudgets {
     awaiting_topup_settle: bool,
     /// The graduation target, or `U256::ZERO` to disable reactive top-up.
     working_deposit: U256,
-    /// The tracked channel's on-chain expiry (Unix seconds), or [`NEVER_EXPIRES`]
-    /// (`0`) when none is tracked / the channel never expires. Fixed for the whole
-    /// pull: `topUp` cannot move it. Gates the near-expiry refusal in [`decide`].
-    expires_at: u64,
-    /// How much time must remain to [`Self::expires_at`] for a reactive top-up to be
-    /// allowed (`blockchain.buyer_reactive_topup_min_ttl_secs`, #1603).
-    /// `Duration::ZERO` disables the guard.
+    /// How much time must remain to the self-capability's expiry for a reactive
+    /// top-up to proceed without regenerating the capability first
+    /// (`blockchain.buyer_reactive_topup_min_ttl_secs`). `Duration::ZERO` disables
+    /// the capability-regeneration guard.
     min_ttl: Duration,
 }
 
@@ -249,7 +241,7 @@ fn awaiting_settle(err: &anyhow::Error) -> bool {
 }
 
 /// The cost of the voucher that was refused: `ceil(interval_bytes * rate / MiB)`,
-/// the same arithmetic `ChannelLedger` itself prices with.
+/// the same arithmetic `PoolLedger` itself prices with.
 ///
 /// Priced off the upstream's QUOTED rate and cadence from the last successful
 /// open — never the buyer's `max_rate_per_mb` ceiling, which bounds what we are
@@ -260,27 +252,24 @@ fn next_voucher_cost(interval_bytes: u64, rate_per_mb: u64) -> U256 {
         .div_ceil(U256::from(MB_BYTES))
 }
 
-/// Whether a channel is too close to its on-chain `expires_at` to be worth a
-/// reactive top-up (#1603).
+/// Whether the node's self-issued capability is close enough to its `expiry` to
+/// warrant regenerating it before the next voucher.
 ///
-/// `topUp` deliberately does not extend expiry (the contract forbids it), so a
-/// fresh working-deposit escrowed into a channel with less than `min_ttl` left
-/// could expire before the resumed leg can spend it — stranding capital until
-/// `reclaimExpired` and risking the pull failing anyway. Two escape hatches, both
-/// meaning "never near expiry": a [`NEVER_EXPIRES`] (`0`) channel has no deadline to
-/// be close to, and a `min_ttl` of zero disables the guard so an operator gets the
-/// pre-#1603 always-top-up behaviour back.
+/// The pool has no expiry, so only the delegating capability is time-boxed. A
+/// `u64::MAX` expiry (the never-expires self-capability the node signs) reads as
+/// "never near", and a `min_ttl` of zero disables the guard. `None` (no capability
+/// attached) also reads as "never near": there is nothing to regenerate.
 ///
 /// `saturating_sub` so an already-past expiry reads as `0` remaining (< any positive
 /// margin ⇒ near expiry), never wrapping.
-///
-/// `pub(crate)` so [`super::funder::NodeFunder`] reuses this exact rule instead of
-/// re-deriving the #1603 margin arithmetic on its own — single source of truth.
-pub(crate) const fn near_expiry(expires_at: u64, now: u64, min_ttl: Duration) -> bool {
-    if expires_at == NEVER_EXPIRES || min_ttl.is_zero() {
+const fn capability_near_expiry(cap_expiry: Option<u64>, now: u64, min_ttl: Duration) -> bool {
+    let Some(expiry) = cap_expiry else {
+        return false;
+    };
+    if expiry == u64::MAX || min_ttl.is_zero() {
         return false;
     }
-    expires_at.saturating_sub(now) < min_ttl.as_secs()
+    expiry.saturating_sub(now) < min_ttl.as_secs()
 }
 
 /// Classify a failed attempt. See [`ResumeAction`]. `now` is the current Unix time
@@ -288,7 +277,7 @@ pub(crate) const fn near_expiry(expires_at: u64, now: u64, min_ttl: Duration) ->
 /// near-expiry guard.
 fn decide(
     err: &anyhow::Error,
-    ctx: &ChannelContext,
+    ctx: &PoolContext,
     committed: Cumulative,
     interval_bytes: u64,
     rate_per_mb: u64,
@@ -315,12 +304,14 @@ fn decide(
             next_voucher_cost(interval_bytes, rate_per_mb),
         )
     {
-        // Genuine exhaustion — we would fund it. But `topUp` cannot extend expiry, so
-        // a channel this close to `expires_at` must NOT be topped up: escrowing a
-        // fresh working-deposit into it could strand the capital past a deadline the
-        // resumed leg cannot beat. End the pull cleanly instead (#1603).
-        if near_expiry(budgets.expires_at, now, budgets.min_ttl) {
-            return ResumeAction::NearExpiry;
+        // Genuine exhaustion — we would fund it. If the node's self-issued
+        // capability is near its expiry, re-sign it first (the node owns the pool
+        // and the key); the pool has no expiry, so funding strands nothing. In
+        // practice the self-capability never expires, so this proceeds straight to
+        // the top-up.
+        let cap_expiry = ctx.capability.as_ref().map(|c| c.capability.expiry);
+        if capability_near_expiry(cap_expiry, now, budgets.min_ttl) {
+            return ResumeAction::RegenerateCapability;
         }
         return ResumeAction::TopUp(budgets.working_deposit);
     }
@@ -427,20 +418,11 @@ pub(super) struct PulledBlob {
 pub(super) async fn pull_blob(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
-    ctx: &mut ChannelContext,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &mut PoolContext,
+    ledger: &Arc<PoolLedger>,
     deadlines: PullDeadlines,
 ) -> anyhow::Result<PulledBlob> {
-    // The channel's on-chain expiry is fixed for the whole pull — `topUp` cannot move
-    // it — so read it once here and carry it in the budgets. `None` (no tracked row)
-    // maps to `NEVER_EXPIRES`, which the near-expiry guard treats as "no deadline",
-    // preserving the pre-#1603 always-top-up behaviour for a channel whose expiry we
-    // cannot see.
-    let expires_at = deps
-        .buyer
-        .channel_expiry(target.provider_addr)
-        .unwrap_or(NEVER_EXPIRES);
-    let mut state = LoopState::new(deps, ledger, expires_at);
+    let mut state = LoopState::new(deps, ledger);
 
     loop {
         // The re-open round trip a settle-wait iteration performs is OUR funding cost,
@@ -487,30 +469,19 @@ pub(super) async fn pull_blob(
                     return Err(err);
                 }
             }
-            // The channel is too close to expiry to fund: `topUp` cannot extend
-            // `expires_at`, so escrowing a fresh deposit here would strand it past a
-            // deadline the resumed leg cannot beat. End on the original exhaustion —
-            // `classify_pull_failure` reads the `InsufficientDeposit` as
-            // `OurDeadChannel` → `wedged_channel`, which KEEPS the row (its escrowed
-            // deposit is refunded by the reclaim sweep at expiry — `reclaimExpired`
-            // needs the row) and suppresses the provider until that expiry, without
-            // scoring the peer. Because we refused precisely for being near expiry,
-            // that suppression is short; once it lapses the provider is rankable again
-            // and the next miss opens a fresh, full-lifetime channel (#1603).
-            ResumeAction::NearExpiry => {
-                warn!(
+            // The node's self-issued capability is near its expiry. The node owns the
+            // pool and the key, so re-sign the capability with a fresh expiry (no chain
+            // tx) and retry the leg on the same offset — the pool has no expiry, so
+            // nothing is stranded. If the re-sign fails, end on the original exhaustion.
+            ResumeAction::RegenerateCapability => {
+                if !regenerate_capability(ctx) {
+                    return Err(err);
+                }
+                debug!(
                     provider = %target.provider_addr,
-                    deposit = %ctx.deposit,
-                    committed = %committed.amount,
-                    expires_at = state.budgets.expires_at,
-                    now,
-                    min_ttl_secs = state.budgets.min_ttl.as_secs(),
-                    "node-origin: channel exhausted mid-pull but is within the reactive-top-up \
-                     expiry margin; refusing to escrow a fresh deposit into a near-expiry channel \
-                     (topUp cannot extend expiry) and ending the pull (#1603)"
+                    "node-origin: regenerated the self-issued capability near its expiry; \
+                     retrying the leg"
                 );
-                deps.metrics.node_pull_reactive_topup_near_expiry();
-                return Err(err);
             }
             ResumeAction::Reseed => {
                 if !reseed(&err, ctx, ledger, &mut state, target.provider_addr) {
@@ -564,7 +535,7 @@ struct LoopState {
 }
 
 impl LoopState {
-    fn new(deps: &NodeOriginDeps, ledger: &ChannelLedger, expires_at: u64) -> Self {
+    fn new(deps: &NodeOriginDeps, ledger: &PoolLedger) -> Self {
         Self {
             buf: Vec::new(),
             byte_offset: 0,
@@ -583,9 +554,32 @@ impl LoopState {
                 max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
                 awaiting_topup_settle: false,
                 working_deposit: deps.config.working_deposit,
-                expires_at,
                 min_ttl: deps.config.reactive_topup_min_ttl,
             },
+        }
+    }
+}
+
+/// Re-sign the node's self-issued capability with a fresh (never-expires) expiry,
+/// updating `ctx.capability` in place. The node owns the pool and the signing key,
+/// so this is a local EIP-712 sign with no chain tx. Returns `false` — leaving the
+/// context untouched — only if the signer errors, in which case the caller ends the
+/// pull on its original exhaustion.
+fn regenerate_capability(ctx: &mut PoolContext) -> bool {
+    match issue_self_capability(
+        ctx.client_signer.as_ref(),
+        ctx.pool_id,
+        ctx.deposit,
+        u64::MAX,
+        &ctx.voucher_domain,
+    ) {
+        Ok(capability) => {
+            ctx.capability = Some(capability);
+            true
+        }
+        Err(err) => {
+            warn!(error = %format!("{err:#}"), "node-origin: failed to regenerate the self-issued capability");
+            false
         }
     }
 }
@@ -598,8 +592,8 @@ impl LoopState {
 async fn stream_leg(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
-    ctx: &ChannelContext,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &PoolContext,
+    ledger: &Arc<PoolLedger>,
     deadlines: PullDeadlines,
     state: &mut LoopState,
 ) -> anyhow::Result<()> {
@@ -662,8 +656,8 @@ async fn stream_leg(
 async fn open_leg(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
-    ctx: &ChannelContext,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &PoolContext,
+    ledger: &Arc<PoolLedger>,
     deadlines: PullDeadlines,
     byte_offset: u64,
 ) -> anyhow::Result<(crate::client_requester::UpstreamPullHeader, UpstreamPull)> {
@@ -709,8 +703,8 @@ async fn open_leg(
 async fn fund(
     deps: &NodeOriginDeps,
     provider_addr: Address,
-    ctx: &mut ChannelContext,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &mut PoolContext,
+    ledger: &Arc<PoolLedger>,
     want: U256,
 ) -> bool {
     // Persist BEFORE the funding await — the longest and most cancellation-prone
@@ -718,10 +712,10 @@ async fn fund(
     // drop, but a concurrent pull sharing this channel's ledger wants an accurate row
     // across the whole transaction, not only after it. Idempotent against a monotonic
     // store.
-    let progress = VoucherProgress::from_cumulative(ledger.settlement(), ctx.prior_nonce);
-    persist_buyer_progress(deps, provider_addr, ctx.channel_id, &progress);
+    let progress = VoucherProgress::from_cumulative(ledger.settlement(), ctx.prior_amount);
+    persist_buyer_progress(deps, provider_addr, ctx.pool_id, &progress);
 
-    let new_deposit = match deps.buyer.top_up_channel(provider_addr, want).await {
+    let new_deposit = match deps.buyer.top_up_pool(want).await {
         Ok(new_deposit) => new_deposit,
         Err(err) => {
             warn!(
@@ -755,8 +749,8 @@ async fn fund(
 async fn top_up_and_reanchor(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
-    ctx: &mut ChannelContext,
-    ledger: &Arc<ChannelLedger>,
+    ctx: &mut PoolContext,
+    ledger: &Arc<PoolLedger>,
     state: &mut LoopState,
     want: U256,
 ) -> bool {
@@ -789,8 +783,8 @@ async fn top_up_and_reanchor(
 /// already refused.
 fn reseed(
     err: &anyhow::Error,
-    ctx: &ChannelContext,
-    ledger: &ChannelLedger,
+    ctx: &PoolContext,
+    ledger: &PoolLedger,
     state: &mut LoopState,
     provider_addr: Address,
 ) -> bool {
@@ -840,7 +834,7 @@ fn reseed(
 /// (the bytes this leg verifiably holds): any concurrent-pull inflation degrades to
 /// a bounded re-fetch of already-paid content, never a gap.
 fn resume_frontier(
-    ledger: &ChannelLedger,
+    ledger: &PoolLedger,
     anchor: LegAnchor,
     total_bytes: u64,
     decoded_len: u64,
@@ -868,8 +862,8 @@ mod tests {
     use alloy::primitives::B256;
     use alloy::signers::local::PrivateKeySigner;
 
-    fn ctx_with_deposit(deposit: U256) -> ChannelContext {
-        ChannelContext {
+    fn ctx_with_deposit(deposit: U256) -> PoolContext {
+        PoolContext {
             channel_id: B256::ZERO,
             token: Address::ZERO,
             deposit,
@@ -914,7 +908,7 @@ mod tests {
     /// `nonce`/`amount` — the shape `resumable_watermark` authenticates against
     /// `ctx.client_signer`, so it cannot be faked by an upstream.
     fn rejection_with_signed_bundle(
-        ctx: &ChannelContext,
+        ctx: &PoolContext,
         reason: VoucherRejectReason,
         nonce: U256,
         amount: U256,
@@ -1101,7 +1095,7 @@ mod tests {
         };
         // The channel watermark claims far more wire than this leg received —
         // exactly what a concurrent pull's acked vouchers produce.
-        let ledger = ChannelLedger::new(Cumulative {
+        let ledger = PoolLedger::new(Cumulative {
             nonce: U256::from(5u64),
             bytes: U256::from(8 * CHUNK_GROUP_BYTES),
             amount: U256::from(500u64),
@@ -1119,7 +1113,7 @@ mod tests {
 
         // An honest single-pull watermark is untouched by the clamp: the frontier
         // always trails the decode (payment lags the credit window).
-        let honest = ChannelLedger::new(Cumulative {
+        let honest = PoolLedger::new(Cumulative {
             nonce: U256::from(1u64),
             bytes: U256::from(CHUNK_GROUP_BYTES),
             amount: U256::from(10u64),
