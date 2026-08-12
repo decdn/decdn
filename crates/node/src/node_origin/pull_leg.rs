@@ -162,6 +162,14 @@ impl PacingWait for ServedPaidWait {
 /// `pull.abandon(None)`).
 ///
 /// With no governor wired (`governor == None`) it is a pass-through `WindowPacer`.
+///
+/// The `served_paid` frontier `self.window` bounds against (via
+/// [`PaceState::served_paid_frontier`], read off the shared [`FillSession`]) is,
+/// under coalescing, the MAX-over-live-observers paid content frontier: each
+/// attached observer's serve leg advances one shared frontier by `fetch_max`, so
+/// the pull is bounded by whichever observer has paid furthest (DECISION-B). A
+/// solo pull — one observer, no coalescing — is exactly the N=1 case of this same
+/// frontier; nothing here changes for it.
 struct LeechPacer {
     window: WindowPacer,
     governor: Option<Arc<LeechGovernor>>,
@@ -473,7 +481,11 @@ impl NodeOrigin {
 /// Run the range-minimized upstream pull for `[offset, offset + len)` of `hash`
 /// into `engine`'s cache via [`drive`], paying only for the missing ranges and
 /// pacing the pull to within `window` of the downstream serve leg's paid frontier
-/// (ADR 037). Records the terminal outcome via the shared [`FillSession::mark_ended`]
+/// (ADR 037). Under coalescing that paid frontier is the shared, MAX-over-live-
+/// observers `served_paid` on `session` — each attached observer's serve leg
+/// advances it by `fetch_max`, so the pull is bounded by whichever observer has
+/// paid furthest (DECISION-B); a solo pull is the N=1 case. Records the terminal
+/// outcome via the shared [`FillSession::mark_ended`]
 /// on completion; a [`SettleOnDrop`] guard persists the buyer watermark (#852) on
 /// EVERY exit — clean completion, a terminal drive error, and a cooperative
 /// `cancel` (the serve leg finished, so the client no longer waits: stop the
@@ -963,6 +975,141 @@ pub(crate) async fn run_local_pull_leg(
     // (`mark_ended` sets the outcome then wakes waiters). `anyhow::Error` is not
     // `Clone`, so flatten it into a `FillError` message.
     session.mark_ended(result.map_err(|e| FillError::new(format!("{e:#}"))));
+}
+
+/// B3.3: pin the `LeechPacer` decision contract — a window-full state PAUSES
+/// (`Wait`), it never terminally `Refuse`s; only the node-wide `LeechGovernor`
+/// abuse cap produces a terminal `Refuse`. Per the task-3 brief, `LeechPacer`
+/// already composes `WindowPacer` (money + window) with the governor's admission
+/// gate on the `Draw` arm only, so these tests are a CONFIRMATION of existing
+/// behavior, not a behavior change.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "tests"
+)]
+#[cfg(test)]
+mod leech_pacer_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use alloy::primitives::U256;
+    use decdn_cache::CHUNK_GROUP_BYTES;
+    use decdn_cache::{Bytes, Percent};
+    use decdn_client_pull::{PaceDecision, PaceState, Pacer, WindowPacer};
+
+    use super::LeechPacer;
+    use crate::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
+    use crate::metrics::Metrics;
+
+    /// A healthy mid-fetch snapshot that yields `Draw` from the inner
+    /// `BudgetPacer` money check (deposit covers the next voucher, range
+    /// incomplete), so only the window/governor axis under test determines the
+    /// final decision. Twin of `client-pull`'s `pacer.rs::tests::healthy()`.
+    fn healthy() -> PaceState {
+        PaceState {
+            cleared_bytes: 0,
+            requested_bytes: 1_000_000,
+            remaining_deposit: U256::from(1_000_000u64),
+            next_voucher_cost: U256::from(10u64),
+            working_deposit: U256::from(5_000u64),
+            topups_used: 0,
+            max_topups: 3,
+            exhaustion_confirmed: false,
+            pulled_frontier: 0,
+            served_paid_frontier: 0,
+        }
+    }
+
+    /// A governor with an effectively unlimited budget/allowance: always admits.
+    fn admitting_governor() -> Arc<LeechGovernor> {
+        Arc::new(LeechGovernor::new(
+            LeechCaps::new_unchecked(LeechCapsConfig {
+                max_unrecouped_leech_bytes: Bytes::new(u64::MAX),
+                initial_allowance_bytes: Bytes::new(u64::MAX),
+                share_ratio_percent: Percent::new(100),
+            }),
+            Arc::new(Metrics::new()),
+        ))
+    }
+
+    /// A governor with a tiny global budget, pre-charged past it via
+    /// `record_pulled` so `poll_admission` denies for any peer.
+    fn refusing_governor() -> Arc<LeechGovernor> {
+        let gov = LeechGovernor::new(
+            LeechCaps::new_unchecked(LeechCapsConfig {
+                max_unrecouped_leech_bytes: Bytes::new(1),
+                initial_allowance_bytes: Bytes::new(1),
+                share_ratio_percent: Percent::new(0),
+            }),
+            Arc::new(Metrics::new()),
+        );
+        gov.record_pulled(&[9u8; 32], 1_000); // unrecouped >> the 1-byte budget
+        Arc::new(gov)
+    }
+
+    /// ADR 037 window-full: the pull's window is exhausted (`pulled -
+    /// served_paid >= window`) but the leech governor admits freely. This must
+    /// PAUSE (`Wait`), never a terminal `Refuse` — a window-full pull may still
+    /// have coalesced observers waiting, and resumes as soon as any observer's
+    /// payment advances the shared `served_paid` frontier.
+    #[test]
+    fn window_full_pauses_not_refuses() {
+        let mut state = healthy();
+        state.pulled_frontier = 2 * CHUNK_GROUP_BYTES;
+        state.served_paid_frontier = 0;
+
+        let refused = Arc::new(AtomicBool::new(false));
+        let pacer = LeechPacer {
+            window: WindowPacer::new(CHUNK_GROUP_BYTES),
+            governor: Some(admitting_governor()),
+            peer: [1u8; 32],
+            last_pulled: AtomicU64::new(0),
+            refused: Arc::clone(&refused),
+        };
+
+        let decision = pacer.decide(&state);
+        assert!(
+            matches!(decision, PaceDecision::Wait),
+            "window-full must pause (Wait), got {decision:?}"
+        );
+        assert!(
+            !refused.load(Ordering::Relaxed),
+            "a window pause must not latch the terminal leech-refuse flag"
+        );
+    }
+
+    /// ADR 037 seed-leech cap: the pull is well inside its window (would
+    /// otherwise `Draw`), but the node-wide leech governor denies admission —
+    /// genuine abuse-cap abuse, not a transient window-full pause. This is
+    /// terminal `Refuse`, and `refused` latches so the caller (`run_pull_leg`)
+    /// skips provider scoring.
+    #[test]
+    fn leech_cap_refuses_terminally() {
+        let mut state = healthy();
+        state.pulled_frontier = 0;
+        state.served_paid_frontier = 0;
+
+        let refused = Arc::new(AtomicBool::new(false));
+        let pacer = LeechPacer {
+            window: WindowPacer::new(u64::MAX),
+            governor: Some(refusing_governor()),
+            peer: [2u8; 32],
+            last_pulled: AtomicU64::new(0),
+            refused: Arc::clone(&refused),
+        };
+
+        let decision = pacer.decide(&state);
+        assert!(
+            matches!(decision, PaceDecision::Refuse),
+            "leech-cap denial must terminally refuse, got {decision:?}"
+        );
+        assert!(
+            refused.load(Ordering::Relaxed),
+            "a leech-cap refusal must latch `refused` so scoring is skipped"
+        );
+    }
 }
 
 #[allow(
