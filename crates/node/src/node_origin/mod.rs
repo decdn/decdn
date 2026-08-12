@@ -79,13 +79,13 @@ use tracing::{debug, warn};
 
 use decdn_reputation::{LocalReputation, Outcome};
 
-use decdn_incentive::ChannelOpenFailureReason;
+use decdn_incentive::PoolOpenFailureReason;
 
-use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported, OpenSlotReserved};
+use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
-    BlobTooLargeClaim, ChannelContext, ChannelLedger, Cumulative, HashMismatch, LocalPullFault,
+    BlobTooLargeClaim, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger,
     PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamPull,
     UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
     effective_rate_ceiling, open_progressive_pull as open_progressive_upstream,
@@ -104,12 +104,12 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// emitting a structured-log line with the failure-class `reason` (#966).
 ///
 /// Bumps the unlabeled `node_pull_channel_open_failures` total and, when the
-/// error chain carries a [`ChannelOpenFailureReason`] (attached by the
+/// error chain carries a [`PoolOpenFailureReason`] (attached by the
 /// `open_channel` kernel for the three `openChannel`-tx failure classes), the
 /// matching `decdn_channel_open_failures_{reason}_total` sibling counter.
 ///
-/// Three outcomes are NOT failures and return before that: [`ChannelOpenPending`] (the
-/// open outlived our budget and continues in the background), [`OpenSlotReserved`] (a
+/// Three outcomes are NOT failures and return before that: [`PoolOpenPending`] (the
+/// open outlived our budget and continues in the background), a reserved slot (a
 /// reconcile holds the slot; retry), and anything the detached open task has already
 /// reported ([`OpenReported`]) — which since the #1145 review includes every one of
 /// `run_open`'s legs, store faults and unreclaimable-expired channels included. So the
@@ -129,7 +129,7 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// typed [`LocalPullFault`] where it is raised, and this function only reads the marker.
 /// That split is not stylistic: [`OpenReported`] means "already logged and metered, do not
 /// restate" — it says nothing about whose fault the failure is — and every leg of the open
-/// task attaches it. So a ladder that tried to classify by [`ChannelOpenFailureReason`]
+/// task attaches it. So a ladder that tried to classify by [`PoolOpenFailureReason`]
 /// here would never run: the `OpenReported` arm ends the walk first. An earlier cut of this
 /// fix did exactly that and shipped a dead `match` whose doc advertised a classification the
 /// code could not perform.
@@ -141,7 +141,7 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// steer clients off a node that is fine.
 // The arms are a flat sentinel ladder; splitting it would scatter one decision.
 #[allow(clippy::cognitive_complexity)]
-fn record_channel_open_failure(
+fn record_pool_open_failure(
     deps: &NodeOriginDeps,
     provider_addr: Address,
     err: &anyhow::Error,
@@ -156,19 +156,9 @@ fn record_channel_open_failure(
     // doc says outright that "raising this to give a slow L2 more room does nothing: that is
     // the channel open." So the comment was sending an operator to a knob its own config
     // documentation calls inert for this symptom.
-    if err.downcast_ref::<ChannelOpenPending>().is_some() {
+    if err.downcast_ref::<PoolOpenPending>().is_some() {
         deps.metrics.node_pull_channel_open_pending();
-        debug!(%provider_addr, %err, "node-origin: channel open still in flight; trying the next candidate");
-        return PullMiss::Clean;
-    }
-    // Also not a failure: a reconcile scan holds this provider's open slot while it
-    // re-hydrates the row, and tells us to retry. Self-clearing, and it happens at
-    // every boot — counting it as a channel-open FAILURE turned each restart into a
-    // spike of `unclassified` failures an operator would chase. Same verdict, and the
-    // same counter, as a pending open: try another candidate, nothing is wrong.
-    if err.downcast_ref::<OpenSlotReserved>().is_some() {
-        deps.metrics.node_pull_channel_open_pending();
-        debug!(%provider_addr, %err, "node-origin: a reconcile holds the provider's open slot; trying the next candidate");
+        debug!(%provider_addr, %err, "node-origin: pool open still in flight; trying the next candidate");
         return PullMiss::Clean;
     }
     // Ahead of `OpenReported`, deliberately, and this ordering is load-bearing (#1560). The
@@ -212,7 +202,7 @@ fn record_channel_open_failure(
         return PullMiss::Clean;
     }
     deps.metrics.node_pull_channel_open_failure();
-    let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+    let reason = err.downcast_ref::<PoolOpenFailureReason>().copied();
     if let Some(reason) = reason {
         deps.metrics.channel_open_failure_by_reason(reason);
     }
@@ -226,7 +216,7 @@ fn record_channel_open_failure(
     // `node_pull_channel_open_failures_total` climb with no line explaining any of it.
     warn!(
         %provider_addr,
-        reason = reason.map_or("unclassified", ChannelOpenFailureReason::as_label),
+        reason = reason.map_or("unclassified", PoolOpenFailureReason::as_label),
         %err,
         "node-origin: buyer channel open/reuse failed (raised outside the open task — \
          suspect this node's store or lock state, not the peer)"
@@ -376,7 +366,7 @@ pub struct NodeOriginDeps {
     /// Resolves a provider `NodeId` to its bonded operator Ethereum address.
     pub addr_resolver: Arc<dyn NodeAddressResolver>,
     /// Buyer-side payment-channel service (opens/reuses the upstream channel).
-    pub buyer: Arc<dyn ChannelOpener>,
+    pub buyer: Arc<dyn PoolOpener>,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
     /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
@@ -670,7 +660,7 @@ impl NodeOrigin {
             // channel is reused if it lands. It is deliberately the smaller budget —
             // this stage and the stream open below are sequential, and
             // `outer_pull_deadline` has to cover both for every candidate.
-            .open_or_reuse_channel(
+            .open_or_reuse_pool(
                 provider_addr,
                 deps.config.deposit_hint,
                 crate::selection::CHANNEL_OPEN_CALLER_BUDGET,
@@ -681,8 +671,8 @@ impl NodeOrigin {
             Err(err) => {
                 // Not blanket-`Clean`: a channel open can fail because THIS node's buyer
                 // side is broken for every provider, and that must not be signed to a
-                // client as an absent blob (#1560). See `record_channel_open_failure`.
-                return Err(record_channel_open_failure(deps, provider_addr, &err));
+                // client as an absent blob (#1560). See `record_pool_open_failure`.
+                return Err(record_pool_open_failure(deps, provider_addr, &err));
             }
         };
         // #1117: bind the request so the upstream can chain a reactive pull.
@@ -767,7 +757,7 @@ impl NodeOrigin {
                     pull,
                     pk,
                     provider_addr,
-                    channel_id: ctx.channel_id,
+                    pool_id: ctx.pool_id,
                     started: Instant::now(),
                     delivered: 0,
                     node_id: candidate.node_id,
@@ -775,8 +765,8 @@ impl NodeOrigin {
                     settle: SettleOnDrop {
                         deps: SettleDeps::Shared(Arc::clone(&self.deps)),
                         provider_addr,
-                        channel_id: ctx.channel_id,
-                        prior_nonce: ctx.prior_nonce,
+                        pool_id: ctx.pool_id,
+                        prior_amount: ctx.prior_amount,
                         ledger,
                     },
                     stream_guard,
@@ -790,7 +780,7 @@ impl NodeOrigin {
                     pk,
                     provider_addr,
                     hash_bytes,
-                    Some(ctx.channel_id),
+                    Some(ctx.pool_id),
                     &err,
                 );
                 Err(PullMiss::for_verdict(verdict))
@@ -845,7 +835,7 @@ pub struct NodeProgressivePull {
     pull: UpstreamPull,
     pk: PublicKey,
     provider_addr: Address,
-    channel_id: B256,
+    pool_id: B256,
     started: Instant,
     /// Bytes pulled (and forwarded) on this stream — the region/reputation count.
     delivered: u64,
@@ -918,7 +908,7 @@ impl NodeProgressivePull {
             pull,
             pk,
             provider_addr,
-            channel_id,
+            pool_id,
             started,
             delivered,
             node_id,
@@ -978,14 +968,8 @@ impl NodeProgressivePull {
                 // The verdict is dropped deliberately: the `StreamResponse` went out
                 // `ok: true` long ago, so there is no refusal code left to pick — see
                 // `classify_pull_failure`'s own note (#1560).
-                let _ = classify_pull_failure(
-                    deps,
-                    pk,
-                    provider_addr,
-                    hash_bytes,
-                    Some(channel_id),
-                    &err,
-                );
+                let _ =
+                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), &err);
                 Err(err)
             }
         }
@@ -1031,7 +1015,7 @@ impl NodeProgressivePull {
             pull,
             pk,
             provider_addr,
-            channel_id,
+            pool_id,
             hash_bytes,
             settle,
             ..
@@ -1047,8 +1031,7 @@ impl NodeProgressivePull {
         if let Some(err) = cause {
             // Verdict dropped for the same reason as in `finish`: this pull was
             // already answered on the wire (#1560).
-            let _ =
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(channel_id), err);
+            let _ = classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), err);
         }
     }
 }
@@ -1664,7 +1647,7 @@ async fn try_pull(
 }
 
 /// Attach this node's ADR 005 client identity binding to an upstream pull's
-/// `ChannelContext` (#1117). Signs over our OWN endpoint `NodeId` with the
+/// `PoolContext` (#1117). Signs over our OWN endpoint `NodeId` with the
 /// channel's buyer key (`ctx.client_signer`) under the `CapacityBond` bind
 /// domain, so the upstream can prove we own the named channel and, on its own
 /// cache miss, chain a further reactive origin pull (`pull_authorized`). A
@@ -1680,7 +1663,7 @@ async fn try_pull(
 /// in the paid-pull requester's voucher leg (`UpstreamPull::pay_one`). Swallowed here, `node_pull_local_fault` stayed at zero in
 /// precisely the emergency its doc describes ("a node that cannot sign a voucher cannot
 /// pay for anything"), and an operator alerting on it got a false all-clear.
-fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Result<ChannelContext> {
+fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: PoolContext) -> anyhow::Result<PoolContext> {
     let own_node_id = B256::from(*deps.endpoint.id().as_bytes());
     let binding = sign_client_binding(&ctx.client_signer, own_node_id, &deps.bind_domain)?;
     Ok(ctx.with_client_binding(binding))
@@ -1698,13 +1681,15 @@ fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Resu
 fn channel_ledger(
     deps: &NodeOriginDeps,
     provider_addr: Address,
-    ctx: &ChannelContext,
-) -> Arc<ChannelLedger> {
+    ctx: &PoolContext,
+) -> Arc<PoolLedger> {
     deps.ledgers.get_or_seed(
-        provider_addr,
-        ctx.channel_id,
+        decdn_incentive::LaneKey {
+            pool_id: ctx.pool_id,
+            signer: ctx.client_signer.address(),
+            provider: provider_addr,
+        },
         Cumulative {
-            nonce: ctx.prior_nonce,
             bytes: ctx.prior_bytes_delivered,
             amount: ctx.prior_amount,
         },
@@ -1741,7 +1726,7 @@ async fn pull_from_candidate(
     let ctx = match deps
         .buyer
         // Same channel-open bound as the window path (#1143) — see there.
-        .open_or_reuse_channel(
+        .open_or_reuse_pool(
             provider_addr,
             deps.config.deposit_hint,
             crate::selection::CHANNEL_OPEN_CALLER_BUDGET,
@@ -1754,7 +1739,7 @@ async fn pull_from_candidate(
             // provider's fault — don't tar its reputation; just try the next.
             // Whether it is also a fault that must change our WIRE answer is a
             // per-reason question the classifier owns (#1560).
-            return Err(record_channel_open_failure(deps, provider_addr, &err));
+            return Err(record_pool_open_failure(deps, provider_addr, &err));
         }
     };
     // #1117: bind the request so the upstream can chain a reactive pull.
@@ -1784,7 +1769,7 @@ async fn pull_from_candidate(
     //
     // `Drop` is the one thing that runs on both paths, so the persist lives there and
     // nowhere else — one path, no second copy to forget. It reads
-    // `ChannelLedger::settlement` (a sync mirror) because a `Drop` cannot await.
+    // `PoolLedger::settlement` (a sync mirror) because a `Drop` cannot await.
     // As on the window path: a zero budget is our own misconfiguration, metered as ours.
     // Checked BEFORE the ledger and the guard, so a pull that cannot legally run never
     // reaches the wire and has nothing to settle.
@@ -1799,8 +1784,8 @@ async fn pull_from_candidate(
     let settle = SettleOnDrop {
         deps: SettleDeps::Borrowed(deps),
         provider_addr,
-        channel_id: ctx.channel_id,
-        prior_nonce: ctx.prior_nonce,
+        pool_id: ctx.pool_id,
+        prior_amount: ctx.prior_amount,
         ledger: Arc::clone(&ledger),
     };
 
@@ -1876,14 +1861,8 @@ async fn pull_from_candidate(
             Ok(bytes)
         }
         Err(err) => {
-            let verdict = classify_pull_failure(
-                deps,
-                pk,
-                provider_addr,
-                hash_bytes,
-                Some(ctx.channel_id),
-                &err,
-            );
+            let verdict =
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(ctx.pool_id), &err);
             Err(PullMiss::for_verdict(verdict))
         }
     }
@@ -1937,16 +1916,18 @@ impl SettleDeps<'_> {
 struct SettleOnDrop<'a> {
     deps: SettleDeps<'a>,
     provider_addr: Address,
-    channel_id: B256,
-    prior_nonce: U256,
-    ledger: Arc<ChannelLedger>,
+    pool_id: B256,
+    /// The lane's cumulative amount the pull started from, so a `Drop` can tell
+    /// whether this stream advanced the watermark past its seed before persisting.
+    prior_amount: U256,
+    ledger: Arc<PoolLedger>,
 }
 
 impl std::fmt::Debug for SettleOnDrop<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SettleOnDrop")
             .field("provider_addr", &self.provider_addr)
-            .field("channel_id", &self.channel_id)
+            .field("pool_id", &self.pool_id)
             .finish_non_exhaustive()
     }
 }
@@ -1961,10 +1942,11 @@ impl Drop for SettleOnDrop<'_> {
         // handling can land inside the ack wait, where a voucher is committed upstream
         // and unacked here (ADR 003 persists before it acks). `settlement` adds back the
         // voucher still on the wire, which is what we actually owe (#1122). Settling at
-        // `committed` there re-signs a spent nonce on the next reuse, and `StaleNonce`
-        // now retires the channel — so the old choice ended in a stranded deposit.
-        let progress = VoucherProgress::from_cumulative(self.ledger.settlement(), self.prior_nonce);
-        persist_buyer_progress(deps, self.provider_addr, self.channel_id, &progress);
+        // `committed` there re-signs a spent cumulative on the next reuse, which the
+        // upstream rejects as a regression — so the old choice stranded lane progress.
+        let progress =
+            VoucherProgress::from_cumulative(self.ledger.settlement(), self.prior_amount);
+        persist_buyer_progress(deps, self.provider_addr, self.pool_id, &progress);
     }
 }
 
@@ -1979,13 +1961,13 @@ impl Drop for SettleOnDrop<'_> {
 fn persist_buyer_progress(
     deps: &NodeOriginDeps,
     provider_addr: Address,
-    channel_id: B256,
+    pool_id: B256,
     progress: &VoucherProgress,
 ) {
-    if let Some((nonce, bytes_delivered, amount)) = progress.acked()
+    if let Some((bytes_delivered, amount)) = progress.advanced()
         && let Err(err) =
             deps.buyer
-                .record_progress(provider_addr, channel_id, nonce, bytes_delivered, amount)
+                .record_progress(provider_addr, pool_id, bytes_delivered, amount)
     {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");
@@ -2157,7 +2139,7 @@ enum PullVerdict {
     ///
     /// Split AGAIN from [`Self::OurSettledChannel`], and this is the load-bearing half:
     /// the row is the only handle this node has on the deposit. `reclaimExpired` needs the
-    /// `channel_id`, and the two recovery sweeps enumerate the store (`load_all`), so a
+    /// `pool_id`, and the two recovery sweeps enumerate the store (`load_all`), so a
     /// FORGOTTEN row is money nothing in this codebase can ever see again — the hazard
     /// `run_open` already reclaims-before-rotating to avoid. Deleting the row here (as the
     /// first cut of this verdict did, for every reason alike) turned an accounting desync
@@ -2199,7 +2181,7 @@ enum PullVerdict {
 /// review). Keep the row, stop using the provider, and say so loudly.
 ///
 /// The row is not bookkeeping — it is the only handle this node has on the money.
-/// `reclaimExpired` refunds the remainder at expiry and needs the `channel_id`; both
+/// `reclaimExpired` refunds the remainder at expiry and needs the `pool_id`; both
 /// recovery sweeps find their work by enumerating the store (`load_all`). A row this
 /// function deleted would therefore be a deposit that nothing in this codebase can ever see
 /// again, which is precisely why `run_open` reclaims BEFORE it rotates an expired channel.
@@ -2234,87 +2216,53 @@ fn wedged_channel(
 ) {
     deps.metrics.node_pull_channel_wedged();
     // Immediate cover: suppress this (peer, hash) for the short refusal TTL so a retry for the
-    // SAME blob does not re-present the dead voucher before the provider-wide horizon lands.
+    // SAME blob does not re-present the same voucher before the provider-wide horizon lands.
     deps.negative_cache.record_failure_with_ttl(
         DhtNodeId::from_bytes(*pk.as_bytes()),
         DhtHash::from_bytes(hash_bytes),
         REFUSAL_SUPPRESSION_TTL,
     );
-    // Provider-wide: the wedged channel cannot serve ANY hash until it expires, so take the
-    // provider out of ranking for every hash until its channel expiry. `None` (no row / a
-    // non-store opener) leaves only the (peer, hash) cover above — the horizon is unknown, so
-    // we do not guess one.
-    // `None` (no row / a non-store opener) leaves only the (peer, hash) cover above — the
-    // horizon is unknown, so we do not guess one.
-    if let Some(expires_at) = deps.buyer.channel_expiry(provider_addr) {
-        deps.record_wedged(&pk, expires_at);
-    }
+    // Provider-wide: a provider that rejected a voucher on terms a lane cannot recover from
+    // is unlikely to serve any hash right now, so take it out of ranking for a bounded window.
+    // The pool has no per-provider deadline to key the horizon on (the deposit fans out across
+    // every provider), so use a fixed suppression window rather than a channel expiry.
+    deps.record_wedged(
+        &pk,
+        crate::payment_settlement::unix_now().saturating_add(WEDGED_PROVIDER_SUPPRESSION_SECS),
+    );
     warn!(
-        %provider_addr, channel_id = ?channel, ?reason,
-        "node-origin: upstream rejected our voucher on terms this channel cannot recover \
-         from. Its deposit is STILL ESCROWED, so the row is kept for the reclaim sweep and \
-         the PROVIDER is suppressed for all hashes until the channel expires and the sweep \
-         refunds it (#1122)"
+        %provider_addr, pool_id = ?channel, ?reason,
+        "node-origin: upstream rejected our voucher on terms this lane cannot recover from; \
+         suppressing the provider for a bounded window while the pool's own deposit is \
+         unaffected (#1122)"
     );
 }
 
-/// A buyer channel that is SETTLED on-chain: the upstream holds a signed cooperative close,
-/// so the deposit has already been divided and the local row can buy us nothing more.
+/// How long a provider that rejected a voucher on a lane-terminal reason is kept out of
+/// ranking (Unix seconds). Bounded because the pool has no per-provider deadline to key the
+/// horizon on — the shared deposit outlives any single lane.
+const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
+
+/// A voucher rejection an upstream can only raise about a pool it has closed. The node owns
+/// its pool and no counterparty closes it, so this is defensive: the shared deposit is never
+/// settled out from under the node by an upstream, and there is no per-provider row to retire.
 ///
-/// The one voucher rejection for which forgetting the row is safe — and necessary, since
-/// `try_reuse_live` gates on expiry alone and would otherwise hand a closed channel straight
-/// back (#1145 review).
-///
-/// `channel` is `None` only for failures that happen before a channel exists, which cannot
-/// produce a voucher rejection — so reaching that arm means the ladder has changed and a
-/// closed channel is about to be silently kept. Say so rather than skip quietly.
-// As `classify_pull_failure`: the tracing macros inflate the cognitive-complexity metric.
-#[allow(clippy::cognitive_complexity)]
+/// The lane self-heals without action here: a rotated pool's ledger is dropped by
+/// [`BuyerLedgers::get_or_seed`] once no pull holds it, and the persistent lane watermark is
+/// monotonic, so the next pull re-seeds correctly. Log it rather than mutate state.
 fn forget_settled_channel(
     deps: &NodeOriginDeps,
     provider_addr: Address,
     reason: VoucherRejectReason,
     channel: Option<B256>,
 ) {
-    let Some(channel_id) = channel else {
-        warn!(
-            %provider_addr, ?reason,
-            "node-origin: upstream rejected our voucher on a pull with no channel — this \
-             should be unreachable; the channel cannot be retired and will be reused"
-        );
-        return;
-    };
-    match deps.buyer.retire_channel(provider_addr, channel_id) {
-        // Not retired because the row is already a DIFFERENT channel: a concurrent open
-        // replaced it while this pull was in flight, so the dead one is gone anyway and the
-        // replacement is not ours to throw away. Nothing to do, and nothing wrong.
-        Ok(false) => debug!(
-            %provider_addr, %channel_id, ?reason,
-            "node-origin: settled channel was already replaced by a newer open"
-        ),
-        Ok(true) => {
-            deps.metrics.node_pull_channel_retired();
-            // Drop the ledger too: no voucher will ever be signed against this channel
-            // again, and a future channel to this provider must not inherit its watermark.
-            deps.ledgers.forget(provider_addr, channel_id);
-            warn!(
-                %provider_addr, %channel_id, ?reason,
-                "node-origin: upstream has this channel's cooperative close signed; it is \
-                 settled on-chain, so the row is retired — the next pull opens a fresh one"
-            );
-        }
-        // The store write failed, so the settled row is still there and the next pull WILL
-        // reuse it and be rejected again. Nothing here can fix that, but an operator can,
-        // and this is the only place that knows.
-        Err(err) => {
-            deps.metrics.node_pull_channel_retire_failure();
-            warn!(
-                %provider_addr, %channel_id, ?reason, %err,
-                "node-origin: could not retire a settled buyer channel; it will be reused \
-                 and rejected again until it expires"
-            );
-        }
-    }
+    deps.metrics.node_pull_voucher_rejected();
+    warn!(
+        %provider_addr, pool_id = ?channel, ?reason,
+        "node-origin: upstream rejected our voucher on a pool-settled reason; the node owns \
+         its pool and no upstream settles it, so this is unexpected — leaving the pool intact \
+         and letting the monotonic lane watermark self-heal the next pull"
+    );
 }
 
 /// What a voucher rejection tells us, and therefore what to do about it (#1145 review).
@@ -2561,7 +2509,7 @@ fn classify_pull_failure(
         //
         // The channel can no longer pay, but its DEPOSIT is still escrowed: a desync, a
         // drained-for-this-voucher balance, an expiry. The row is the only handle on that
-        // money (`reclaimExpired` needs the `channel_id`; the sweeps enumerate the store), so
+        // money (`reclaimExpired` needs the `pool_id`; the sweeps enumerate the store), so
         // it is KEPT and the provider is suppressed instead of the row being deleted. This
         // arm used to delete it, which stranded the deposit permanently. `warn!`, not
         // `debug!`, for the same reason the local-fault arm is: at the default
@@ -2758,15 +2706,15 @@ mod tests {
 
     /// The failure-class `reason` (#966) the `open_channel` kernel attaches to
     /// the `anyhow` error chain must survive the additional `.context(...)`
-    /// layers `open_and_persist` / `open_or_reuse_channel` wrap around it —
-    /// `record_channel_open_failure`'s `downcast_ref` walks the whole chain, so
+    /// layers `open_and_persist` / `open_or_reuse_pool` wrap around it —
+    /// `record_pool_open_failure`'s `downcast_ref` walks the whole chain, so
     /// the metric label is recovered regardless of how deep the reason sits.
     #[test]
     fn failure_reason_survives_context_wrapping() {
         for reason in [
-            ChannelOpenFailureReason::InsufficientDeposit,
-            ChannelOpenFailureReason::ContractRevert,
-            ChannelOpenFailureReason::RpcError,
+            PoolOpenFailureReason::InsufficientDeposit,
+            PoolOpenFailureReason::ContractRevert,
+            PoolOpenFailureReason::RpcError,
         ] {
             // Approximate the real chain: a base error, the kernel's typed
             // reason, then the caller's wrapping `.context` layers. The exact
@@ -2778,7 +2726,7 @@ mod tests {
                 .context(reason)
                 .context("submit openChannel")
                 .context("persist newly-opened buyer channel");
-            let recovered = err.downcast_ref::<ChannelOpenFailureReason>().copied();
+            let recovered = err.downcast_ref::<PoolOpenFailureReason>().copied();
             assert_eq!(
                 recovered,
                 Some(reason),
@@ -2790,11 +2738,7 @@ mod tests {
         // to `None`, so the helper logs `unclassified` and only the unlabeled
         // total moves.
         let storeless = anyhow::anyhow!("redb write failed").context("persist buyer channel");
-        assert!(
-            storeless
-                .downcast_ref::<ChannelOpenFailureReason>()
-                .is_none()
-        );
+        assert!(storeless.downcast_ref::<PoolOpenFailureReason>().is_none());
     }
 
     /// An unprovisioned `NodeOrigin` is a clean miss for any hash, so wiring it

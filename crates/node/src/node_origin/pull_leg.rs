@@ -62,10 +62,10 @@ use super::resume::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::{
     NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleDeps, SettleOnDrop, bind_upstream_ctx,
     cached_candidates, channel_ledger, classify_pull_failure, discover, now_micros, probe_and_rank,
-    record_channel_open_failure, record_outcome,
+    record_outcome, record_pool_open_failure,
 };
 use crate::client_requester::{
-    ChannelContext, ChannelLedger, PullDeadlines, effective_rate_ceiling,
+    PoolContext, PoolLedger, PullDeadlines, effective_rate_ceiling,
     open_progressive_pull as open_progressive_upstream,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
@@ -104,9 +104,9 @@ pub(crate) struct PullLegTarget {
     /// The buyer channel context, shared behind `Arc<Mutex<..>>` with the
     /// [`NodeFunder`] so a mid-pull top-up's new deposit is visible to the next
     /// [`PeerSource`].
-    ctx: Arc<std::sync::Mutex<ChannelContext>>,
+    ctx: Arc<std::sync::Mutex<PoolContext>>,
     /// The channel's shared voucher ledger (`BuyerLedgers::get_or_seed`).
-    ledger: Arc<ChannelLedger>,
+    ledger: Arc<PoolLedger>,
     /// The upstream-claimed content length, from the header handshake.
     pub(crate) total_bytes: u64,
     /// The candidate's DHT id, for region accounting on the clean path.
@@ -380,7 +380,7 @@ impl NodeOrigin {
         };
         let ctx = match deps
             .buyer
-            .open_or_reuse_channel(
+            .open_or_reuse_pool(
                 provider_addr,
                 deps.config.deposit_hint,
                 CHANNEL_OPEN_CALLER_BUDGET,
@@ -388,7 +388,7 @@ impl NodeOrigin {
             .await
         {
             Ok(ctx) => ctx,
-            Err(err) => return Err(record_channel_open_failure(deps, provider_addr, &err)),
+            Err(err) => return Err(record_pool_open_failure(deps, provider_addr, &err)),
         };
         let ctx = match bind_upstream_ctx(deps, ctx) {
             Ok(ctx) => ctx,
@@ -443,7 +443,7 @@ impl NodeOrigin {
                     pk,
                     provider_addr,
                     hash_bytes,
-                    Some(ctx.channel_id),
+                    Some(ctx.pool_id),
                     &err,
                 );
                 return Err(PullMiss::for_verdict(verdict));
@@ -523,17 +523,11 @@ pub(crate) async fn run_pull_leg(
         deadlines,
     } = target;
 
-    // Read the channel identifiers once (quick std-lock, never held across await).
-    let (channel_id, _token) = {
-        let guard = ctx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (guard.channel_id, guard.token)
-    };
-    let prior_nonce = ctx
+    // Read the pool id once (quick std-lock, never held across await).
+    let pool_id = ctx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .prior_nonce;
+        .pool_id;
 
     let Some(deps) = deps_lock.get() else {
         // Unprovisioned under us (cannot happen — we discovered via deps): still
@@ -551,8 +545,7 @@ pub(crate) async fn run_pull_leg(
     let _settle = SettleOnDrop {
         deps: SettleDeps::Shared(Arc::clone(&deps_lock)),
         provider_addr,
-        channel_id,
-        prior_nonce,
+        pool_id,
         ledger: Arc::clone(&ledger),
     };
 
@@ -587,13 +580,7 @@ pub(crate) async fn run_pull_leg(
         last_pulled: AtomicU64::new(0),
         refused: Arc::clone(&leech_refused),
     };
-    let node_funder = NodeFunder::new(
-        Arc::clone(&deps.buyer),
-        provider_addr,
-        Arc::clone(&ctx),
-        deps.config.reactive_topup_min_ttl,
-        Arc::new(crate::payment_settlement::unix_now),
-    );
+    let node_funder = NodeFunder::new(Arc::clone(&deps.buyer), Arc::clone(&ctx));
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
@@ -704,7 +691,7 @@ pub(crate) async fn run_pull_leg(
                         pk,
                         provider_addr,
                         hash_bytes,
-                        Some(channel_id),
+                        Some(pool_id),
                         err,
                     );
                 }
@@ -750,7 +737,7 @@ impl Funder for NullFunder {
     }
 }
 
-/// Build the benign LOCAL [`ChannelContext`] the driver carries as pure
+/// Build the benign LOCAL [`PoolContext`] the driver carries as pure
 /// bookkeeping for the unpaid leg (THE CRUX).
 ///
 /// It signs NOTHING: the [`BackendSource`] quotes rate 0, so `drive` never prices,
@@ -758,23 +745,25 @@ impl Funder for NullFunder {
 /// large `deposit` keeps the pacer's `remaining_deposit` (`deposit −
 /// committed.amount`, and `committed.amount` stays 0 at rate 0) permanently above
 /// `next_voucher_cost` (also 0), so [`crate::pacer` `BudgetPacer`] never reaches
-/// its exhaustion/top-up arm. Fresh nonce/amounts — there is no prior channel
-/// state to resume. `U256::MAX` is used, not a merely-large value, so no blob size
-/// can ever bring the gap headroom below the (zero) voucher cost.
+/// its exhaustion/top-up arm. Fresh priors — there is no prior pool state to
+/// resume. `U256::MAX` is used, not a merely-large value, so no blob size can ever
+/// bring the gap headroom below the (zero) voucher cost.
 #[allow(dead_code, reason = "wired by the own-origin serve-miss orchestration")]
-fn local_bookkeeping_ctx() -> ChannelContext {
-    ChannelContext {
-        channel_id: B256::ZERO,
-        token: Address::ZERO,
+fn local_bookkeeping_ctx() -> PoolContext {
+    PoolContext {
+        pool_id: B256::ZERO,
+        // No provider is paid: rate 0 means no voucher is ever signed, so the
+        // ZERO-provider signing guard is never reached on this local leg.
+        provider: Address::ZERO,
         deposit: U256::MAX,
         client_signer: Arc::new(PrivateKeySigner::random()),
         // Chain 0 / zero contract: this domain is never used to sign, because rate
         // 0 means no voucher is ever produced. It exists only to satisfy the struct.
         voucher_domain: decdn_incentive::voucher_domain(0, Address::ZERO),
-        prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
         client_binding: None,
+        capability: None,
     }
 }
 
@@ -807,7 +796,7 @@ fn local_bookkeeping_ctx() -> ChannelContext {
 /// the ledger's committed `bytes` reach the gap end. An unpaid source that never
 /// advanced a ledger would leave that frontier at zero and the gap loop would
 /// re-draw forever. So the [`BackendSource`] carries a LOCAL bookkeeping
-/// [`ChannelLedger`] and, on `finish`, advances its `bytes` by exactly the leg's
+/// [`PoolLedger`] and, on `finish`, advances its `bytes` by exactly the leg's
 /// drained wire (at amount 0). We hand `drive` that SAME ledger ([`BackendSource::ledger`])
 /// plus a benign [`local_bookkeeping_ctx`] and a [`NullFunder`], so the completion
 /// counter the source moves is the one the gap loop reads. This is NOT payment — no
@@ -1118,7 +1107,7 @@ mod local_pull_leg_tests {
         CacheEngine, FillError, FillSession, Hash, Origin, OriginFetch, OriginKind,
         OriginPullError, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
     };
-    use decdn_client_pull::{ChannelLedger, Cumulative};
+    use decdn_client_pull::{Cumulative, PoolLedger};
     use tokio_util::sync::CancellationToken;
 
     use super::BackendSource;
@@ -1255,8 +1244,8 @@ mod local_pull_leg_tests {
         (0..size).map(|i| (i % 251) as u8).collect()
     }
 
-    fn fresh_ledger() -> Arc<ChannelLedger> {
-        Arc::new(ChannelLedger::new(Cumulative::default()))
+    fn fresh_ledger() -> Arc<PoolLedger> {
+        Arc::new(PoolLedger::new(Cumulative::default()))
     }
 
     /// Build an engine over one `FakeOrigin` in `mode`, plus the root/outboard/total
