@@ -287,8 +287,10 @@ impl ClientHandler {
         // Spawn the off-task pull leg iff this claim owns one, on its own
         // current-thread runtime. All inputs are owned + `'static`; it shares only the
         // session Arc. Its cancel token is the SERVE session's — lease-driven, not a
-        // fresh local token.
-        let pull_thread = if let Some((pull_offset, pull_len)) = pull_range {
+        // fresh local token. The handle is PARKED on the session (`set_pull_handle`) so
+        // whichever observer leaves LAST joins it (the owner-join hand-off, #1664),
+        // freeing an owner whose own client finishes first from parking in the join.
+        if let Some((pull_offset, pull_len)) = pull_range {
             let deps_lock = origin.deps_arc();
             let engine = self.cache.clone();
             let session = Arc::clone(&serve_session);
@@ -327,22 +329,23 @@ impl ClientHandler {
                     }
                 });
             match spawned {
-                Ok(handle) => Some(handle),
+                Ok(handle) => serve_session.set_pull_handle(handle),
                 Err(e) => {
                     // The OS refused the thread: fail any attached observer fast
-                    // (`mark_ended`), release every lease, and fail the serve.
+                    // (`mark_ended`), release every lease (no handle parked, so nothing
+                    // to join), and fail the serve.
                     serve_session.mark_ended(Err(decdn_cache::FillError::new(format!(
                         "could not spawn serve-miss pull thread: {e}"
                     ))));
-                    drop(leases);
+                    for lease in leases {
+                        let _ = lease.release();
+                    }
                     return Err(anyhow::anyhow!(
                         "could not spawn serve-miss pull thread: {e}"
                     ));
                 }
             }
-        } else {
-            None
-        };
+        }
 
         // Run the serve leg on THIS (accept) task and await it. It owns termination.
         // It mints its outboard reader from the shared per-hash outboard and reads the
@@ -368,17 +371,23 @@ impl ClientHandler {
             )
             .await;
 
-        // Teardown (LEASE-driven, #1610): drop every lease FIRST. If a drop takes a
-        // fill's last observer while its pull still runs, that drop cancels the pull;
-        // an attach lease's drop lets a sibling's owner join. THEN JOIN our own pull
-        // thread if we spawned one — bounded, since the pull ends when it finishes
-        // filling its range or is cancelled, and its `SettleOnDrop` persists the buyer
-        // watermark (#852). Joined off the async worker via `spawn_blocking`. Never
-        // cancel a token directly.
-        drop(leases);
-        if let Some(pull_thread) = pull_thread {
+        // Teardown (LEASE-driven, #1610): release every lease. A last-out release
+        // cancels the pull (if still running) and hands back the session's parked
+        // pull-thread handle for THIS caller to join off-task — never under the map
+        // lock, never by cancelling the token directly. A non-last-out release returns
+        // at once, leaving the pull filling for the remaining observers. At most one
+        // handle comes back per lease (our own pull, plus a coalesced sibling's pull if
+        // we are its last observer); each `SettleOnDrop` persists the buyer watermark
+        // (#852). Join each off the async worker via `spawn_blocking`.
+        let mut to_join = Vec::new();
+        for lease in leases {
+            if let Some(handle) = lease.release() {
+                to_join.push(handle);
+            }
+        }
+        for handle in to_join {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = pull_thread.join();
+                let _ = handle.join();
             })
             .await;
         }
@@ -594,7 +603,7 @@ impl ClientHandler {
         // that `run_local_pull_leg` reads back via `source.ledger()` and hands to
         // `drive` as the completion frontier (THE CRUX — a completion counter, never
         // payment).
-        let pull_thread = if let Some((pull_offset, pull_len)) = pull_range {
+        if let Some((pull_offset, pull_len)) = pull_range {
             let engine = self.cache.clone();
             let metrics = Arc::clone(&self.metrics);
             let session = Arc::clone(&serve_session);
@@ -641,22 +650,24 @@ impl ClientHandler {
                     }
                 });
             match spawned {
-                Ok(handle) => Some(handle),
+                // Park the handle so whichever observer leaves LAST joins it (#1664).
+                Ok(handle) => serve_session.set_pull_handle(handle),
                 Err(e) => {
                     // The OS refused the thread: fail any attached observer fast
-                    // (`mark_ended`), release every lease, and fail the serve.
+                    // (`mark_ended`), release every lease (nothing parked to join), and
+                    // fail the serve.
                     serve_session.mark_ended(Err(decdn_cache::FillError::new(format!(
                         "could not spawn serve-miss local pull thread: {e}"
                     ))));
-                    drop(leases);
+                    for lease in leases {
+                        let _ = lease.release();
+                    }
                     return Err(anyhow::anyhow!(
                         "could not spawn serve-miss local pull thread: {e}"
                     ));
                 }
             }
-        } else {
-            None
-        };
+        }
 
         // Run the serve leg on THIS (accept) task and await it. It owns termination —
         // mid-stream takedown and client-disconnect are both handled inside it — and
@@ -681,13 +692,20 @@ impl ClientHandler {
             )
             .await;
 
-        // Teardown (LEASE-driven, #1610): drop every lease FIRST (last-out cancels the
-        // pull; an attach lease's drop wakes a sibling owner's blocked join), THEN JOIN
-        // our own pull thread if we spawned one. Never cancel a token directly.
-        drop(leases);
-        if let Some(pull_thread) = pull_thread {
+        // Teardown (LEASE-driven, #1610): release every lease. A last-out release
+        // cancels the pull (if still running) and hands back the session's parked
+        // pull-thread handle for THIS caller to join off-task — a non-last-out release
+        // returns at once, leaving the pull filling for the remaining observers. Join
+        // each returned handle off the async worker; never cancel a token directly.
+        let mut to_join = Vec::new();
+        for lease in leases {
+            if let Some(handle) = lease.release() {
+                to_join.push(handle);
+            }
+        }
+        for handle in to_join {
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = pull_thread.join();
+                let _ = handle.join();
             })
             .await;
         }

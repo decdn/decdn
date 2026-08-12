@@ -523,6 +523,35 @@ impl ChainFixture {
         Ok(())
     }
 
+    /// Fund a node operator as a paid **buyer** so its daemon can open an
+    /// upstream `PaymentChannel` and pay for a node-to-node cache-miss pull.
+    ///
+    /// [`Self::onboard_operator`] funds only the operator's *seller* role (a
+    /// TOKEN capacity bond); it never mints the USDC a buyer channel escrows, so
+    /// a node whose miss must pay an upstream peer would fail at channel-open.
+    /// This mints `usdc` settlement units to the operator address (the daemon
+    /// opens buyer channels under the same eth key it bonds and settles with).
+    ///
+    /// It deliberately does **not** set the `PaymentChannel` allowance: the
+    /// daemon does that itself, once, at buyer bootstrap (`blockchain.buyer_max_approve`
+    /// defaults to `true`, so `BuyerChannelService::bootstrap` sends the approve
+    /// from the node's own wallet before pull-through is provisioned). Approving
+    /// here from the same operator key would race the daemon's approve on that
+    /// account's nonce, so minting is the fixture's whole job — the approval is
+    /// the node's. `usdc` need only cover the buyer deposit
+    /// (`blockchain.buyer_initial_deposit_micro_usdc`, default 0.5 USDC) plus any
+    /// reactive top-up toward the working deposit (default 10 USDC); mint
+    /// generously so a multi-interval pull never starves the channel.
+    pub async fn fund_node_as_buyer(
+        &self,
+        operator_addr: Address,
+        usdc: U256,
+    ) -> anyhow::Result<()> {
+        self.mint_usdc(operator_addr, usdc)
+            .await
+            .context("mint node-buyer USDC")
+    }
+
     /// Rebind `operator` to `new_secret`'s node id via `CapacityBond.bindNodeId`
     /// — the iroh key-rotation path, driven directly rather than through the CLI
     /// (#1034, G-NODE-07).
