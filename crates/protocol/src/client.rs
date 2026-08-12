@@ -601,10 +601,10 @@ impl Voucher {
     }
 }
 
-/// The node's true watermark for a channel, echoed back on a gated
+/// The node's true watermark for a pool capability, echoed back on a gated
 /// [`StreamError::VoucherRejected`] so a wallet-less client can self-heal
-/// (issue #1481). `amount`/`nonce`/`bytes_delivered` mirror the seller-side
-/// `ChannelState::last_*` fields, 256-bit big-endian for the same reason as
+/// (issue #1481). `amount`/`bytes_delivered` mirror the seller-side
+/// `PoolState::last_*` fields, 256-bit big-endian for the same reason as
 /// [`Voucher`] — no `U256` in the protocol crate. `last_signature` is the
 /// node's stored last-accepted **client** signature (`r‖s‖v`, exactly
 /// [`VOUCHER_SIG_LEN`]) — not a node signature over this bundle — so the
@@ -613,8 +613,6 @@ impl Voucher {
 pub struct WatermarkBundle {
     /// Cumulative amount of the node's last-accepted voucher, big-endian `uint256`.
     pub amount: [u8; 32],
-    /// Nonce of the node's last-accepted voucher, big-endian `uint256`.
-    pub nonce: [u8; 32],
     /// Cumulative bytes delivered as of the node's last-accepted voucher,
     /// big-endian `uint256`.
     pub bytes_delivered: [u8; 32],
@@ -693,19 +691,18 @@ pub enum StreamError {
         reason: VoucherRejectReason,
         /// The node's true watermark plus the client's own last-accepted
         /// signature, attached ONLY on the regression/exhaustion reasons
-        /// (`StaleNonce`, `AmountRegression`, `BytesRegression`,
-        /// `InsufficientDeposit`) and ONLY when the rejected voucher's
-        /// signature recovers to the channel's pinned `voucher_signer`
-        /// (issue #1481 §5 security property — otherwise anyone who guessed
-        /// the chain-derivable `channel_id` could pull the node's watermark).
-        /// A wallet-less client cannot reconstruct its watermark from chain
-        /// (the claim watermark is `0` until settlement), so this lets it
-        /// self-heal: re-seed the ledger's PAYMENT BASELINE to `bytes_delivered`
-        /// (a channel-cumulative counter, NOT a blob `byte_offset`) and re-sign
-        /// from `nonce + 1`. `None` for every
-        /// handler-direct reason (`Expired`, `RetryLater`,
-        /// `CooperativeCloseSigned`, `RateFloorRaised`, …) and whenever the
-        /// signer does not recover to `voucher_signer`.
+        /// (`AmountRegression`, `BytesRegression`, `CapExceeded`) and ONLY
+        /// when the rejected voucher's signature recovers to the
+        /// capability's pinned `voucher_signer` (issue #1481 §5 security
+        /// property — otherwise anyone who guessed the chain-derivable
+        /// `pool_id` could pull the node's watermark). A wallet-less client
+        /// cannot reconstruct its watermark from chain (the claim watermark
+        /// is `0` until settlement), so this lets it self-heal: re-seed the
+        /// ledger's PAYMENT BASELINE to `bytes_delivered` (a pool-cumulative
+        /// counter, NOT a blob `byte_offset`) and re-sign from the new
+        /// baseline. `None` for every handler-direct reason (`RetryLater`,
+        /// `RateFloorRaised`, …) and whenever the signer does not recover to
+        /// `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
     /// The channel funding this request is owned by a blacklisted origin
@@ -740,21 +737,19 @@ impl StreamError {
 
 /// Why a [`Voucher`] was rejected (ADR 005 §`VoucherRejected` semantics).
 ///
-/// The first eight variants mirror `decdn_incentive::ChannelError` ∪
+/// The first seven variants mirror `decdn_incentive::PoolError` ∪
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
-/// matches those exhaustively so a new `ChannelError` variant fails to compile
+/// matches those exhaustively so a new `PoolError` variant fails to compile
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
 /// variants have no validation-enum counterpart and are emitted directly by the
 /// `cdn/client/v1` handler: [`Self::RetryLater`] is the wire expression of a
-/// transient persist-write failure (`ChannelError::Store`,
+/// transient persist-write failure (`PoolError::Store`,
 /// `decdn_incentive::RetrySignal`), the one rejection where the client should
 /// resend the **same** voucher rather than treat the failure as permanent
-/// (ADR 003 §Off-chain voucher state persistence); [`Self::Expired`] is the
-/// on-chain channel-expiry serve-gate refusal (#751); [`Self::CooperativeCloseSigned`]
-/// is the coop-close waiver refusal (ADR 003 §Cooperative close); and
-/// [`Self::RateFloorRaised`] is the honest-buyer re-quote signal when the live
-/// delivery floor rose above a stream's quoted rate (#1382). Variant order is
-/// frozen — new handler-direct reasons append at the end.
+/// (ADR 003 §Off-chain voucher state persistence); and [`Self::RateFloorRaised`]
+/// is the honest-buyer re-quote signal when the live delivery floor rose above
+/// a stream's quoted rate (#1382). Variant order is frozen — new handler-direct
+/// reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -763,22 +758,21 @@ pub enum VoucherRejectReason {
     /// Signature well-formed but recovers to the wrong signer.
     /// `VoucherError::WrongSigner`.
     WrongSigner,
-    /// `voucher.channel_id` mismatch (also: unknown channel).
-    /// `ChannelError::WrongChannel`.
-    WrongChannel,
-    /// `voucher.token` mismatch — cross-token replay defense.
-    /// `ChannelError::WrongToken`.
-    WrongToken,
-    /// Nonce did not strictly increase. `ChannelError::NonceNotIncreasing`.
-    StaleNonce,
-    /// Cumulative amount regressed. `ChannelError::AmountDecreasing`.
+    /// `voucher.pool_id` mismatch (also: unknown pool). `PoolError::WrongPool`.
+    WrongPool,
+    /// The voucher names a provider node other than the one receiving it —
+    /// a capability voucher scoped to one node redeemed against another.
+    /// `PoolError::WrongProvider`.
+    WrongProvider,
+    /// Cumulative amount regressed. `PoolError::AmountDecreasing`.
     AmountRegression,
-    /// Cumulative bytes delivered regressed. `ChannelError::BytesDecreasing`.
+    /// Cumulative bytes delivered regressed. `PoolError::BytesDecreasing`.
     BytesRegression,
-    /// Voucher amount exceeds the channel deposit.
-    /// `ChannelError::AmountExceedsDeposit`.
-    InsufficientDeposit,
-    /// Transient node-side persist-write failure (`ChannelError::Store`,
+    /// The signer's remaining spending cap is exhausted — the voucher amount
+    /// exceeds what the capability has left to spend, or the capability
+    /// itself has expired. `PoolError::CapExceeded`.
+    CapExceeded,
+    /// Transient node-side persist-write failure (`PoolError::Store`,
     /// surfaced via `decdn_incentive::RetrySignal`). The voucher itself was
     /// valid and in-memory state did not advance, so the client should resend
     /// the **same** voucher on a fresh stream rather than refreshing state or
@@ -786,24 +780,6 @@ pub enum VoucherRejectReason {
     /// never returns this; the `cdn/client/v1` handler emits it directly (ADR
     /// 003 §Off-chain voucher state persistence).
     RetryLater,
-    /// The channel has passed its on-chain `expiresAt`: `withdraw`/`closeChannel`
-    /// now revert and the client may `reclaimExpired` for a full refund, so any
-    /// further delivery would be unpaid. The node refuses to accept the voucher
-    /// (the seller settlement sweep normally closes + retires the channel well
-    /// before this; this gate is the defense-in-depth for a node that was down
-    /// through the close window). The voucher itself may be valid — the client
-    /// should stop streaming on this channel rather than resend (#751). No
-    /// validation-enum counterpart — `voucher_reject_reason` never returns this;
-    /// the `cdn/client/v1` handler emits it directly.
-    Expired,
-    /// The node has signed a cooperative-close waiver for this channel (ADR 003
-    /// §Cooperative close): it has committed to settling at the current
-    /// watermark and serves no further bytes. The voucher itself may be valid —
-    /// the client should stop streaming and submit the cooperative close (or
-    /// fall back to `closeChannel`) rather than resend. No validation-enum
-    /// counterpart — `voucher_reject_reason` never returns this; the
-    /// `cdn/client/v1` handler emits it directly, like `Expired`/`RetryLater`.
-    CooperativeCloseSigned,
     /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
     /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
     /// stream was quoted at, after the signed `StreamResponse` but before this
@@ -822,27 +798,23 @@ pub enum VoucherRejectReason {
 
 impl VoucherRejectReason {
     /// Whether a [`StreamError::VoucherRejected`] carrying this reason is
-    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the four
+    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the three
     /// regression/exhaustion reasons a wallet-less client cannot distinguish
     /// from chain, since its local watermark is the only thing that could be
-    /// wrong. Every handler-direct reason (`Expired`, `RetryLater`,
-    /// `CooperativeCloseSigned`, `RateFloorRaised`, plus the signer/channel/
-    /// token mismatches) is never eligible — a bundle would not help there,
-    /// since the fix is not "resync the watermark".
+    /// wrong. Every handler-direct reason (`RetryLater`, `RateFloorRaised`,
+    /// plus the signer/pool/provider mismatches) is never eligible — a bundle
+    /// would not help there, since the fix is not "resync the watermark".
     ///
     /// Single source of truth for the gate: the node checks this before
     /// attaching a bundle (`crates/node/src/handlers/client/voucher.rs`) and
     /// the client checks it again before trusting one enough to self-heal
     /// (`crates/client-pull/src/lib.rs`) — both call this rather than each
-    /// keeping their own copy of the four-way match.
+    /// keeping their own copy of the three-way match.
     #[must_use]
     pub const fn is_watermark_gated(self) -> bool {
         matches!(
             self,
-            Self::StaleNonce
-                | Self::AmountRegression
-                | Self::BytesRegression
-                | Self::InsufficientDeposit
+            Self::AmountRegression | Self::BytesRegression | Self::CapExceeded
         )
     }
 }
@@ -1021,7 +993,7 @@ mod tests {
     #[test]
     fn stream_error_voucher_rejected_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
-            reason: VoucherRejectReason::StaleNonce,
+            reason: VoucherRejectReason::CapExceeded,
             bundle: None,
         };
         let bytes = postcard::to_allocvec(&e)?;
@@ -1037,10 +1009,9 @@ mod tests {
     #[test]
     fn stream_error_voucher_rejected_with_bundle_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
-            reason: VoucherRejectReason::StaleNonce,
+            reason: VoucherRejectReason::CapExceeded,
             bundle: Some(WatermarkBundle {
                 amount: [0x11u8; 32],
-                nonce: [0x22u8; 32],
                 bytes_delivered: [0x33u8; 32],
                 last_signature: vec![0x44u8; VOUCHER_SIG_LEN],
             }),
@@ -1116,15 +1087,12 @@ mod tests {
         for (i, r) in [
             VoucherRejectReason::BadSignature,
             VoucherRejectReason::WrongSigner,
-            VoucherRejectReason::WrongChannel,
-            VoucherRejectReason::WrongToken,
-            VoucherRejectReason::StaleNonce,
+            VoucherRejectReason::WrongPool,
+            VoucherRejectReason::WrongProvider,
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
-            VoucherRejectReason::InsufficientDeposit,
+            VoucherRejectReason::CapExceeded,
             VoucherRejectReason::RetryLater,
-            VoucherRejectReason::Expired,
-            VoucherRejectReason::CooperativeCloseSigned,
             VoucherRejectReason::RateFloorRaised,
         ]
         .into_iter()
@@ -1308,7 +1276,6 @@ mod tests {
     fn watermark_bundle_validate_rejects_wrong_len_signature() {
         let b = WatermarkBundle {
             amount: [0u8; 32],
-            nonce: [0u8; 32],
             bytes_delivered: [0u8; 32],
             last_signature: vec![0xCDu8; VOUCHER_SIG_LEN - 1],
         };
@@ -1569,7 +1536,7 @@ mod tests {
                 ..sample_body()
             },
             error: Some(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::StaleNonce,
+                reason: VoucherRejectReason::CapExceeded,
                 bundle: None,
             }),
             ..sample_response()
@@ -1689,10 +1656,9 @@ mod tests {
             ClientMessage::Voucher(sample_voucher()),
             ClientMessage::StreamEnd,
             ClientMessage::StreamError(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::InsufficientDeposit,
+                reason: VoucherRejectReason::CapExceeded,
                 bundle: Some(WatermarkBundle {
                     amount: [0x01u8; 32],
-                    nonce: [0x02u8; 32],
                     bytes_delivered: [0x03u8; 32],
                     last_signature: vec![0x04u8; VOUCHER_SIG_LEN],
                 }),

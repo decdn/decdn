@@ -33,15 +33,12 @@ pub enum decdn_protocol::client::VoucherRejectReason
 pub decdn_protocol::client::VoucherRejectReason::AmountRegression
 pub decdn_protocol::client::VoucherRejectReason::BadSignature
 pub decdn_protocol::client::VoucherRejectReason::BytesRegression
-pub decdn_protocol::client::VoucherRejectReason::CooperativeCloseSigned
-pub decdn_protocol::client::VoucherRejectReason::Expired
-pub decdn_protocol::client::VoucherRejectReason::InsufficientDeposit
+pub decdn_protocol::client::VoucherRejectReason::CapExceeded
 pub decdn_protocol::client::VoucherRejectReason::RateFloorRaised
 pub decdn_protocol::client::VoucherRejectReason::RetryLater
-pub decdn_protocol::client::VoucherRejectReason::StaleNonce
-pub decdn_protocol::client::VoucherRejectReason::WrongChannel
+pub decdn_protocol::client::VoucherRejectReason::WrongPool
+pub decdn_protocol::client::VoucherRejectReason::WrongProvider
 pub decdn_protocol::client::VoucherRejectReason::WrongSigner
-pub decdn_protocol::client::VoucherRejectReason::WrongToken
 impl decdn_protocol::client::VoucherRejectReason
 pub const fn decdn_protocol::client::VoucherRejectReason::is_watermark_gated(self) -> bool
 pub struct decdn_protocol::client::ChunkData
@@ -90,7 +87,6 @@ pub struct decdn_protocol::client::WatermarkBundle
 pub decdn_protocol::client::WatermarkBundle::amount: [u8; 32]
 pub decdn_protocol::client::WatermarkBundle::bytes_delivered: [u8; 32]
 pub decdn_protocol::client::WatermarkBundle::last_signature: alloc::vec::Vec<u8>
-pub decdn_protocol::client::WatermarkBundle::nonce: [u8; 32]
 impl decdn_protocol::client::WatermarkBundle
 pub const fn decdn_protocol::client::WatermarkBundle::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
@@ -348,15 +344,12 @@ pub enum decdn_protocol::VoucherRejectReason
 pub decdn_protocol::VoucherRejectReason::AmountRegression
 pub decdn_protocol::VoucherRejectReason::BadSignature
 pub decdn_protocol::VoucherRejectReason::BytesRegression
-pub decdn_protocol::VoucherRejectReason::CooperativeCloseSigned
-pub decdn_protocol::VoucherRejectReason::Expired
-pub decdn_protocol::VoucherRejectReason::InsufficientDeposit
+pub decdn_protocol::VoucherRejectReason::CapExceeded
 pub decdn_protocol::VoucherRejectReason::RateFloorRaised
 pub decdn_protocol::VoucherRejectReason::RetryLater
-pub decdn_protocol::VoucherRejectReason::StaleNonce
-pub decdn_protocol::VoucherRejectReason::WrongChannel
+pub decdn_protocol::VoucherRejectReason::WrongPool
+pub decdn_protocol::VoucherRejectReason::WrongProvider
 pub decdn_protocol::VoucherRejectReason::WrongSigner
-pub decdn_protocol::VoucherRejectReason::WrongToken
 impl decdn_protocol::client::VoucherRejectReason
 pub const fn decdn_protocol::client::VoucherRejectReason::is_watermark_gated(self) -> bool
 pub struct decdn_protocol::BatchStoreAck
