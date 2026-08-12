@@ -392,16 +392,30 @@ impl Drop for ObserverLease {
             // attach, so the decrement + cancel are moot. Skip.
             return;
         };
-        let _ = self.hash; // retained so a future map-eviction drop can key by hash.
         // Take the SAME lock `fill_plan`/`register_fill` hold to attach, so the
-        // decrement and the cancel decision cannot interleave with an attach.
-        let _guard = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
+        // decrement, the map removal, and the cancel decision cannot interleave with
+        // an attach.
+        let mut map = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
         // `fetch_sub` returns the PREVIOUS value; `1` means this drop took the
-        // count to 0. Cancel only if the pull has not already ended — a completed
-        // pull needs no cancel, and a failed one already terminated.
+        // count to 0.
         let prev = self.session.observers.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 && self.session.outcome().is_none() {
-            self.session.cancel.cancel();
+        if prev == 1 {
+            // Last observer left: free the session from the map so dead sessions do
+            // not accumulate forever (a slow leak — `fill_plan` skips them via
+            // `is_dead` but never frees them). Remove by pointer identity so a sibling
+            // session for the same hash survives; drop the `hash` key if its Vec empties.
+            if let Some(sessions) = map.get_mut(&self.hash) {
+                sessions.retain(|s| !Arc::ptr_eq(s, &self.session));
+                if sessions.is_empty() {
+                    map.remove(&self.hash);
+                }
+            }
+            // Cancel only if the pull has not already ended — a completed pull needs
+            // no cancel, and a failed one already terminated. The session is removed
+            // from the map regardless.
+            if self.session.outcome().is_none() {
+                self.session.cancel.cancel();
+            }
         }
     }
 }
@@ -668,6 +682,18 @@ mod fill_registry_tests {
         Hash::from_bytes([byte; 32])
     }
 
+    /// Whether the registry map still holds an entry (a non-empty session Vec) for
+    /// `hash`. Reaches the private `map` field directly — the discriminating check
+    /// for last-observer removal, which `fill_plan` alone cannot distinguish from
+    /// the `is_dead` skip.
+    fn mapped(reg: &FillRegistry, hash: Hash) -> bool {
+        reg.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&hash)
+            .is_some_and(|sessions| !sessions.is_empty())
+    }
+
     fn root(byte: u8) -> blake3::Hash {
         blake3::Hash::from([byte; 32])
     }
@@ -785,6 +811,99 @@ mod fill_registry_tests {
             "the last observer left — pull is cancelled"
         );
         assert_eq!(session.observer_count(), 0);
+    }
+
+    /// The last observer leaving removes the session from the registry map, so dead
+    /// sessions do not accumulate forever. An earlier leaver keeps the session
+    /// mapped (a fresh serve-miss still attaches to it). The discriminating check is
+    /// the map key itself: `fill_plan` already skips a dead-but-mapped session via
+    /// `is_dead`, so only a direct map inspection distinguishes removal from that
+    /// pre-existing safety net.
+    #[test]
+    fn last_observer_leaving_removes_session() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x28);
+
+        let session = FillSession::new(root(0x28), total);
+        session.set_covered(ranges(0, 0, total)); // [0, total)
+        let owner = reg.register_fill(hash, Arc::clone(&session));
+        assert_eq!(session.observer_count(), 1, "owner is one observer");
+        assert!(mapped(&reg, hash), "registered session is in the map");
+
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        let (_attached, second) = plan.session.expect("attaches a second observer");
+        assert_eq!(session.observer_count(), 2, "owner + attached");
+
+        // Drop the attached lease (count 2 → 1): not last-out, session STILL mapped,
+        // so a fresh serve-miss attaches to it.
+        drop(second);
+        assert_eq!(session.observer_count(), 1);
+        assert!(
+            mapped(&reg, hash),
+            "non-last leaver keeps the session mapped"
+        );
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        assert!(
+            plan.session.is_some(),
+            "session still present — a fresh miss attaches"
+        );
+        assert!(!plan.attach.is_empty(), "attach is non-empty");
+        // That planning minted a third observer lease; release it so the owner is the
+        // sole remaining observer.
+        drop(plan.session);
+        assert_eq!(session.observer_count(), 1, "back to the owner only");
+
+        // Drop the owner (count 1 → 0): last-out REMOVES the session from the map, so
+        // the hash key is gone and a fresh serve-miss opens a new pull.
+        drop(owner);
+        assert_eq!(session.observer_count(), 0);
+        assert!(
+            !mapped(&reg, hash),
+            "last observer left — session removed from the map"
+        );
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        assert!(
+            plan.session.is_none(),
+            "session removed — nothing to attach"
+        );
+        assert!(plan.attach.is_empty(), "removed session covers nothing");
+        assert_eq!(
+            plan.remainder,
+            ranges(0, 0, total),
+            "the whole range is a fresh pull"
+        );
+    }
+
+    /// A sibling session for the same hash survives when one session's last observer
+    /// leaves: removal is by pointer identity, and the hash key stays while any
+    /// session remains under it.
+    #[test]
+    fn removing_one_session_keeps_a_sibling_for_the_same_hash() {
+        let total = 8 * G;
+        let half = 4 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x29);
+
+        // Two disjoint-range sessions for the same hash (each its own pull).
+        let first = FillSession::new(root(0x29), total);
+        first.set_covered(ranges(0, half, total)); // [0, half)
+        let first_owner = reg.register_fill(hash, Arc::clone(&first));
+
+        let second = FillSession::new(root(0x29), total);
+        second.set_covered(ranges(half, total - half, total)); // [half, total)
+        let _second_owner = reg.register_fill(hash, Arc::clone(&second));
+
+        // Drop the first session's sole observer: it is removed, but the sibling and
+        // the hash key remain, so a serve-miss for the second half still attaches.
+        drop(first_owner);
+        assert!(mapped(&reg, hash), "sibling keeps the hash key alive");
+        let plan = reg.fill_plan(hash, half, total - half, total);
+        let (attached, _lease) = plan.session.expect("attaches to the surviving sibling");
+        assert!(
+            Arc::ptr_eq(&attached, &second),
+            "the surviving sibling is bound, not the removed session"
+        );
     }
 
     /// A cancelled session is dead: `fill_plan` must NOT attach to it, and its

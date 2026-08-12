@@ -248,7 +248,14 @@ impl ClientHandler {
                     // window). One contiguous delivery from `offset`, so `offset`
                     // is the single fetch-start.
                     let served = content_paid_frontier(offset, total_bytes, paid);
-                    session.served_frontier().store(served, Ordering::Relaxed);
+                    // `fetch_max`, not `store`: N observers advance the SHARED frontier
+                    // and the pull's `WindowPacer` binds on the MAX-over-observers paid
+                    // frontier (DECISION-B), so a slower observer must not regress a
+                    // faster one. Behavior-preserving for N=1 (a single contiguous
+                    // delivery is already monotone, so `fetch_max == store`).
+                    session
+                        .served_frontier()
+                        .fetch_max(served, Ordering::Relaxed);
                     session.served_advanced().notify_waiters();
                 }
                 // Re-queue deltas the client had not paid yet (a short batch),
