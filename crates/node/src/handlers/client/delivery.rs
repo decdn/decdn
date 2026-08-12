@@ -8,8 +8,8 @@ use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
 use super::{
-    Arc, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId, ChunkData,
-    ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, RecvStream, SendStream, VecDeque,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
+    LaneDeliveryState, LaneKey, MB_BYTES, Mutex, RecvStream, SendStream, VecDeque,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -135,8 +135,8 @@ impl ClientHandler {
         byte_offset: u64,
         byte_len: u64,
         total_bytes: u64,
-        channel_id: ChannelId,
-        channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
+        lane_key: LaneKey,
+        lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
         interval_mb: u64,
@@ -191,18 +191,15 @@ impl ClientHandler {
             .unwrap_or(usize::MAX)
             .max(1);
 
-        // Resolved once: a channel's funder is fixed for its lifetime, and the
-        // per-boundary takedown re-check below must not take the channel lock
-        // every MB just to re-read an immutable field.
-        //
-        // This is the FUNDER (ADR 011 compliance), never the channel's
-        // `voucher_signer`, and must not be re-keyed onto it: a blacklisted
-        // funder can pin a clean throwaway key as its signer, so checking the
-        // signer here would silently stop enforcing takedowns.
-        let funder = match channel {
-            Some(chan) => Some(chan.lock().await.state.client),
-            None => None,
-        };
+        // The in-flight takedown re-check (ADR 011 compliance) keys on the pool
+        // FUNDER — the pool owner. In the shared-payment-pool model the owner is
+        // a chain quantity (`getPool.owner`), not carried on the per-lane
+        // [`LaneState`], so the funder is threaded to the mid-stream re-check by
+        // E4 (from the cached `getPool` view). Until then the per-lane loop
+        // passes `None`, so a mid-stream funder takedown is caught by the
+        // open-time gates and the hash-denylist re-check, not the funder
+        // re-check. BOUNDARY: E4 pool-owner threading.
+        let funder = None;
 
         // Bytes written to the wire, and bytes covered by an accepted voucher.
         // Their gap `delivered − paid` is the unrecouped credit the window caps.
@@ -296,8 +293,8 @@ impl ClientHandler {
                         recv,
                         &mut reader,
                         hash,
-                        channel_id,
-                        channel,
+                        lane_key,
+                        lane,
                         client_node_id,
                         rate_per_mb,
                         &deltas,

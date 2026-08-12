@@ -12,7 +12,7 @@
 //!
 //! There are two layers. [`ReceiptLog`] is the *disk* boundary — a small trait
 //! (mirroring the trait+impl pattern of
-//! [`decdn_incentive::store::ChannelStateStore`] / [`crate::channel_store`])
+//! [`decdn_incentive::store::PoolStateStore`] / [`crate::channel_store`])
 //! whose runtime impl is the disk-backed [`JsonlReceiptLog`], appending one JSON
 //! object per line to `<data_dir>/download_receipts.jsonl` (JSON Lines).
 //! [`ReceiptSink`] is the *hot-path* boundary: the paid-delivery path does not
@@ -27,10 +27,10 @@
 //! Each [`ReceiptLog::append`] writes one line and flushes it to the OS
 //! (`write_all` + `flush`) but does **not** fsync per record. The receipt log
 //! is an *audit* artifact, not the #527 voucher-replay guard — the durable
-//! anti-replay watermark is [`crate::channel_store::PersistentChannelStateStore`],
+//! anti-replay watermark is [`crate::channel_store::PersistentPoolStateStore`],
 //! which fsyncs every accepted voucher *before* a receipt is ever written. A
 //! crash that loses a not-yet-fsynced receipt tail therefore cannot reopen a
-//! replay window; at worst the audit log trails the channel store by a few
+//! replay window; at worst the audit log trails the lane store by a few
 //! entries. Skipping the per-line fsync keeps the cost off the hot delivery
 //! path at the testnet scale this targets (see CLAUDE.md / ADR 003).
 //!
@@ -90,10 +90,11 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 /// - `hash` — BLAKE3 content hash of the delivered blob (raw 32 bytes, hex).
 /// - `client_node_id` — iroh `NodeId` (ed25519 public key) of the paying peer
 ///   (raw 32 bytes, hex).
-/// - `voucher_nonce` — the accepted voucher's sequence number within its
-///   channel, as a decimal string. A decimal `uint256` (not hex) so an auditor
-///   reads the same value the on-chain `PaymentChannel` and operator dashboards
-///   show; it is reconstructed from the 32-byte big-endian wire nonce.
+/// - `voucher_amount` — the accepted voucher's cumulative amount (its sole
+///   ordering key; there is no nonce), as a decimal string. A decimal `uint256`
+///   (not hex) so an auditor reads the same value the on-chain `PaymentPool` and
+///   operator dashboards show; it is reconstructed from the 32-byte big-endian
+///   wire amount.
 ///
 /// `size` is the byte count covered by *this* voucher interval (the newly
 /// delivered, now-paid bytes), and `timestamp_secs` is the node's wall-clock
@@ -105,7 +106,7 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 /// renders the hex and decimal-`uint256` strings from typed inputs. This makes
 /// the invariants type-owned: a receipt cannot be built field-wise, and serde's
 /// derived `Deserialize` cannot synthesize one with a malformed `hash` /
-/// `client_node_id` / `voucher_nonce` from outside the crate (the fields stay
+/// `client_node_id` / `voucher_amount` from outside the crate (the fields stay
 /// private to readers). Accessor methods expose the rendered values read-only.
 ///
 /// Field-wise construction from outside the crate does not compile (the fields
@@ -118,7 +119,7 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 ///     hash: "not-a-hash".to_string(),
 ///     size: 1,
 ///     client_node_id: "nope".to_string(),
-///     voucher_nonce: "0xdeadbeef".to_string(),
+///     voucher_amount: "0xdeadbeef".to_string(),
 ///     timestamp: 0,
 /// };
 /// ```
@@ -132,8 +133,8 @@ pub struct DownloadReceipt {
     size: u64,
     /// iroh `NodeId` of the paying client, lower-hex (64 chars).
     client_node_id: String,
-    /// Accepted voucher sequence number, decimal `uint256` string.
-    voucher_nonce: String,
+    /// Accepted voucher cumulative amount, decimal `uint256` string.
+    voucher_amount: String,
     /// Node wall-clock Unix time (seconds) at voucher acceptance. The wire key
     /// stays `timestamp` (preserved via `#[serde(rename)]`) so the on-disk JSONL
     /// format is byte-identical to the original; the Rust field name carries the
@@ -150,22 +151,22 @@ impl DownloadReceipt {
     ///   type from `client_node_id_bytes`, so the two 32-byte identifiers cannot
     ///   be transposed at a call site. Rendered to lower-hex (no `0x`).
     /// - `client_node_id_bytes` is the raw 32-byte iroh node id, lower-hex.
-    /// - `voucher_nonce` is the accepted voucher's `uint256` nonce; the decimal
-    ///   string is rendered here so the "decimal uint256" invariant is owned by
-    ///   the type, not the caller.
+    /// - `voucher_amount` is the accepted voucher's cumulative `uint256` amount;
+    ///   the decimal string is rendered here so the "decimal uint256" invariant
+    ///   is owned by the type, not the caller.
     #[must_use]
     pub fn new(
         hash: &Hash,
         size: u64,
         client_node_id_bytes: &[u8; 32],
-        voucher_nonce: U256,
+        voucher_amount: U256,
         timestamp_secs: u64,
     ) -> Self {
         Self {
             hash: hex_lower(hash.as_bytes()),
             size,
             client_node_id: hex_lower(client_node_id_bytes),
-            voucher_nonce: voucher_nonce.to_string(),
+            voucher_amount: voucher_amount.to_string(),
             timestamp_secs,
         }
     }
@@ -188,10 +189,10 @@ impl DownloadReceipt {
         &self.client_node_id
     }
 
-    /// Accepted voucher sequence number, decimal `uint256` string.
+    /// Accepted voucher cumulative amount, decimal `uint256` string.
     #[must_use]
-    pub fn voucher_nonce(&self) -> &str {
-        &self.voucher_nonce
+    pub fn voucher_amount(&self) -> &str {
+        &self.voucher_amount
     }
 
     /// Node wall-clock Unix time (seconds) at voucher acceptance.
@@ -223,7 +224,7 @@ pub trait ReceiptLog: Send + Sync {
     ///
     /// Returns the underlying [`std::io::Error`] if serialization or the write
     /// fails. The caller treats a receipt-log failure as non-fatal (the payment
-    /// already committed to the fsynced channel store) and logs it.
+    /// already committed to the fsynced lane store) and logs it.
     fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()>;
 }
 
@@ -313,7 +314,7 @@ impl JsonlReceiptLog {
     /// log that is already near the cap rotates on the next append rather than
     /// only after a full cap's worth of fresh writes.
     ///
-    /// Unlike [`crate::channel_store::PersistentChannelStateStore::open`], a
+    /// Unlike [`crate::channel_store::PersistentPoolStateStore::open`], a
     /// failure here is **not** required to abort node bring-up: the receipt log
     /// is an audit artifact, not the #527 replay guard. The runtime decides the
     /// fatality (it currently logs and continues without the audit log).
@@ -462,7 +463,7 @@ fn open_append(path: &Path) -> std::io::Result<File> {
 /// Tighten the on-disk file mode to `0o600`. Idempotent: skips the syscall when
 /// the mode already matches so a read-only mount with the correct mode (e.g.
 /// from a prior boot) does not fail startup. Mirrors
-/// [`crate::channel_store::PersistentChannelStateStore`]'s tightening.
+/// [`crate::channel_store::PersistentPoolStateStore`]'s tightening.
 #[cfg(unix)]
 fn tighten_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -533,7 +534,7 @@ impl ReceiptLog for JsonlReceiptLog {
 /// A [`ReceiptLog`] that drops every receipt. Used as the runtime fallback when
 /// [`JsonlReceiptLog::open`] fails at bring-up: the audit log is best-effort, so
 /// the node serves paid delivery without it rather than refusing to start (the
-/// #527 replay guard lives in the separate, fsynced channel store). The
+/// #527 replay guard lives in the separate, fsynced lane store). The
 /// operator gets one `error!` at startup naming the open failure.
 #[derive(Debug, Default)]
 pub struct NoopReceiptLog;
@@ -547,10 +548,11 @@ impl ReceiptLog for NoopReceiptLog {
 /// Non-blocking enqueue boundary for [`DownloadReceipt`]s on the paid-delivery
 /// hot path (#803).
 ///
-/// The voucher-accept path records a receipt through this seam *before* sending
-/// `VoucherAck`, so the implementation MUST NOT block on disk I/O: a backed-up
-/// sink drops the receipt (best-effort, audit-only) rather than stall the
-/// payment, which already committed to the fsynced channel store. The runtime
+/// The voucher-accept path records a receipt through this seam as each voucher
+/// is durably accepted (acceptance is implicit — delivery simply continues), so
+/// the implementation MUST NOT block on disk I/O: a backed-up sink drops the
+/// receipt (best-effort, audit-only) rather than stall the payment, which
+/// already committed to the fsynced lane store. The runtime
 /// uses [`ChannelReceiptSink`] (hands off to the background
 /// [`spawn_receipt_writer`] task); tests use a synchronous fake behind
 /// [`DirectReceiptSink`].
@@ -567,7 +569,7 @@ pub trait ReceiptSink: Send + Sync {
 /// end-state of #802) is worked off, without ever back-pressuring paid
 /// delivery. On overflow the *audit* receipt is dropped (counted via
 /// [`Metrics::receipt_write_dropped`]) rather than the *payment* stalling — the
-/// payment already committed to the fsynced channel store. Rotation (#802)
+/// payment already committed to the fsynced lane store. Rotation (#802)
 /// bounds the log on disk; this bounds it in memory.
 pub const RECEIPT_LOG_CAPACITY: usize = 1024;
 
@@ -659,9 +661,9 @@ impl ReceiptSink for DirectReceiptSink {
 ///
 /// Decouples the audit write from the paid-delivery hot path (#803): the
 /// voucher-accept path now only does a non-blocking [`ReceiptSink::record`] (a
-/// bounded `try_send`) before `VoucherAck`, while this task performs the actual
+/// bounded `try_send`) as each voucher is durably accepted, while this task performs the actual
 /// `append` on the blocking pool. A slow or full disk can therefore only fill
-/// the queue (and drop audit records, counted) — it can never delay `VoucherAck`
+/// the queue (and drop audit records, counted) — it can never delay delivery
 /// or serialize delivery on the receipt-log mutex. The writer is the *only*
 /// caller of [`ReceiptLog::append`], so the log's internal mutex sees no
 /// cross-stream contention.
@@ -746,7 +748,7 @@ async fn append_one(log: &Arc<dyn ReceiptLog>, receipt: DownloadReceipt) {
         tracing::warn!(
             hash = receipt.hash(),
             client_node_id = receipt.client_node_id(),
-            voucher_nonce = receipt.voucher_nonce(),
+            voucher_amount = receipt.voucher_amount(),
             error = %e,
             event = "download_receipt_write_failed",
             "failed to append download receipt; payment already committed (audit log only)"
@@ -960,13 +962,13 @@ mod tests {
         assert_eq!(r.hash(), "ab".repeat(32));
         assert_eq!(r.client_node_id(), "01".repeat(32));
         assert_eq!(r.size(), 42);
-        assert_eq!(r.voucher_nonce(), "7");
+        assert_eq!(r.voucher_amount(), "7");
         assert_eq!(r.timestamp_secs(), 123);
     }
 
     /// Lock the on-disk JSONL wire format: the serialized line for a known input
     /// must be byte-identical to the original schema (lower-hex `hash` /
-    /// `client_node_id`, decimal-uint256 `voucher_nonce` string, Unix-seconds
+    /// `client_node_id`, decimal-uint256 `voucher_amount` string, Unix-seconds
     /// `timestamp` key, `size` u64). This guards the private-field +
     /// `#[serde(rename = "timestamp")]` refactor against any wire drift.
     #[test]
@@ -980,7 +982,7 @@ mod tests {
         );
         let line = serde_json::to_string(&r)?;
         let expected = format!(
-            "{{\"hash\":\"{}\",\"size\":4096,\"client_node_id\":\"{}\",\"voucher_nonce\":\"42\",\"timestamp\":1700000000}}",
+            "{{\"hash\":\"{}\",\"size\":4096,\"client_node_id\":\"{}\",\"voucher_amount\":\"42\",\"timestamp\":1700000000}}",
             "ab".repeat(32),
             "01".repeat(32),
         );

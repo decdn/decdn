@@ -15,29 +15,30 @@ impl ClientHandler {
     ///
     /// The receipt is handed to [`ReceiptSink::record`](super::ReceiptSink::record), a **non-blocking**
     /// enqueue: the actual `write_all` + `flush` runs off the hot path in the
-    /// background receipt writer, so this never blocks before `VoucherAck` and a
+    /// background receipt writer, so this never blocks before delivery continues and a
     /// slow or full disk cannot back-pressure delivery (the bug in #803).
     /// Receipts are enqueued in voucher-acceptance order and the single writer
     /// drains them FIFO, preserving the audit ordering and shutdown-tail
     /// guarantees the previously-awaited inline write relied on (CLAUDE.md /
     /// ADR 003).
     ///
-    /// The `voucher_nonce` is rendered as a decimal `uint256` from the
-    /// big-endian wire nonce; `client_node_id` is the iroh node id of the paying
-    /// peer; `delta_bytes` is the bytes this voucher covers.
+    /// The `voucher_amount` is rendered as a decimal `uint256` from the
+    /// big-endian wire amount (the pool voucher's cumulative amount — its sole
+    /// ordering key, there is no nonce); `client_node_id` is the iroh node id of
+    /// the paying peer; `delta_bytes` is the bytes this voucher covers.
     pub(super) fn record_receipt(
         &self,
         hash: Hash,
         delta_bytes: u64,
         client_node_id: B256,
-        wire_nonce: [u8; 32],
+        wire_amount: [u8; 32],
     ) {
-        let voucher_nonce = U256::from_be_bytes(wire_nonce);
+        let voucher_amount = U256::from_be_bytes(wire_amount);
         let receipt = DownloadReceipt::new(
             &hash,
             delta_bytes,
             &client_node_id.0,
-            voucher_nonce,
+            voucher_amount,
             crate::payment_settlement::unix_now(),
         );
         self.receipt_sink.record(receipt);
@@ -123,10 +124,6 @@ impl ClientHandler {
             ServeRejectReason::InsufficientDeposit => {
                 self.metrics.serve_stream_rejected_insufficient_deposit();
             }
-            ServeRejectReason::CooperativeCloseSigned => {
-                self.metrics
-                    .serve_stream_rejected_cooperative_close_signed();
-            }
             ServeRejectReason::RangeNotSatisfiable => {
                 self.metrics.serve_stream_rejected_range_not_satisfiable();
             }
@@ -142,7 +139,7 @@ impl ClientHandler {
             ok: false,
             rate_per_mb,
             total_bytes: 0,
-            channel_id: req.channel_id,
+            pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
             redirect: None,
         };

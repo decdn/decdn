@@ -38,9 +38,8 @@ use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
 
 use super::{
-    Arc, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId, ChunkData,
-    ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, Ordering, RecvStream, SendStream,
-    VecDeque,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
+    LaneDeliveryState, LaneKey, MB_BYTES, Mutex, Ordering, RecvStream, SendStream, VecDeque,
 };
 
 impl ClientHandler {
@@ -81,9 +80,9 @@ impl ClientHandler {
         recv: &mut RecvStream,
         store: NodeRangedStore,
         session: Arc<FillSession>,
-        channel: &Arc<Mutex<ChannelDeliveryState>>,
+        lane: &Arc<Mutex<LaneDeliveryState>>,
         hash: Hash,
-        channel_id: ChannelId,
+        lane_key: LaneKey,
         client_node_id: B256,
         rate_per_mb: u64,
         interval_mb: u64,
@@ -111,11 +110,12 @@ impl ClientHandler {
             .unwrap_or(usize::MAX)
             .max(1);
 
-        // Read once: the funder is immutable for the channel's lifetime, and the
-        // per-boundary in-flight takedown check must not re-take the channel lock
-        // every batch to re-read it. This is the FUNDER (ADR 011 compliance),
-        // never the channel's `voucher_signer`.
-        let funder = channel.lock().await.state.client;
+        // The in-flight takedown re-check (ADR 011) keys on the pool FUNDER (the
+        // pool owner), a chain quantity (`getPool.owner`) not carried on the
+        // per-lane [`LaneState`]. E4 threads it from the cached `getPool` view;
+        // until then this leg passes `None` and relies on the open-time gates +
+        // hash-denylist re-check. BOUNDARY: E4 pool-owner threading.
+        let funder: Option<super::Address> = None;
 
         // Bytes written to the wire, and bytes an accepted voucher covered — both
         // WIRE quantities (bao content + proof, ADR 038). Their gap
@@ -215,8 +215,8 @@ impl ClientHandler {
                         recv,
                         &mut reader,
                         hash,
-                        channel_id,
-                        Some(channel),
+                        lane_key,
+                        Some(lane),
                         client_node_id,
                         rate_per_mb,
                         &deltas,
@@ -292,7 +292,7 @@ impl ClientHandler {
             // `StreamEnd`, not a reset). Abandoning the concurrent pull of the
             // taken-down blob is the pull leg's own takedown handling, reached when
             // this return drops it.
-            if collected_any && !done && self.takedown_landed(hash, Some(funder)) {
+            if collected_any && !done && self.takedown_landed(hash, funder) {
                 self.terminate_for_takedown(send, recv, hash);
                 return Ok(());
             }
