@@ -998,7 +998,7 @@ async fn build_chain_and_handlers(
     let dht_routing = dht_handler.routing_table();
 
     // `cdn/client/v1` paid-delivery handler (#317). The voucher EIP-712 domain
-    // binds to the `PaymentChannel` deployment; the ephemeral-binding
+    // binds to the `PaymentPool` deployment; the ephemeral-binding
     // domain to the `CapacityBond` deployment (== `capacity_bond_addr`,
     // which holds the NodeId↔address mappings). The handler hydrates per-channel
     // voucher state from `channel_state_store` so a restart cannot replay an
@@ -1010,7 +1010,7 @@ async fn build_chain_and_handlers(
 
     // Authoritative on-chain delivery-rate floor (#1172, ADR 019 §3.1 / ADR
     // 003). Read once at startup — a fail-fast self-check in the same spirit as
-    // `PaymentChannel.usdc()` — and seed the shared clamp created above,
+    // `PaymentPool.usdc()` — and seed the shared clamp created above,
     // replacing the config stand-in. The on-chain floor is `uint256`; the node
     // clamps in `u64`, so an out-of-range value must refuse startup rather than
     // silently truncate. The `RateBoundsUpdated` watcher spawned below keeps the
@@ -1021,7 +1021,7 @@ async fn build_chain_and_handlers(
             ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         );
         let on_chain_floor = contract.getRateBounds().call().await.with_context(|| {
-            format!("PaymentChannel.getRateBounds() startup read at {payment_pool_addr}")
+            format!("PaymentPool.getRateBounds() startup read at {payment_pool_addr}")
         })?;
         // Both rejection arms live in `rate_bounds::on_chain_floor_to_u64` so a
         // unit test can reach them; inline here they sat behind an async chain
@@ -1839,7 +1839,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .context("local reputation config invalid")?,
     );
 
-    // Buyer-side PaymentChannel bootstrap + node-to-node pull-through
+    // Buyer-side PaymentPool bootstrap + node-to-node pull-through
     // provisioning (#831), fully backgrounded off the startup critical path
     // (#1109). The USDC `approve` receipt that `bootstrap` awaits could hang for
     // many minutes on a stuck tx (now capped by `APPROVE_RECEIPT_TIMEOUT`);
@@ -1931,7 +1931,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     tracing::warn!(
                         err = %sanitize_rpc_display(&err),
                         payment_pool_addr = %payment_pool_addr_for_buyer,
-                        "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss \
+                        "buyer-side PaymentPool bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
                          This condition is sticky — restart the node to retry. Check: (1) \
                          blockchain.payment_pool_address is correct, (2) the RPC endpoint is \

@@ -663,9 +663,8 @@ impl ClientHandler {
                 })),
             );
         }
-        // Deposit is a pool-level, on-chain quantity (getPool) and no longer
-        // carried per lane, so the seller-side snapshot reports lane count only;
-        // E4 threads any deposit gauge from the buyer/pool table.
+        // Deposit is a pool-level, on-chain quantity (getPool), not carried per
+        // lane, so the seller-side snapshot reports lane count only.
         deps.metrics
             .set_inbound_channel_snapshot(map.len(), U256::ZERO);
         Ok(Self {
@@ -1038,8 +1037,8 @@ impl ClientHandler {
     async fn refresh_channel_metrics(&self) {
         let _refresh = self.channel_metrics_refresh.lock().await;
         let open = self.lanes.lock().await.len();
-        // Deposit is a pool-level, on-chain quantity (getPool) and no longer
-        // carried per lane, so the seller-side snapshot reports lane count only.
+        // Deposit is a pool-level, on-chain quantity (getPool), not carried per
+        // lane, so the seller-side snapshot reports lane count only.
         self.metrics.set_inbound_channel_snapshot(open, U256::ZERO);
     }
 }
@@ -1241,13 +1240,71 @@ impl BufferedVoucherReader {
     }
 }
 
+/// Build a `ClientHandler` over an arbitrary [`PoolStateStore`] for the
+/// sibling-module tests (e.g. `voucher.rs`'s #527 durability tests need a
+/// fault-injecting store). Kept at module level (not inside `mod tests`) so a
+/// child module's `#[cfg(test)]` can reach it as `super::handler_over_store`.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(super) async fn handler_over_store(
+    metrics: &Arc<Metrics>,
+    store: Arc<dyn PoolStateStore>,
+) -> (Arc<ClientHandler>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
+        .await
+        .expect("cache");
+    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let deps = ClientHandlerDeps::new(
+        iroh::SecretKey::generate().public(),
+        Arc::clone(metrics),
+        Arc::new(ConnectionLimiter::new(
+            &decdn_common::config::ResolvedSecurity {
+                max_concurrent_handlers: u32::MAX,
+                per_source_rate_per_sec: 1e9,
+                per_source_burst: u32::MAX,
+                max_tracked_sources: 16,
+            },
+            Arc::clone(metrics),
+        )),
+        cache,
+        Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+        domain.clone(),
+        domain.clone(),
+        domain,
+        store,
+        Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
+            crate::receipt_log::NoopReceiptLog,
+        ))) as Arc<dyn ReceiptSink>,
+        Arc::new(AtomicU64::new(1)),
+        crate::rate_bounds::RateBounds::new(0),
+        1,
+        0,
+        16,
+        Arc::new(crate::content_deny::ContentDenylist::empty()),
+        U256::ZERO,
+    );
+    let handler = ClientHandler::new(deps).expect("handler");
+    (Arc::new(handler), dir)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
-    /// Build the smallest `ClientHandler` for the handler-layer tests below.
+    /// Build the smallest `ClientHandler` for the handler-layer tests below,
+    /// seeding the floor-`M` minimum-remaining-deposit at zero.
     async fn handler_for_tests(metrics: &Arc<Metrics>) -> (Arc<ClientHandler>, tempfile::TempDir) {
+        handler_for_tests_with_floor(metrics, U256::ZERO).await
+    }
+
+    /// [`handler_for_tests`] with an explicit floor-`M` so the floor-`M` guard can
+    /// be exercised with a non-zero minimum-remaining-deposit.
+    async fn handler_for_tests_with_floor(
+        metrics: &Arc<Metrics>,
+        pool_min_remaining_deposit: U256,
+    ) -> (Arc<ClientHandler>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
             .await
@@ -1281,15 +1338,52 @@ mod tests {
             0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
-            U256::ZERO,
+            pool_min_remaining_deposit,
         );
         let handler = ClientHandler::new(deps).expect("handler");
         (Arc::new(handler), dir)
     }
 
+    /// The floor-`M` solvency arithmetic with a NON-ZERO floor `M`
+    /// (`pool_remaining_covers_window`, ADR 003 §Sizing). The node keeps serving a
+    /// pool only while its on-chain remaining minus `M` still covers the reserved
+    /// credit window; it refuses once the refundable floor would be dipped into.
+    #[tokio::test]
+    async fn pool_remaining_covers_window_reserves_the_floor_m() {
+        let metrics = Arc::new(Metrics::new());
+        // M = 1 USDC; a 1 MB window at 1 USDC/MB costs exactly 1 USDC.
+        let m = U256::from(1_000_000u64);
+        let (handler, _dir) = handler_for_tests_with_floor(&metrics, m).await;
+        let rate_per_mb = 1_000_000u64; // 1 USDC/MB
+        let window_bytes = decdn_protocol::MB_BYTES; // one MB
+        let window_cost = decdn_incentive::min_payment(window_bytes, rate_per_mb);
+        assert_eq!(window_cost, U256::from(1_000_000u64), "1 MB @ 1 USDC/MB");
+
+        // remaining just below `M + window_cost` → the window would dip into the
+        // floor → refuse.
+        let below = m + window_cost - U256::from(1u64);
+        assert!(
+            !handler.pool_remaining_covers_window(below, window_bytes, rate_per_mb),
+            "remaining under M + window cost must be refused"
+        );
+        // remaining exactly `M + window_cost` → the window is covered above the
+        // floor → serve.
+        let exact = m + window_cost;
+        assert!(
+            handler.pool_remaining_covers_window(exact, window_bytes, rate_per_mb),
+            "remaining at exactly M + window cost must be served"
+        );
+        // A pool with only the floor left (remaining == M) can never serve a
+        // non-empty window.
+        assert!(
+            !handler.pool_remaining_covers_window(m, window_bytes, rate_per_mb),
+            "remaining == M leaves nothing above the floor"
+        );
+    }
+
     /// The seller-side lane-count gauge tracks the live `lanes` map. Deposit is a
-    /// pool-level on-chain quantity (getPool) and no longer carried per lane, so
-    /// the snapshot reports the open-lane count only.
+    /// pool-level on-chain quantity (getPool), not carried per lane, so the
+    /// snapshot reports the open-lane count only.
     #[tokio::test]
     async fn lane_count_gauge_tracks_the_live_map() {
         let metrics = Arc::new(Metrics::new());

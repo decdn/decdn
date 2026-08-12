@@ -444,3 +444,127 @@ enum CommitOutcome {
     /// caller rejects the whole batch with `RetryLater`.
     StoreFailed,
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, U256};
+    use decdn_incentive::store::{PoolStateStore, StoreError};
+    use decdn_incentive::{LaneKey, LaneState};
+    use tokio::sync::Mutex;
+
+    use super::super::{LaneDeliveryState, handler_over_store};
+    use super::{CommitOutcome, StagedVoucher};
+    use crate::metrics::Metrics;
+    use decdn_cache::Hash;
+
+    /// A [`PoolStateStore`] whose `record` always fails, to drive the #527
+    /// durable-commit failure path. Reads succeed (empty) so hydration is clean.
+    #[derive(Debug)]
+    struct FailingRecordStore;
+
+    impl PoolStateStore for FailingRecordStore {
+        fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn record(&self, _state: &LaneState) -> Result<(), StoreError> {
+            Err(StoreError::Backend("injected record failure".to_string()))
+        }
+        fn forget(&self, _key: LaneKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn get(&self, _key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+            Ok(None)
+        }
+    }
+
+    /// #527: a failed durable `record` in `commit_batch` leaves the in-memory lane
+    /// state UNCHANGED and reports [`CommitOutcome::StoreFailed`] (which the batch
+    /// path turns into `RetryLater` with `committed == 0`). Serving MUST NOT
+    /// continue on un-durable state — a restart would otherwise reopen the
+    /// voucher-replay window.
+    #[tokio::test]
+    async fn store_failure_rejects_batch_with_retry_later_no_state_advance() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_over_store(
+            &metrics,
+            Arc::new(FailingRecordStore) as Arc<dyn PoolStateStore>,
+        )
+        .await;
+
+        let lane_key = LaneKey {
+            pool_id: alloy::primitives::B256::repeat_byte(0x33),
+            signer: Address::repeat_byte(0x44),
+            provider: Address::repeat_byte(0x55),
+        };
+        // Seed the live lane at amount/bytes zero.
+        let seed = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::from(1_000_000u64), // cap
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState {
+            state: seed,
+            bytes_delivered_cumulative: U256::ZERO,
+        }));
+        handler
+            .lanes
+            .lock()
+            .await
+            .insert(lane_key, Arc::clone(&lane));
+
+        // An advanced candidate the commit would swap in on success.
+        let candidate = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::from(1_000_000u64),
+            0,
+            U256::from(500u64),
+            U256::from(500u64),
+            Some([7u8; 65]),
+        );
+        let staged = vec![StagedVoucher {
+            delta_bytes: 500,
+            amount: U256::from(500u64).to_be_bytes(),
+        }];
+
+        let guard = lane.lock().await;
+        let outcome = handler
+            .commit_batch(
+                guard,
+                lane_key,
+                Hash::from_bytes([9u8; 32]),
+                alloy::primitives::B256::repeat_byte(0x66),
+                candidate,
+                U256::from(500u64),
+                &staged,
+            )
+            .await
+            .expect("commit_batch returns Ok(StoreFailed), never Err, on a store fault");
+        assert!(
+            matches!(outcome, CommitOutcome::StoreFailed),
+            "a record failure must surface as StoreFailed"
+        );
+
+        // The in-memory lane state did NOT advance past the seed.
+        let after = lane.lock().await;
+        assert_eq!(
+            after.state.last_amount(),
+            U256::ZERO,
+            "the committed watermark must stay at the seed after a store failure"
+        );
+        assert_eq!(
+            after.bytes_delivered_cumulative,
+            U256::ZERO,
+            "the cumulative byte counter must not advance on an un-durable batch"
+        );
+    }
+}

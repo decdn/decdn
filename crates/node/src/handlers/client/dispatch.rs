@@ -121,10 +121,9 @@ impl ClientHandler {
         };
 
         // Stream-cap exhausted: reset the stream with no signed response.
-        // Signing a `StreamResponse` (or a cooperative-close waiver) per rejected
-        // request would let a request flood amplify into CPU exhaustion (an ECDSA
-        // signature per reject) — the cap exists to shed load, not to add work to
-        // the reject path.
+        // Signing a `StreamResponse` per rejected request would let a request
+        // flood amplify into CPU exhaustion (an ECDSA signature per reject) — the
+        // cap exists to shed load, not to add work to the reject path.
         if permit.is_none() {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(());
@@ -178,11 +177,10 @@ impl ClientHandler {
         // caller having priced the request exactly once.
         //
         // Deliberately BELOW the binding block. Every exit above this point — a
-        // first-message read error, the stream-cap shed, a cooperative close, a
-        // malformed binding — returns without signing a `StreamResponse`, so none
-        // of them ever quotes a rate, and pricing them would meter a clamp for a
-        // request that never had a price. (The cooperative close does sign: an
-        // EIP-712 waiver, which carries no rate.)
+        // first-message read error, the stream-cap shed, a malformed binding —
+        // returns without signing a `StreamResponse`, so none of them ever quotes
+        // a rate, and pricing them would meter a clamp for a request that never
+        // had a price.
         let rate_per_mb = self.clamped_rate();
 
         // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval

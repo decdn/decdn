@@ -153,11 +153,11 @@ impl ClientHandler {
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the
     /// stream **cleanly** — no QUIC reset — so the client can read the reason
     /// (ADR 005 §`VoucherRejected` semantics). `bundle` is the wallet-less
-    /// resume watermark (issue #1481): callers pass `Some` only for the four
-    /// gated regression/exhaustion reasons, and only after verifying the
-    /// rejected voucher's signature recovered to the channel's pinned
-    /// `voucher_signer` — this method does not re-derive or re-check that
-    /// gate, it trusts the caller.
+    /// resume watermark (issue #1481): callers pass `Some` only for the three
+    /// watermark-gated regression/exhaustion reasons (`AmountRegression`,
+    /// `BytesRegression`, `CapExceeded`), and only after verifying the rejected
+    /// voucher's signature recovered to the lane's pinned `signer` — this method
+    /// does not re-derive or re-check that gate, it trusts the caller.
     pub(super) async fn write_reject(
         &self,
         send: &mut SendStream,

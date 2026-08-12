@@ -1104,6 +1104,7 @@ impl KeyedCheckpointStore for PersistentPoolStateStore {
 mod tests {
     use super::*;
     use alloy::primitives::{address, b256};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn data_dir() -> anyhow::Result<TempDir> {
@@ -1134,6 +1135,60 @@ mod tests {
             U256::from(byte) * U256::from(1_024u64),
             Some([byte; 65]),
         )
+    }
+
+    /// The capability store round-trips: what the seller intake persists via
+    /// [`CapabilitySink::store_capability`] is exactly what the redeemer reads
+    /// through [`StoredCapabilitySource`], and a `(pool_id, signer)` with no
+    /// stored capability yields `None` (so the redeemer safely skips it).
+    #[test]
+    fn capability_store_round_trips_and_missing_is_none() -> anyhow::Result<()> {
+        use crate::payment_settlement::CapabilitySource;
+
+        let dir = data_dir()?;
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        let pool_id = b256!("00000000000000000000000000000000000000000000000000000000000000a7");
+        let signer = address!("00000000000000000000000000000000000000b5");
+        let provider = address!("00000000000000000000000000000000000000c9");
+        let owner_sig = vec![0x42u8; 65];
+        let spending_cap = U256::from(5_000_000u64);
+        let expiry = 1_950_000_000u64;
+
+        // A signer with nothing persisted yields None.
+        let source = StoredCapabilitySource::new(Arc::clone(&store));
+        let empty_key = LaneKey {
+            pool_id,
+            signer,
+            provider,
+        };
+        anyhow::ensure!(source.registration_material(&empty_key).is_none());
+
+        // Persist through the write trait, read back through the source.
+        CapabilitySink::store_capability(
+            store.as_ref(),
+            pool_id,
+            signer,
+            spending_cap,
+            expiry,
+            &owner_sig,
+        )?;
+        let material = source
+            .registration_material(&empty_key)
+            .ok_or_else(|| anyhow::anyhow!("expected stored capability material"))?;
+        anyhow::ensure!(material.spending_cap == spending_cap);
+        anyhow::ensure!(material.expiry == expiry);
+        anyhow::ensure!(material.owner_sig.as_ref() == owner_sig.as_slice());
+
+        // The provider segment of the lane key is ignored (capability is keyed by
+        // (pool_id, signer)): a different provider under the same signer still
+        // resolves the same material.
+        let other_provider_key = LaneKey {
+            pool_id,
+            signer,
+            provider: address!("00000000000000000000000000000000000000ff"),
+        };
+        anyhow::ensure!(source.registration_material(&other_provider_key).is_some());
+        Ok(())
     }
 
     #[test]

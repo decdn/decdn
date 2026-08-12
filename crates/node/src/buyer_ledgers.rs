@@ -127,7 +127,8 @@ mod tests {
         );
     }
 
-    /// A rotated pool gets its own ledger — the old one can sign nothing.
+    /// Each pool id keys its own ledger, so a different pool addresses a distinct
+    /// entry rather than sharing the incumbent's.
     #[test]
     fn a_rotated_pool_gets_a_fresh_ledger() {
         let ledgers = BuyerLedgers::default();
@@ -168,8 +169,8 @@ mod tests {
         let ledgers = BuyerLedgers::default();
         // The live lane, held by a concurrent pull (so its `Arc` outlives the map entry).
         let live = ledgers.get_or_seed(lane(10, 1), seed_at(5));
-        // A late call with a STALE pool: under the old provider-key this evicted pool 10's
-        // ledger; keyed by `LaneKey` it just addresses pool 9's own entry.
+        // A late call with a STALE pool: keyed by `LaneKey`, it addresses pool 9's
+        // own entry and never touches pool 10's live ledger.
         let _stale = ledgers.get_or_seed(lane(9, 1), seed_at(0));
         // pool 10's live ledger survives — a subsequent pull on it rejoins the SAME Arc.
         let rejoined = ledgers.get_or_seed(lane(10, 1), seed_at(0));
