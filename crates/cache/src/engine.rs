@@ -28,7 +28,7 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
-use crate::fill_session::{FillClaim, FillPlan, FillRegistry, FillSession, ObserverLease};
+use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
@@ -269,12 +269,12 @@ struct Inner {
     /// reading party.
     #[allow(dead_code)]
     gc_store_handle: Option<Arc<OnceLock<FsStore>>>,
-    /// Range-aware in-flight fill registry (#1621 B3.2). Coalesces concurrent
+    /// Range-aware in-flight fill registry (ADR 038). Coalesces concurrent
     /// serve-misses for the same hash: a request whose range an in-flight pull
-    /// already covers attaches an observer instead of opening a duplicate pull.
-    /// Purely synchronous range math; holds no blob bytes. Consulted by
-    /// [`CacheEngine::fill_plan`] and populated by [`CacheEngine::register_fill`]
-    /// (the live-pull wiring lands in B3.4).
+    /// already covers attaches an observer instead of opening a duplicate pull,
+    /// and a partial overlap opens a pull for only its remainder. Also holds the
+    /// per-hash captured outboard every serve leg reads. Purely synchronous range
+    /// math; holds no blob bytes. Driven through [`CacheEngine::claim_fill`].
     fill_registry: Arc<FillRegistry>,
 }
 
@@ -1038,16 +1038,6 @@ impl CacheEngine {
         })
     }
 
-    /// Plan a serve-miss of `[offset, offset+len)` (`len == 0` = to end) of the
-    /// `total`-byte blob `hash` against the in-flight fills: split it into `attach`
-    /// (an in-flight pull already covers these bytes — attach an observer) and
-    /// `remainder` (fetch these). See [`FillRegistry::fill_plan`]. The live-pull
-    /// wiring that consumes this lands in B3.4.
-    #[must_use]
-    pub fn fill_plan(&self, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
-        self.inner.fill_registry.fill_plan(hash, offset, len, total)
-    }
-
     /// Peek the in-flight fill registry for a LIVE fill of `hash`, returning its
     /// blob `total_bytes` if one runs. ADVISORY: the serve-miss path uses it to skip
     /// the upstream header handshake when it will coalesce onto a live pull, but the
@@ -1058,20 +1048,15 @@ impl CacheEngine {
         self.inner.fill_registry.in_flight_total(hash)
     }
 
-    /// Publish a new pull's [`FillSession`] (already scoped via
-    /// [`FillSession::set_covered`]) so later serve-misses can coalesce onto it,
-    /// returning the owner [`ObserverLease`]. See [`FillRegistry::register_fill`].
-    pub fn register_fill(&self, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
-        self.inner.fill_registry.register_fill(hash, session)
-    }
-
     /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
-    /// of the `total`-byte blob `hash`: decide attach-vs-own AND register under one
-    /// map-lock acquisition, closing the [`Self::fill_plan`] + [`Self::register_fill`]
-    /// TOCTOU race. Returns [`FillClaim::Attach`] to coalesce onto a live pull (no new
-    /// pull) or [`FillClaim::Owner`] with a freshly-registered session the caller must
-    /// drive a pull for. `make_session` builds the session only on the owner branch
-    /// (never built-and-dropped on attach). See [`FillRegistry::claim`].
+    /// of the `total`-byte blob `hash`: decide attach/own/mixed AND register any new
+    /// owner session under one map-lock acquisition (no plan-then-register TOCTOU
+    /// race). Returns [`FillClaim::Attach`] to coalesce wholly onto a live pull,
+    /// [`FillClaim::Owner`] with a freshly-registered session covering the whole
+    /// request, or [`FillClaim::Mixed`] to own a pull for a contiguous remainder while
+    /// attaching a sibling for the overlap. `make_session` builds the session only on
+    /// an owning branch (never built-and-dropped on a pure attach). See
+    /// [`FillRegistry::claim`].
     pub fn claim_fill(
         &self,
         hash: Hash,

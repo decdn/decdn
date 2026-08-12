@@ -17,14 +17,29 @@
 //! So the cache keeps its own copy, captured as each range admits (the pull leg
 //! already receives those exact proof nodes in the verified upstream bao it ingests,
 //! and the cache's `admit_bao_stream` captures them via [`FillSession::capture`] into
-//! this whole-tree buffer). The serve leg reads them through a
-//! [`SessionOutboardReader`], whose [`Outboard::load`] AWAITS a node that has not been
-//! captured yet — racing the pull's terminal signal so a pull that fails (or a
-//! genuinely missing node after a clean pull) fails the serve rather than hanging.
+//! a whole-tree buffer). The serve leg reads them through a [`SessionOutboardReader`],
+//! whose [`Outboard::load`] AWAITS a node that has not been captured yet — racing the
+//! registry-wide fill liveness so a fill that dies (or a genuinely missing node after
+//! a clean pull) fails the serve rather than hanging.
 //!
-//! Because the pull admits front-to-back and the first admit carries the whole
-//! right-spine down to the first gap, every node the encoder needs is captured by
-//! an admit that has already happened by the time the encoder reaches it.
+//! # The outboard is per-HASH, shared by every fill of that hash
+//!
+//! A blob is BLAKE3-addressed, so its tree geometry — and thus every captured
+//! `(left, right)` node — is a property of the HASH, not of any single pull. When two
+//! serve-misses want overlapping bytes of one hash, one opens a pull for its
+//! remainder and the other for its own; both admit into the SAME store and each admit
+//! captures proof nodes into the ONE per-hash [`HashOutboard`]. Because
+//! `attach ∪ remainder = R` by construction, the two pulls together capture every
+//! proof node a coherent encode of `R` needs, into that single buffer. A serve leg
+//! reading `R` therefore does not care which pull filled what — it reads the shared
+//! per-hash outboard and the source-agnostic present-range watch.
+//!
+//! The one thing that must generalize past a single pull is termination: "await this
+//! node, or fail" has to consult ALL live fills whose `covered` ranges intersect the
+//! node's byte span, not one pull's terminal signal. [`FillSession::range_still_live`]
+//! (backed by [`FillRegistry::range_still_live`]) answers exactly that — it fails a
+//! parked reader iff no live session's `covered` still intersects the range, which is
+//! the N-fill generalization of the single-pull failure race.
 //!
 //! # Ownership seam (cache owns the structure, the node drives it)
 //!
@@ -36,7 +51,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak};
 
 use bao_tree::io::fsm::Outboard;
 use bao_tree::{BaoTree, BlockSize, ChunkRanges, TreeNode, blake3};
@@ -54,6 +69,9 @@ const IROH_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
 
 /// Bytes per outboard node (a `(left, right)` blake3 hash pair).
 const HASH_PAIR_BYTES: usize = 64;
+
+/// Bytes per bao chunk (the `ChunkNum` unit). `ChunkNum(n)` starts at `n * 1024`.
+const CHUNK_BYTES: u64 = 1024;
 
 /// A flattened terminal error for a fill: the node's pull leg records why its pull
 /// ended, and the serve-side [`SessionOutboardReader`] / data reader surface it.
@@ -89,27 +107,110 @@ struct OutboardState {
     captured: Vec<bool>,
 }
 
-/// One in-flight fill of a `total_bytes`-byte blob rooted at `root`.
-///
-/// Holds the shared whole-tree outboard (captured by the cache admit path via
-/// [`Self::capture`], read by [`SessionOutboardReader`]), the pull's terminal
-/// outcome ([`Self::mark_ended`] / [`Self::outcome`]), and the shared downstream
-/// paid frontier the pull leg paces against ([`Self::served_frontier`] /
-/// [`Self::served_advanced`]). Shared behind an `Arc`; every field is
-/// interior-mutable, so both legs hold `Arc<FillSession>` and coordinate on it.
+/// The captured whole-tree outboard for ONE hash, shared by every [`FillSession`]
+/// that fills that hash. A blob's tree geometry is fixed by its BLAKE3 root, so a
+/// node captured by any pull — of any range, from any source — is valid for every
+/// serve leg reading that hash. The registry keys exactly one of these per hash and
+/// every session for the hash references it, which is what makes partial-overlap
+/// proof-sourcing free: pull A (admitting `attach`) and pull B (admitting
+/// `remainder`) capture into the same buffer, and a serve leg for `R = attach ∪
+/// remainder` reads every node either supplied.
 #[derive(Debug)]
-pub struct FillSession {
+pub struct HashOutboard {
     tree: BaoTree,
     root: blake3::Hash,
     state: StdMutex<OutboardState>,
     /// Notified after every [`Self::capture`] so a parked [`Outboard::load`]
     /// re-checks. Runtime-agnostic, so it crosses the pull/serve runtimes safely.
-    advanced: Notify,
+    captured: Notify,
+    /// Notified when ANY session for this hash ends or is cancelled, so a parked
+    /// reader re-checks [`FillRegistry::range_still_live`] and fails a range no live
+    /// pull will fill. Shared as an `Arc` so a data reader on the node side can hold
+    /// an owned handle without naming this cache-private type.
+    liveness: Arc<Notify>,
+}
+
+impl HashOutboard {
+    /// Build the empty outboard for a `total_bytes`-byte blob rooted at `root`.
+    #[must_use]
+    fn new(root: blake3::Hash, total_bytes: u64) -> Arc<Self> {
+        let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
+        let size = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
+        let nodes = size / HASH_PAIR_BYTES;
+        Arc::new(Self {
+            tree,
+            root,
+            state: StdMutex::new(OutboardState {
+                bytes: vec![0u8; size],
+                captured: vec![false; nodes],
+            }),
+            captured: Notify::new(),
+            liveness: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Capture one internal node's `(left, right)` hash pair. Idempotent: re-saving
+    /// a node (a re-admitted range) overwrites with the same bytes and re-notifies,
+    /// which is harmless. A `node` with no outboard slot (a leaf) is ignored.
+    fn capture(&self, node: TreeNode, pair: (blake3::Hash, blake3::Hash)) {
+        let Some(offset) = self.tree.pre_order_offset(node) else {
+            return; // leaf: no hash pair in the outboard
+        };
+        let idx = usize::try_from(offset).unwrap_or(usize::MAX);
+        let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let (l, r) = pair;
+            if let Some(slot) = state.bytes.get_mut(byte_off..byte_off + HASH_PAIR_BYTES)
+                && let Some((left, right)) = slot.split_at_mut_checked(32)
+            {
+                left.copy_from_slice(l.as_bytes());
+                right.copy_from_slice(r.as_bytes());
+            }
+            if let Some(flag) = state.captured.get_mut(idx) {
+                *flag = true;
+            }
+        }
+        self.captured.notify_waiters();
+    }
+
+    /// Read node `idx`'s captured pair, or `None` if not captured yet. Never holds
+    /// the lock across an await.
+    fn try_load(&self, idx: usize) -> Option<(blake3::Hash, blake3::Hash)> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.captured.get(idx).copied() != Some(true) {
+            return None;
+        }
+        let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
+        let slot = state.bytes.get(byte_off..byte_off + HASH_PAIR_BYTES)?;
+        let (l, r) = slot.split_at_checked(32)?;
+        let left: [u8; 32] = l.try_into().ok()?;
+        let right: [u8; 32] = r.try_into().ok()?;
+        Some((blake3::Hash::from(left), blake3::Hash::from(right)))
+    }
+}
+
+/// One in-flight fill of a `total_bytes`-byte blob rooted at `root`.
+///
+/// Holds a reference to the per-hash [`HashOutboard`] (captured by the cache admit
+/// path via [`Self::capture`], read by [`SessionOutboardReader`]), the pull's
+/// terminal outcome ([`Self::mark_ended`] / [`Self::outcome`]), the ranges this fill
+/// covers ([`Self::set_covered`]), and the shared downstream paid frontier the pull
+/// leg paces against ([`Self::served_frontier`] / [`Self::served_advanced`]). Shared
+/// behind an `Arc`; every field is interior-mutable, so both legs hold
+/// `Arc<FillSession>` and coordinate on it.
+#[derive(Debug)]
+pub struct FillSession {
+    /// The per-hash captured outboard. A freshly built session starts with its own,
+    /// but registration ([`FillRegistry::register_fill`] / [`FillRegistry::claim`])
+    /// swaps in the hash's canonical one via [`Self::adopt_outboard`], so all
+    /// sessions for a hash — and every reader they mint — share the ONE buffer. The
+    /// swap runs under the registry lock before the session is handed to a pull leg
+    /// or a serve leg, so no capture or read observes a stale outboard.
+    outboard: StdMutex<Arc<HashOutboard>>,
     /// The pull leg's terminal outcome — `None` while running, `Some(Ok)` on a
     /// clean end, `Some(Err)` on a failure.
     ended: StdMutex<Option<Result<(), FillError>>>,
-    /// Fired by [`Self::mark_ended`] so a parked reader / data reader re-checks.
-    ended_notify: Notify,
     /// The client's PAID content frontier: the serve leg stores it after each
     /// voucher batch commits, the pull leg's `WindowPacer` reads it to bound
     /// `pulled − served_paid ≤ window`. An `Arc` so a pull leg on its own runtime
@@ -119,11 +220,11 @@ pub struct FillSession {
     /// exactly when a downstream voucher clears.
     served_paid_advanced: Arc<Notify>,
     /// The chunk ranges THIS fill will produce — exactly the bytes this pull
-    /// fetches (its `missing_ranges ∩ R`). [`FillRegistry::fill_plan`] intersects a
-    /// serve-miss range against the union of all live sessions' `covered` to decide
-    /// `attach` / `remainder`. Set at registration via [`Self::set_covered`];
-    /// defaults to [`ChunkRanges::all`] so a session built but not yet range-scoped
-    /// coalesces conservatively.
+    /// fetches (its `missing_ranges ∩ R`). [`FillRegistry::range_still_live`]
+    /// intersects a reader's node range against the union of all live sessions'
+    /// `covered` to decide whether to keep awaiting or fail. Set at registration via
+    /// [`Self::set_covered`]; defaults to [`ChunkRanges::all`] so a session built but
+    /// not yet range-scoped coalesces conservatively.
     covered: StdMutex<ChunkRanges>,
     /// Live observer count: the pull owner plus every serve leg attached to this
     /// fill. An [`ObserverLease`] increments on attach and decrements on drop; when
@@ -134,6 +235,12 @@ pub struct FillSession {
     /// node's pull leg selects on it to abort ingest; the tagged partial persists
     /// for a later resume.
     cancel: CancellationToken,
+    /// A back-link to the owning registry + this session's hash, set once at
+    /// registration ([`Self::bind_registry`]). It lets a reader consult ALL
+    /// live sessions for the hash via [`FillRegistry::range_still_live`]. A session
+    /// built standalone (in tests) leaves this unset and falls back to its own
+    /// single-fill liveness — correct, because a standalone session is the only fill.
+    registry: OnceLock<(Weak<FillRegistry>, Hash)>,
     /// The node's pull-thread [`JoinHandle`](std::thread::JoinHandle), parked here by
     /// the owner right after it spawns the pull, so whichever observer leaves LAST
     /// joins it. That frees an owner whose OWN client finishes first from parking in
@@ -147,41 +254,32 @@ pub struct FillSession {
 impl FillSession {
     /// Construct the fill session for a `total_bytes`-byte blob rooted at `root`.
     /// The served frontier starts at 0; the orchestration seeds it to the request's
-    /// content start before either leg streams.
+    /// content start before either leg streams. The session starts with a private
+    /// per-hash outboard, replaced by the registry's canonical one at registration.
     #[must_use]
     pub fn new(root: blake3::Hash, total_bytes: u64) -> Arc<Self> {
-        let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
-        let size = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
-        let nodes = size / HASH_PAIR_BYTES;
         Arc::new(Self {
-            tree,
-            root,
-            state: StdMutex::new(OutboardState {
-                bytes: vec![0u8; size],
-                captured: vec![false; nodes],
-            }),
-            advanced: Notify::new(),
+            outboard: StdMutex::new(HashOutboard::new(root, total_bytes)),
             ended: StdMutex::new(None),
-            ended_notify: Notify::new(),
             served_paid: Arc::new(AtomicU64::new(0)),
             served_paid_advanced: Arc::new(Notify::new()),
             covered: StdMutex::new(ChunkRanges::all()),
             observers: AtomicUsize::new(0),
             cancel: CancellationToken::new(),
+            registry: OnceLock::new(),
             pull_thread: StdMutex::new(None),
         })
     }
 
     /// Park the owner's pull-thread handle on the session so whichever observer leaves
-    /// LAST joins it. Called once, on the owner branch, right after the pull thread is
-    /// spawned. The attach path never calls this — it drives no pull of its own.
+    /// LAST joins it. Called once, on an owning branch, right after the pull thread is
+    /// spawned. The pure-attach path never calls this — it drives no pull of its own.
     ///
-    /// Refuses to overwrite an already-parked handle: a session has exactly one owner
-    /// (`FillRegistry::claim` returns one `Owner`), so a second park cannot happen —
-    /// but if a future regression called this twice, overwriting would DROP the first
-    /// handle and detach its thread, orphaning a pull that keeps paying/draining. So
-    /// keep the first (the one the last-out observer will join) and `debug_assert` the
-    /// double-park loudly in tests/dev.
+    /// Refuses to overwrite an already-parked handle: a session has exactly one owning
+    /// pull, so a second park cannot happen — but if a future regression called this
+    /// twice, overwriting would DROP the first handle and detach its thread, orphaning
+    /// a pull that keeps paying/draining. So keep the first (the one the last-out
+    /// observer will join) and `debug_assert` the double-park loudly in tests/dev.
     pub fn set_pull_handle(&self, handle: std::thread::JoinHandle<()>) {
         let mut slot = self
             .pull_thread
@@ -207,8 +305,32 @@ impl FillSession {
             .take()
     }
 
+    /// The per-hash outboard this session currently references. Cloned out (a cheap
+    /// `Arc` bump) rather than borrowed, so the swap lock is never held across a
+    /// capture or a read.
+    fn outboard(&self) -> Arc<HashOutboard> {
+        self.outboard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Adopt the hash's canonical outboard (shared with sibling sessions). Called
+    /// once, under the registry lock, before this session drives a pull or mints a
+    /// reader — so every later capture / read lands in the one shared buffer.
+    fn adopt_outboard(&self, shared: Arc<HashOutboard>) {
+        *self.outboard.lock().unwrap_or_else(PoisonError::into_inner) = shared;
+    }
+
+    /// Bind this session to its registry + hash, so a reader it mints can ask the
+    /// registry which live fills still cover a range. Called once at registration.
+    fn bind_registry(&self, registry: Weak<FillRegistry>, hash: Hash) {
+        let _ = self.registry.set((registry, hash));
+    }
+
     /// Set the chunk ranges this fill will produce. Called once at registration,
-    /// before the pull streams — the registry reads it to plan observer attach.
+    /// before the pull streams — the registry reads it to plan observer attach and
+    /// to answer [`Self::range_still_live`].
     pub fn set_covered(&self, covered: ChunkRanges) {
         *self.covered.lock().unwrap_or_else(PoisonError::into_inner) = covered;
     }
@@ -226,7 +348,7 @@ impl FillSession {
     /// already knows the geometry from its `BaoTree`.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
-        self.tree.size()
+        self.outboard().tree.size()
     }
 
     /// The live observer count (pull owner + attached serve legs).
@@ -250,18 +372,21 @@ impl FillSession {
 
     /// Whether this session is dead: the pull has recorded a terminal outcome, or
     /// the fill was cancelled because its last observer left. A dead session must
-    /// not block a fresh pull ([`FillRegistry::fill_plan`] excludes its `covered`
-    /// from the union) and must not be an attach target.
+    /// not block a fresh pull (its `covered` is excluded from the coverage union)
+    /// and must not be an attach target.
     #[must_use]
     fn is_dead(&self) -> bool {
         self.outcome().is_some() || self.cancel.is_cancelled()
     }
 
-    /// Mint a serve-side [`SessionOutboardReader`] over this session's outboard.
+    /// Mint a serve-side [`SessionOutboardReader`] over this hash's shared outboard.
+    /// The reader snapshots the (already-adopted) outboard and holds this session so
+    /// its termination race can reach the registry.
     #[must_use]
     pub fn outboard_reader(self: &Arc<Self>) -> SessionOutboardReader {
         SessionOutboardReader {
             session: Arc::clone(self),
+            outboard: self.outboard(),
         }
     }
 
@@ -277,47 +402,53 @@ impl FillSession {
         &self.served_paid_advanced
     }
 
-    /// The signal fired when the pull leg terminates ([`Self::mark_ended`]). A
-    /// serve-side reader registers a waiter on it BEFORE inspecting [`Self::outcome`]
-    /// so a terminal outcome recorded concurrently cannot slip past the check.
+    /// The per-hash liveness signal, notified whenever any session for this hash
+    /// ends or is cancelled. A serve-side data reader awaits it (alongside the
+    /// present-range watch) so a range no live pull will fill fails the read rather
+    /// than hanging. Handed out as an owned `Arc<Notify>` so the node's data reader
+    /// need not name the cache-private [`HashOutboard`].
     #[must_use]
-    pub const fn ended_signal(&self) -> &Notify {
-        &self.ended_notify
+    pub fn liveness_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.outboard().liveness)
     }
 
-    /// Capture one internal node's `(left, right)` hash pair. Idempotent: re-saving
-    /// a node (a re-admitted range) overwrites with the same bytes and re-notifies,
-    /// which is harmless. A `node` with no outboard slot (a leaf) is ignored.
-    pub fn capture(&self, node: TreeNode, pair: (blake3::Hash, blake3::Hash)) {
-        let Some(offset) = self.tree.pre_order_offset(node) else {
-            return; // leaf: no hash pair in the outboard
-        };
-        let idx = usize::try_from(offset).unwrap_or(usize::MAX);
-        let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let (l, r) = pair;
-            if let Some(slot) = state.bytes.get_mut(byte_off..byte_off + HASH_PAIR_BYTES)
-                && let Some((left, right)) = slot.split_at_mut_checked(32)
-            {
-                left.copy_from_slice(l.as_bytes());
-                right.copy_from_slice(r.as_bytes());
-            }
-            if let Some(flag) = state.captured.get_mut(idx) {
-                *flag = true;
-            }
+    /// Whether any LIVE fill of this hash still covers `range`, so a not-yet-present
+    /// node / leaf in `range` may still be filled. A registry-bound session consults
+    /// EVERY live session for the hash (the N-fill generalization); a standalone
+    /// session (unregistered, in tests) is the only fill, so it answers from its own
+    /// liveness. Returns `false` when nothing live covers `range` — the caller then
+    /// fails the read instead of hanging.
+    #[must_use]
+    pub fn range_still_live(&self, range: &ChunkRanges) -> bool {
+        match self.registry.get() {
+            Some((weak, hash)) => match weak.upgrade() {
+                Some(registry) => registry.range_still_live(*hash, range),
+                // The registry (the whole cache) is gone; nothing can fill anything.
+                None => false,
+            },
+            // Standalone: this session is the only fill, so its liveness decides.
+            None => !self.is_dead() && !(&self.covered_ranges() & range).is_empty(),
         }
-        self.advanced.notify_waiters();
     }
 
-    /// Record the pull leg's terminal outcome and wake any parked reader. Idempotent
+    /// Capture one internal node's `(left, right)` hash pair into the per-hash
+    /// outboard. Idempotent; a leaf (no outboard slot) is ignored. Every
+    /// `admit_bao_stream` for the hash, from any pull or source, calls this — so the
+    /// one shared buffer accumulates the whole tree's proof.
+    pub fn capture(&self, node: TreeNode, pair: (blake3::Hash, blake3::Hash)) {
+        self.outboard().capture(node, pair);
+    }
+
+    /// Record the pull leg's terminal outcome and wake parked readers. Idempotent
     /// on the wake; the outcome is set once by the pull leg on its single exit.
+    /// Fires the per-hash liveness so a reader awaiting a range this fill covered
+    /// re-checks [`Self::range_still_live`] at once.
     pub fn mark_ended(&self, result: Result<(), FillError>) {
         {
             let mut guard = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
             *guard = Some(result);
         }
-        self.ended_notify.notify_waiters();
+        self.outboard().liveness.notify_waiters();
     }
 
     /// The pull leg's terminal outcome, if it has ended: `Some(Ok)` clean,
@@ -329,106 +460,106 @@ impl FillSession {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
-
-    /// Read node `idx`'s captured pair, or `None` if not captured yet. Never holds
-    /// the lock across an await.
-    fn try_load(&self, idx: usize) -> Option<(blake3::Hash, blake3::Hash)> {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.captured.get(idx).copied() != Some(true) {
-            return None;
-        }
-        let byte_off = idx.saturating_mul(HASH_PAIR_BYTES);
-        let slot = state.bytes.get(byte_off..byte_off + HASH_PAIR_BYTES)?;
-        let (l, r) = slot.split_at_checked(32)?;
-        let left: [u8; 32] = l.try_into().ok()?;
-        let right: [u8; 32] = r.try_into().ok()?;
-        Some((blake3::Hash::from(left), blake3::Hash::from(right)))
-    }
 }
 
-/// Serve-side [`Outboard`] over a [`FillSession`]'s captured proof nodes. Its
-/// [`Outboard::load`] awaits a not-yet-captured node, racing the pull's terminal
-/// outcome for the no-hang guarantee. Minted via [`FillSession::outboard_reader`].
+/// Serve-side [`Outboard`] over a hash's shared [`HashOutboard`]. Its
+/// [`Outboard::load`] awaits a not-yet-captured node, racing the registry-wide fill
+/// liveness for the no-hang guarantee: it fails iff no live fill still covers the
+/// node's byte range. Minted via [`FillSession::outboard_reader`].
 #[derive(Debug)]
 pub struct SessionOutboardReader {
     session: Arc<FillSession>,
+    /// The shared per-hash outboard, snapshot at mint (after the session adopted the
+    /// canonical one), so every `load` reads whatever any pull for the hash captured.
+    outboard: Arc<HashOutboard>,
+}
+
+impl SessionOutboardReader {
+    /// The terminal error for a node no live fill will supply: a precise message
+    /// when this session's own pull ended (the standalone / single-fill case), a
+    /// generic one when the covering fills were siblings.
+    fn dead_range_error(&self, node: TreeNode) -> io::Error {
+        match self.session.outcome() {
+            Some(Err(msg)) => io::Error::other(format!(
+                "upstream pull failed before supplying outboard node {node:?}: {msg}"
+            )),
+            Some(Ok(())) => io::Error::other(format!(
+                "upstream pull completed but outboard node {node:?} was never captured"
+            )),
+            None => io::Error::other(format!(
+                "no live fill covers outboard node {node:?}; every covering pull ended"
+            )),
+        }
+    }
 }
 
 impl Outboard for SessionOutboardReader {
     fn root(&self) -> blake3::Hash {
-        self.session.root
+        self.outboard.root
     }
 
     fn tree(&self) -> BaoTree {
-        self.session.tree
+        self.outboard.tree
     }
 
     async fn load(&mut self, node: TreeNode) -> io::Result<Option<(blake3::Hash, blake3::Hash)>> {
-        let Some(offset) = self.session.tree.pre_order_offset(node) else {
+        let Some(offset) = self.outboard.tree.pre_order_offset(node) else {
             return Ok(None); // leaf: bao_tree sources this from the data reader
         };
         let idx = usize::try_from(offset).unwrap_or(usize::MAX);
+        let node_range = ChunkRanges::from(node.chunk_range());
         loop {
             // Register the wakers BEFORE inspecting shared state, so a capture /
-            // pull-end recorded concurrently cannot slip between the check and the
+            // fill-end recorded concurrently cannot slip between the check and the
             // await.
-            let advanced = self.session.advanced.notified();
-            let ended = self.session.ended_signal().notified();
-            tokio::pin!(advanced);
-            tokio::pin!(ended);
-            advanced.as_mut().enable();
-            ended.as_mut().enable();
+            let captured = self.outboard.captured.notified();
+            let liveness = self.outboard.liveness.notified();
+            tokio::pin!(captured);
+            tokio::pin!(liveness);
+            captured.as_mut().enable();
+            liveness.as_mut().enable();
 
-            if let Some(pair) = self.session.try_load(idx) {
+            if let Some(pair) = self.outboard.try_load(idx) {
                 return Ok(Some(pair));
             }
 
-            // Not captured yet. If the pull has ended, decide now: a failure fails the
-            // serve; a clean end means every proof node was supplied, so one more check
-            // settles it — a still-missing node is a genuine inconsistency, not a wait.
-            if let Some(outcome) = self.session.outcome() {
-                if let Some(pair) = self.session.try_load(idx) {
+            // Not captured yet. If no live fill still covers this node's range, the
+            // proof node will never arrive — decide now. A clean end may lag one
+            // capture behind the outcome, so re-check once before failing.
+            if !self.session.range_still_live(&node_range) {
+                if let Some(pair) = self.outboard.try_load(idx) {
                     return Ok(Some(pair));
                 }
-                return match outcome {
-                    Err(msg) => Err(io::Error::other(format!(
-                        "upstream pull failed before supplying outboard node {node:?}: {msg}"
-                    ))),
-                    Ok(()) => Err(io::Error::other(format!(
-                        "upstream pull completed but outboard node {node:?} was never captured"
-                    ))),
-                };
+                return Err(self.dead_range_error(node));
             }
 
-            // Await the next capture or the pull ending, then re-check.
+            // Await the next capture or a liveness change, then re-check.
             tokio::select! {
                 biased;
-                () = ended.as_mut() => {}
-                () = advanced.as_mut() => {}
+                () = liveness.as_mut() => {}
+                () = captured.as_mut() => {}
             }
         }
     }
 }
 
-/// RAII observer handle on a [`FillSession`]. One is minted for the pull owner
-/// ([`FillRegistry::register_fill`]) and one per attached serve leg
-/// ([`FillRegistry::fill_plan`]). Dropping it decrements the session's observer
-/// count; the last-out drop, if the pull is still running, cancels the pull so a
-/// fill no client is waiting on stops ingesting (#1610).
-///
-/// Teardown is the same whether the lease is dropped or explicitly [`Self::release`]d;
-/// `release` additionally hands the last-out caller the session's parked pull-thread
-/// handle to join, so whichever observer leaves LAST joins the pull — an owner whose
-/// own client finishes first is not parked in the join while other observers stream.
+/// RAII observer handle on a [`FillSession`]. One is minted for the pull owner and
+/// one per attached serve leg ([`FillRegistry::claim`]). Releasing it decrements the
+/// session's observer count; the last-out release, if the pull is still running,
+/// cancels the pull so a fill no client is waiting on stops ingesting (#1610) — and
+/// hands back the session's parked pull-thread handle so THAT caller joins it
+/// off-task (the owner-join hand-off: whoever leaves LAST joins the pull, freeing an
+/// owner whose own client finished first).
 ///
 /// The decrement + cancel decision runs UNDER the registry map lock — the same
-/// lock `fill_plan`/`register_fill` hold when they attach an observer. That mutual
-/// exclusion closes the resurrection race: a concurrent `fill_plan` cannot
-/// `fetch_add` a session 0→1 in the window between this drop's last-out
-/// `fetch_sub` (1→0) and its `cancel()`, so no live observer can end up bound to a
-/// cancelled fill. The lease therefore holds a [`Weak`] back to the registry (plus
-/// the session's `hash`) to reach that lock at drop. If the upgrade fails the
-/// registry is gone, so the fill is moot and the drop just skips.
+/// lock `claim`/`register_fill` hold when they attach an observer. That mutual
+/// exclusion closes the resurrection race: a concurrent claim cannot `fetch_add` a
+/// session 0→1 in the window between this drop's last-out `fetch_sub` (1→0) and its
+/// `cancel()`, so no live observer can end up bound to a cancelled fill. The lease
+/// therefore holds a [`Weak`] back to the registry (plus the session's `hash`) to
+/// reach that lock at drop. If the upgrade fails the registry is gone, so the fill
+/// is moot and the drop just skips. It only TAKES the pull handle under the lock;
+/// the JOIN always runs off it.
 #[derive(Debug)]
 pub struct ObserverLease {
     session: Arc<FillSession>,
@@ -442,7 +573,7 @@ pub struct ObserverLease {
 
 impl ObserverLease {
     /// Release the lease at a serve leg's teardown, handing back the parked
-    /// pull-thread handle when THIS drop is the last one out. The caller joins that
+    /// pull-thread handle when THIS release is the last one out. The caller joins that
     /// handle OFF the registry map lock and off its accept task (on a blocking
     /// thread). A non-last-out release returns `None`, so an owner whose own client
     /// finished first returns at once, leaving the pull filling for the remaining
@@ -454,11 +585,10 @@ impl ObserverLease {
     }
 
     /// The last-out decrement + cancel, shared by [`Self::release`] and [`Drop`].
-    /// Runs under the registry map lock — the SAME lock `fill_plan`/`register_fill`
-    /// hold to attach — so the decrement, the map removal, and the cancel decision
-    /// cannot interleave with an attach (the #1610 resurrection-race fix). It only
-    /// TAKES the pull handle here; it never JOINS under the lock. Idempotent via
-    /// `armed`.
+    /// Runs under the registry map lock — the SAME lock `claim`/`register_fill` hold
+    /// to attach — so the decrement, the map removal, and the cancel decision cannot
+    /// interleave with an attach (the #1610 resurrection-race fix). It only TAKES the
+    /// pull handle here; it never JOINS under the lock. Idempotent via `armed`.
     fn teardown(&mut self) -> Option<std::thread::JoinHandle<()>> {
         if !self.armed {
             return None;
@@ -469,6 +599,9 @@ impl ObserverLease {
             // attach, so the decrement + cancel are moot. Skip.
             return None;
         };
+        // Take the SAME lock `claim`/`register_fill` hold to attach, so the
+        // decrement, the map removal, and the cancel decision cannot interleave with
+        // an attach.
         let mut map = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
         // `fetch_sub` returns the PREVIOUS value; `1` means this drop took the
         // count to 0.
@@ -477,21 +610,23 @@ impl ObserverLease {
             return None;
         }
         // Last observer left: free the session from the map so dead sessions do not
-        // accumulate forever (a slow leak — `fill_plan` skips them via `is_dead` but
-        // never frees them). Remove by pointer identity so a sibling session for the
-        // same hash survives; drop the `hash` key if its Vec empties.
-        if let Some(sessions) = map.get_mut(&self.hash) {
-            sessions.retain(|s| !Arc::ptr_eq(s, &self.session));
-            if sessions.is_empty() {
+        // accumulate forever. Remove by pointer identity so a sibling session for the
+        // same hash survives; drop the `hash` key if its Vec empties (the per-hash
+        // outboard then drops once every reader releases it).
+        if let Some(entry) = map.get_mut(&self.hash) {
+            entry.sessions.retain(|s| !Arc::ptr_eq(s, &self.session));
+            if entry.sessions.is_empty() {
                 map.remove(&self.hash);
             }
         }
         // Cancel only if the pull has not already ended — a completed pull needs no
         // cancel, and a failed one already terminated. The session is removed from the
-        // map regardless.
+        // map regardless. Firing the per-hash liveness wakes any reader parked on a
+        // range this fill covered so it re-checks at once.
         if self.session.outcome().is_none() {
             self.session.cancel.cancel();
         }
+        self.session.outboard().liveness.notify_waiters();
         // Hand the parked pull-thread handle to this last-out caller to join off-task.
         // Taking (not joining) it here keeps the map lock free of a blocking join.
         self.session.take_pull_handle()
@@ -504,35 +639,18 @@ impl Drop for ObserverLease {
     }
 }
 
-/// The plan for serving a miss of range `R` against the in-flight fills for a hash.
-/// `attach` is `R ∩ covered_union` (bytes an already-running pull will produce, so
-/// the serve leg attaches instead of opening a duplicate pull); `remainder` is
-/// `R − covered_union` (bytes no live pull covers, which the caller must fetch).
-/// `session` is `Some` iff `attach` is non-empty — the live session with the
-/// largest overlap, plus a fresh [`ObserverLease`] the caller holds for the life of
-/// its serve leg.
-#[derive(Debug)]
-pub struct FillPlan {
-    /// `R ∩ covered_union` — bytes an in-flight pull will produce.
-    pub attach: ChunkRanges,
-    /// `R − covered_union` — bytes no live pull covers; the caller fetches these.
-    pub remainder: ChunkRanges,
-    /// The session to attach to (largest-overlap) and the observer lease, when
-    /// `attach` is non-empty.
-    pub session: Option<(Arc<FillSession>, ObserverLease)>,
-}
-
 /// The atomic outcome of [`FillRegistry::claim`]: a serve-miss either coalesces
-/// onto a live pull (`Attach`) or becomes the owner of a fresh one (`Owner`). Both
-/// carry the target [`FillSession`] and an [`ObserverLease`] the caller holds for
-/// the life of its serve leg. Unlike the two-call [`FillRegistry::fill_plan`] +
-/// [`FillRegistry::register_fill`] sequence, `claim` decides attach-vs-own AND
-/// registers under ONE map-lock acquisition, so two concurrent fresh misses for the
-/// same blob cannot both see an empty registry and both open a pull.
+/// wholly onto live pulls (`Attach`), owns a fresh pull for its whole range
+/// (`Owner`), or — on a partial overlap — owns a fresh pull for its non-overlapping
+/// REMAINDER while attaching to a live sibling for the overlap (`Mixed`). Every
+/// variant carries the [`FillSession`]s and [`ObserverLease`]s the caller holds
+/// for the life of its serve leg. `claim` decides the split AND registers any new
+/// owner session under ONE map-lock acquisition, so two concurrent fresh misses for
+/// the same blob cannot both open a pull.
 #[derive(Debug)]
 pub enum FillClaim {
-    /// A live pull already covers the request; run a serve leg over `session` and
-    /// open NO new pull. `lease` is an observer lease on the existing fill.
+    /// A live pull already covers the whole request; run a serve leg over `session`
+    /// and open NO new pull. `lease` is an observer lease on the existing fill.
     Attach {
         /// The live session to serve from (largest overlap with the request).
         session: Arc<FillSession>,
@@ -540,13 +658,32 @@ pub enum FillClaim {
         lease: ObserverLease,
     },
     /// No live pull covers the request; the caller owns the freshly-registered
-    /// `session` and must spawn the pull for the whole request range. `lease` is the
-    /// owner lease (observer count starts at 1).
+    /// `session` (scoped to the WHOLE request) and must spawn the pull. `lease` is
+    /// the owner lease (observer count starts at 1).
     Owner {
         /// The freshly-registered session the caller must drive a pull for.
         session: Arc<FillSession>,
         /// The owner lease (count 1) held for the life of the owning pull.
         lease: ObserverLease,
+    },
+    /// A partial overlap: a live sibling covers a prefix/suffix of the request. The
+    /// caller OWNS a fresh pull for the contiguous `remainder` (`[remainder_offset,
+    /// remainder_offset + remainder_len)`) and ATTACHES to the sibling for the
+    /// overlap, serving the whole request from the shared per-hash cache + outboard.
+    /// Two pulls, each fetching its bytes once.
+    Mixed {
+        /// The freshly-registered session covering the remainder; drive its pull.
+        owner: Arc<FillSession>,
+        /// The owner lease (count 1) for the remainder pull.
+        owner_lease: ObserverLease,
+        /// The live sibling covering the overlap; its pull is shared, not re-opened.
+        attach: Arc<FillSession>,
+        /// The observer lease on the sibling, held for the life of the serve leg.
+        attach_lease: ObserverLease,
+        /// The remainder's byte offset — the pull leg fetches `[offset, offset+len)`.
+        remainder_offset: u64,
+        /// The remainder's byte length.
+        remainder_len: u64,
     },
 }
 
@@ -565,14 +702,43 @@ fn chunk_span(ranges: &ChunkRanges) -> u64 {
         .sum()
 }
 
-/// Range-aware coalescing registry: the live in-flight fills, keyed by hash. A
-/// serve-miss consults [`Self::fill_plan`] to split its range into `attach`
-/// (covered by a running pull — attach an observer) and `remainder` (fetch it),
-/// and [`Self::register_fill`] to publish a new pull's session. Purely synchronous
-/// range math under a std `Mutex`; the lock is never held across an await.
+/// The single contiguous byte span `[offset, offset+len)` of a chunk-range set, or
+/// `None` if it is empty or split into two or more disjoint pieces. A `Mixed` claim
+/// only opens a remainder pull when the remainder is one contiguous range (a
+/// prefix/suffix overlap), because the pull leg fetches one `[offset, len)` gap; a
+/// remainder split by an interior overlap falls back to a conservative whole-request
+/// pull. `total` clamps the final (possibly ragged) group to the blob end.
+fn contiguous_byte_span(ranges: &ChunkRanges, total: u64) -> Option<(u64, u64)> {
+    match ranges.boundaries() {
+        [start, end] => {
+            let offset = start.0.saturating_mul(CHUNK_BYTES);
+            let end_bytes = end.0.saturating_mul(CHUNK_BYTES).min(total);
+            Some((offset, end_bytes.saturating_sub(offset)))
+        }
+        _ => None,
+    }
+}
+
+/// One hash's live in-flight fills plus the ONE per-hash outboard they all capture
+/// into and serve from.
+#[derive(Debug)]
+struct HashEntry {
+    /// The canonical per-hash outboard, adopted by every session for this hash.
+    outboard: Arc<HashOutboard>,
+    /// The live fills for this hash (each a distinct pull). Removed by pointer
+    /// identity when a session's last observer leaves.
+    sessions: Vec<Arc<FillSession>>,
+}
+
+/// Range-aware coalescing registry: the live in-flight fills, keyed by hash, plus a
+/// per-hash captured outboard. A serve-miss consults [`Self::claim`] to split its
+/// range into an attach (covered by a running pull) and a remainder (fetch it), and
+/// [`Self::range_still_live`] answers a parked reader's "keep awaiting or fail?".
+/// Purely synchronous range math under a std `Mutex`; the lock is never held across
+/// an await.
 #[derive(Debug, Default)]
 pub struct FillRegistry {
-    map: StdMutex<HashMap<Hash, Vec<Arc<FillSession>>>>,
+    map: StdMutex<HashMap<Hash, HashEntry>>,
 }
 
 impl FillRegistry {
@@ -597,15 +763,37 @@ impl FillRegistry {
         }
     }
 
-    /// Publish a new pull's `session` (already scoped via
-    /// [`FillSession::set_covered`] to the bytes it will fetch) and return the
-    /// owner lease (observer count starts at 1). The entry stays in the map until
-    /// the owning pull is joined node-side.
-    pub fn register_fill(self: &Arc<Self>, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
+    /// Insert a freshly-built `session` for `hash` under the held map lock: adopt the
+    /// hash's canonical outboard (or seed it from this session if it is the first),
+    /// bind the session's registry back-link, and publish it. The session's
+    /// `covered` must already be set by the caller.
+    fn insert_session(
+        self: &Arc<Self>,
+        map: &mut HashMap<Hash, HashEntry>,
+        hash: Hash,
+        session: &Arc<FillSession>,
+    ) {
+        let entry = map.entry(hash).or_insert_with(|| HashEntry {
+            outboard: session.outboard(),
+            sessions: Vec::new(),
+        });
+        session.adopt_outboard(Arc::clone(&entry.outboard));
+        session.bind_registry(Arc::downgrade(self), hash);
+        entry.sessions.push(Arc::clone(session));
+    }
+
+    /// Publish a new pull's `session` (already scoped via [`FillSession::set_covered`]
+    /// to the bytes it will fetch) and return the owner lease (observer count starts
+    /// at 1). The entry stays in the map until the owning pull is joined node-side.
+    /// A test-facing helper; production registers via [`Self::claim`].
+    pub fn register_fill(
+        self: &Arc<Self>,
+        hash: Hash,
+        session: &Arc<FillSession>,
+    ) -> ObserverLease {
         let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
-        let lease = self.mint_lease(&session, hash);
-        map.entry(hash).or_default().push(session);
-        lease
+        self.insert_session(&mut map, hash, session);
+        self.mint_lease(session, hash)
     }
 
     /// The blob length of a LIVE in-flight fill for `hash`, if one runs — an
@@ -622,94 +810,53 @@ impl FillRegistry {
     pub fn in_flight_total(&self, hash: Hash) -> Option<u64> {
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
         map.get(&hash)?
+            .sessions
             .iter()
             .find(|session| !session.is_dead())
             .map(|session| session.total_bytes())
     }
 
-    /// Plan a serve-miss of `[offset, offset+len)` (`len == 0` = to end) against the
-    /// live fills for `hash`. Aligns the request to chunk-group boundaries, then
-    /// splits it into `attach = R ∩ covered_union` and `remainder = R − covered_union`.
-    /// If `attach` is non-empty, binds to the live session with the largest overlap
-    /// and increments its observer count (returned as an [`ObserverLease`]).
+    /// Whether any LIVE fill of `hash` still covers `range`. A parked reader calls
+    /// this (via [`FillSession::range_still_live`]) to decide "keep awaiting a
+    /// capture / present-range advance, or fail because no pull will ever fill this".
+    /// `true` iff some live session's `covered` intersects `range`.
     #[must_use]
-    pub fn fill_plan(self: &Arc<Self>, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
-        let empty = || FillPlan {
-            attach: ChunkRanges::empty(),
-            remainder: ChunkRanges::empty(),
-            session: None,
-        };
-        let Ok(aligned) = align_range(offset, len, total) else {
-            // An out-of-bounds request has no coalescable range; the caller's own
-            // path surfaces the error when it tries to fetch.
-            return empty();
-        };
-        let r = aligned.chunk_ranges().clone();
-
+    pub fn range_still_live(&self, hash: Hash, range: &ChunkRanges) -> bool {
         let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut covered_union = ChunkRanges::empty();
-        let mut best: Option<(Arc<FillSession>, u64)> = None;
-        if let Some(sessions) = map.get(&hash) {
-            for session in sessions {
-                // A dead session (ended or cancelled) may never deliver its bytes,
-                // so its `covered` must neither block a fresh pull nor be an attach
-                // target. Removal from the map is node-side on pull-thread join;
-                // here we just skip it. Reading `is_dead` under the map lock pins
-                // the decision against a concurrent last-out lease drop, which fires
-                // `cancel()` under this same lock.
-                if session.is_dead() {
-                    continue;
-                }
-                let covered = session.covered_ranges();
-                let overlap = &r & &covered;
-                if !overlap.is_empty() {
-                    let span = chunk_span(&overlap);
-                    if best.as_ref().is_none_or(|(_, best_span)| span > *best_span) {
-                        best = Some((Arc::clone(session), span));
-                    }
-                }
-                covered_union |= covered;
-            }
-        }
-
-        let attach = &r & &covered_union;
-        let remainder = &r - &covered_union;
-        let session = if attach.is_empty() {
-            None
-        } else {
-            best.map(|(session, _)| {
-                let lease = self.mint_lease(&session, hash);
-                (session, lease)
-            })
-        };
-        FillPlan {
-            attach,
-            remainder,
-            session,
+        match map.get(&hash) {
+            Some(entry) => entry
+                .sessions
+                .iter()
+                .any(|s| !s.is_dead() && !(&s.covered_ranges() & range).is_empty()),
+            None => false,
         }
     }
 
-    /// Atomically decide attach-vs-own AND register, all under ONE map-lock
-    /// acquisition. This closes the coalescing TOCTOU race that the separate
-    /// [`Self::fill_plan`] (read) + [`Self::register_fill`] (write) calls leave open:
-    /// between those two lock acquisitions another thread can register, so two
-    /// concurrent fresh misses for the same blob both see an empty registry and both
-    /// open a pull. `claim` holds the map lock across the whole decision, so exactly
-    /// one of two racing identical claims registers an owner and the other attaches.
+    /// Atomically decide attach/own/mixed AND register any new owner session, all
+    /// under ONE map-lock acquisition. This closes the coalescing TOCTOU race a
+    /// separate plan-then-register pair would leave open: between two lock
+    /// acquisitions another thread can register, so two concurrent fresh misses for
+    /// the same blob would both see an empty registry and both open a pull. `claim`
+    /// holds the lock across the whole decision, so exactly one of two racing
+    /// identical claims registers an owner and the other attaches.
     ///
     /// `R = align_range(offset, len, total)`. On an align error or empty `R`, the
     /// caller takes the Owner path (its own fetch surfaces any out-of-bounds error).
-    /// Otherwise `remainder = R − covered_union` over LIVE sessions:
-    /// - `remainder.is_empty()` (a live pull covers all of `R`) → ATTACH to the
+    /// Otherwise, over LIVE sessions, `covered_union = ⋃ covered`,
+    /// `attach = R ∩ covered_union`, `remainder = R − covered_union`:
+    /// - `attach` empty → OWNER of the whole `R`.
+    /// - `remainder` empty (a live pull covers all of `R`) → ATTACH to the
     ///   largest-overlap session; `make_session` is NOT called.
-    /// - else → OWNER: build the session (only now — `make_session` allocates an
-    ///   outboard buffer, so it is never built-and-dropped on the attach branch),
-    ///   set its `covered` to the WHOLE `R` (the conservative cut: this owner fetches
-    ///   everything it will serve, even on a partial overlap — partial-overlap de-dup
-    ///   is a deferred follow-up), register it, and return the owner lease (count 1).
+    /// - both non-empty, and the largest-overlap sibling covers ALL of `attach`, and
+    ///   `R − sibling.covered` is ONE contiguous span → MIXED: own a pull for that
+    ///   remainder, attach the sibling for the overlap.
+    /// - otherwise (a multi-sibling union, or an interior overlap splitting the
+    ///   remainder in two) → OWNER of the whole `R`, the conservative fallback that
+    ///   never double-pulls or wedges. Range-serving lands the general case later.
     ///
-    /// `make_session` runs under the lock, which is safe: it does no await (a std
-    /// lock) and only allocates.
+    /// `make_session` runs under the lock only on an owning branch (never
+    /// built-and-dropped on a pure attach); it does no await (a std lock) and only
+    /// allocates, so holding the lock across it is safe.
     pub fn claim(
         self: &Arc<Self>,
         hash: Hash,
@@ -729,9 +876,9 @@ impl FillRegistry {
 
         if !r.is_empty() {
             let mut covered_union = ChunkRanges::empty();
-            let mut best: Option<(Arc<FillSession>, u64)> = None;
-            if let Some(sessions) = map.get(&hash) {
-                for session in sessions {
+            let mut best: Option<(Arc<FillSession>, ChunkRanges, u64)> = None;
+            if let Some(entry) = map.get(&hash) {
+                for session in &entry.sessions {
                     // Dead sessions (ended or cancelled) may never deliver, so their
                     // `covered` neither blocks a fresh pull nor is an attach target.
                     // Reading `is_dead` under the map lock pins it against a
@@ -744,35 +891,69 @@ impl FillRegistry {
                     let overlap = &r & &covered;
                     if !overlap.is_empty() {
                         let span = chunk_span(&overlap);
-                        if best.as_ref().is_none_or(|(_, best_span)| span > *best_span) {
-                            best = Some((Arc::clone(session), span));
+                        if best
+                            .as_ref()
+                            .is_none_or(|(_, _, best_span)| span > *best_span)
+                        {
+                            best = Some((Arc::clone(session), covered.clone(), span));
                         }
                     }
                     covered_union |= covered;
                 }
             }
 
+            let attach = &r & &covered_union;
             let remainder = &r - &covered_union;
-            if remainder.is_empty() {
-                // Fully covered by live pulls → ATTACH. `best` is `Some` whenever a
-                // non-empty `R` is covered by the union (some session must overlap);
-                // the `if let` is defensive against the unreachable `None`.
-                if let Some((session, _)) = best {
-                    let lease = self.mint_lease(&session, hash);
-                    return FillClaim::Attach { session, lease };
+
+            if !attach.is_empty()
+                && let Some((sibling, sib_covered, _)) = best
+            {
+                if remainder.is_empty() {
+                    // Whole R covered by live pulls → pure ATTACH to the sibling.
+                    let lease = self.mint_lease(&sibling, hash);
+                    return FillClaim::Attach {
+                        session: sibling,
+                        lease,
+                    };
+                }
+                // Partial overlap. Coalesce only when ONE sibling covers all of the
+                // overlap AND the bytes it does not cover form ONE contiguous span
+                // the remainder pull can fetch as a single gap. Otherwise fall
+                // through to a conservative whole-R owner (no double-pull, no wedge).
+                let attach_covered_by_sibling = (&attach - &sib_covered).is_empty();
+                let remainder_vs_sibling = &r - &sib_covered;
+                if attach_covered_by_sibling
+                    && let Some((rem_offset, rem_len)) =
+                        contiguous_byte_span(&remainder_vs_sibling, total)
+                {
+                    let owner = make_session();
+                    owner.set_covered(remainder_vs_sibling);
+                    self.insert_session(&mut map, hash, &owner);
+                    let owner_lease = self.mint_lease(&owner, hash);
+                    let attach_lease = self.mint_lease(&sibling, hash);
+                    return FillClaim::Mixed {
+                        owner,
+                        owner_lease,
+                        attach: sibling,
+                        attach_lease,
+                        remainder_offset: rem_offset,
+                        remainder_len: rem_len,
+                    };
                 }
             }
         }
 
-        // OWNER: no live pull covers the request (or `R` is empty/unalignable). Build
-        // the session now — never on the attach branch — and scope it to the WHOLE
-        // `R` (the conservative cut). Register + mint the owner lease under the SAME
-        // lock, so a racing identical claim sees this session and attaches.
-        let session = make_session();
-        session.set_covered(r);
-        let lease = self.mint_lease(&session, hash);
-        map.entry(hash).or_default().push(Arc::clone(&session));
-        FillClaim::Owner { session, lease }
+        // OWNER: no overlap, an empty/unalignable R, or the conservative fallback.
+        // Scope the session to the WHOLE R (so a later identical claim attaches),
+        // register + mint the owner lease under the SAME lock.
+        let owner = make_session();
+        owner.set_covered(r);
+        self.insert_session(&mut map, hash, &owner);
+        let lease = self.mint_lease(&owner, hash);
+        FillClaim::Owner {
+            session: owner,
+            lease,
+        }
     }
 }
 
@@ -887,13 +1068,14 @@ mod tests {
 mod fill_registry_tests {
     use std::sync::Arc;
 
-    use bao_tree::{ChunkRanges, blake3};
-    use decdn_bao_range::align_range;
+    use bao_tree::io::fsm::Outboard;
+    use bao_tree::{BaoTree, ChunkRanges, blake3};
+    use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
 
     use super::{FillClaim, FillError, FillRegistry, FillSession};
     use crate::{CHUNK_GROUP_BYTES, Hash};
 
-    /// One chunk group of bytes, the alignment granularity `fill_plan` snaps to.
+    /// One chunk group of bytes, the alignment granularity `claim` snaps to.
     const G: u64 = CHUNK_GROUP_BYTES;
 
     fn store_hash(byte: u8) -> Hash {
@@ -902,23 +1084,27 @@ mod fill_registry_tests {
 
     /// Whether the registry map still holds an entry (a non-empty session Vec) for
     /// `hash`. Reaches the private `map` field directly — the discriminating check
-    /// for last-observer removal, which `fill_plan` alone cannot distinguish from
-    /// the `is_dead` skip.
+    /// for last-observer removal, which a coverage query alone cannot distinguish
+    /// from the `is_dead` skip.
     fn mapped(reg: &FillRegistry, hash: Hash) -> bool {
         reg.map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
-            .is_some_and(|sessions| !sessions.is_empty())
+            .is_some_and(|entry| !entry.sessions.is_empty())
     }
 
     fn root(byte: u8) -> blake3::Hash {
         blake3::Hash::from([byte; 32])
     }
 
+    fn hb(byte: u8) -> blake3::Hash {
+        blake3::Hash::from([byte; 32])
+    }
+
     /// The chunk ranges covering the byte span `[start, start+len)` of a `total`
     /// blob (`len == 0` = to end), built via the same `align_range` the registry
-    /// uses so `covered` and the expected `attach`/`remainder` cannot drift.
+    /// uses so `covered` and the expected splits cannot drift.
     fn ranges(start: u64, len: u64, total: u64) -> ChunkRanges {
         align_range(start, len, total)
             .expect("aligned range")
@@ -926,176 +1112,309 @@ mod fill_registry_tests {
             .clone()
     }
 
+    /// The first interior node whose byte span lies wholly inside the chunk range
+    /// `[start_group, end_group)` (in groups), for exercising per-hash proof reads.
+    fn interior_node_in(total: u64, start_group: u64, end_group: u64) -> bao_tree::TreeNode {
+        let tree = BaoTree::new(total, IROH_BLOCK_SIZE);
+        let want = ranges(start_group * G, (end_group - start_group) * G, total);
+        tree.pre_order_nodes_iter()
+            .find(|n| {
+                tree.pre_order_offset(*n).is_some()
+                    && (&ChunkRanges::from(n.chunk_range()) - &want).is_empty()
+            })
+            .expect("an interior node inside the range")
+    }
+
+    /// A registered session is bound to the registry, so `range_still_live` consults
+    /// the whole registry (not just the session's own liveness).
+    fn register(
+        reg: &Arc<FillRegistry>,
+        hash: Hash,
+        root: blake3::Hash,
+        total: u64,
+        cov: ChunkRanges,
+    ) -> (Arc<FillSession>, super::ObserverLease) {
+        let s = FillSession::new(root, total);
+        s.set_covered(cov);
+        let lease = reg.register_fill(hash, &s);
+        (s, lease)
+    }
+
+    /// Two sessions for one hash share the ONE per-hash outboard: a node captured via
+    /// the first session is loadable through a reader minted from the second. This is
+    /// the precondition for partial-overlap serving — a serve leg reads proof no
+    /// matter which pull captured it.
+    #[tokio::test]
+    async fn siblings_share_one_per_hash_outboard() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x40);
+
+        let (a, _al) = register(&reg, hash, hb(0x40), total, ranges(0, 4 * G, total));
+        let (b, _bl) = register(&reg, hash, hb(0x40), total, ranges(4 * G, 4 * G, total));
+
+        // Capture an interior node through A; a reader minted from B must load it.
+        let node = interior_node_in(total, 0, 8);
+        let pair = (hb(1), hb(2));
+        a.capture(node, pair);
+
+        let mut reader_b = b.outboard_reader();
+        assert_eq!(
+            reader_b.load(node).await.unwrap(),
+            Some(pair),
+            "B's reader sees a node A captured — one shared per-hash outboard"
+        );
+    }
+
+    /// A reader minted from a session that does NOT cover a node's range must FAIL
+    /// when the sibling that DOES cover it dies — even though the minting session is
+    /// still live. This is the N-fill termination the coherent encoder needs so a
+    /// partial-overlap serve fails (never hangs) if a coalesced sibling pull dies.
+    #[tokio::test]
+    async fn reader_fails_when_the_only_covering_sibling_dies() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x41);
+
+        // Owner covers [0,4g); sibling covers [4g,8g).
+        let (owner, _ol) = register(&reg, hash, hb(0x41), total, ranges(0, 4 * G, total));
+        let (sibling, _sl) = register(&reg, hash, hb(0x41), total, ranges(4 * G, 4 * G, total));
+
+        // A node wholly inside [4g,8g) — covered only by the sibling.
+        let node = interior_node_in(total, 4, 8);
+        let mut reader = owner.outboard_reader();
+
+        let load = tokio::spawn(async move { reader.load(node).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !load.is_finished(),
+            "load parks until the sibling supplies it"
+        );
+
+        // The sibling dies without capturing the node; the owner (which does not
+        // cover it) is still live. The read must fail, not hang.
+        sibling.mark_ended(Err(FillError::new("sibling upstream died")));
+        let err = load
+            .await
+            .unwrap()
+            .expect_err("no live fill covers the node — the read must fail");
+        assert!(err.to_string().contains("no live fill covers"));
+    }
+
     /// (a) Same range: a second serve-miss for the exact range an in-flight pull
-    /// covers attaches wholly, leaves no remainder, and raises the count to 2.
+    /// covers attaches wholly and raises the count to 2 (`claim`).
     #[test]
-    fn same_range_coalesces_to_one_pull() {
+    fn claim_same_range_attaches() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xA1);
 
-        let session = FillSession::new(root(0xA1), total);
-        session.set_covered(ranges(0, 0, total)); // [0, total)
-        let _owner = reg.register_fill(hash, Arc::clone(&session));
-
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        assert_eq!(
-            plan.attach,
-            ranges(0, 0, total),
-            "attach is the whole range"
-        );
-        assert!(plan.remainder.is_empty(), "nothing left to fetch");
-        let (attached, _lease) = plan.session.expect("attaches to the in-flight pull");
+        let FillClaim::Owner {
+            session,
+            lease: _owner,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xA1), total))
+        else {
+            panic!("first whole-range claim owns");
+        };
+        let FillClaim::Attach {
+            session: attached,
+            lease: _l,
+        } = reg.claim(hash, 0, 0, total, || {
+            panic!("attach must not build a session")
+        })
+        else {
+            panic!("second identical claim attaches");
+        };
         assert!(Arc::ptr_eq(&attached, &session), "binds the same session");
         assert_eq!(session.observer_count(), 2, "owner + one attached observer");
     }
 
-    /// (b) Disjoint halves: a serve-miss for the second half of a pull that only
-    /// covers the first half attaches nothing, and the full request falls to
-    /// `remainder`; the first session's count is untouched.
+    /// (b) Disjoint halves: a claim for the second half of a pull that only covers
+    /// the first half OWNS its own pull; no coalescing.
     #[test]
-    fn disjoint_halves_do_not_attach() {
+    fn claim_disjoint_halves_both_own() {
         let total = 8 * G;
         let half = 4 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xB2);
 
-        let session = FillSession::new(root(0xB2), total);
-        session.set_covered(ranges(0, half, total)); // [0, half)
-        let _owner = reg.register_fill(hash, Arc::clone(&session));
-
-        let plan = reg.fill_plan(hash, half, total - half, total); // [half, total)
-        assert!(plan.attach.is_empty(), "no overlap, nothing to attach");
-        assert_eq!(
-            plan.remainder,
-            ranges(half, total - half, total),
-            "the whole request must be fetched"
-        );
-        assert!(plan.session.is_none(), "no session bound");
-        assert_eq!(session.observer_count(), 1, "count untouched");
+        let FillClaim::Owner {
+            session: lo,
+            lease: _lo,
+        } = reg.claim(hash, 0, half, total, || FillSession::new(root(0xB2), total))
+        else {
+            panic!("first disjoint claim owns");
+        };
+        let FillClaim::Owner {
+            session: hi,
+            lease: _hi,
+        } = reg.claim(hash, half, total - half, total, || {
+            FillSession::new(root(0xB2), total)
+        })
+        else {
+            panic!("disjoint second claim owns its own pull");
+        };
+        assert!(!Arc::ptr_eq(&lo, &hi), "distinct owner sessions");
+        assert_eq!(lo.observer_count(), 1, "no cross-attach");
     }
 
-    /// (c) Partial overlap: a request straddling the covered edge splits into an
-    /// `attach` for the covered part and a `remainder` for the rest, and binds an
-    /// observer to the overlapping session.
+    /// (c) Partial overlap (prefix): a sibling covers `[0,3g)`; a request for
+    /// `[2g,5g)` MIXES — owns a pull for the contiguous remainder `[3g,5g)` and
+    /// attaches the sibling for the `[2g,3g)` overlap.
     #[test]
-    fn partial_overlap_splits() {
+    fn claim_partial_prefix_overlap_mixes() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xC3);
 
-        let session = FillSession::new(root(0xC3), total);
-        session.set_covered(ranges(0, 3 * G, total)); // [0, 3g)
-        let _owner = reg.register_fill(hash, Arc::clone(&session));
+        let (sibling, _sl) = register(&reg, hash, hb(0xC3), total, ranges(0, 3 * G, total));
 
-        let plan = reg.fill_plan(hash, 2 * G, 3 * G, total); // [2g, 5g)
-        assert_eq!(plan.attach, ranges(2 * G, G, total), "attach == [2g, 3g)");
-        assert_eq!(
-            plan.remainder,
-            ranges(3 * G, 2 * G, total),
-            "remainder == [3g, 5g)"
+        let claim = reg.claim(hash, 2 * G, 3 * G, total, || {
+            FillSession::new(hb(0xC3), total)
+        });
+        let FillClaim::Mixed {
+            owner,
+            attach,
+            remainder_offset,
+            remainder_len,
+            ..
+        } = claim
+        else {
+            panic!("a prefix overlap with a contiguous remainder mixes");
+        };
+        assert!(
+            Arc::ptr_eq(&attach, &sibling),
+            "attaches the overlapping sibling"
         );
-        assert!(plan.session.is_some(), "binds the overlapping session");
-        assert_eq!(session.observer_count(), 2, "owner + one attached observer");
+        assert_eq!(
+            owner.covered_ranges(),
+            ranges(3 * G, 2 * G, total),
+            "owner covers the remainder [3g,5g)"
+        );
+        assert_eq!((remainder_offset, remainder_len), (3 * G, 2 * G));
+        assert_eq!(sibling.observer_count(), 2, "sibling owner + our attach");
+        assert_eq!(owner.observer_count(), 1, "our own remainder pull");
+    }
+
+    /// An interior overlap splits the remainder into two disjoint pieces, which one
+    /// `[offset, len)` pull cannot express — so `claim` conservatively OWNS the whole
+    /// request rather than double-pull or wedge.
+    #[test]
+    fn claim_interior_overlap_falls_back_to_whole_owner() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0xC4);
+
+        // Sibling covers a MIDDLE slice [3g,4g).
+        let (sibling, _sl) = register(&reg, hash, hb(0xC4), total, ranges(3 * G, G, total));
+
+        // Request [0,8g): overlap [3g,4g), remainder [0,3g) ∪ [4g,8g) — two pieces.
+        let FillClaim::Owner { session, lease: _l } =
+            reg.claim(hash, 0, 0, total, || FillSession::new(hb(0xC4), total))
+        else {
+            panic!("a split remainder falls back to a whole-request owner");
+        };
+        assert_eq!(
+            session.covered_ranges(),
+            ranges(0, 0, total),
+            "the fallback owner covers the whole request"
+        );
+        assert_eq!(
+            sibling.observer_count(),
+            1,
+            "no attach on the fallback path"
+        );
+    }
+
+    /// A subset claim (its `R` fully inside a live pull's `covered`) ATTACHES.
+    #[test]
+    fn claim_subset_attaches() {
+        let total = 8 * G;
+        let half = 4 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x32);
+
+        let FillClaim::Owner {
+            session: owner,
+            lease: _o,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x32), total))
+        else {
+            panic!("first whole-range claim owns");
+        };
+        let FillClaim::Attach {
+            session: attached,
+            lease: _l,
+        } = reg.claim(hash, 0, half, total, || panic!("subset must attach"))
+        else {
+            panic!("a subset of the covered range attaches");
+        };
+        assert!(Arc::ptr_eq(&attached, &owner), "attaches to the owner");
+        assert_eq!(owner.observer_count(), 2, "owner + attached");
+    }
+
+    /// `make_session` MUST NOT run on the attach branch — a coalescing serve leg
+    /// allocates no outboard buffer.
+    #[test]
+    fn claim_make_session_not_called_on_attach() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x34);
+
+        let owner = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x34), total));
+        assert!(matches!(owner, FillClaim::Owner { .. }), "first claim owns");
+        let attach = reg.claim(hash, 0, 0, total, || {
+            panic!("make_session must not be called on the attach branch")
+        });
+        assert!(
+            matches!(attach, FillClaim::Attach { .. }),
+            "second attaches"
+        );
     }
 
     /// (d) Lease teardown: the last observer leaving before the pull ends cancels
-    /// the pull; an earlier leaver does not.
+    /// the pull and removes the session from the map; an earlier leaver does not.
     #[test]
-    fn last_observer_leaving_cancels() {
+    fn last_observer_leaving_cancels_and_removes() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xD4);
 
-        let session = FillSession::new(root(0xD4), total);
-        session.set_covered(ranges(0, 0, total));
-        let owner = reg.register_fill(hash, Arc::clone(&session));
+        let FillClaim::Owner {
+            session,
+            lease: owner,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xD4), total))
+        else {
+            panic!("owns");
+        };
         assert_eq!(session.observer_count(), 1, "owner is one observer");
+        assert!(mapped(&reg, hash), "registered session is mapped");
 
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        let (_attached, second) = plan.session.expect("attaches a second observer");
+        let FillClaim::Attach {
+            session: _a,
+            lease: second,
+        } = reg.claim(hash, 0, 0, total, || panic!("attach"))
+        else {
+            panic!("attaches");
+        };
         assert_eq!(session.observer_count(), 2);
 
         drop(second);
-        assert!(
-            !session.is_cancelled(),
-            "the owner still waits — pull must not cancel"
-        );
+        assert!(!session.is_cancelled(), "owner still waits — no cancel");
         assert_eq!(session.observer_count(), 1);
+        assert!(mapped(&reg, hash), "non-last leaver keeps it mapped");
 
         drop(owner);
         assert!(
             session.is_cancelled(),
-            "the last observer left — pull is cancelled"
+            "last observer left — pull cancelled"
         );
         assert_eq!(session.observer_count(), 0);
-    }
-
-    /// The last observer leaving removes the session from the registry map, so dead
-    /// sessions do not accumulate forever. An earlier leaver keeps the session
-    /// mapped (a fresh serve-miss still attaches to it). The discriminating check is
-    /// the map key itself: `fill_plan` already skips a dead-but-mapped session via
-    /// `is_dead`, so only a direct map inspection distinguishes removal from that
-    /// pre-existing safety net.
-    #[test]
-    fn last_observer_leaving_removes_session() {
-        let total = 8 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x28);
-
-        let session = FillSession::new(root(0x28), total);
-        session.set_covered(ranges(0, 0, total)); // [0, total)
-        let owner = reg.register_fill(hash, Arc::clone(&session));
-        assert_eq!(session.observer_count(), 1, "owner is one observer");
-        assert!(mapped(&reg, hash), "registered session is in the map");
-
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        let (_attached, second) = plan.session.expect("attaches a second observer");
-        assert_eq!(session.observer_count(), 2, "owner + attached");
-
-        // Drop the attached lease (count 2 → 1): not last-out, session STILL mapped,
-        // so a fresh serve-miss attaches to it.
-        drop(second);
-        assert_eq!(session.observer_count(), 1);
-        assert!(
-            mapped(&reg, hash),
-            "non-last leaver keeps the session mapped"
-        );
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        assert!(
-            plan.session.is_some(),
-            "session still present — a fresh miss attaches"
-        );
-        assert!(!plan.attach.is_empty(), "attach is non-empty");
-        // That planning minted a third observer lease; release it so the owner is the
-        // sole remaining observer.
-        drop(plan.session);
-        assert_eq!(session.observer_count(), 1, "back to the owner only");
-
-        // Drop the owner (count 1 → 0): last-out REMOVES the session from the map, so
-        // the hash key is gone and a fresh serve-miss opens a new pull.
-        drop(owner);
-        assert_eq!(session.observer_count(), 0);
-        assert!(
-            !mapped(&reg, hash),
-            "last observer left — session removed from the map"
-        );
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        assert!(
-            plan.session.is_none(),
-            "session removed — nothing to attach"
-        );
-        assert!(plan.attach.is_empty(), "removed session covers nothing");
-        assert_eq!(
-            plan.remainder,
-            ranges(0, 0, total),
-            "the whole range is a fresh pull"
-        );
+        assert!(!mapped(&reg, hash), "last observer left — session removed");
     }
 
     /// A sibling session for the same hash survives when one session's last observer
-    /// leaves: removal is by pointer identity, and the hash key stays while any
-    /// session remains under it.
+    /// leaves: removal is by pointer identity, and the hash key (and its shared
+    /// outboard) stay while any session remains under it.
     #[test]
     fn removing_one_session_keeps_a_sibling_for_the_same_hash() {
         let total = 8 * G;
@@ -1103,141 +1422,116 @@ mod fill_registry_tests {
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0x29);
 
-        // Two disjoint-range sessions for the same hash (each its own pull).
-        let first = FillSession::new(root(0x29), total);
-        first.set_covered(ranges(0, half, total)); // [0, half)
-        let first_owner = reg.register_fill(hash, Arc::clone(&first));
+        let (first, first_owner) = register(&reg, hash, hb(0x29), total, ranges(0, half, total));
+        let (second, _second_owner) = register(
+            &reg,
+            hash,
+            hb(0x29),
+            total,
+            ranges(half, total - half, total),
+        );
 
-        let second = FillSession::new(root(0x29), total);
-        second.set_covered(ranges(half, total - half, total)); // [half, total)
-        let _second_owner = reg.register_fill(hash, Arc::clone(&second));
-
-        // Drop the first session's sole observer: it is removed, but the sibling and
-        // the hash key remain, so a serve-miss for the second half still attaches.
         drop(first_owner);
         assert!(mapped(&reg, hash), "sibling keeps the hash key alive");
-        let plan = reg.fill_plan(hash, half, total - half, total);
-        let (attached, _lease) = plan.session.expect("attaches to the surviving sibling");
-        assert!(
-            Arc::ptr_eq(&attached, &second),
-            "the surviving sibling is bound, not the removed session"
-        );
+        assert!(first.is_cancelled(), "the emptied session cancelled");
+
+        // A serve-miss for the second half still attaches to the surviving sibling.
+        let FillClaim::Attach {
+            session: attached,
+            lease: _l,
+        } = reg.claim(hash, half, total - half, total, || panic!("attach"))
+        else {
+            panic!("attaches to the surviving sibling");
+        };
+        assert!(Arc::ptr_eq(&attached, &second), "the sibling is bound");
     }
 
-    /// A cancelled session is dead: `fill_plan` must NOT attach to it, and its
-    /// `covered` must NOT suppress a fresh pull — the whole range falls to
-    /// `remainder`. Guards against attaching a new observer to a fill being torn
-    /// down (the #1610 resurrection hazard).
+    /// A cancelled session is dead: `claim` must NOT attach to it, and its `covered`
+    /// must NOT suppress a fresh pull.
     #[test]
-    fn fill_plan_skips_cancelled_session() {
+    fn claim_skips_cancelled_session() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xE5);
 
-        let session = FillSession::new(root(0xE5), total);
-        session.set_covered(ranges(0, 0, total)); // [0, total)
-        let owner = reg.register_fill(hash, Arc::clone(&session));
-
-        // Drop the sole owner so the last-out lease fires cancel (count 1 → 0).
+        let FillClaim::Owner {
+            session,
+            lease: owner,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xE5), total))
+        else {
+            panic!("owns");
+        };
         drop(owner);
         assert!(session.is_cancelled(), "cancel fired on last-out drop");
-        assert_eq!(session.observer_count(), 0);
 
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        assert!(
-            plan.session.is_none(),
-            "must not attach to a cancelled session"
-        );
-        assert!(plan.attach.is_empty(), "a dead session covers nothing");
-        assert_eq!(
-            plan.remainder,
-            ranges(0, 0, total),
-            "the whole range is a fresh pull"
-        );
-        assert_eq!(
-            session.observer_count(),
-            0,
-            "no observer attached to the dead session"
-        );
+        let FillClaim::Owner {
+            session: fresh,
+            lease: _l,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xE5), total))
+        else {
+            panic!("a dead session must not block a fresh owner");
+        };
+        assert!(!Arc::ptr_eq(&fresh, &session), "a genuinely fresh session");
     }
 
-    /// An ended session (terminal outcome recorded) is likewise dead: `fill_plan`
-    /// must not attach and must not let its `covered` block a fresh pull.
+    /// `range_still_live` is false once every covering session is dead, and true
+    /// while any live session still covers the range.
     #[test]
-    fn fill_plan_skips_ended_session() {
+    fn range_still_live_tracks_covering_sessions() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0xF6);
+        let hash = store_hash(0x50);
+        let probe = ranges(4 * G, 2 * G, total); // [4g,6g)
 
-        let session = FillSession::new(root(0xF6), total);
-        session.set_covered(ranges(0, 0, total)); // [0, total)
-        let _owner = reg.register_fill(hash, Arc::clone(&session));
+        let (a, _al) = register(&reg, hash, hb(0x50), total, ranges(0, 6 * G, total));
+        let (b, _bl) = register(&reg, hash, hb(0x50), total, ranges(4 * G, 4 * G, total));
+        assert!(reg.range_still_live(hash, &probe), "two live coverers");
 
-        session.mark_ended(Err(FillError::new("upstream died")));
-
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        assert!(
-            plan.session.is_none(),
-            "must not attach to an ended session"
-        );
-        assert!(plan.attach.is_empty(), "a dead session covers nothing");
-        assert_eq!(
-            plan.remainder,
-            ranges(0, 0, total),
-            "the whole range is a fresh pull"
-        );
+        a.mark_ended(Ok(()));
+        assert!(reg.range_still_live(hash, &probe), "b still covers [4g,6g)");
+        b.mark_ended(Ok(()));
+        assert!(!reg.range_still_live(hash, &probe), "no live coverer left");
     }
 
-    /// Structural serialization invariant: register (count 1) + attach (count 2),
-    /// then drop both leases. The decrement + cancel decision runs under the map
-    /// lock, so the non-last drop must NOT cancel and the last-out drop must cancel
-    /// exactly once, ending at count 0. Deterministic — no sleeps, no threads.
+    /// `FillSession::total_bytes` reports the blob length the session was built with,
+    /// so the attach path can sign its `StreamResponse` without a header handshake.
     #[test]
-    fn teardown_decrement_and_cancel_are_lock_serialized() {
-        let total = 8 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x17);
-
-        let session = FillSession::new(root(0x17), total);
-        session.set_covered(ranges(0, 0, total));
-        let owner = reg.register_fill(hash, Arc::clone(&session));
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        let (_attached, second) = plan.session.expect("attaches a second observer");
-        assert_eq!(session.observer_count(), 2, "owner + attached");
-
-        // Drop the attached lease first: count 2 → 1, not last-out, no cancel.
-        drop(second);
-        assert_eq!(session.observer_count(), 1);
-        assert!(!session.is_cancelled(), "not the last observer — no cancel");
-
-        // Drop the owner: count 1 → 0, last-out, cancels exactly once.
-        drop(owner);
-        assert_eq!(session.observer_count(), 0);
-        assert!(session.is_cancelled(), "last observer left — cancelled");
+    fn total_bytes_reports_blob_length() {
+        let total = 5 * G + 321;
+        let session = FillSession::new(root(0x35), total);
+        assert_eq!(session.total_bytes(), total);
     }
 
     /// The pull-thread handle is parked on the session and handed back to whichever
     /// observer leaves LAST. An owner whose own client finishes first (a non-last-out
     /// release) gets `None`, so its accept task returns at once while the pull keeps
     /// filling; the remaining observer, on its last-out release, takes the handle to
-    /// join. This is the whole point of the lifecycle refactor: the finished owner is
-    /// no longer parked in the join while another observer streams.
+    /// join. This is the owner-join hand-off (#1664): the finished owner is no longer
+    /// parked in the join while another observer streams.
     #[test]
     fn last_out_release_takes_the_pull_handle() {
         let total = 8 * G;
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0x40);
 
-        let session = FillSession::new(root(0x40), total);
-        session.set_covered(ranges(0, 0, total));
-        let owner = reg.register_fill(hash, Arc::clone(&session));
-
+        let FillClaim::Owner {
+            session,
+            lease: owner,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x40), total))
+        else {
+            panic!("owns");
+        };
         // Owner parks the pull-thread handle on the shared session after spawning it.
         session.set_pull_handle(std::thread::spawn(|| {}));
 
         // A second observer attaches.
-        let plan = reg.fill_plan(hash, 0, 0, total);
-        let (_attached, observer) = plan.session.expect("attaches a second observer");
+        let FillClaim::Attach {
+            session: _a,
+            lease: observer,
+        } = reg.claim(hash, 0, 0, total, || panic!("attach"))
+        else {
+            panic!("attaches");
+        };
         assert_eq!(session.observer_count(), 2, "owner + attached");
 
         // Owner leaves FIRST (count 2 → 1, not last-out): no handle handed back, so its
@@ -1275,10 +1569,13 @@ mod fill_registry_tests {
         let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0x41);
 
-        let session = FillSession::new(root(0x41), total);
-        session.set_covered(ranges(0, 0, total));
-        let owner = reg.register_fill(hash, Arc::clone(&session));
-
+        let FillClaim::Owner {
+            session,
+            lease: owner,
+        } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x41), total))
+        else {
+            panic!("owns");
+        };
         assert!(
             owner.release().is_none(),
             "no handle parked → nothing to join"
@@ -1287,197 +1584,6 @@ mod fill_registry_tests {
             session.is_cancelled(),
             "sole observer left — pull cancelled"
         );
-    }
-
-    // The `claim` tests below assert STRUCTURAL outcomes (which variant, which
-    // session, observer counts). Concurrent interleaving is prevented not by these
-    // sequential tests but by `claim`'s single map-lock acquisition: it decides
-    // attach-vs-own AND registers under one lock, so a true multi-thread race test
-    // would be flaky where the lock already guarantees atomicity structurally.
-
-    /// A fresh miss on an empty registry OWNS; a second identical miss ATTACHES to
-    /// that same owner session, raising its observer count to 2. This is the exact
-    /// race `claim` closes: with `fill_plan` + `register_fill` split, both misses
-    /// could see an empty registry and both open a pull.
-    #[test]
-    fn claim_first_owns_second_attaches_same_range() {
-        let total = 8 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x30);
-
-        let first = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x30), total));
-        let FillClaim::Owner {
-            session: owner,
-            lease: _owner_lease,
-        } = first
-        else {
-            panic!("first claim on an empty registry must own");
-        };
-        assert_eq!(owner.observer_count(), 1, "owner is one observer");
-
-        let second = reg.claim(hash, 0, 0, total, || {
-            panic!("second claim must attach, not build a session")
-        });
-        let FillClaim::Attach {
-            session: attached,
-            lease: _attach_lease,
-        } = second
-        else {
-            panic!("second identical claim must attach to the live pull");
-        };
-        assert!(
-            Arc::ptr_eq(&attached, &owner),
-            "attaches to the same owner session"
-        );
-        assert_eq!(owner.observer_count(), 2, "owner + one attached observer");
-    }
-
-    /// Two disjoint-range claims for the same hash each OWN a distinct session — no
-    /// overlap means no coalescing, so two live pulls run.
-    #[test]
-    fn claim_disjoint_both_own() {
-        let total = 8 * G;
-        let half = 4 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x31);
-
-        let first = reg.claim(hash, 0, half, total, || FillSession::new(root(0x31), total));
-        let FillClaim::Owner {
-            session: lo,
-            lease: _lo,
-        } = first
-        else {
-            panic!("first disjoint claim must own");
-        };
-
-        let second = reg.claim(hash, half, total - half, total, || {
-            FillSession::new(root(0x31), total)
-        });
-        let FillClaim::Owner {
-            session: hi,
-            lease: _hi,
-        } = second
-        else {
-            panic!("disjoint second claim must own its own pull");
-        };
-        assert!(!Arc::ptr_eq(&lo, &hi), "distinct owner sessions");
-        assert!(mapped(&reg, hash), "two live sessions under the hash");
-    }
-
-    /// A subset claim (its `R` fully inside a live pull's `covered`) ATTACHES: the
-    /// remainder is empty, so no new pull opens.
-    #[test]
-    fn claim_subset_attaches() {
-        let total = 8 * G;
-        let half = 4 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x32);
-
-        let owner = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x32), total));
-        let FillClaim::Owner {
-            session: owner,
-            lease: _owner,
-        } = owner
-        else {
-            panic!("first whole-range claim must own");
-        };
-
-        let sub = reg.claim(hash, 0, half, total, || {
-            panic!("a subset claim must attach, not build a session")
-        });
-        let FillClaim::Attach {
-            session: attached,
-            lease: _lease,
-        } = sub
-        else {
-            panic!("a subset of the covered range must attach");
-        };
-        assert!(Arc::ptr_eq(&attached, &owner), "attaches to the owner");
-        assert_eq!(owner.observer_count(), 2, "owner + attached");
-    }
-
-    /// A superset claim (its `R` exceeds a live pull's `covered`, so the remainder is
-    /// non-empty) OWNS, and — per the conservative cut — its session covers the WHOLE
-    /// `R`, not just the remainder. Verified by a third claim over `[0, total)`
-    /// attaching to the superset owner (which now covers all of it).
-    #[test]
-    fn claim_superset_owns_and_covers_whole_r() {
-        let total = 8 * G;
-        let half = 4 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x33);
-
-        // First owner covers only [0, half).
-        let first = reg.claim(hash, 0, half, total, || FillSession::new(root(0x33), total));
-        let FillClaim::Owner {
-            session: _lower,
-            lease: _lower_lease,
-        } = first
-        else {
-            panic!("first partial claim must own");
-        };
-
-        // Superset [0, total): remainder [half, total) is non-empty → OWNER.
-        let sup = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x33), total));
-        let FillClaim::Owner {
-            session: superset,
-            lease: _sup_lease,
-        } = sup
-        else {
-            panic!("a superset with a non-empty remainder must own");
-        };
-        assert_eq!(
-            superset.covered_ranges(),
-            ranges(0, 0, total),
-            "the owner covers the WHOLE R (conservative cut), not just the remainder"
-        );
-
-        // A third whole-range claim attaches to the superset owner (largest overlap),
-        // proving it covers all of [0, total).
-        let third = reg.claim(hash, 0, 0, total, || {
-            panic!("the third claim must attach to the whole-range owner")
-        });
-        let FillClaim::Attach {
-            session: attached,
-            lease: _third_lease,
-        } = third
-        else {
-            panic!("a whole-range claim must attach to the whole-range owner");
-        };
-        assert!(
-            Arc::ptr_eq(&attached, &superset),
-            "attaches to the superset owner that covers the whole range"
-        );
-    }
-
-    /// `make_session` MUST NOT run on the attach branch — a serve leg that coalesces
-    /// allocates no outboard buffer. A closure that panics if invoked proves it.
-    #[test]
-    fn claim_make_session_not_called_on_attach() {
-        let total = 8 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x34);
-
-        let owner = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x34), total));
-        assert!(matches!(owner, FillClaim::Owner { .. }), "first claim owns");
-
-        // If `claim` invokes this on the attach path, the test panics and fails.
-        let attach = reg.claim(hash, 0, 0, total, || {
-            panic!("make_session must not be called on the attach branch")
-        });
-        assert!(
-            matches!(attach, FillClaim::Attach { .. }),
-            "second identical claim attaches without building a session"
-        );
-    }
-
-    /// `FillSession::total_bytes` reports the blob length the session was built with,
-    /// so the attach path can sign its `StreamResponse` without a header handshake.
-    #[test]
-    fn total_bytes_reports_blob_length() {
-        let total = 5 * G + 321;
-        let session = FillSession::new(root(0x35), total);
-        assert_eq!(session.total_bytes(), total);
     }
 
     /// `in_flight_total` peeks a LIVE fill's blob length so the serve-miss path can
@@ -1498,14 +1604,14 @@ mod fill_registry_tests {
 
         let session = FillSession::new(root(0x40), total);
         session.set_covered(ranges(0, 0, total));
-        let owner = reg.register_fill(hash, Arc::clone(&session));
+        let owner = reg.register_fill(hash, &session);
         assert_eq!(
             reg.in_flight_total(hash),
             Some(total),
             "a live fill reports its blob length"
         );
 
-        // Last observer leaves → the session is removed from the map → nothing in
+        // Last observer leaves -> the session is removed from the map -> nothing in
         // flight, so a fresh serve-miss must handshake.
         drop(owner);
         assert_eq!(
@@ -1516,7 +1622,7 @@ mod fill_registry_tests {
     }
 
     /// An ENDED session is dead: `in_flight_total` skips it even while it is still
-    /// mapped, because there is nothing live to coalesce onto — the caller must
+    /// mapped, because there is nothing live to coalesce onto -- the caller must
     /// handshake.
     #[test]
     fn in_flight_total_skips_ended_session() {
@@ -1526,7 +1632,7 @@ mod fill_registry_tests {
 
         let session = FillSession::new(root(0x41), total);
         session.set_covered(ranges(0, 0, total));
-        let _owner = reg.register_fill(hash, Arc::clone(&session));
+        let _owner = reg.register_fill(hash, &session);
         assert_eq!(reg.in_flight_total(hash), Some(total));
 
         session.mark_ended(Err(FillError::new("upstream died")));
@@ -1538,7 +1644,7 @@ mod fill_registry_tests {
     }
 
     /// With a dead session and a LIVE sibling for the same hash, `in_flight_total`
-    /// reports the live one's length — the dead session is skipped, not the whole
+    /// reports the live one's length -- the dead session is skipped, not the whole
     /// hash.
     #[test]
     fn in_flight_total_reports_live_sibling_past_a_dead_one() {
@@ -1549,12 +1655,12 @@ mod fill_registry_tests {
 
         let dead = FillSession::new(root(0x42), total);
         dead.set_covered(ranges(0, half, total));
-        let _dead_owner = reg.register_fill(hash, Arc::clone(&dead));
+        let _dead_owner = reg.register_fill(hash, &dead);
         dead.mark_ended(Err(FillError::new("first pull died")));
 
         let live = FillSession::new(root(0x42), total);
         live.set_covered(ranges(half, total - half, total));
-        let _live_owner = reg.register_fill(hash, Arc::clone(&live));
+        let _live_owner = reg.register_fill(hash, &live);
 
         assert_eq!(
             reg.in_flight_total(hash),
