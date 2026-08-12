@@ -5,8 +5,10 @@ import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol"
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import { IFeeRouterSettlement } from "./interfaces/IFeeRouterSettlement.sol";
 import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
@@ -166,6 +168,21 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     event PoolOpened(bytes32 indexed poolId, address indexed owner, uint256 deposit);
     event PoolToppedUp(bytes32 indexed poolId, uint256 additionalDeposit, uint256 newDeposit);
 
+    /// @notice A node cashed a voucher against its lane. `paid` is the USDC
+    ///         routed to `FeeRouter` this call, `bytesPaid` the paid-proportional
+    ///         served bytes stamped into the operator's epoch, and
+    ///         `newPaidCumulative` the lane's cumulative paid amount after the
+    ///         advance. A node follows this event (filtered on its own
+    ///         `provider`) as the single write path for the paid side.
+    event PoolRedeemed(
+        bytes32 indexed poolId,
+        address indexed signer,
+        address indexed provider,
+        uint256 paid,
+        uint256 bytesPaid,
+        uint256 newPaidCumulative
+    );
+
     // -----------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------
@@ -178,6 +195,12 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error ZeroAmount();
     error PoolNotOpen();
     error NotPoolOwner();
+    error NothingToRedeem();
+    error NotProvider();
+    error InvalidVoucherSignature();
+    error InvalidCapabilitySignature();
+    error RateFloorViolation(uint256 amount, uint256 bytesDelivered, uint256 deliveryFloor);
+    error PoolClosed();
 
     // -----------------------------------------------------------------
     // Constructor
@@ -294,6 +317,43 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     }
 
     // -----------------------------------------------------------------
+    // Redemption
+    // -----------------------------------------------------------------
+
+    /// @notice Pay a node against a monotone cumulative voucher while the pool
+    ///         is `Open` or inside the grace window (ADR 003 § `redeem`
+    ///         behavior). The payee (`provider == msg.sender`) presents the
+    ///         highest voucher it holds; redemption pays the increment over the
+    ///         lane watermark, bounded by the signer's remaining cap and the
+    ///         pool's remaining deposit, then routes the paid USDC through
+    ///         `FeeRouter.routeSettlement` in the same transaction.
+    /// @param  voucherSig The signer's EIP-712 `Voucher` signature over
+    ///         `{poolId, signer, provider, cumulative, bytesDelivered}`.
+    /// @param  capability On a signer's first redemption, the ABI-encoded tuple
+    ///         `(uint256 spendingCap, uint64 expiry, bytes ownerSig)` carrying
+    ///         the owner's EIP-712 `Capability` signature and the limits it
+    ///         authorizes; empty bytes for every later redemption of an
+    ///         already-registered signer.
+    // slither-disable-next-line reentrancy-no-eth
+    function redeem(
+        bytes32 poolId,
+        address signer,
+        address provider,
+        uint256 cumulative,
+        uint256 bytesDelivered,
+        bytes calldata voucherSig,
+        bytes calldata capability
+    ) external nonReentrant {
+        if (capability.length != 0) {
+            (uint256 spendingCap, uint64 expiry, bytes memory ownerSig) =
+                abi.decode(capability, (uint256, uint64, bytes));
+            _registerCapability(poolId, signer, spendingCap, expiry, ownerSig);
+        }
+        uint256 paid = _redeemVoucher(poolId, signer, provider, cumulative, bytesDelivered, voucherSig);
+        if (paid == 0) revert NothingToRedeem();
+    }
+
+    // -----------------------------------------------------------------
     // Views
     // -----------------------------------------------------------------
 
@@ -330,5 +390,137 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // on a word > 1; reject such a router here so the probe truly
         // mirrors that decode.
         if (abi.decode(ret, (uint256)) > 1) revert FeeRouterMissingPausedView(router);
+    }
+
+    /// @dev Register a signer once, on its first redemption, by verifying the
+    ///      owner's EIP-712 `Capability` over `{signer, spendingCap, poolId,
+    ///      expiry}` against `pools[poolId].owner`. Idempotent: an
+    ///      already-registered signer (`cap != 0 || expiry != 0`) returns
+    ///      without re-verifying or overwriting, so a stray capability on a
+    ///      later redeem cannot raise the cap or extend the expiry. Factored so
+    ///      the batch `redeemMany` registers each capability before applying its
+    ///      vouchers.
+    function _registerCapability(
+        bytes32 poolId,
+        address signer,
+        uint256 spendingCap,
+        uint64 expiry,
+        bytes memory ownerSig
+    ) internal {
+        Authorization storage a = authorized[poolId][signer];
+        if (a.cap != 0 || a.expiry != 0) return;
+
+        bytes32 structHash = keccak256(abi.encode(CAPABILITY_TYPEHASH, signer, spendingCap, poolId, expiry));
+        bytes32 digest = _hashTypedDataV4(structHash);
+        if (!SignatureChecker.isValidSignatureNow(pools[poolId].owner, digest, ownerSig)) {
+            revert InvalidCapabilitySignature();
+        }
+        a.cap = spendingCap;
+        a.expiry = expiry;
+    }
+
+    /// @dev The cumulative-`min` redemption core (ADR 003 § `redeem` behavior).
+    ///      Returns the routed `paid`, or 0 on a transient-empty voucher that
+    ///      writes no state: an unregistered signer, an expired capability, a
+    ///      cumulative at or below the lane watermark, or a fully drained /
+    ///      cap-reached lane. Reverts only on structural errors: a closed or
+    ///      past-deadline pool (`PoolClosed`), a non-payee caller
+    ///      (`NotProvider`), a bad voucher signature (`InvalidVoucherSignature`),
+    ///      or a sub-floor delivery rate (`RateFloorViolation`). The
+    ///      return-0-vs-revert split is what lets the batch `redeemMany` skip an
+    ///      empty voucher without reverting the whole batch. Follows
+    ///      checks-effects-interactions: the lane, `spent`, and `totalRedeemed`
+    ///      advance before the `_route` external call.
+    // slither-disable-next-line reentrancy-no-eth
+    function _redeemVoucher(
+        bytes32 poolId,
+        address signer,
+        address provider,
+        uint256 cumulative,
+        uint256 bytesDelivered,
+        bytes memory voucherSig
+    ) internal returns (uint256 paid) {
+        Pool storage p = pools[poolId];
+
+        // Status gate: Open, or Closing before the grace-window deadline.
+        if (p.status == Status.Closed) revert PoolClosed();
+        // forge-lint: disable-next-line(block-timestamp)
+        if (p.status == Status.Closing && block.timestamp >= p.disputeDeadline) revert PoolClosed();
+
+        if (provider != msg.sender) revert NotProvider();
+
+        Authorization storage a = authorized[poolId][signer];
+        // Unregistered signer: transient-empty. The single `redeem` path has
+        // registered via `_registerCapability` first; the batch path skips it.
+        if (a.cap == 0 && a.expiry == 0) return 0;
+
+        _verifyVoucher(poolId, signer, provider, cumulative, bytesDelivered, voucherSig);
+
+        // Expired capability is transient-empty (skippable in a batch); the
+        // single path surfaces it as `NothingToRedeem`.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp >= a.expiry) return 0;
+
+        // Per-MB price floor on the cumulative claim, evaluated as a bytes
+        // ceiling via `Math.mulDiv` so a `bytesDelivered` near
+        // `type(uint256).max` reverts cleanly instead of arithmetic-panicking.
+        // `deliveryFloor >= MIN_RATE_FLOOR (1)` keeps the divisor non-zero.
+        if (bytesDelivered > Math.mulDiv(cumulative, BYTES_PER_MB, deliveryFloor)) {
+            revert RateFloorViolation(cumulative, bytesDelivered, deliveryFloor);
+        }
+
+        Lane storage w = watermark[poolId][signer][provider];
+        // Regression / already-paid cumulative: transient-empty.
+        if (cumulative <= w.amount) return 0;
+
+        uint256 desired = cumulative - w.amount;
+        paid = Math.min(desired, Math.min(a.cap - a.spent, p.deposit - p.totalRedeemed));
+        // Drained pool or cap reached: transient-empty, retriable after a top-up.
+        if (paid == 0) return 0;
+
+        uint256 bytesPaid = Math.mulDiv(bytesDelivered - w.bytesDelivered, paid, desired);
+
+        // Effects before interactions (checks-effects-interactions).
+        w.amount += paid;
+        w.bytesDelivered += bytesPaid;
+        a.spent += paid;
+        p.totalRedeemed += paid;
+
+        _route(provider, bytesPaid, paid);
+
+        emit PoolRedeemed(poolId, signer, provider, paid, bytesPaid, w.amount);
+    }
+
+    /// @dev Verify an EIP-712 `Voucher` signature (EOA or ERC-1271) against
+    ///      `signer` over the canonical typed data. Factored out of
+    ///      `_redeemVoucher` to keep that frame within the stack limit.
+    function _verifyVoucher(
+        bytes32 poolId,
+        address signer,
+        address provider,
+        uint256 cumulative,
+        uint256 bytesDelivered,
+        bytes memory voucherSig
+    ) internal view {
+        bytes32 structHash = keccak256(
+            abi.encode(VOUCHER_TYPEHASH, poolId, signer, provider, cumulative, bytesDelivered)
+        );
+        bytes32 digest = _hashTypedDataV4(structHash);
+        if (!SignatureChecker.isValidSignatureNow(signer, digest, voucherSig)) revert InvalidVoucherSignature();
+    }
+
+    /// @dev Approve then route a strictly-positive delta to `FeeRouter` in the
+    ///      same transaction; the router pulls the USDC via `safeTransferFrom`,
+    ///      performs the three-bucket split, and stamps `bytesDelta` into the
+    ///      operator's epoch. Reads `feeRouter` live so a governance re-point
+    ///      credits the new router. Resets the allowance to zero afterward: an
+    ///      honest router pulls exactly `amountDelta`, but a re-pointed or buggy
+    ///      one pulling less would otherwise leave a standing allowance over
+    ///      this contract's USDC. Callers MUST have committed the watermark
+    ///      first.
+    function _route(address operator, uint256 bytesDelta, uint256 amountDelta) internal {
+        usdc.forceApprove(feeRouter, amountDelta);
+        IFeeRouterSettlement(feeRouter).routeSettlement(operator, bytesDelta, amountDelta);
+        usdc.forceApprove(feeRouter, 0);
     }
 }
