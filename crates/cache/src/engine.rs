@@ -28,6 +28,7 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
+use crate::fill_session::{FillPlan, FillRegistry, FillSession, ObserverLease};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
@@ -268,6 +269,13 @@ struct Inner {
     /// reading party.
     #[allow(dead_code)]
     gc_store_handle: Option<Arc<OnceLock<FsStore>>>,
+    /// Range-aware in-flight fill registry (#1621 B3.2). Coalesces concurrent
+    /// serve-misses for the same hash: a request whose range an in-flight pull
+    /// already covers attaches an observer instead of opening a duplicate pull.
+    /// Purely synchronous range math; holds no blob bytes. Consulted by
+    /// [`CacheEngine::fill_plan`] and populated by [`CacheEngine::register_fill`]
+    /// (the live-pull wiring lands in B3.4).
+    fill_registry: Arc<FillRegistry>,
 }
 
 impl Inner {
@@ -1025,8 +1033,26 @@ impl CacheEngine {
                 // the lag to actually fire.
                 inserts_tx: broadcast::channel(1024).0,
                 gc_store_handle,
+                fill_registry: Arc::new(FillRegistry::new()),
             }),
         })
+    }
+
+    /// Plan a serve-miss of `[offset, offset+len)` (`len == 0` = to end) of the
+    /// `total`-byte blob `hash` against the in-flight fills: split it into `attach`
+    /// (an in-flight pull already covers these bytes — attach an observer) and
+    /// `remainder` (fetch these). See [`FillRegistry::fill_plan`]. The live-pull
+    /// wiring that consumes this lands in B3.4.
+    #[must_use]
+    pub fn fill_plan(&self, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
+        self.inner.fill_registry.fill_plan(hash, offset, len, total)
+    }
+
+    /// Publish a new pull's [`FillSession`] (already scoped via
+    /// [`FillSession::set_covered`]) so later serve-misses can coalesce onto it,
+    /// returning the owner [`ObserverLease`]. See [`FillRegistry::register_fill`].
+    pub fn register_fill(&self, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
+        self.inner.fill_registry.register_fill(hash, session)
     }
 
     /// Subscribe to a stream of `Hash`es announcing every blob that

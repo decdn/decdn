@@ -42,7 +42,9 @@ pub use engine::{
     TeeReservation,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
-pub use fill_session::{FillError, FillSession, SessionOutboardReader};
+pub use fill_session::{
+    FillError, FillPlan, FillRegistry, FillSession, ObserverLease, SessionOutboardReader,
+};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean
 /// `iroh_blobs::Hash` (the BLAKE3 digest the iroh-blobs store keys on)
 /// so every existing `decdn_cache::Hash` path in `decdn-node` and the
