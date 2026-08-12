@@ -7207,11 +7207,12 @@ mod tests {
         );
     }
 
-    /// Drain a serve-leg export stream to completion, prefixed with its already
-    /// -pulled `first` item. Every remaining item MUST be `Ok`: an in-flight
-    /// reader started before an evict has to keep delivering correct bytes even
-    /// after the blob is evicted and GC-swept out of the store. Consumes (and
-    /// thus drops) the stream, releasing its handle so the disk can reclaim.
+    /// Drain a serve-leg export stream to completion, prefixed with its
+    /// already-pulled `first` item. Every remaining item MUST be `Ok`: an
+    /// in-flight reader started before an evict has to keep delivering correct
+    /// bytes even after the blob is evicted and GC-swept out of the store.
+    /// Consumes (and thus drops) the stream, releasing its handle so the disk
+    /// space can free.
     async fn drain_serve_leg(
         first: Bytes,
         mut stream: Pin<Box<dyn futures_util::Stream<Item = CacheResult<Bytes>> + Send>>,
@@ -7252,7 +7253,7 @@ mod tests {
     /// `export_bao_range_stream` handle. This test reduces that to the cache-level
     /// invariant the node layer relies on: **two in-flight readers over one
     /// partial, evicted mid-serve, both still finish delivering byte-for-byte
-    /// correct bytes, and the disk is then reclaimed.**
+    /// correct bytes even after the GC sweep has logically removed the blob.**
     ///
     /// The load-bearing assumption B3 deferred (decision 5): reader-pinning is
     /// UNCHANGED by coalescing — N serve-leg readers survive an evict + GC sweep
@@ -7301,19 +7302,6 @@ mod tests {
             "the partial carries its B0 protecting tag"
         );
 
-        // A distinct untagged partial. It is not live once the target's tag drops,
-        // so the SAME GC sweep reclaims both — its `NotFound` gates "a full sweep
-        // ran after the evict" without coupling the test to the GC interval.
-        let (root_c, pt_c, ob_c) = synth_blob((total + group) as usize);
-        let (control, r_c, b_c) = bao_for(root_c, &pt_c, ob_c, 0, 6 * group, total + group);
-        engine
-            .inner
-            .store
-            .blobs()
-            .import_bao_bytes(control, r_c, b_c)
-            .await
-            .unwrap();
-
         // The exact wire each serve leg must deliver, captured before the evict.
         let expected = engine
             .export_bao_range(hash, 0, 6 * group, total)
@@ -7347,12 +7335,18 @@ mod tests {
             "a NEW serve is blocked immediately after evict"
         );
 
-        // Wait out a full GC sweep after the tag drop (gated on the control).
-        wait_reclaimed(&engine, control, Duration::from_secs(15)).await;
+        // Wait — while BOTH serve legs are still held — for the target itself to
+        // report `NotFound`. This is the documented subtlety made an assertion:
+        // the GC sweep deletes the untagged blob and flips its logical status the
+        // instant it runs, without waiting for the in-flight readers. Gating on
+        // the target (not a proxy) both proves a sweep ran after the tag drop and
+        // pins that the delete does not defer to the last reader.
+        wait_reclaimed(&engine, hash, Duration::from_secs(15)).await;
 
         // The heart of the composition: BOTH in-flight readers, started before the
         // evict, still drain to completion with byte-for-byte identical bytes even
-        // though the blob was evicted and swept out of the store. Reader-pinning
+        // though the blob was already logically removed by the sweep above. Each
+        // reader's open export handle keeps its bytes reachable — reader-pinning
         // held for two readers exactly as it would for one.
         let served_a = drain_serve_leg(first_a, leg_a).await;
         let served_b = drain_serve_leg(first_b, leg_b).await;
@@ -7364,9 +7358,5 @@ mod tests {
             served_b, expected,
             "serve leg B delivered the full range intact"
         );
-
-        // Both handles are now dropped (consumed by `drain_serve_leg`); the store
-        // reports the partial gone — the disk is reclaimed once no reader pins it.
-        wait_reclaimed(&engine, hash, Duration::from_secs(15)).await;
     }
 }
