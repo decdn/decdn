@@ -81,6 +81,7 @@ impl ClientHandler {
         recv: &mut RecvStream,
         store: NodeRangedStore,
         session: Arc<FillSession>,
+        also_pace: &[Arc<FillSession>],
         channel: &Arc<Mutex<ChannelDeliveryState>>,
         hash: Hash,
         channel_id: ChannelId,
@@ -253,6 +254,16 @@ impl ClientHandler {
                         .served_frontier()
                         .fetch_max(served, Ordering::Relaxed);
                     session.served_advanced().notify_waiters();
+                    // Under partial-overlap coalescing this serve leg is fed by more
+                    // than its own pull: each attached sibling pull produces part of
+                    // `R` too. Advance every sibling's shared max frontier by the same
+                    // paid content offset, so each pull recoups against the
+                    // fastest-paying observer of its bytes (DECISION-B). Empty in the
+                    // common N=1 case (a whole-request owner or a pure attach).
+                    for extra in also_pace {
+                        extra.served_frontier().fetch_max(served, Ordering::Relaxed);
+                        extra.served_advanced().notify_waiters();
+                    }
                 }
                 // Re-queue deltas the client had not paid yet (a short batch),
                 // preserving order at the front.
