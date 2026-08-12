@@ -317,16 +317,36 @@ impl ClientFixture {
         node: &NodeFixture,
         warmup: Hash,
     ) -> anyhow::Result<(ChannelSession, Vec<u8>)> {
+        self.open_session_in_namespace(chain, node, warmup, alloy::primitives::U256::ZERO)
+            .await
+    }
+
+    /// [`Self::open_session`] with a caller-chosen `namespace_id` for the warm-up
+    /// fetch.
+    ///
+    /// The namespace matters when `warmup` is a blob the node does **not** hold
+    /// itself and must acquire through node-to-node pull-through: the serving
+    /// node routes its own cache miss to a provider via the on-chain
+    /// `OriginAssignment` directory, which is keyed on the request's namespace
+    /// (`NO_NAMESPACE`/`U256::ZERO` resolves to no origins). A cross-node warm-up
+    /// under `U256::ZERO` would therefore never discover the provider and the
+    /// session would never register. Own-origin warm-ups are namespace-agnostic
+    /// (the origin backend is hash-keyed), so [`Self::open_session`] keeps the
+    /// zero default.
+    pub async fn open_session_in_namespace(
+        &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
+        warmup: Hash,
+        namespace_id: alloy::primitives::U256,
+    ) -> anyhow::Result<(ChannelSession, Vec<u8>)> {
         let mut session = self.open_channel(chain, node).await?;
         node.wait_for_channel(session.channel_id(), Duration::from_secs(60))
             .await?;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         loop {
-            match self
-                .fetch_once(&mut session, warmup, 0, alloy::primitives::U256::ZERO)
-                .await
-            {
+            match self.fetch_once(&mut session, warmup, 0, namespace_id).await {
                 Ok(bytes) => return Ok((session, bytes)),
                 Err(e) if tokio::time::Instant::now() < deadline && is_retryable(&e) => {
                     tracing::debug!("session warm-up not ready ({e}); retrying");
