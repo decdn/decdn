@@ -17,9 +17,9 @@
 //!     `error` and `voucher_interval_mb` are unsigned (ADR 005 §Voucher interval
 //!     negotiation).
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
-//!     carries `{signature, amount, nonce}` and the receiver reconstructs the
-//!     full typed data `{channelId, amount, nonce, bytesDelivered, token}` from
-//!     stream context (ADR 005 §Voucher wire format, `decdn_incentive::Voucher`).
+//!     carries `{signature, amount}` and the receiver reconstructs the full typed
+//!     data `{poolId, signer, provider, amount, bytesDelivered}` from stream
+//!     context (ADR 005 §Voucher wire format, `decdn_incentive::Voucher`).
 //!
 //! # Signed-field freezing (ADR 013 §Signed Field Freezing)
 //!
