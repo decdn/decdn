@@ -38,8 +38,7 @@ pub use circuit_breaker::{
 /// under-reserves by up to two groups.
 pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
-    CacheEngine, EvictionCandidates, EvictionPreview, PresentRanges, RangePullOutcome, TeeOpen,
-    TeeReservation,
+    CacheEngine, EvictionCandidates, EvictionPreview, PresentRanges, RangePullOutcome,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 pub use fill_session::{

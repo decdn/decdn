@@ -30,10 +30,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{
-    Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen,
-    TeeReservation,
-};
+use decdn_cache::{Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{

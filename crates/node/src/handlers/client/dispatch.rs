@@ -6,8 +6,8 @@ use super::{
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ChannelId, ClientHandler, ClientMessage, Connection,
     FillOutcome, FirstMessage, Hash, MB_BYTES, Mutex, OwnedSemaphorePermit,
     REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, TeeOpen, VarInt, min_payment, read_first_message,
-    reset_stream, verify_binding,
+    StreamReadError, StreamResponseBody, VarInt, min_payment, read_first_message, reset_stream,
+    verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -477,12 +477,12 @@ impl ClientHandler {
                 // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
                 // published outboard / no origin size / no origins => fall through to
                 // `try_local_populate` below, EXACTLY as the old path's Ok(None) did.
-                // Once serviceable, an `open_tee_sink` claim coalesces concurrent
-                // whole-blob same-hash misses: the first opens the local pull; a
-                // second parks on `TeeOpen::InFlight` and serves from the store when
-                // the first lands (no double origin egress). B3 (a later PR) owns
-                // RANGE-aware coalescing; this is only the whole-blob guard the peer
-                // window branch already has.
+                // Once serviceable, `serve_via_backend_origin` claims the fill itself
+                // (`CacheEngine::claim_fill`, #1621 B3): the first same-hash miss OWNS
+                // the local origin pull; a concurrent one ATTACHES as an observer and
+                // streams the same filling cache to its own client (no double origin
+                // egress). The registry is range-aware, so this is not limited to the
+                // whole-blob case as the old `open_tee_sink` guard was.
                 if range_pulled_size.is_none()
                     && !locally_filled
                     && req.byte_offset == 0
@@ -493,53 +493,25 @@ impl ClientHandler {
                         Ok(Some(total)) => {
                             match self.cache.origin_fetch_outboard_bytes(hash, total).await {
                                 // Serviceable: size known and an origin publishes the
-                                // outboard. Claim the in-flight coalescing slot ONLY
-                                // now — after the serviceability probe has decided to
-                                // serve via the backend origin — so a non-serviceable
-                                // origin degrades without taking (and releasing) a
-                                // claim, exactly as the peer window branch orders its
-                                // checks against `open_tee_sink`.
-                                Ok(Some(_)) => match self.cache.open_tee_sink(hash) {
-                                    TeeOpen::Owner(tee) => {
-                                        // Boxed: the serve future is large
-                                        // (clippy::large_futures).
-                                        return Box::pin(self.serve_via_backend_origin(
-                                            send,
-                                            recv,
-                                            &req,
-                                            &ext,
-                                            hash,
-                                            client_node_id,
-                                            total,
-                                            tee,
-                                            fault_seen,
-                                            rate_per_mb,
-                                        ))
-                                        .await;
-                                    }
-                                    // A concurrent fill for this hash is already
-                                    // running (#856): do NOT open a second local pull
-                                    // (no double origin egress). Wait for it via the
-                                    // coalescing `populate`; if it lands, mark the blob
-                                    // locally filled and fall through to the size gate
-                                    // + delivery (serve from the store), skipping the
-                                    // remaining fill tiers. If it does not land, report
-                                    // the miss — honoring any earlier-tier or coalesced
-                                    // fault (#1129).
-                                    TeeOpen::InFlight => {
-                                        let coalesced = self.await_coalesced_fill(hash).await;
-                                        if coalesced.is_filled() {
-                                            locally_filled = true;
-                                        } else {
-                                            let reason = FillOutcome::miss_reason(
-                                                fault_seen || coalesced.is_fault(),
-                                            );
-                                            return self
-                                                .respond_error(&mut send, &req, reason, rate_per_mb)
-                                                .await;
-                                        }
-                                    }
-                                },
+                                // outboard. Enter the orchestration directly — it claims
+                                // the fill (owner-or-attach) internally after signing the
+                                // response, so no coalescing decision happens here.
+                                Ok(Some(_)) => {
+                                    // Boxed: the serve future is large
+                                    // (clippy::large_futures).
+                                    return Box::pin(self.serve_via_backend_origin(
+                                        send,
+                                        recv,
+                                        &req,
+                                        &ext,
+                                        hash,
+                                        client_node_id,
+                                        total,
+                                        fault_seen,
+                                        rate_per_mb,
+                                    ))
+                                    .await;
+                                }
                                 // Size known but no published outboard — not
                                 // serviceable via the range encoder. Degrade to the
                                 // buffered local populate below, exactly as the old
@@ -633,40 +605,23 @@ impl ClientHandler {
                     && req.byte_len == 0
                     && self.pull_authorized(&req, verified_client).await
                 {
-                    match self.cache.open_tee_sink(hash) {
-                        TeeOpen::Owner(tee) => {
-                            // Boxed: the fused serve future is large; keep it off
-                            // the `serve_stream` stack frame (clippy::large_futures).
-                            return Box::pin(self.serve_via_window_pull_through(
-                                send,
-                                recv,
-                                &req,
-                                &ext,
-                                hash,
-                                client_node_id,
-                                Arc::clone(origin),
-                                tee,
-                                fault_seen,
-                                rate_per_mb,
-                            ))
-                            .await;
-                        }
-                        // A concurrent fill for this hash is already running
-                        // (#305): do NOT open a second upstream pull (no double
-                        // spend). Wait for it via the coalescing `populate`, then
-                        // fall through to serve from the store; if it does not
-                        // land, report the miss.
-                        TeeOpen::InFlight => {
-                            let coalesced = self.await_coalesced_fill(hash).await;
-                            if !coalesced.is_filled() {
-                                let reason =
-                                    FillOutcome::miss_reason(fault_seen || coalesced.is_fault());
-                                return self
-                                    .respond_error(&mut send, &req, reason, rate_per_mb)
-                                    .await;
-                            }
-                        }
-                    }
+                    // Boxed: the fused serve future is large; keep it off the
+                    // `serve_stream` stack frame (clippy::large_futures). The
+                    // orchestration claims the fill (owner-or-attach) internally after
+                    // signing the response, so two concurrent same-hash misses share one
+                    // upstream pull (no double spend, #305) without a decision here.
+                    return Box::pin(self.serve_via_window_pull_through(
+                        send,
+                        recv,
+                        &req,
+                        &ext,
+                        hash,
+                        client_node_id,
+                        Arc::clone(origin),
+                        fault_seen,
+                        rate_per_mb,
+                    ))
+                    .await;
                 } else {
                     // Buffered pull-through (#831): the pre-#856 path, used when
                     // the window provider is unset or for a resumed request.

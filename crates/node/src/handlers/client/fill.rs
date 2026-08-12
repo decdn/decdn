@@ -262,32 +262,6 @@ impl ClientHandler {
         }
     }
 
-    /// Wait for a concurrent fill of `hash` to land, then report whether the blob
-    /// is now present (#856 coalescing). Used when [`CacheEngine::open_tee_sink`](super::CacheEngine::open_tee_sink)
-    /// reported [`TeeOpen::InFlight`](super::TeeOpen::InFlight): another request is already pulling this
-    /// hash, so we MUST NOT open a second upstream pull (no double spend). The
-    /// coalescing [`CacheEngine::populate`](super::CacheEngine::populate) (via [`Self::try_pull_through`]) waits
-    /// on the same in-flight entry and re-checks presence; if no pull-through
-    /// deadline is configured it degrades to a plain presence check.
-    pub(super) async fn await_coalesced_fill(&self, hash: Hash) -> FillOutcome {
-        match self.pull_through {
-            Some(timeout) => self.try_pull_through(hash, timeout).await,
-            // No pull-through configured: the coalesced fill either landed or it
-            // did not. A `has` *error* is a real store fault, not a clean miss —
-            // surface it (like `on_pull_through_timeout`) rather than silently
-            // reclassifying it as "blob absent" and reporting a clean `NotFound`.
-            None => match self.cache.has(hash).await {
-                Ok(true) => FillOutcome::Filled,
-                Ok(false) => FillOutcome::CleanMiss,
-                Err(e) => {
-                    self.metrics.node_pull_through_error();
-                    tracing::warn!(%hash, error = %e, "coalesced-fill store lookup failed; treating as a fault");
-                    FillOutcome::HardFault
-                }
-            },
-        }
-    }
-
     /// Whether a speculative pull may proceed for `peer` under the seed-leech caps
     /// (#856). Always `true` when no governor is wired. Like
     /// [`LeechGovernor::poll_admission`](super::LeechGovernor::poll_admission) this is a stateful, advisory poll (it
