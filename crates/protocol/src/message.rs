@@ -113,14 +113,6 @@ pub enum MessageValidationError {
     /// recovers the bound address.
     #[error("ClientBinding.binding_signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidBindingSigLen { len: usize },
-    /// A wire [`crate::client::CooperativeCloseAuth`]'s `signature` is not
-    /// [`crate::client::COOPERATIVE_CLOSE_SIG_LEN`] bytes. The provider's
-    /// cooperative-close waiver is the same EOA off-chain signing form (ADR 024
-    /// §Off-Chain ERC-1271 Verification); receivers reject deviations before
-    /// `decdn_incentive` recovers the provider address (ADR 003 §Cooperative
-    /// close).
-    #[error("CooperativeCloseAuth.signature has invalid length {len} (EOA form is 65 bytes)")]
-    InvalidCooperativeCloseSigLen { len: usize },
     /// A negotiated `voucher_interval_mb` is outside `1..=MAX_VOUCHER_INTERVAL_MB`
     /// (ADR 003 §Voucher Interval Negotiation). Zero would never require a
     /// voucher; an oversized value opens an unbounded unvouchered-byte window
