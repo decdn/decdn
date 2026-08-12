@@ -273,8 +273,8 @@ const fn capability_near_expiry(cap_expiry: Option<u64>, now: u64, min_ttl: Dura
 }
 
 /// Classify a failed attempt. See [`ResumeAction`]. `now` is the current Unix time
-/// in seconds, against which the channel's `expires_at` is measured for the
-/// near-expiry guard.
+/// in seconds, against which the self-issued capability's `expiry` is measured for
+/// the capability-regeneration guard.
 fn decide(
     err: &anyhow::Error,
     ctx: &PoolContext,
