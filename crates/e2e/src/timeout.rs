@@ -1,0 +1,52 @@
+//! Per-journey overall-timeout ceilings, anchored to measurement (issue #1620).
+//!
+//! # The rule (copy this reasoning, not a nearby number)
+//!
+//! A journey's overall ceiling is NOT derived from other timeouts. Pick the tier
+//! whose budget both:
+//!
+//! 1. clears this journey's observed p100 runtime with a CI-contention margin, and
+//! 2. contains the fixture's largest *reachable in-test retry ladder*, so an
+//!    exhausted ladder surfaces its own specific message (e.g. "deploy failed
+//!    after N attempts") before this opaque ceiling fires (#785).
+//!
+//! The binding ladder is the deploy retry ladder in [`crate::chain`]: CI worst
+//! case `DEPLOY_ATTEMPTS * ci_scaled(DEPLOY_TIMEOUT)` = `2 * 120s = 240s`, so
+//! every tier here clears 240s. `forge build` no longer counts toward it — it is
+//! hoisted to a one-time job step (`.github/workflows/ci.yml`), so the cold
+//! contract compile happens once, outside any per-test ceiling, and the in-test
+//! `forge build` is a warm incremental no-op under CI.
+//!
+//! # Measurement (source: issue #1620, runs of 2026-08-05)
+//!
+//! `anvil e2e (journeys)` on `main`, four consecutive runs: 5m23s / 5m40s /
+//! 6m00s / 8m37s. Full suite locally at `--test-threads 1`: 377s for 36 tests.
+//! Only two journeys exceed 25s — `origin_stream_while_store` corrupt-outboard
+//! (94s, a real pull-deadline wait) and `cli_publish` (72s, watcher-convergence
+//! bound); every other journey is <= 23s.
+//!
+//! # The two tiers
+//!
+//! - [`STANDARD`] (300s) — the default. ~3x the 94s p100, and it contains the
+//!   240s deploy ladder plus one slow poll under 4-vCPU / `--test-threads 2`
+//!   contention.
+//! - [`HEAVY`] (600s) — journeys whose *internal* poll ladder is long enough
+//!   that a slow poll under contention could crowd the deploy ladder inside
+//!   300s: a sequential poll budget above ~150s, i.e. more than half the
+//!   standard tier. Today that is `g_gov_02` (a 120+60+120+60s repricing walk),
+//!   `origin_blacklist_compliance` (repeated 180s catch-up polls), `slash_appeal`
+//!   (120+30+30s), and the `g_node_07` Ethereum leg (five sequential CLI
+//!   invocations across the unbonding window).
+//!
+//! When you add a journey, pick a tier by the rule above. Do not copy `STANDARD`
+//! because a neighbouring test uses it — confirm its poll ladder stays under
+//! ~150s first.
+
+use std::time::Duration;
+
+/// Default per-journey overall ceiling. See the [module rule](self).
+pub const STANDARD: Duration = Duration::from_secs(300);
+
+/// Heavier per-journey ceiling for long internal poll ladders. See the
+/// [module rule](self).
+pub const HEAVY: Duration = Duration::from_secs(600);

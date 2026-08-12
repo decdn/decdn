@@ -43,8 +43,9 @@ use decdn_e2e::cli::decdn_command;
 use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use tokio::process::Command;
 
-/// Matches the other CLI journeys (anvil launch + forge deploy dominate).
-const OVERALL_TIMEOUT: Duration = Duration::from_mins(13);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule);
+/// anvil launch + forge deploy dominate its runtime.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Tier to bond up to. Must exceed what `onboard_operator` posted (`minBond`,
 /// undeclared) so the run has a real shortfall to `approve` + `bond`, and must

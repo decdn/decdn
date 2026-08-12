@@ -63,7 +63,8 @@ use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
 use iroh::EndpointAddr;
 
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 const COOP_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread")]

@@ -607,16 +607,17 @@ jobs:
   anvil-e2e-settlement:
     name: anvil e2e (settlement)
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Bound above settlement's 13m in-test `OVERALL_TIMEOUT` ceiling plus the
-    # workspace compile and the in-test forge deploy, so a genuinely hung test
-    # hits its own clear per-test message before this opaque job-level kill
-    # (#785). Sized for the worst case — a cold cache: this job's `shared-key`
-    # is new, so the introducing PR (and any branch cut before it merges) runs a
-    # from-scratch full-workspace compile with nothing to restore, before the
-    # 13m test. Once main warms the key it finishes in a few minutes; this is a
-    # generous backstop, deliberately letting a wedged compile or a pre-timer
-    # forge hang burn the bound rather than reintroduce a sub-ceiling kill.
-    timeout-minutes: 60
+    # Bound derived from OBSERVED job duration (~2m on `main`), but floored by the
+    # #785 ordering rather than set to a bare multiple of it. The settlement
+    # test's own in-test `OVERALL_TIMEOUT` is 13m (it contains ~560s of internal
+    # poll budgets + build + deploy, and this PR does not retier it), so a hung
+    # test surfaces its clear per-test message only if this job-level kill sits
+    # above 13m + the pre-test work (the workspace compile and the hoisted
+    # `forge build` below). 15m would leave too little for that pre-test work;
+    # 20m clears the 13m ceiling with room and is still ~10x the observed run — a
+    # large cut from the old 60m. `forge build` is hoisted to the step below,
+    # off the cold path inside the test (#1620).
+    timeout-minutes: 20
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||
@@ -653,7 +654,7 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
-      # cache. cache-profile: none — the test drives its own `forge build`.
+      # cache. cache-profile: none — the contract build is the hoisted step below.
       - uses: ./.github/actions/foundry-setup
         with:
           cache-profile: none
@@ -664,6 +665,14 @@ jobs:
       - uses: taiki-e/install-action@v2.85.9
         with:
           tool: cargo-nextest
+      # Hoist the cold contract compile out of the tests (#1620). Both anvil
+      # targets shell out to their own `forge build` (a 180s single-attempt cap
+      # with no retry); running it once here keeps that cold build — which on a
+      # contended cold cache can approach the cap — off the introducing PR's
+      # in-test path, leaving each test's build a warm incremental no-op.
+      - name: Build contracts once (hoisted from the tests)
+        working-directory: contracts
+        run: forge build
       # In-process anvil e2e targets: each spawns anvil + shells out to forge,
       # then drives real node code against the live chain — settlement through
       # `PaymentChannelService`, bring-up through `runtime::run`. Neither needs a
@@ -687,53 +696,23 @@ jobs:
   anvil-e2e-journeys:
     name: anvil e2e (journeys)
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Bound above the ~166m balanced journeys schedule (below) plus the bin build
-    # and workspace compile, so a genuinely hung test hits its own clear per-test
-    # message before this opaque job-level kill (#785). The step below runs the
-    # whole `anvil-e2e` feature with no target filter, so the inventory is every
-    # gated test, not a curated list: at --test-threads 2 that is 27 tests across
-    # 16 files whose per-test `OVERALL_TIMEOUT` ceilings sum to 331m. Count tests
-    # that RUN, not files and not `#[tokio::test]` attributes — `cli_fetch_topup`
-    # declares four but one is `#[ignore]`d:
-    #   13m x12  smoke, cli_publish, cli_setup_partial, cli_fetch_resume,
-    #            cli_bundle_pull_channel_id, coop_close_watermark_reconcile,
-    #            G-NODE-06 (1 test each) + cli_fetch_topup (3 running tests)
-    #            + G-NODE-07's iroh-rotation and unbound-key legs
-    #   20m x4   slash_appeal, G-GOV-02, G-GOV-03, G-NODE-07's eth leg (it
-    #            walks the whole unbonding window)
-    #   10m x8   G-NODE-04 (3 tests), origin_blacklist_compliance (3 tests),
-    #            G-ORIGIN-01 (2 tests)
-    #   5m  x3   origin_stream_while_store
-    # 13*12 + 20*4 + 10*8 + 5*3 = 156 + 80 + 80 + 15 = 331m. A balanced 2-thread
-    # schedule is ~166m (331/2, no single test exceeding it), so the bound must
-    # clear that plus the bin build, the workspace compile and the per-fixture
-    # in-test forge deploys. Keep this inventory in sync when adding a journey —
-    # it has gone stale four times now (it once described 6 tests after the
-    # cli_* and G-ORIGIN-* journeys landed; later named a nonexistent
-    # G-ORIGIN-04 while missing the G-GOV-02 / G-NODE-08 journeys; then claimed
-    # 20 tests across 17 files by naming a cli_fetch_manifest and three
-    # G-NODE-08 tests that exist nowhere in the repo, counting cli_fetch_topup
-    # once when it holds four, and omitting cli_bundle_pull_channel_id and
-    # origin_stream_while_store outright; and most recently, when G-NODE-07
-    # landed, arrived at 328m/~164m by a plain arithmetic slip — the bucket
-    # math above sums to 331m, not 328m). Sum-of-ceilings is itself a fragile
-    # way to derive this bound — every figure here is derived from another
-    # figure in this comment, none from a measurement — and is slated to be
-    # replaced by one anchored to observed job duration; see #1620.
-    # The bound was 130m at a ~128m balanced ceiling, then 160m when
-    # coop_close_watermark_reconcile (#1495) pushed it to ~135m, then 175m once a
-    # corrected 298m sum put the real ceiling at ~149m. That 298m over-counted by
-    # 13m: it credited `cli_fetch_topup` with four running tests when its fourth
-    # is `#[ignore]`d. G-NODE-07 (#1034) then adds three tests summing 46m, so the
-    # real sum is 331m and the balanced ceiling ~166m — which leaves 200m ~34m of
-    # compile headroom, comfortably clearing the rule above. A hung test must
-    # still hit its own clear per-test message before this opaque job-level kill.
-    # In practice the job finishes in ~6-9m; these are ceilings, not
-    # estimates. The generous backstop deliberately lets a wedged compile or a
-    # pre-timer forge hang burn the full bound rather than reintroduce the opaque
-    # sub-ceiling kill (#785) that masks the clear per-test message this ordering
-    # exists to surface.
-    timeout-minutes: 200
+    # Bound derived from OBSERVED job duration, not from a sum of per-test
+    # ceilings. That sum-of-ceilings model assumed every test simultaneously
+    # burned its full budget — which cannot happen — and went stale four times as
+    # journeys landed (#1620 has the history). The job runs in ~6-9m on `main`
+    # (the ~9m tail is the cold compile the job also covers, not the tests); 30m
+    # is ~3.5x the worst observed run, with headroom for that compile, the
+    # daemon+CLI build, and the hoisted `forge build` below.
+    #
+    # This still honors the #785 ordering — a hung test must surface its own
+    # clear per-test message before this opaque job-level kill. The largest
+    # per-test `OVERALL_TIMEOUT` is the 10m heavy tier
+    # (`crates/e2e/src/timeout.rs`), and each fixture's binding in-test retry
+    # ladder — the deploy ladder, now capped at ~240s (`crate::chain`) — is
+    # contained by that tier, so a real deploy flake reports as
+    # "deploy failed after N attempts" rather than as a generic timeout. 30m
+    # clears 10m + the compile + the builds with room to spare.
+    timeout-minutes: 30
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||
@@ -765,7 +744,9 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
-      # cache. cache-profile: none — the fixtures drive their own `forge build`.
+      # cache. cache-profile: none — the contract build is the hoisted step below
+      # (a `ci`-profile cache would need the fixtures on that same forge profile,
+      # else their default-profile build recompiles; left as a follow-up, #1620).
       - uses: ./.github/actions/foundry-setup
         with:
           cache-profile: none
@@ -776,6 +757,16 @@ jobs:
       - uses: taiki-e/install-action@v2.85.9
         with:
           tool: cargo-nextest
+      # Hoist the cold contract compile out of the fixtures (#1620). Each
+      # `decdn-e2e` fixture shells out to `forge build`; running it once here
+      # means only this step pays the cold compile, and every fixture's in-test
+      # build is a warm incremental no-op. This keeps the cold build off
+      # whichever test nextest schedules first and is what lets the per-test
+      # ceilings shrink to the `crates/e2e/src/timeout.rs` tiers — a cold build
+      # (CI worst case ~30m) no longer sits inside a per-test `OVERALL_TIMEOUT`.
+      - name: Build contracts once (hoisted from the fixtures)
+        working-directory: contracts
+        run: forge build
       # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
       # binary, and the slash-appeal journey additionally shells out to the
       # user CLI `decdn` (package `decdn-cli`), so both must exist on disk

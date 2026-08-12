@@ -62,8 +62,9 @@ use tokio::process::Command;
 
 const MIB: usize = 1024 * 1024;
 
-/// Matches the CLI-journey budgets (anvil launch + forge deploy dominate).
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule) for the
+/// iroh-rotation and unbound-key legs; anvil launch + forge deploy dominate.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Payload size for the paid leg. 2 MiB at the fixture's 10 micro-USDC/MiB is
 /// a 20 micro-USDC claim, above the fixture's 10 micro-USDC redeem threshold, so
@@ -71,10 +72,10 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 /// the same sizing `smoke.rs` relies on.
 const PAYLOAD_LEN: usize = 2 * MIB;
 
-/// The Ethereum leg walks the full unbonding window (five CLI invocations plus
-/// the chain-clock advance), so it gets the larger budget the slash/governance
-/// journeys use rather than the CLI-journey default.
-const ETH_TIMEOUT: Duration = Duration::from_secs(1200);
+/// The Ethereum leg walks the full unbonding window (five sequential CLI
+/// invocations plus the chain-clock advance), so it takes the heavy journey tier
+/// rather than the standard one (see [`decdn_e2e::timeout`] for the tier rule).
+const ETH_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 /// Tier declared on the migrated-to address. The contract's `minCapacityMbps`
 /// default, and far below the bond curve's crossover with `minBond` — so the

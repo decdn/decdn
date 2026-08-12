@@ -63,11 +63,10 @@ use jsonrpsee::http_client::HttpClient;
 
 const MIB: usize = 1024 * 1024;
 
-/// Overall ceiling so an unbounded await fails fast with a clear message.
-/// Cleanup (anvil kill, daemon kill) runs on drop even on timeout. Kept
-/// comfortably below the `anvil-e2e` job timeout so this per-test message wins
-/// over the opaque job kill; ~3-4× the observed runtime.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). Its
+/// longest internal poll ladder is 60+60s (the regional leg), which stays under
+/// the ~150s threshold for the heavy tier. Cleanup runs on drop even on timeout.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// EIP-712 typehash string for `ProbeResponse` — must byte-match
 /// `SlashJudge.PROBE_TYPEHASH`.

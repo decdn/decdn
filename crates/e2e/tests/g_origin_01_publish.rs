@@ -51,9 +51,9 @@ use decdn_e2e::cli::decdn_command;
 use decdn_e2e::time;
 use decdn_incentive::eth_identity;
 
-/// Overall ceiling so an unbounded await fails fast with a clear message.
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
 /// Cleanup (anvil kill) runs on drop even on timeout.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Password for the publisher's throwaway keystore; passed to the CLI through
 /// `DECDN_KEYSTORE_PASSWORD` so no prompt is ever reached.

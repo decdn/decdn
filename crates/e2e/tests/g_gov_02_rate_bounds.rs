@@ -136,11 +136,12 @@ const PROPOSAL_STATE_QUEUED: u8 = 5;
 /// OZ `IGovernor.ProposalState::Executed`.
 const PROPOSAL_STATE_EXECUTED: u8 = 7;
 
-/// Generous overall ceiling: three full Governor lifecycles (propose → vote →
-/// queue → timelock → execute) plus two real paid deliveries and a daemon
-/// subprocess. The chain-time warping is `evm_increaseTime`, which costs no wall
-/// clock, so this is a backstop rather than a tight bound.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(1200);
+/// Heavy journey tier (see [`decdn_e2e::timeout`] for the tier rule): its
+/// internal poll ladder walks a repricing sequence — 120+60+120+60s of
+/// sequential poll budgets — above the ~150s threshold that keeps a slow poll
+/// from crowding the deploy ladder inside the standard tier. Chain-time warping
+/// is `evm_increaseTime`, which costs no wall clock, so this is a backstop.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ratified_rate_bounds_reach_a_live_daemon() -> anyhow::Result<()> {

@@ -69,22 +69,37 @@ const MIN_BOND_WEI: &str = "50000000000000000000000";
 /// `FeeRouter`/`CapacityBond` epoch length, for the served-bytes read.
 const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
 
-// A cold-CI compile of the full contracts suite can be slow; a single 180s cap
-// with no retry made an over-budget-but-progressing build a hard failure. Give
-// it headroom plus a bounded retry for a transient stall (mirrors the deploy
-// retry). A real compile error still fails fast — only a timeout is retried.
-// The base budget is scaled up under CI via `ci_scaled` (see #1384).
+// A cold compile of the full contracts suite can be slow; a single 180s cap with
+// no retry made an over-budget-but-progressing build a hard failure. Give it
+// headroom plus a bounded retry for a transient stall (mirrors the deploy retry).
+// A real compile error still fails fast — only a timeout is retried. The base
+// budget is scaled up under CI via `ci_scaled` (see #1384).
+//
+// Under CI this ladder is effectively never reached: `.github/workflows/ci.yml`
+// hoists `forge build` into a one-time job step, so `contracts/out` is already
+// warm and the in-test build is a sub-second incremental no-op. The cold cost is
+// paid once per job, outside any per-test `OVERALL_TIMEOUT`, which is what lets
+// the per-test ceilings shrink to the tiers in `crate::timeout` (see #1620). The
+// ladder still guards local runs, which have no such job step.
 const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const BUILD_ATTEMPTS: usize = 3;
 // The deploy script broadcasts against a live anvil while the runner is running
 // two journeys at once (`--test-threads 2` on a 4-core box), so give each attempt
-// more wall-clock headroom and one extra attempt. `run_deploy_script` reverts
-// anvil to a pre-deploy snapshot between attempts, so a widened budget buys real
-// recovery chances rather than doomed nonce-colliding retries (#785). The base
-// budget is comfortable locally; on a contended CI runner it is scaled up via
-// `ci_scaled` because the failure mode is CPU starvation, not slowness (#1384).
+// generous wall-clock headroom. `run_deploy_script` reverts anvil to a pre-deploy
+// snapshot between attempts, so a widened budget buys real recovery chances rather
+// than doomed nonce-colliding retries (#785). The base budget is comfortable
+// locally; on a contended CI runner it is scaled up via `ci_scaled` because the
+// failure mode is CPU starvation, not slowness (#1384).
+//
+// The deploy ladder runs *inside* every journey's fixture and cannot be hoisted
+// (it needs the test's own live anvil), so it is the binding in-test retry ladder
+// the per-test ceilings must contain (see `crate::timeout` and #1620). Two
+// attempts cap the CI worst case at `2 * ci_scaled(60s) = 240s`, which fits under
+// the 300s standard tier while still absorbing one snapshot-reverted transient at
+// full per-attempt margin — the #1384 starvation fix is per-attempt time, not
+// attempt count, so it stays intact.
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
-const DEPLOY_ATTEMPTS: usize = 4;
+const DEPLOY_ATTEMPTS: usize = 2;
 // The anvil-e2e deploy flakiness (#1384) is starvation, not slowness: under
 // `--test-threads 2` on the 4-core CI runner (see `.github/workflows/ci.yml`),
 // each journey spawns its own anvil + `forge script` (and often a `decdn-node`),

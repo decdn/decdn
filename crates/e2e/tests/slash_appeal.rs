@@ -56,9 +56,12 @@ const DAY: u64 = 24 * 60 * 60;
 const STATUS_OPEN: u8 = 1;
 const STATUS_RESOLVED: u8 = 3;
 
-/// Generous overall ceiling: the journey runs a real challenge + a full Governor
-/// lifecycle with several time warps, plus two node subprocesses.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(1200);
+/// Heavy journey tier (see [`decdn_e2e::timeout`] for the tier rule): its
+/// internal poll ladder is 120+30+30s (served, then two post-restart polls),
+/// above the ~150s threshold for the standard tier. The journey runs a real
+/// challenge + a full Governor lifecycle with several time warps, plus two node
+/// subprocesses.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slash_detection_appeal_and_grant() -> anyhow::Result<()> {

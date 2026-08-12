@@ -193,6 +193,29 @@ impl ClientFixture {
         hash: Hash,
         namespace_id: alloy::primitives::U256,
     ) -> anyhow::Result<FetchOutcome> {
+        self.fetch_with_deadline(chain, node, hash, namespace_id, Duration::from_secs(45))
+            .await
+    }
+
+    /// [`Self::fetch`] with a caller-chosen readiness-retry budget.
+    ///
+    /// A *negative* journey that expects the fetch to fail — a corrupt outboard
+    /// the node can never serve, say — has no success to converge on, so it burns
+    /// the whole budget spinning on the node's refusal before returning the error
+    /// the assertion wants. Such a caller passes a budget tighter than the 45s
+    /// [`Self::fetch`] default to keep its runtime bounded. That is strictly safe:
+    /// a shorter budget can only surface the expected failure sooner, never turn a
+    /// real success into a spurious timeout. It must still clear the node's
+    /// ~500ms-cadence watcher catch-up so the failure reflects the refusal under
+    /// test, not an un-observed channel.
+    pub async fn fetch_with_deadline(
+        &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
+        hash: Hash,
+        namespace_id: alloy::primitives::U256,
+        retry_budget: Duration,
+    ) -> anyhow::Result<FetchOutcome> {
         let mut session = self.open_channel(chain, node).await?;
         let cid = session.channel_id();
         let target = session.target.clone();
@@ -200,7 +223,7 @@ impl ClientFixture {
         // The node accepts vouchers only once its chain watcher has decoded the
         // ChannelOpened event (poll cadence ~500ms). Retry the paid fetch until
         // that catch-up completes or the budget expires.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let deadline = tokio::time::Instant::now() + retry_budget;
         loop {
             // `stream_fetch_tracked` reports the acked voucher watermark via
             // `progress` on every return path (Ok/Err/timeout), so a retry after a

@@ -49,7 +49,8 @@ use decdn_incentive::voucher_domain;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "bundle-adopt-e2e-password";
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bundle_pull_adopts_one_channel_for_the_whole_bundle() -> anyhow::Result<()> {
