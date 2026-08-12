@@ -88,7 +88,8 @@ use decdn_incentive::eth_identity;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "resume-e2e-password";
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Bytes per bao chunk group — the granularity a resume offset must snap to.
 const CHUNK_GROUP: usize = 16 * 1024;

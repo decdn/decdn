@@ -36,6 +36,7 @@ pub mod client;
 pub mod node;
 mod poll;
 pub mod time;
+pub mod timeout;
 
 pub use poll::poll;
 

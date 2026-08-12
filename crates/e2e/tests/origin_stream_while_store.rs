@@ -52,8 +52,11 @@ use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 
-/// Overall ceiling so an unbounded await fails fast with a clear message.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). The
+/// corrupt-outboard leg is the suite's slowest journey (~94s): it waits out the
+/// client's real pull deadline on two expected-failure fetches, which
+/// `run_corrupt_outboard` caps tighter than the default to keep that bounded.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Bytes per bao chunk group (matches `decdn_bao_range::IROH_BLOCK_SIZE`,
 /// chunk-log 4 == 16 KiB chunk groups). A multi-chunk-group blob is required so
@@ -244,7 +247,15 @@ async fn run_corrupt_outboard() -> anyhow::Result<()> {
 
     let client = ClientFixture::new(&chain).await?;
 
-    let result = client.fetch(&chain, &node, hash, U256::ZERO).await;
+    // The node can never serve this blob (its origin pull fails bao verification),
+    // so the fetch is *expected* to fail and spins on the refusal until its retry
+    // budget expires. Cap that budget well under the 45s default — 20s clears the
+    // watcher catch-up many times over while keeping this leg (the suite's
+    // slowest) bounded (#1620).
+    let expect_failure_budget = Duration::from_secs(20);
+    let result = client
+        .fetch_with_deadline(&chain, &node, hash, U256::ZERO, expect_failure_budget)
+        .await;
     anyhow::ensure!(
         result.is_err(),
         "a fetch against a corrupt outboard must fail, not silently deliver bytes"
@@ -267,7 +278,9 @@ async fn run_corrupt_outboard() -> anyhow::Result<()> {
     std::fs::remove_file(&outboard_path).context("remove corrupted origin outboard")?;
 
     let second_client = ClientFixture::new(&chain).await?;
-    let after_origin_removed = second_client.fetch(&chain, &node, hash, U256::ZERO).await;
+    let after_origin_removed = second_client
+        .fetch_with_deadline(&chain, &node, hash, U256::ZERO, expect_failure_budget)
+        .await;
     anyhow::ensure!(
         after_origin_removed.is_err(),
         "a fetch that failed bao verification must leave NO committed local copy, so a second \

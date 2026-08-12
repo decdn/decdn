@@ -63,10 +63,11 @@ use decdn_e2e::cli::decdn_command;
 use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use tokio::process::Command;
 
-/// Defense-in-depth overall ceiling so an unbounded await fails fast with a
-/// clear message rather than squatting the runner. Cleanup (anvil kill, daemon
-/// kill) runs on drop even on timeout. Matches the smoke / cli-fetch budgets.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
+/// Defense-in-depth so an unbounded await fails fast with a clear message
+/// rather than squatting the runner; cleanup (anvil kill, daemon kill) runs on
+/// drop even on timeout.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_namespace_and_assign_land_on_chain() -> anyhow::Result<()> {

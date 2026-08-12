@@ -37,8 +37,9 @@ use decdn_e2e::cli::decdn_command;
 use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use tokio::process::Command;
 
-/// Matches the CLI-journey budgets (anvil launch + forge deploy dominate).
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule);
+/// the unbonding window is time-warped, so anvil launch + forge deploy dominate.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Tier the operator bonds up to before reducing. Both tiers must sit on the
 /// part of the curve where `bondRequired` dominates `minBond`, or the two

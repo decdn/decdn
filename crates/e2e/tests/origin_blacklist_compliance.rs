@@ -51,9 +51,10 @@ use decdn_protocol::client::StreamError;
 
 const MIB: usize = 1024 * 1024;
 
-/// Overall ceiling so an unbounded await fails fast with a clear message.
-/// Cleanup (anvil kill, daemon kill) runs on drop even on timeout.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// Heavy journey tier (see [`decdn_e2e::timeout`] for the tier rule): the legs
+/// chain repeated 180s `CATCHUP_BUDGET` polls, above the ~150s threshold for the
+/// standard tier. Cleanup (anvil kill, daemon kill) runs on drop even on timeout.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 /// Budget for each catch-up poll. Generous because a *refused* `fetch` retries
 /// its (transient-classified) `OriginBlacklisted` reject to its own ~45s internal

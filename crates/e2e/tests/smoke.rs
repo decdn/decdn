@@ -54,10 +54,11 @@ use decdn_e2e::time;
 
 const MIB: usize = 1024 * 1024;
 
-/// Defense-in-depth overall ceiling so an unbounded await fails fast with a
-/// clear message rather than squatting the runner. Cleanup (anvil kill, daemon
-/// kill) runs on drop even on timeout.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Overall ceiling: the standard journey tier (see [`decdn_e2e::timeout`] for
+/// the rule that picks it). Defense-in-depth so an unbounded await fails fast
+/// with a clear message rather than squatting the runner; cleanup (anvil kill,
+/// daemon kill) runs on drop even on timeout.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_compose_fixtures() -> anyhow::Result<()> {

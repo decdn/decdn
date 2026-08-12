@@ -54,7 +54,8 @@ use decdn_incentive::voucher_domain;
 use decdn_protocol::MB_BYTES;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_fetch_auto_topup_raises_and_persists_deposit() -> anyhow::Result<()> {

@@ -96,10 +96,11 @@ const BASE_RATE_PER_MB: u64 = 10;
 /// delivery band, so the daemon signs it unclamped.
 const SWITCHED_RATE_PER_MB: u64 = 40;
 
-/// Overall ceiling so an unbounded await fails fast with a clear message.
-/// Cleanup (anvil kill, daemon kill) runs on drop even on timeout. The journey
-/// runs a full deploy, a daemon, several commit-reveal challenges and time warps.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(1200);
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). The
+/// journey runs a full deploy, a daemon, and several commit-reveal challenges,
+/// but each on-chain step is time-warped rather than waited out, so it stays
+/// under the standard budget. Cleanup runs on drop even on timeout.
+const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn real_node_responses_are_valid_on_chain_evidence() -> anyhow::Result<()> {
