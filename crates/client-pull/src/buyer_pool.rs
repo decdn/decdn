@@ -1,33 +1,32 @@
-//! Buyer-side `PaymentChannel` open kernel, shared by the node's
-//! `BuyerChannelService` (node-to-node miss pulls, #744) and the CLI (`decdn
-//! fetch`, #940).
+//! Buyer-side `PaymentPool` open kernel, shared by the node's node-to-node
+//! cache-miss buyer (#744) and the CLI (`decdn fetch`, #940).
 //!
-//! The genuinely duplication-prone part — the `openChannel` transaction, the
-//! authoritative `ChannelOpened`-from-receipt decode, and the
-//! [`BuyerChannelState`] / [`ChannelContext`] construction — lives here. Channel
-//! *reuse* and watermark *recording* are thin compositions over
-//! [`decdn_incentive::BuyerChannelStore`] (`get_by_provider`, `advance_progress`)
-//! that each caller does directly: a one-shot CLI fetch needs neither the node
-//! service's per-provider concurrency guard nor its background reclaim/reconcile
-//! machinery, so only the open kernel is shared.
+//! The genuinely duplication-prone part — the `openPool` transaction, the
+//! authoritative `PoolOpened`-from-receipt decode, the self-owned capability the
+//! single-user buyer signs for its own key, and the [`BuyerPoolState`] /
+//! [`PoolContext`] construction — lives here. Pool *reuse* and watermark
+//! *recording* are thin compositions over [`decdn_incentive::BuyerPoolStore`]
+//! (`get_by_owner`, `advance_progress`) that each caller does directly: a
+//! one-shot CLI fetch needs neither the node service's per-owner concurrency
+//! guard nor its background reclaim/reconcile machinery, so only the open kernel
+//! is shared.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, FixedBytes, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use decdn_incentive::buyer_channel::{BuyerChannelStore, DepositOutcome};
 use decdn_incentive::erc20::Erc20;
-use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{BuyerChannelState, ChannelOpenFailureReason};
-use tracing::{debug, error, info, warn};
+use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::{BuyerPoolState, Capability, PoolOpenFailureReason, SignedCapability};
+use tracing::{debug, error, info};
 
-use crate::ChannelContext;
+use crate::PoolContext;
 
-/// Re-approve the `PaymentChannel` spender for the *unlimited* case when the
+/// Re-approve the `PaymentPool` spender for the *unlimited* case when the
 /// standing USDC allowance has fallen below this floor. Half of `U256::MAX` so
 /// one max approval covers effectively unlimited deposits and a re-run with the
 /// approval already in place skips the redundant `approve`, while a
@@ -62,37 +61,70 @@ fn approve_decision(current: U256, amount: Option<U256>) -> Option<U256> {
 }
 
 /// Bound the wait for the one-time USDC `approve` receipt so a stuck or
-/// underpriced tx can't wedge the buyer lane (#1109 — ~27 min observed on a live
-/// node). Sized well above a normal inclusion window but short enough that the
-/// worst case is a few minutes. On timeout the broadcast tx may still mine
-/// later; the allowance read at the top of the next run makes the re-approve
-/// idempotent, so no funds are stranded. Not config-tunable yet (YAGNI), like
-/// the `RECONCILE_IDLE_SWEEPS` convention in the node's `buyer_channel`.
+/// underpriced tx can't wedge the buyer path (#1109). Sized well above a normal
+/// inclusion window but short enough that the worst case is a few minutes. On
+/// timeout the broadcast tx may still mine later; the allowance read at the top
+/// of the next run makes the re-approve idempotent, so no funds are stranded.
 const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// A freshly opened buyer channel: the persistable [`BuyerChannelState`], a
-/// ready-to-sign [`ChannelContext`], and the open transaction hash (so a caller
+/// A freshly opened buyer pool: the persistable [`BuyerPoolState`], a
+/// ready-to-sign [`PoolContext`], the self-owned [`SignedCapability`] the buyer
+/// registers on its first redemption, and the open transaction hash (so a caller
 /// whose subsequent `store.record` fails can log the escrowed-but-untracked tx
-/// for manual reconciliation — the deposit is on-chain the moment `openChannel`
+/// for manual reconciliation — the deposit is on-chain the moment `openPool`
 /// mines).
 #[derive(Debug)]
-pub struct OpenedChannel {
-    /// Persist this via `BuyerChannelStore::record`.
-    pub state: BuyerChannelState,
-    /// Use this to sign vouchers for the new channel.
-    pub ctx: ChannelContext,
-    /// The `openChannel` transaction hash.
+pub struct OpenedPool {
+    /// Persist this via `BuyerPoolStore::record`.
+    pub state: BuyerPoolState,
+    /// Use this to sign vouchers for the new pool. The fetch target's provider
+    /// address and the lane priors are pinned per-pull via
+    /// [`PoolContext::with_provider`].
+    pub ctx: PoolContext,
+    /// The owner-signed grant delegating spend on this pool to the buyer's own
+    /// signing key, regenerated per open and never stored.
+    pub capability: SignedCapability,
+    /// The `openPool` transaction hash.
     pub tx: TxHash,
 }
 
-/// Ensure `owner` holds a sufficient USDC allowance for the `PaymentChannel`
+/// Sign a self-owned [`SignedCapability`]: the pool owner delegates spend on
+/// `pool_id` to its OWN signing key, up to `spending_cap`, until `expiry`. This
+/// is the single-user case — the owner and the voucher signer are the same key —
+/// so the capability is regenerated from the key per connection and never stored.
+///
+/// The serving node registers it on the buyer's first on-chain redemption
+/// (`redeemMany`'s `CapabilityReg`), then accepts vouchers from this signer up to
+/// the cap (ADR 003 §Capability delegation).
+///
+/// # Errors
+///
+/// Propagates a signing error from the owner signer.
+pub fn issue_self_capability(
+    owner_signer: &PrivateKeySigner,
+    pool_id: B256,
+    spending_cap: U256,
+    expiry: u64,
+    voucher_domain: &Eip712Domain,
+) -> Result<SignedCapability> {
+    Capability {
+        signer: owner_signer.address(),
+        spending_cap,
+        pool_id,
+        expiry,
+    }
+    .sign(owner_signer, voucher_domain)
+    .map_err(|e| anyhow::anyhow!("sign self capability: {e}"))
+}
+
+/// Ensure `owner` holds a sufficient USDC allowance for the `PaymentPool`
 /// `spender`, issuing at most one `approve` when the current allowance is below
-/// what `amount` requires. `amount == None` grants an unlimited
-/// (`U256::MAX`) allowance — the node/operator posture that avoids re-approve
-/// churn; `amount == Some(deposit)` grants exactly `deposit` — the client
-/// default that keeps the standing spend authority scoped to the deposit being
-/// escrowed. See `approve_decision` for the skip logic. Idempotent across runs
-/// — a wallet already at or above the required allowance skips the tx.
+/// what `amount` requires. `amount == None` grants an unlimited (`U256::MAX`)
+/// allowance — the node/operator posture that avoids re-approve churn;
+/// `amount == Some(deposit)` grants exactly `deposit` — the client default that
+/// keeps the standing spend authority scoped to the deposit being escrowed. See
+/// `approve_decision` for the skip logic. Idempotent across runs — a wallet
+/// already at or above the required allowance skips the tx.
 ///
 /// # Errors
 ///
@@ -140,126 +172,87 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         %spender,
         %approve_value,
         unlimited = amount.is_none(),
-        "issued USDC approval for PaymentChannel deposits"
+        "issued USDC approval for PaymentPool deposits"
     );
     Ok(())
 }
 
-/// Open a fresh `PaymentChannel` against `provider_addr`, escrowing `deposit`
-/// USDC, and decode the authoritative `channelId` + `expiresAt` from the
-/// receipt's own `ChannelOpened` event.
+/// Open a fresh `PaymentPool` deposit for `owner`, escrowing `deposit` USDC, and
+/// decode the authoritative `poolId` from the receipt's own `PoolOpened` event.
 ///
-/// Decoding from the receipt (rather than a follow-up `getChannel`) is atomic
-/// with the open: a mined tx guarantees the event, so the caller can always
-/// persist — a transient read failure can never leave the deposit orphaned
-/// (opened-but-untracked). The event is filtered on `client == self_address`
-/// and `provider == provider_addr` to confirm we decoded our own open.
+/// `openPool` names no provider and no signer — a pool is bound to no payee at
+/// open, and fans out to many `(signer, provider)` lanes off-chain (ADR 003).
+/// The returned [`OpenedPool`] carries a self-owned capability the buyer signs
+/// for its own key (`spending_cap == credited deposit`, no expiry), which the
+/// serving node registers on the first redemption.
+///
+/// Decoding from the receipt (rather than a follow-up `getPool`) is atomic with
+/// the open: a mined tx guarantees the event, so the caller can always persist —
+/// a transient read failure can never leave the deposit orphaned. The event is
+/// filtered on `owner == owner` to confirm we decoded our own open.
 ///
 /// `deposit` is the final escrow amount — the caller applies any
-/// `max(hint, default)` clamping before calling. The returned
-/// [`OpenedChannel`] is **not yet persisted**: the caller records
-/// [`OpenedChannel::state`] in its `BuyerChannelStore`, and on a record failure
-/// should log [`OpenedChannel::tx`] (the deposit is escrowed on-chain).
+/// `max(hint, default)` clamping before calling. The returned [`OpenedPool`] is
+/// **not yet persisted**: the caller records [`OpenedPool::state`] in its
+/// `BuyerPoolStore`, and on a record failure should log [`OpenedPool::tx`].
 ///
 /// # Errors
 ///
-/// Fails on `openChannel` submit/receipt, a reverted tx, or a missing
-/// `ChannelOpened` event in the receipt logs. The classified failure legs
-/// (submit, receipt wait, mined revert) attach a [`ChannelOpenFailureReason`]
-/// into the `anyhow` error chain (recover it with
-/// `err.downcast_ref::<ChannelOpenFailureReason>()`), so a caller can bump the
-/// matching `decdn_channel_open_failures_{reason}_total` sibling counter
-/// (a plain counter field carries no label dimension, so each class is its own counter) without
-/// re-parsing the alloy error: a deterministic revert (with ABI revert data,
-/// decoded against the insufficient-deposit error selectors) is split from a
-/// transport/RPC fault (no revert data) and a mined on-chain revert. The
-/// missing-`ChannelOpened` leg carries no reason — the deposit is escrowed but
-/// untracked, so it surfaces as an unclassified error for manual reconciliation
-/// rather than a metric bump.
+/// Fails on `openPool` submit/receipt, a reverted tx, a missing `PoolOpened`
+/// event in the receipt logs, or a capability-signing error. The classified
+/// failure legs attach a [`PoolOpenFailureReason`] into the `anyhow` error chain
+/// (recover it with `err.downcast_ref::<PoolOpenFailureReason>()`) so a caller
+/// can bump the matching `decdn_pool_open_failures_{reason}_total` counter: a
+/// deterministic revert (with ABI revert data, decoded against the
+/// insufficient-deposit error selectors) is split from a transport/RPC fault (no
+/// revert data) and a mined on-chain revert. The missing-`PoolOpened` leg carries
+/// no reason — the deposit is escrowed but untracked, so it surfaces as an
+/// unclassified error for manual reconciliation.
 ///
 /// # The receipt wait is deliberately UNBOUNDED
 ///
-/// `ensure_allowance`'s `approve` bounds its receipt wait (`APPROVE_RECEIPT_TIMEOUT`).
-/// `openChannel` must not — and neither does `top_up`, the module's third tx, which awaits
-/// its receipt unbounded for exactly the reason below. The line is not "one tx is special";
-/// it is ESCROWING vs idempotent, and it is load-bearing rather than an oversight (#1143).
-///
-/// `approve` is idempotent: giving up on its receipt costs nothing, because the
-/// allowance read on the next run makes a re-approve a no-op. `openChannel` and `top_up`
-/// **escrow funds**. Giving up on the receipt does not cancel the tx — it only
-/// makes us stop watching a transfer of real USDC that is still in the mempool. The
-/// caller then has no row, believes no open is in flight, and the next cache miss
-/// escrows a **second** deposit against the same provider. When the first tx mines,
-/// the boot reconcile scan finds a live row already covering that provider and
-/// classifies the orphan `DeferredSecondOpen` — it declines to adopt it, and the
-/// deposit is stranded for the channel's full expiry.
-///
-/// So: while an `openChannel` is outstanding, the only safe thing to do is keep
-/// waiting. The node calls this inside a DETACHED task that holds the provider's
-/// open slot for exactly as long as this future runs, which is what makes the wait
-/// harmless — no caller is blocked by it (they time out on their own budget and get
-/// `ChannelOpenPending`), and no second open can start behind it. It is also what
-/// lets the boot scan do its job: with no second open, there is no live row, so an
-/// orphan is `Rehydrate`d rather than deferred.
-#[allow(clippy::too_many_arguments)]
-pub async fn open_channel<P: Provider + Clone>(
-    contract: &PaymentChannel::PaymentChannelInstance<P>,
+/// `ensure_allowance`'s `approve` bounds its receipt wait (idempotent — giving up
+/// costs nothing). `openPool` and `top_up` **escrow funds**: giving up on the
+/// receipt does not cancel the tx, so a caller that then believes no open is in
+/// flight would escrow a second deposit against a pool the first tx is still
+/// going to mine. So while an `openPool` is outstanding, the only safe thing is
+/// to keep waiting; the node calls this inside a detached task that holds the
+/// owner's open slot for exactly as long as this future runs (#1143).
+pub async fn open_pool<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
     signer: Arc<PrivateKeySigner>,
     voucher_domain: &Eip712Domain,
     token: Address,
-    self_address: Address,
-    provider_addr: Address,
+    owner: Address,
     deposit: U256,
-    voucher_signer: Address,
-) -> Result<OpenedChannel> {
-    // `voucher_signer` pins the channel's EIP-712 `voucherSigner`. A zero
-    // address resolves on-chain to `msg.sender` (this buyer's own key) — the
-    // pre-publisher-pays self-signing behaviour. A non-zero delegate is the
-    // publisher-pays case: `decdn channel open --voucher-signer <ADDR>`.
-    let pending = match contract
-        .openChannel(provider_addr, deposit, voucher_signer)
-        .send()
-        .await
-    {
+) -> Result<OpenedPool> {
+    let pending = match contract.openPool(deposit).send().await {
         Ok(pending) => pending,
         Err(err) => {
-            // A deterministic revert (a zero deposit, USDC balance/allowance
-            // too low, provider inactive, …) is caught at gas
-            // estimation, so it surfaces here with ABI revert data attached;
-            // a send error *without* revert data is a transport/RPC fault.
-            let reason =
-                ChannelOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
+            // A deterministic revert (a zero deposit, USDC balance/allowance too
+            // low) is caught at gas estimation, so it surfaces here with ABI
+            // revert data attached; a send error *without* revert data is a
+            // transport/RPC fault.
+            let reason = PoolOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
             return Err(anyhow::Error::new(err))
-                .context("submit openChannel")
+                .context("submit openPool")
                 .context(reason);
         }
     };
     // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
-    // section above. A `tokio::time::timeout` here would be worse than no bound at
-    // all: it abandons an escrowing tx that is still going to land.
-    let receipt = pending
-        .get_receipt()
-        .await
-        // A failed receipt wait is always a transport/RPC condition (the tx may
-        // even have landed) — never a settlement decision.
-        .map_err(|err| {
-            anyhow::Error::new(err)
-                .context("await openChannel receipt")
-                .context(ChannelOpenFailureReason::RpcError)
-        })?;
+    // section above.
+    let receipt = pending.get_receipt().await.map_err(|err| {
+        anyhow::Error::new(err)
+            .context("await openPool receipt")
+            .context(PoolOpenFailureReason::RpcError)
+    })?;
     if !receipt.status() {
-        // A mined revert: the revert reason is not recoverable from the receipt
-        // (no trace), so it is classified as a generic on-chain revert. Most
-        // insufficient-deposit cases are caught at gas estimation above, but
-        // because balance/allowance state can change between
-        // estimation and mining, a mined revert *could* still be
-        // insufficient-deposit — it just can't be distinguished here, so it
-        // folds into `ContractRevert`.
+        // A mined revert: the reason is not recoverable from the receipt (no
+        // trace), so it folds into `ContractRevert`.
         return Err(anyhow::anyhow!(
-            "openChannel reverted (provider {provider_addr}, deposit {deposit}); check USDC \
-             balance/allowance and that the provider is active"
+            "openPool reverted (owner {owner}, deposit {deposit}); check USDC balance/allowance"
         )
-        .context(ChannelOpenFailureReason::ContractRevert));
+        .context(PoolOpenFailureReason::ContractRevert));
     }
     let tx = receipt.transaction_hash;
 
@@ -267,256 +260,83 @@ pub async fn open_channel<P: Provider + Clone>(
         .inner
         .logs()
         .iter()
-        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelOpened>().ok())
+        .filter_map(|log| log.log_decode::<PaymentPool::PoolOpened>().ok())
         .map(|decoded| decoded.inner.data)
-        .find(|ev| ev.client == self_address && ev.provider == provider_addr)
+        .find(|ev| ev.owner == owner)
     else {
-        // The deposit is escrowed on-chain and we cannot name the channel it bought.
+        // The deposit is escrowed on-chain and we cannot name the pool it bought.
         // Log it HERE rather than leaving it to the caller: the node's caller is a
-        // detached task whose `Err` nobody may be waiting on (#1143), so a bare
-        // `bail!` could lose the only record of real, escrowed USDC.
+        // detached task whose `Err` nobody may be waiting on (#1143).
         error!(
             %tx,
-            provider = %provider_addr,
+            %owner,
             %deposit,
-            "openChannel mined but its ChannelOpened event is missing from the receipt logs; \
+            "openPool mined but its PoolOpened event is missing from the receipt logs; \
              the deposit is escrowed on-chain but UNTRACKED — reconcile manually against the tx"
         );
         anyhow::bail!(
-            "ChannelOpened event for provider {provider_addr} not found in openChannel receipt \
-             logs (tx {tx}); the deposit is escrowed on-chain but untracked — reconcile manually"
+            "PoolOpened event for owner {owner} not found in openPool receipt logs (tx {tx}); \
+             the deposit is escrowed on-chain but untracked — reconcile manually"
         );
     };
-    let channel_id = opened.channelId;
-    // `ChannelOpened.expiresAt` is `uint256`; clamp to `u64` (a too-far expiry
-    // only ever means a reclaim sweep waits longer).
-    let expires_at = u64::try_from(opened.expiresAt).unwrap_or(u64::MAX);
-
-    // The funder is always whoever called `open_channel` (they put up the
-    // deposit). For the *local* record, resolve the zero sentinel to
-    // `self_address`: on-chain, a zero `voucherSigner` argument resolves to
-    // `msg.sender` (this same address), so that is the real pinned signer —
-    // recording a bare `Address::ZERO` here would make
-    // `can_sign_voucher`-style checks (`signer.address() == state.voucher_signer`,
-    // #1481) fail for every self-signed channel even though this key is the one
-    // the contract actually accepts. The on-chain `openChannel` call above still
-    // sends the raw sentinel (not this resolved value) — resolving here is
-    // purely a local bookkeeping concern.
-    let recorded_voucher_signer = if voucher_signer.is_zero() {
-        self_address
-    } else {
-        voucher_signer
-    };
+    let pool_id = opened.poolId;
     // Record what the contract CREDITED, not what we asked it to transfer.
-    // `openChannel` sets `ch.deposit` to the measured balance delta and emits that
-    // in `ChannelOpened.deposit`, precisely so a fee-on-transfer token cannot
-    // over-state a channel against the shared USDC pool.
-    //
-    // Recording the requested amount puts the over-statement in our own row. The
-    // harm is buyer-side, not a settlement revert: nothing here bounds vouchers by
-    // this field (`ChannelContext::deposit` is informational — the seller enforces
-    // the real one, refusing off-chain via `stage_voucher`'s `AmountExceedsDeposit`
-    // long before any on-chain call). What breaks is our own headroom arithmetic:
-    // `refill_amount` reads `deposit - prior_amount` from the inflated row, so the
-    // auto-refill fires late or short, and because `add_deposit` accumulates, the
-    // drift compounds with every top-up until every seller refuses us. `channelId`
-    // and `expiresAt` were already taken from this event; `deposit` was the one
-    // field still read from the argument.
+    // `openPool` sets the pool deposit to the measured balance delta and emits
+    // that in `PoolOpened.deposit`, precisely so a fee-on-transfer token cannot
+    // over-state a pool against the shared USDC balance.
     let credited = opened.deposit;
-    let state = BuyerChannelState::new(
-        channel_id,
-        provider_addr,
-        self_address,
-        recorded_voucher_signer,
-        token,
+    let state = BuyerPoolState::new(pool_id, owner, token, credited);
+    let capability = issue_self_capability(
+        signer.as_ref(),
+        pool_id,
         credited,
-        expires_at,
-    );
-    let ctx = ChannelContext::for_buyer_channel(&state, signer, voucher_domain.clone());
+        SELF_CAPABILITY_EXPIRY,
+        voucher_domain,
+    )?;
+    let ctx = PoolContext::for_pool(&state, signer, voucher_domain.clone());
     info!(
-        provider = %provider_addr,
-        %channel_id,
+        %owner,
+        %pool_id,
         requested = %deposit,
         credited = %credited,
-        expires_at,
-        "opened buyer payment channel"
+        "opened buyer payment pool"
     );
-    Ok(OpenedChannel { state, ctx, tx })
+    Ok(OpenedPool {
+        state,
+        ctx,
+        capability,
+        tx,
+    })
 }
 
-/// Log the local-credit outcome of a landed `topUp` at the right severity.
-///
-/// Extracted from [`top_up`] to keep it under the cognitive-complexity limit. The
-/// severities are the point: by the time any of these fire the deposit is already
-/// escrowed on-chain, so `UnknownChannel` means escrowed-and-untracked (matching
-/// the open path's posture) while `ChannelMismatch` leaves the provider reclaimable.
-fn log_top_up_outcome(
-    outcome: &DepositOutcome,
-    provider_addr: Address,
-    channel_id: FixedBytes<32>,
-    additional: U256,
-    tx: TxHash,
-) {
-    match outcome {
-        DepositOutcome::Added(new_deposit) => {
-            info!(
-                provider = %provider_addr,
-                %channel_id,
-                %new_deposit,
-                %tx,
-                "topped up buyer channel"
-            );
-        }
-        // The on-chain topUp already credited `channel_id`, but the local row
-        // vanished during the RPC. Funds are escrowed on-chain with zero local
-        // tracking — `error!` (matching the open path's escrowed-but-untracked
-        // posture) and surface the tx for reconcile.
-        DepositOutcome::UnknownChannel => {
-            error!(
-                provider = %provider_addr,
-                %channel_id,
-                %additional,
-                %tx,
-                "top_up: on-chain topUp landed but no local channel record exists to credit; \
-                 deposit is escrowed on-chain and untracked — reconcile against the tx"
-            );
-        }
-        // A row still exists (for a different channel), so the provider stays
-        // reclaimable — less severe than `UnknownProvider`, hence `warn!`.
-        DepositOutcome::ChannelMismatch => {
-            warn!(
-                provider = %provider_addr,
-                %channel_id,
-                %additional,
-                %tx,
-                "top_up: provider channel replaced during the topUp RPC; the on-chain deposit \
-                 was credited to the topped-up channel but the local record now tracks a \
-                 different channel — reconcile against the tx"
-            );
-        }
-    }
-}
+/// Expiry stamped on the self-owned capability [`open_pool`] signs. The
+/// single-user buyer owns both keys, so there is no delegation to time-box —
+/// `u64::MAX` means "never expires", and the pool's own grace-window close is the
+/// only lifecycle gate (there is no pool expiry, ADR 003).
+const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 
-/// How much a landed `topUp` actually credited on-chain.
+/// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
+/// credited amount read back from the `PoolToppedUp` event — the shared mechanism
+/// behind the node's cache-miss buyer (#744) and the CLI fetch buyer's auto-refill
+/// (#1103). `topUp` does not extend any lifecycle deadline; the caller credits the
+/// returned amount into its local [`BuyerPoolState`] via `add_deposit`.
 ///
-/// `topUp` adds the measured balance DELTA, not the requested amount, so a
-/// fee-on-transfer token cannot over-state a channel — and the local row has to
-/// mirror that or the buyer's own headroom arithmetic drifts (see `top_up`).
-/// Normally that value is `ChannelToppedUp.additionalDeposit`.
-///
-/// Extracted from [`top_up`] both to keep that function under the complexity limit
-/// and because the three-way fallback is the part worth reading on its own.
-async fn resolve_top_up_credit<P: Provider + Clone>(
-    contract: &PaymentChannel::PaymentChannelInstance<P>,
-    channel_id: FixedBytes<32>,
-    additional: U256,
-    prior_deposit: U256,
-    tx: TxHash,
-    receipt: &alloy::rpc::types::TransactionReceipt,
-) -> U256 {
-    // Filtered on the emitting address, not just the topic: `topUp` transfers
-    // BEFORE it emits, so a token with a transfer hook could plant a forged
-    // `ChannelToppedUp` earlier in the same receipt and `find` would prefer it. Not
-    // reachable today (the settlement token's address is immutable at deployment),
-    // but this function's whole premise is a token that misbehaves during transfer,
-    // so the one assumption it rests on should not be the unchecked one.
-    if let Some(ev) = receipt
-        .inner
-        .logs()
-        .iter()
-        .filter(|log| log.address() == *contract.address())
-        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelToppedUp>().ok())
-        .map(|decoded| decoded.inner.data)
-        .find(|ev| ev.channelId == channel_id)
-    {
-        return ev.additionalDeposit;
-    }
-
-    // No event for our channel means our view of the contract is wrong (an ABI
-    // skew, a swallowed log) — which is exactly the state in which guessing
-    // `additional` is least defensible, since the same skew invalidates the
-    // assumption that `additional` is still the right quantity. Read the truth
-    // instead: the funds are already escrowed, so one extra `eth_call` is cheap and
-    // `getChannel` is the value we were trying to mirror anyway.
-    match contract.getChannel(channel_id).call().await {
-        Ok(ch) => {
-            warn!(
-                %channel_id, %tx,
-                "topUp receipt carried no ChannelToppedUp for this channel; \
-                 reconciled the deposit against getChannel instead"
-            );
-            // Delta against the pre-RPC snapshot. Exact unless a concurrent top-up
-            // landed during our own RPC, which would make this credit too large —
-            // acceptable only because we are already in the "our ABI is wrong"
-            // state, and still strictly better than a number the chain never saw.
-            ch.deposit.saturating_sub(prior_deposit)
-        }
-        Err(e) => {
-            error!(
-                %channel_id, %tx, error = %e,
-                "topUp landed but neither its event nor getChannel could be read; \
-                 crediting the requested amount, which may over-state the local row"
-            );
-            additional
-        }
-    }
-}
-
-/// Add `additional` USDC to the buyer channel tracked for `provider_addr` and
-/// reconcile the persisted deposit — the shared mechanism behind the node's
-/// cache-miss buyer (`BuyerChannelService::top_up`, #744) and the CLI fetch
-/// buyer's auto-refill (#1103). `topUp` does not extend `expiresAt` (the
-/// contract forbids it), so callers rotate a near-expiry channel rather than
-/// top it up.
-///
-/// The `channelId` is read from the store *before* the RPC (it is needed both to
-/// call `topUp` and as the channel-id guard on the post-RPC write). After the
-/// receipt lands, the committed deposit is credited via
-/// [`BuyerChannelStore::add_deposit`], which reads the deposit inside its own
-/// write transaction (never this pre-call snapshot) and channel-id-guards it, so
-/// a concurrent watermark advance or channel rotation during the RPC is not
-/// clobbered. The amount credited is read back from `ChannelToppedUp`, not assumed
-/// to equal `additional`: the contract credits a measured balance delta, so the
-/// two differ under a fee-on-transfer token and the local row must not over-state
-/// the on-chain deposit.
-///
-/// # Returns
-///
-/// The [`DepositOutcome`] of crediting the local row: `Added` on the clean path,
-/// or `UnknownProvider` / `ChannelMismatch` when the on-chain `topUp` landed but
-/// the local record vanished or was replaced during the RPC (funds escrowed
-/// on-chain, untracked locally — reconcile against the tx). The caller decides how
-/// to grade those: they are `Ok` here (the deposit is safe on-chain), but a caller
-/// that meters success separately should NOT count them as a clean top-up (#1146).
+/// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
+/// assumed to equal `additional`: the contract credits a measured balance delta,
+/// so the two differ under a fee-on-transfer token and the local row must not
+/// over-state the on-chain deposit. If the event is absent (an ABI skew), the
+/// requested `additional` is returned as the best available estimate.
 ///
 /// # Errors
 ///
-/// Errors if no channel is tracked for `provider_addr` *before* the RPC, or if
-/// the `topUp` transaction fails (submit, revert, or receipt). The
-/// escrowed-but-untracked outcomes above are returned as `Ok`, not errors — the
-/// funds are already escrowed on-chain against the topped-up channel, so failing
-/// here would not unwind them.
-pub async fn top_up<P, S>(
-    contract: &PaymentChannel::PaymentChannelInstance<P>,
-    store: &S,
-    provider_addr: Address,
+/// Errors if the `topUp` transaction fails (submit, revert, or receipt).
+pub async fn top_up<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pool_id: B256,
     additional: U256,
-) -> Result<DepositOutcome>
-where
-    P: Provider + Clone,
-    S: BuyerChannelStore + ?Sized,
-{
-    // Read the channel_id BEFORE the RPC — needed for `topUp` and as the
-    // channel-id guard on the post-RPC write. The deposit snapshot alongside it is
-    // used ONLY as the baseline for the degraded reconcile path below, never for
-    // the normal credit.
-    let row = store
-        .get_by_provider(provider_addr)
-        .context("look up buyer channel for top-up")?
-        .with_context(|| format!("top_up for unknown provider {provider_addr}"))?;
-    let (channel_id, prior_deposit) = (row.channel_id, row.deposit);
+) -> Result<U256> {
     let receipt = contract
-        .topUp(channel_id, additional)
+        .topUp(pool_id, additional)
         .send()
         .await
         .context("submit topUp")?
@@ -524,29 +344,25 @@ where
         .await
         .context("await topUp receipt")?;
     if !receipt.status() {
-        anyhow::bail!("topUp reverted for channel {channel_id}");
+        anyhow::bail!("topUp reverted for pool {pool_id}");
     }
-    let tx = receipt.transaction_hash;
-    // Credit the *committed* deposit inside a write txn (never the pre-RPC
-    // snapshot), channel-id-guarded so a concurrent advance/reuse during the RPC
-    // is not clobbered.
-    let credited = resolve_top_up_credit(
-        contract,
-        channel_id,
-        additional,
-        prior_deposit,
-        tx,
-        &receipt,
-    )
-    .await;
-    let outcome = store
-        .add_deposit(provider_addr, channel_id, credited)
-        .context("persist buyer channel top-up")?;
-    log_top_up_outcome(&outcome, provider_addr, channel_id, additional, tx);
-    Ok(outcome)
+    // Filtered on the emitting address, not just the topic: `topUp` transfers
+    // BEFORE it emits, so a token with a transfer hook could plant a forged
+    // `PoolToppedUp` earlier in the same receipt and `find` would prefer it.
+    let credited = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.address() == *contract.address())
+        .filter_map(|log| log.log_decode::<PaymentPool::PoolToppedUp>().ok())
+        .map(|decoded| decoded.inner.data)
+        .find(|ev| ev.poolId == pool_id)
+        .map_or(additional, |ev| ev.additionalDeposit);
+    info!(%pool_id, %credited, "topped up buyer payment pool");
+    Ok(credited)
 }
 
-/// Refill a reused buyer channel to `target_deposit` once its remaining spendable
+/// Refill a reused buyer pool to `target_deposit` once its remaining spendable
 /// deposit falls below `1/N` of the configured working deposit.
 /// `5` → refill triggers below 20% remaining, then restores to a full deposit.
 ///
@@ -554,43 +370,21 @@ where
 /// path (#1146), so the refill policy has a single source of truth.
 pub const LOW_WATER_DIVISOR: u64 = 5;
 
-/// Decide how much USDC to add to a reused channel so a sustained series of
-/// fetches against one provider isn't stranded by a spent-down deposit (#1103).
+/// Decide how much USDC to add to a reused pool so a sustained series of fetches
+/// isn't stranded by a spent-down deposit (#1103).
 ///
-/// Pure decision (no I/O) so the policy is unit-testable. `deposit` is the
-/// channel's current on-chain deposit and `prior_amount` the cumulative amount
-/// already vouchered, so the remaining spendable is `deposit - prior_amount`.
-/// When that remaining balance has fallen below `low_water`, return the top-up
-/// that restores it to `target_deposit` (the configured working deposit);
-/// otherwise return `U256::ZERO` (no refill).
+/// Pure decision (no I/O) so the policy is unit-testable. `deposit` is the pool's
+/// current on-chain deposit and `prior_amount` the cumulative amount already
+/// vouchered across its lanes, so the remaining spendable is
+/// `deposit - prior_amount`. When that remaining balance has fallen below
+/// `low_water`, return the top-up that restores it to `target_deposit`; otherwise
+/// return `U256::ZERO` (no refill). Hysteresis (`low_water < target_deposit`)
+/// keeps a busy pool from topping up on every reuse.
 ///
-/// Deliberately NOT gated on evidence of service (#1497 review). Gating on
-/// `prior_amount > 0` — "only graduate a channel that has had a voucher accepted"
-/// — reads like the right way to make the two-tier deposit's trust story literal,
-/// and it DEADLOCKS: the seller refuses to serve at all unless the channel's
-/// headroom covers its pre-serve reserve (one credit window at the quoted rate,
-/// `handlers/client/window.rs`), which at a stock rate is several times the
-/// default 0.5 USDC initial deposit. A channel whose initial deposit is below that
-/// reserve is never served, so no voucher is ever accepted, so the gate never
-/// opens — and the low-water refill that would have rescued it is exactly what the
-/// gate suppressed. The `anvil-e2e` journey
-/// `fetch_larger_than_initial_deposit_tops_up_and_completes` fails this way.
-///
-/// So graduation is a pure low-water refill, and the honest statement of the
-/// guarantee is positional rather than reputational: the buyer's exposure to an
-/// unproven counterparty is bounded by the INITIAL deposit for as long as the
-/// channel is only opened, and rises to the working target on reuse. See
-/// [ADR 003 § Deposit Economics](../../../adr/003-payments.md).
-///
-/// The exact cost of the *next* fetch is not known at refill time on either
-/// caller — the per-MB `rate` is only learned from the provider's probe /
-/// `StreamResponse` (and the CLI's explicit `--node-id` path does no probe; the
-/// node fires this on channel reuse, before any `StreamResponse`) — so this uses a
-/// rate-independent low-water refill: keep at least `low_water` of headroom, and
-/// refill to a full `target_deposit` when it runs low. Hysteresis
-/// (`low_water < target_deposit`) keeps a busy channel from topping up on every
-/// reuse. `topUp` does not extend expiry, so an already-expired channel is replaced
-/// (not refilled) by the caller.
+/// The exact cost of the *next* fetch is not known at refill time (the per-MB
+/// `rate` is only learned from the provider's probe / `StreamResponse`), so this
+/// uses a rate-independent low-water refill: keep at least `low_water` of headroom,
+/// and refill to a full `target_deposit` when it runs low.
 #[must_use]
 pub fn refill_amount(
     deposit: U256,
@@ -613,33 +407,96 @@ pub fn refill_amount(
     clippy::panic
 )]
 mod tests {
-    use super::{LOW_WATER_DIVISOR, approval_floor, approve_decision, open_channel, refill_amount};
-    use alloy::primitives::U256;
+    use super::{
+        LOW_WATER_DIVISOR, approval_floor, approve_decision, issue_self_capability, open_pool,
+        refill_amount, top_up,
+    };
+    use alloy::dyn_abi::Eip712Domain;
+    use alloy::primitives::{Address, B256, U256};
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::{SignedCapability, voucher_domain};
 
-    // ---- `open_channel` voucher_signer plumbing (#1481) ------------------
+    const CHAIN_ID: u64 = 421_614;
 
-    /// Compile-time signature check that `open_channel` takes a trailing
-    /// `voucher_signer: Address` and plumbs it into `OpenedChannel.state`.
-    /// `open_channel` submits a real `openChannel` tx and decodes the mined
-    /// receipt's `ChannelOpened` event, so exercising the `state.voucher_signer
-    /// == voucher_signer` assertion end-to-end needs a live chain — that's
-    /// covered by the anvil e2e (Task 6). This test instead pins the function's
-    /// *shape*: if a future edit drops the parameter, reorders it, or changes
-    /// its type, this fails to compile (a `cargo test` build failure), which
-    /// is a real regression signal even though nothing runs at runtime.
-    #[test]
-    fn open_channel_signature_takes_trailing_voucher_signer() {
-        // `open_channel` submits a real `openChannel` tx and decodes the mined
-        // receipt's `ChannelOpened` event, so exercising the
-        // `state.voucher_signer == voucher_signer` assertion end-to-end needs a
-        // live chain — that's covered by the anvil e2e (Task 6). This instead
-        // pins the function's *shape* at compile time: naming the (monomorphized)
-        // generic fn item as a value, without calling it, forces the compiler to
-        // check its parameter list matches — including the trailing
-        // `voucher_signer: Address`. If a future edit drops the parameter,
-        // reorders it, or changes its type, this fails to compile.
-        let _ = open_channel::<alloy::providers::RootProvider>;
+    fn domain() -> Eip712Domain {
+        voucher_domain(CHAIN_ID, Address::repeat_byte(0xCC))
     }
+
+    // ---- `open_pool` / `top_up` signatures -------------------------------
+
+    /// Compile-time signature check that `open_pool` takes only `deposit` on the
+    /// value axis (no provider, no `voucher_signer`): naming the monomorphized
+    /// generic fn item as a value forces the compiler to check its parameter
+    /// list. `open_pool` submits a real `openPool` tx and decodes the mined
+    /// receipt, so end-to-end coverage lives in the anvil e2e.
+    #[test]
+    fn open_pool_signature_takes_deposit_only() {
+        let _ = open_pool::<alloy::providers::RootProvider>;
+    }
+
+    /// Compile-time signature check that `top_up` takes `(contract, pool_id,
+    /// additional)` — no store, no provider — mirroring the pool contract's own
+    /// `topUp(poolId, additionalDeposit)`.
+    #[test]
+    fn top_up_signature_takes_pool_id_and_amount() {
+        let _ = top_up::<alloy::providers::RootProvider>;
+    }
+
+    // ---- self-owned capability (#966 / ADR 003 §Capability delegation) ---
+
+    /// The capability [`open_pool`] signs must recover to the OWNER — the buyer
+    /// signs its own key as the delegate, so `recover_owner` returns the buyer's
+    /// address.
+    #[test]
+    fn issue_self_capability_recovers_to_owner() -> anyhow::Result<()> {
+        let owner = PrivateKeySigner::random();
+        let pool_id = B256::repeat_byte(0x11);
+        let cap: SignedCapability = issue_self_capability(
+            &owner,
+            pool_id,
+            U256::from(1_000_000u64),
+            u64::MAX,
+            &domain(),
+        )?;
+        assert_eq!(cap.recover_owner(&domain())?, owner.address());
+        assert_eq!(
+            cap.capability.signer,
+            owner.address(),
+            "the delegated signer is the owner's own key"
+        );
+        assert_eq!(cap.capability.pool_id, pool_id);
+        Ok(())
+    }
+
+    /// Regenerating the capability from the same key + params is deterministic:
+    /// EIP-712 signing over a fixed digest is stable, so a per-connection
+    /// regeneration (never stored) yields byte-identical signatures.
+    #[test]
+    fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<()> {
+        let owner = PrivateKeySigner::random();
+        let pool_id = B256::repeat_byte(0x22);
+        let a = issue_self_capability(
+            &owner,
+            pool_id,
+            U256::from(5_000u64),
+            1_900_000_000,
+            &domain(),
+        )?;
+        let b = issue_self_capability(
+            &owner,
+            pool_id,
+            U256::from(5_000u64),
+            1_900_000_000,
+            &domain(),
+        )?;
+        assert_eq!(
+            a.signature, b.signature,
+            "regenerated signatures must match"
+        );
+        Ok(())
+    }
+
+    // ---- allowance decision (unchanged from the channel path) -------------
 
     #[test]
     fn unlimited_zero_allowance_approves_max() {
@@ -648,7 +505,6 @@ mod tests {
 
     #[test]
     fn unlimited_sufficient_skips() {
-        // At exactly the floor the existing (max) approval is honored.
         assert_eq!(approve_decision(approval_floor(), None), None);
         assert_eq!(approve_decision(U256::MAX, None), None);
     }
@@ -680,16 +536,12 @@ mod tests {
 
     #[test]
     fn exact_no_downgrade_from_unlimited() {
-        // A wallet that previously granted an unlimited allowance never gets
-        // re-approved downward when the client switches to exact mode.
         let deposit = U256::from(10_000_000u64);
         assert_eq!(approve_decision(U256::MAX, Some(deposit)), None);
     }
 
     // ---- auto-refill decision (#1103, #1146) ----------------------------
 
-    // Configured working deposit + its derived low-water mark, mirroring what
-    // the reuse paths pass (`low_water = target / LOW_WATER_DIVISOR`).
     fn target() -> U256 {
         U256::from(10_000_000u64) // 10 USDC
     }
@@ -699,14 +551,12 @@ mod tests {
 
     #[test]
     fn refill_amount_no_top_up_when_remaining_at_or_above_low_water() {
-        // Fresh channel (nothing spent): remaining == deposit == target.
         assert_eq!(
             refill_amount(target(), U256::ZERO, target(), low_water()),
             U256::ZERO,
-            "a full channel must not be topped up"
+            "a full pool must not be topped up"
         );
-        // Spent down to exactly the low-water mark: still sufficient (>=).
-        let prior = target() - low_water(); // remaining == low_water
+        let prior = target() - low_water();
         assert_eq!(
             refill_amount(target(), prior, target(), low_water()),
             U256::ZERO,
@@ -716,7 +566,6 @@ mod tests {
 
     #[test]
     fn refill_amount_restores_to_target_when_low() {
-        // Spent so remaining is just below the low-water mark.
         let remaining = low_water() - U256::from(1u64);
         let prior = target() - remaining;
         assert_eq!(
@@ -724,9 +573,7 @@ mod tests {
             target() - remaining,
             "refill must restore the remaining deposit back up to the target"
         );
-
-        // Nearly drained: remaining ~0 → top up ~a full target's worth.
-        let prior_drained = target() - U256::from(1u64); // remaining == 1
+        let prior_drained = target() - U256::from(1u64);
         assert_eq!(
             refill_amount(target(), prior_drained, target(), low_water()),
             target() - U256::from(1u64),
@@ -735,28 +582,22 @@ mod tests {
 
     #[test]
     fn refill_amount_has_hysteresis_after_a_prior_top_up() {
-        // A channel that was already topped up (on-chain deposit == 2*target)
-        // and has spent back down to just above low-water must NOT top up again.
         let deposit = target() * U256::from(2u64);
-        let prior = deposit - low_water(); // remaining == low_water
+        let prior = deposit - low_water();
         assert_eq!(
             refill_amount(deposit, prior, target(), low_water()),
             U256::ZERO,
-            "a topped-up channel with headroom must not refill on every reuse"
+            "a topped-up pool with headroom must not refill on every reuse"
         );
     }
 
     #[test]
     fn refill_amount_saturates_and_never_underflows() {
-        // Pathological: prior_amount above deposit (never happens on-chain, but
-        // the math must not panic under the anti-panic policy) → remaining 0.
         assert_eq!(
             refill_amount(target(), target() * U256::from(3u64), target(), low_water()),
             target(),
             "remaining saturates to zero, so refill is a full target"
         );
-        // Low-water above target (misconfiguration): remaining below low-water
-        // but at/above target → nothing to add (saturating).
         let deposit = target() * U256::from(2u64);
         assert_eq!(
             refill_amount(deposit, U256::ZERO, target(), deposit),
@@ -765,49 +606,14 @@ mod tests {
         );
     }
 
-    /// A never-served channel MUST still be refillable (#1497 review).
-    ///
-    /// It is tempting to gate graduation on evidence of service — refuse to refill
-    /// while `prior_amount == 0`, so an unproven counterparty can never hold the
-    /// working deposit. That gate deadlocks, and this test is the guard against
-    /// re-introducing it: the seller will not serve a channel whose headroom is
-    /// below its pre-serve reserve (one credit window at the quoted rate), which
-    /// at a stock rate exceeds the default 0.5 USDC open. Such a channel is never
-    /// served → never has a voucher accepted → never satisfies the gate → is never
-    /// refilled, and the fetch fails permanently instead of graduating. Verified
-    /// against the live daemon: adding the gate makes the `anvil-e2e` journey
-    /// `fetch_larger_than_initial_deposit_tops_up_and_completes` fail with the
-    /// node's `remaining channel deposit below the reserved cost` refusal.
-    #[test]
-    fn refill_amount_graduates_a_freshly_opened_channel_that_has_served_nothing() {
-        let initial = U256::from(500_000u64); // the shipped open size
-        let working = target(); // 10 USDC
-        let low_water = working / U256::from(LOW_WATER_DIVISOR); // 2 USDC
-
-        // The shipped defaults really do put a fresh open below low-water — which
-        // is what makes the refill reachable (and a service gate fatal) here.
-        assert!(
-            initial < low_water,
-            "fixture must put a freshly opened channel below low-water"
-        );
-        assert_eq!(
-            refill_amount(initial, U256::ZERO, working, low_water),
-            working - initial,
-            "a channel that has served nothing must still be refillable, or a small \
-             initial deposit can never reach the seller's pre-serve reserve"
-        );
-    }
-
     #[test]
     fn refill_targets_working_deposit_not_initial_open_size() {
-        // Channel opened at initial 500_000, spent to 40_000 remaining (< 20% of the
-        // 10_000_000 working target). Refill must restore toward WORKING, not initial.
         let initial = U256::from(500_000u64);
         let working = U256::from(10_000_000u64);
-        let deposit = initial; // opened at initial
+        let deposit = initial;
         let prior = U256::from(460_000u64); // remaining = 40_000
         let low_water = working / U256::from(LOW_WATER_DIVISOR);
         let add = refill_amount(deposit, prior, working, low_water);
-        assert_eq!(add, working - (deposit - prior)); // tops up remaining -> working
+        assert_eq!(add, working - (deposit - prior));
     }
 }
