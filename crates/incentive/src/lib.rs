@@ -39,15 +39,14 @@ pub mod buyer_channel;
 pub mod buyer_channel_redb;
 #[cfg(feature = "buyer-store-core")]
 pub mod buyer_channel_table;
+pub mod capability;
 pub mod capacity_bond;
-pub mod channel;
 pub mod channel_open_error;
 pub mod client_bridge;
 pub mod content_blacklist;
-pub mod coop_close_request;
-pub mod cooperative_close;
 pub mod erc20;
 pub mod eth_identity;
+pub mod lane;
 pub mod node_register;
 pub mod origin_assignment;
 pub mod payment_channel;
@@ -75,26 +74,22 @@ pub use buyer_channel::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, BuyerProgressError,
     DepositOutcome, MemoryBuyerChannelStore,
 };
-pub use channel::{ChannelError, ChannelId, ChannelState, VoucherApplied};
+pub use capability::{Capability, CapabilityError, SignedCapability};
 pub use channel_open_error::ChannelOpenFailureReason;
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
 };
-pub use coop_close_request::{
-    COOP_CLOSE_REQUEST_SIG_LEN, CoopCloseRequestError, coop_close_request_signing_hash,
-    recover_coop_close_request, sign_coop_close_request,
-};
-pub use cooperative_close::{CooperativeClose, SignedCooperativeClose};
 pub use erc20::Erc20;
+pub use lane::{ChannelId, LaneKey, LaneState, PoolError, VoucherApplied};
 pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
     slash_judge_domain,
 };
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
-    ChannelStateStore, CheckpointKey, KeyedCheckpointStore, MemoryChannelStateStore,
-    MemoryPendingSettleStore, PendingSettle, PendingSettleStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, MemoryPendingSettleStore, MemoryPoolStateStore,
+    PendingSettle, PendingSettleStore, PoolStateStore, StoreError,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use swap_balancer::BalancerV3Venue;

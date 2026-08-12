@@ -7,8 +7,8 @@
 //! upstream close & settle — or, if the upstream abandons the channel, reclaims
 //! its own deposit after expiry (ADR 003 §node→node).
 //!
-//! This is the *buyer's* mirror of [`crate::channel::ChannelState`] /
-//! [`crate::store::ChannelStateStore`], which track the *seller's* view. The
+//! This is the *buyer's* mirror of [`crate::lane::LaneState`] /
+//! [`crate::store::PoolStateStore`], which track the *seller's* view. The
 //! two are deliberately separate types:
 //!
 //! - The seller keys channels by `channelId` and records the latest voucher
@@ -30,11 +30,11 @@ use std::sync::Mutex;
 
 use alloy::primitives::{Address, U256};
 
-use crate::channel::ChannelId;
+use crate::lane::ChannelId;
 use crate::store::StoreError;
 
 /// "Never expires" sentinel for [`BuyerChannelState::expires_at`]. Matches the
-/// [`crate::channel::ChannelState`] convention for records hydrated from a
+/// [`crate::lane::LaneState`] convention for records hydrated from a
 /// pre-expiry schema (and the on-chain `uint64` width, so it round-trips
 /// byte-identically through the store).
 pub const NEVER_EXPIRES: u64 = 0;
@@ -59,7 +59,7 @@ pub const NEVER_EXPIRES: u64 = 0;
 /// hydration path (`decdn-node` decoding the redb record) needs struct-literal
 /// construction, but no other writer should mutate `last_*` directly: doing so
 /// bypasses the monotonicity guard and can resume a reused channel at a nonce
-/// the upstream rejects. Mirrors the [`crate::channel::ChannelState`] posture.
+/// the upstream rejects. Mirrors the [`crate::lane::LaneState`] posture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuyerChannelState {
     /// On-chain `channelId` (`keccak256(client, provider, channelNonce)`) —
@@ -264,7 +264,7 @@ pub enum DepositOutcome {
 /// Durable backing store for [`BuyerChannelState`], keyed by `channel_id`
 /// (its on-chain identity) with `provider` as a secondary reuse index.
 ///
-/// Mirrors [`crate::store::ChannelStateStore`] but for the buyer's view. The
+/// Mirrors [`crate::store::PoolStateStore`] but for the buyer's view. The
 /// reuse unit is one open channel per provider, so `get_by_provider` is the
 /// hot path the channel-open trigger consults before deciding to reuse vs.
 /// open — it resolves through the provider index to the primary

@@ -30,7 +30,7 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use serde::{Deserialize, Serialize};
 
 use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerLoad, DepositOutcome};
-use crate::channel::ChannelId;
+use crate::lane::ChannelId;
 use crate::store::StoreError;
 
 /// The buyer table: name, key type, and value type.

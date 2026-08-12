@@ -6,7 +6,7 @@
 //! (#744) consume:
 //!
 //! - reads: `usdc()` (the immutable settlement token, used to fill
-//!   [`crate::channel::ChannelState::token`] since `ChannelOpened` does not
+//!   [`crate::lane::LaneState`] since `ChannelOpened` does not
 //!   carry it) and `getChannel(channelId)` (to read the on-chain
 //!   `withdrawnAmount` watermark when deciding whether a redemption delta
 //!   crosses the threshold);

@@ -27,7 +27,7 @@ use crate::buyer_channel::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, DepositOutcome,
 };
 use crate::buyer_channel_table::BuyerChannelTable;
-use crate::channel::ChannelId;
+use crate::lane::ChannelId;
 use crate::store::StoreError;
 
 /// File name of the buyer-channel redb database within the data dir.

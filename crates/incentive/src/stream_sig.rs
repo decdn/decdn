@@ -103,7 +103,7 @@ impl StreamSlashData {
             ok: body.ok,
             rate_per_mb: body.rate_per_mb,
             total_bytes: body.total_bytes,
-            channel_id: B256::from(body.channel_id),
+            channel_id: B256::from(body.pool_id),
             timestamp_us: body.timestamp_us,
             redirect: body
                 .redirect
@@ -474,7 +474,7 @@ mod tests {
             ok: true,
             rate_per_mb: 10_000,
             total_bytes: 1_048_576,
-            channel_id: [0x33u8; 32],
+            pool_id: [0x33u8; 32],
             timestamp_us: 1_700_000_000_000_000,
             redirect: None,
         };

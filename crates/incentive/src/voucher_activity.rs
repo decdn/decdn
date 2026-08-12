@@ -1,6 +1,6 @@
 //! In-memory per-channel voucher-activity clock (issue #749).
 //!
-//! [`crate::ChannelState`] persists *what* the latest accepted voucher was
+//! [`crate::LaneState`] persists *what* the latest accepted voucher was
 //! (nonce, amount, bytes), but not *when* it was accepted: the redb schema
 //! carries no last-voucher wall-clock, and adding one would be a schema
 //! migration touching every `ChannelState` call site. The operator-facing
@@ -12,7 +12,7 @@
 //! [`VoucherActivity`] is that clock: a `Mutex<HashMap<ChannelId, Instant>>`
 //! the voucher-accept path stamps on each acceptance ([`VoucherActivity::touch`])
 //! and the admin snapshot reads ([`VoucherActivity::seconds_since`]). It is
-//! deliberately *not* wired into [`crate::ChannelState::apply_voucher`] (which
+//! deliberately *not* wired into [`crate::LaneState::apply_voucher`] (which
 //! is a sync, store-coupled leaf method) — the `decdn-node` client handler
 //! stamps it after a successful apply, the same place it fires the redeem hint.
 //!
@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::channel::ChannelId;
+use crate::lane::ChannelId;
 
 /// In-memory clock recording the last time this process accepted a voucher
 /// on each channel. Thread-safe and cheap to clone the `Arc` around: the
