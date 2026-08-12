@@ -175,11 +175,26 @@ impl FillSession {
     /// Park the owner's pull-thread handle on the session so whichever observer leaves
     /// LAST joins it. Called once, on the owner branch, right after the pull thread is
     /// spawned. The attach path never calls this — it drives no pull of its own.
+    ///
+    /// Refuses to overwrite an already-parked handle: a session has exactly one owner
+    /// (`FillRegistry::claim` returns one `Owner`), so a second park cannot happen —
+    /// but if a future regression called this twice, overwriting would DROP the first
+    /// handle and detach its thread, orphaning a pull that keeps paying/draining. So
+    /// keep the first (the one the last-out observer will join) and `debug_assert` the
+    /// double-park loudly in tests/dev.
     pub fn set_pull_handle(&self, handle: std::thread::JoinHandle<()>) {
-        *self
+        let mut slot = self
             .pull_thread
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(handle);
+            .unwrap_or_else(PoisonError::into_inner);
+        debug_assert!(
+            slot.is_none(),
+            "a FillSession parks exactly one pull-thread handle; a second park would \
+             detach the first and orphan its pull"
+        );
+        if slot.is_none() {
+            *slot = Some(handle);
+        }
     }
 
     /// Take the parked pull-thread handle, if any. Called only by the last-out lease
