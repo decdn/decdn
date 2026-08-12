@@ -16,7 +16,7 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
-import { PaymentChannel } from "../src/PaymentChannel.sol";
+import { PaymentPool } from "../src/PaymentPool.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
@@ -235,10 +235,9 @@ abstract contract BaseProtocolDeploy is Script {
         BalancerVenueParams bal;
     }
 
-    // PaymentChannel launch params (ADR 003 § Initial deployment values). All
+    // PaymentPool launch params (ADR 003 § Initial deployment values). All
     // governance-tunable post-deploy within the contract's safety bounds.
     uint256 internal constant PAYMENT_DISPUTE_WINDOW = 48 hours;
-    uint256 internal constant PAYMENT_MAX_CHANNEL_DURATION = 90 days;
     uint256 internal constant PAYMENT_DELIVERY_FLOOR = 1;
 
     // SlashJudge launch params (ADR 014 § Governable Parameters). `maxEvidenceAge`
@@ -306,7 +305,7 @@ abstract contract BaseProtocolDeploy is Script {
         PublisherRegistry registry;
         TimelockController timelock;
         DecdnGovernor governor;
-        PaymentChannel paymentChannel;
+        PaymentPool paymentPool;
         SlashJudge slashJudge;
         OriginAssignment originAssignment;
         ManualVettingPolicy vettingPolicy;
@@ -538,14 +537,13 @@ abstract contract BaseProtocolDeploy is Script {
         d.blacklist =
             new ContentBlacklist({ capacityBond_: ICapacityBondEjector(address(d.bond)), admin: cfg.deployer });
 
-        // PaymentChannel (ADR 003): USDC settlement gateway. `feeRouter` must be
+        // PaymentPool (ADR 003): USDC settlement gateway. `feeRouter` must be
         // a deployed contract (constructor checks code size) — `d.router` above.
-        d.paymentChannel = new PaymentChannel({
+        d.paymentPool = new PaymentPool({
             usdc_: cfg.usdc,
             capacityBond_: ICapacityBondActivity(address(d.bond)),
             feeRouter_: address(d.router),
             disputeWindow_: PAYMENT_DISPUTE_WINDOW,
-            maxChannelDuration_: PAYMENT_MAX_CHANNEL_DURATION,
             deliveryFloor_: PAYMENT_DELIVERY_FLOOR,
             admin: cfg.deployer
         });
@@ -698,13 +696,13 @@ abstract contract BaseProtocolDeploy is Script {
         d.bond.grantRole(d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.router.grantRole(d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashAppeal.grantRole(d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
-        d.paymentChannel.grantRole(d.paymentChannel.PAUSER_ROLE(), cfg.emergencyMultisig);
+        d.paymentPool.grantRole(d.paymentPool.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashJudge.grantRole(d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
         // PaymentChannel.settleChannel / withdraw call FeeRouter.routeSettlement
         // (ADR 016 § Post-Deployment Init step 4) — without this the settlement
         // path reverts.
-        d.router.grantRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel));
+        d.router.grantRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool));
         // SlashJudge is the sole holder of SLASH_ROLE on CapacityBond (step 3) —
         // the only on-chain slash trigger.
         d.bond.grantRole(d.bond.SLASH_ROLE(), address(d.slashJudge));
@@ -847,7 +845,7 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
         _requireRole(d.bond, d.bond.SLASH_ROLE(), address(d.slashJudge));
         // FeeRouter settlement-routing grant.
-        _requireRole(d.router, d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel));
+        _requireRole(d.router, d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool));
         // EMERGENCY_MULTISIG_ROLE on both appeal surfaces.
         _requireRole(d.slashAppeal, d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
@@ -855,7 +853,7 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.bond, d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.router, d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.slashAppeal, d.slashAppeal.PAUSER_ROLE(), cfg.emergencyMultisig);
-        _requireRole(d.paymentChannel, d.paymentChannel.PAUSER_ROLE(), cfg.emergencyMultisig);
+        _requireRole(d.paymentPool, d.paymentPool.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.slashJudge, d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
         // Address bindings from deployer-only setters.
@@ -884,7 +882,7 @@ abstract contract BaseProtocolDeploy is Script {
 
     /// @dev The nine GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
     ///      off to the Timelock (router, bond, blacklist, slashAppeal, registry,
-    ///      paymentChannel, slashJudge, originAssignment, vettingPolicy) — single
+    ///      paymentPool, slashJudge, originAssignment, vettingPolicy) — single
     ///      source of truth for `_handOffGovernance` and `_assertNoBackDoors` so
     ///      the governed set can't drift between them. The array width MUST equal
     ///      the number of role-bearing `Deployment` members; adding a target
@@ -898,7 +896,7 @@ abstract contract BaseProtocolDeploy is Script {
             d.blacklist,
             d.slashAppeal,
             d.registry,
-            d.paymentChannel,
+            d.paymentPool,
             d.slashJudge,
             d.originAssignment,
             d.vettingPolicy
