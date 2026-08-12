@@ -199,10 +199,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         if (operator == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
-        // Pull USDC from the caller (PaymentChannel) once, then push out the
-        // three legs. Pulls + pushes share the same token, so we avoid the
-        // approve-from-channel race by transferring in here. PaymentChannel
-        // must `approve(this, amount)` before calling.
+        // Pull USDC from the caller (PaymentPool) once, then push out the
+        // three legs. Pulls + pushes share the same token, so we avoid an
+        // approve race by transferring in here. PaymentPool must
+        // `approve(this, amount)` before calling.
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
         // forge-lint: disable-next-line(block-timestamp)

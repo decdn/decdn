@@ -63,7 +63,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                         TimelockController; buyback bucket
 ///                                         dormant — see BuybackBurner note below),
 ///                                         ContentBlacklist, PublisherRegistry,
-///                                         PaymentChannel, SlashJudge,
+///                                         PaymentPool, SlashJudge,
 ///                                         OriginAssignment. Deployer is admin of
 ///                                         every AccessControl-bearing target.
 ///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
@@ -75,7 +75,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
 ///                                          Pausable target,
-///                                          router-caller → PaymentChannel,
+///                                          router-caller → PaymentPool,
 ///                                          SLASH_ROLE → SlashJudge) plus the
 ///                                          deployer-only
 ///                                          `OriginAssignment.setContentBlacklist`
@@ -699,9 +699,8 @@ abstract contract BaseProtocolDeploy is Script {
         d.paymentPool.grantRole(d.paymentPool.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.slashJudge.grantRole(d.slashJudge.PAUSER_ROLE(), cfg.emergencyMultisig);
 
-        // PaymentChannel.settleChannel / withdraw call FeeRouter.routeSettlement
-        // (ADR 016 § Post-Deployment Init step 4) — without this the settlement
-        // path reverts.
+        // PaymentPool.redeem calls FeeRouter.routeSettlement (ADR 016 § Post-
+        // Deployment Init step 4) — without this the settlement path reverts.
         d.router.grantRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool));
         // SlashJudge is the sole holder of SLASH_ROLE on CapacityBond (step 3) —
         // the only on-chain slash trigger.

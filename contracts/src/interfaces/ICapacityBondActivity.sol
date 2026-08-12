@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 /// @title ICapacityBondActivity
 /// @notice Consumer-side view of `CapacityBond.isActive` (ADR 003
 ///         § NodeId-to-Ethereum Binding, ADR 016 § Off-Chain Read API).
-///         `PaymentChannel.openChannel` reads it to refuse channels against an
+///         `PaymentPool.openPool` reads it to refuse pools against an
 ///         operator that is not a currently-bonded, active node; `OriginAssignment`
 ///         reads the same predicate for origin authorization. Kept focused —
 ///         mirroring `ICapacityBondEpoch` / `ICapacityBondEjector` — so

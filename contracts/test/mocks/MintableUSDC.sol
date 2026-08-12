@@ -8,7 +8,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 ///         deploy tests), this is deployed standalone to a local anvil by the
 ///         Rust on-chain settlement e2e (`crates/node/tests/anvil_settlement_e2e.rs`,
 ///         issue #745): the harness mints settlement USDC to the test client so
-///         it can fund a `PaymentChannel.openChannel` deposit. `mint` is open
+///         it can fund a `PaymentPool.openPool` deposit. `mint` is open
 ///         by design — this contract must never ship to a real network.
 contract MintableUSDC is ERC20 {
     constructor() ERC20("USD Coin", "USDC") { }

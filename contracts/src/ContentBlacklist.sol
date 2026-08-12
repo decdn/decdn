@@ -610,7 +610,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         removal between two page reads can move an unread element into an
     ///         already-read slot and skip it. Page every offset at ONE pinned
     ///         block height and re-check `blacklistedHashCount` at that same
-    ///         height. Same hazard `PaymentChannel.deferredSettlements` documents.
+    ///         height. The same swap-and-pop pagination hazard applies to any
+    ///         other enumerable set this contract or its peers expose.
     function blacklistedHashes(bytes32 region, uint256 offset, uint256 limit)
         external
         view

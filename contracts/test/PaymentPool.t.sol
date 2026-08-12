@@ -93,9 +93,8 @@ contract MockSettlementRouter is IFeeRouterSettlement {
     }
 }
 
-/// @notice Router that pulls one wei LESS than approved. Not exercised until
-///         `redeem` lands (Task 2); ported now to keep the double roster
-///         aligned with `PaymentChannel.t.sol`.
+/// @notice Router that pulls one wei LESS than approved. Exercised by the
+///         `redeem` under-pull tests below.
 contract UnderPullRouter is IFeeRouterSettlement {
     IERC20 public immutable usdc;
 

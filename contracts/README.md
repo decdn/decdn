@@ -13,7 +13,7 @@ Deployable contracts in [`src/`](src/):
 | `Token` | Fixed-supply (1B) ERC20 with permit + burn; no mint post-genesis | [026](../adr/026-tokenomics.md) |
 | `CapacityBond` | Operator registry; custodies the TOKEN bond, executes escrow-on-slash, reports settlements to `FeeRouter` | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `FeeRouter` | 60/30/10 settlement split (operator / buyback / treasury) and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
-| `PaymentChannel` | Unidirectional off-chain USDC channels with on-chain settlement; forwards fees to `FeeRouter` rather than skimming inline | [003](../adr/003-payments.md) |
+| `PaymentPool` | Shared USDC payment pool with off-chain vouchers and on-chain redemption; forwards fees to `FeeRouter` rather than skimming inline | [003](../adr/003-payments.md) |
 | `SlashJudge` | On-chain adjudicator for signature-dependent slashable offenses; verifies the EIP-712 slash signature | [028](../adr/028-slashing-appeals.md) |
 | `SlashAppeal` | Slash-appeal state machine (open → ratify/reverse) holding a per-appeal TOKEN bond | [028](../adr/028-slashing-appeals.md) |
 | `OriginAssignment` | The DAO's positive origin authority — namespace-based origin allow-lists | [011](../adr/011-content-takedown.md) |

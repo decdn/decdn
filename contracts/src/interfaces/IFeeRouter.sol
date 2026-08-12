@@ -5,8 +5,8 @@ pragma solidity 0.8.28;
 /// @notice External surface of `FeeRouter` — the three-bucket per-byte settlement
 ///         distributor (ADR 026 § FeeRouter split) and the canonical served-bytes
 ///         accountant that `DecdnGovernor` reads for voting weight per ADR 036.
-/// @dev    Settlement: `PaymentChannel.settleChannel` forwards the operator's
-///         full USDC balance to `routeSettlement`, which performs the
+/// @dev    Settlement: `PaymentPool._route` forwards each redeemed voucher's
+///         paid delta to `routeSettlement`, which performs the
 ///         default 60% operator / 30% buyback / 10% treasury split inline
 ///         (governance-mutable within per-bucket bounds via `setShares`),
 ///         and updates per-operator + global byte counters.
@@ -21,7 +21,7 @@ interface IFeeRouter {
 
     /// @notice Distribute `amount` USDC across the three buckets and stamp the
     ///         served `bytesDelivered` into the current epoch. Called by
-    ///         `PaymentChannel.settleChannel` under `ROUTER_CALLER_ROLE`.
+    ///         `PaymentPool._route` under `ROUTER_CALLER_ROLE`.
     function routeSettlement(address operator, uint256 bytesDelivered, uint256 amount) external;
 
     // ─── Per-epoch byte accounting (ADR 036) ──────────────────────────

@@ -147,7 +147,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     /// @dev Override the base hook to grant the test harness
     ///      `ROUTER_CALLER_ROLE` on FeeRouter so it can call `routeSettlement`
     ///      to seed served-bytes for vote-weight tests. In production the deploy
-    ///      script grants the role only to `PaymentChannel`, and asserts it, so
+    ///      script grants the role only to `PaymentPool`, and asserts it, so
     ///      this grant is an extra holder for the harness, not a substitute.
     ///      (Governance can grant it elsewhere later — the role's admin is
     ///      `DEFAULT_ADMIN_ROLE`, which the Timelock holds after the handoff.)
