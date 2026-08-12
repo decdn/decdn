@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError, Weak};
 
 use bao_tree::io::fsm::Outboard;
 use bao_tree::{BaoTree, BlockSize, ChunkRanges, TreeNode, blake3};
@@ -196,12 +196,13 @@ impl FillSession {
         &self.cancel
     }
 
-    /// Register one more observer and hand back its RAII lease.
-    fn add_observer(self: &Arc<Self>) -> ObserverLease {
-        self.observers.fetch_add(1, Ordering::AcqRel);
-        ObserverLease {
-            session: Arc::clone(self),
-        }
+    /// Whether this session is dead: the pull has recorded a terminal outcome, or
+    /// the fill was cancelled because its last observer left. A dead session must
+    /// not block a fresh pull ([`FillRegistry::fill_plan`] excludes its `covered`
+    /// from the union) and must not be an attach target.
+    #[must_use]
+    fn is_dead(&self) -> bool {
+        self.outcome().is_some() || self.cancel.is_cancelled()
     }
 
     /// Mint a serve-side [`SessionOutboardReader`] over this session's outboard.
@@ -362,9 +363,20 @@ impl Outboard for SessionOutboardReader {
 /// ([`FillRegistry::fill_plan`]). Dropping it decrements the session's observer
 /// count; the last-out drop, if the pull is still running, cancels the pull so a
 /// fill no client is waiting on stops ingesting (#1610).
+///
+/// The decrement + cancel decision runs UNDER the registry map lock — the same
+/// lock `fill_plan`/`register_fill` hold when they attach an observer. That mutual
+/// exclusion closes the resurrection race: a concurrent `fill_plan` cannot
+/// `fetch_add` a session 0→1 in the window between this drop's last-out
+/// `fetch_sub` (1→0) and its `cancel()`, so no live observer can end up bound to a
+/// cancelled fill. The lease therefore holds a [`Weak`] back to the registry (plus
+/// the session's `hash`) to reach that lock at drop. If the upgrade fails the
+/// registry is gone, so the fill is moot and the drop just skips.
 #[derive(Debug)]
 pub struct ObserverLease {
     session: Arc<FillSession>,
+    registry: Weak<FillRegistry>,
+    hash: Hash,
 }
 
 impl ObserverLease {
@@ -375,6 +387,15 @@ impl ObserverLease {
 
 impl Drop for ObserverLease {
     fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            // Registry dropped — the fill (and its map entry) are gone; nothing can
+            // attach, so the decrement + cancel are moot. Skip.
+            return;
+        };
+        let _ = self.hash; // retained so a future map-eviction drop can key by hash.
+        // Take the SAME lock `fill_plan`/`register_fill` hold to attach, so the
+        // decrement and the cancel decision cannot interleave with an attach.
+        let _guard = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
         // `fetch_sub` returns the PREVIOUS value; `1` means this drop took the
         // count to 0. Cancel only if the pull has not already ended — a completed
         // pull needs no cancel, and a failed one already terminated.
@@ -437,18 +458,26 @@ impl FillRegistry {
         }
     }
 
+    /// Increment `session`'s observer count and mint its RAII lease. The caller
+    /// MUST already hold the map lock — the increment shares the lock the lease's
+    /// drop takes for its decrement, so attach and teardown are mutually exclusive.
+    fn mint_lease(self: &Arc<Self>, session: &Arc<FillSession>, hash: Hash) -> ObserverLease {
+        session.observers.fetch_add(1, Ordering::AcqRel);
+        ObserverLease {
+            session: Arc::clone(session),
+            registry: Arc::downgrade(self),
+            hash,
+        }
+    }
+
     /// Publish a new pull's `session` (already scoped via
     /// [`FillSession::set_covered`] to the bytes it will fetch) and return the
     /// owner lease (observer count starts at 1). The entry stays in the map until
     /// the owning pull is joined node-side.
-    pub fn register_fill(&self, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
-        let lease = session.add_observer();
-        self.map
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(hash)
-            .or_default()
-            .push(session);
+    pub fn register_fill(self: &Arc<Self>, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        let lease = self.mint_lease(&session, hash);
+        map.entry(hash).or_default().push(session);
         lease
     }
 
@@ -458,7 +487,7 @@ impl FillRegistry {
     /// If `attach` is non-empty, binds to the live session with the largest overlap
     /// and increments its observer count (returned as an [`ObserverLease`]).
     #[must_use]
-    pub fn fill_plan(&self, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
+    pub fn fill_plan(self: &Arc<Self>, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
         let empty = || FillPlan {
             attach: ChunkRanges::empty(),
             remainder: ChunkRanges::empty(),
@@ -476,6 +505,15 @@ impl FillRegistry {
         let mut best: Option<(Arc<FillSession>, u64)> = None;
         if let Some(sessions) = map.get(&hash) {
             for session in sessions {
+                // A dead session (ended or cancelled) may never deliver its bytes,
+                // so its `covered` must neither block a fresh pull nor be an attach
+                // target. Removal from the map is node-side on pull-thread join;
+                // here we just skip it. Reading `is_dead` under the map lock pins
+                // the decision against a concurrent last-out lease drop, which fires
+                // `cancel()` under this same lock.
+                if session.is_dead() {
+                    continue;
+                }
                 let covered = session.covered_ranges();
                 let overlap = &r & &covered;
                 if !overlap.is_empty() {
@@ -494,7 +532,7 @@ impl FillRegistry {
             None
         } else {
             best.map(|(session, _)| {
-                let lease = session.add_observer();
+                let lease = self.mint_lease(&session, hash);
                 (session, lease)
             })
         };
@@ -620,7 +658,7 @@ mod fill_registry_tests {
     use bao_tree::{ChunkRanges, blake3};
     use decdn_bao_range::align_range;
 
-    use super::{FillRegistry, FillSession};
+    use super::{FillError, FillRegistry, FillSession};
     use crate::{CHUNK_GROUP_BYTES, Hash};
 
     /// One chunk group of bytes, the alignment granularity `fill_plan` snaps to.
@@ -649,7 +687,7 @@ mod fill_registry_tests {
     #[test]
     fn same_range_coalesces_to_one_pull() {
         let total = 8 * G;
-        let reg = FillRegistry::new();
+        let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xA1);
 
         let session = FillSession::new(root(0xA1), total);
@@ -675,7 +713,7 @@ mod fill_registry_tests {
     fn disjoint_halves_do_not_attach() {
         let total = 8 * G;
         let half = 4 * G;
-        let reg = FillRegistry::new();
+        let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xB2);
 
         let session = FillSession::new(root(0xB2), total);
@@ -699,7 +737,7 @@ mod fill_registry_tests {
     #[test]
     fn partial_overlap_splits() {
         let total = 8 * G;
-        let reg = FillRegistry::new();
+        let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xC3);
 
         let session = FillSession::new(root(0xC3), total);
@@ -722,7 +760,7 @@ mod fill_registry_tests {
     #[test]
     fn last_observer_leaving_cancels() {
         let total = 8 * G;
-        let reg = FillRegistry::new();
+        let reg = Arc::new(FillRegistry::new());
         let hash = store_hash(0xD4);
 
         let session = FillSession::new(root(0xD4), total);
@@ -747,5 +785,97 @@ mod fill_registry_tests {
             "the last observer left — pull is cancelled"
         );
         assert_eq!(session.observer_count(), 0);
+    }
+
+    /// A cancelled session is dead: `fill_plan` must NOT attach to it, and its
+    /// `covered` must NOT suppress a fresh pull — the whole range falls to
+    /// `remainder`. Guards against attaching a new observer to a fill being torn
+    /// down (the #1610 resurrection hazard).
+    #[test]
+    fn fill_plan_skips_cancelled_session() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0xE5);
+
+        let session = FillSession::new(root(0xE5), total);
+        session.set_covered(ranges(0, 0, total)); // [0, total)
+        let owner = reg.register_fill(hash, Arc::clone(&session));
+
+        // Drop the sole owner so the last-out lease fires cancel (count 1 → 0).
+        drop(owner);
+        assert!(session.is_cancelled(), "cancel fired on last-out drop");
+        assert_eq!(session.observer_count(), 0);
+
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        assert!(
+            plan.session.is_none(),
+            "must not attach to a cancelled session"
+        );
+        assert!(plan.attach.is_empty(), "a dead session covers nothing");
+        assert_eq!(
+            plan.remainder,
+            ranges(0, 0, total),
+            "the whole range is a fresh pull"
+        );
+        assert_eq!(
+            session.observer_count(),
+            0,
+            "no observer attached to the dead session"
+        );
+    }
+
+    /// An ended session (terminal outcome recorded) is likewise dead: `fill_plan`
+    /// must not attach and must not let its `covered` block a fresh pull.
+    #[test]
+    fn fill_plan_skips_ended_session() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0xF6);
+
+        let session = FillSession::new(root(0xF6), total);
+        session.set_covered(ranges(0, 0, total)); // [0, total)
+        let _owner = reg.register_fill(hash, Arc::clone(&session));
+
+        session.mark_ended(Err(FillError::new("upstream died")));
+
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        assert!(
+            plan.session.is_none(),
+            "must not attach to an ended session"
+        );
+        assert!(plan.attach.is_empty(), "a dead session covers nothing");
+        assert_eq!(
+            plan.remainder,
+            ranges(0, 0, total),
+            "the whole range is a fresh pull"
+        );
+    }
+
+    /// Structural serialization invariant: register (count 1) + attach (count 2),
+    /// then drop both leases. The decrement + cancel decision runs under the map
+    /// lock, so the non-last drop must NOT cancel and the last-out drop must cancel
+    /// exactly once, ending at count 0. Deterministic — no sleeps, no threads.
+    #[test]
+    fn teardown_decrement_and_cancel_are_lock_serialized() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x17);
+
+        let session = FillSession::new(root(0x17), total);
+        session.set_covered(ranges(0, 0, total));
+        let owner = reg.register_fill(hash, Arc::clone(&session));
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        let (_attached, second) = plan.session.expect("attaches a second observer");
+        assert_eq!(session.observer_count(), 2, "owner + attached");
+
+        // Drop the attached lease first: count 2 → 1, not last-out, no cancel.
+        drop(second);
+        assert_eq!(session.observer_count(), 1);
+        assert!(!session.is_cancelled(), "not the last observer — no cancel");
+
+        // Drop the owner: count 1 → 0, last-out, cancels exactly once.
+        drop(owner);
+        assert_eq!(session.observer_count(), 0);
+        assert!(session.is_cancelled(), "last observer left — cancelled");
     }
 }
