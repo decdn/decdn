@@ -1146,17 +1146,6 @@ pub struct DecdnMetrics {
     /// aborted the upstream pull and abandoned the partial fill. The per-request
     /// loss is bounded to `pull_ahead_bytes`; a sustained rate flags a leech.
     pub node_pull_through_client_abandoned: Counter,
-    /// `decdn_node_pull_through_tee_finalize_failed_total` (#856): a window-paced
-    /// serve delivered (and was paid for) the full blob, but promoting the teed
-    /// bytes into the local cache failed for a LOCAL, non-integrity reason (store
-    /// fault, size-cap breach, or import-task join failure — a tee bao-verify
-    /// failure routes to `upstream_verify_failed` instead, ADR 038). The client
-    /// got correct bytes; the node forfeits the warm-cache benefit and does NOT
-    /// become a holder. A sustained rate means the node is paying upstream egress
-    /// on every pull-through and caching none of it — investigate the store /
-    /// `data_dir`. Field has no `_total` suffix because the `OpenMetrics` encoder
-    /// appends it.
-    pub node_pull_through_tee_finalize_failed: Counter,
     /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
     /// serve-miss pull ingested upstream bytes that failed bao verification against
     /// the content root (ADR 038) — a chunk group rejected mid-stream (the
@@ -1169,17 +1158,6 @@ pub struct DecdnMetrics {
     /// corrupt-upstream bytes through this node. Field has no `_total` suffix
     /// because the `OpenMetrics` encoder appends it.
     pub node_pull_through_upstream_verify_failed: Counter,
-    /// `decdn_node_pull_through_local_tee_failed_total` (#856): a window-paced
-    /// serve aborted mid-pull because writing an already-paid upstream chunk into
-    /// the local cache tee failed for a genuinely LOCAL reason (a
-    /// store/`data_dir` fault) — a mid-stream bao-verify rejection routes to
-    /// `upstream_verify_failed` instead (#915). Distinct from
-    /// `node_pull_through_client_abandoned`, which counts the downstream client
-    /// dropping or underpaying. Splitting the three lets an operator tell a
-    /// failing local store from a lying upstream from flaky/abusive downstreams:
-    /// a sustained rate HERE points at disk, not peers. Field has no `_total`
-    /// suffix because the `OpenMetrics` encoder appends it.
-    pub node_pull_through_local_tee_failed: Counter,
     /// `decdn_local_outboard_serves_total` (#1130): times the node served a
     /// whole-blob cache miss by streaming straight from its own configured
     /// origin (http/s3/fs) into the paying client while filling
@@ -2200,18 +2178,9 @@ recorders! {
     /// or underpaid mid-pull (#856).
     node_pull_through_client_abandoned => node_pull_through_client_abandoned.inc();
 
-    /// A window-paced serve delivered the full blob but failed to promote it into
-    /// the local cache (#856).
-    node_pull_through_tee_finalize_failed => node_pull_through_tee_finalize_failed.inc();
-
     /// A serve-miss pull ingested upstream bytes that failed bao verification
     /// against the content root (#856/#915).
     node_pull_through_upstream_verify_failed => node_pull_through_upstream_verify_failed.inc();
-
-    /// A window-paced serve aborted because a local cache-tee write of an
-    /// already-paid upstream chunk failed (#856) — a store fault, not a downstream
-    /// client drop.
-    node_pull_through_local_tee_failed => node_pull_through_local_tee_failed.inc();
 
     /// The node entered `serve_via_backend_origin` — the stream-while-store
     /// serve tier fired for this request (#1130). Counted at entry, before any

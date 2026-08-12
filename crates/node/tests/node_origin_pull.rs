@@ -8543,22 +8543,17 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
     );
     conn.close(0u32.into(), b"done");
 
-    // The fused window path must never have run: no pause, no tee finalize, no
+    // The serve-miss pull-through must never have run: no window pause, no
     // upstream verify — and crucially B must have made NO upstream pull (empty
     // progress log) and cached NOTHING. A regression that dropped the offset-0
-    // gate would trip at least the upstream pull (non-empty log) and likely the
-    // tee.
+    // gate would trip at least the upstream pull (non-empty log).
     anyhow::ensure!(
         counter_value(&b_metrics, "node_pull_through_window_paused_total")? == 0,
-        "fused window pause must not fire for a resumed (offset>0) request"
-    );
-    anyhow::ensure!(
-        counter_value(&b_metrics, "node_pull_through_tee_finalize_failed_total")? == 0,
-        "fused tee must not run for a resumed (offset>0) request"
+        "serve-miss window pause must not fire for a resumed (offset>0) request"
     );
     anyhow::ensure!(
         counter_value(&b_metrics, "node_pull_through_upstream_verify_failed_total")? == 0,
-        "fused upstream verify must not run for a resumed (offset>0) request"
+        "serve-miss upstream verify must not run for a resumed (offset>0) request"
     );
     anyhow::ensure!(
         progress_log(&recorded)?.is_empty(),
@@ -9126,11 +9121,7 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         "node_pull_through_upstream_verify_failed_total",
         1,
     )?;
-    // Mutually exclusive with the local-fault arms: a lying upstream must NOT
-    // read as a failing local disk (#915 review).
-    assert_counter(&b_metrics, "node_pull_through_local_tee_failed_total", 0)?;
-    assert_counter(&b_metrics, "node_pull_through_tee_finalize_failed_total", 0)?;
-    // The tee verdict reached the scorer: A recorded a `Corruption` observation,
+    // The verify verdict reached the scorer: A recorded a `Corruption` observation,
     // so its local score dropped below the pre-pull baseline (#915).
     let a_score_after = local_rep.score(a_id);
     anyhow::ensure!(
@@ -9149,17 +9140,12 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -> Result<()> {
     // #915 review: a corrupt group MID-stream — past the first voucher interval,
-    // with plenty of wire still to come — kills the tee's verifying decoder while
-    // the forward loop is still writing, so the failure surfaces as a `tee.write`
-    // error, NOT at finalization. This is the dominant real-world corruption
-    // shape (the finalize arm only fires when the whole remaining wire fits in
-    // the tee channel slack, i.e. tiny blobs like the sibling test above).
-    // Pre-fix this arm was misclassified as a LOCAL store fault:
-    // `local_tee_failed` (the operator's failing-disk alarm) fired, no reputation
-    // outcome was recorded, and the corrupt upstream kept its score. It must
-    // instead: abandon the pull early (bounded spend), not promote, fire
-    // `upstream_verify_failed` (and NOT `local_tee_failed`), and score A
-    // `Corruption`.
+    // with plenty of wire still to come — kills the verifying decoder while the
+    // node is still forwarding, so the failure surfaces mid-stream rather than at
+    // the end. This is the dominant real-world corruption shape. It must be
+    // classified as an UPSTREAM fault, not a local store fault: abandon the pull
+    // early (bounded spend), not promote, fire `upstream_verify_failed`, and score
+    // A `Corruption`.
     //
     // Construction: the HONEST whole-blob bao wire for a 1.5 MiB payload
     // (multi-interval, so one voucher exchange completes before the corruption),
@@ -9247,9 +9233,6 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         "node_pull_through_upstream_verify_failed_total",
         1,
     )?;
-    // The whole point of the fix: mid-stream corruption is the UPSTREAM's fault,
-    // not a local disk fault.
-    assert_counter(&b_metrics, "node_pull_through_local_tee_failed_total", 0)?;
     let a_score_after = local_rep.score(a_id);
     anyhow::ensure!(
         a_score_after < a_score_before,
