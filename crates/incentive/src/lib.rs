@@ -9,7 +9,7 @@
 //! keystore→signer bridge ([`eth_identity`], #406) used by both
 //! `decdn key-gen` and the runtime to load a `PrivateKeySigner`, and the
 //! `alloy::sol!` contract bindings for the on-chain surface the node consumes
-//! ([`capacity_bond`] reads, [`payment_channel`] reads + writes, [`erc20`]
+//! ([`capacity_bond`] reads, [`payment_pool`] reads + writes, [`erc20`]
 //! approve). The seller-side on-chain settlement path (#327 — `ChannelOpened`
 //! → persist, threshold/shutdown `withdraw` + `closeChannel`, `ChannelSettled`
 //! → forget) is fully driven by the `decdn-node` runtime. So is the buyer-side
@@ -26,7 +26,7 @@
 //! `ChannelCloseInitiated` on the node's own channels and re-submits its latest
 //! voucher (operator-arranged redundancy and the dispute window back it). That
 //! monitor is deferred (#324) — the runtime observes the event but never
-//! disputes — so the [`payment_channel`] bindings here carry the close/withdraw
+//! disputes — so the [`payment_pool`] bindings here carry the close/redeem
 //! surface and deliberately omit `disputeChannel`.
 
 pub mod bind_sig;
@@ -49,7 +49,7 @@ pub mod eth_identity;
 pub mod lane;
 pub mod node_register;
 pub mod origin_assignment;
-pub mod payment_channel;
+pub mod payment_pool;
 pub mod probe_sig;
 pub mod publisher_registry;
 pub mod rate;
