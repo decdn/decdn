@@ -118,39 +118,73 @@ async fn settled_outstanding(node: &NodeFixture, channel_id: B256) -> anyhow::Re
     Ok(snapshot.outstanding_micro_usdc)
 }
 
+/// Time to keep observing the provider's channel store AFTER the first paid
+/// channel appears, so a second one lagging through the persisted-store fsync
+/// window is caught rather than raced past. Sized as several `wait_for_channel`
+/// / redeem poll cadences (~500ms), comfortably inside the overall budget.
+const UPSTREAM_CHANNEL_SETTLE_WINDOW: Duration = Duration::from_secs(3);
+
 /// Poll the PROVIDER's channel store for the buyer channels funded by `payer`
 /// (the server operator) that have accrued a non-zero settled claim, returning
 /// `(count, total_outstanding_micro_usdc)`. Proves the upstream pull moved real
 /// money server → provider, and that it did so over exactly ONE channel.
+///
+/// Returning on the FIRST sighting of any paid channel would undercount: a
+/// SECOND paid channel — the signature of a coalescing regression that opened
+/// two upstream pulls — can surface a beat later through the same fsync window,
+/// and a single read would race past it and let a caller's `== 1` assertion pass
+/// falsely. So this waits for at least one paid channel, then keeps observing for
+/// [`UPSTREAM_CHANNEL_SETTLE_WINDOW`] and returns the MAXIMUM paid-channel count
+/// seen — a lagging second channel then correctly fails the assertion. The total
+/// is the sum at that maximum.
 async fn provider_channels_from(
     provider: &NodeFixture,
     payer: Address,
 ) -> anyhow::Result<(usize, u64)> {
     let admin = provider.admin_client()?;
     let payer_hex = payer.to_string();
-    let result = poll(Duration::from_secs(30), || async {
+
+    // (1) Ride out the fsync window: wait until at least one paid channel funded
+    // by `payer` is visible before starting to count.
+    poll(Duration::from_secs(30), || async {
         let resp = admin.channels().await.context("admin channels")?;
-        let paid: Vec<_> = resp
-            .channels
-            .into_iter()
-            .filter(|s| {
-                s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
-            })
-            .collect();
-        // Only resolve once at least one paid channel is visible; a delivered
-        // pull always leaves one, so an empty read is just the fsync window.
-        if paid.is_empty() {
-            Ok(None)
-        } else {
-            let total: u64 = paid.iter().map(|s| s.outstanding_micro_usdc).sum();
-            Ok(Some((paid.len(), total)))
-        }
+        let any_paid = resp.channels.iter().any(|s| {
+            s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
+        });
+        Ok(any_paid.then_some(()))
     })
     .await?
     .with_context(|| {
         format!("provider never reported a non-zero settled claim funded by {payer_hex}")
     })?;
-    Ok(result)
+
+    // (2) Observe a stability window and take the max count seen, so a second
+    // paid channel that surfaces late is not missed.
+    let mut max_count = 0usize;
+    let mut total_at_max = 0u64;
+    let deadline = tokio::time::Instant::now() + UPSTREAM_CHANNEL_SETTLE_WINDOW;
+    loop {
+        let resp = admin.channels().await.context("admin channels")?;
+        let paid: Vec<u64> = resp
+            .channels
+            .into_iter()
+            .filter(|s| {
+                s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
+            })
+            .map(|s| s.outstanding_micro_usdc)
+            .collect();
+        // `>=` so a growing cumulative claim on a stable count still refreshes the
+        // reported total to the latest reading.
+        if paid.len() >= max_count {
+            max_count = paid.len();
+            total_at_max = paid.iter().sum();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok((max_count, total_at_max))
 }
 
 #[tokio::test(flavor = "multi_thread")]
