@@ -4,10 +4,19 @@
 //! the buyer deposit through the injected [`Funder`] seam (`source.rs`) rather
 //! than naming a chain handle directly, so the node's upstream cache-miss pull
 //! leg (B2) shares that driver instead of running its own copy of the top-up
-//! loop. `NodeFunder` is the bridge: it maps `Funder::top_up`'s DELTA
-//! (`additional`) onto `PoolOpener::top_up_pool`'s ABSOLUTE `target_deposit`,
-//! reading the "current deposit" half of that sum off the shared [`PoolContext`]
-//! the driver mutates as the pull progresses.
+//! loop. `NodeFunder` is the bridge.
+//!
+//! `Funder::top_up(additional)` means "add exactly `additional` to the deposit"
+//! — the same contract the CLI's `CliFunder` honours by calling `topUp` with
+//! `additional` directly. A `topUp` leaves the pool's committed spend untouched,
+//! so adding `additional` to the deposit adds exactly `additional` to the
+//! spendable headroom too. [`PoolOpener::top_up_pool`], though, takes a SPENDABLE
+//! target (post-top-up spendable == its argument), so `NodeFunder` converts:
+//! it reads the pool's current spendable — `deposit - committed`, off the shared
+//! [`PoolContext`] the driver mutates and the shared [`PoolLedger`] the pull
+//! commits through — and asks `top_up_pool` for `current_spendable + additional`.
+//! That drives spendable up by exactly `additional`, matching resume::fund's own
+//! use of `top_up_pool` (which targets `working_deposit` of spendable directly).
 //!
 //! The pool has no expiry, so a `topUp` strands nothing time-bound — the node
 //! funds its own pool freely, and there is no near-expiry refusal to derive.
@@ -17,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::U256;
 use async_trait::async_trait;
 use decdn_client_pull::source::SourceFuture;
-use decdn_client_pull::{Funder, PoolContext};
+use decdn_client_pull::{Funder, PoolContext, PoolLedger};
 use decdn_incentive::DepositOutcome;
 
 use super::resume::MAX_REACTIVE_TOPUPS;
@@ -32,14 +41,19 @@ use crate::buyer_channel::PoolOpener;
 ///   origin already stores its buyer service behind that same object-safe seam.
 /// - `ctx`: the driver's live [`PoolContext`], shared (not copied) because its
 ///   `deposit` field grows across the fetch as earlier top-ups land — reading a
-///   stale copy would under-shoot `target` on a pool that already got topped up
+///   stale copy would under-shoot the target on a pool that already got topped up
 ///   once this fetch by a DIFFERENT path (the proactive low-water refill can fire
 ///   concurrently; see `top_up_pool`'s own join-or-spawn dedup for why that race
 ///   is expected). Locked only to copy `deposit` out; the guard is never held
 ///   across `.await` (`top_up_pool` is a network+chain round trip).
+/// - `ledger`: the pull's shared [`PoolLedger`], read for the committed spend that
+///   turns `deposit` into spendable headroom. It is the same ledger the driver
+///   subtracts to compute the `additional` it passes here, so the two agree on
+///   what "current spendable" is.
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
     ctx: Arc<Mutex<PoolContext>>,
+    ledger: Arc<PoolLedger>,
 }
 
 impl std::fmt::Debug for NodeFunder {
@@ -49,18 +63,30 @@ impl std::fmt::Debug for NodeFunder {
 }
 
 impl NodeFunder {
-    pub(crate) fn new(opener: Arc<dyn PoolOpener>, ctx: Arc<Mutex<PoolContext>>) -> Self {
-        Self { opener, ctx }
+    pub(crate) fn new(
+        opener: Arc<dyn PoolOpener>,
+        ctx: Arc<Mutex<PoolContext>>,
+        ledger: Arc<PoolLedger>,
+    ) -> Self {
+        Self {
+            opener,
+            ctx,
+            ledger,
+        }
     }
 
-    /// Copy the shared context's current deposit. Locks, copies, drops — never
-    /// held across an `.await`.
-    fn current_deposit(&self) -> U256 {
-        let guard = self
-            .ctx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.deposit
+    /// The pool's current spendable headroom: `deposit - committed`. Locks the
+    /// context only to copy `deposit` out and reads the committed watermark off the
+    /// shared ledger — neither guard is held across an `.await`.
+    fn current_spendable(&self) -> U256 {
+        let deposit = {
+            let guard = self
+                .ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.deposit
+        };
+        deposit.saturating_sub(self.ledger.committed().amount)
     }
 }
 
@@ -72,8 +98,11 @@ impl Funder for NodeFunder {
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
-            let target = self.current_deposit().saturating_add(additional);
-            let new_deposit = self.opener.top_up_pool(target).await?;
+            // `top_up_pool` targets spendable, so raise the target by exactly
+            // `additional` above the current spendable — that is what adds
+            // `additional` to the deposit (a `topUp` never touches committed spend).
+            let spendable_target = self.current_spendable().saturating_add(additional);
+            let new_deposit = self.opener.top_up_pool(spendable_target).await?;
             Ok(DepositOutcome::Added(new_deposit))
         })
     }
@@ -176,13 +205,23 @@ mod tests {
         }))
     }
 
+    /// A lane ledger whose committed spend is `committed` — the amount already
+    /// vouchered, which `deposit - committed` is the spendable headroom over.
+    fn test_ledger(committed: U256) -> Arc<PoolLedger> {
+        Arc::new(PoolLedger::new(decdn_client_pull::Cumulative {
+            bytes: U256::ZERO,
+            amount: committed,
+        }))
+    }
+
+    /// With nothing committed, spendable == deposit, so the target `top_up_pool`
+    /// receives is `deposit + additional`.
     #[tokio::test]
-    async fn top_up_computes_target_from_current_deposit_plus_additional() {
+    async fn top_up_targets_current_spendable_plus_additional() {
         let deposit = U256::from(1_000u64);
         let additional = U256::from(250u64);
         let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
-        let ctx = test_ctx(deposit);
-        let f = NodeFunder::new(opener.clone(), ctx);
+        let f = NodeFunder::new(opener.clone(), test_ctx(deposit), test_ledger(U256::ZERO));
 
         let outcome = f.top_up(additional).await.expect("top-up should succeed");
 
@@ -190,11 +229,33 @@ mod tests {
         assert_eq!(outcome, DepositOutcome::Added(U256::from(1_250u64)));
     }
 
+    /// The driver path's contract: `top_up(additional)` adds exactly `additional`
+    /// to spendable, never over-escrowing by the committed spend. With `committed`
+    /// already vouchered, spendable is `deposit - committed`, so the target must be
+    /// `(deposit - committed) + additional` — NOT `deposit + additional`, which
+    /// would over-target by `committed` and drive spendable to `working + committed`.
+    #[tokio::test]
+    async fn top_up_adds_exactly_additional_to_spendable() {
+        let deposit = U256::from(1_000u64);
+        let committed = U256::from(600u64);
+        let additional = U256::from(250u64);
+        let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
+        let f = NodeFunder::new(opener.clone(), test_ctx(deposit), test_ledger(committed));
+
+        f.top_up(additional).await.expect("top-up should succeed");
+
+        // current spendable = 1000 - 600 = 400; target = 400 + 250 = 650.
+        assert_eq!(opener.last_target(), Some(U256::from(650u64)));
+    }
+
     #[tokio::test]
     async fn top_up_pool_error_propagates() {
         let opener = Arc::new(MockOpener::new(Err("chain rejected".to_string())));
-        let ctx = test_ctx(U256::from(100u64));
-        let f = NodeFunder::new(opener.clone(), ctx);
+        let f = NodeFunder::new(
+            opener.clone(),
+            test_ctx(U256::from(100u64)),
+            test_ledger(U256::ZERO),
+        );
 
         let err = f.top_up(U256::from(50u64)).await.unwrap_err();
 
@@ -205,8 +266,7 @@ mod tests {
     #[test]
     fn max_topups_reports_the_reactive_budget() {
         let opener = Arc::new(MockOpener::new(Ok(U256::ZERO)));
-        let ctx = test_ctx(U256::ZERO);
-        let f = NodeFunder::new(opener, ctx);
+        let f = NodeFunder::new(opener, test_ctx(U256::ZERO), test_ledger(U256::ZERO));
 
         assert_eq!(f.max_topups(), MAX_REACTIVE_TOPUPS);
         assert_eq!(f.max_topups(), 1);
