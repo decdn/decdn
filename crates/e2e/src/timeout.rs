@@ -12,10 +12,18 @@
 //!
 //! The binding ladder is the deploy retry ladder in [`crate::chain`]: CI worst
 //! case `DEPLOY_ATTEMPTS * ci_scaled(DEPLOY_TIMEOUT)` = `2 * 120s = 240s`, so
-//! every tier here clears 240s. `forge build` no longer counts toward it — it is
-//! hoisted to a one-time job step (`.github/workflows/ci.yml`), so the cold
-//! contract compile happens once, outside any per-test ceiling, and the in-test
-//! `forge build` is a warm incremental no-op under CI.
+//! every tier here clears 240s.
+//!
+//! `forge build` is NOT part of that binding ladder *under CI*. Every journey's
+//! [`crate::chain::ChainFixture::launch`] still calls `forge_build`, but the
+//! GitHub Actions jobs hoist a one-time `forge build` step
+//! (`.github/workflows/ci.yml`) that warms `contracts/out` first, so the in-test
+//! build is a sub-second incremental no-op there. The same holds for a local run
+//! with already-warm artifacts. Only a *cold local* run pays the full build
+//! ladder inside a per-test ceiling — which is fine, because a local run has no
+//! job-level kill racing the per-test message; the containment guarantee this
+//! rule protects is a CI property. Do not read the tiers as containing a cold
+//! `forge build` on a fresh checkout.
 //!
 //! # Measurement (source: issue #1620, runs of 2026-08-05)
 //!

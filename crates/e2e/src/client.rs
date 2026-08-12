@@ -203,11 +203,18 @@ impl ClientFixture {
     /// the node can never serve, say — has no success to converge on, so it burns
     /// the whole budget spinning on the node's refusal before returning the error
     /// the assertion wants. Such a caller passes a budget tighter than the 45s
-    /// [`Self::fetch`] default to keep its runtime bounded. That is strictly safe:
-    /// a shorter budget can only surface the expected failure sooner, never turn a
-    /// real success into a spurious timeout. It must still clear the node's
-    /// ~500ms-cadence watcher catch-up so the failure reflects the refusal under
-    /// test, not an un-observed channel.
+    /// [`Self::fetch`] default to keep its runtime bounded.
+    ///
+    /// Tightening the budget is safe **only for expect-failure callers**: with no
+    /// success to miss, a shorter budget can only surface the expected failure
+    /// sooner. A *positive* fetch is the opposite case — too tight a budget can
+    /// expire in the window between opening the channel and the node's watcher
+    /// observing it, failing a fetch the node would have served moments later.
+    /// That readiness window is exactly why [`Self::fetch`] budgets a generous
+    /// 45s; a positive caller must keep enough headroom above the node's
+    /// ~500ms-cadence catch-up, not minimize the budget. Either way the budget
+    /// must clear that catch-up, so an expect-failure result reflects the refusal
+    /// under test rather than an un-observed channel.
     pub async fn fetch_with_deadline(
         &self,
         chain: &ChainFixture,
