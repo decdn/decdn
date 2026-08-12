@@ -177,6 +177,14 @@ impl FillSession {
             .clone()
     }
 
+    /// The blob's total byte length. The attach path signs its `StreamResponse`
+    /// from this without re-running the upstream header handshake — the session
+    /// already knows the geometry from its `BaoTree`.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.tree.size()
+    }
+
     /// The live observer count (pull owner + attached serve legs).
     #[must_use]
     pub fn observer_count(&self) -> usize {
@@ -438,6 +446,34 @@ pub struct FillPlan {
     pub session: Option<(Arc<FillSession>, ObserverLease)>,
 }
 
+/// The atomic outcome of [`FillRegistry::claim`]: a serve-miss either coalesces
+/// onto a live pull (`Attach`) or becomes the owner of a fresh one (`Owner`). Both
+/// carry the target [`FillSession`] and an [`ObserverLease`] the caller holds for
+/// the life of its serve leg. Unlike the two-call [`FillRegistry::fill_plan`] +
+/// [`FillRegistry::register_fill`] sequence, `claim` decides attach-vs-own AND
+/// registers under ONE map-lock acquisition, so two concurrent fresh misses for the
+/// same blob cannot both see an empty registry and both open a pull.
+#[derive(Debug)]
+pub enum FillClaim {
+    /// A live pull already covers the request; run a serve leg over `session` and
+    /// open NO new pull. `lease` is an observer lease on the existing fill.
+    Attach {
+        /// The live session to serve from (largest overlap with the request).
+        session: Arc<FillSession>,
+        /// The observer lease held for the life of the attaching serve leg.
+        lease: ObserverLease,
+    },
+    /// No live pull covers the request; the caller owns the freshly-registered
+    /// `session` and must spawn the pull for the whole request range. `lease` is the
+    /// owner lease (observer count starts at 1).
+    Owner {
+        /// The freshly-registered session the caller must drive a pull for.
+        session: Arc<FillSession>,
+        /// The owner lease (count 1) held for the life of the owning pull.
+        lease: ObserverLease,
+    },
+}
+
 /// Total chunk count spanned by a (disjoint, sorted) chunk-range set. Boundaries
 /// come in `[start, end)` pairs; a trailing unpaired boundary (an open-ended set)
 /// contributes nothing, which is fine for the finite `covered ∩ R` overlaps this
@@ -556,6 +592,92 @@ impl FillRegistry {
             session,
         }
     }
+
+    /// Atomically decide attach-vs-own AND register, all under ONE map-lock
+    /// acquisition. This closes the coalescing TOCTOU race that the separate
+    /// [`Self::fill_plan`] (read) + [`Self::register_fill`] (write) calls leave open:
+    /// between those two lock acquisitions another thread can register, so two
+    /// concurrent fresh misses for the same blob both see an empty registry and both
+    /// open a pull. `claim` holds the map lock across the whole decision, so exactly
+    /// one of two racing identical claims registers an owner and the other attaches.
+    ///
+    /// `R = align_range(offset, len, total)`. On an align error or empty `R`, the
+    /// caller takes the Owner path (its own fetch surfaces any out-of-bounds error).
+    /// Otherwise `remainder = R − covered_union` over LIVE sessions:
+    /// - `remainder.is_empty()` (a live pull covers all of `R`) → ATTACH to the
+    ///   largest-overlap session; `make_session` is NOT called.
+    /// - else → OWNER: build the session (only now — `make_session` allocates an
+    ///   outboard buffer, so it is never built-and-dropped on the attach branch),
+    ///   set its `covered` to the WHOLE `R` (the conservative cut: this owner fetches
+    ///   everything it will serve, even on a partial overlap — partial-overlap de-dup
+    ///   is a deferred follow-up), register it, and return the owner lease (count 1).
+    ///
+    /// `make_session` runs under the lock, which is safe: it does no await (a std
+    /// lock) and only allocates.
+    pub fn claim(
+        self: &Arc<Self>,
+        hash: Hash,
+        offset: u64,
+        len: u64,
+        total: u64,
+        make_session: impl FnOnce() -> Arc<FillSession>,
+    ) -> FillClaim {
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // R = the chunk ranges the request spans. An align error (out-of-bounds) or
+        // an empty R has no coalescable range, so fall straight to the Owner path.
+        let r = match align_range(offset, len, total) {
+            Ok(aligned) => aligned.chunk_ranges().clone(),
+            Err(_) => ChunkRanges::empty(),
+        };
+
+        if !r.is_empty() {
+            let mut covered_union = ChunkRanges::empty();
+            let mut best: Option<(Arc<FillSession>, u64)> = None;
+            if let Some(sessions) = map.get(&hash) {
+                for session in sessions {
+                    // Dead sessions (ended or cancelled) may never deliver, so their
+                    // `covered` neither blocks a fresh pull nor is an attach target.
+                    // Reading `is_dead` under the map lock pins it against a
+                    // concurrent last-out lease drop (which fires `cancel()` under
+                    // this same lock).
+                    if session.is_dead() {
+                        continue;
+                    }
+                    let covered = session.covered_ranges();
+                    let overlap = &r & &covered;
+                    if !overlap.is_empty() {
+                        let span = chunk_span(&overlap);
+                        if best.as_ref().is_none_or(|(_, best_span)| span > *best_span) {
+                            best = Some((Arc::clone(session), span));
+                        }
+                    }
+                    covered_union |= covered;
+                }
+            }
+
+            let remainder = &r - &covered_union;
+            if remainder.is_empty() {
+                // Fully covered by live pulls → ATTACH. `best` is `Some` whenever a
+                // non-empty `R` is covered by the union (some session must overlap);
+                // the `if let` is defensive against the unreachable `None`.
+                if let Some((session, _)) = best {
+                    let lease = self.mint_lease(&session, hash);
+                    return FillClaim::Attach { session, lease };
+                }
+            }
+        }
+
+        // OWNER: no live pull covers the request (or `R` is empty/unalignable). Build
+        // the session now — never on the attach branch — and scope it to the WHOLE
+        // `R` (the conservative cut). Register + mint the owner lease under the SAME
+        // lock, so a racing identical claim sees this session and attaches.
+        let session = make_session();
+        session.set_covered(r);
+        let lease = self.mint_lease(&session, hash);
+        map.entry(hash).or_default().push(Arc::clone(&session));
+        FillClaim::Owner { session, lease }
+    }
 }
 
 #[cfg(test)]
@@ -672,7 +794,7 @@ mod fill_registry_tests {
     use bao_tree::{ChunkRanges, blake3};
     use decdn_bao_range::align_range;
 
-    use super::{FillError, FillRegistry, FillSession};
+    use super::{FillClaim, FillError, FillRegistry, FillSession};
     use crate::{CHUNK_GROUP_BYTES, Hash};
 
     /// One chunk group of bytes, the alignment granularity `fill_plan` snaps to.
@@ -996,5 +1118,196 @@ mod fill_registry_tests {
         drop(owner);
         assert_eq!(session.observer_count(), 0);
         assert!(session.is_cancelled(), "last observer left — cancelled");
+    }
+
+    // The `claim` tests below assert STRUCTURAL outcomes (which variant, which
+    // session, observer counts). Concurrent interleaving is prevented not by these
+    // sequential tests but by `claim`'s single map-lock acquisition: it decides
+    // attach-vs-own AND registers under one lock, so a true multi-thread race test
+    // would be flaky where the lock already guarantees atomicity structurally.
+
+    /// A fresh miss on an empty registry OWNS; a second identical miss ATTACHES to
+    /// that same owner session, raising its observer count to 2. This is the exact
+    /// race `claim` closes: with `fill_plan` + `register_fill` split, both misses
+    /// could see an empty registry and both open a pull.
+    #[test]
+    fn claim_first_owns_second_attaches_same_range() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x30);
+
+        let first = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x30), total));
+        let FillClaim::Owner {
+            session: owner,
+            lease: _owner_lease,
+        } = first
+        else {
+            panic!("first claim on an empty registry must own");
+        };
+        assert_eq!(owner.observer_count(), 1, "owner is one observer");
+
+        let second = reg.claim(hash, 0, 0, total, || {
+            panic!("second claim must attach, not build a session")
+        });
+        let FillClaim::Attach {
+            session: attached,
+            lease: _attach_lease,
+        } = second
+        else {
+            panic!("second identical claim must attach to the live pull");
+        };
+        assert!(
+            Arc::ptr_eq(&attached, &owner),
+            "attaches to the same owner session"
+        );
+        assert_eq!(owner.observer_count(), 2, "owner + one attached observer");
+    }
+
+    /// Two disjoint-range claims for the same hash each OWN a distinct session — no
+    /// overlap means no coalescing, so two live pulls run.
+    #[test]
+    fn claim_disjoint_both_own() {
+        let total = 8 * G;
+        let half = 4 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x31);
+
+        let first = reg.claim(hash, 0, half, total, || FillSession::new(root(0x31), total));
+        let FillClaim::Owner {
+            session: lo,
+            lease: _lo,
+        } = first
+        else {
+            panic!("first disjoint claim must own");
+        };
+
+        let second = reg.claim(hash, half, total - half, total, || {
+            FillSession::new(root(0x31), total)
+        });
+        let FillClaim::Owner {
+            session: hi,
+            lease: _hi,
+        } = second
+        else {
+            panic!("disjoint second claim must own its own pull");
+        };
+        assert!(!Arc::ptr_eq(&lo, &hi), "distinct owner sessions");
+        assert!(mapped(&reg, hash), "two live sessions under the hash");
+    }
+
+    /// A subset claim (its `R` fully inside a live pull's `covered`) ATTACHES: the
+    /// remainder is empty, so no new pull opens.
+    #[test]
+    fn claim_subset_attaches() {
+        let total = 8 * G;
+        let half = 4 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x32);
+
+        let owner = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x32), total));
+        let FillClaim::Owner {
+            session: owner,
+            lease: _owner,
+        } = owner
+        else {
+            panic!("first whole-range claim must own");
+        };
+
+        let sub = reg.claim(hash, 0, half, total, || {
+            panic!("a subset claim must attach, not build a session")
+        });
+        let FillClaim::Attach {
+            session: attached,
+            lease: _lease,
+        } = sub
+        else {
+            panic!("a subset of the covered range must attach");
+        };
+        assert!(Arc::ptr_eq(&attached, &owner), "attaches to the owner");
+        assert_eq!(owner.observer_count(), 2, "owner + attached");
+    }
+
+    /// A superset claim (its `R` exceeds a live pull's `covered`, so the remainder is
+    /// non-empty) OWNS, and — per the conservative cut — its session covers the WHOLE
+    /// `R`, not just the remainder. Verified by a third claim over `[0, total)`
+    /// attaching to the superset owner (which now covers all of it).
+    #[test]
+    fn claim_superset_owns_and_covers_whole_r() {
+        let total = 8 * G;
+        let half = 4 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x33);
+
+        // First owner covers only [0, half).
+        let first = reg.claim(hash, 0, half, total, || FillSession::new(root(0x33), total));
+        let FillClaim::Owner {
+            session: _lower,
+            lease: _lower_lease,
+        } = first
+        else {
+            panic!("first partial claim must own");
+        };
+
+        // Superset [0, total): remainder [half, total) is non-empty → OWNER.
+        let sup = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x33), total));
+        let FillClaim::Owner {
+            session: superset,
+            lease: _sup_lease,
+        } = sup
+        else {
+            panic!("a superset with a non-empty remainder must own");
+        };
+        assert_eq!(
+            superset.covered_ranges(),
+            ranges(0, 0, total),
+            "the owner covers the WHOLE R (conservative cut), not just the remainder"
+        );
+
+        // A third whole-range claim attaches to the superset owner (largest overlap),
+        // proving it covers all of [0, total).
+        let third = reg.claim(hash, 0, 0, total, || {
+            panic!("the third claim must attach to the whole-range owner")
+        });
+        let FillClaim::Attach {
+            session: attached,
+            lease: _third_lease,
+        } = third
+        else {
+            panic!("a whole-range claim must attach to the whole-range owner");
+        };
+        assert!(
+            Arc::ptr_eq(&attached, &superset),
+            "attaches to the superset owner that covers the whole range"
+        );
+    }
+
+    /// `make_session` MUST NOT run on the attach branch — a serve leg that coalesces
+    /// allocates no outboard buffer. A closure that panics if invoked proves it.
+    #[test]
+    fn claim_make_session_not_called_on_attach() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x34);
+
+        let owner = reg.claim(hash, 0, 0, total, || FillSession::new(root(0x34), total));
+        assert!(matches!(owner, FillClaim::Owner { .. }), "first claim owns");
+
+        // If `claim` invokes this on the attach path, the test panics and fails.
+        let attach = reg.claim(hash, 0, 0, total, || {
+            panic!("make_session must not be called on the attach branch")
+        });
+        assert!(
+            matches!(attach, FillClaim::Attach { .. }),
+            "second identical claim attaches without building a session"
+        );
+    }
+
+    /// `FillSession::total_bytes` reports the blob length the session was built with,
+    /// so the attach path can sign its `StreamResponse` without a header handshake.
+    #[test]
+    fn total_bytes_reports_blob_length() {
+        let total = 5 * G + 321;
+        let session = FillSession::new(root(0x35), total);
+        assert_eq!(session.total_bytes(), total);
     }
 }

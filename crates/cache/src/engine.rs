@@ -28,7 +28,7 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
-use crate::fill_session::{FillPlan, FillRegistry, FillSession, ObserverLease};
+use crate::fill_session::{FillClaim, FillPlan, FillRegistry, FillSession, ObserverLease};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
@@ -1053,6 +1053,26 @@ impl CacheEngine {
     /// returning the owner [`ObserverLease`]. See [`FillRegistry::register_fill`].
     pub fn register_fill(&self, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
         self.inner.fill_registry.register_fill(hash, session)
+    }
+
+    /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
+    /// of the `total`-byte blob `hash`: decide attach-vs-own AND register under one
+    /// map-lock acquisition, closing the [`Self::fill_plan`] + [`Self::register_fill`]
+    /// TOCTOU race. Returns [`FillClaim::Attach`] to coalesce onto a live pull (no new
+    /// pull) or [`FillClaim::Owner`] with a freshly-registered session the caller must
+    /// drive a pull for. `make_session` builds the session only on the owner branch
+    /// (never built-and-dropped on attach). See [`FillRegistry::claim`].
+    pub fn claim_fill(
+        &self,
+        hash: Hash,
+        offset: u64,
+        len: u64,
+        total: u64,
+        make_session: impl FnOnce() -> Arc<FillSession>,
+    ) -> FillClaim {
+        self.inner
+            .fill_registry
+            .claim(hash, offset, len, total, make_session)
     }
 
     /// Subscribe to a stream of `Hash`es announcing every blob that
