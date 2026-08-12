@@ -159,6 +159,13 @@ pub enum MessageValidationError {
     /// `try_from` decode gate, as above.
     #[error("ChunkData payload of {len} bytes exceeds CHUNK_SIZE ({max})", max = crate::CHUNK_SIZE)]
     ChunkTooLarge { len: usize },
+    /// A wire [`crate::client::WireCapability`]'s `owner_signature` is empty.
+    /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
+    /// ERC-1271 contract-signer form may be longer, so only the non-empty
+    /// floor is a wire-level check; the rest is `decdn_incentive`'s job
+    /// (ADR 024 §Off-Chain ERC-1271 Verification).
+    #[error("WireCapability.owner_signature is empty")]
+    EmptyCapabilitySignature,
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per

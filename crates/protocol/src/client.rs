@@ -227,6 +227,15 @@ pub struct StreamRequestExt {
     /// so a half-populated state (address without signature, or vice versa) is
     /// unrepresentable; absent ⇒ a registered/on-chain client.
     pub binding: Option<ClientBinding>,
+    /// The pool owner's spending capability for this stream's `signer`,
+    /// attached at session start so the delivering node can register the
+    /// signer on that signer's first on-chain redemption (ADR 003 §Capability
+    /// delegation). Node-agnostic: the same capability is valid at every node
+    /// the client streams from, since it grants spend against the pool, not
+    /// against a specific delivering node. Absent ⇒ the node already has the
+    /// signer registered (or the client is relying on a capability it sent on
+    /// an earlier stream to a different node this session).
+    pub capability: Option<WireCapability>,
 }
 
 /// Off-chain ephemeral client identity binding (ADR 003 §Off-Chain Ephemeral
@@ -262,6 +271,47 @@ impl ClientBinding {
     }
 }
 
+/// A pool owner's spending capability, carried inside [`StreamRequestExt`]
+/// (ADR 003 §Capability delegation). `signer` and `pool_id` are not on the
+/// wire — they are derived from stream context, exactly like a [`Voucher`]'s
+/// implicit fields: `signer` is the request's bound Ethereum address
+/// ([`ClientBinding::ethereum_address`], or the registered on-chain signer
+/// when `binding` is absent) and `pool_id` is [`StreamRequest::pool_id`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireCapability {
+    /// Maximum cumulative amount the signer may spend against the pool under
+    /// this grant, big-endian `uint256` (mirrors [`Voucher::amount`] — no
+    /// `U256` in the protocol crate).
+    pub spending_cap: [u8; 32],
+    /// Unix-seconds expiry. After it, vouchers under this capability are no
+    /// longer redeemable.
+    pub expiry: u64,
+    /// EIP-712 owner signature over the capability (`r‖s‖v`, 65 bytes for an
+    /// EOA owner; may be longer for an ERC-1271 contract owner, so unlike
+    /// [`VOUCHER_SIG_LEN`]-pinned signatures this is only checked non-empty at
+    /// the wire boundary — [`WireCapability::validate`]). The cryptographic
+    /// recovery/verification happens in `decdn_incentive`.
+    pub owner_signature: Vec<u8>,
+}
+
+impl WireCapability {
+    /// Validate the wire-level `owner_signature` non-emptiness. Unlike
+    /// [`ClientBinding::validate`] / [`Voucher::validate`] this cannot pin an
+    /// exact length — an ERC-1271 contract signature may be longer than the
+    /// 65-byte EOA form — so this is a floor, not a full shape check.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::EmptyCapabilitySignature`] if `owner_signature`
+    /// is empty.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.owner_signature.is_empty() {
+            return Err(MessageValidationError::EmptyCapabilitySignature);
+        }
+        Ok(())
+    }
+}
+
 impl StreamRequestExt {
     /// Validate the negotiated cadence and (if present) the client binding.
     /// Called by the node on the receive path after [`parse_stream_request_ext`];
@@ -273,7 +323,8 @@ impl StreamRequestExt {
     /// [`MessageValidationError::VoucherIntervalOutOfRange`] if
     /// `voucher_interval_mb` is present and outside `1..=MAX_VOUCHER_INTERVAL_MB`;
     /// [`MessageValidationError::InvalidBindingSigLen`] if a present `binding`
-    /// has a wrong-length signature.
+    /// has a wrong-length signature; [`MessageValidationError::EmptyCapabilitySignature`]
+    /// if a present `capability` has an empty `owner_signature`.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if let Some(mb) = self.voucher_interval_mb
             && (mb == 0 || mb > MAX_VOUCHER_INTERVAL_MB)
@@ -283,6 +334,12 @@ impl StreamRequestExt {
         if let Some(binding) = &self.binding {
             // `?` is not yet stable in `const fn`; match-return instead.
             match binding.validate() {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(capability) = &self.capability {
+            match capability.validate() {
                 Ok(()) => {}
                 Err(e) => return Err(e),
             }
@@ -867,6 +924,15 @@ mod tests {
         StreamRequestExt {
             voucher_interval_mb: Some(8),
             binding: Some(sample_binding()),
+            capability: Some(sample_capability()),
+        }
+    }
+
+    fn sample_capability() -> WireCapability {
+        WireCapability {
+            spending_cap: [0x22u8; 32],
+            expiry: 1_800_000_000,
+            owner_signature: vec![0x03u8; VOUCHER_SIG_LEN],
         }
     }
 
@@ -930,6 +996,60 @@ mod tests {
         bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]); // simulated future field
         assert_eq!(parse_stream_request_ext(&bytes)?, ext);
         Ok(())
+    }
+
+    /// `capability` round-trips both present and absent, independent of
+    /// `binding` (the wire fields are orthogonal — a registered on-chain
+    /// client can still carry a capability, and vice versa).
+    #[test]
+    fn stream_request_ext_capability_roundtrip() -> Result<(), postcard::Error> {
+        let with_cap = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: None,
+            capability: Some(sample_capability()),
+        };
+        let bytes = postcard::to_allocvec(&with_cap)?;
+        let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
+        assert_eq!(with_cap, decoded);
+
+        let without_cap = StreamRequestExt {
+            capability: None,
+            ..with_cap
+        };
+        let bytes = postcard::to_allocvec(&without_cap)?;
+        let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
+        assert_eq!(without_cap, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn wire_capability_rejects_empty_signature() {
+        let cap = WireCapability {
+            spending_cap: [0u8; 32],
+            expiry: 0,
+            owner_signature: Vec::new(),
+        };
+        assert_eq!(
+            cap.validate(),
+            Err(MessageValidationError::EmptyCapabilitySignature)
+        );
+    }
+
+    #[test]
+    fn stream_request_ext_validate_rejects_empty_capability_signature() {
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: None,
+            capability: Some(WireCapability {
+                spending_cap: [0u8; 32],
+                expiry: 0,
+                owner_signature: Vec::new(),
+            }),
+        };
+        assert_eq!(
+            ext.validate(),
+            Err(MessageValidationError::EmptyCapabilitySignature)
+        );
     }
 
     #[test]
@@ -1423,6 +1543,7 @@ mod tests {
             let ext = StreamRequestExt {
                 voucher_interval_mb: Some(mb),
                 binding: None,
+                capability: None,
             };
             assert_eq!(ext.validate(), Ok(()));
         }
@@ -1433,6 +1554,7 @@ mod tests {
         let ext = StreamRequestExt {
             voucher_interval_mb: Some(0),
             binding: None,
+            capability: None,
         };
         assert_eq!(
             ext.validate(),
@@ -1446,6 +1568,7 @@ mod tests {
         let ext = StreamRequestExt {
             voucher_interval_mb: Some(over),
             binding: None,
+            capability: None,
         };
         assert_eq!(
             ext.validate(),
@@ -1461,6 +1584,7 @@ mod tests {
                 ethereum_address: [0u8; 20],
                 binding_signature: vec![0x01; BINDING_SIG_LEN - 1],
             }),
+            capability: None,
         };
         assert_eq!(
             ext.validate(),
