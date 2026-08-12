@@ -261,6 +261,11 @@ impl PoolLedger {
     /// bytes the upstream refused to be paid for).
     ///
     /// Returns `false` if there was nothing to rewind — a spurious rejection.
+    ///
+    /// Assumes the rejected voucher is the LATEST committed one: the one-step
+    /// `committed → prev` rewind is exact for the inline-await receive loop, which
+    /// issues at most one armed voucher at a time and learns of its rejection before
+    /// issuing the next.
     pub fn resolve_reject(&self) -> bool {
         let mut pipeline = self.pipeline();
         pipeline.armed = None;

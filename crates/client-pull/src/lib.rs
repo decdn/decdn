@@ -1292,12 +1292,12 @@ where
 ///
 /// The bug this fixes: each `stream_fetch`/`stream_fetch_tracked` call seeds its
 /// own voucher state from `ctx.prior_*`, so N concurrent pulls on the same channel
-/// all sign the next voucher at `prior_nonce + 1` and collide — the node accepts
-/// exactly one and rejects the rest as `AmountRegression`. Passing every concurrent
-/// caller the SAME `&PoolLedger` (typically an `Arc<PoolLedger>` shared
+/// each compute the next cumulative `amount` independently and collide — the node
+/// accepts exactly one and rejects the rest as `AmountRegression`. Passing every
+/// concurrent caller the SAME `&PoolLedger` (typically an `Arc<PoolLedger>` shared
 /// across `tokio::spawn`/`join!`) serializes their voucher issuance through the
-/// ledger's mutex: each issues the next nonce in turn, the channel advances
-/// monotonically, and all pulls succeed.
+/// ledger's mutex: each issue advances the cumulative `amount`/`bytes_delivered`
+/// in turn, the channel advances monotonically, and all pulls succeed.
 ///
 /// The caller owns the ledger's lifetime and persists what the channel paid from it
 /// directly (this entrypoint does not surface a [`VoucherProgress`] — the shared ledger
@@ -2211,8 +2211,8 @@ pub struct UpstreamPull {
     ctx: PoolContext,
     /// The channel's voucher ledger, SHARED with every other concurrent pull on this
     /// channel (#1145 review). Not a per-pull one-shot: that made two concurrent pulls
-    /// both sign `prior_nonce + 1` and collide — see [`stream_fetch_shared`], whose doc
-    /// describes the same bug on the buffered path.
+    /// each compute the same next cumulative `amount` independently and collide — see
+    /// [`stream_fetch_shared`], whose doc describes the same bug on the buffered path.
     ledger: Arc<PoolLedger>,
     hash: [u8; 32],
     rate_per_mb: u64,
@@ -2266,9 +2266,9 @@ impl std::fmt::Debug for UpstreamPull {
 ///
 /// `ledger` is the CHANNEL's voucher ledger, not this pull's: pass the same
 /// `Arc<PoolLedger>` to every concurrent pull on one channel, exactly as with
-/// [`stream_fetch_shared`], or they will each sign `prior_nonce + 1` and collide
-/// (#1145 review). The caller reads what to persist from it — including after a drop —
-/// via [`PoolLedger::settlement`].
+/// [`stream_fetch_shared`], or they will each compute the same next cumulative
+/// `amount` independently and collide (#1145 review). The caller reads what to
+/// persist from it — including after a drop — via [`PoolLedger::settlement`].
 #[allow(clippy::too_many_arguments)]
 pub async fn open_progressive_pull(
     endpoint: &Endpoint,
@@ -2404,9 +2404,9 @@ impl UpstreamPull {
 
     /// Send one voucher for `delta_bytes` newly delivered since the last voucher,
     /// through the CHANNEL's ledger — shared with every other concurrent pull on it, so
-    /// their vouchers are serialized into strict nonce order rather than colliding (see
-    /// [`stream_fetch_shared`]). Sends optimistically (#1484): the ack is read back by
-    /// [`Self::next_chunk`] / [`Self::finish`], not awaited here.
+    /// their vouchers are serialized into strict cumulative-amount order rather than
+    /// colliding (see [`stream_fetch_shared`]). Sends optimistically (#1484): the ack is
+    /// read back by [`Self::next_chunk`] / [`Self::finish`], not awaited here.
     async fn pay_one(&mut self, delta_bytes: u64) -> anyhow::Result<()> {
         let ledger = Arc::clone(&self.ledger);
         send_voucher(
@@ -2624,6 +2624,11 @@ async fn send_voucher(
     rate_per_mb: u64,
     delta_bytes: u64,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !ctx.provider.is_zero(),
+        "voucher provider is not pinned (Address::ZERO) — call PoolContext::with_provider \
+         before signing"
+    );
     ledger
         .issue(delta_bytes, rate_per_mb, |next: Cumulative| async move {
             let signed = Voucher {

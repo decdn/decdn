@@ -691,7 +691,10 @@ mod tests {
         let signer = PrivateKeySigner::random();
         PoolContext {
             pool_id: B256::ZERO,
-            provider: Address::ZERO,
+            // Pinned to a non-zero test provider: `send_voucher` fast-fails on
+            // `Address::ZERO` (an unpinned lane), so every driver test that
+            // actually signs a voucher needs a real-looking address here.
+            provider: Address::repeat_byte(0xAB),
             deposit: U256::from(u128::MAX),
             client_signer: Arc::new(signer),
             voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
