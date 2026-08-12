@@ -1,12 +1,10 @@
-//! Integration tests for `decdn channel close` / `settle` / `clean` (#1136).
+//! Integration tests for `decdn pool top-up` / `close` / `reclaim`.
 //!
 //! These exercise the pre-chain guard paths that are reachable without a live
-//! node/anvil: an empty-store `clean` is a no-op success, and `close`/`settle`
-//! for an untracked provider fail fast at the store lookup (before any signer
-//! load or RPC dial). The on-chain state machine itself is unit-tested
-//! exhaustively via `next_action` next to the command impl, and the underlying
-//! `closeChannel`/`settleChannel`/`reclaimExpired` primitives are covered by the
-//! node crate's anvil settlement e2e.
+//! node/anvil: a malformed `--pool` id fails fast at parse time, before the
+//! buyer-pool store is opened, the keystore is loaded, or any RPC is dialed.
+//! The on-chain `openPool`/`topUp`/`closePool`/`reclaim` primitives themselves
+//! are covered by the node crate's anvil settlement e2e.
 
 #![cfg(unix)] // The buyer store enforces POSIX `0o700` on its data dir.
 #![allow(
@@ -21,14 +19,10 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use alloy::primitives::{Address, B256, U256};
-use decdn_cli::commands::channel::channel_dispatch;
+use decdn_cli::commands::pool::pool_dispatch;
 use decdn_common::cli::{
-    ChannelArgs, ChannelChainArgs, ChannelCleanArgs, ChannelCloseArgs, ChannelCommand,
-    ChannelSettleArgs,
+    PoolArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolReclaimArgs, PoolTopUpArgs,
 };
-use decdn_incentive::buyer_channel::{BuyerChannelState, BuyerChannelStore};
-use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 
 /// The buyer store enforces `0o700` on its data dir; `tempdir()` honours the
 /// umask, so tighten it first.
@@ -46,131 +40,64 @@ fn empty_config(dir: &Path) -> std::path::PathBuf {
     path
 }
 
-/// Chain flags that satisfy `resolve_chain` (rpc + payment-channel required) so
-/// the guard tests reach the store lookup. The values are never dialed — every
-/// case here returns before building a provider.
-fn chain_args(dir: &Path) -> ChannelChainArgs {
-    ChannelChainArgs {
+/// Chain flags that satisfy `resolve_chain` (rpc + payment-pool required) so
+/// the guard tests reach the `--pool` parse. The values are never dialed —
+/// every case here returns before building a provider or loading a keystore.
+fn chain_args(dir: &Path) -> PoolChainArgs {
+    PoolChainArgs {
         rpc_url: Some("http://127.0.0.1:1".to_string()),
-        payment_channel_address: Some("0x00000000000000000000000000000000000000ab".to_string()),
+        payment_pool_address: Some("0x00000000000000000000000000000000000000ab".to_string()),
         chain_id: None,
         keystore: None,
         data_dir: Some(dir.to_path_buf()),
     }
 }
 
-fn seed(dir: &Path, provider_byte: u8) {
-    let store = RedbBuyerChannelStore::open(dir).unwrap();
-    let mut state = BuyerChannelState::new(
-        B256::repeat_byte(0xab),
-        Address::repeat_byte(provider_byte),
-        Address::repeat_byte(provider_byte),
-        Address::repeat_byte(provider_byte),
-        Address::repeat_byte(0xcd),
-        U256::from(2_000_000u64),
-        0,
-    );
-    state.last_nonce = U256::from(4u64);
-    state.last_amount = U256::from(1_500_000u64);
-    state.last_bytes_delivered = U256::from(4096u64);
-    store.record(&state).unwrap();
-}
-
-fn seed_corrupt(dir: &Path, channel_id: B256) {
-    let store = RedbBuyerChannelStore::open(dir).unwrap();
-    store
-        .insert_raw_buyer_record(channel_id, &[0u8; 8])
-        .unwrap();
-}
-
 #[tokio::test]
-async fn clean_empty_store_is_a_noop_success() {
+async fn top_up_with_unparseable_pool_id_errors_before_touching_chain() {
     let dir = data_dir();
     let cfg = empty_config(dir.path());
-    let args = ChannelArgs {
-        command: ChannelCommand::Clean(ChannelCleanArgs {
+    let args = PoolArgs {
+        command: PoolCommand::TopUp(PoolTopUpArgs {
+            pool: "not-a-pool-id".to_string(),
+            amount_micro_usdc: 1_000_000,
             chain: chain_args(dir.path()),
         }),
     };
-    channel_dispatch(&args, Some(&cfg))
+    let err = pool_dispatch(&args, Some(&cfg))
         .await
-        .expect("clean over an empty store should be a no-op success");
-}
-
-#[test]
-fn clean_with_only_an_undecodable_row_does_not_claim_nothing_to_clean() {
-    let dir = data_dir();
-    let cfg = empty_config(dir.path());
-    let corrupt_channel_id = B256::repeat_byte(0x55);
-    seed_corrupt(dir.path(), corrupt_channel_id);
-
-    let output = common::decdn_command(dir.path())
-        .arg("--config")
-        .arg(cfg)
-        .args([
-            "channel",
-            "clean",
-            "--rpc-url",
-            "http://127.0.0.1:1",
-            "--payment-channel-address",
-            "0x00000000000000000000000000000000000000ab",
-            "--data-dir",
-        ])
-        .arg(dir.path())
-        .output()
-        .expect("run decdn channel clean");
-    assert!(
-        output.status.success(),
-        "clean failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stdout.contains("no tracked channels to clean"), "{stdout}");
-    assert!(
-        stderr.contains(&format!("{corrupt_channel_id:#x}")),
-        "{stderr}"
-    );
-    assert!(stderr.contains("escrowed"), "{stderr}");
+        .expect_err("an unparseable --pool must error before touching chain");
+    assert!(err.to_string().contains("invalid --pool"), "{err}");
 }
 
 #[tokio::test]
-async fn close_unknown_provider_errors_before_touching_chain() {
+async fn close_with_unparseable_pool_id_errors_before_touching_chain() {
     let dir = data_dir();
     let cfg = empty_config(dir.path());
-    // Store exists (a different provider tracked) but lacks the requested one.
-    seed(dir.path(), 0x22);
-    let args = ChannelArgs {
-        command: ChannelCommand::Close(ChannelCloseArgs {
-            provider_address: "0x1111111111111111111111111111111111111111".to_string(),
+    let args = PoolArgs {
+        command: PoolCommand::Close(PoolCloseArgs {
+            pool: "not-a-pool-id".to_string(),
             chain: chain_args(dir.path()),
         }),
     };
-    let err = channel_dispatch(&args, Some(&cfg))
+    let err = pool_dispatch(&args, Some(&cfg))
         .await
-        .expect_err("close for an untracked provider must error");
-    assert!(
-        err.to_string().contains("no buyer channel tracked"),
-        "unexpected error: {err}"
-    );
+        .expect_err("an unparseable --pool must error before touching chain");
+    assert!(err.to_string().contains("invalid --pool"), "{err}");
 }
 
 #[tokio::test]
-async fn settle_unknown_provider_errors_before_touching_chain() {
+async fn reclaim_with_unparseable_pool_id_errors_before_touching_chain() {
     let dir = data_dir();
     let cfg = empty_config(dir.path());
-    seed(dir.path(), 0x22);
-    let args = ChannelArgs {
-        command: ChannelCommand::Settle(ChannelSettleArgs {
-            provider_address: "0x1111111111111111111111111111111111111111".to_string(),
+    let args = PoolArgs {
+        command: PoolCommand::Reclaim(PoolReclaimArgs {
+            pool: "not-a-pool-id".to_string(),
             chain: chain_args(dir.path()),
         }),
     };
-    let err = channel_dispatch(&args, Some(&cfg))
+    let err = pool_dispatch(&args, Some(&cfg))
         .await
-        .expect_err("settle for an untracked provider must error");
-    assert!(
-        err.to_string().contains("no buyer channel tracked"),
-        "unexpected error: {err}"
-    );
+        .expect_err("an unparseable --pool must error before touching chain");
+    assert!(err.to_string().contains("invalid --pool"), "{err}");
 }

@@ -31,7 +31,7 @@ region = "us"
 
 [blockchain]
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
-payment_channel_address = "0x0000000000000000000000000000000000000001"
+payment_pool_address = "0x0000000000000000000000000000000000000001"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"
@@ -39,7 +39,7 @@ content_blacklist_address = "0x0000000000000000000000000000000000000004"
 
 const MISSING_RPC: &str = r#"
 [blockchain]
-payment_channel_address = "0x0000000000000000000000000000000000000001"
+payment_pool_address = "0x0000000000000000000000000000000000000001"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 "#;
 
@@ -48,7 +48,7 @@ fn unknown_var_config(var_name: &str) -> String {
         r#"
 [blockchain]
 rpc_url = "${{{var_name}}}"
-payment_channel_address = "0x0000000000000000000000000000000000000001"
+payment_pool_address = "0x0000000000000000000000000000000000000001"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 "#
     )
@@ -229,7 +229,7 @@ fn validate_fails_when_config_flag_points_at_missing_file() -> anyhow::Result<()
 // max_blob_size_mb >= cache_size_mb, and rate_per_mb = 0.
 const MULTI_ERROR: &str = r#"
 [blockchain]
-payment_channel_address = "0x0000000000000000000000000000000000000001"
+payment_pool_address = "0x0000000000000000000000000000000000000001"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 
@@ -335,7 +335,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             rpc_url: "https://rpc.example/SECRET_TOKEN_abc123".to_string(),
             eth_keystore: PathBuf::from("/var/lib/decdn/keystore.json"),
             keystore_password_file: None,
-            payment_channel_address: "0x0000000000000000000000000000000000000001".to_string(),
+            payment_pool_address: "0x0000000000000000000000000000000000000001".to_string(),
             capacity_bond_address: "0x0000000000000000000000000000000000000002".to_string(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 7000,
@@ -345,9 +345,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
-            settlement_dispute_min_residual_micro_usdc: 100_000,
+            pool_min_remaining_deposit_micro_usdc: 100_000,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
             content_blacklist_poll_interval_sec: 600,

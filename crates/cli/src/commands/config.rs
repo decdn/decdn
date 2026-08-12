@@ -136,8 +136,8 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  payment_channel_address:  {}",
-        resolved.blockchain.payment_channel_address
+        "  payment_pool_address:  {}",
+        resolved.blockchain.payment_pool_address
     )?;
     writeln!(
         w,
@@ -191,20 +191,35 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  rate_bounds_poll_interval_sec: {}",
         resolved.blockchain.rate_bounds_poll_interval_sec
     )?;
-    match resolved.blockchain.settlement_auto_threshold_micro_usdc {
-        Some(v) => writeln!(w, "  settlement_auto_threshold_micro_usdc: {v}")?,
-        None => writeln!(w, "  settlement_auto_threshold_micro_usdc: disabled")?,
-    }
-    match resolved.blockchain.settlement_auto_by_voucher_nonce_span {
-        Some(v) => writeln!(w, "  settlement_auto_by_voucher_nonce_span: {v}")?,
-        None => writeln!(w, "  settlement_auto_by_voucher_nonce_span: disabled")?,
-    }
     writeln!(
         w,
-        "  settlement_dispute_min_residual_micro_usdc: {}",
-        resolved
-            .blockchain
-            .settlement_dispute_min_residual_micro_usdc
+        "  redeem_threshold_micro_usdc: {}",
+        resolved.blockchain.redeem_threshold_micro_usdc
+    )?;
+    writeln!(
+        w,
+        "  redeem_interval_secs: {}",
+        resolved.blockchain.redeem_interval_secs
+    )?;
+    writeln!(
+        w,
+        "  buyer_initial_deposit_micro_usdc: {}",
+        resolved.blockchain.buyer_initial_deposit_micro_usdc
+    )?;
+    writeln!(
+        w,
+        "  buyer_working_deposit_micro_usdc: {}",
+        resolved.blockchain.buyer_working_deposit_micro_usdc
+    )?;
+    writeln!(
+        w,
+        "  buyer_max_approve: {}",
+        resolved.blockchain.buyer_max_approve
+    )?;
+    writeln!(
+        w,
+        "  pool_min_remaining_deposit_micro_usdc: {}",
+        resolved.blockchain.pool_min_remaining_deposit_micro_usdc
     )?;
     writeln!(
         w,
@@ -463,7 +478,7 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
          chain_id = {chain_id}\n\
          # eth_keystore = \"~/.decdn/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
          # --- Contract addresses (from deployments/{chain_id}.json) ---\n\
-         payment_channel_address    = \"{payment_channel}\"\n\
+         payment_pool_address       = \"{payment_channel}\"\n\
          capacity_bond_address      = \"{capacity_bond}\"\n\
          slash_judge_address        = \"{slash_judge}\"\n\
          content_blacklist_address  = \"{content_blacklist}\"\n\
@@ -568,7 +583,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [blockchain]
 # rpc_url = ""                       # REQUIRED: Arbitrum Sepolia JSON-RPC URL
 # eth_keystore = "~/.decdn/keystore.json"
-# payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
+# payment_pool_address = ""          # REQUIRED: 0x-prefixed hex
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
 # origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
@@ -581,12 +596,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rate_bounds_poll_interval_sec = 3600 # authoritative getRateBounds() re-read cadence, safety net beside the RateBoundsUpdated subscription (#1172); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
-# buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a channel (first-contact lock); default 0.5 USDC
+# buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a pool (first-contact lock); default 0.5 USDC
 # buyer_working_deposit_micro_usdc = 10000000    # refill target on reuse or mid-transfer shortfall; 0 disables top-up; default 10 USDC
-# buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
-# settlement_auto_threshold_micro_usdc = 50000000   # auto-closeChannel once un-redeemed µUSDC reaches this (#742); leave unset/commented to disable — when set it must be > 0
-# settlement_auto_by_voucher_nonce_span = 1000       # auto-closeChannel once the un-redeemed nonce span reaches this (#742); leave unset/commented to disable — when set it must be > 0
-# settlement_dispute_min_residual_micro_usdc = 100000 # self-defense disputeChannel gas-cost floor (#1586): react to a stale close only when the recoverable residual clears this µUSDC; default 0.1 USDC; 0 disables the floor
+# buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
+# pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
 # CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -810,7 +823,7 @@ mod tests {
         let config::types::BlockchainConfig {
             rpc_url,
             eth_keystore,
-            payment_channel_address,
+            payment_pool_address,
             capacity_bond_address,
             origin_assignment_address,
             publisher_registry_address,
@@ -827,9 +840,7 @@ mod tests {
             buyer_initial_deposit_micro_usdc,
             buyer_working_deposit_micro_usdc,
             buyer_max_approve,
-            settlement_auto_threshold_micro_usdc,
-            settlement_auto_by_voucher_nonce_span,
-            settlement_dispute_min_residual_micro_usdc,
+            pool_min_remaining_deposit_micro_usdc,
             swap_venue,
             swap_router_address,
             swap_quoter_address,
@@ -841,10 +852,7 @@ mod tests {
         let blockchain = [
             ("rpc_url =", rpc_url.is_none()),
             ("eth_keystore =", eth_keystore.is_none()),
-            (
-                "payment_channel_address =",
-                payment_channel_address.is_none(),
-            ),
+            ("payment_pool_address =", payment_pool_address.is_none()),
             ("capacity_bond_address =", capacity_bond_address.is_none()),
             (
                 "origin_assignment_address =",
@@ -889,16 +897,8 @@ mod tests {
             ),
             ("buyer_max_approve =", buyer_max_approve.is_none()),
             (
-                "settlement_auto_threshold_micro_usdc =",
-                settlement_auto_threshold_micro_usdc.is_none(),
-            ),
-            (
-                "settlement_auto_by_voucher_nonce_span =",
-                settlement_auto_by_voucher_nonce_span.is_none(),
-            ),
-            (
-                "settlement_dispute_min_residual_micro_usdc =",
-                settlement_dispute_min_residual_micro_usdc.is_none(),
+                "pool_min_remaining_deposit_micro_usdc =",
+                pool_min_remaining_deposit_micro_usdc.is_none(),
             ),
             ("swap_venue =", swap_venue.is_none()),
             ("swap_router_address =", swap_router_address.is_none()),
@@ -1091,7 +1091,7 @@ mod tests {
         // Every manifest-derived address is filled in (not left commented), and
         // equals the manifest exactly.
         let a = chain.addresses().expect("addresses");
-        assert_eq!(bc.payment_channel_address, Some(a.payment_channel));
+        assert_eq!(bc.payment_pool_address, Some(a.payment_channel));
         assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));
         assert_eq!(bc.slash_judge_address, Some(a.slash_judge));
         assert_eq!(bc.content_blacklist_address, Some(a.content_blacklist));

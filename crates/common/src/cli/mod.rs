@@ -8,12 +8,12 @@
 
 pub mod appeal;
 pub mod bundle;
-pub mod channel;
 pub mod common;
 pub mod config_cmd;
 pub mod fetch;
 pub mod key_gen;
 pub mod node;
+pub mod pool;
 pub mod probe;
 pub mod publish;
 pub mod run;
@@ -21,10 +21,6 @@ pub mod setup;
 
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
-pub use channel::{
-    ChannelArgs, ChannelChainArgs, ChannelCleanArgs, ChannelCloseArgs, ChannelCommand,
-    ChannelListArgs, ChannelOpenArgs, ChannelSettleArgs, CoopCloseArgs,
-};
 pub use common::{
     CommonChainArgs, ConfigPathSource, LogFormat, default_client_data_dir, default_config_path,
     default_data_dir,
@@ -36,6 +32,10 @@ pub use node::{
     AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DeregisterArgs, DrainArgs, EvictArgs,
     HealthArgs, LookupArgs, NodeArgs, NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs,
     ReloadArgs, RotateKeyArgs, RotateKeyTarget, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
+};
+pub use pool::{
+    PoolArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs, PoolOpenArgs,
+    PoolReclaimArgs, PoolTopUpArgs,
 };
 pub use probe::ProbeArgs;
 pub use publish::{
@@ -88,7 +88,8 @@ pub enum Command {
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
     /// Fetch a single content-addressed blob from a node over the paid
-    /// `cdn/client/v1` path, paying per-MB from an open `PaymentChannel`.
+    /// `cdn/client/v1` path, paying per-MB from the caller's own `PaymentPool`
+    /// deposit.
     Fetch(FetchArgs),
     /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
     /// key generation, bond, and on-chain registration, with a final
@@ -102,8 +103,9 @@ pub enum Command {
     /// linking BLAKE3-content-addressed blobs by relative path. See
     /// `appendix-bundles.md` for the format and issue #391 for status.
     Bundle(BundleArgs),
-    /// Client-side payment-channel lifecycle (`list`/`status`, `coop-close`).
-    Channel(ChannelArgs),
+    /// Client-side payment-pool lifecycle (`list`/`status`, `open`, `top-up`,
+    /// `close`, `reclaim`).
+    Pool(PoolArgs),
     /// Publisher control plane: create namespaces, request publisher vetting,
     /// and seat or unseat authorized origins on-chain (issues #1029 / #1491).
     /// Content is bound to a namespace off-chain at fetch time, so there is no
