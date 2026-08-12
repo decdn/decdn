@@ -341,7 +341,6 @@ fn build_config(
             redeem_interval_secs: 300,
             buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
-            buyer_reactive_topup_min_ttl_secs: 86_400,
             // No on-chain approval tx at bring-up: keeps the (unregistered,
             // gas-funded-but-otherwise-inert) node's boot path chain-write-free.
             buyer_max_approve: false,

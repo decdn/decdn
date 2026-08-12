@@ -880,7 +880,6 @@ fn build_origin_with_probe_caches(
             working_deposit,
             // A day's margin; the fixtures use never-expiring channels, so the
             // near-expiry guard (#1603) is inert unless a test sets an expiry.
-            reactive_topup_min_ttl: Duration::from_hours(24),
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.
@@ -1021,7 +1020,6 @@ fn build_origin_multi_hash(
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
-            reactive_topup_min_ttl: Duration::from_hours(24),
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.
@@ -9841,7 +9839,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
-            reactive_topup_min_ttl: Duration::from_hours(24),
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.
@@ -12498,7 +12495,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
-            reactive_topup_min_ttl: Duration::from_hours(24),
             // Short, so a post-top-up settle wait cannot dominate a test's wall clock.
             // The fixtures accept the resumed open immediately, so the budget is only
             // ever spent when a test deliberately withholds settlement.

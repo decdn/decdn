@@ -102,17 +102,6 @@ pub const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
 ///
 /// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
 pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// Default near-expiry margin (seconds) for the reactive mid-pull top-up guard
-/// (#1603): roughly one day. A buyer capability with less than this left to
-/// its own `expiry` is not reactively topped up — instead a fresh capability
-/// is regenerated (see [`DEFAULT_BUYER_CAPABILITY_TTL_SECS`]) — because
-/// escrowing a fresh working-deposit against a capability this close to
-/// expiry could see the capability expire before the resumed leg spends it.
-/// One day comfortably clears a normal pull while leaving the operator a
-/// wide margin; `0` disables the guard entirely.
-///
-/// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
-pub const DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS: u64 = 86_400;
 /// Default refundable floor `M`: 1 USDC (`1_000_000` `µUSDC`). ADR 003 §
 /// Sizing defines `M = k·ρ·B·Δ` (redeem cadence × rate × credit window ×
 /// round-trip slack); this is a conservative static value at the
@@ -121,10 +110,6 @@ pub const DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS: u64 = 86_400;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
-/// Default horizon (seconds) for the node-as-buyer's self-issued capability
-/// `expiry`: 86,400s (1 day). The pool itself carries no expiry (ADR 003); the
-/// capability does, and this is the window the buyer path re-signs it over.
-pub const DEFAULT_BUYER_CAPABILITY_TTL_SECS: u64 = 86_400;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -1504,14 +1489,6 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
-    // Near-expiry guard for the reactive mid-pull top-up (#1603). `0` is the legal
-    // "disable the guard" sentinel (always top up, whatever the remaining time), so
-    // there is no `> 0` check — unlike the interval fields above, a 0 here builds no
-    // timer and cannot panic.
-    let buyer_reactive_topup_min_ttl_secs = file
-        .and_then(|b| b.buyer_reactive_topup_min_ttl_secs)
-        .unwrap_or(DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS);
-
     // Default-on: the one-time max approval is what lets the buyer path join
     // pools without a manual approve step (ADR 003 § Deposit Economics).
     let buyer_max_approve = file.and_then(|b| b.buyer_max_approve).unwrap_or(true);
@@ -1521,13 +1498,6 @@ fn resolve_blockchain_into(
     let pool_min_remaining_deposit_micro_usdc = file
         .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
-
-    // Self-issued buyer-capability expiry horizon. No `> 0` check — an operator
-    // who sets `0` gets capabilities that expire immediately, which is a bad
-    // configuration but not one this resolver needs to guard against.
-    let buyer_capability_ttl_secs = file
-        .and_then(|b| b.buyer_capability_ttl_secs)
-        .unwrap_or(DEFAULT_BUYER_CAPABILITY_TTL_SECS);
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -1555,10 +1525,8 @@ fn resolve_blockchain_into(
         redeem_interval_secs,
         buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
-        buyer_reactive_topup_min_ttl_secs,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
-        buyer_capability_ttl_secs,
     }
 }
 
@@ -8995,8 +8963,7 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_blockchain_applies_default_pool_floor_and_capability_ttl_when_absent()
-    -> anyhow::Result<()> {
+    fn resolve_blockchain_applies_default_pool_floor_when_absent() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -9015,15 +8982,11 @@ swap_pool_address = \"0xPool\"
             resolved.pool_min_remaining_deposit_micro_usdc,
             DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC
         );
-        assert_eq!(
-            resolved.buyer_capability_ttl_secs,
-            DEFAULT_BUYER_CAPABILITY_TTL_SECS
-        );
         Ok(())
     }
 
     #[test]
-    fn resolve_blockchain_threads_explicit_pool_floor_and_capability_ttl() -> anyhow::Result<()> {
+    fn resolve_blockchain_threads_explicit_pool_floor() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -9039,14 +9002,12 @@ swap_pool_address = \"0xPool\"
         };
         let file = types::BlockchainConfig {
             pool_min_remaining_deposit_micro_usdc: Some(2_500_000),
-            buyer_capability_ttl_secs: Some(3_600),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
         assert_eq!(resolved.pool_min_remaining_deposit_micro_usdc, 2_500_000);
-        assert_eq!(resolved.buyer_capability_ttl_secs, 3_600);
         Ok(())
     }
 

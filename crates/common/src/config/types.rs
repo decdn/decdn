@@ -224,18 +224,6 @@ pub struct BlockchainConfig {
     /// spent-down deposit errors instead of refilling). Must be
     /// `>= buyer_initial_deposit_micro_usdc` when nonzero.
     pub buyer_working_deposit_micro_usdc: Option<u64>,
-    /// Minimum remaining time (SECONDS) to the buyer's self-issued capability
-    /// `expiry` below which the daemon's node-to-node miss pull will NOT
-    /// reactively top up that pool (#1603). A capability nearing expiry is
-    /// regenerated rather than topped up — escrowing a fresh working deposit
-    /// against a capability this close to expiry risks the capability expiring
-    /// before the resumed leg can spend it. Inside this margin the pull ends
-    /// cleanly instead, so the next miss regenerates a fresh, full-lifetime
-    /// capability (see [`Self::buyer_capability_ttl_secs`]). Seconds so
-    /// operators can tune it per chain lane. Absent => default
-    /// (`super::DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS`, ~1 day). `0` disables
-    /// the guard (always top up, whatever the remaining time).
-    pub buyer_reactive_topup_min_ttl_secs: Option<u64>,
     /// Whether to issue an unlimited (max) USDC approval for the
     /// `PaymentPool` contract so the buyer path can join a pool (#744).
     /// The absent-default is **profile-dependent**: the node daemon defaults to
@@ -257,15 +245,6 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
-    /// Seconds the node-as-buyer sets a self-issued capability's `expiry`
-    /// horizon to. The pool itself carries no expiry (ADR 003 — no epoch, no
-    /// pool-expiry); only the capability the buyer signs to authorize spend
-    /// against it does. The near-expiry regenerate guard
-    /// ([`Self::buyer_reactive_topup_min_ttl_secs`]) reads this horizon to
-    /// decide when a capability is close enough to its own expiry that a fresh
-    /// one should be issued instead of topped up. Absent => default (86,400s /
-    /// 1 day).
-    pub buyer_capability_ttl_secs: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
     /// operator funds the bond in TOKEN directly). Consumed only by the CLI

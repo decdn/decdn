@@ -51,7 +51,6 @@ use decdn_protocol::client::NO_NAMESPACE;
 use iroh::{EndpointAddr, PublicKey};
 use tracing::{debug, info, warn};
 
-use crate::client_requester::buyer_pool::issue_self_capability;
 use crate::client_requester::sink::{content_paid_frontier, pull_to_sink};
 use crate::client_requester::{
     Cumulative, LocalPullFault, MAX_RESUME_ATTEMPTS, PoolContext, PoolLedger, PullDeadlines,
@@ -137,15 +136,6 @@ enum ResumeAction {
     /// A genuine ceiling hit, corroborated by our own ledger: raise the channel
     /// toward this target and resume at the paid frontier.
     TopUp(U256),
-    /// A genuine ceiling hit we would fund, but the node's self-issued capability
-    /// is inside its expiry margin. Because the node OWNS its pool, this is not a
-    /// refusal: the owner key re-signs the capability with a fresh expiry (no chain
-    /// tx) and the leg retries. The pool itself has no expiry, so funding it strands
-    /// nothing time-bound; only the delegating capability is time-boxed, and the
-    /// owner regenerates it at will. In practice the self-capability is signed to
-    /// never expire, so this arm is a defensive path a finite-expiry policy would
-    /// exercise; `decide` otherwise proceeds straight to [`Self::TopUp`].
-    RegenerateCapability,
     /// The upstream holds a voucher we do not — reseed the ledger and retry.
     Reseed,
     /// The upstream claimed `CapExceeded` while OUR ledger still covers
@@ -177,11 +167,6 @@ struct ResumeBudgets {
     awaiting_topup_settle: bool,
     /// The graduation target, or `U256::ZERO` to disable reactive top-up.
     working_deposit: U256,
-    /// How much time must remain to the self-capability's expiry for a reactive
-    /// top-up to proceed without regenerating the capability first
-    /// (`blockchain.buyer_reactive_topup_min_ttl_secs`). `Duration::ZERO` disables
-    /// the capability-regeneration guard.
-    min_ttl: Duration,
 }
 
 impl ResumeBudgets {
@@ -249,36 +234,13 @@ fn next_voucher_cost(interval_bytes: u64, rate_per_mb: u64) -> U256 {
         .div_ceil(U256::from(MB_BYTES))
 }
 
-/// Whether the node's self-issued capability is close enough to its `expiry` to
-/// warrant regenerating it before the next voucher.
-///
-/// The pool has no expiry, so only the delegating capability is time-boxed. A
-/// `u64::MAX` expiry (the never-expires self-capability the node signs) reads as
-/// "never near", and a `min_ttl` of zero disables the guard. `None` (no capability
-/// attached) also reads as "never near": there is nothing to regenerate.
-///
-/// `saturating_sub` so an already-past expiry reads as `0` remaining (< any positive
-/// margin ⇒ near expiry), never wrapping.
-const fn capability_near_expiry(cap_expiry: Option<u64>, now: u64, min_ttl: Duration) -> bool {
-    let Some(expiry) = cap_expiry else {
-        return false;
-    };
-    if expiry == u64::MAX || min_ttl.is_zero() {
-        return false;
-    }
-    expiry.saturating_sub(now) < min_ttl.as_secs()
-}
-
-/// Classify a failed attempt. See [`ResumeAction`]. `now` is the current Unix time
-/// in seconds, against which the self-issued capability's `expiry` is measured for
-/// the capability-regeneration guard.
+/// Classify a failed attempt. See [`ResumeAction`].
 fn decide(
     err: &anyhow::Error,
     ctx: &PoolContext,
     committed: Cumulative,
     interval_bytes: u64,
     rate_per_mb: u64,
-    now: u64,
     budgets: ResumeBudgets,
 ) -> ResumeAction {
     // Ahead of everything: a refusal we PROVOKED by topping up a moment ago is not
@@ -301,15 +263,9 @@ fn decide(
             next_voucher_cost(interval_bytes, rate_per_mb),
         )
     {
-        // Genuine exhaustion — we would fund it. If the node's self-issued
-        // capability is near its expiry, re-sign it first (the node owns the pool
-        // and the key); the pool has no expiry, so funding strands nothing. In
-        // practice the self-capability never expires, so this proceeds straight to
-        // the top-up.
-        let cap_expiry = ctx.capability.as_ref().map(|c| c.capability.expiry);
-        if capability_near_expiry(cap_expiry, now, budgets.min_ttl) {
-            return ResumeAction::RegenerateCapability;
-        }
+        // Genuine exhaustion — fund it. The node owns the pool and the pool has no
+        // expiry, so funding strands nothing; the self-issued capability never
+        // expires (u64::MAX), so there is no capability deadline to work around.
         return ResumeAction::TopUp(budgets.working_deposit);
     }
 
@@ -435,14 +391,12 @@ pub(super) async fn pull_blob(
         };
 
         let committed = ledger.committed();
-        let now = crate::payment_settlement::unix_now();
         match decide(
             &err,
             ctx,
             committed,
             state.voucher_interval_bytes,
             state.quoted_rate_per_mb,
-            now,
             state.budgets,
         ) {
             ResumeAction::SettleWait => {
@@ -465,20 +419,6 @@ pub(super) async fn pull_blob(
                 if !top_up_and_reanchor(deps, target, ctx, ledger, &mut state, want).await {
                     return Err(err);
                 }
-            }
-            // The node's self-issued capability is near its expiry. The node owns the
-            // pool and the key, so re-sign the capability with a fresh expiry (no chain
-            // tx) and retry the leg on the same offset — the pool has no expiry, so
-            // nothing is stranded. If the re-sign fails, end on the original exhaustion.
-            ResumeAction::RegenerateCapability => {
-                if !regenerate_capability(ctx) {
-                    return Err(err);
-                }
-                debug!(
-                    provider = %target.provider_addr,
-                    "node-origin: regenerated the self-issued capability near its expiry; \
-                     retrying the leg"
-                );
             }
             ResumeAction::Reseed => {
                 if !reseed(&err, ctx, ledger, &mut state, target.provider_addr) {
@@ -551,32 +491,7 @@ impl LoopState {
                 max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
                 awaiting_topup_settle: false,
                 working_deposit: deps.config.working_deposit,
-                min_ttl: deps.config.reactive_topup_min_ttl,
             },
-        }
-    }
-}
-
-/// Re-sign the node's self-issued capability with a fresh (never-expires) expiry,
-/// updating `ctx.capability` in place. The node owns the pool and the signing key,
-/// so this is a local EIP-712 sign with no chain tx. Returns `false` — leaving the
-/// context untouched — only if the signer errors, in which case the caller ends the
-/// pull on its original exhaustion.
-fn regenerate_capability(ctx: &mut PoolContext) -> bool {
-    match issue_self_capability(
-        ctx.client_signer.as_ref(),
-        ctx.pool_id,
-        ctx.deposit,
-        u64::MAX,
-        &ctx.voucher_domain,
-    ) {
-        Ok(capability) => {
-            ctx.capability = Some(capability);
-            true
-        }
-        Err(err) => {
-            warn!(error = %format!("{err:#}"), "node-origin: failed to regenerate the self-issued capability");
-            false
         }
     }
 }
@@ -856,29 +771,19 @@ fn resume_frontier(
 #[allow(clippy::panic, clippy::duration_suboptimal_units)]
 mod tests {
     use super::*;
+    use crate::client_requester::buyer_pool::issue_self_capability;
     use alloy::primitives::B256;
     use alloy::signers::local::PrivateKeySigner;
 
-    /// A fixed "now" for the pure `decide` tests. Any value works while the guard is
-    /// inert (the default capability never expires); the capability-regeneration
-    /// tests below set the capability's `expiry` relative to it explicitly.
-    const NOW: u64 = 1_700_000_000;
-
-    /// A context whose self-issued capability carries `cap_expiry`. The pool has no
-    /// expiry; only the capability is time-boxed, and `decide` reads its expiry for
-    /// the regeneration guard.
-    fn ctx_with_cap_expiry(deposit: U256, cap_expiry: u64) -> PoolContext {
+    /// A context with a never-expiring self-issued capability (`u64::MAX`). The
+    /// pool has no expiry and the node signs its self-capability to never expire.
+    fn ctx_with_deposit(deposit: U256) -> PoolContext {
         let signer = Arc::new(PrivateKeySigner::random());
         let voucher_domain = alloy::dyn_abi::Eip712Domain::default();
         let pool_id = B256::ZERO;
-        let capability = issue_self_capability(
-            signer.as_ref(),
-            pool_id,
-            deposit,
-            cap_expiry,
-            &voucher_domain,
-        )
-        .unwrap_or_else(|e| panic!("capability signing failed: {e}"));
+        let capability =
+            issue_self_capability(signer.as_ref(), pool_id, deposit, u64::MAX, &voucher_domain)
+                .unwrap_or_else(|e| panic!("capability signing failed: {e}"));
         PoolContext {
             pool_id,
             provider: Address::repeat_byte(9),
@@ -892,15 +797,6 @@ mod tests {
         }
     }
 
-    fn ctx_with_deposit(deposit: U256) -> PoolContext {
-        // A never-expiring capability keeps the regeneration guard inert unless a
-        // test opts into a finite expiry.
-        ctx_with_cap_expiry(deposit, u64::MAX)
-    }
-
-    /// Budgets with the capability-regeneration guard INERT (a zero margin means
-    /// "never near expiry"), so a test not exercising it sees the pre-guard
-    /// behaviour unchanged.
     fn budgets(working_deposit: U256) -> ResumeBudgets {
         ResumeBudgets {
             topups: 0,
@@ -909,15 +805,6 @@ mod tests {
             max_settle_waits: 28,
             awaiting_topup_settle: false,
             working_deposit,
-            min_ttl: Duration::ZERO,
-        }
-    }
-
-    /// Budgets with the capability-regeneration guard ARMED at `min_ttl`.
-    fn budgets_with_ttl(working_deposit: U256, min_ttl: Duration) -> ResumeBudgets {
-        ResumeBudgets {
-            min_ttl,
-            ..budgets(working_deposit)
         }
     }
 
@@ -980,7 +867,6 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
-                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::Reseed
@@ -1012,7 +898,6 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
-                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::Reseed
@@ -1036,7 +921,7 @@ mod tests {
         let mut spent = budgets(U256::from(1000u64));
         spent.attempts = MAX_RESUME_ATTEMPTS;
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, spent),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, spent),
             ResumeAction::Terminal
         );
     }
@@ -1059,7 +944,6 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
-                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::RefuseFunding
@@ -1082,7 +966,7 @@ mod tests {
             StreamError::NotFound,
         ));
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, waiting),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, waiting),
             ResumeAction::SettleWait
         );
     }
@@ -1169,7 +1053,6 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
-                NOW,
                 budgets(working)
             ),
             ResumeAction::TopUp(working)
@@ -1192,7 +1075,6 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
-                NOW,
                 budgets(U256::ZERO)
             ),
             ResumeAction::Terminal
@@ -1211,15 +1093,7 @@ mod tests {
         let mut spent = budgets(U256::from(1000u64));
         spent.topups = MAX_REACTIVE_TOPUPS;
         assert_eq!(
-            decide(
-                &cap_exceeded(),
-                &ctx,
-                committed,
-                MB_BYTES,
-                1_000,
-                NOW,
-                spent
-            ),
+            decide(&cap_exceeded(), &ctx, committed, MB_BYTES, 1_000, spent),
             ResumeAction::Terminal
         );
     }
@@ -1240,7 +1114,7 @@ mod tests {
             byte_offset: 200,
         });
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, waiting),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, waiting),
             ResumeAction::SettleWait
         );
     }
@@ -1263,115 +1137,9 @@ mod tests {
             byte_offset: 200,
         });
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, spent),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, spent),
             ResumeAction::Terminal
         );
-    }
-
-    /// A genuine ceiling hit while the node's self-issued capability is inside its
-    /// expiry margin regenerates the capability rather than refusing — the node owns
-    /// the pool and the key, so it re-signs and retries; the pool has no expiry, so
-    /// nothing is stranded.
-    #[test]
-    fn a_capability_near_expiry_is_regenerated_not_refused() {
-        // Exhausted by our own accounting (deposit == committed), so absent the
-        // capability guard this is exactly a corroborated ceiling hit that would
-        // `TopUp` — the ONLY thing steering it to regeneration is the near-expiry cap.
-        let ctx = ctx_with_cap_expiry(U256::from(10u64), NOW + 3_600);
-        let committed = Cumulative {
-            bytes: U256::from(4096u64),
-            amount: U256::from(10u64),
-        };
-        // Capability expires in one hour, well inside the one-day margin.
-        let budgets = budgets_with_ttl(U256::from(1000u64), Duration::from_secs(86_400));
-        assert_eq!(
-            decide(
-                &cap_exceeded(),
-                &ctx,
-                committed,
-                MB_BYTES,
-                1_000,
-                NOW,
-                budgets
-            ),
-            ResumeAction::RegenerateCapability
-        );
-    }
-
-    /// The guard fires ONLY inside the margin. A capability with ample time to its
-    /// expiry is funded exactly as before — the same corroborated exhaustion, the
-    /// same working target — so the guard cannot suppress healthy top-ups.
-    #[test]
-    fn a_healthy_capability_still_funds_even_with_the_guard_armed() {
-        // Ten days to the capability's expiry, comfortably past the one-day margin.
-        let ctx = ctx_with_cap_expiry(U256::from(10u64), NOW + 10 * 86_400);
-        let committed = Cumulative {
-            bytes: U256::from(4096u64),
-            amount: U256::from(10u64),
-        };
-        let working = U256::from(1000u64);
-        let budgets = budgets_with_ttl(working, Duration::from_secs(86_400));
-        assert_eq!(
-            decide(
-                &cap_exceeded(),
-                &ctx,
-                committed,
-                MB_BYTES,
-                1_000,
-                NOW,
-                budgets
-            ),
-            ResumeAction::TopUp(working)
-        );
-    }
-
-    /// A zero margin disables the guard — a near-expiry capability funds exactly as
-    /// it would without the guard, the operator's explicit opt-out.
-    #[test]
-    fn a_zero_margin_disables_the_capability_guard() {
-        // One second to the capability's expiry, but the margin is zero.
-        let ctx = ctx_with_cap_expiry(U256::from(10u64), NOW + 1);
-        let committed = Cumulative {
-            bytes: U256::from(4096u64),
-            amount: U256::from(10u64),
-        };
-        let working = U256::from(1000u64);
-        let budgets = budgets_with_ttl(working, Duration::ZERO);
-        assert_eq!(
-            decide(
-                &cap_exceeded(),
-                &ctx,
-                committed,
-                MB_BYTES,
-                1_000,
-                NOW,
-                budgets
-            ),
-            ResumeAction::TopUp(working)
-        );
-    }
-
-    /// The never-expiring self-capability (`u64::MAX`) has no deadline to be close
-    /// to, so the guard never fires however small the wall-clock reading. `None`
-    /// (no capability) also reads as never-near. A real deadline inside the margin
-    /// does fire.
-    #[test]
-    fn capability_near_expiry_matches_the_expiry_and_margin() {
-        assert!(!capability_near_expiry(
-            Some(u64::MAX),
-            NOW,
-            Duration::from_secs(86_400)
-        ));
-        assert!(!capability_near_expiry(
-            None,
-            NOW,
-            Duration::from_secs(86_400)
-        ));
-        assert!(capability_near_expiry(
-            Some(NOW + 1),
-            NOW,
-            Duration::from_secs(86_400)
-        ));
     }
 
     /// A rejection that is not about the deposit is nobody's funding problem.
@@ -1392,7 +1160,6 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
-                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::Terminal

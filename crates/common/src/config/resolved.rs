@@ -151,13 +151,6 @@ pub struct ResolvedBlockchain {
     /// balance toward. Defaults to 10 USDC (`10_000_000`). `0` disables
     /// top-up. Guaranteed `>= buyer_initial_deposit_micro_usdc` when nonzero.
     pub buyer_working_deposit_micro_usdc: u64,
-    /// Minimum remaining seconds to the buyer's self-issued capability
-    /// `expiry` below which the node-to-node miss pull refuses a reactive
-    /// top-up (#1603) and regenerates the capability instead (see
-    /// [`Self::buyer_capability_ttl_secs`]). Defaults to
-    /// `super::DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS` (~1 day); `0` disables
-    /// the guard.
-    pub buyer_reactive_topup_min_ttl_secs: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
     /// `PaymentPool` contract at startup (#744, ADR 003 § Deposit
     /// Economics). Defaults to `true`; set `false` to manage the allowance
@@ -168,12 +161,6 @@ pub struct ResolvedBlockchain {
     /// remaining on-chain balance minus `M` can no longer cover the next
     /// credit window. Defaults to 1 USDC (`1_000_000` `µUSDC`).
     pub pool_min_remaining_deposit_micro_usdc: u64,
-    /// Seconds the node-as-buyer sets a self-issued capability's `expiry`
-    /// horizon to. The pool itself carries no expiry (ADR 003); only the
-    /// capability does. Read by the near-expiry regenerate guard
-    /// ([`Self::buyer_reactive_topup_min_ttl_secs`]). Defaults to 86,400s
-    /// (1 day).
-    pub buyer_capability_ttl_secs: u64,
 }
 
 /// Resolved cache fields.

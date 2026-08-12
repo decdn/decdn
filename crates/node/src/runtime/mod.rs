@@ -1881,12 +1881,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // initial deposit mid-stream (#1530). Same target the proactive low-water
         // refill uses; `0` disables the reactive leg.
         working_deposit: buyer_working_deposit,
-        // Refuse a reactive top-up when the channel is this close to on-chain expiry
-        // (#1603): `topUp` cannot extend expiry, so funding a near-expiry channel
-        // would escrow a deposit that may expire before the resumed leg spends it.
-        reactive_topup_min_ttl: std::time::Duration::from_secs(
-            cfg.blockchain.buyer_reactive_topup_min_ttl_secs,
-        ),
         event_poll_interval: std::time::Duration::from_millis(
             cfg.blockchain.event_poll_interval_ms,
         ),
@@ -3701,10 +3695,8 @@ mod tests {
                 redeem_interval_secs: 300,
                 buyer_initial_deposit_micro_usdc: 10_000_000,
                 buyer_working_deposit_micro_usdc: 10_000_000,
-                buyer_reactive_topup_min_ttl_secs: 86_400,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
-                buyer_capability_ttl_secs: 86_400,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,

@@ -344,7 +344,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             redeem_interval_secs: 300,
             buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
-            buyer_reactive_topup_min_ttl_secs: 86_400,
             buyer_max_approve: true,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,

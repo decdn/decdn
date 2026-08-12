@@ -279,17 +279,6 @@ pub struct NodeOriginConfig {
     /// (`crate::buyer_channel::refill_decision`). The two legs graduate to the same
     /// target; they differ only in what triggers them.
     pub working_deposit: U256,
-    /// Minimum remaining time to a channel's on-chain `expires_at` below which a
-    /// reactive mid-pull top-up is refused
-    /// (`blockchain.buyer_reactive_topup_min_ttl_secs`, #1603).
-    ///
-    /// `topUp` deliberately does not extend expiry (the contract forbids it), so
-    /// funding a channel inside this margin would escrow a fresh working-deposit
-    /// that may expire before the resumed leg can spend it — stranding it until
-    /// `reclaimExpired`. Inside the margin the pull ends cleanly and the next miss
-    /// opens a fresh, full-lifetime channel. `Duration::ZERO` disables the guard.
-    /// See `resume::near_expiry`.
-    pub reactive_topup_min_ttl: Duration,
     /// How often this node's chain watcher polls for events
     /// (`blockchain.event_poll_interval_ms`), used to size the post-top-up settle
     /// wait (#1530).
