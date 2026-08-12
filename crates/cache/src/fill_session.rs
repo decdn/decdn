@@ -531,6 +531,25 @@ impl FillRegistry {
         lease
     }
 
+    /// The blob length of a LIVE in-flight fill for `hash`, if one runs — an
+    /// ADVISORY peek the serve-miss path uses to skip its upstream header handshake
+    /// when a pull it can coalesce onto already exists. Returns the `total_bytes` of
+    /// the first non-dead session under `hash` (every session for one hash shares
+    /// the blob's geometry, so any live one's length is THE length); `None` when no
+    /// live fill exists (empty, or only dead sessions remain). Advisory only: a
+    /// concurrent last-observer drop can retire the peeked session before the
+    /// caller's atomic [`Self::claim`], which then owns a fresh pull and opens the
+    /// leg late — so this NEVER replaces `claim`, it only removes the handshake in
+    /// the common coalescing case.
+    #[must_use]
+    pub fn in_flight_total(&self, hash: Hash) -> Option<u64> {
+        let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        map.get(&hash)?
+            .iter()
+            .find(|session| !session.is_dead())
+            .map(|session| session.total_bytes())
+    }
+
     /// Plan a serve-miss of `[offset, offset+len)` (`len == 0` = to end) against the
     /// live fills for `hash`. Aligns the request to chunk-group boundaries, then
     /// splits it into `attach = R ∩ covered_union` and `remainder = R − covered_union`.
@@ -1309,5 +1328,88 @@ mod fill_registry_tests {
         let total = 5 * G + 321;
         let session = FillSession::new(root(0x35), total);
         assert_eq!(session.total_bytes(), total);
+    }
+
+    /// `in_flight_total` peeks a LIVE fill's blob length so the serve-miss path can
+    /// skip its upstream header handshake when it will coalesce onto that pull:
+    /// `None` on an empty registry, `Some(total)` while a live pull runs, `None`
+    /// once that pull's last observer leaves (the session is removed).
+    #[test]
+    fn in_flight_total_peeks_live_fill_length() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x40);
+
+        assert_eq!(
+            reg.in_flight_total(hash),
+            None,
+            "an empty registry has no in-flight fill"
+        );
+
+        let session = FillSession::new(root(0x40), total);
+        session.set_covered(ranges(0, 0, total));
+        let owner = reg.register_fill(hash, Arc::clone(&session));
+        assert_eq!(
+            reg.in_flight_total(hash),
+            Some(total),
+            "a live fill reports its blob length"
+        );
+
+        // Last observer leaves → the session is removed from the map → nothing in
+        // flight, so a fresh serve-miss must handshake.
+        drop(owner);
+        assert_eq!(
+            reg.in_flight_total(hash),
+            None,
+            "a removed fill is not in flight"
+        );
+    }
+
+    /// An ENDED session is dead: `in_flight_total` skips it even while it is still
+    /// mapped, because there is nothing live to coalesce onto — the caller must
+    /// handshake.
+    #[test]
+    fn in_flight_total_skips_ended_session() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x41);
+
+        let session = FillSession::new(root(0x41), total);
+        session.set_covered(ranges(0, 0, total));
+        let _owner = reg.register_fill(hash, Arc::clone(&session));
+        assert_eq!(reg.in_flight_total(hash), Some(total));
+
+        session.mark_ended(Err(FillError::new("upstream died")));
+        assert_eq!(
+            reg.in_flight_total(hash),
+            None,
+            "an ended session is not attachable in flight"
+        );
+    }
+
+    /// With a dead session and a LIVE sibling for the same hash, `in_flight_total`
+    /// reports the live one's length — the dead session is skipped, not the whole
+    /// hash.
+    #[test]
+    fn in_flight_total_reports_live_sibling_past_a_dead_one() {
+        let total = 8 * G;
+        let half = 4 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x42);
+
+        let dead = FillSession::new(root(0x42), total);
+        dead.set_covered(ranges(0, half, total));
+        let _dead_owner = reg.register_fill(hash, Arc::clone(&dead));
+        dead.mark_ended(Err(FillError::new("first pull died")));
+
+        let live = FillSession::new(root(0x42), total);
+        live.set_covered(ranges(half, total - half, total));
+        let _live_owner = reg.register_fill(hash, Arc::clone(&live));
+
+        assert_eq!(
+            reg.in_flight_total(hash),
+            Some(total),
+            "a live sibling is reported past the dead session"
+        );
     }
 }
