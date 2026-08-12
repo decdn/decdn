@@ -42,8 +42,11 @@ pub(crate) fn speed_score_from_bps(bytes_per_sec: f64, reference_bps: u64) -> f6
     if !bytes_per_sec.is_finite() || bytes_per_sec <= 0.0 || reference_bps == 0 {
         return 0.0;
     }
-    let denom = (1.0 + reference_bps as f64).ln();
-    ((1.0 + bytes_per_sec).ln() / denom).clamp(0.0, 1.0)
+    // `ln_1p(x)` computes `ln(1 + x)` without the catastrophic cancellation a
+    // literal `(1.0 + x).ln()` suffers for very small `x` — so a near-zero-rate
+    // transfer is scored accurately rather than swamped by float error.
+    let denom = (reference_bps as f64).ln_1p();
+    (bytes_per_sec.ln_1p() / denom).clamp(0.0, 1.0)
 }
 
 /// `w.speed * speed + w.correctness * correctness + w.reachability *
