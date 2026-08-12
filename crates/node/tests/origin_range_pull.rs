@@ -1481,8 +1481,8 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
     let waiter_target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     // Request A (the owner) is launched first and, after a short stagger, request B
-    // — by then A holds the reservation and is blocked on the delayed origin GET, so
-    // B is guaranteed to observe `TeeOpen::InFlight`.
+    // — by then A holds the `claim_fill` Owner claim and is blocked on the delayed
+    // origin GET, so B is guaranteed to Attach to A's in-flight fill.
     let owner_hash = hash;
     let a = tokio::spawn(async move {
         ranged_paid_pull(

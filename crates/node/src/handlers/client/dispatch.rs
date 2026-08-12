@@ -482,7 +482,8 @@ impl ClientHandler {
                 // the local origin pull; a concurrent one ATTACHES as an observer and
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this is not limited to the
-                // whole-blob case as the old `open_tee_sink` guard was.
+                // whole-blob case as an earlier version of this `claim_fill`/coalescing
+                // guard was.
                 if range_pulled_size.is_none()
                     && !locally_filled
                     && req.byte_offset == 0

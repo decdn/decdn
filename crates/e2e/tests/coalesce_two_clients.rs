@@ -35,8 +35,10 @@
 //!      leak would show one channel at ~2x and the other at ~0, or one carrying
 //!      the sum).
 //!   4. Removing the origin and fetching once more from a third client still
-//!      delivers the blob byte-exact — the two concurrent misses produced ONE
-//!      shared, promoted cache entry (not a torn or duplicated fill).
+//!      delivers the blob byte-exact — proving the concurrent misses promoted a
+//!      complete, byte-exact, non-torn cache entry retrievable without the
+//!      origin. (The one-vs-two-fills count itself is the node-level test cited
+//!      below, not this assertion.)
 //!
 //! What it does NOT assert, and why (incentive sign-off points (a) and (c)):
 //!   - The strict "exactly ONE upstream pull" count and the abandoned-pull leech
@@ -241,9 +243,11 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
          channel was billed the other's bytes (A={paid_a}, B={paid_b})"
     );
 
-    // (4) The two concurrent misses produced ONE shared, promoted cache entry.
+    // (4) The concurrent misses promoted a complete, byte-exact cache entry.
     // Take the origin away and fetch once more from a fresh client: it can only
-    // succeed if the coalesced fill committed the blob to the node's cache.
+    // succeed if the coalesced fill committed the blob to the node's cache. This
+    // proves the entry is non-torn and complete, not that only one fill ran —
+    // that count is the node-level test cited above.
     let hex = hash.to_hex();
     let shard = hex.as_str().get(..2).context("blob hex too short")?;
     let data_path = node.origin_root().join(shard).join(hex.as_str());
@@ -259,7 +263,8 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
     anyhow::ensure!(
         out_c.bytes == blob,
         "a post-coalescing fetch with the origin removed must be served byte-exact from the \
-         node's cache — the concurrent misses must have promoted ONE shared cache entry"
+         node's cache — the concurrent misses must have promoted a complete, non-torn cache \
+         entry"
     );
 
     Ok(())

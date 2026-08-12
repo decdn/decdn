@@ -1553,11 +1553,11 @@ fn spawn_a_lying_server(
 /// A protocol-correct upstream that serves the *right* bytes but pauses, on the
 /// client stream, between reading B's `StreamRequest` and emitting any bytes: it
 /// fires `received` once B's upstream request lands, then blocks on `release`
-/// before streaming. Because B opens its tee sink *before* it dials upstream, the
-/// `received` signal proves B's coalescing owner-pull is in flight and B's cache
-/// is still empty — so a test can open a second same-hash request against B while
-/// the gate is held and deterministically drive it into the `TeeOpen::InFlight`
-/// coalescing branch (#895/#305: one upstream pull, no double spend). Modelled on
+/// before streaming. Because B becomes the `claim_fill` Owner *before* it dials
+/// upstream, the `received` signal proves B's owner pull is in flight and B's
+/// cache is still empty — so a test can open a second same-hash request against B
+/// while the gate is held and deterministically drive it into the `claim_fill`
+/// Attach branch (#895/#305: one upstream pull, no double spend). Modelled on
 /// [`serve_wrong_bytes`] but honest + gated.
 async fn serve_gated_correct_bytes(
     conn: Connection,
@@ -1634,7 +1634,7 @@ async fn serve_gated_correct_bytes(
             let _ = send.finish();
             continue;
         }
-        // The real range pull landed (B's owner tee is in flight, cache still empty);
+        // The real range pull landed (B's claim_fill Owner pull is in flight, cache still empty);
         // hold here until the test has opened the coalescing second request.
         received.notify_one();
         release.notified().await;
@@ -8276,19 +8276,18 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
 
 /// #895 (#305 no-double-spend): two concurrent same-hash leaf requests against a
 /// node B with an empty cache must open exactly ONE upstream pull. The first
-/// request owns the tee sink and pulls from A; the second hits `TeeOpen::InFlight`
-/// and waits on the coalesced fill (`await_coalesced_fill`) rather than opening a
-/// second upstream pull — which would double-spend real USDC on the B↔A channel.
-/// The cache-level coalescing primitive is unit-tested (`engine.rs`
-/// `tee_sink_coalesces_concurrent_fills`); this pins the handler-side consequence
-/// at the layer that actually spends.
+/// request becomes the `claim_fill` Owner and pulls from A; the second is an
+/// Attach observer that serves from the shared `FillSession` concurrently rather
+/// than opening a second upstream pull — which would double-spend real USDC on
+/// the B↔A channel. The cache-level coalescing primitive is unit-tested
+/// (`engine.rs`); this pins the handler-side consequence at the layer that
+/// actually spends.
 ///
 /// Determinism: a gated upstream A parks after receiving B's (single) upstream
-/// request. Because B opens its tee sink before dialing upstream, the gate signal
-/// proves the owner pull is in flight and B's cache is still empty, so the second
-/// leaf — launched while the gate is held — is expected to coalesce. The
-/// no-double-spend
-/// assertions hold for every interleaving regardless.
+/// request. Because B becomes the `claim_fill` Owner before dialing upstream, the
+/// gate signal proves the owner pull is in flight and B's cache is still empty,
+/// so the second leaf — launched while the gate is held — is expected to Attach.
+/// The no-double-spend assertions hold for every interleaving regardless.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Result<()> {
@@ -8342,7 +8341,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
 
     // Leaf 1: the owner pull. Spawn it, then wait for A to confirm B's single
-    // upstream request landed (tee in flight, cache empty).
+    // upstream request landed (claim_fill Owner in flight, cache empty).
     let leaf1_sk = fresh_key();
     let leaf1_node_id = B256::from(*leaf1_sk.public().as_bytes());
     let (leaf1_ep, _) = local_endpoint(leaf1_sk, vec![]).await?;
@@ -8375,9 +8374,10 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
         })?;
 
     // Leaf 2: the coalescing request. With the gate still held, B's cache is empty
-    // and leaf 1's tee owns the in-flight fill, so leaf 2 hits `TeeOpen::InFlight`.
-    // The brief pause lets leaf 2 reach that branch before we release A; the
-    // no-double-spend assertions below hold regardless of interleaving.
+    // and leaf 1 owns the in-flight fill as the `claim_fill` Owner, so leaf 2
+    // Attaches to it. The brief pause lets leaf 2 reach that branch before we
+    // release A; the no-double-spend assertions below hold regardless of
+    // interleaving.
     let leaf2_sk = fresh_key();
     let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
     let (leaf2_ep, _) = local_endpoint(leaf2_sk, vec![]).await?;
@@ -8398,8 +8398,11 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     });
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    // Release A: the single upstream pull completes, the tee promotes the blob,
-    // and leaf 2's coalesced wait resolves and serves from cache.
+    // Release A: bytes start flowing on the single upstream pull. Leaf 2, as the
+    // Attach observer, has been running its own `serve_leg` over the shared
+    // `FillSession` since it joined — it streams bytes to leaf 2 as they arrive
+    // rather than waiting for the whole fill to finish — so both legs complete
+    // once A finishes streaming.
     release.notify_one();
 
     let out1 = leaf1_task.await??;
