@@ -714,51 +714,99 @@ impl ClientHandler {
         view.status(pool_id).await.map(|s| s.owner)
     }
 
-    /// Persist an owner-signed capability presented at session start (ADR 003
-    /// §Capability delegation) so the redeemer can register the signer on its
-    /// first on-chain redemption. `signer` is the request's bound Ethereum
-    /// address; `pool_id` is [`StreamRequest::pool_id`].
+    /// Accept an owner-signed capability presented at session start (ADR 003
+    /// §Capability delegation): verify the owner signature against the on-chain
+    /// pool owner, register the lane so the voucher path serves it, and persist
+    /// the grant so the redeemer can register the signer on its first on-chain
+    /// redemption. `signer` is the request's bound Ethereum address; `pool_id`
+    /// is [`StreamRequest::pool_id`]; `pool_owner` is `getPool.owner` from the
+    /// cached pool-view.
     ///
-    /// Best-effort and off the durability path: a failure here never fails the
-    /// stream — the client re-sends the capability on the next request, and the
-    /// on-chain `redeem` is the authoritative owner check (the contract recovers
-    /// the owner signature against the pool owner). For the common EOA case the
-    /// 65-byte owner signature is recovered off-chain first, so a malformed grant
-    /// is dropped before it reaches the redeemer; a longer ERC-1271 signature is
-    /// persisted as-is and verified on-chain. The `getPool.owner` equality
-    /// pre-check is deferred with the handler pool-view (see the E4 BOUNDARY in
-    /// `dispatch.rs`).
+    /// The owner check is authoritative here, not deferred: the on-chain
+    /// `PaymentPool.redeemMany` verifies every capability's owner signature
+    /// against `pools[poolId].owner` and reverts the WHOLE batch on one bad
+    /// grant, which would strand every other lane's redemption in an
+    /// indefinite-retry tick. So a grant whose owner signature does not verify
+    /// against the pool owner is DROPPED — never persisted, never lane-registered.
+    ///
+    /// The verification recovers the 65-byte EOA signature via
+    /// [`SignedCapability::verify_owner`] (canonical-`s` ecrecover, matching the
+    /// contract's verifiable set). Two cases drop rather than persist:
+    /// - `pool_owner` is `None` — no pool-view, an unknown pool, or an RPC fault
+    ///   left the owner unknown, so ownership cannot be confirmed. Intake is
+    ///   best-effort and the client re-sends the capability on its next request.
+    /// - a non-65-byte (contract-wallet / ERC-1271-shaped) owner signature, which
+    ///   cannot be recovered off-chain; this design does not accept contract
+    ///   wallets as pool owners.
+    ///
+    /// Best-effort and off the durability path otherwise: a persist failure never
+    /// fails the stream. Lane registration is idempotent — a re-observed grant for
+    /// an already-tracked lane does NOT reset the accepted-voucher watermark
+    /// (#527); the lane's `cap`/`expiry` are set once at first registration.
+    #[allow(clippy::cognitive_complexity)] // linear verify → register → persist sequence.
     async fn intake_capability(
         &self,
         pool_id: B256,
         signer: Address,
+        pool_owner: Option<Address>,
         capability: &decdn_protocol::client::WireCapability,
     ) {
-        let Some(sink) = self.capability_sink.as_ref() else {
+        // Without the on-chain pool owner the grant cannot be confirmed to belong
+        // to this pool; persisting an unverified capability is exactly what
+        // strands the redeemer. Drop it — the client re-sends next request.
+        let Some(pool_owner) = pool_owner else {
+            tracing::debug!(%pool_id, %signer, "dropping capability: pool owner unavailable, cannot verify");
             return;
         };
         let spending_cap = U256::from_be_bytes(capability.spending_cap);
         let expiry = capability.expiry;
-        // Off-chain owner-signature recovery for the common EOA (65-byte) case.
-        if let Ok(sig_bytes) = <[u8; 65]>::try_from(capability.owner_signature.as_slice()) {
-            let Ok(signature) = alloy::primitives::Signature::from_raw(&sig_bytes) else {
-                tracing::debug!(%pool_id, %signer, "dropping capability: malformed owner signature");
-                return;
-            };
-            let grant = SignedCapability {
-                capability: Capability {
-                    signer,
-                    spending_cap,
-                    pool_id,
-                    expiry,
-                },
-                signature,
-            };
-            if let Err(e) = grant.recover_owner(&self.voucher_domain) {
-                tracing::debug!(%pool_id, %signer, error = %e, "dropping capability: owner recovery failed");
-                return;
-            }
+        // Only the common EOA (65-byte) owner signature is recoverable off-chain;
+        // a contract-wallet signature is dropped rather than persisted unverified.
+        let Ok(sig_bytes) = <[u8; 65]>::try_from(capability.owner_signature.as_slice()) else {
+            tracing::debug!(%pool_id, %signer, "dropping capability: owner signature is not a recoverable EOA signature");
+            return;
+        };
+        let Ok(signature) = alloy::primitives::Signature::from_raw(&sig_bytes) else {
+            tracing::debug!(%pool_id, %signer, "dropping capability: malformed owner signature");
+            return;
+        };
+        let grant = SignedCapability {
+            capability: Capability {
+                signer,
+                spending_cap,
+                pool_id,
+                expiry,
+            },
+            signature,
+        };
+        if let Err(e) = grant.verify_owner(pool_owner, &self.voucher_domain) {
+            tracing::debug!(%pool_id, %signer, error = %e, "dropping capability: owner verification failed");
+            return;
         }
+
+        // The grant is authentic. Register the lane so the voucher path accepts
+        // vouchers for `(pool_id, signer, this operator)` — without this a
+        // brand-new lane's first request is never served, since the serve gate
+        // admits only known lanes. Idempotent for an already-tracked lane.
+        let lane = LaneState::hydrate(
+            pool_id,
+            signer,
+            self.eth_signer.address(),
+            spending_cap,
+            expiry,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        if let Err(e) = self.register_lane(lane).await {
+            tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
+        }
+
+        // Persist the owner-signed material for the redeemer (if a settlement
+        // sink is wired). `None` (tests) makes this a no-op.
+        let Some(sink) = self.capability_sink.as_ref() else {
+            return;
+        };
         let sink = Arc::clone(sink);
         let owner_sig = capability.owner_signature.clone();
         let write = tokio::task::spawn_blocking(move || {
@@ -1638,6 +1686,178 @@ mod tests {
             ),
             "after the live floor rises above the quoted rate the voucher must be \
              rejected — it would revert on-chain with RateFloorViolation"
+        );
+    }
+
+    /// A [`crate::channel_store::CapabilitySink`] that records which
+    /// `(pool_id, signer)` grants were persisted, so a test can assert a
+    /// forged-owner capability is dropped before it reaches the redeemer.
+    #[derive(Debug)]
+    struct RecordingCapabilitySink {
+        recorded: Arc<std::sync::Mutex<Vec<(B256, Address)>>>,
+    }
+
+    impl crate::channel_store::CapabilitySink for RecordingCapabilitySink {
+        fn store_capability(
+            &self,
+            pool_id: B256,
+            signer: Address,
+            _spending_cap: U256,
+            _expiry: u64,
+            _owner_sig: &[u8],
+        ) -> Result<(), StoreError> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((pool_id, signer));
+            Ok(())
+        }
+    }
+
+    /// A [`crate::pool_view::PoolView`] returning a fixed owner (and unbounded
+    /// remaining, so the floor-`M` gate never interferes) for the capability
+    /// owner-verification test.
+    #[derive(Debug)]
+    struct FixedPoolView {
+        owner: Address,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::pool_view::PoolView for FixedPoolView {
+        async fn status(&self, _pool_id: B256) -> Option<crate::pool_view::PoolStatus> {
+            Some(crate::pool_view::PoolStatus {
+                owner: self.owner,
+                remaining: U256::MAX,
+            })
+        }
+    }
+
+    /// Build a handler with a recording capability sink and a fixed-owner
+    /// pool-view wired, for the capability-intake owner check.
+    async fn handler_with_capability_intake(
+        metrics: &Arc<Metrics>,
+        owner: Address,
+    ) -> (
+        Arc<ClientHandler>,
+        Arc<std::sync::Mutex<Vec<(B256, Address)>>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
+            .await
+            .expect("cache");
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut deps = ClientHandlerDeps::new(
+            iroh::SecretKey::generate().public(),
+            Arc::clone(metrics),
+            Arc::new(ConnectionLimiter::new(
+                &decdn_common::config::ResolvedSecurity {
+                    max_concurrent_handlers: u32::MAX,
+                    per_source_rate_per_sec: 1e9,
+                    per_source_burst: u32::MAX,
+                    max_tracked_sources: 16,
+                },
+                Arc::clone(metrics),
+            )),
+            cache,
+            Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+            domain.clone(),
+            domain.clone(),
+            domain,
+            Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                as Arc<dyn PoolStateStore>,
+            Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
+                crate::receipt_log::NoopReceiptLog,
+            ))) as Arc<dyn ReceiptSink>,
+            Arc::new(AtomicU64::new(1)),
+            crate::rate_bounds::RateBounds::new(0),
+            1,
+            0,
+            16,
+            Arc::new(crate::content_deny::ContentDenylist::empty()),
+            U256::ZERO,
+        );
+        deps.capability_sink = Some(Arc::new(RecordingCapabilitySink {
+            recorded: Arc::clone(&recorded),
+        }));
+        deps.pool_view = Some(Arc::new(FixedPoolView { owner }));
+        let handler = ClientHandler::new(deps).expect("handler");
+        (Arc::new(handler), recorded, dir)
+    }
+
+    /// Fix 1 (security): capability intake verifies the owner signature against
+    /// the on-chain pool owner. A grant signed by a NON-owner key is dropped —
+    /// never persisted, never lane-registered — so it cannot revert the
+    /// redeemer's `redeemMany` batch. A correct-owner grant is persisted and
+    /// registers its lane.
+    #[tokio::test]
+    async fn intake_rejects_wrong_owner_capability() {
+        let metrics = Arc::new(Metrics::new());
+        let owner = PrivateKeySigner::random();
+        let (handler, recorded, _dir) =
+            handler_with_capability_intake(&metrics, owner.address()).await;
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let pool_id = B256::repeat_byte(0x77);
+        let signer = Address::repeat_byte(0x11);
+        let spending_cap = U256::from(1_000_000u64);
+        let expiry = 1_900_000_000u64;
+
+        let make_wire = |key: &PrivateKeySigner| -> decdn_protocol::client::WireCapability {
+            let signed = Capability {
+                signer,
+                spending_cap,
+                pool_id,
+                expiry,
+            }
+            .sign(key, &domain)
+            .expect("sign capability");
+            decdn_protocol::client::WireCapability {
+                spending_cap: spending_cap.to_be_bytes(),
+                expiry,
+                owner_signature: signed.signature.as_bytes().to_vec(),
+            }
+        };
+
+        let lane_key = LaneKey {
+            pool_id,
+            signer,
+            provider: handler.eth_signer.address(),
+        };
+
+        // A capability signed by a NON-owner is dropped: not persisted, no lane.
+        let bad = make_wire(&PrivateKeySigner::random());
+        handler
+            .intake_capability(pool_id, signer, Some(owner.address()), &bad)
+            .await;
+        assert!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a forged-owner capability must not be persisted"
+        );
+        assert!(
+            !handler.lanes.lock().await.contains_key(&lane_key),
+            "a forged-owner capability must not register a lane"
+        );
+
+        // The correct owner's capability is persisted and registers the lane.
+        let good = make_wire(&owner);
+        handler
+            .intake_capability(pool_id, signer, Some(owner.address()), &good)
+            .await;
+        assert_eq!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[(pool_id, signer)],
+            "a correct-owner capability is persisted for the redeemer"
+        );
+        assert!(
+            handler.lanes.lock().await.contains_key(&lane_key),
+            "a correct-owner capability registers its lane so vouchers can be served"
         );
     }
 }

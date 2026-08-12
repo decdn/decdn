@@ -49,11 +49,12 @@ impl ClientHandler {
             signer: client,
             provider: self.eth_signer.address(),
         };
-        // BOUNDARY (E4): the spend-side origin-blacklist gate (ADR 011) keys on
-        // the pool FUNDER (the pool owner from `getPool.owner`), which is not
-        // carried on the per-lane [`LaneState`]. Until E4 threads the cached
-        // pool owner here, this gate is discharged only by the serve-path
-        // open-time funder gate. Existence of the lane is the authority check.
+        // This is a lane-membership (spend-authority) check only. The spend-side
+        // origin-blacklist gate (ADR 011) keys on the pool FUNDER
+        // (`getPool.owner`), and it runs at the serve gate's open-time funder
+        // check in `dispatch.rs`, which precedes every fill tier — a blacklisted
+        // funder is refused there before this authority check is ever reached, so
+        // no fill fronts USDC on a blacklisted funder's behalf.
         self.lanes.lock().await.contains_key(&lane_key)
     }
 

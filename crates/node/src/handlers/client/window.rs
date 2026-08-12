@@ -67,6 +67,7 @@ impl ClientHandler {
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         origin: Arc<NodeOrigin>,
+        pool_remaining: Option<U256>,
         fault_seen: bool,
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
@@ -86,15 +87,52 @@ impl ClientHandler {
         // (`pull_authorized` + the serve gate), and threaded in as `lane` /
         // `lane_key` for the downstream voucher collection.
         //
-        // BOUNDARY (E4): the pre-flight floor-M guard (the pull-through twin of
-        // the `dispatch.rs` gate) refuses the speculative pull when the pool's
-        // on-chain remaining minus the refundable floor `M` cannot cover the
-        // reserved window (`self.pool_remaining_covers_window(remaining,
-        // guard_bytes, rate_per_mb)`). `remaining` is a `getPool` chain read the
-        // handler does not hold, so the refusal is completed once E4 threads the
-        // cached `getPool` view here. The reserved window is `max_blob_size_bytes`
-        // (finite cap) else `pull_ahead_bytes` floored at one interval, widened to
-        // the credit window.
+        // Voucher-interval negotiation (ADR 003), resolved up front so the floor-M
+        // guard, the response signature, and the serve/pull window all price
+        // against the same interval.
+        let interval_mb = match ext.voucher_interval_mb {
+            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
+            None => self.voucher_interval_mb,
+        };
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // The pacing window: at least `pull_ahead_bytes` (the ADR 037 upstream
+        // exposure knob), the downstream `credit_window` (#1477), and one interval
+        // — the exact bound the two-leg serve/pull driver paces against, and what
+        // the floor-M guard reserves.
+        let window = self
+            .pull_ahead_bytes
+            .as_ref()
+            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
+            .max(interval_bytes)
+            .max(self.credit_window(interval_bytes));
+
+        // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
+        // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
+        // when the pool's on-chain remaining (`getPool.deposit − totalRedeemed`)
+        // minus the refundable floor `M` can no longer cover the reserved window,
+        // so the node never fronts upstream USDC for a pool that cannot cover it.
+        // `pool_remaining` is the cached `getPool.remaining` threaded from the
+        // serve gate; `None` (no pool-view, unknown pool, or a read fault) fails
+        // open — the on-chain `redeem` is the backstop.
+        if let Some(remaining) = pool_remaining
+            && !self.pool_remaining_covers_window(remaining, window, rate_per_mb)
+        {
+            let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
+            self.log_deposit_refusal(
+                B256::from(req.pool_id),
+                hash,
+                headroom,
+                decdn_incentive::min_payment(window, rate_per_mb),
+            );
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // (2) Seed-leech admission: global unrecouped budget + per-peer share
         // ratio. `may_pull` bumps its own pause metric on refusal.
@@ -152,12 +190,8 @@ impl ClientHandler {
                 .await;
         }
 
-        // (5) Voucher-interval negotiation (ADR 003), then sign + send the response up
-        // front — it commits to `total_bytes`, now known from the header handshake.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
+        // (5) Sign + send the response up front — it commits to `total_bytes`,
+        // now known from the header handshake, and to the interval negotiated above.
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -179,17 +213,8 @@ impl ClientHandler {
         // `FillSession`: the shared PAID content frontier the pull's `WindowPacer` reads,
         // the captured-outboard the serve leg's coherent encoder reads, and the pull's
         // terminal signal the serve leg races so a pull that cannot fill a gap fails the
-        // serve (no hang). `Notify` wakers + atomics are runtime-agnostic.
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-        // The pacing window: at least `pull_ahead_bytes` (the ADR 037 upstream exposure
-        // knob), the downstream `credit_window` (#1477), and one interval — the exact
-        // bound the two-leg serve/pull driver paces against.
-        let window = self
-            .pull_ahead_bytes
-            .as_ref()
-            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
-            .max(interval_bytes)
-            .max(self.credit_window(interval_bytes));
+        // serve (no hang). `Notify` wakers + atomics are runtime-agnostic. `interval_bytes`
+        // and the pacing `window` were resolved with the floor-M guard above.
 
         // (6a) Atomically claim the fill (ADR 038): under one registry lock,
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
@@ -412,6 +437,7 @@ impl ClientHandler {
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         total_bytes: u64,
+        pool_remaining: Option<U256>,
         fault_seen: bool,
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
@@ -425,13 +451,51 @@ impl ClientHandler {
         // `lane` / `lane_key` are threaded in for the downstream voucher
         // collection.
         //
-        // BOUNDARY (E4): the pre-flight floor-M guard (twin of the peer path and
-        // of `dispatch.rs`) refuses the serve when the pool's on-chain remaining
-        // minus the refundable floor `M` cannot cover the reserved window
-        // (`self.pool_remaining_covers_window(remaining, guard_bytes,
-        // rate_per_mb)`). `remaining` is a `getPool` chain read the handler does
-        // not hold, so the refusal is completed once E4 threads the cached
-        // `getPool` view here.
+        // Voucher-interval negotiation (ADR 003), resolved up front so the floor-M
+        // guard, the response signature, and the serve/pull window price against
+        // the same interval.
+        let interval_mb = match ext.voucher_interval_mb {
+            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
+            None => self.voucher_interval_mb,
+        };
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // The pacing window: at least `pull_ahead_bytes`, the downstream
+        // `credit_window` (#1477), and one interval — the same bound the peer twin
+        // computes, and what the floor-M guard reserves.
+        let window = self
+            .pull_ahead_bytes
+            .as_ref()
+            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
+            .max(interval_bytes)
+            .max(self.credit_window(interval_bytes));
+
+        // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
+        // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
+        // pool's on-chain remaining minus the refundable floor `M` cannot cover
+        // the reserved window. `pool_remaining` is the cached `getPool.remaining`
+        // threaded from the serve gate; `None` fails open (on-chain `redeem` is
+        // the backstop). The own-origin leg fronts no upstream USDC, but delivery
+        // is billed per voucher, so a pool that cannot cover the window is refused
+        // here for wire-parity with the peer path rather than served for free.
+        if let Some(remaining) = pool_remaining
+            && !self.pool_remaining_covers_window(remaining, window, rate_per_mb)
+        {
+            let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
+            self.log_deposit_refusal(
+                B256::from(req.pool_id),
+                hash,
+                headroom,
+                decdn_incentive::min_payment(window, rate_per_mb),
+            );
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // (2) Seed-leech admission: global unrecouped budget + per-peer share ratio.
         // `leech_admit` bumps its own pause metric on refusal. A shed here is a miss,
@@ -453,13 +517,9 @@ impl ClientHandler {
                 .await;
         }
 
-        // (4) Voucher-interval negotiation (ADR 003), then sign + send the response
-        // up front — it commits to `total_bytes`, which the caller already read from
-        // the origin size probe.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
+        // (4) Sign + send the response up front — it commits to `total_bytes`,
+        // which the caller already read from the origin size probe, and to the
+        // interval negotiated above.
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -480,16 +540,8 @@ impl ClientHandler {
         // current-thread runtime, coordinating only through the `Send + Sync`
         // `FillSession` (the shared PAID frontier, the captured outboard, the pull's
         // terminal signal). #1610 — ingest only behind a waiting, paying client.
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-        // The pacing window: at least `pull_ahead_bytes`, the downstream
-        // `credit_window` (#1477), and one interval — the same bound the peer twin
-        // computes.
-        let window = self
-            .pull_ahead_bytes
-            .as_ref()
-            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
-            .max(interval_bytes)
-            .max(self.credit_window(interval_bytes));
+        // `interval_bytes` and the pacing `window` were resolved with the floor-M
+        // guard above.
 
         // (5a) Atomically claim the fill (ADR 038): under one registry lock,
         // OWN a fresh local pull for `hash` or ATTACH as an observer to a live same-hash

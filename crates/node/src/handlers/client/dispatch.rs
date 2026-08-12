@@ -233,53 +233,26 @@ impl ClientHandler {
                 .await;
         }
 
-        // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
-        // any StreamRequest that presents a pool funded by that operator
-        // address"). BOUNDARY (E4): the funding address is the pool OWNER
-        // (`getPool.owner`), a chain quantity not carried on the per-lane
-        // [`LaneState`], so this gate is re-instated once E4 threads the cached
-        // pool owner to the handler. Until then the open-time hash-denylist gates
-        // above and the hash-denylist re-check inside the serve loop carry
-        // compliance; the funder-origin refusal is deferred, not silently
-        // dropped.
-        //
-        // Resolve the lane early. The seller keys a lane by
+        // Resolve the lane key early. The seller keys a lane by
         // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
         // the request, the signer from the verified client binding, the provider
         // from this node's own Ethereum identity. An unbound request cannot name
         // a lane, so it resolves to `None` — which every downstream gate treats
         // as "not my business" (it cannot make this node spend, because
         // `pull_authorized` refuses it before every fill tier).
-        //
-        // The resolved `Arc` is KEPT rather than dropped at the end of this gate:
-        // the cache-miss arm below reuses the same lane, and re-resolving it
-        // would take the map lock a second time for no reason.
         let self_operator = self.eth_signer.address();
         let lane_key = verified_client.map(|signer| LaneKey {
             pool_id: B256::from(req.pool_id),
             signer,
             provider: self_operator,
         });
-        let known_lane = match lane_key {
-            Some(key) => self.lanes.lock().await.get(&key).cloned(),
-            None => None,
-        };
-
-        // Capability intake (ADR 003 §Capability delegation). A bound request
-        // whose extension carries a `capability` persists the owner-signed grant
-        // for `(pool_id, signer)`, so the redeemer can register the signer on its
-        // first on-chain redemption. Best-effort — it never gates serving.
-        if let (Some(signer), Some(capability)) = (verified_client, ext.capability.as_ref()) {
-            self.intake_capability(B256::from(req.pool_id), signer, capability)
-                .await;
-        }
 
         // Cached `getPool` view (owner + remaining), read ONCE and reused by the
-        // funder gate here and the floor-`M` solvency gate below. `None` — no
-        // pool-view wired, an unknown pool, or a read fault — makes both gates
-        // fail open: a transient RPC blip must not refuse paying clients, and the
-        // open-time hash gates plus the first voucher's on-chain `redeem` still
-        // carry compliance and revenue.
+        // funder gate here, the capability owner check, and the floor-`M` solvency
+        // gates below. `None` — no pool-view wired, an unknown pool, or a read
+        // fault — makes the fail-open gates fail open: a transient RPC blip must
+        // not refuse paying clients, and the open-time hash gates plus the first
+        // voucher's on-chain `redeem` still carry compliance and revenue.
         let pool_status = match self.pool_view.as_ref() {
             Some(view) => view.status(B256::from(req.pool_id)).await,
             None => None,
@@ -287,10 +260,11 @@ impl ClientHandler {
 
         // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
         // pool whose FUNDER (`getPool.owner`) is on the operator's local
-        // `denied_origins` or the on-chain origin blacklist. The two questions are
-        // kept distinct — spend authority is a signer question, compliance a funder
-        // question — so a blacklisted funder is refused here even under a clean
-        // delegate signer.
+        // `denied_origins` or the on-chain origin blacklist. The funding address is
+        // the pool OWNER from `getPool.owner`, threaded here via the cached
+        // pool-view. The two questions are kept distinct — spend authority is a
+        // signer question, compliance a funder question — so a blacklisted funder
+        // is refused here even under a clean delegate signer.
         if let Some(status) = pool_status
             && self.content_deny.is_origin_denied(&status.owner)
         {
@@ -303,6 +277,33 @@ impl ClientHandler {
                 )
                 .await;
         }
+
+        // Capability intake + lane registration (ADR 003 §Capability delegation).
+        // A bound request whose extension carries a `capability` whose owner
+        // signature verifies against the pool owner (a) registers the lane so the
+        // voucher path serves `(pool_id, signer, this operator)` and (b) persists
+        // the owner-signed grant for the redeemer. A forged-owner grant is dropped
+        // — never registered, never persisted — so it cannot revert the redeemer's
+        // `redeemMany` batch. Best-effort otherwise.
+        if let (Some(signer), Some(capability)) = (verified_client, ext.capability.as_ref()) {
+            self.intake_capability(
+                B256::from(req.pool_id),
+                signer,
+                pool_status.map(|s| s.owner),
+                capability,
+            )
+            .await;
+        }
+
+        // Resolve the live lane AFTER intake, so a lane just registered from this
+        // request's own capability is visible to the spend + serve gates below.
+        // The resolved `Arc` is KEPT rather than dropped: the cache-miss arm below
+        // reuses the same lane, and re-resolving it would take the map lock again
+        // for no reason.
+        let known_lane = match lane_key {
+            Some(key) => self.lanes.lock().await.get(&key).cloned(),
+            None => None,
+        };
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
@@ -419,27 +420,47 @@ impl ClientHandler {
                 // the tier that fronts UPSTREAM spend. Do not delete it on the
                 // strength of this floor alone.
                 //
-                // Pre-spend floor-M guard (shared-payment-pool model). The guard
-                // refuses to front a fill when the pool's on-chain **remaining**
-                // (`getPool.deposit − getPool.totalRedeemed`) minus the
-                // refundable floor `M` cannot cover the reserved credit window:
-                // see [`ClientHandler::pool_remaining_covers_window`], the pure
-                // policy this site calls. `reserved` is one credit window, capped
-                // by the request's own aligned span when it bounds itself.
+                // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
+                // front any fill when the pool's on-chain **remaining**
+                // (`getPool.deposit − getPool.totalRedeemed`) minus the refundable
+                // floor `M` cannot cover the reserved credit window: see
+                // [`ClientHandler::pool_remaining_covers_window`], the pure policy
+                // this site calls. `reserved` is one credit window, capped by the
+                // request's own aligned span when it bounds itself.
                 //
-                // BOUNDARY (E4): `remaining` is a `getPool` chain read the handler
-                // does not hold, so the refusal is completed once E4 threads the
-                // cached `getPool` view here (`self.pool_remaining_covers_window(
-                // remaining, reserved, rate_per_mb)`). Skipped for an unknown lane
-                // — `pull_authorized` already refuses those before every tier.
-                if known_lane.is_some() {
+                // `remaining` comes from the cached `getPool` view resolved above;
+                // a `None` view fails open (the on-chain `redeem` is the backstop).
+                // Skipped for an unknown lane — `pull_authorized` refuses those
+                // before every tier, so no spend happens there anyway.
+                if known_lane.is_some()
+                    && let Some(status) = pool_status
+                {
                     let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
                     let window = self.credit_window(interval_bytes);
-                    let _reserved = if req.byte_len > 0 {
+                    let reserved = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
                         window
                     };
+                    if !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb) {
+                        let headroom = status
+                            .remaining
+                            .saturating_sub(self.pool_min_remaining_deposit);
+                        self.log_deposit_refusal(
+                            B256::from(req.pool_id),
+                            hash,
+                            headroom,
+                            decdn_incentive::min_payment(reserved, rate_per_mb),
+                        );
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::InsufficientDeposit,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
                 }
 
                 let mut fault_seen = false;
@@ -512,6 +533,7 @@ impl ClientHandler {
                                             lk,
                                             ln,
                                             total,
+                                            pool_status.map(|s| s.remaining),
                                             fault_seen,
                                             rate_per_mb,
                                         ))
@@ -627,6 +649,7 @@ impl ClientHandler {
                             lk,
                             ln,
                             Arc::clone(origin),
+                            pool_status.map(|s| s.remaining),
                             fault_seen,
                             rate_per_mb,
                         ))
