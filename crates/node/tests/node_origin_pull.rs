@@ -13018,7 +13018,7 @@ async fn top_up_fixture_multi(
 
 /// [`top_up_fixture_multi`] with the buyer's local reputation configured explicitly,
 /// so the delivery-speed regression can read a single delivery's speed off the score
-/// (`alpha = 1.0`, no EWMA blend) against a known `expected_bps`.
+/// (`alpha = 1.0`, no EWMA blend) against a known `reference_bps`.
 async fn top_up_fixture_multi_rep(
     payloads: Vec<Arc<Vec<u8>>>,
     setup: TopUpSetup,
@@ -13210,15 +13210,22 @@ async fn a_pull_larger_than_the_initial_deposit_tops_up_once_and_completes() -> 
 /// # Why this pins what `score(provider) > 0.5` cannot
 ///
 /// The reputation is configured so ONE delivery's speed reads straight off the score:
-/// `alpha = 1.0` drops the EWMA blend, so `score == 0.4·speed + 0.6` with
-/// `speed = min(1, bytes_per_sec / expected_bps)`. The upstream is throttled to serve
-/// the resume leg over [`SLOW_RESUME`], so the honest `elapsed` spans at least that:
+/// `alpha = 1.0` drops the EWMA blend, so `score == 0.4·speed + 0.6` with the
+/// log-normalized `speed = clamp(ln(1+bytes_per_sec) / ln(1+reference_bps), 0, 1)`
+/// (ADR 008 §Local Score Calculation). The upstream is throttled to serve the resume
+/// leg over [`SLOW_RESUME`], so the honest `elapsed` spans at least that:
 ///
-/// - CORRECT: `bytes_per_sec ≤ 3 MiB / 3 s = 1 MiB/s`, and at `expected_bps = 2 MiB/s`
-///   that is `speed ≤ 0.5`, so `score ≤ 0.8` — comfortably under the bound below.
+/// - CORRECT: the whole ~3,146,505-byte payload crosses over the throttled
+///   `SLOW_RESUME = 3 s`, so `bytes_per_sec ≈ 1,048,835` (~1 MiB/s). At
+///   `reference_bps = 1 GiB/s` (`1,073,741,824`, chosen — as the log curve
+///   recommends — well above the throttled rate so the log gap is legible), that is
+///   `speed = ln(1,048,836) / ln(1,073,741,825) ≈ 13.86319 / 20.79442 ≈ 0.66668`, so
+///   `score ≈ 0.4·0.66668 + 0.6 ≈ 0.86667` — comfortably under the bound below.
 /// - BUGGED: the ~3 s transfer is folded into `paid_wait`, leaving `elapsed ≈ the
-///   pre-top-up leg` (sub-second, no throttle), so `speed` saturates to 1 and the
-///   score pins at ≈1.0.
+///   pre-top-up leg` (sub-second, no throttle). Even a lenient 0.1 s bug-elapsed
+///   already yields `bytes_per_sec ≈ 31,465,050`, `speed ≈ 0.83`, `score ≈ 0.932`; a
+///   realistic sub-10ms elapsed pins `speed` near 1 and `score` near `1.0`. Either
+///   way the bugged score clears the bound below by a wide margin.
 ///
 /// `> 0.5` — what the other top-up tests assert — passes both, which is exactly why it
 /// never caught this.
@@ -13227,16 +13234,18 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
     /// Long enough that the resumed leg's transfer dominates `elapsed`, so a score that
     /// still reads "fast" can only mean the transfer was wrongly charged to `paid_wait`.
     const SLOW_RESUME: Duration = Duration::from_secs(3);
-    /// 2 MiB/s. Picked so the throttled resume (≤1 MiB/s over the whole blob) reads as
-    /// `speed ≤ 0.5`, while the bug's sub-second `elapsed` saturates `speed` to 1.
-    const EXPECTED_BPS: u64 = 2 * MB_BYTES;
+    /// 1 GiB/s — the production default reference (`DEFAULT_REFERENCE_BPS`), set
+    /// explicitly here for a self-contained derivation. Picked well above the
+    /// throttled resume's ~1 MiB/s so the log curve's gap between "throttled" and
+    /// "saturated" reads clearly (see the derivation above).
+    const REFERENCE_BPS: u64 = 1024 * 1024 * 1024;
 
     let payload = multi_interval_payload();
     let mut rep_config = LocalReputationConfig::default();
     // One delivery must move the score to exactly its interaction sample, so the speed
     // term is legible; the default 0.1 EWMA would compress both cases against neutral.
     rep_config.alpha = 1.0;
-    rep_config.expected_bps = EXPECTED_BPS;
+    rep_config.reference_bps = REFERENCE_BPS;
 
     let mut setup = TopUpSetup::honest(2 * RATE, 200 * RATE, true);
     setup.resume_delay = SLOW_RESUME;
@@ -13266,16 +13275,19 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
     assert_counter(&fixture.metrics, "node_pull_unreachable_total", 0)?;
 
     // The delivery scored, so the speed term is live (`score > 0.6` means `speed > 0`).
-    // The bound that matters: the throttled resume caps an HONEST `elapsed`'s speed at
-    // 0.5, i.e. `score ≤ 0.8`. The bug charges the transfer to `paid_wait`, saturating
-    // the speed and pinning the score at ≈1.0, which trips the ceiling.
+    // The bound that matters: the throttled resume gives an HONEST `elapsed` a
+    // log-curve speed of ≈0.66668, i.e. `score ≈ 0.86667` (derived above). The bug
+    // charges the transfer to `paid_wait`, leaving a sub-second `elapsed` whose
+    // log-curve speed is ≥0.83 even under a lenient 0.1 s assumption (score ≥0.93),
+    // and near 1.0 for a realistic sub-10ms elapsed. 0.90 sits with clear margin
+    // above the honest score and below every bugged one.
     let score = fixture.local_rep.score(fixture.provider);
     anyhow::ensure!(
         score > 0.6,
         "a completed delivery must credit correctness+reachability, got {score}"
     );
     anyhow::ensure!(
-        score < 0.85,
+        score < 0.90,
         "a slow post-top-up delivery must score slow; a score of {score} means the resume \
          leg's transfer was wrongly excluded from `elapsed` (folded into `paid_wait`) — #1602"
     );

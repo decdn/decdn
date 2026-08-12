@@ -14,22 +14,25 @@ use thiserror::Error;
 
 const DEFAULT_ALPHA: f64 = 0.1;
 const DEFAULT_INITIAL_SCORE: f64 = 0.5;
-const DEFAULT_EXPECTED_BPS: u64 = 10 * 1024 * 1024;
+const DEFAULT_REFERENCE_BPS: u64 = 1024 * 1024 * 1024; // 1 GiB/s log reference (~1.0)
 const DEFAULT_SPEED_WEIGHT: f64 = 0.4;
 const DEFAULT_CORRECTNESS_WEIGHT: f64 = 0.4;
 const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
-/// ADR 008 §Score Decay: idle scores decay 10% per week toward neutral.
-const DEFAULT_DECAY_RATE_PER_WEEK: f64 = 0.10;
+/// Default decay half-life: 3 days. Sub-weekly on purpose — a transiently
+/// dinged node re-enters selection in days, not weeks, and no node coasts on
+/// stale reputation, both of which widen the serving set (ADR 008 §Score Decay).
+const DEFAULT_DECAY_HALF_LIFE_SECS: u64 = 3 * 24 * 3600; // 259_200
 
-/// Seconds in a week — the decay unit (ADR 008 §Score Decay).
+/// Seconds in a week — used only to bound the eviction idle window (ADR 008
+/// §Score Decay).
 const SECONDS_PER_WEEK: f64 = 7.0 * 24.0 * 3600.0;
 
 /// Eviction candidates must be within this band of neutral (ADR 008
 /// §Score Decay: converge within 0.05 of neutral).
 const EVICT_NEUTRAL_BAND: f64 = 0.05;
-/// …and idle for longer than this many weeks. 26 weeks (~½ year) leaves ample
-/// margin over the ~30 weeks a score needs to decay within the neutral band,
-/// so eviction only ever drops entries that already read as neutral.
+/// …and idle for longer than this many weeks. 26 weeks (~½ year) is far
+/// longer than the ~10 days a score now needs to reach the neutral band, so
+/// eviction only drops entries already reading neutral.
 const EVICT_IDLE_WEEKS: f64 = 26.0;
 // ADR 008 §14a excludes per-report clamping from the local scoring rule. The
 // clamp logic is kept so callers can opt into §8's ±0.05 cap by overriding this
@@ -50,8 +53,8 @@ pub const LOCAL_SCORE_MAX_DELTA_PER_REPORT: f64 = 0.05;
 pub enum ConfigError {
     #[error("{field} must be a finite number in [0.0, 1.0], got {value}")]
     OutOfUnitInterval { field: &'static str, value: f64 },
-    #[error("expected_bps must be > 0")]
-    ZeroExpectedBps,
+    #[error("reference_bps must be > 0")]
+    ZeroReferenceBps,
     #[error(
         "weights must sum to 1.0; got speed={speed} + correctness={correctness} \
          + reachability={reachability} = {sum}"
@@ -108,14 +111,16 @@ pub enum Outcome {
 pub struct LocalReputationConfig {
     pub alpha: f64,
     pub initial_score: f64,
-    pub expected_bps: u64,
+    /// Reference throughput scoring ~1.0 under the log speed curve (was the
+    /// flat saturation baseline).
+    pub reference_bps: u64,
     pub speed_weight: f64,
     pub correctness_weight: f64,
     pub reachability_weight: f64,
     pub max_delta_per_update: f64,
-    /// Weekly decay toward neutral for an idle peer (ADR 008 §Score Decay).
-    /// Defaults to `0.10` (10% per week). A value of `0.0` disables decay.
-    pub decay_rate_per_week: f64,
+    /// Half-life (seconds) of idle-score decay toward neutral (ADR 008 §Score
+    /// Decay). Each half-life halves the distance to neutral. `0` disables decay.
+    pub decay_half_life_secs: u64,
 }
 
 impl Default for LocalReputationConfig {
@@ -123,12 +128,12 @@ impl Default for LocalReputationConfig {
         Self {
             alpha: DEFAULT_ALPHA,
             initial_score: DEFAULT_INITIAL_SCORE,
-            expected_bps: DEFAULT_EXPECTED_BPS,
+            reference_bps: DEFAULT_REFERENCE_BPS,
             speed_weight: DEFAULT_SPEED_WEIGHT,
             correctness_weight: DEFAULT_CORRECTNESS_WEIGHT,
             reachability_weight: DEFAULT_REACHABILITY_WEIGHT,
             max_delta_per_update: DEFAULT_MAX_DELTA_PER_UPDATE,
-            decay_rate_per_week: DEFAULT_DECAY_RATE_PER_WEEK,
+            decay_half_life_secs: DEFAULT_DECAY_HALF_LIFE_SECS,
         }
     }
 }
@@ -302,20 +307,20 @@ impl LocalReputation {
         });
     }
 
-    /// Closed-form decay of a stored score toward neutral (ADR 008 §Score
-    /// Decay): `neutral + (score - neutral) * (1 - rate)^weeks_elapsed`, with
-    /// `weeks_elapsed` fractional. A backward clock yields no decay (elapsed
-    /// saturates at 0). The iterative weekly form in the ADR is exactly this
-    /// closed form sampled at whole weeks.
+    /// Closed-form half-life decay toward neutral (ADR 008 §Score Decay):
+    /// `neutral + (score - neutral) * 0.5^(elapsed_secs / half_life_secs)`.
+    /// A `0` half-life disables decay; a backward clock yields no decay
+    /// (elapsed saturates at 0).
     fn decay(&self, score: f64, last_update_secs: u64, now_secs: u64) -> f64 {
         let elapsed_secs = now_secs.saturating_sub(last_update_secs);
-        if elapsed_secs == 0 {
+        let hl = self.config.decay_half_life_secs;
+        if elapsed_secs == 0 || hl == 0 {
             return score;
         }
         #[allow(clippy::cast_precision_loss)]
-        let weeks = elapsed_secs as f64 / SECONDS_PER_WEEK;
+        let half_lives = elapsed_secs as f64 / hl as f64;
         let neutral = self.config.initial_score;
-        neutral + (score - neutral) * (1.0 - self.config.decay_rate_per_week).powf(weeks)
+        neutral + (score - neutral) * 0.5_f64.powf(half_lives)
     }
 
     fn interaction_score(&self, outcome: Outcome) -> f64 {
@@ -334,7 +339,7 @@ impl LocalReputation {
             Outcome::Corruption => crate::interaction::interaction_score(w, 0.0, 0.0, 1.0),
             // correctly delivered: full correctness + reachability, scaled speed
             Outcome::Delivered { bytes, elapsed } => {
-                let speed = speed_score(bytes, elapsed, self.config.expected_bps);
+                let speed = speed_score(bytes, elapsed, self.config.reference_bps);
                 crate::interaction::interaction_score(w, speed, 1.0, 1.0)
             }
         }
@@ -352,8 +357,8 @@ impl LocalReputation {
 
 // Thin wrapper over the shared formula so local and network paths cannot
 // drift (see [`crate::interaction`]).
-fn speed_score(bytes: u64, elapsed: Duration, expected_bps: u64) -> f64 {
-    crate::interaction::speed_score_from_transfer(bytes, elapsed, expected_bps)
+fn speed_score(bytes: u64, elapsed: Duration, reference_bps: u64) -> f64 {
+    crate::interaction::speed_score_from_transfer(bytes, elapsed, reference_bps)
 }
 
 fn validate(c: &LocalReputationConfig) -> Result<(), ConfigError> {
@@ -363,9 +368,8 @@ fn validate(c: &LocalReputationConfig) -> Result<(), ConfigError> {
     require_unit_interval(c.correctness_weight, "correctness_weight")?;
     require_unit_interval(c.reachability_weight, "reachability_weight")?;
     require_unit_interval(c.max_delta_per_update, "max_delta_per_update")?;
-    require_unit_interval(c.decay_rate_per_week, "decay_rate_per_week")?;
-    if c.expected_bps == 0 {
-        return Err(ConfigError::ZeroExpectedBps);
+    if c.reference_bps == 0 {
+        return Err(ConfigError::ZeroReferenceBps);
     }
     let sum = c.speed_weight + c.correctness_weight + c.reachability_weight;
     if (sum - 1.0).abs() > 1e-9 {
@@ -454,7 +458,7 @@ mod tests {
 
     fn delivered_full() -> Outcome {
         Outcome::Delivered {
-            bytes: 10 * 1024 * 1024,
+            bytes: 1024 * 1024 * 1024, // reference throughput in 1s → speed 1.0
             elapsed: Duration::from_secs(1),
         }
     }
@@ -471,14 +475,14 @@ mod tests {
         ensure!(approx(c.speed_weight, 0.4));
         ensure!(approx(c.correctness_weight, 0.4));
         ensure!(approx(c.reachability_weight, 0.2));
-        ensure!(c.expected_bps == 10 * 1024 * 1024);
+        ensure!(c.reference_bps == 1024 * 1024 * 1024);
         // §14a defers clamping; default is no-op (1.0).
         ensure!(approx(c.max_delta_per_update, 1.0));
-        // §Score Decay: 10% per idle week toward neutral.
+        // §Score Decay: half-life default is 3 days.
         ensure!(
-            approx(c.decay_rate_per_week, 0.10),
-            "decay drift: {}",
-            c.decay_rate_per_week
+            c.decay_half_life_secs == 3 * 24 * 3600,
+            "half-life drift: {}",
+            c.decay_half_life_secs
         );
         let sum = c.speed_weight + c.correctness_weight + c.reachability_weight;
         ensure!((sum - 1.0).abs() < 1e-9, "weight sum drift: {sum}");
@@ -497,12 +501,12 @@ mod tests {
         ));
 
         let bad = LocalReputationConfig {
-            expected_bps: 0,
+            reference_bps: 0,
             ..LocalReputationConfig::default()
         };
         assert!(matches!(
             LocalReputation::new(bad),
-            Err(ConfigError::ZeroExpectedBps)
+            Err(ConfigError::ZeroReferenceBps)
         ));
 
         let bad = LocalReputationConfig {
@@ -535,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn delivered_at_baseline_speed_pulls_score_up() -> anyhow::Result<()> {
+    fn delivered_at_reference_speed_pulls_score_up() -> anyhow::Result<()> {
         let r = LocalReputation::new(LocalReputationConfig::default())?;
         let p = fresh_peer();
         // interaction = 0.4*1 + 0.4 + 0.2 = 1.0
@@ -543,7 +547,7 @@ mod tests {
         let next = r.record(
             p,
             Outcome::Delivered {
-                bytes: 10 * 1024 * 1024,
+                bytes: 1024 * 1024 * 1024,
                 elapsed: Duration::from_secs(1),
             },
         );
@@ -665,50 +669,21 @@ mod tests {
     }
 
     #[test]
-    fn speed_score_saturates_above_baseline() -> anyhow::Result<()> {
-        let r = LocalReputation::new(LocalReputationConfig::default())?;
-        let p1 = fresh_peer();
-        let p2 = fresh_peer();
-        let baseline = r.record(
-            p1,
-            Outcome::Delivered {
-                bytes: 10 * 1024 * 1024,
-                elapsed: Duration::from_secs(1),
-            },
-        );
-        let above = r.record(
-            p2,
-            Outcome::Delivered {
-                bytes: 100 * 1024 * 1024, // 10× baseline
-                elapsed: Duration::from_secs(1),
-            },
-        );
-        ensure!(approx(baseline, above), "baseline={baseline} above={above}");
-        // Anchor: rule out a "always returns initial" bug by pinning the
-        // saturated value (0.55 from EWMA of 0.5 ← 1.0 with α=0.1).
-        ensure!(
-            approx(baseline, 0.55),
-            "expected saturation to land at 0.55, got {baseline}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn speed_score_function_is_correct() {
-        let bps = 10 * 1024 * 1024;
+        let bps = 1024 * 1024 * 1024; // 1 GiB/s reference
         let one_sec = Duration::from_secs(1);
         assert!(approx(speed_score(bps, one_sec, bps), 1.0));
         assert!(approx(speed_score(2 * bps, one_sec, bps), 1.0));
-        assert!(approx(speed_score(bps / 10, one_sec, bps), 0.1));
+        assert!(speed_score(bps / 10, one_sec, bps) < speed_score(bps, one_sec, bps));
         assert!(approx(speed_score(0, one_sec, bps), 0.0));
         assert!(approx(speed_score(1, Duration::ZERO, bps), 0.0));
         assert!(approx(speed_score(1, one_sec, 0), 0.0));
     }
 
     #[test]
-    fn expected_bps_override_changes_speed_baseline() -> anyhow::Result<()> {
+    fn reference_bps_override_changes_speed_baseline() -> anyhow::Result<()> {
         let cfg = LocalReputationConfig {
-            expected_bps: 1024 * 1024, // 1 MiB/s baseline
+            reference_bps: 1024 * 1024, // 1 MiB/s baseline
             ..LocalReputationConfig::default()
         };
         let r = LocalReputation::new(cfg)?;
@@ -733,7 +708,8 @@ mod tests {
         let r_full = LocalReputation::new(cfg)?;
         let p = fresh_peer();
         let corrupt = r_corrupt.record(p, Outcome::Corruption);
-        // ~10% of baseline → speed_score ≈ 0.1 → interaction ≈ 0.64
+        // 1 MiB/s vs. the 1 GiB/s reference: log curve still scores this well
+        // above zero but below a full-reference-speed delivery.
         let slow = r_slow.record(
             p,
             Outcome::Delivered {
@@ -762,7 +738,7 @@ mod tests {
             r.record(
                 p_good,
                 Outcome::Delivered {
-                    bytes: 10 * 1024 * 1024,
+                    bytes: 1024 * 1024 * 1024,
                     elapsed: Duration::from_secs(1),
                 },
             );
@@ -854,50 +830,37 @@ mod tests {
     }
 
     #[test]
-    fn high_score_decays_toward_neutral_matching_adr_examples() -> anyhow::Result<()> {
-        // Seed a peer at exactly 1.0 (alpha=1, full-quality delivery), then read
-        // it back at successive idle weeks. ADR 008 §Score Decay: the iterative
-        // 10%/week rule is the closed form 0.5 + 0.5·0.9^weeks sampled at whole
-        // weeks. (The ADR's tabulated 0.65/0.53 at weeks 10/20 are loose
-        // roundings; the exact rule gives 0.6743/0.5608.)
+    fn score_decays_by_half_each_half_life() -> anyhow::Result<()> {
         let (r, clock) = with_manual_clock(seeding_config())?;
         let p = fresh_peer();
         ensure!(approx(r.record(p, delivered_full()), 1.0), "seed != 1.0");
-        for (week, expected) in [
-            (1u64, 0.95),
-            (5, 0.795_245),
-            (10, 0.674_339),
-            (20, 0.560_788),
-            (30, 0.521_195),
-        ] {
-            clock.set(week * WEEK_SECS);
+        let hl = LocalReputationConfig::default().decay_half_life_secs;
+        for (n, expected) in [(1u64, 0.75), (2, 0.625), (3, 0.5625)] {
+            clock.set(n * hl);
             let got = r.score(p);
             ensure!(
-                approx_eps(got, expected, 1e-6),
-                "week {week}: got {got}, want {expected}"
+                approx_eps(got, expected, 1e-9),
+                "n={n}: got {got}, want {expected}"
             );
         }
-        // ADR: "within 0.05 of neutral after ~30 weeks."
-        ensure!((r.score(p) - 0.5).abs() <= 0.05, "week 30 not within band");
         Ok(())
     }
 
     #[test]
-    fn low_score_decays_up_toward_neutral() -> anyhow::Result<()> {
-        // Symmetric to the high-score case: a peer seeded at 0.0 rehabilitates
-        // toward 0.5 (0.5 − 0.5·0.9^weeks).
+    fn low_score_rehabilitates_by_half_each_half_life() -> anyhow::Result<()> {
         let (r, clock) = with_manual_clock(seeding_config())?;
         let p = fresh_peer();
         ensure!(
             approx(r.record(p, Outcome::Unreachable), 0.0),
             "seed != 0.0"
         );
-        for (week, expected) in [(1u64, 0.05), (5, 0.204_755), (30, 0.478_804)] {
-            clock.set(week * WEEK_SECS);
+        let hl = LocalReputationConfig::default().decay_half_life_secs;
+        for (n, expected) in [(1u64, 0.25), (2, 0.375)] {
+            clock.set(n * hl);
             let got = r.score(p);
             ensure!(
-                approx_eps(got, expected, 1e-6),
-                "week {week}: got {got}, want {expected}"
+                approx_eps(got, expected, 1e-9),
+                "n={n}: got {got}, want {expected}"
             );
         }
         Ok(())
@@ -906,32 +869,35 @@ mod tests {
     #[test]
     fn record_decays_stored_score_before_folding() -> anyhow::Result<()> {
         // With alpha=0.1, one full delivery at t=0 lands the peer at 0.55. After
-        // 5 idle weeks the *stored* 0.55 has decayed to 0.5 + 0.05·0.9^5 =
-        // 0.529524; the next Unreachable must fold from that decayed value
-        // (0.9·0.529524 = 0.476572), not from the stale 0.55 (→ 0.495).
+        // one half-life the *stored* 0.55 has decayed to 0.5 + 0.05·0.5 =
+        // 0.525; the next Unreachable must fold from that decayed value
+        // (0.9·0.525 = 0.4725), not from the stale 0.55 (→ 0.495).
         let (r, clock) = with_manual_clock(LocalReputationConfig::default())?;
         let p = fresh_peer();
         ensure!(approx(r.record(p, delivered_full()), 0.55), "seed != 0.55");
-        clock.set(5 * WEEK_SECS);
+        clock.set(LocalReputationConfig::default().decay_half_life_secs);
         let next = r.record(p, Outcome::Unreachable);
         ensure!(
-            approx_eps(next, 0.476_572, 1e-6),
+            approx_eps(next, 0.4725, 1e-9),
             "expected fold from decayed base, got {next}"
         );
         Ok(())
     }
 
     #[test]
-    fn decay_disabled_when_rate_zero() -> anyhow::Result<()> {
+    fn decay_disabled_when_half_life_zero() -> anyhow::Result<()> {
         let cfg = LocalReputationConfig {
-            decay_rate_per_week: 0.0,
+            decay_half_life_secs: 0,
             ..seeding_config()
         };
         let (r, clock) = with_manual_clock(cfg)?;
         let p = fresh_peer();
         ensure!(approx(r.record(p, delivered_full()), 1.0), "seed != 1.0");
         clock.set(100 * WEEK_SECS);
-        ensure!(approx(r.score(p), 1.0), "rate 0 should freeze the score");
+        ensure!(
+            approx(r.score(p), 1.0),
+            "half-life 0 should freeze the score"
+        );
         Ok(())
     }
 
@@ -943,28 +909,29 @@ mod tests {
         // forward read would over-decay.
         let (r, clock) = with_manual_clock(seeding_config())?;
         let p = fresh_peer();
-        clock.set(10 * WEEK_SECS);
+        let hl = LocalReputationConfig::default().decay_half_life_secs;
+        clock.set(10 * hl);
         ensure!(approx(r.record(p, delivered_full()), 1.0), "seed != 1.0");
 
-        clock.set(5 * WEEK_SECS); // clock goes backwards
+        clock.set(5 * hl); // clock goes backwards
         ensure!(
             approx(r.score(p), 1.0),
             "backward read decayed: {}",
             r.score(p)
         );
-        // A record while the clock is behind keeps the stored timestamp at week 10.
+        // A record while the clock is behind keeps the stored timestamp at 10*hl.
         ensure!(
             approx(r.record(p, delivered_full()), 1.0),
             "backward record moved score"
         );
 
-        // Forward to week 12: only 2 weeks of decay from the pinned week-10
-        // timestamp, i.e. 0.5 + 0.5·0.9^2 = 0.905 — not decay measured from week 5.
-        clock.set(12 * WEEK_SECS);
+        // Forward to 12*hl: only 2 half-lives of decay from the pinned 10*hl
+        // timestamp, i.e. 0.5 + 0.5·0.5^2 = 0.625 — not decay measured from 5*hl.
+        clock.set(12 * hl);
         let got = r.score(p);
         ensure!(
-            approx_eps(got, 0.905, 1e-6),
-            "timestamp rewound: got {got}, want 0.905"
+            approx_eps(got, 0.625, 1e-9),
+            "timestamp rewound: got {got}, want 0.625"
         );
         Ok(())
     }
@@ -981,16 +948,16 @@ mod tests {
 
         // t=0: seed the peer that will age fully into neutrality by week 40.
         r.record(evictable, Outcome::Unreachable);
-        // Week 16: seed the peer that, at week 40, is idle only 24 weeks — near
-        // neutral (≈0.46, within the band) but below the 26-week idle floor.
-        clock.set(16 * WEEK_SECS);
+        // Week 30: seed the peer that, at week 40, is idle only 10 weeks — near
+        // neutral (half-life is days) but below the 26-week idle floor.
+        clock.set(30 * WEEK_SECS);
         r.record(not_idle_enough, Outcome::Unreachable);
         // Week 40: refresh `recent` (idle 0, score 0.0), then evict.
         clock.set(40 * WEEK_SECS);
         r.record(recent, Outcome::Unreachable);
 
         // Preconditions the eviction predicate keys on: two are inside the band,
-        // one is not; ages are 40 wk / 24 wk / 0 wk respectively.
+        // one is not; idle ages are 40 wk / 10 wk / 0 wk respectively.
         ensure!(
             (r.score(evictable) - 0.5).abs() <= EVICT_NEUTRAL_BAND,
             "evictable not within band: {}",
@@ -1030,28 +997,14 @@ mod tests {
         let (r, clock) = with_manual_clock(seeding_config())?;
         let p = fresh_peer();
         r.record(p, delivered_full()); // 1.0 at t=0
-        clock.set(5 * WEEK_SECS);
+        let hl = LocalReputationConfig::default().decay_half_life_secs;
+        clock.set(2 * hl);
         let snap: HashMap<NodeId, f64> = r.snapshot().into_iter().collect();
         let s = *snap.get(&p).context("peer missing from snapshot")?;
         ensure!(
-            approx_eps(s, 0.795_245, 1e-6),
+            approx_eps(s, 0.625, 1e-9),
             "snapshot did not decay: got {s}"
         );
         Ok(())
-    }
-
-    #[test]
-    fn invalid_decay_rate_rejected() {
-        let bad = LocalReputationConfig {
-            decay_rate_per_week: 1.5,
-            ..LocalReputationConfig::default()
-        };
-        assert!(matches!(
-            LocalReputation::new(bad),
-            Err(ConfigError::OutOfUnitInterval {
-                field: "decay_rate_per_week",
-                ..
-            })
-        ));
     }
 }
