@@ -26,8 +26,8 @@ import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
 /// @dev    OZ bases per ADR 016 § OpenZeppelin Framework Usage:
 ///         `AccessControl` (governance-gated setters + emergency pause role,
 ///         handed to the `TimelockController` post-deploy), `ReentrancyGuard`
-///         + `Pausable` (fund custody), `EIP712` + `SignatureChecker` (EOA +
-///         ERC-1271/4337 capability and voucher signers per ADR 024). The
+///         + `Pausable` (fund custody), `EIP712` (capability and voucher
+///         signing domain per ADR 024). The
 ///         USDC address is immutable; the `FeeRouter` target is
 ///         governance-re-pointable per ADR 016 § No proxy deployment
 ///         patterns (the capability/voucher domain separator hashes this
@@ -66,8 +66,8 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     /// @dev Mirrors `decdn_protocol::MAX_RATE_PER_MB` (ADR 005 §Wire protocol),
     ///      the largest `rate_per_mb` the wire schema will decode. A floor
-    ///      above it is network-isolating (see `PaymentChannel` for the full
-    ///      rationale, restated here since each contract is a leaf).
+    ///      above it is network-isolating: no advertised delivery rate could
+    ///      ever clear it, so redemption would always revert.
     uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
 
     /// @dev Lower bound of the governable per-MB delivery-rate floor.
@@ -119,11 +119,11 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @notice Grace window in seconds (default 48h; bounded [48h, 72h]).
     uint256 public disputeWindow;
 
-    /// @dev Per-MB delivery-rate floor in USDC base units, exposed via
-    ///      `getRateBounds`. There is no governance ceiling: a seller
-    ///      self-clamping its own advertised rate downward buys no on-chain
-    ///      safety. The floor is itself capped at `MAX_RATE_PER_MB` so it can
-    ///      never exceed what the wire schema will carry.
+    /// @dev Per-MB delivery-rate floor in USDC base units. There is no
+    ///      governance ceiling: a seller self-clamping its own advertised
+    ///      rate downward buys no on-chain safety. The floor is itself
+    ///      capped at `MAX_RATE_PER_MB` so it can never exceed what the wire
+    ///      schema will carry.
     uint256 internal deliveryFloor;
 
     /// @notice Per-owner monotonic pool counter used in `poolId` derivation.
@@ -165,9 +165,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     event PoolOpened(bytes32 indexed poolId, address indexed owner, uint256 deposit);
     event PoolToppedUp(bytes32 indexed poolId, uint256 additionalDeposit, uint256 newDeposit);
-    event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
-    event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
-    event RateBoundsUpdated(uint256 newDeliveryFloor);
 
     // -----------------------------------------------------------------
     // Errors
@@ -304,35 +301,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         return pools[poolId];
     }
 
-    function getAuthorization(bytes32 poolId, address signer) external view returns (Authorization memory) {
-        return authorized[poolId][signer];
-    }
-
-    function getRateBounds() external view returns (uint256 floor) {
-        return deliveryFloor;
-    }
-
-    // -----------------------------------------------------------------
-    // Governance setters (GOVERNANCE_ROLE — Timelock post-deploy)
-    // -----------------------------------------------------------------
-
-    function setDisputeWindow(uint256 newWindow) external onlyRole(GOVERNANCE_ROLE) {
-        if (newWindow < DISPUTE_WINDOW_FLOOR || newWindow > DISPUTE_WINDOW_CEILING) {
-            revert ParamOutOfBounds(newWindow, DISPUTE_WINDOW_FLOOR, DISPUTE_WINDOW_CEILING);
-        }
-        uint256 old = disputeWindow;
-        disputeWindow = newWindow;
-        emit DisputeWindowUpdated(old, newWindow);
-    }
-
-    function setRateBounds(uint256 newFloor) external onlyRole(GOVERNANCE_ROLE) {
-        if (newFloor < MIN_RATE_FLOOR || newFloor > MAX_RATE_PER_MB) {
-            revert RateBoundsInvalid(newFloor);
-        }
-        deliveryFloor = newFloor;
-        emit RateBoundsUpdated(newFloor);
-    }
-
     // -----------------------------------------------------------------
     // Pause control (PAUSER_ROLE — emergency multisig). Pause blocks new
     // pools/top-ups only.
@@ -351,7 +319,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     // Internal
     // -----------------------------------------------------------------
 
-    /// @dev `settleChannel`-style routers rely on `FeeRouter.paused()`;
+    /// @dev Redemption relies on `FeeRouter.paused()` being callable;
     ///      probe the view once at config time so a router that does not
     ///      expose it is rejected loudly here rather than bricking a later
     ///      redemption on the missing pause view.
