@@ -862,28 +862,48 @@ mod tests {
     use alloy::primitives::B256;
     use alloy::signers::local::PrivateKeySigner;
 
-    fn ctx_with_deposit(deposit: U256) -> PoolContext {
-        PoolContext {
-            channel_id: B256::ZERO,
-            token: Address::ZERO,
+    /// A fixed "now" for the pure `decide` tests. Any value works while the guard is
+    /// inert (the default capability never expires); the capability-regeneration
+    /// tests below set the capability's `expiry` relative to it explicitly.
+    const NOW: u64 = 1_700_000_000;
+
+    /// A context whose self-issued capability carries `cap_expiry`. The pool has no
+    /// expiry; only the capability is time-boxed, and `decide` reads its expiry for
+    /// the regeneration guard.
+    fn ctx_with_cap_expiry(deposit: U256, cap_expiry: u64) -> PoolContext {
+        let signer = Arc::new(PrivateKeySigner::random());
+        let voucher_domain = alloy::dyn_abi::Eip712Domain::default();
+        let pool_id = B256::ZERO;
+        let capability = issue_self_capability(
+            signer.as_ref(),
+            pool_id,
             deposit,
-            client_signer: Arc::new(PrivateKeySigner::random()),
-            voucher_domain: alloy::dyn_abi::Eip712Domain::default(),
-            prior_nonce: U256::ZERO,
+            cap_expiry,
+            &voucher_domain,
+        )
+        .unwrap_or_else(|e| panic!("capability signing failed: {e}"));
+        PoolContext {
+            pool_id,
+            provider: Address::repeat_byte(9),
+            deposit,
+            client_signer: signer,
+            voucher_domain,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,
+            capability: Some(capability),
         }
     }
 
-    /// A fixed "now" for the pure `decide` tests. Any value works while the guard is
-    /// inert (see [`budgets`]); the near-expiry tests below set `expires_at` relative
-    /// to it explicitly.
-    const NOW: u64 = 1_700_000_000;
+    fn ctx_with_deposit(deposit: U256) -> PoolContext {
+        // A never-expiring capability keeps the regeneration guard inert unless a
+        // test opts into a finite expiry.
+        ctx_with_cap_expiry(deposit, u64::MAX)
+    }
 
-    /// Budgets with the near-expiry guard INERT — `NEVER_EXPIRES` and a zero margin
-    /// both mean "never near expiry" — so a test not exercising #1603 sees the
-    /// pre-guard behaviour unchanged.
+    /// Budgets with the capability-regeneration guard INERT (a zero margin means
+    /// "never near expiry"), so a test not exercising it sees the pre-guard
+    /// behaviour unchanged.
     fn budgets(working_deposit: U256) -> ResumeBudgets {
         ResumeBudgets {
             topups: 0,
@@ -892,8 +912,15 @@ mod tests {
             max_settle_waits: 28,
             awaiting_topup_settle: false,
             working_deposit,
-            expires_at: NEVER_EXPIRES,
             min_ttl: Duration::ZERO,
+        }
+    }
+
+    /// Budgets with the capability-regeneration guard ARMED at `min_ttl`.
+    fn budgets_with_ttl(working_deposit: U256, min_ttl: Duration) -> ResumeBudgets {
+        ResumeBudgets {
+            min_ttl,
+            ..budgets(working_deposit)
         }
     }
 
@@ -905,20 +932,21 @@ mod tests {
     }
 
     /// A rejection carrying a bundle the buyer's OWN key really signed, at
-    /// `nonce`/`amount` — the shape `resumable_watermark` authenticates against
-    /// `ctx.client_signer`, so it cannot be faked by an upstream.
+    /// `amount` — the shape `resumable_watermark` authenticates against
+    /// `ctx.client_signer`, so it cannot be faked by an upstream. The `_nonce`
+    /// argument is retained for call-site parity but the pool voucher has no nonce.
     fn rejection_with_signed_bundle(
         ctx: &PoolContext,
         reason: VoucherRejectReason,
-        nonce: U256,
+        _nonce: U256,
         amount: U256,
     ) -> anyhow::Error {
         let voucher = decdn_incentive::Voucher {
-            channel_id: ctx.channel_id,
+            pool_id: ctx.pool_id,
+            signer: ctx.client_signer.address(),
+            provider: ctx.provider,
             amount,
-            nonce,
             bytes_delivered: U256::from(4096u64),
-            token: ctx.token,
         };
         let signed = voucher
             .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
@@ -927,7 +955,6 @@ mod tests {
             reason,
             bundle: Some(decdn_protocol::client::WatermarkBundle {
                 amount: amount.to_be_bytes(),
-                nonce: nonce.to_be_bytes(),
                 bytes_delivered: U256::from(4096u64).to_be_bytes(),
                 last_signature: signed.signature.as_bytes().to_vec(),
             }),
@@ -944,7 +971,6 @@ mod tests {
     fn an_advancing_bundle_reseeds() {
         let ctx = ctx_with_deposit(U256::from(1_000_000u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -981,7 +1007,6 @@ mod tests {
         // from `TopUp` is the advancing bundle.
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1011,7 +1036,6 @@ mod tests {
     fn reseeds_are_bounded() {
         let ctx = ctx_with_deposit(U256::from(1_000_000u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1037,7 +1061,6 @@ mod tests {
     fn a_bogus_exhaustion_claim_is_refused_distinctly() {
         let ctx = ctx_with_deposit(U256::from(1_000_000u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1062,7 +1085,6 @@ mod tests {
     fn a_not_found_right_after_a_topup_is_waited_out() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1096,7 +1118,6 @@ mod tests {
         // The channel watermark claims far more wire than this leg received —
         // exactly what a concurrent pull's acked vouchers produce.
         let ledger = PoolLedger::new(Cumulative {
-            nonce: U256::from(5u64),
             bytes: U256::from(8 * CHUNK_GROUP_BYTES),
             amount: U256::from(500u64),
         });
@@ -1114,7 +1135,6 @@ mod tests {
         // An honest single-pull watermark is untouched by the clamp: the frontier
         // always trails the decode (payment lags the credit window).
         let honest = PoolLedger::new(Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(CHUNK_GROUP_BYTES),
             amount: U256::from(10u64),
         });
@@ -1150,7 +1170,6 @@ mod tests {
     fn a_corroborated_ceiling_hit_funds_the_channel() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1175,7 +1194,6 @@ mod tests {
     fn a_zero_working_deposit_disables_the_reactive_leg() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1199,7 +1217,6 @@ mod tests {
     fn reactive_topups_are_bounded() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1225,7 +1242,6 @@ mod tests {
     fn a_refusal_right_after_a_topup_is_waited_out_not_funded() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1247,7 +1263,6 @@ mod tests {
     fn the_settle_wait_is_bounded() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
@@ -1265,34 +1280,22 @@ mod tests {
         );
     }
 
-    /// Budgets whose near-expiry guard is ARMED: a channel expiring `secs_left`
-    /// seconds from [`NOW`], and a one-day margin. Genuine exhaustion inside the
-    /// margin must refuse funding rather than escrow into a doomed channel.
-    fn budgets_expiring_in(working_deposit: U256, secs_left: u64) -> ResumeBudgets {
-        ResumeBudgets {
-            expires_at: NOW + secs_left,
-            min_ttl: Duration::from_secs(86_400),
-            ..budgets(working_deposit)
-        }
-    }
-
-    /// #1603: a genuine ceiling hit on a channel inside the near-expiry margin is
-    /// NOT funded — `topUp` cannot extend `expires_at`, so a fresh working-deposit
-    /// escrowed here could expire before the resumed leg spends it. The loop ends
-    /// the pull cleanly instead, and the caller opens a fresh channel next miss.
+    /// A genuine ceiling hit while the node's self-issued capability is inside its
+    /// expiry margin regenerates the capability rather than refusing — the node owns
+    /// the pool and the key, so it re-signs and retries; the pool has no expiry, so
+    /// nothing is stranded.
     #[test]
-    fn a_near_expiry_channel_is_not_topped_up() {
+    fn a_capability_near_expiry_is_regenerated_not_refused() {
         // Exhausted by our own accounting (deposit == committed), so absent the
-        // expiry guard this is exactly `a_corroborated_ceiling_hit_funds_the_channel`
-        // — the ONLY thing steering it away from `TopUp` is the near-expiry margin.
-        let ctx = ctx_with_deposit(U256::from(10u64));
+        // capability guard this is exactly a corroborated ceiling hit that would
+        // `TopUp` — the ONLY thing steering it to regeneration is the near-expiry cap.
+        let ctx = ctx_with_cap_expiry(U256::from(10u64), NOW + 3_600);
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
-        // One hour left, well inside the one-day margin.
-        let budgets = budgets_expiring_in(U256::from(1000u64), 3_600);
+        // Capability expires in one hour, well inside the one-day margin.
+        let budgets = budgets_with_ttl(U256::from(1000u64), Duration::from_secs(86_400));
         assert_eq!(
             decide(
                 &insufficient_deposit(),
@@ -1303,24 +1306,23 @@ mod tests {
                 NOW,
                 budgets
             ),
-            ResumeAction::NearExpiry
+            ResumeAction::RegenerateCapability
         );
     }
 
-    /// #1603: the guard fires ONLY inside the margin. A channel with ample time to
-    /// its expiry is funded exactly as before — the same corroborated exhaustion,
-    /// the same working target — so the guard cannot suppress healthy top-ups.
+    /// The guard fires ONLY inside the margin. A capability with ample time to its
+    /// expiry is funded exactly as before — the same corroborated exhaustion, the
+    /// same working target — so the guard cannot suppress healthy top-ups.
     #[test]
-    fn a_healthy_channel_still_funds_even_with_the_guard_armed() {
-        let ctx = ctx_with_deposit(U256::from(10u64));
+    fn a_healthy_capability_still_funds_even_with_the_guard_armed() {
+        // Ten days to the capability's expiry, comfortably past the one-day margin.
+        let ctx = ctx_with_cap_expiry(U256::from(10u64), NOW + 10 * 86_400);
         let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
         let working = U256::from(1000u64);
-        // Ten days left, comfortably past the one-day margin.
-        let budgets = budgets_expiring_in(working, 10 * 86_400);
+        let budgets = budgets_with_ttl(working, Duration::from_secs(86_400));
         assert_eq!(
             decide(
                 &insufficient_deposit(),
@@ -1335,54 +1337,18 @@ mod tests {
         );
     }
 
-    /// #1603: an already-past expiry (clock skew, or a channel that expired mid-pull)
-    /// reads as zero time remaining — firmly inside the margin — and is refused, not
-    /// funded. `saturating_sub` is what keeps `expires_at < now` from wrapping to a
-    /// huge remaining time that would wave the top-up through.
+    /// A zero margin disables the guard — a near-expiry capability funds exactly as
+    /// it would without the guard, the operator's explicit opt-out.
     #[test]
-    fn an_already_past_expiry_is_refused() {
-        let ctx = ctx_with_deposit(U256::from(10u64));
+    fn a_zero_margin_disables_the_capability_guard() {
+        // One second to the capability's expiry, but the margin is zero.
+        let ctx = ctx_with_cap_expiry(U256::from(10u64), NOW + 1);
         let committed = Cumulative {
-            nonce: U256::from(1u64),
-            bytes: U256::from(4096u64),
-            amount: U256::from(10u64),
-        };
-        let budgets = ResumeBudgets {
-            expires_at: NOW - 1,
-            min_ttl: Duration::from_secs(86_400),
-            ..budgets(U256::from(1000u64))
-        };
-        assert_eq!(
-            decide(
-                &insufficient_deposit(),
-                &ctx,
-                committed,
-                MB_BYTES,
-                1_000,
-                NOW,
-                budgets
-            ),
-            ResumeAction::NearExpiry
-        );
-    }
-
-    /// #1603: a zero margin disables the guard — a near-expiry channel funds exactly
-    /// as it did pre-guard, the operator's explicit opt-out.
-    #[test]
-    fn a_zero_margin_disables_the_near_expiry_guard() {
-        let ctx = ctx_with_deposit(U256::from(10u64));
-        let committed = Cumulative {
-            nonce: U256::from(1u64),
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
         let working = U256::from(1000u64);
-        // One second to expiry, but the margin is zero, so the guard never arms.
-        let budgets = ResumeBudgets {
-            expires_at: NOW + 1,
-            min_ttl: Duration::ZERO,
-            ..budgets(working)
-        };
+        let budgets = budgets_with_ttl(working, Duration::ZERO);
         assert_eq!(
             decide(
                 &insufficient_deposit(),
@@ -1397,17 +1363,27 @@ mod tests {
         );
     }
 
-    /// #1603: a `NEVER_EXPIRES` (0) channel has no deadline to be close to, so the
-    /// guard never fires however small the wall-clock reading — funding proceeds.
+    /// The never-expiring self-capability (`u64::MAX`) has no deadline to be close
+    /// to, so the guard never fires however small the wall-clock reading. `None`
+    /// (no capability) also reads as never-near. A real deadline inside the margin
+    /// does fire.
     #[test]
-    fn a_never_expires_channel_is_never_near_expiry() {
-        assert!(!near_expiry(
-            NEVER_EXPIRES,
+    fn capability_near_expiry_matches_the_expiry_and_margin() {
+        assert!(!capability_near_expiry(
+            Some(u64::MAX),
             NOW,
             Duration::from_secs(86_400)
         ));
-        // ...and a real deadline one second out IS near expiry under the same margin.
-        assert!(near_expiry(NOW + 1, NOW, Duration::from_secs(86_400)));
+        assert!(!capability_near_expiry(
+            None,
+            NOW,
+            Duration::from_secs(86_400)
+        ));
+        assert!(capability_near_expiry(
+            Some(NOW + 1),
+            NOW,
+            Duration::from_secs(86_400)
+        ));
     }
 
     /// A rejection that is not about the deposit is nobody's funding problem.
@@ -1415,7 +1391,6 @@ mod tests {
     fn an_unrelated_failure_is_terminal() {
         let ctx = ctx_with_deposit(U256::from(10u64));
         let committed = Cumulative {
-            nonce: U256::ZERO,
             bytes: U256::ZERO,
             amount: U256::ZERO,
         };
