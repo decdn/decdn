@@ -134,6 +134,14 @@ pub struct FillSession {
     /// node's pull leg selects on it to abort ingest; the tagged partial persists
     /// for a later resume.
     cancel: CancellationToken,
+    /// The node's pull-thread [`JoinHandle`](std::thread::JoinHandle), parked here by
+    /// the owner right after it spawns the pull, so whichever observer leaves LAST
+    /// joins it. That frees an owner whose OWN client finishes first from parking in
+    /// the join while other observers still stream: a non-last-out release returns
+    /// immediately, and the true last-out [`ObserverLease`] drop takes the handle back
+    /// out to join OFF the map lock. `None` when no pull was spawned (an attach, or a
+    /// spawn that failed).
+    pull_thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl FillSession {
@@ -160,7 +168,43 @@ impl FillSession {
             covered: StdMutex::new(ChunkRanges::all()),
             observers: AtomicUsize::new(0),
             cancel: CancellationToken::new(),
+            pull_thread: StdMutex::new(None),
         })
+    }
+
+    /// Park the owner's pull-thread handle on the session so whichever observer leaves
+    /// LAST joins it. Called once, on the owner branch, right after the pull thread is
+    /// spawned. The attach path never calls this — it drives no pull of its own.
+    ///
+    /// Refuses to overwrite an already-parked handle: a session has exactly one owner
+    /// (`FillRegistry::claim` returns one `Owner`), so a second park cannot happen —
+    /// but if a future regression called this twice, overwriting would DROP the first
+    /// handle and detach its thread, orphaning a pull that keeps paying/draining. So
+    /// keep the first (the one the last-out observer will join) and `debug_assert` the
+    /// double-park loudly in tests/dev.
+    pub fn set_pull_handle(&self, handle: std::thread::JoinHandle<()>) {
+        let mut slot = self
+            .pull_thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        debug_assert!(
+            slot.is_none(),
+            "a FillSession parks exactly one pull-thread handle; a second park would \
+             detach the first and orphan its pull"
+        );
+        if slot.is_none() {
+            *slot = Some(handle);
+        }
+    }
+
+    /// Take the parked pull-thread handle, if any. Called only by the last-out lease
+    /// teardown, so exactly one caller ever receives it — the one that then joins the
+    /// thread off-task.
+    fn take_pull_handle(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.pull_thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Set the chunk ranges this fill will produce. Called once at registration,
@@ -372,6 +416,11 @@ impl Outboard for SessionOutboardReader {
 /// count; the last-out drop, if the pull is still running, cancels the pull so a
 /// fill no client is waiting on stops ingesting (#1610).
 ///
+/// Teardown is the same whether the lease is dropped or explicitly [`Self::release`]d;
+/// `release` additionally hands the last-out caller the session's parked pull-thread
+/// handle to join, so whichever observer leaves LAST joins the pull — an owner whose
+/// own client finishes first is not parked in the join while other observers stream.
+///
 /// The decrement + cancel decision runs UNDER the registry map lock — the same
 /// lock `fill_plan`/`register_fill` hold when they attach an observer. That mutual
 /// exclusion closes the resurrection race: a concurrent `fill_plan` cannot
@@ -385,46 +434,73 @@ pub struct ObserverLease {
     session: Arc<FillSession>,
     registry: Weak<FillRegistry>,
     hash: Hash,
+    /// Cleared once teardown has run. [`Self::release`] consumes the lease and runs
+    /// teardown explicitly; the value then still `Drop`s, so this flag makes the
+    /// second pass a no-op — the decrement fires exactly once.
+    armed: bool,
 }
 
 impl ObserverLease {
-    /// Explicitly release the lease. Equivalent to `drop(self)`; named so a serve
-    /// leg's teardown reads as intent rather than an incidental drop.
-    pub fn detach(self) {}
-}
+    /// Release the lease at a serve leg's teardown, handing back the parked
+    /// pull-thread handle when THIS drop is the last one out. The caller joins that
+    /// handle OFF the registry map lock and off its accept task (on a blocking
+    /// thread). A non-last-out release returns `None`, so an owner whose own client
+    /// finished first returns at once, leaving the pull filling for the remaining
+    /// observers — the last of which cancels it (#1610 preserved). Named so teardown
+    /// reads as intent rather than an incidental drop.
+    #[must_use]
+    pub fn release(mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.teardown()
+    }
 
-impl Drop for ObserverLease {
-    fn drop(&mut self) {
+    /// The last-out decrement + cancel, shared by [`Self::release`] and [`Drop`].
+    /// Runs under the registry map lock — the SAME lock `fill_plan`/`register_fill`
+    /// hold to attach — so the decrement, the map removal, and the cancel decision
+    /// cannot interleave with an attach (the #1610 resurrection-race fix). It only
+    /// TAKES the pull handle here; it never JOINS under the lock. Idempotent via
+    /// `armed`.
+    fn teardown(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if !self.armed {
+            return None;
+        }
+        self.armed = false;
         let Some(registry) = self.registry.upgrade() else {
             // Registry dropped — the fill (and its map entry) are gone; nothing can
             // attach, so the decrement + cancel are moot. Skip.
-            return;
+            return None;
         };
-        // Take the SAME lock `fill_plan`/`register_fill` hold to attach, so the
-        // decrement, the map removal, and the cancel decision cannot interleave with
-        // an attach.
         let mut map = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
         // `fetch_sub` returns the PREVIOUS value; `1` means this drop took the
         // count to 0.
         let prev = self.session.observers.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            // Last observer left: free the session from the map so dead sessions do
-            // not accumulate forever (a slow leak — `fill_plan` skips them via
-            // `is_dead` but never frees them). Remove by pointer identity so a sibling
-            // session for the same hash survives; drop the `hash` key if its Vec empties.
-            if let Some(sessions) = map.get_mut(&self.hash) {
-                sessions.retain(|s| !Arc::ptr_eq(s, &self.session));
-                if sessions.is_empty() {
-                    map.remove(&self.hash);
-                }
-            }
-            // Cancel only if the pull has not already ended — a completed pull needs
-            // no cancel, and a failed one already terminated. The session is removed
-            // from the map regardless.
-            if self.session.outcome().is_none() {
-                self.session.cancel.cancel();
+        if prev != 1 {
+            return None;
+        }
+        // Last observer left: free the session from the map so dead sessions do not
+        // accumulate forever (a slow leak — `fill_plan` skips them via `is_dead` but
+        // never frees them). Remove by pointer identity so a sibling session for the
+        // same hash survives; drop the `hash` key if its Vec empties.
+        if let Some(sessions) = map.get_mut(&self.hash) {
+            sessions.retain(|s| !Arc::ptr_eq(s, &self.session));
+            if sessions.is_empty() {
+                map.remove(&self.hash);
             }
         }
+        // Cancel only if the pull has not already ended — a completed pull needs no
+        // cancel, and a failed one already terminated. The session is removed from the
+        // map regardless.
+        if self.session.outcome().is_none() {
+            self.session.cancel.cancel();
+        }
+        // Hand the parked pull-thread handle to this last-out caller to join off-task.
+        // Taking (not joining) it here keeps the map lock free of a blocking join.
+        self.session.take_pull_handle()
+    }
+}
+
+impl Drop for ObserverLease {
+    fn drop(&mut self) {
+        let _ = self.teardown();
     }
 }
 
@@ -517,6 +593,7 @@ impl FillRegistry {
             session: Arc::clone(session),
             registry: Arc::downgrade(self),
             hash,
+            armed: true,
         }
     }
 
@@ -1118,6 +1195,79 @@ mod fill_registry_tests {
         drop(owner);
         assert_eq!(session.observer_count(), 0);
         assert!(session.is_cancelled(), "last observer left — cancelled");
+    }
+
+    /// The pull-thread handle is parked on the session and handed back to whichever
+    /// observer leaves LAST. An owner whose own client finishes first (a non-last-out
+    /// release) gets `None`, so its accept task returns at once while the pull keeps
+    /// filling; the remaining observer, on its last-out release, takes the handle to
+    /// join. This is the whole point of the lifecycle refactor: the finished owner is
+    /// no longer parked in the join while another observer streams.
+    #[test]
+    fn last_out_release_takes_the_pull_handle() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x40);
+
+        let session = FillSession::new(root(0x40), total);
+        session.set_covered(ranges(0, 0, total));
+        let owner = reg.register_fill(hash, Arc::clone(&session));
+
+        // Owner parks the pull-thread handle on the shared session after spawning it.
+        session.set_pull_handle(std::thread::spawn(|| {}));
+
+        // A second observer attaches.
+        let plan = reg.fill_plan(hash, 0, 0, total);
+        let (_attached, observer) = plan.session.expect("attaches a second observer");
+        assert_eq!(session.observer_count(), 2, "owner + attached");
+
+        // Owner leaves FIRST (count 2 → 1, not last-out): no handle handed back, so its
+        // accept task is freed immediately; the pull is NOT cancelled.
+        assert!(
+            owner.release().is_none(),
+            "a non-last-out release must not take the pull handle"
+        );
+        assert_eq!(session.observer_count(), 1);
+        assert!(
+            !session.is_cancelled(),
+            "an observer still streams — no cancel"
+        );
+
+        // The last observer leaving (count 1 → 0) takes the handle to join off-task and
+        // cancels the pull.
+        let handle = observer
+            .release()
+            .expect("the last-out release must hand back the pull handle");
+        handle.join().expect("the parked pull thread joins");
+        assert_eq!(session.observer_count(), 0);
+        assert!(
+            session.is_cancelled(),
+            "last observer left — pull cancelled"
+        );
+    }
+
+    /// The spawn-failure path parks no handle, so a last-out release must still be
+    /// safe: it runs the decrement + cancel and simply returns `None` (nothing to
+    /// join). Guards the owner error arm that releases its lease without ever storing
+    /// a pull thread.
+    #[test]
+    fn last_out_release_without_a_parked_handle_returns_none() {
+        let total = 8 * G;
+        let reg = Arc::new(FillRegistry::new());
+        let hash = store_hash(0x41);
+
+        let session = FillSession::new(root(0x41), total);
+        session.set_covered(ranges(0, 0, total));
+        let owner = reg.register_fill(hash, Arc::clone(&session));
+
+        assert!(
+            owner.release().is_none(),
+            "no handle parked → nothing to join"
+        );
+        assert!(
+            session.is_cancelled(),
+            "sole observer left — pull cancelled"
+        );
     }
 
     // The `claim` tests below assert STRUCTURAL outcomes (which variant, which

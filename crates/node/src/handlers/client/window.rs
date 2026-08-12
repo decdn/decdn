@@ -331,16 +331,23 @@ impl ClientHandler {
                     Ok(handle) => handle,
                     Err(e) => {
                         // The OS refused the thread: fail any attached observer fast
-                        // (`mark_ended`), release the lease, and fail the serve.
+                        // (`mark_ended`), release the lease, and fail the serve. No pull
+                        // handle is parked yet, so `release` yields nothing to join.
                         session.mark_ended(Err(decdn_cache::FillError::new(format!(
                             "could not spawn serve-miss pull thread: {e}"
                         ))));
-                        lease.detach();
+                        let _ = lease.release();
                         return Err(anyhow::anyhow!(
                             "could not spawn serve-miss pull thread: {e}"
                         ));
                     }
                 };
+
+                // Park the pull-thread handle on the shared session so whichever
+                // observer leaves LAST joins it (teardown below) — freeing this owner's
+                // accept task the moment its own delivery finishes, even while an
+                // attached observer keeps streaming.
+                session.set_pull_handle(pull_thread);
 
                 // Run the serve leg on THIS (accept) task and await it. It owns
                 // termination. It mints its outboard reader from the shared `session`
@@ -364,18 +371,22 @@ impl ClientHandler {
                     )
                     .await;
 
-                // Teardown (LEASE-driven, #1610): drop the observer lease FIRST. If this
-                // was the last observer and the pull is still running, that drop cancels
-                // the session token, stopping the pull; if other observers remain the
-                // pull keeps filling for them. THEN JOIN the pull thread — bounded, since
-                // the pull ends when it finishes filling R or is cancelled, and its
-                // `SettleOnDrop` persists the buyer watermark (#852). Joined off the
-                // async worker via `spawn_blocking`. Never cancel the token directly.
-                lease.detach();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = pull_thread.join();
-                })
-                .await;
+                // Teardown (LEASE-driven, #1610): release the observer lease. If THIS
+                // drop is the last one out, `release` has already cancelled the pull
+                // (if still running) under the registry lock and hands back the parked
+                // pull-thread handle to join — bounded, since the pull ends when it
+                // finishes filling R or is cancelled, and its `SettleOnDrop` persists the
+                // buyer watermark (#852). A non-last-out release returns `None`, so an
+                // owner whose own client finished first returns immediately, leaving the
+                // pull filling for the remaining observers. The join runs off the async
+                // worker via `spawn_blocking`; never cancel the token directly, never
+                // join under the registry map lock.
+                if let Some(pull_thread) = lease.release() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = pull_thread.join();
+                    })
+                    .await;
+                }
                 serve_result
             }
             // ATTACH: a live pull already covers this hash. Run a serve leg over the
@@ -407,10 +418,17 @@ impl ClientHandler {
                         window,
                     )
                     .await;
-                // Teardown: drop the lease. If this was the last observer, its drop
-                // cancels the session token, which makes the owner's blocked join
-                // return. No pull thread to join here.
-                lease.detach();
+                // Teardown: release the lease. If THIS observer is the last one out, it
+                // takes the owner's parked pull-thread handle and joins it off-task (the
+                // owner may already have finished its own delivery and returned); its
+                // last-out drop also cancels the pull if it is still running. Otherwise
+                // `release` returns `None` and there is nothing to join.
+                if let Some(pull_thread) = lease.release() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = pull_thread.join();
+                    })
+                    .await;
+                }
                 serve_result
             }
         }
@@ -678,16 +696,22 @@ impl ClientHandler {
                     Ok(handle) => handle,
                     Err(e) => {
                         // The OS refused the thread: fail any attached observer fast
-                        // (`mark_ended`), release the lease, and fail the serve.
+                        // (`mark_ended`), release the lease, and fail the serve. No pull
+                        // handle is parked yet, so `release` yields nothing to join.
                         session.mark_ended(Err(decdn_cache::FillError::new(format!(
                             "could not spawn serve-miss local pull thread: {e}"
                         ))));
-                        lease.detach();
+                        let _ = lease.release();
                         return Err(anyhow::anyhow!(
                             "could not spawn serve-miss local pull thread: {e}"
                         ));
                     }
                 };
+
+                // Park the pull-thread handle on the shared session so whichever
+                // observer leaves LAST joins it (teardown below), freeing this owner's
+                // accept task the moment its own delivery finishes.
+                session.set_pull_handle(pull_thread);
 
                 // Run the serve leg on THIS (accept) task and await it. It owns
                 // termination — mid-stream takedown and client-disconnect are both
@@ -711,16 +735,20 @@ impl ClientHandler {
                     )
                     .await;
 
-                // Teardown (LEASE-driven, #1610): drop the observer lease FIRST (last-out
-                // cancels the session token, stopping the pull; otherwise the pull keeps
-                // filling for the remaining observers), THEN JOIN the pull thread —
-                // bounded, since the pull ends when it finishes filling R or is
-                // cancelled. Never cancel the token directly.
-                lease.detach();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = pull_thread.join();
-                })
-                .await;
+                // Teardown (LEASE-driven, #1610): release the observer lease. If THIS
+                // drop is the last one out, `release` has already cancelled the pull (if
+                // still running) under the registry lock and hands back the parked
+                // pull-thread handle to join — bounded, since the pull ends when it
+                // finishes filling R or is cancelled. A non-last-out release returns
+                // `None`, so an owner whose own client finished first returns immediately,
+                // leaving the pull filling for the remaining observers. Never cancel the
+                // token directly, never join under the registry map lock.
+                if let Some(pull_thread) = lease.release() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = pull_thread.join();
+                    })
+                    .await;
+                }
                 serve_result
             }
             // ATTACH: a live same-hash pull already covers this request. Run a serve leg
@@ -752,9 +780,17 @@ impl ClientHandler {
                         window,
                     )
                     .await;
-                // Teardown: drop the lease. If this was the last observer, its drop
-                // cancels the session token, waking the owner's blocked join.
-                lease.detach();
+                // Teardown: release the lease. If THIS observer is the last one out, it
+                // takes the owner's parked pull-thread handle and joins it off-task (the
+                // owner may already have finished and returned); its last-out drop also
+                // cancels the pull if it is still running. Otherwise `release` returns
+                // `None` and there is nothing to join.
+                if let Some(pull_thread) = lease.release() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = pull_thread.join();
+                    })
+                    .await;
+                }
                 serve_result
             }
         }
