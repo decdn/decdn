@@ -101,7 +101,7 @@ pub struct ClientFetchArgs {
 
     /// `PaymentChannel` contract address (0x hex) — the voucher EIP-712
     /// `verifyingContract` and the `openChannel` target. Overrides
-    /// `blockchain.payment_channel_address`.
+    /// `blockchain.payment_pool_address`.
     #[arg(long, value_name = "0xADDR")]
     pub payment_channel_address: Option<String>,
 

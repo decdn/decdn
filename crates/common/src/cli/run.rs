@@ -84,9 +84,9 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
 
-    /// `PaymentChannel` contract address (0x-prefixed hex).
-    #[arg(long, value_name = "ADDR", env = "DECDN_PAYMENT_CHANNEL_ADDRESS")]
-    pub payment_channel_address: Option<String>,
+    /// `PaymentPool` contract address (0x-prefixed hex).
+    #[arg(long, value_name = "ADDR", env = "DECDN_PAYMENT_POOL_ADDRESS")]
+    pub payment_pool_address: Option<String>,
 
     /// `CapacityBond` contract address (0x-prefixed hex).
     #[arg(long, value_name = "ADDR", env = "DECDN_CAPACITY_BOND_ADDRESS")]

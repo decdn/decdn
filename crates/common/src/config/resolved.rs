@@ -86,8 +86,9 @@ pub struct ResolvedBlockchain {
     /// `DECDN_KEYSTORE_PASSWORD` env var, then this file, then prompts on
     /// stdin if connected to a TTY.
     pub keystore_password_file: Option<PathBuf>,
-    /// `PaymentChannel` contract address.
-    pub payment_channel_address: String,
+    /// `PaymentPool` contract address — the shared payment pool this node
+    /// registers against for buyer and seller flows alike.
+    pub payment_pool_address: String,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
     /// `OriginAssignment` contract address. `Some` only when the operator opts
@@ -133,54 +134,46 @@ pub struct ResolvedBlockchain {
     /// (`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`); the resolver rejects `0`.
     pub rate_bounds_poll_interval_sec: u64,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the seller
-    /// settlement path submits an on-chain `withdraw` (#327). Defaults to
-    /// 1 USDC (`1_000_000` `µUSDC`) when unset.
+    /// settlement path submits an on-chain redeem against the pool (#327).
+    /// Defaults to 1 USDC (`1_000_000` `µUSDC`) when unset.
     pub redeem_threshold_micro_usdc: u64,
     /// Seconds between the redeemer self-tick sweeps (#327, #751): the
-    /// low-frequency backstop that scans every channel for an above-threshold
+    /// low-frequency backstop that scans every pool for an above-threshold
     /// claim independent of the advisory per-voucher hints. Defaults to 300s
     /// (`DEFAULT_REDEEM_INTERVAL_SECS`); the resolver rejects `0`.
     pub redeem_interval_secs: u64,
-    /// First-contact `openChannel` deposit (base units, `µUSDC`). Defaults to
+    /// First-contact pool-open deposit (base units, `µUSDC`). Defaults to
     /// 0.5 USDC (`500_000`); escrowed as configured at open time (no on-chain
     /// floor; only a non-zero requirement). See
     /// `ResolvedBlockchain::buyer_working_deposit_micro_usdc`.
     pub buyer_initial_deposit_micro_usdc: u64,
-    /// Refill target (base units, `µUSDC`) every `topUp` restores toward.
-    /// Defaults to 10 USDC (`10_000_000`). `0` disables top-up. Guaranteed
-    /// `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    /// Refill target (base units, `µUSDC`) every top-up restores the pool
+    /// balance toward. Defaults to 10 USDC (`10_000_000`). `0` disables
+    /// top-up. Guaranteed `>= buyer_initial_deposit_micro_usdc` when nonzero.
     pub buyer_working_deposit_micro_usdc: u64,
-    /// Minimum remaining seconds to a channel's on-chain `expires_at` below which
-    /// the node-to-node miss pull refuses a reactive top-up (#1603), since `topUp`
-    /// cannot extend expiry. Defaults to
+    /// Minimum remaining seconds to the buyer's self-issued capability
+    /// `expiry` below which the node-to-node miss pull refuses a reactive
+    /// top-up (#1603) and regenerates the capability instead (see
+    /// [`Self::buyer_capability_ttl_secs`]). Defaults to
     /// `super::DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS` (~1 day); `0` disables
     /// the guard.
     pub buyer_reactive_topup_min_ttl_secs: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
-    /// `PaymentChannel` contract at startup (#744, ADR 003 § Deposit
+    /// `PaymentPool` contract at startup (#744, ADR 003 § Deposit
     /// Economics). Defaults to `true`; set `false` to manage the allowance
-    /// out-of-band (e.g. a tighter per-channel approval policy).
+    /// out-of-band (e.g. a tighter per-pool approval policy).
     pub buyer_max_approve: bool,
-    /// Outstanding-USDC threshold (base units, `µUSDC`) at which the seller
-    /// settlement path proactively `closeChannel`s a channel to secure a large
-    /// un-redeemed balance on-chain before the client can go dark (#742). `None`
-    /// disables auto-settlement (the default — behavior unchanged). When `Some`,
-    /// the resolver guarantees it is `> 0`.
-    pub settlement_auto_threshold_micro_usdc: Option<u64>,
-    /// Nonce-span companion threshold (#742): close once a channel's un-redeemed
-    /// nonce span (`last_nonce − claimedNonce`) reaches this value, independent of
-    /// USDC value. The span is an UPPER BOUND on the un-redeemed voucher count
-    /// (nonces may skip values per ADR 003 §Voucher Nonce Convention), not an
-    /// exact count. `None` disables the span trigger; when `Some`, the resolver
-    /// guarantees `> 0`.
-    pub settlement_auto_by_voucher_nonce_span: Option<u64>,
-    /// Estimated on-chain gas-cost floor (base units, `µUSDC`) below which the
-    /// node does not submit a self-defense `disputeChannel` (#1586). Always-on
-    /// (not opt-in): the resolver defaults it to
-    /// `super::DEFAULT_DISPUTE_MIN_RESIDUAL_MICRO_USDC`. `0` disables the floor
-    /// (dispute any positive residual); a zero-recovery dispute is guarded out
-    /// regardless of this value.
-    pub settlement_dispute_min_residual_micro_usdc: u64,
+    /// The node's refundable floor `M` (base units, `µUSDC`), sized per ADR
+    /// 003 § Sizing (`M = k·ρ·B·Δ`). The node stops serving a pool once its
+    /// remaining on-chain balance minus `M` can no longer cover the next
+    /// credit window. Defaults to 1 USDC (`1_000_000` `µUSDC`).
+    pub pool_min_remaining_deposit_micro_usdc: u64,
+    /// Seconds the node-as-buyer sets a self-issued capability's `expiry`
+    /// horizon to. The pool itself carries no expiry (ADR 003); only the
+    /// capability does. Read by the near-expiry regenerate guard
+    /// ([`Self::buyer_reactive_topup_min_ttl_secs`]). Defaults to 86,400s
+    /// (1 day).
+    pub buyer_capability_ttl_secs: u64,
 }
 
 /// Resolved cache fields.
@@ -630,7 +623,7 @@ impl Default for ResolvedReceipts {
 /// CLI flag > config file > built-in default.
 ///
 /// Required fields that have no default (`rpc_url`,
-/// `payment_channel_address`, `capacity_bond_address`) cause
+/// `payment_pool_address`, `capacity_bond_address`) cause
 /// [`super::resolve_config`] to return an error if not provided.
 #[derive(Debug)]
 pub struct ResolvedConfig {

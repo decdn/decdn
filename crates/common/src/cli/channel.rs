@@ -112,7 +112,7 @@ pub struct ChannelChainArgs {
     pub rpc_url: Option<String>,
 
     /// `PaymentChannel` contract address — the on-chain call target and the
-    /// EIP-712 `verifyingContract` (else `blockchain.payment_channel_address`).
+    /// EIP-712 `verifyingContract` (else `blockchain.payment_pool_address`).
     #[arg(long, value_name = "ADDRESS")]
     pub payment_channel_address: Option<String>,
 

@@ -126,8 +126,9 @@ pub struct BlockchainConfig {
     pub rpc_url: Option<String>,
     /// Ethereum keystore file path.
     pub eth_keystore: Option<PathBuf>,
-    /// `PaymentChannel` contract address.
-    pub payment_channel_address: Option<String>,
+    /// `PaymentPool` contract address — the shared payment pool this node
+    /// registers against for buyer and seller flows alike.
+    pub payment_pool_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the
@@ -191,93 +192,80 @@ pub struct BlockchainConfig {
     /// be `0` (that would poll every tick); rejected at config resolution.
     pub rate_bounds_poll_interval_sec: Option<u64>,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the node
-    /// submits an on-chain `withdraw` for a channel (#327, ADR 003 § Operator
+    /// submits an on-chain redeem against the pool (#327, ADR 003 § Operator
     /// early withdrawal). Larger values amortize gas across more delivery;
     /// smaller values bound unsettled exposure. Absent => default
     /// (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
     /// Seconds between the redeemer's self-tick sweeps (#327, #751): the
-    /// low-frequency backstop that scans every channel for an above-threshold
+    /// low-frequency backstop that scans every pool for an above-threshold
     /// claim independent of the advisory per-voucher hints, so a dropped hint can
     /// never strand an accrued balance. Smaller values withdraw earnings sooner
-    /// at the cost of more `getChannel` reads; larger values lean harder on the
+    /// at the cost of more pool-state reads; larger values lean harder on the
     /// hints. Absent => default (300s / 5 min). Must not be `0`; rejected at
     /// config resolution.
     pub redeem_interval_secs: Option<u64>,
     /// Deposit (base units, `µUSDC`) the buyer path escrows when it **opens** a
-    /// new `PaymentChannel` against a provider (the first-contact lock). Kept
+    /// new payment pool against a provider (the first-contact lock). Kept
     /// small so an untried node holds little of the buyer's capital on first
     /// contact. Absent => default (0.5 USDC = `500_000`).
     /// Escrowed as configured at open time (no on-chain floor; only a
     /// non-zero requirement).
     pub buyer_initial_deposit_micro_usdc: Option<u64>,
-    /// Deposit (base units, `µUSDC`) every `topUp` refills the channel toward
-    /// once it is reused or runs short mid-transfer. Both refill legs target
-    /// this: the proactive low-water refill, which both binaries run on channel
-    /// reuse, and the reactive mid-transfer top-up, which the `decdn fetch`
+    /// Deposit (base units, `µUSDC`) every top-up refills the pool balance
+    /// toward once it is reused or runs short mid-transfer. Both refill legs
+    /// target this: the proactive low-water refill, which both binaries run on
+    /// pool reuse, and the reactive mid-transfer top-up, which the `decdn fetch`
     /// streaming path and the daemon's node-to-node cache-miss pull both run
     /// (#1530). `decdn bundle pull` is the one remaining fetch path with the
     /// proactive leg only. Larger values amortize gas
-    /// across more delivery at the cost of more capital locked for up to the
-    /// 48h dispute window. Absent => default (10 USDC = `10_000_000`). `0`
-    /// disables top-up entirely (a spent-down channel errors instead of
-    /// refilling). Must be `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    /// across more delivery at the cost of more capital locked. Absent =>
+    /// default (10 USDC = `10_000_000`). `0` disables top-up entirely (a
+    /// spent-down deposit errors instead of refilling). Must be
+    /// `>= buyer_initial_deposit_micro_usdc` when nonzero.
     pub buyer_working_deposit_micro_usdc: Option<u64>,
-    /// Minimum remaining time (SECONDS) to a channel's on-chain `expires_at`
-    /// below which the daemon's node-to-node miss pull will NOT reactively top
-    /// that channel up (#1603). `topUp` deliberately does not extend expiry (the
-    /// contract forbids it), so escrowing a fresh working-deposit into a channel
-    /// this close to expiry risks the deposit expiring before the resumed leg can
-    /// spend it — stranding it until `reclaimExpired`. Inside this margin the pull
-    /// ends cleanly instead, so the next miss opens a fresh, full-lifetime channel.
-    /// Seconds so operators can tune it per chain lane. Absent => default
+    /// Minimum remaining time (SECONDS) to the buyer's self-issued capability
+    /// `expiry` below which the daemon's node-to-node miss pull will NOT
+    /// reactively top up that pool (#1603). A capability nearing expiry is
+    /// regenerated rather than topped up — escrowing a fresh working deposit
+    /// against a capability this close to expiry risks the capability expiring
+    /// before the resumed leg can spend it. Inside this margin the pull ends
+    /// cleanly instead, so the next miss regenerates a fresh, full-lifetime
+    /// capability (see [`Self::buyer_capability_ttl_secs`]). Seconds so
+    /// operators can tune it per chain lane. Absent => default
     /// (`super::DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS`, ~1 day). `0` disables
     /// the guard (always top up, whatever the remaining time).
     pub buyer_reactive_topup_min_ttl_secs: Option<u64>,
     /// Whether to issue an unlimited (max) USDC approval for the
-    /// `PaymentChannel` contract so the buyer path can `openChannel` (#744).
+    /// `PaymentPool` contract so the buyer path can join a pool (#744).
     /// The absent-default is **profile-dependent**: the node daemon defaults to
     /// `true` (a long-lived operator amortizes one unlimited approval across many
     /// node-to-node miss pulls), while the `decdn` client fetch commands (`fetch`,
     /// `bundle pull`) default to `false`, i.e. an **exact deposit-sized** approval
-    /// scoped to what each channel escrows. Set `true` on the client to opt a
+    /// scoped to what each pool escrows. Set `true` on the client to opt a
     /// power user back into the unlimited allowance.
     pub buyer_max_approve: Option<bool>,
-    /// Outstanding (un-redeemed) USDC (base units, `µUSDC`) at which the node
-    /// proactively `closeChannel`s a channel to start its dispute window, so a
-    /// large unsubmitted voucher balance is secured on-chain before the client
-    /// can go dark (#742, ADR 003 § payment-channel lifecycle). A close starts
-    /// the dispute window; the existing settle sweep finalizes the remainder
-    /// after it elapses. Distinct from (and should be set above)
-    /// [`Self::redeem_threshold_micro_usdc`] — `withdraw` reclaims earnings on a
-    /// still-open channel, whereas this caps total at-risk exposure by closing.
-    /// Absent => disabled (`None`): behavior is unchanged unless an operator
-    /// opts in. A configured value of `0` is rejected at resolution.
-    pub settlement_auto_threshold_micro_usdc: Option<u64>,
-    /// Optional nonce-span companion to
-    /// [`Self::settlement_auto_threshold_micro_usdc`] (#742): close a channel
-    /// once its un-redeemed nonce span reaches at least this value, independent
-    /// of USDC value. The span is the off-chain latest voucher nonce minus the
-    /// on-chain `claimedNonce` — an UPPER BOUND on the un-redeemed voucher count,
-    /// NOT an exact count: voucher nonces may skip values (ADR 003 §Voucher Nonce
-    /// Convention), so a gapped stream reaches a given span with fewer vouchers
-    /// than the span implies. Useful when many small vouchers accrue without
-    /// crossing the value threshold. Either trigger firing closes the channel
-    /// (logical OR). Absent => disabled (`None`); a configured value of `0` is
-    /// rejected at resolution.
-    pub settlement_auto_by_voucher_nonce_span: Option<u64>,
-    /// Estimated on-chain gas-cost floor (base units, `µUSDC`) below which the
-    /// node does NOT submit a self-defense `disputeChannel` (#1586). When a
-    /// counterparty closes one of this node's channels at a watermark staler
-    /// than the node's latest voucher, the node reacts by submitting that
-    /// voucher inside the dispute window — but only when the recoverable residual
-    /// (`myAmount − onchainClaimedAmount`) meets this floor, so a dust residual
-    /// never costs more gas than it recovers. Unlike the auto-settlement
-    /// triggers this is an always-on reaction (not opt-in); absent => default
-    /// (0.1 USDC = `100_000`). `0` disables the floor (dispute any positive
-    /// residual). No `> 0` requirement — a zero-recovery dispute is guarded out
-    /// regardless.
-    pub settlement_dispute_min_residual_micro_usdc: Option<u64>,
+    /// The node's refundable floor `M` (base units, `µUSDC`): the minimum
+    /// remaining on-chain pool balance the node insists on keeping in reserve
+    /// (ADR 003 § Sizing, `M = k·ρ·B·Δ` — a function of the redeem cadence `k`,
+    /// the node's advertised rate `ρ`, the credit window `B`, and the round-trip
+    /// slack `Δ`). The node stops serving a pool once its remaining on-chain
+    /// balance minus `M` can no longer cover the next credit window, so a buyer
+    /// that drains its pool balance cannot leave the node's already-delivered,
+    /// not-yet-redeemed bytes stranded. Absent => default (1 USDC =
+    /// `1_000_000` `µUSDC`), a conservative static value at the redeem-threshold
+    /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
+    /// build-time constant.
+    pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
+    /// Seconds the node-as-buyer sets a self-issued capability's `expiry`
+    /// horizon to. The pool itself carries no expiry (ADR 003 — no epoch, no
+    /// pool-expiry); only the capability the buyer signs to authorize spend
+    /// against it does. The near-expiry regenerate guard
+    /// ([`Self::buyer_reactive_topup_min_ttl_secs`]) reads this horizon to
+    /// decide when a capability is close enough to its own expiry that a fresh
+    /// one should be issued instead of topped up. Absent => default (86,400s /
+    /// 1 day).
+    pub buyer_capability_ttl_secs: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
     /// operator funds the bond in TOKEN directly). Consumed only by the CLI
