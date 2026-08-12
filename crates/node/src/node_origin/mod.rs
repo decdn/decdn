@@ -716,7 +716,7 @@ impl NodeOrigin {
                 return Err(PullMiss::for_verdict(verdict));
             }
         };
-        let ledger = channel_ledger(deps, provider_addr, &ctx);
+        let ledger = lane_ledger(deps, provider_addr, &ctx);
         let stream_guard = deps.metrics.outbound_stream_guard();
         match open_progressive_upstream(
             &deps.endpoint,
@@ -1512,8 +1512,8 @@ struct PullOutcome<T> {
 /// Deliberately NOT a per-verdict taxonomy. The crate-private `PullVerdict`
 /// already carries the full one, and it answers a different question ("what does
 /// this failure say about the PEER?"); this answers "what may we tell the
-/// client?". Only its `OurLocalFault` arm changes that answer: a wedged or settled
-/// channel to ONE provider is not node-wide degradation, and it already has its
+/// client?". Only its `OurLocalFault` arm changes that answer: a wedged lane to
+/// ONE provider is not node-wide degradation, and it already has its
 /// own remedy (keep the row, suppress the provider).
 ///
 /// `#[must_use]`: a classifier's verdict that is dropped rather than propagated silently
@@ -1552,16 +1552,15 @@ impl PullMiss {
             // Every other verdict is either about the peer (`Refused` of the first three
             // kinds, `Stalled`, `Corruption`, `Unreachable`), about OUR configuration of
             // what we will accept from it (`OversizeClaim`, `RateCeiling`, `OurDeadline`),
-            // or about one channel to one provider (the three voucher arms). None of them
+            // or about one lane to one provider (the two voucher arms). None of them
             // is evidence that THIS node is broken for every client and every blob, so
-            // none earns an `InternalError`: a node with one wedged channel is still a
+            // none earns an `InternalError`: a node with one wedged lane is still a
             // healthy node that simply cannot serve this blob right now.
             PullVerdict::OversizeClaim
             | PullVerdict::RateCeiling
             | PullVerdict::OurDeadline
             | PullVerdict::Stalled
-            | PullVerdict::OurDeadChannel(_)
-            | PullVerdict::OurSettledChannel(_)
+            | PullVerdict::OurDeadLane(_)
             | PullVerdict::OurVoucherRetryable(_)
             | PullVerdict::Refused(
                 RefusalVerdict::NodeFault
@@ -1669,16 +1668,16 @@ fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: PoolContext) -> anyhow::Result<
     Ok(ctx.with_client_binding(binding))
 }
 
-/// The voucher ledger this pull must issue through: the CHANNEL's, shared with every other
-/// concurrent pull on it — never a fresh one per pull (#1145 review).
+/// The voucher ledger this pull must issue through: the LANE's, shared with every other
+/// concurrent pull on it — never a fresh one per pull.
 ///
 /// One call site per pull path, so neither can quietly go back to minting its own. Both did,
 /// and the caller-owned-ledger entrypoints exist precisely
-/// because that is broken: N concurrent pulls each seeded from `ctx.prior_*` all sign
-/// `prior_nonce + 1` and collide, the upstream accepts one and rejects the rest
-/// `StaleNonce`. `ctx.prior_*` is only a SEED — it loses to a live ledger, which is at least
-/// as far along as the row it was read from. See [`BuyerLedgers`].
-fn channel_ledger(
+/// because that is broken: N concurrent pulls each seeded from `ctx.prior_*` all sign the
+/// same next cumulative watermark and collide, the upstream accepts one and rejects the rest
+/// as a regression. `ctx.prior_*` is only a SEED — it loses to a live ledger, which is at
+/// least as far along as the row it was read from. See [`BuyerLedgers`].
+fn lane_ledger(
     deps: &NodeOriginDeps,
     provider_addr: Address,
     ctx: &PoolContext,
@@ -1764,8 +1763,8 @@ async fn pull_from_candidate(
     // disconnect, node shutdown). On every one of those paths the copy-back never ran
     // and the acked watermark died with
     // the frame, while the USDC it recorded had already left the node. The next pull
-    // then re-signed a stale nonce, the upstream rejected `StaleNonce`, and the
-    // channel was wedged until it expired.
+    // then re-signed a cumulative watermark the upstream had already advanced past,
+    // the upstream rejected it as a regression, and the lane was wedged.
     //
     // `Drop` is the one thing that runs on both paths, so the persist lives there and
     // nowhere else — one path, no second copy to forget. It reads
@@ -1780,7 +1779,7 @@ async fn pull_from_candidate(
             return Err(PullMiss::for_verdict(verdict));
         }
     };
-    let ledger = channel_ledger(deps, provider_addr, &ctx);
+    let ledger = lane_ledger(deps, provider_addr, &ctx);
     let settle = SettleOnDrop {
         deps: SettleDeps::Borrowed(deps),
         provider_addr,
@@ -2029,17 +2028,15 @@ enum DurableMissCause {
 /// Much shorter than the negative cache's own TTL (5 min), and the asymmetry is the
 /// point. A probe's `has_blob: false` is an authoritative statement about content the
 /// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
-/// deliberately collapses SEVEN reject reasons onto the wire `NotFound` so that a probing
-/// client cannot map out other clients' channel balances — and FOUR of the seven are ours or
-/// transient: `InsufficientDeposit`, `UnknownChannel` (while the upstream's chain watcher
-/// catches up), `CooperativeCloseSigned`, and `RangeNotSatisfiable` (our own bad range
-/// computation — counted three here, which undersold the case by one, #1145 review). We
-/// cannot tell them apart, and we must not: the collapse is a privacy property, not an
-/// oversight.
+/// deliberately collapses several reject reasons onto the wire `NotFound` so that a probing
+/// client cannot map out other clients' remaining pool balances — and some of them are ours
+/// or transient: `InsufficientDeposit`, `UnknownChannel` (while the upstream's chain watcher
+/// catches up), and `RangeNotSatisfiable` (our own bad range computation). We cannot tell
+/// them apart, and we must not: the collapse is a privacy property, not an oversight.
 ///
 /// So the refusal is suppressed on the assumption it may be *us*. At the full TTL, a
-/// deposit that ran dry for one pull — or the pre-observation window right after we open
-/// a channel — blackholed a perfectly healthy upstream for five minutes.
+/// pool that ran dry for one pull — or the pre-observation window right after we open
+/// a pool — blackholed a perfectly healthy upstream for five minutes.
 const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 
 // `match_same_arms`: `VoucherRejected` and `OriginBlacklisted` both map to
@@ -2127,42 +2124,30 @@ enum PullVerdict {
     /// The peer went SILENT mid-stream (#1134). Unlike [`Self::OurDeadline`] this IS about
     /// the peer: a clock that resets on every byte can only fire on one that stopped.
     Stalled,
-    /// The peer rejected a voucher and the channel is finished, but its deposit is NOT:
-    /// there is still an escrowed remainder, recoverable only by `reclaimExpired` at expiry
-    /// (#1145 review).
+    /// The peer rejected a voucher and this lane to this provider is finished, but the
+    /// shared pool deposit is NOT: it still backs every other lane and is refundable through
+    /// the pool's own grace-window close and reclaim.
     ///
     /// Split from [`Self::OurVoucherRetryable`] because the two want opposite actions and
-    /// collapsing them is what made a drained deposit invisible. `UpstreamVoucherRejected`
+    /// collapsing them is what made a drained lane invisible. `UpstreamVoucherRejected`
     /// carries a `VoucherRejectReason` whose variants prescribe *different* remedies —
-    /// resend, top up, rotate, stop — and the classifier used to discard it with a bare
+    /// resend, top up, suppress, stop — and the classifier used to discard it with a bare
     /// `.is_some()`, so every one of them became "skip this candidate, say nothing".
     ///
-    /// Split AGAIN from [`Self::OurSettledChannel`], and this is the load-bearing half:
-    /// the row is the only handle this node has on the deposit. `reclaimExpired` needs the
-    /// `pool_id`, and the two recovery sweeps enumerate the store (`load_all`), so a
-    /// FORGOTTEN row is money nothing in this codebase can ever see again — the hazard
-    /// `run_open` already reclaims-before-rotating to avoid. Deleting the row here (as the
-    /// first cut of this verdict did, for every reason alike) turned an accounting desync
-    /// into a permanently stranded deposit.
-    ///
-    /// So the row survives and the provider is SUPPRESSED instead. That costs us the
-    /// provider until its channel expires — the store is provider-keyed, so we cannot open
-    /// a replacement without overwriting the very row we are keeping — and that is the
-    /// right trade: there are other providers, and there is no other copy of this deposit.
-    /// Recovering it sooner means cooperatively closing the wedged channel to settle at the
-    /// true watermark; that is the real fix for the desync, tracked in #1122.
-    OurDeadChannel(VoucherRejectReason),
-    /// The peer rejected a voucher and the channel is settled ON-CHAIN — the upstream has
-    /// its cooperative close signed, so there is no remainder to reclaim and nothing the
-    /// local row can still buy us. The one case where forgetting it is safe (#1145 review).
-    OurSettledChannel(VoucherRejectReason),
-    /// The peer rejected a voucher we presented, but the channel is FINE — nothing to
-    /// rotate, nothing to top up (#1145 review). Two reasons land here: `RetryLater` (a
+    /// The pool row is the node's handle on the deposit, and the recovery sweeps enumerate
+    /// the store (`load_all`), so it is KEPT rather than deleted. The provider is SUPPRESSED
+    /// for a bounded window instead: the pool has no per-provider deadline to key a horizon
+    /// on — the shared deposit fans out across every provider — so a lane-terminal rejection
+    /// takes the provider out of ranking for a fixed window while the pool's deposit stays
+    /// intact and available to every other lane.
+    OurDeadLane(VoucherRejectReason),
+    /// The peer rejected a voucher we presented, but the pool is FINE — nothing to
+    /// suppress, nothing to top up. Two reasons land here: `RetryLater` (a
     /// transient node-side persist fault upstream; ADR 003 has its state not advance, so the
     /// SAME voucher can be resent on a fresh stream) and `RateFloorRaised` (a governance
     /// delivery-floor raise made the quoted rate stale, #1382, so the client re-probes and
     /// re-quotes at the new floor on a fresh stream). Different client remedy, same action
-    /// here: keep the healthy channel and retry.
+    /// here: keep the healthy pool and retry.
     OurVoucherRetryable(VoucherRejectReason),
     /// The peer refused delivery, carrying the wire code's own verdict (#1144).
     Refused(RefusalVerdict),
@@ -2177,35 +2162,28 @@ enum PullVerdict {
     Unreachable,
 }
 
-/// A buyer channel that can no longer pay but whose DEPOSIT is still escrowed (#1145
-/// review). Keep the row, stop using the provider, and say so loudly.
+/// A buyer lane that can no longer pay but whose shared pool DEPOSIT is still escrowed.
+/// Keep the pool row, stop using the provider, and say so loudly.
 ///
-/// The row is not bookkeeping — it is the only handle this node has on the money.
-/// `reclaimExpired` refunds the remainder at expiry and needs the `pool_id`; both
-/// recovery sweeps find their work by enumerating the store (`load_all`). A row this
-/// function deleted would therefore be a deposit that nothing in this codebase can ever see
-/// again, which is precisely why `run_open` reclaims BEFORE it rotates an expired channel.
+/// The pool row is not bookkeeping — it is the node's handle on the money. The pool's
+/// grace-window close and reclaim refund the deposit and need the `pool_id`; the recovery
+/// sweeps find their work by enumerating the store (`load_all`). A row this function deleted
+/// would therefore be a deposit that nothing in this codebase can ever see again.
 ///
-/// So this deliberately does NOT call `retire_channel`. What it does instead:
+/// So this deliberately does NOT retire the pool. What it does instead:
 ///
-/// - **Suppress the PROVIDER, for all hashes, until the channel expires.** The row survives,
-///   so `try_reuse_live` (which gates on expiry alone) would hand the dead channel straight
-///   back on the next miss — for ANY blob, not just the one that wedged it — and burn a
-///   candidate slot on a pull that cannot pay. Two suppressions cover this: a short
-///   per-`(peer, hash)` negative-cache entry ([`REFUSAL_SUPPRESSION_TTL`]) for the immediate
-///   same-blob retry, and a provider-wide entry in `wedged_providers` keyed by the peer and
-///   held until the channel's on-chain expiry, so `probe_and_rank` drops the provider from
-///   ranking for every hash until then. The earlier version wrote ONLY the `(peer, hash)`
-///   entry (#1145 review), which suppressed one blob for 30s while the channel stayed dead
-///   for its whole ~90-day lifetime — so a miss for any other blob re-selected the provider
-///   and re-wedged it on every pull.
+/// - **Suppress the PROVIDER, for all hashes, for a bounded window.** The pool row survives
+///   and backs every other lane, so a lane-terminal rejection must not take the pool down —
+///   only this provider. Two suppressions cover it: a short per-`(peer, hash)` negative-cache
+///   entry ([`REFUSAL_SUPPRESSION_TTL`]) for the immediate same-blob retry, and a
+///   provider-wide entry in `wedged_providers` keyed by the peer and held for
+///   [`WEDGED_PROVIDER_SUPPRESSION_SECS`], so `probe_and_rank` drops the provider from
+///   ranking for every hash until then. The pool has no per-provider deadline to key the
+///   horizon on — the shared deposit fans out across every provider — so the window is fixed.
 /// - **Score nothing.** The peer behaved correctly; our accounting is what broke.
 ///
-/// The cost is this provider until its channel expires: the store is provider-keyed, so we
-/// cannot open a replacement without overwriting the row we are keeping. That is the right
-/// side of the trade — there are other providers, and there is no second copy of the
-/// deposit. Recovering it sooner means cooperatively closing the wedged channel to settle at
-/// the true watermark, which is the real repair for the desync (#1122).
+/// The cost is this provider for the suppression window; the pool's deposit is untouched and
+/// stays available to every other lane.
 fn wedged_channel(
     deps: &NodeOriginDeps,
     pk: PublicKey,
@@ -2243,101 +2221,66 @@ fn wedged_channel(
 /// horizon on — the shared deposit outlives any single lane.
 const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 
-/// A voucher rejection an upstream can only raise about a pool it has closed. The node owns
-/// its pool and no counterparty closes it, so this is defensive: the shared deposit is never
-/// settled out from under the node by an upstream, and there is no per-provider row to retire.
-///
-/// The lane self-heals without action here: a rotated pool's ledger is dropped by
-/// [`BuyerLedgers::get_or_seed`] once no pull holds it, and the persistent lane watermark is
-/// monotonic, so the next pull re-seeds correctly. Log it rather than mutate state.
-fn forget_settled_channel(
-    deps: &NodeOriginDeps,
-    provider_addr: Address,
-    reason: VoucherRejectReason,
-    channel: Option<B256>,
-) {
-    deps.metrics.node_pull_voucher_rejected();
-    warn!(
-        %provider_addr, pool_id = ?channel, ?reason,
-        "node-origin: upstream rejected our voucher on a pool-settled reason; the node owns \
-         its pool and no upstream settles it, so this is unexpected — leaving the pool intact \
-         and letting the monotonic lane watermark self-heal the next pull"
-    );
-}
-
-/// What a voucher rejection tells us, and therefore what to do about it (#1145 review).
+/// What a voucher rejection tells us, and therefore what to do about it.
 ///
 /// Exhaustive on purpose, like [`classify_refusal`]: a new `VoucherRejectReason` must break
 /// this build rather than silently inherit a verdict. The reasons are not variations on one
-/// theme — four genuinely different things arrive on this wire code:
+/// theme — three genuinely different things arrive on this wire code:
 ///
 /// - **Our signer is broken.** `BadSignature`/`WrongSigner` mean the upstream could not
 ///   verify a signature WE produced. That is not a payment problem, it is a defect in this
-///   node, and it will hit every candidate we try — so it belongs in the loud
+///   node, and it hits every candidate we try — so it belongs in the loud
 ///   [`PullVerdict::OurLocalFault`] arm, which exists for exactly this. Routing it to the
-///   payment bucket also *hid* it: the ladder checks `UpstreamVoucherRejected` before
-///   `LocalPullFault`, so a broken buyer key produced a `debug!` about payments instead of
+///   payment bucket also *hides* it: the ladder checks `UpstreamVoucherRejected` before
+///   `LocalPullFault`, so a broken buyer key produces a `debug!` about payments instead of
 ///   the `warn!` about a node that cannot pay anyone.
-/// - **The channel is finished, but its DEPOSIT is not.** Spent down, expired, or desynced
-///   from the upstream's committed nonce. No future voucher on it can be accepted — but an
-///   escrowed remainder survives it, and the local row is this node's only handle on that.
-/// - **The channel is settled.** `CooperativeCloseSigned` alone: the upstream holds a signed
-///   cooperative close, so the channel is finalised on-chain and there is no remainder.
+/// - **This lane to this provider is finished, but the pool's DEPOSIT is not.** The signer's
+///   spending cap is exhausted or its capability expired (`CapExceeded`), our accounting
+///   drifted (`AmountRegression`/`BytesRegression`), or the voucher was addressed to the
+///   wrong pool or a different provider (`WrongPool`/`WrongProvider`). No further voucher on
+///   this lane is accepted, but the shared pool deposit survives it and other lanes still
+///   draw on it — so the provider is suppressed for a bounded window and the pool row is
+///   KEPT for the deposit it still holds.
 /// - **Try again.** `RetryLater` (the voucher was valid and the upstream's state did not
 ///   advance, ADR 003, so the same voucher can go out on a fresh stream) and
 ///   `RateFloorRaised` (a governance floor raise made the quoted rate stale, #1382, so the
 ///   client re-probes/re-quotes at the new floor on a fresh stream). Different remedies,
-///   same action here: the channel is healthy, so leave it alone and retry.
+///   same action here: the pool is healthy, so leave it alone and retry.
 ///
-/// Wallet-less resume (issue #1481 §5 review item 2): this classifier does NOT special-case a
-/// bundled `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`, and it does
-/// not need to. `resume::pull_blob` (this node's own cache-miss buyer leg) already retries a
-/// resumable rejection in its own loop before it can ever
-/// surface here: it reseeds the channel's ledger and reopens the pull, transparently,
-/// and this classifier sees only the
-/// FINAL outcome. (Before #1530 the same retry happened one layer down, inside
-/// `decdn-client-pull::fetch_inner`; moving it up is what let the loop also answer a
-/// genuine `InsufficientDeposit` with a top-up instead of a terminal error.) So by the time `pull_verdict` downcasts an error to `UpstreamVoucherRejected`
-/// and reaches this function, the rejection is genuinely terminal: either the reason was never
+/// Wallet-less resume: this classifier does NOT special-case a bundled
+/// `CapExceeded`/`AmountRegression`/`BytesRegression`, and it does not need to.
+/// `resume::pull_blob` (this node's own cache-miss buyer leg) already retries a resumable
+/// rejection in its own loop before it can ever surface here: it reseeds the pool's ledger
+/// and reopens the pull, transparently, and this classifier sees only the FINAL outcome. The
+/// loop also answers a genuine `CapExceeded` with an on-chain top-up rather than a terminal
+/// error. So by the time `pull_verdict` downcasts an error to `UpstreamVoucherRejected` and
+/// reaches this function, the rejection is genuinely terminal: either the reason was never
 /// gated, it carried no bundle, the bundle failed shape validation, or the bounded resume
-/// attempts were exhausted. `OurDeadChannel` remains the correct verdict for all four reasons
-/// below in that case — the channel really is unusable and its deposit really is what needs
-/// reclaiming, not resuming.
+/// attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
+/// reason in that case — the lane really is unusable, and the shared pool deposit is not what
+/// needs reclaiming.
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
     match reason {
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
             PullVerdict::OurLocalFault
         }
-        // Channel and signer both fine — resend (`RetryLater`) or re-quote at the new floor
-        // (`RateFloorRaised`, #1382); either way keep the channel and try again.
+        // Pool and signer both fine — resend (`RetryLater`) or re-quote at the new floor
+        // (`RateFloorRaised`, #1382); either way keep the pool and try again.
         VoucherRejectReason::RetryLater | VoucherRejectReason::RateFloorRaised => {
             PullVerdict::OurVoucherRetryable(reason)
         }
-        // Settled on-chain: the deposit is already divided, so the row buys us nothing.
-        VoucherRejectReason::CooperativeCloseSigned => PullVerdict::OurSettledChannel(reason),
-        // Everything else is terminal for this channel while its deposit is STILL ESCROWED.
-        //
-        // The previous cut of this match SAW the distinction and then discarded it. It said,
-        // in as many words, that these arrive "for two different underlying reasons — the
-        // money ran out (`InsufficientDeposit`, `Expired`) or our accounting drifted
-        // (`StaleNonce`, `AmountRegression`, `BytesRegression`, `WrongChannel`,
-        // `WrongToken`)" — and then gave both the same remedy: "drop it and open a fresh
-        // channel". Dropping the row is exactly what makes the deposit unreclaimable (see
-        // `PullVerdict::OurDeadChannel`), and NEITHER group has surrendered its money:
-        //
-        // - a desync spent nothing extra, so the deposit is very nearly intact;
-        // - `InsufficientDeposit` means too little for THIS voucher, not nothing left;
-        // - an `Expired` channel is the exact case `reclaimExpired` exists to refund, and
-        //   the reclaim sweep already does that — from the row.
-        //
-        // So none of them may forget it.
-        VoucherRejectReason::WrongChannel
-        | VoucherRejectReason::WrongToken
-        | VoucherRejectReason::StaleNonce
+        // Terminal for THIS lane while the shared pool deposit is still escrowed. The signer's
+        // cap is spent or its capability expired (`CapExceeded`), our accounting drifted
+        // (`AmountRegression`/`BytesRegression`), or the voucher named the wrong pool or a
+        // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered the
+        // pool's money — a mis-addressed or drifted voucher spends nothing, and an exhausted
+        // cap means too little for THIS voucher, not an empty pool — so the provider is
+        // suppressed and the pool row is KEPT for the deposit it still holds.
+        VoucherRejectReason::WrongPool
+        | VoucherRejectReason::WrongProvider
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
-        | VoucherRejectReason::InsufficientDeposit
-        | VoucherRejectReason::Expired => PullVerdict::OurDeadChannel(reason),
+        | VoucherRejectReason::CapExceeded => PullVerdict::OurDeadLane(reason),
     }
 }
 
@@ -2424,11 +2367,11 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
 /// refusal code, and there is no answer left to pick. A caller that has NOT yet answered
 /// owes the verdict a [`PullMiss`] — dropping it there is how #1560 shipped.
 ///
-/// `channel` is the buyer channel the pull was paying on, or `None` for the failures that
-/// happen before there is one to pay on (a channel open that never completed, a local
+/// `channel` is the buyer pool the pull was paying from, or `None` for the failures that
+/// happen before there is one to pay from (a pool open that never completed, a local
 /// binding-signature fault). It is `Option` rather than plumbed unconditionally because the
 /// distinction is real: only a pull that presented a voucher can have one rejected, so only
-/// those sites can reach [`PullVerdict::OurDeadChannel`] and need a channel to retire.
+/// those sites can reach [`PullVerdict::OurDeadLane`] and name the pool to suppress against.
 // The tracing macros inflate the cognitive-complexity metric past threshold.
 #[allow(clippy::cognitive_complexity)]
 fn classify_pull_failure(
@@ -2504,32 +2447,24 @@ fn classify_pull_failure(
             debug!(%provider_addr, %err, "node-origin: upstream stalled mid-stream; scoring unreachable");
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
-        // Our payment-side fault either way — the provider is not scored (#857). What
-        // separates these three arms is what it costs the CHANNEL (#1145 review).
+        // Our payment-side fault — the provider is not scored (#857). What separates this arm
+        // from the retryable one below is what it costs the LANE.
         //
-        // The channel can no longer pay, but its DEPOSIT is still escrowed: a desync, a
-        // drained-for-this-voucher balance, an expiry. The row is the only handle on that
-        // money (`reclaimExpired` needs the `pool_id`; the sweeps enumerate the store), so
-        // it is KEPT and the provider is suppressed instead of the row being deleted. This
-        // arm used to delete it, which stranded the deposit permanently. `warn!`, not
-        // `debug!`, for the same reason the local-fault arm is: at the default
-        // `RUST_LOG=info` a `debug!` is invisible, and money is at stake.
-        PullVerdict::OurDeadChannel(reason) => {
+        // This lane can no longer pay, but the shared pool DEPOSIT is still escrowed: a
+        // desync, a drained-cap balance, a mis-addressed voucher. The pool row is the handle
+        // on that money (the recovery sweeps enumerate the store), so it is KEPT and the
+        // provider is suppressed instead of the row being deleted. `warn!`, not `debug!`, for
+        // the same reason the local-fault arm is: at the default `RUST_LOG=info` a `debug!`
+        // is invisible, and money is at stake.
+        PullVerdict::OurDeadLane(reason) => {
             deps.metrics.node_pull_voucher_rejected();
             wedged_channel(deps, pk, provider_addr, hash_bytes, reason, channel);
         }
-        // The channel is SETTLED on-chain — the upstream has its cooperative close signed, so
-        // the deposit is already divided and the row buys us nothing. The one rejection for
-        // which forgetting it is both safe and necessary.
-        PullVerdict::OurSettledChannel(reason) => {
-            deps.metrics.node_pull_voucher_rejected();
-            forget_settled_channel(deps, provider_addr, reason, channel);
-        }
-        // The channel is fine: either the upstream hit a transient persist fault and its
+        // The pool is fine: either the upstream hit a transient persist fault and its
         // state did not advance (`RetryLater`, ADR 003, so the same voucher can be resent) or
         // a governance floor raise made the quote stale (`RateFloorRaised`, #1382, so a retry
         // re-probes and re-quotes at the new floor). Skip the candidate this once and leave
-        // the channel alone — rotating here would throw away a healthy channel over a hiccup.
+        // the pool alone — suppressing here would throw away a healthy pool over a hiccup.
         PullVerdict::OurVoucherRetryable(reason) => {
             deps.metrics.node_pull_voucher_rejected();
             debug!(
@@ -2777,7 +2712,7 @@ mod tests {
         assert!(timeout.downcast_ref::<HashMismatch>().is_none());
 
         let rejected: anyhow::Error = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: decdn_protocol::client::VoucherRejectReason::StaleNonce,
+            reason: decdn_protocol::client::VoucherRejectReason::CapExceeded,
             bundle: None,
         });
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
@@ -2859,8 +2794,8 @@ mod tests {
     /// #1382: a `RateFloorRaised` rejection is the honest-buyer re-quote signal —
     /// a governance delivery-floor raise made the stream's quote stale, so its
     /// voucher is unredeemable at that rate. The buyer did nothing wrong, so this
-    /// must be judged retryable with the channel KEPT — not an `OurDeadChannel`
-    /// (which would strand a perfectly good deposit) nor an `OurLocalFault` (which
+    /// must be judged retryable with the pool KEPT — not an `OurDeadLane`
+    /// (which would suppress a provider needlessly) nor an `OurLocalFault` (which
     /// would tar the peer for our own stale quote). Re-probing at the new floor is
     /// the fix, which is exactly what `OurVoucherRetryable` drives.
     #[test]
@@ -2999,23 +2934,22 @@ mod tests {
     /// existing variant made — the thing a future refactor could flip without noticing.
     ///
     /// Known edges, stated precisely because the guarantee is narrower than it looks:
-    /// `for_verdict` matches `OurDeadChannel(_)` / `OurSettledChannel(_)` /
-    /// `OurVoucherRetryable(_)` on their payloads, so a new `VoucherRejectReason` inherits
-    /// `Clean` without a build break — acceptable, because `voucher_verdict` IS exhaustive
-    /// over all twelve and already routes the node-wide reasons (`BadSignature`,
-    /// `WrongSigner`) to `OurLocalFault` before this function sees them. `RefusalVerdict`'s
-    /// four discriminants are spelled out so a FIFTH does break the build; its
-    /// `DurableMiss(_)` payload is not, so a new `DurableMissCause` still inherits `Clean`.
+    /// `for_verdict` matches `OurDeadLane(_)` / `OurVoucherRetryable(_)` on their payloads,
+    /// so a new `VoucherRejectReason` inherits `Clean` without a build break — acceptable,
+    /// because `voucher_verdict` IS exhaustive over all nine and already routes the node-wide
+    /// reasons (`BadSignature`, `WrongSigner`) to `OurLocalFault` before this function sees
+    /// them. `RefusalVerdict`'s four discriminants are spelled out so a FIFTH does break the
+    /// build; its `DurableMiss(_)` payload is not, so a new `DurableMissCause` still inherits
+    /// `Clean`.
     #[test]
     fn only_our_own_fault_may_withhold_a_not_found() {
-        let reason = VoucherRejectReason::StaleNonce;
+        let reason = VoucherRejectReason::CapExceeded;
         for verdict in [
             PullVerdict::OversizeClaim,
             PullVerdict::RateCeiling,
             PullVerdict::OurDeadline,
             PullVerdict::Stalled,
-            PullVerdict::OurDeadChannel(reason),
-            PullVerdict::OurSettledChannel(reason),
+            PullVerdict::OurDeadLane(reason),
             PullVerdict::OurVoucherRetryable(reason),
             PullVerdict::Refused(RefusalVerdict::NodeFault),
             PullVerdict::Refused(RefusalVerdict::Transient),

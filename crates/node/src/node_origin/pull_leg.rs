@@ -61,7 +61,7 @@ use super::funder::NodeFunder;
 use super::resume::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::{
     NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleDeps, SettleOnDrop, bind_upstream_ctx,
-    cached_candidates, channel_ledger, classify_pull_failure, discover, now_micros, probe_and_rank,
+    cached_candidates, classify_pull_failure, discover, lane_ledger, now_micros, probe_and_rank,
     record_outcome, record_pool_open_failure,
 };
 use crate::client_requester::{
@@ -406,7 +406,7 @@ impl NodeOrigin {
                 return Err(PullMiss::for_verdict(verdict));
             }
         };
-        let ledger = channel_ledger(deps, provider_addr, &ctx);
+        let ledger = lane_ledger(deps, provider_addr, &ctx);
         let rate_ceiling =
             effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb);
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
@@ -580,7 +580,11 @@ pub(crate) async fn run_pull_leg(
         last_pulled: AtomicU64::new(0),
         refused: Arc::clone(&leech_refused),
     };
-    let node_funder = NodeFunder::new(Arc::clone(&deps.buyer), Arc::clone(&ctx));
+    let node_funder = NodeFunder::new(
+        Arc::clone(&deps.buyer),
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+    );
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),

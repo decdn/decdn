@@ -28,7 +28,7 @@
 //! is `Done` only once the ledger's committed `bytes` reach the gap end. An unpaid
 //! source whose `finish` never advanced a ledger would leave that frontier at zero
 //! and the gap loop would re-draw forever. So this source carries a fresh, LOCAL
-//! bookkeeping [`ChannelLedger`] (`self_pay`) and, on [`BlobSource::finish`],
+//! bookkeeping [`PoolLedger`] (`self_pay`) and, on [`BlobSource::finish`],
 //! advances it by exactly the leg's drained WIRE bytes at rate 0 — `committed.bytes`
 //! moves so the frontier reaches the gap end, while `committed.amount` stays 0 so
 //! nothing resembling a payment or a deposit-exhaustion is ever computed. This is

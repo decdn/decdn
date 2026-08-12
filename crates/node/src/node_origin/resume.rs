@@ -1,20 +1,17 @@
 //! The node-to-node buffered miss pull, as a **resumable** progressive pull with
 //! a reactive mid-pull deposit top-up (#1530).
 //!
-//! # What this replaces, and why
+//! # Why the pull resumes rather than restarts
 //!
-//! [`Origin::fetch`](decdn_cache::origin::Origin::fetch) used to reach the wire
-//! through `stream_fetch_shared` at a fixed `byte_offset == 0`. That call buffers
-//! the whole blob and has no resume point, which made the reactive half of the
-//! two-tier deposit (ADR 003 § Two-tier deposit) impossible on this leg: answering
-//! a genuine `InsufficientDeposit` there would mean retrying from zero and
-//! **re-paying for every delivered byte**. Worse, after real exhaustion the
-//! from-zero retry re-spends the fresh working deposit on bytes it already bought
-//! and re-exhausts at the same offset, so it cannot make progress at all. The
-//! daemon therefore shipped with the proactive low-water refill only, and a single
-//! miss pull larger than the initial deposit simply failed.
+//! The reactive half of the two-tier deposit (ADR 003 § Two-tier deposit) needs a
+//! resume point: answering a genuine `CapExceeded` by retrying from
+//! `byte_offset == 0` would **re-pay for every delivered byte**, and after real
+//! exhaustion the from-zero retry re-spends the fresh working deposit on bytes it
+//! already bought and re-exhausts at the same offset, so it cannot make progress at
+//! all. So the pull resumes at the paid frontier: it buffers the blob but keeps a
+//! live `byte_offset` a top-up can rewind to without re-paying.
 //!
-//! So this module drives the same loop the CLI streaming fetch drives
+//! This module drives the same loop the CLI streaming fetch drives
 //! (`crates/cli/src/commands/fetch.rs`): `open_progressive_pull` at a live
 //! `byte_offset`, [`pull_to_sink`] into a sink, and on a genuine ceiling hit an
 //! on-chain top-up followed by a resume at the **paid frontier** — the largest
@@ -68,7 +65,7 @@ use super::{NodeOriginDeps, now_micros, persist_buyer_progress};
 use crate::selection::Candidate;
 
 /// How many times ONE call of [`pull_blob`] answers a genuine mid-pull
-/// `InsufficientDeposit` with an on-chain `topUp` before giving up.
+/// `CapExceeded` with an on-chain `topUp` before giving up.
 ///
 /// Deliberately **1**, where the CLI's [`MAX_TOPUP_ATTEMPTS`] is 3. The node tops
 /// up from the initial deposit straight to the working deposit — 0.5 USDC to 10
@@ -151,7 +148,7 @@ enum ResumeAction {
     RegenerateCapability,
     /// The upstream holds a voucher we do not — reseed the ledger and retry.
     Reseed,
-    /// The upstream claimed `InsufficientDeposit` while OUR ledger still covers
+    /// The upstream claimed `CapExceeded` while OUR ledger still covers
     /// the next voucher. Terminal, like [`Self::Terminal`] — but named apart
     /// because it is the one adversarial shape here: a peer that can make us
     /// escrow more USDC on demand simply by refusing vouchers it could accept.
@@ -325,13 +322,13 @@ fn decide(
 
     // Below the reseed check, deliberately: a bundled rejection is a desync we can
     // heal, and healing it is strictly better than reporting a refusal. What is left
-    // here is an `InsufficientDeposit` we would have been willing and able to fund —
+    // here is a `CapExceeded` we would have been willing and able to fund —
     // budget unspent, top-up enabled — and declined to, because our own ledger
     // contradicts the claim. That is the peer misbehaving, and the only place it
     // becomes visible.
     if budgets.topups < MAX_REACTIVE_TOPUPS
         && !budgets.working_deposit.is_zero()
-        && is_insufficient_deposit(err)
+        && is_cap_exhausted(err)
     {
         return ResumeAction::RefuseFunding;
     }
@@ -339,12 +336,12 @@ fn decide(
     ResumeAction::Terminal
 }
 
-/// Whether `err` is an upstream voucher rejection for `InsufficientDeposit`,
+/// Whether `err` is an upstream voucher rejection for `CapExceeded`,
 /// regardless of whether our own ledger corroborates it. [`genuine_exhaustion`] is
 /// the corroborating test; this is the bare wire claim.
-fn is_insufficient_deposit(err: &anyhow::Error) -> bool {
+fn is_cap_exhausted(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamVoucherRejected>()
-        .is_some_and(|r| r.reason == VoucherRejectReason::InsufficientDeposit)
+        .is_some_and(|r| r.reason == VoucherRejectReason::CapExceeded)
 }
 
 /// Who we are pulling from. Bundled because the four identifiers travel together
@@ -493,7 +490,7 @@ pub(super) async fn pull_blob(
                     provider = %target.provider_addr,
                     deposit = %ctx.deposit,
                     committed = %committed.amount,
-                    "node-origin: upstream claimed InsufficientDeposit but our own ledger still \
+                    "node-origin: upstream claimed CapExceeded but our own ledger still \
                      covers the next voucher; refusing to escrow more USDC on its word (#1530)"
                 );
                 deps.metrics.node_pull_reactive_topup_refused();
@@ -528,7 +525,7 @@ struct LoopState {
     total_bytes: u64,
     /// Its quoted rate and voucher cadence, used to price the voucher a rejection
     /// refused. Only ever read after at least one successful open, which is exactly
-    /// when an `InsufficientDeposit` can occur.
+    /// when a `CapExceeded` can occur.
     quoted_rate_per_mb: u64,
     voucher_interval_bytes: u64,
     budgets: ResumeBudgets,
@@ -924,21 +921,19 @@ mod tests {
         }
     }
 
-    fn insufficient_deposit() -> anyhow::Error {
+    fn cap_exceeded() -> anyhow::Error {
         anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::InsufficientDeposit,
+            reason: VoucherRejectReason::CapExceeded,
             bundle: None,
         })
     }
 
     /// A rejection carrying a bundle the buyer's OWN key really signed, at
     /// `amount` — the shape `resumable_watermark` authenticates against
-    /// `ctx.client_signer`, so it cannot be faked by an upstream. The `_nonce`
-    /// argument is retained for call-site parity but the pool voucher has no nonce.
+    /// `ctx.client_signer`, so it cannot be faked by an upstream.
     fn rejection_with_signed_bundle(
         ctx: &PoolContext,
         reason: VoucherRejectReason,
-        _nonce: U256,
         amount: U256,
     ) -> anyhow::Error {
         let voucher = decdn_incentive::Voucher {
@@ -961,12 +956,11 @@ mod tests {
         })
     }
 
-    /// A bundled `StaleNonce` that ADVANCES our committed nonce is a desync the
-    /// ledger can heal — reseed and retry, do not spend.
+    /// A bundled `BytesRegression` whose watermark ADVANCES our committed amount is
+    /// a desync the ledger can heal — reseed and retry, do not spend.
     ///
-    /// The node's miss pull drives this itself since #1530. Before that the retry
-    /// lived inside `client-pull`'s `fetch_inner`, so moving it up here brought the
-    /// path with no coverage of its own (#1600 review).
+    /// The node's miss pull drives this itself: the reseed loop lives here, not in
+    /// `client-pull`, so its coverage lives here too.
     #[test]
     fn an_advancing_bundle_reseeds() {
         let ctx = ctx_with_deposit(U256::from(1_000_000u64));
@@ -976,8 +970,7 @@ mod tests {
         };
         let err = rejection_with_signed_bundle(
             &ctx,
-            VoucherRejectReason::StaleNonce,
-            U256::from(5u64),
+            VoucherRejectReason::BytesRegression,
             U256::from(50u64),
         );
         assert_eq!(
@@ -994,15 +987,15 @@ mod tests {
         );
     }
 
-    /// The ordering that keeps money out of a healable desync: an
-    /// `InsufficientDeposit` whose bundle ADVANCES us must reseed, NOT fund.
+    /// The ordering that keeps money out of a healable desync: a
+    /// `CapExceeded` whose bundle ADVANCES us must reseed, NOT fund.
     ///
     /// `genuine_exhaustion` owns this carve-out — an advancing bundle means the
     /// upstream accepted a voucher we never recorded, so our headroom arithmetic
     /// is what is stale, not the deposit. Funding on it would escrow USDC to
     /// paper over a bookkeeping gap.
     #[test]
-    fn an_advancing_bundle_outranks_funding_even_on_insufficient_deposit() {
+    fn an_advancing_bundle_outranks_funding_even_on_cap_exceeded() {
         // Exhausted by our own accounting, so the ONLY thing steering this away
         // from `TopUp` is the advancing bundle.
         let ctx = ctx_with_deposit(U256::from(10u64));
@@ -1010,12 +1003,8 @@ mod tests {
             bytes: U256::from(4096u64),
             amount: U256::from(10u64),
         };
-        let err = rejection_with_signed_bundle(
-            &ctx,
-            VoucherRejectReason::InsufficientDeposit,
-            U256::from(9u64),
-            U256::from(90u64),
-        );
+        let err =
+            rejection_with_signed_bundle(&ctx, VoucherRejectReason::CapExceeded, U256::from(90u64));
         assert_eq!(
             decide(
                 &err,
@@ -1041,8 +1030,7 @@ mod tests {
         };
         let err = rejection_with_signed_bundle(
             &ctx,
-            VoucherRejectReason::StaleNonce,
-            U256::from(5u64),
+            VoucherRejectReason::BytesRegression,
             U256::from(50u64),
         );
         let mut spent = budgets(U256::from(1000u64));
@@ -1053,7 +1041,7 @@ mod tests {
         );
     }
 
-    /// An uncorroborated `InsufficientDeposit` is REFUSED, distinctly from an
+    /// An uncorroborated `CapExceeded` is REFUSED, distinctly from an
     /// ordinary terminal failure, so the caller can meter the peer's behaviour
     /// (#1600 review — this case previously collapsed into `Terminal` and its
     /// counter could never fire).
@@ -1066,7 +1054,7 @@ mod tests {
         };
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
@@ -1080,7 +1068,7 @@ mod tests {
 
     /// A `NotFound` right after a top-up is the upstream's deposit gate — the
     /// shape production actually produces, since the pre-serve gate collapses
-    /// `InsufficientDeposit` to `NotFound` on the wire.
+    /// its empty-deposit serve-reject to `NotFound` on the wire.
     #[test]
     fn a_not_found_right_after_a_topup_is_waited_out() {
         let ctx = ctx_with_deposit(U256::from(10u64));
@@ -1176,7 +1164,7 @@ mod tests {
         let working = U256::from(1000u64);
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
@@ -1199,7 +1187,7 @@ mod tests {
         };
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
@@ -1224,7 +1212,7 @@ mod tests {
         spent.topups = MAX_REACTIVE_TOPUPS;
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
@@ -1298,7 +1286,7 @@ mod tests {
         let budgets = budgets_with_ttl(U256::from(1000u64), Duration::from_secs(86_400));
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
@@ -1325,7 +1313,7 @@ mod tests {
         let budgets = budgets_with_ttl(working, Duration::from_secs(86_400));
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
@@ -1351,7 +1339,7 @@ mod tests {
         let budgets = budgets_with_ttl(working, Duration::ZERO);
         assert_eq!(
             decide(
-                &insufficient_deposit(),
+                &cap_exceeded(),
                 &ctx,
                 committed,
                 MB_BYTES,
