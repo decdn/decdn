@@ -272,25 +272,10 @@ impl ClientHandler {
             // `session.cancel_token()`; the last observer leaving (teardown below)
             // cancels it (#1610). The freshly-handshaked `target` feeds the pull.
             decdn_cache::FillClaim::Owner { session, lease } => {
-                // Seed the outboard with proof nodes for ranges this node ALREADY holds.
-                // The pull leg only captures ranges it ADMITS, but a range-minimized
-                // serve-miss can start with bytes already present (ADR 037 §held ranges
-                // read locally) — without this seed the coherent encoder would `load` a
-                // held span's proof node that was never captured, park until the pull
-                // ends, then fail "outboard node never captured". `outboard_pairs` over
-                // the present ranges emits exactly those nodes (plus the right-spine).
-                // Best-effort, and OUTSIDE the claim lock so these awaits are safe.
-                if let Ok(present) = self.cache.present_ranges(hash).await
-                    && !present.chunk_ranges().is_empty()
-                    && let Ok(pairs) = self
-                        .cache
-                        .outboard_pairs(hash, present.chunk_ranges())
-                        .await
-                {
-                    for (node, pair) in pairs {
-                        session.capture(node, pair);
-                    }
-                }
+                // Seed the shared outboard with proof for held ranges the pull never
+                // admits (`seed_held_outboard`). OUTSIDE the claim lock, so the awaits
+                // are safe.
+                self.seed_held_outboard(hash, &session).await;
 
                 // The serve leg reads the cache the pull leg fills — same engine, same
                 // hash.
@@ -394,11 +379,14 @@ impl ClientHandler {
                 serve_result
             }
             // ATTACH: a live pull already covers this hash. Run a serve leg over the
-            // shared session — NO new pull, NO thread, NO held-range seed (the owner
-            // does all that into the shared session). The `target` handshake opened
+            // shared session — NO new pull, NO thread. The `target` handshake opened
             // above is now unused (a free handshake spent; a follow-up optimization can
             // peek the registry before handshaking).
             decdn_cache::FillClaim::Attach { session, lease } => {
+                // Seed held-range proof so this observer's coherent encoder is
+                // self-sufficient, not dependent on the owner's seed-before-spawn
+                // ordering (`seed_held_outboard`; idempotent, near-free on a full miss).
+                self.seed_held_outboard(hash, &session).await;
                 let serve_store =
                     decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
                 let serve_result = self
@@ -620,20 +608,9 @@ impl ClientHandler {
             // selects on `session.cancel_token()`; the last observer leaving (teardown
             // below) cancels it (#1610).
             decdn_cache::FillClaim::Owner { session, lease } => {
-                // Seed the outboard with proof nodes for ranges this node ALREADY holds
-                // (see the peer twin). Best-effort, OUTSIDE the claim lock so these
-                // awaits are safe.
-                if let Ok(present) = self.cache.present_ranges(hash).await
-                    && !present.chunk_ranges().is_empty()
-                    && let Ok(pairs) = self
-                        .cache
-                        .outboard_pairs(hash, present.chunk_ranges())
-                        .await
-                {
-                    for (node, pair) in pairs {
-                        session.capture(node, pair);
-                    }
-                }
+                // Seed the shared outboard with proof for held ranges the pull never
+                // admits (`seed_held_outboard`). OUTSIDE the claim lock.
+                self.seed_held_outboard(hash, &session).await;
 
                 // The serve leg reads the cache the pull leg fills — same engine, same
                 // hash.
@@ -747,10 +724,14 @@ impl ClientHandler {
                 serve_result
             }
             // ATTACH: a live same-hash pull already covers this request. Run a serve leg
-            // over the shared session — NO new pull, NO thread, NO held-range seed (the
-            // owner does all that). This is the S3-egress saving: the observer streams
-            // the cache the owner fills from origin, so the origin is fetched once.
+            // over the shared session — NO new pull, NO thread. This is the S3-egress
+            // saving: the observer streams the cache the owner fills from origin, so the
+            // origin is fetched once.
             decdn_cache::FillClaim::Attach { session, lease } => {
+                // Seed held-range proof so this observer's coherent encoder is
+                // self-sufficient (`seed_held_outboard`; idempotent, near-free on a full
+                // miss).
+                self.seed_held_outboard(hash, &session).await;
                 let serve_store =
                     decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
                 let serve_result = self
@@ -775,6 +756,30 @@ impl ClientHandler {
                 // cancels the session token, waking the owner's blocked join.
                 lease.detach();
                 serve_result
+            }
+        }
+    }
+
+    /// Seed the shared fill session's outboard with proof nodes for ranges this
+    /// node ALREADY holds. The pull leg captures only ranges it ADMITS, but a
+    /// range-minimized serve-miss can start with held ranges (ADR 037 §held ranges
+    /// read locally); their proof nodes are never admitted, so a coherent encoder
+    /// that `load`s a held span's node would otherwise park until the pull ends and
+    /// then fail "outboard node never captured". `outboard_pairs` over the present
+    /// ranges emits exactly those nodes (plus the right-spine). Idempotent (capture
+    /// overwrites the same bytes), so EVERY serve leg — the owner AND each attached
+    /// observer — seeds the held-range proof its own encoder reads, rather than an
+    /// observer depending on the owner's seed-before-spawn ordering. Best-effort.
+    async fn seed_held_outboard(&self, hash: Hash, session: &Arc<decdn_cache::FillSession>) {
+        if let Ok(present) = self.cache.present_ranges(hash).await
+            && !present.chunk_ranges().is_empty()
+            && let Ok(pairs) = self
+                .cache
+                .outboard_pairs(hash, present.chunk_ranges())
+                .await
+        {
+            for (node, pair) in pairs {
+                session.capture(node, pair);
             }
         }
     }
