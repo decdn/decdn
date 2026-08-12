@@ -35,7 +35,7 @@ Where interaction_score is:
 
 | Metric | Score Contribution | Weight |
 |--------|-------------------|--------|
-| Delivery speed (bytes/sec vs. expected) | 0.0-1.0 (linear scale) | 40% |
+| Delivery speed (bytes/sec vs. reference) | 0.0-1.0 (log scale) | 40% |
 | Data correctness (BLAKE3 verified) | 0.0 or 1.0 (binary) | 40% ¹ |
 | Connection success (reachable?) | 0.0 or 1.0 (binary) | 20% |
 
@@ -43,29 +43,31 @@ Formula: `interaction_score = 0.4 * speed_score + 0.4 * correctness + 0.2 * reac
 
 > **¹ Why 40% for data correctness — same as delivery speed?** Reputation measures *service quality*, not *honesty*. Data correctness is one quality signal among several; the primary corruption deterrent is **economic** (no payment for failed delivery) **plus traffic loss** (reputation-driven node selection), not on-chain slashing. Content corruption is fully absorbed at the wire by progressive BLAKE3 verification at the client (mandatory in `cdn/client/v1` per [ADR 002](002-content-addressing.md#adr-002-content-addressing) / [ADR 005](005-protocol.md#adr-005-wire-protocol)) — a corrupt window yields no voucher, so the node is unpaid for the bandwidth shipping garbage; see [ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery). Reputation impact compounds on top: a single corruption event (a) zeros the correctness component (−0.4 on `interaction_score`), (b) drops `local_score` via EWMA, (c) degrades node selection via the quadratic reputation penalty (`1/max(reputation, 0.1)²` — [ADR 001](001-network.md#node-selection-algorithm)). Lost revenue plus the traffic-routing penalty make sustained corruption irrational. A higher reputation weight or an immediate local blacklist would over-penalize transient bao-pull failures that the EWMA already absorbs.
 
-Normalization: `speed_score = min(1.0, actual_bps / expected_bps)` where `expected_bps` is a node-local configurable baseline (default: 10 MiB/s = 10,485,760 bytes/sec).
+Normalization: `speed_score = clamp(ln(1 + actual_bps) / ln(1 + reference_bps), 0.0, 1.0)`, where `reference_bps` is a node-local configurable throughput that scores ~1.0 (default: 1 GiB/s = 1,073,741,824 bytes/sec). The log curve does not saturate at a flat baseline: throughput above the old ~80 Mbps cutoff still scores strictly higher as it climbs, so a materially faster node earns a materially better speed score instead of tying with every other node above the cutoff.
 
 EWMA with alpha=0.1 means recent interactions matter more but old interactions still contribute.
 
 ### Score Decay
 
-Scores decay toward neutral (0.5) over time without new data, so a peer that stops being used drifts back to unopinionated rather than holding a stale high or low score. Applied iteratively each week:
+Scores decay toward neutral (0.5) over time without new data, so a peer that stops being used drifts back to unopinionated rather than holding a stale high or low score. The node applies closed-form half-life decay at read time, from the last update:
 
 ```
-score_new = score_old + (0.5 - score_old) * decay_rate
+score_new = 0.5 + (score_old - 0.5) * 0.5 ^ (elapsed_secs / half_life_secs)
 ```
 
-With `decay_rate = 0.10` (10% per week). Examples:
+Each half-life halves the distance between the score and neutral. `half_life_secs` is a node-local configurable value, default 3 days (259,200 seconds). A `half_life_secs` of `0` disables decay. Examples at the default half-life:
 
-- Score 1.0: week 1 = 0.95, week 5 = 0.80, week 10 = 0.65, week 20 = 0.53
-- Score 0.0: week 1 = 0.05, week 5 = 0.20, week 10 = 0.35, week 20 = 0.47
+- Score 1.0: +3 days = 0.75, +6 days = 0.625, +9 days = 0.5625
+- Score 0.0: +3 days = 0.25, +6 days = 0.375, +9 days = 0.4375
 
-Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after ~30 weeks.
+Scores converge to 0.5 asymptotically, reaching within 0.05 of neutral after roughly 4.3 half-lives (about 13 days at the default).
+
+The half-life is deliberately sub-weekly. A transiently dinged node re-enters selection within days rather than weeks, and no incumbent coasts on a stale high score for weeks after it stops delivering — both widen the serving set. [`Outcome::Unreachable`] reachability failures ride this same decay as an ordinary negative sample; there is no separate hard-crater penalty for a peer that becomes briefly unreachable.
 
 | Parameter | Value |
 |-----------|-------|
-| Decay rate | 10% per week (applied iteratively) |
-| Decay starts after | 1 week with no new interactions |
+| Decay half-life | 3 days (259,200 s) by default, node-local configurable; `0` disables decay |
+| Decay applied | Continuously from the last update, computed lazily at read time |
 | Minimum score (floor) | 0.0 (selection algorithm clamps at 0.1 — see [ADR 001](001-network.md#node-selection-algorithm)) |
 
 ### Score Clamping
@@ -94,7 +96,7 @@ flowchart TD
     M3 --> IS
     IS --> EWMA1["local_score = EWMA(local, interaction, a=0.1)"]
     EWMA1 --> CLAMP1["Per-interaction clamp: max ±0.05"]
-    CLAMP1 --> DECAY["Decay toward 0.5<br/>10%/week without data"]
+    CLAMP1 --> DECAY["Decay toward 0.5<br/>half-life 3d without data"]
     DECAY --> SEL["Node selection<br/>(ADR 001, quadratic penalty)"]
 ```
 
