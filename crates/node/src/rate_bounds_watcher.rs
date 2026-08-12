@@ -1,4 +1,4 @@
-//! `PaymentChannel.RateBoundsUpdated` watcher (#1172, ADR 019 §3.1 / ADR 003).
+//! `PaymentPool.RateBoundsUpdated` watcher (#1172, ADR 019 §3.1 / ADR 003).
 //!
 //! The node seeds its live delivery-rate clamp ([`RateBounds`]) from an
 //! authoritative `getRateBounds()` read at startup (see `runtime::mod`). This
@@ -23,7 +23,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::eth::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
-use decdn_incentive::payment_channel::PaymentChannel;
+use decdn_incentive::payment_pool::PaymentPool;
 
 use crate::chain_events::resumable_watcher::{
     self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
@@ -35,7 +35,7 @@ use crate::rate_bounds::RateBounds;
 /// clamp, and re-reads `getRateBounds()` authoritatively once per
 /// `poll_interval` at the end of a clean tick.
 struct RateBoundsSink<P: Provider + Clone> {
-    contract: PaymentChannel::PaymentChannelInstance<P>,
+    contract: PaymentPool::PaymentPoolInstance<P>,
     bounds: RateBounds,
     /// Authoritative-re-read cadence (`rate_bounds_poll_interval`).
     poll_interval: Duration,
@@ -91,8 +91,8 @@ impl<P: Provider + Clone + 'static> LogSink for RateBoundsSink<P> {
     async fn apply(&mut self, log: Log) -> Result<()> {
         // Filter is scoped to the single RateBoundsUpdated topic; match
         // defensively so an unexpected log is skipped, not misdecoded.
-        if log.topic0() == Some(&PaymentChannel::RateBoundsUpdated::SIGNATURE_HASH) {
-            match PaymentChannel::RateBoundsUpdated::decode_log_data(&log.inner.data) {
+        if log.topic0() == Some(&PaymentPool::RateBoundsUpdated::SIGNATURE_HASH) {
+            match PaymentPool::RateBoundsUpdated::decode_log_data(&log.inner.data) {
                 Ok(ev) => {
                     self.store_bounds(ev.newDeliveryFloor, "event");
                 }
@@ -141,7 +141,7 @@ impl<P: Provider + Clone + 'static> LogSink for RateBoundsSink<P> {
 /// authoritative-re-read safety net (`rate_bounds_poll_interval`, default 1h).
 pub(crate) fn spawn<P>(
     provider: P,
-    payment_channel_addr: Address,
+    payment_pool_addr: Address,
     bounds: RateBounds,
     event_poll_interval: Duration,
     poll_interval: Duration,
@@ -151,7 +151,7 @@ pub(crate) fn spawn<P>(
 where
     P: Provider + Clone + 'static,
 {
-    let contract = PaymentChannel::new(payment_channel_addr, provider.clone());
+    let contract = PaymentPool::new(payment_pool_addr, provider.clone());
     let sink = RateBoundsSink {
         contract,
         bounds,
@@ -165,8 +165,8 @@ where
     let cfg = WatcherConfig::new(
         head,
         Filter::new()
-            .address(payment_channel_addr)
-            .event_signature(PaymentChannel::RateBoundsUpdated::SIGNATURE_HASH),
+            .address(payment_pool_addr)
+            .event_signature(PaymentPool::RateBoundsUpdated::SIGNATURE_HASH),
         // Start the tail at head — no historical scan at all. `window_blocks: 0`
         // resolves to head exactly. The startup `getRateBounds()` read is the
         // authoritative baseline and already folds in every past event, so a

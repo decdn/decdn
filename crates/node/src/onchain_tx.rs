@@ -1,27 +1,19 @@
-//! Shared driver for the node's on-chain `PaymentChannel` write ladders.
+//! Shared driver for the node's on-chain `PaymentPool` write ladders.
 //!
-//! Every state-changing call the node makes against `PaymentChannel`
-//! (`settleChannel`, `reclaimExpired`, `closeChannel`, …) follows the same
+//! Every state-changing call the node makes against `PaymentPool`
+//! (`redeem`, `redeemMany`, buyer-side `reclaim`, …) follows the same
 //! micro-sequence: issue the transaction with `.send()`, await its receipt
 //! (optionally under a timeout), and inspect `receipt.status()` to tell a
 //! mined-and-succeeded transaction from a mined-and-reverted one. What each
 //! caller then *does* with that result — which metric it ticks, whether it
-//! re-reads the channel to resolve a revert, what it returns — is domain state
+//! re-reads the pool to resolve a revert, what it returns — is domain state
 //! that stays at the call site.
 //!
 //! `send_and_await_receipt` folds only that common plumbing into one place and
 //! hands back a `TxOutcome`. It deliberately does **not** take the call builder
-//! (each `settleChannel`/`reclaimExpired`/… builder is a distinct type, which
-//! would force a generic or a closure hook); it takes the already issued
-//! `.send()` result, so the concrete method call stays a visible call at every
-//! site.
-//!
-//! Adoption is partial by design: it drives the reclaim, unilateral-close, and
-//! settle ladders, but two `PaymentChannel` write sites stay hand-rolled
-//! because their control flow diverges — the seller close (`send_close`)
-//! returns a deferred future the shutdown path awaits concurrently, and
-//! `withdraw` (`try_redeem`) uses `?`/`.context()` error-propagation rather than
-//! terminal classification. Do not route those through this helper.
+//! (each `redeem`/`redeemMany`/… builder is a distinct type, which would force a
+//! generic or a closure hook); it takes the already issued `.send()` result, so
+//! the concrete method call stays a visible call at every site.
 //!
 //! The helper is fixed to the `Ethereum` network — the whole crate is
 //! Ethereum-only — which keeps its signature free of a `Provider` type
