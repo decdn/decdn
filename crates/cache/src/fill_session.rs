@@ -479,16 +479,6 @@ impl SessionOutboardReader {
     /// when this session's own pull ended (the standalone / single-fill case), a
     /// generic one when the covering fills were siblings.
     fn dead_range_error(&self, node: TreeNode) -> io::Error {
-        // DIAG#1673: capture-on-failure — the coherent encoder's OUTBOARD reader is
-        // failing a proof node because no live fill still covers its byte range. Twin
-        // of the data-reader dead-range site; `nextest` surfaces this for a failing
-        // serve-miss test to pin whether the mid-stream close is a proof-node or a
-        // data-leaf coverage failure.
-        eprintln!(
-            "DIAG#1673 outboard_reader.dead_range node={node:?} pull_outcome={:?} observers={}",
-            self.session.outcome(),
-            self.session.observer_count(),
-        );
         match self.session.outcome() {
             Some(Err(msg)) => io::Error::other(format!(
                 "upstream pull failed before supplying outboard node {node:?}: {msg}"
@@ -634,14 +624,6 @@ impl ObserverLease {
         // map regardless. Firing the per-hash liveness wakes any reader parked on a
         // range this fill covered so it re-checks at once.
         if self.session.outcome().is_none() {
-            // DIAG#1673: capture-on-failure — the last observer left while the pull was
-            // STILL RUNNING, so its fill is being cancelled (#1610). For a serve that
-            // should complete this is unexpected teardown ordering; recording it lets a
-            // failing CI job see a session-cancel racing a live sibling under starvation.
-            eprintln!(
-                "DIAG#1673 lease.cancel_live_pull hash={} — last observer left before the pull ended",
-                self.hash
-            );
             self.session.cancel.cancel();
         }
         self.session.outboard().liveness.notify_waiters();

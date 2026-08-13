@@ -736,18 +736,6 @@ pub(crate) async fn run_pull_leg(
         }
     }
 
-    // DIAG#1673: capture-on-failure — how the PAID (node-to-node) pull leg terminated,
-    // so a failing CI job can correlate the serve's mid-stream close with a pull that
-    // died / was cancelled vs one that stayed healthy.
-    if cancelled || refused || result.is_err() {
-        eprintln!(
-            "DIAG#1673 pull_leg.ended hash={hash} offset={offset} len={len} \
-             cancelled={cancelled} refused={refused} observers={} err={:?}",
-            session.observer_count(),
-            result.as_ref().err().map(|e| format!("{e:#}")),
-        );
-    }
-
     // Record the terminal outcome so the serve leg can decide a gap it is waiting on
     // (`mark_ended` sets the outcome then wakes waiters). On cancel the serve leg has
     // already finished and nobody reads this, but set it regardless. `anyhow::Error`
@@ -991,19 +979,6 @@ pub(crate) async fn run_local_pull_leg(
             %hash,
             error = %err,
             "own-origin pull leg failed; local-origin fault (no upstream to score)"
-        );
-    }
-
-    // DIAG#1673: capture-on-failure — record how the LOCAL pull leg terminated
-    // (cancelled by last-observer teardown, a leech-cap refusal, or an origin fault)
-    // so a failing CI job can tell whether the serve's mid-stream close was preceded by
-    // the pull dying/being cancelled, vs the serve closing while the pull was healthy.
-    if cancelled || refused || result.is_err() {
-        eprintln!(
-            "DIAG#1673 local_pull_leg.ended hash={hash} offset={offset} len={len} \
-             cancelled={cancelled} refused={refused} observers={} err={:?}",
-            session.observer_count(),
-            result.as_ref().err().map(|e| format!("{e:#}")),
         );
     }
 

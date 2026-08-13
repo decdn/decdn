@@ -110,7 +110,8 @@ impl HttpOrigin {
         // no idle pool each serve opens its own connection on its own runtime, so a
         // finishing serve's runtime teardown can never strand another's request. The
         // own-origin path fetches few, large ranges, so the per-request handshake cost
-        // amortizes over big transfers.
+        // amortizes over big transfers. The stable-pull-runtime fix that would let us
+        // restore origin keep-alive is tracked in #1675.
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(user_agent)
