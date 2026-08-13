@@ -7,7 +7,9 @@
 //!
 //! - leaf DATA comes from [`AwaitingDataReader`], which blocks on the store's
 //!   present-range watch until the leaf's content lands (racing the pull's terminal
-//!   signal for the no-hang guarantee), then reads it;
+//!   signal for the no-hang guarantee), then reads it; once the covering pull ends
+//!   cleanly the range is durably stored, so it reads straight from the store rather
+//!   than waiting on the observed bitfield, which can lag the admit;
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
 //!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture;
 //! - the encoded bytes are pushed through a bounded channel ([`ChannelWriter`]) and
@@ -38,17 +40,6 @@ use tokio::sync::{Notify, mpsc};
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
 /// first chunk group) before a present-range watch can be opened.
 const WATCH_OPEN_RETRY: Duration = Duration::from_millis(25);
-
-/// Ceiling on the wait for the observed bitfield to reflect a range that a CLEAN
-/// pull (`outcome() == Ok`) already admitted. A clean outcome GUARANTEES the range
-/// is in the store, so a still-missing read is only the store actor's observed
-/// bitfield lagging the admit completion — a lag that resolves in milliseconds under
-/// any scheduler speed. The wait is therefore timing-INDEPENDENT: it blocks until the
-/// range is observed present, never aborting the serve on a scheduling hiccup. This
-/// ceiling is deliberately generous (seconds, not milliseconds) and is expected to be
-/// unreachable after a clean pull; it exists only so a pathological permanent lag
-/// (e.g. the hash evicted mid-serve) surfaces an error instead of hanging forever.
-const CLEAN_PULL_PRESENT_CEILING: Duration = Duration::from_secs(15);
 
 /// Bounded backpressure between the encoder and the frame consumer: the encoder
 /// parks once this many encoded chunks are buffered ahead of delivery, so the
@@ -102,55 +93,6 @@ impl AwaitingDataReader {
             .map_err(io::Error::other)?;
         Ok(missing.is_empty())
     }
-
-    /// Wait for the observed bitfield to report `[offset, offset + need)` present,
-    /// after the covering pull ended CLEANLY. A clean outcome guarantees the range
-    /// was admitted to the store, so a not-yet-present read is only the store actor's
-    /// observed bitfield lagging the admit completion — not a missing byte. Awaiting
-    /// the present-range watch (re-opening it when it closes on completion) resolves
-    /// that lag under ANY scheduler speed, so the serve never aborts on a scheduling
-    /// hiccup. Bounded by [`CLEAN_PULL_PRESENT_CEILING`], a generous ceiling a clean
-    /// pull is never expected to reach; it exists only so a pathological permanent lag
-    /// (e.g. the hash evicted mid-serve) surfaces an error instead of hanging.
-    async fn await_present_after_clean_pull(&mut self, offset: u64, need: u64) -> io::Result<()> {
-        let deadline = tokio::time::Instant::now() + CLEAN_PULL_PRESENT_CEILING;
-        loop {
-            if self.present_covers(offset, need).await? {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(io::Error::other(format!(
-                    "clean pull did not surface content [{offset}, +{need}) within \
-                     {CLEAN_PULL_PRESENT_CEILING:?}"
-                )));
-            }
-            // Ensure a watch is open (it errors only until the blob materializes,
-            // which a clean pull guarantees), then await its next advance — capped by
-            // `WATCH_OPEN_RETRY` so a watch that already closed on completion is
-            // re-opened and re-checked promptly, and the ceiling is honored even
-            // without a fresh advance.
-            if self.watch.is_none() {
-                match self.store.observe().await {
-                    Ok(w) => self.watch = Some(w),
-                    Err(_not_materialized) => {
-                        tokio::time::sleep(WATCH_OPEN_RETRY).await;
-                        continue;
-                    }
-                }
-            }
-            let advanced = async {
-                match self.watch.as_mut() {
-                    Some(w) => w.next().await.map(|_ranges| ()),
-                    None => None,
-                }
-            };
-            match tokio::time::timeout(WATCH_OPEN_RETRY, advanced).await {
-                Ok(Some(())) => {}             // advanced — re-check presence
-                Ok(None) => self.watch = None, // watch closed on completion — re-open
-                Err(_elapsed) => {}            // periodic re-check even without an advance
-            }
-        }
-    }
 }
 
 impl AsyncSliceReader for AwaitingDataReader {
@@ -178,18 +120,20 @@ impl AsyncSliceReader for AwaitingDataReader {
             // No live fill still covers this range. Decide on the terminal outcome:
             if !self.session.range_still_live(&range) {
                 match self.session.outcome() {
-                    // A clean pull admitted every byte of its range before it marked
-                    // ended, so the range is authoritatively in the store. If the
-                    // observed bitfield does not YET reflect the admit, that is the
-                    // store actor's watch lagging the admit completion — a visibility
-                    // lag, never a missing byte. WAIT for the observed range to appear
-                    // rather than aborting the serve; this resolves under ANY scheduler
-                    // speed (timing-independent), bounded only by a generous ceiling a
-                    // clean pull is never expected to reach.
-                    Some(Ok(())) => {
-                        self.await_present_after_clean_pull(offset, need).await?;
-                        break;
-                    }
+                    // A clean pull admitted every byte of its range to the store
+                    // BEFORE it marked ended, so the bytes are durably stored and the
+                    // authoritative ranged read below returns them. Read them straight
+                    // from the store rather than re-gating on the observed present
+                    // bitfield: that bitfield is served through the store actor's
+                    // `observe`, which can lag the durable admit by a store-actor hop
+                    // when the actor is starved of CPU (a slow, coverage-instrumented
+                    // run). Gating on it — as a wall-clock-bounded present-poll did —
+                    // aborts a serve whose bytes are in fact readable the moment the
+                    // lag exceeds the ceiling. The durable ranged read has no such lag,
+                    // so a clean outcome is proof the range is readable: break to it.
+                    // Timing-INDEPENDENT — the decision rests on the outcome, never a
+                    // wall clock.
+                    Some(Ok(())) => break,
                     // A failed pull can never make the byte present — fail fast.
                     Some(Err(msg)) => {
                         return Err(io::Error::other(format!(
