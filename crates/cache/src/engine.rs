@@ -28,7 +28,7 @@ use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
-use crate::fill_session::{FillClaim, FillPlan, FillRegistry, FillSession, ObserverLease};
+use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, Presence};
@@ -269,12 +269,12 @@ struct Inner {
     /// reading party.
     #[allow(dead_code)]
     gc_store_handle: Option<Arc<OnceLock<FsStore>>>,
-    /// Range-aware in-flight fill registry (#1621 B3.2). Coalesces concurrent
+    /// Range-aware in-flight fill registry (ADR 038). Coalesces concurrent
     /// serve-misses for the same hash: a request whose range an in-flight pull
-    /// already covers attaches an observer instead of opening a duplicate pull.
-    /// Purely synchronous range math; holds no blob bytes. Consulted by
-    /// [`CacheEngine::fill_plan`] and populated by [`CacheEngine::register_fill`]
-    /// (the live-pull wiring lands in B3.4).
+    /// already covers attaches an observer instead of opening a duplicate pull,
+    /// and a partial overlap opens a pull for only its remainder. Also holds the
+    /// per-hash captured outboard every serve leg reads. Purely synchronous range
+    /// math; holds no blob bytes. Driven through [`CacheEngine::claim_fill`].
     fill_registry: Arc<FillRegistry>,
 }
 
@@ -1038,30 +1038,25 @@ impl CacheEngine {
         })
     }
 
-    /// Plan a serve-miss of `[offset, offset+len)` (`len == 0` = to end) of the
-    /// `total`-byte blob `hash` against the in-flight fills: split it into `attach`
-    /// (an in-flight pull already covers these bytes — attach an observer) and
-    /// `remainder` (fetch these). See [`FillRegistry::fill_plan`]. The live-pull
-    /// wiring that consumes this lands in B3.4.
+    /// Peek the in-flight fill registry for a LIVE fill of `hash`, returning its
+    /// blob `total_bytes` if one runs. ADVISORY: the serve-miss path uses it to skip
+    /// the upstream header handshake when it will coalesce onto a live pull, but the
+    /// authoritative own-vs-attach decision stays in [`Self::claim_fill`]. See
+    /// [`FillRegistry::in_flight_total`].
     #[must_use]
-    pub fn fill_plan(&self, hash: Hash, offset: u64, len: u64, total: u64) -> FillPlan {
-        self.inner.fill_registry.fill_plan(hash, offset, len, total)
-    }
-
-    /// Publish a new pull's [`FillSession`] (already scoped via
-    /// [`FillSession::set_covered`]) so later serve-misses can coalesce onto it,
-    /// returning the owner [`ObserverLease`]. See [`FillRegistry::register_fill`].
-    pub fn register_fill(&self, hash: Hash, session: Arc<FillSession>) -> ObserverLease {
-        self.inner.fill_registry.register_fill(hash, session)
+    pub fn in_flight_total(&self, hash: Hash) -> Option<u64> {
+        self.inner.fill_registry.in_flight_total(hash)
     }
 
     /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
-    /// of the `total`-byte blob `hash`: decide attach-vs-own AND register under one
-    /// map-lock acquisition, closing the [`Self::fill_plan`] + [`Self::register_fill`]
-    /// TOCTOU race. Returns [`FillClaim::Attach`] to coalesce onto a live pull (no new
-    /// pull) or [`FillClaim::Owner`] with a freshly-registered session the caller must
-    /// drive a pull for. `make_session` builds the session only on the owner branch
-    /// (never built-and-dropped on attach). See [`FillRegistry::claim`].
+    /// of the `total`-byte blob `hash`: decide attach/own/mixed AND register any new
+    /// owner session under one map-lock acquisition (no plan-then-register TOCTOU
+    /// race). Returns [`FillClaim::Attach`] to coalesce wholly onto a live pull,
+    /// [`FillClaim::Owner`] with a freshly-registered session covering the whole
+    /// request, or [`FillClaim::Mixed`] to own a pull for a contiguous remainder while
+    /// attaching a sibling for the overlap. `make_session` builds the session only on
+    /// an owning branch (never built-and-dropped on a pure attach). See
+    /// [`FillRegistry::claim`].
     pub fn claim_fill(
         &self,
         hash: Hash,
@@ -7204,6 +7199,159 @@ mod tests {
                 BlobStatus::Partial { .. }
             ),
             "tagged partial survives GC"
+        );
+    }
+
+    /// Drain a serve-leg export stream to completion, prefixed with its
+    /// already-pulled `first` item. Every remaining item MUST be `Ok`: an
+    /// in-flight reader started before an evict has to keep delivering correct
+    /// bytes even after the blob is evicted and GC-swept out of the store.
+    /// Consumes (and thus drops) the stream, releasing its handle so the disk
+    /// space can free.
+    async fn drain_serve_leg(
+        first: Bytes,
+        mut stream: Pin<Box<dyn futures_util::Stream<Item = CacheResult<Bytes>> + Send>>,
+    ) -> Bytes {
+        let mut out = bytes::BytesMut::from(&first[..]);
+        while let Some(item) = stream.next().await {
+            let bytes =
+                item.expect("in-flight serve-leg reader must deliver bytes despite evict + GC");
+            out.extend_from_slice(&bytes);
+        }
+        out.freeze()
+    }
+
+    /// Poll the store until `hash` reports `NotFound`, or fail after `deadline`.
+    /// Used to gate on a GC sweep having reclaimed a blob without pinning the
+    /// test to the exact 200ms interval — robust on slow/loaded CI.
+    async fn wait_reclaimed(engine: &CacheEngine, hash: Hash, deadline: Duration) {
+        use iroh_blobs::api::blobs::BlobStatus;
+        let start = std::time::Instant::now();
+        loop {
+            if matches!(
+                engine.inner.store.blobs().status(hash).await.unwrap(),
+                BlobStatus::NotFound
+            ) {
+                return;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "blob {hash} never reclaimed within {deadline:?}: GC did not run"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// B3 multi-observer coalescing (#1656) composes with operator eviction
+    /// (#279). A coalesced serve-miss fans one upstream pull out to N serve legs;
+    /// each serve leg reads the filling partial through its own in-flight
+    /// `export_bao_range_stream` handle. This test reduces that to the cache-level
+    /// invariant the node layer relies on: **two in-flight readers over one
+    /// partial, evicted mid-serve, both still finish delivering byte-for-byte
+    /// correct bytes even after the GC sweep has logically removed the blob.**
+    ///
+    /// The load-bearing assumption B3 deferred (decision 5): reader-pinning is
+    /// UNCHANGED by coalescing — N serve-leg readers survive an evict + GC sweep
+    /// exactly as one reader would, because each holds its own live export handle.
+    /// Eviction is a *logical* takedown: it drops the B0 partial tag and blocks
+    /// NEW serves (`has` reports absent), but it does not tear down readers already
+    /// in flight.
+    ///
+    /// One subtlety this pins precisely: the store flips the blob to `NotFound`
+    /// the instant the GC sweep deletes it — the logical delete does NOT wait for
+    /// the last reader. The in-flight readers still complete correctly because the
+    /// bytes they need stay reachable through their open handles until they drop
+    /// (the disk space is what frees only after the last handle closes).
+    #[tokio::test]
+    async fn evict_mid_serve_lets_coalesced_readers_finish_then_reclaims() {
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 8 * group;
+        let tmp = tempfile::tempdir().unwrap();
+        // Short GC interval so the store's internal run_gc loop sweeps within the
+        // test window (same knob as `tagged_partial_survives_gc_...`).
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![],
+            16,
+            PinnedHashes::empty(),
+            RetryPolicy::disabled(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::new(CacheMetrics::default())),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+        // The coalesced-fill target: a genuine partial (groups [0, 6g) of an 8g
+        // blob), tagged by `admit_bao` exactly as the pull leg tags it.
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, 6 * group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(
+            !engine.present_ranges(hash).await.unwrap().is_complete(),
+            "the fill target is a genuine partial"
+        );
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "the partial carries its B0 protecting tag"
+        );
+
+        // The exact wire each serve leg must deliver, captured before the evict.
+        let expected = engine
+            .export_bao_range(hash, 0, 6 * group, total)
+            .await
+            .unwrap();
+
+        // Two coalesced serve legs: each opens an in-flight verified-range stream
+        // and pulls its first frame, so both hold a live export handle when the
+        // evict lands.
+        let mut leg_a = engine
+            .export_bao_range_stream(hash, 0, 6 * group, total)
+            .await
+            .unwrap();
+        let mut leg_b = engine
+            .export_bao_range_stream(hash, 0, 6 * group, total)
+            .await
+            .unwrap();
+        let first_a = leg_a.next().await.expect("leg A first frame").unwrap();
+        let first_b = leg_b.next().await.expect("leg B first frame").unwrap();
+
+        // Evict mid-serve. Logical takedown: tag dropped, new serves blocked.
+        engine.evict(hash).await.unwrap();
+        assert!(engine.is_evicted(hash), "evict flag set");
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            0,
+            "evict drops the B0 protecting tag"
+        );
+        assert!(
+            !engine.has(hash).await.unwrap(),
+            "a NEW serve is blocked immediately after evict"
+        );
+
+        // Wait — while BOTH serve legs are still held — for the target itself to
+        // report `NotFound`. This is the documented subtlety made an assertion:
+        // the GC sweep deletes the untagged blob and flips its logical status the
+        // instant it runs, without waiting for the in-flight readers. Gating on
+        // the target (not a proxy) both proves a sweep ran after the tag drop and
+        // pins that the delete does not defer to the last reader.
+        wait_reclaimed(&engine, hash, Duration::from_secs(15)).await;
+
+        // The heart of the composition: BOTH in-flight readers, started before the
+        // evict, still drain to completion with byte-for-byte identical bytes even
+        // though the blob was already logically removed by the sweep above. Each
+        // reader's open export handle keeps its bytes reachable — reader-pinning
+        // held for two readers exactly as it would for one.
+        let served_a = drain_serve_leg(first_a, leg_a).await;
+        let served_b = drain_serve_leg(first_b, leg_b).await;
+        assert_eq!(
+            served_a, expected,
+            "serve leg A delivered the full range intact"
+        );
+        assert_eq!(
+            served_b, expected,
+            "serve leg B delivered the full range intact"
         );
     }
 }

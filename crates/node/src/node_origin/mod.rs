@@ -60,7 +60,7 @@ pub(crate) use funder::NodeFunder;
     unused_imports,
     reason = "wired by the own-origin serve-miss orchestration"
 )]
-pub(crate) use pull_leg::{run_local_pull_leg, run_pull_leg};
+pub(crate) use pull_leg::{PullLegTarget, run_local_pull_leg, run_pull_leg};
 
 use std::collections::HashMap;
 use std::future::Future;

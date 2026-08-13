@@ -33,7 +33,7 @@ use decdn_cache::{FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
 use decdn_protocol::CHUNK_SIZE;
 use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
 /// first chunk group) before a present-range watch can be opened.
@@ -53,18 +53,26 @@ struct AwaitingDataReader {
     total: u64,
     /// Live present-range watch, opened lazily once the blob materializes.
     watch: Option<PresentRangeWatch>,
-    /// The shared fill session: its terminal signal races the present-range watch so
-    /// a pull that could not fill a gap fails the read rather than hanging.
+    /// The shared fill session: [`FillSession::range_still_live`] races the
+    /// present-range watch so a range no live pull will fill fails the read rather
+    /// than hanging. Under partial-overlap coalescing a leaf may be filled by a
+    /// sibling pull (of the same hash), so termination consults ALL live fills, not
+    /// just this session's own terminal signal.
     session: Arc<FillSession>,
+    /// The per-hash liveness signal, snapshot at construction: notified whenever any
+    /// fill of this hash ends or is cancelled, so a parked read re-checks liveness.
+    liveness: Arc<Notify>,
 }
 
 impl AwaitingDataReader {
     fn new(store: NodeRangedStore, total: u64, session: Arc<FillSession>) -> Self {
+        let liveness = session.liveness_signal();
         Self {
             store,
             total,
             watch: None,
             session,
+            liveness,
         }
     }
 
@@ -88,35 +96,47 @@ impl AwaitingDataReader {
 impl AsyncSliceReader for AwaitingDataReader {
     async fn read_at(&mut self, offset: u64, len: usize) -> io::Result<Bytes> {
         let need = len as u64;
+        // The chunk range this read needs, for the "any live fill still covers it?"
+        // termination check. An align error (never for an in-bounds encoder read)
+        // yields an empty range, which reads as "no live coverer" and fails cleanly
+        // rather than hanging.
+        let range = align_range(offset, need, self.total)
+            .map_or_else(|_| ChunkRanges::empty(), |a| a.chunk_ranges().clone());
         loop {
             if self.present_covers(offset, need).await? {
                 break;
             }
 
-            // Register the pull-ended waiter BEFORE re-inspecting shared state, so a
-            // terminal outcome recorded concurrently cannot slip past the check.
-            let session = Arc::clone(&self.session);
-            let mut ended = Box::pin(session.ended_signal().notified());
+            // Register the liveness waiter BEFORE re-inspecting shared state, so a
+            // terminal outcome recorded concurrently cannot slip past the check. Clone
+            // the `Arc` to a local so the waiter borrows it, not `self` — leaving
+            // `&mut self` free for the present-range checks below.
+            let liveness = Arc::clone(&self.liveness);
+            let mut ended = Box::pin(liveness.notified());
             ended.as_mut().enable();
 
-            // Terminal pull outcome? A failed pull fails the read; a clean pull means
-            // the bytes are authoritatively cached — one more check settles a lag.
-            if let Some(outcome) = self.session.outcome() {
+            // No live fill still covers this range? A failed / abandoned pull fails
+            // the read; a clean pull means the bytes are authoritatively cached — one
+            // more check settles a lag.
+            if !self.session.range_still_live(&range) {
                 if self.present_covers(offset, need).await? {
                     break;
                 }
-                return Err(match outcome {
-                    Err(msg) => io::Error::other(format!(
+                return Err(match self.session.outcome() {
+                    Some(Err(msg)) => io::Error::other(format!(
                         "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
                     )),
-                    Ok(()) => io::Error::other(format!(
+                    Some(Ok(())) => io::Error::other(format!(
                         "upstream pull completed but content [{offset}, +{len}) is missing"
+                    )),
+                    None => io::Error::other(format!(
+                        "no live fill covers content [{offset}, +{len}); every covering pull ended"
                     )),
                 });
             }
 
             // Ensure a watch is open; it errors until the blob materializes —
-            // tolerate that with a bounded poll racing `pull_ended`, then retry.
+            // tolerate that with a bounded poll racing the liveness signal, then retry.
             if self.watch.is_none() {
                 match self.store.observe().await {
                     Ok(w) => self.watch = Some(w),
@@ -287,5 +307,218 @@ impl CoherentFrameProducer {
                 None => return Ok(self.rx.recv().await),
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::too_many_arguments
+)] // tests
+mod tests {
+    use std::sync::Arc;
+
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    use bytes::Bytes;
+    use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
+    use decdn_cache::{CacheEngine, FillClaim, FillSession, Hash, NodeRangedStore};
+    use iroh_io::AsyncStreamReader;
+
+    use super::CoherentFrameProducer;
+
+    /// One chunk group — the alignment granularity the registry and encoder snap to.
+    const G: u64 = decdn_cache::CHUNK_GROUP_BYTES;
+
+    /// Deterministic pseudo-random blob (the generator the cache + admit-store tests
+    /// share) plus its root and pre-order outboard.
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes().first().copied().unwrap_or(0);
+        }
+        let ob = PreOrderMemOutboard::create(&plaintext, IROH_BLOCK_SIZE);
+        (*ob.root.as_bytes(), plaintext, Bytes::from(ob.data))
+    }
+
+    /// A header-less bao-wire reader over a `Bytes` cursor (the shape
+    /// `admit_bao_stream` consumes; the size comes from the caller's `total_bytes`).
+    struct MemReader {
+        wire: Bytes,
+    }
+
+    impl AsyncStreamReader for MemReader {
+        async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+            let take = self.wire.len().min(len);
+            Ok(self.wire.split_to(take))
+        }
+
+        async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+            if self.wire.len() < L {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "MemReader exhausted",
+                ));
+            }
+            let got = self.wire.split_to(L);
+            let mut out = [0u8; L];
+            out.copy_from_slice(&got);
+            Ok(out)
+        }
+    }
+
+    /// The header-less verified bao wire for the aligned byte range `[off, off+len)`.
+    fn range_wire(
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: &Bytes,
+        total: u64,
+        off: u64,
+        len: u64,
+    ) -> (bao_tree::ChunkRanges, Bytes) {
+        let aligned = align_range(off, len, total).expect("align");
+        let s = aligned.fetch_start() as usize;
+        let e = aligned.fetch_end() as usize;
+        let combined = encode_verified_range(root, &aligned, &plaintext[s..e], outboard.clone())
+            .expect("encode");
+        (aligned.chunk_ranges().clone(), combined.slice(8..))
+    }
+
+    /// Admit one aligned range through `session` (so the cache captures its proof into
+    /// the per-hash outboard, exactly as the pull leg does).
+    async fn admit(
+        engine: &CacheEngine,
+        hash: Hash,
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: &Bytes,
+        total: u64,
+        off: u64,
+        len: u64,
+        session: &Arc<FillSession>,
+    ) {
+        let (ranges, wire) = range_wire(root, plaintext, outboard, total, off, len);
+        engine
+            .admit_bao_stream(hash, ranges, total, MemReader { wire }, Some(session))
+            .await
+            .expect("admit range");
+    }
+
+    /// Drain a producer's frames to one byte vector.
+    async fn drain(mut producer: CoherentFrameProducer) -> anyhow::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(frame) = producer.next_frame().await? {
+            out.extend_from_slice(&frame);
+        }
+        Ok(out)
+    }
+
+    /// Two partially-overlapping serve-misses share ONE fill for the overlap: client A
+    /// pulls `[0,3g)`, client B (wanting `[2g,5g)`) coalesces — it opens a pull for
+    /// only its non-overlapping remainder `[3g,5g)` and serves the whole `[2g,5g)`,
+    /// reading the `[2g,3g)` overlap from A's fill (never re-pulled) and its own
+    /// `[3g,5g)`. B's coherent encode must AWAIT the remainder (no wedge) and produce
+    /// byte-identical wire to a single-pull encode of `[2g,5g)`. This is the whole
+    /// partial-overlap lift: without the shared per-hash outboard + registry-wide
+    /// termination, B's encode would fail on a node A captured or hang on A's data.
+    #[tokio::test]
+    async fn partial_overlap_shares_one_fill_and_serves_r_byte_exact() {
+        let total = 8 * G;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+
+        // Client A: [0,3g) → OWNER.
+        let FillClaim::Owner {
+            session: a_session,
+            lease: _a_lease,
+        } = engine.claim_fill(hash, 0, 3 * G, total, || FillSession::new(a_root, total))
+        else {
+            panic!("A owns its whole request");
+        };
+
+        // Client B: [2g,5g) overlaps A's prefix → MIXED. B owns only the remainder
+        // [3g,5g) and attaches A for the [2g,3g) overlap — the "share one pull".
+        let FillClaim::Mixed {
+            owner: b_owner,
+            attach: b_attach,
+            remainder_offset,
+            remainder_len,
+            owner_lease: _ol,
+            attach_lease: _al,
+        } = engine.claim_fill(hash, 2 * G, 3 * G, total, || {
+            FillSession::new(a_root, total)
+        })
+        else {
+            panic!("B mixes: owns the remainder, attaches the overlap sibling");
+        };
+        assert!(Arc::ptr_eq(&b_attach, &a_session), "B attaches A's fill");
+        assert_eq!(
+            (remainder_offset, remainder_len),
+            (3 * G, 2 * G),
+            "B opens a pull for ONLY its non-overlapping remainder"
+        );
+
+        // A fills [0,3g): the overlap [2g,3g) is now present + its proof captured.
+        admit(
+            &engine,
+            hash,
+            root,
+            &plaintext,
+            &outboard,
+            total,
+            0,
+            3 * G,
+            &a_session,
+        )
+        .await;
+
+        // B serves the WHOLE [2g,5g) before its remainder lands: it must deliver the
+        // overlap from A's fill, then PARK awaiting [3g,5g) — never wedge.
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let producer = CoherentFrameProducer::new(store, Arc::clone(&b_owner), 2 * G, 5 * G, total);
+        let serve = tokio::spawn(drain(producer));
+        tokio::task::yield_now().await;
+        assert!(
+            !serve.is_finished(),
+            "B's serve must park awaiting its remainder, not complete or wedge"
+        );
+
+        // B's own remainder [3g,5g) lands; the parked encode resumes.
+        admit(
+            &engine,
+            hash,
+            root,
+            &plaintext,
+            &outboard,
+            total,
+            3 * G,
+            2 * G,
+            &b_owner,
+        )
+        .await;
+
+        let served = tokio::time::timeout(std::time::Duration::from_secs(20), serve)
+            .await
+            .expect("B's serve must not hang once its remainder lands")
+            .expect("serve task")
+            .expect("serve produced a coherent stream");
+
+        // Byte-identical to a single verified encode of the whole [2g,5g).
+        let (_r, reference) = range_wire(root, &plaintext, &outboard, total, 2 * G, 3 * G);
+        assert_eq!(
+            served,
+            reference.as_ref(),
+            "the coalesced two-pull serve of [2g,5g) is byte-identical to a single-pull encode"
+        );
     }
 }

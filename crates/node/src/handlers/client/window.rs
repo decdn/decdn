@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 
 use alloy::primitives::U256;
 
+use crate::node_origin::PullLegTarget;
+
 use super::{
     Arc, B256, ClientHandler, ClientMessage, FillOutcome, Hash, LaneDeliveryState, LaneKey,
     MB_BYTES, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest,
@@ -148,62 +150,65 @@ impl ClientHandler {
                 .await;
         }
 
-        // (3) Discover an upstream, open a channel, and read the blob header — ONE
-        // discovery shared by both legs, with open-time candidate fallback preserved
-        // (`open_pull_leg`). Bounded by the pull-through deadline so a slow/absent
-        // upstream can't pin the stream. The namespace (ADR 005 §Namespace routing)
+        // (3) Learn the blob geometry. PEEK the in-flight fill registry first: if a
+        // live pull for this hash already runs, it already knows `total_bytes` from
+        // its own header handshake, so this miss can coalesce onto it and SKIP the
+        // expensive discovery + channel-open + header handshake (`open_pull_leg`)
+        // entirely. The peek is ADVISORY — the authoritative own-vs-attach decision
+        // stays in the atomic `claim_fill` below. A concurrent last observer can
+        // retire the peeked session between the peek and the claim, so `claim_fill`
+        // can still return `Owner`; that branch opens the pull leg LATE (step 6b) —
+        // it alone needs a `target`. The namespace (ADR 005 §Namespace routing)
         // drives the origin-directory fallback inside `discover` on a total DHT miss
         // and is threaded onto the node-to-node leg so a directory-discovered cold
         // origin's own pull-through gate resolves (#1401); big-endian to the on-chain
         // `uint256` shape.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let namespace_id = U256::from_be_bytes(req.namespace_id);
-        let target =
-            match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id)).await {
-                Ok(Ok(target)) => target,
-                // No upstream provider could be opened — a clean miss on THIS tier, or
-                // a latched earlier-tier / local fault honored per #1129 / #1560 (a
-                // walk that failed on our own broken buyer key is not evidence the blob
-                // is absent).
-                Ok(Err(miss)) => {
-                    let reason = FillOutcome::miss_reason(fault_seen || miss.is_local_fault());
-                    return self
-                        .respond_error(&mut send, req, reason, rate_per_mb)
-                        .await;
+        let mut target: Option<PullLegTarget> = None;
+        let total_bytes = match self.cache.in_flight_total(hash) {
+            Some(total) => total,
+            None => {
+                // No live fill to coalesce onto — handshake upstream to learn the
+                // geometry and secure the pull target this miss will own. ONE discovery
+                // shared by both legs, open-time candidate fallback preserved.
+                match self
+                    .open_pull_leg_bounded(
+                        origin.as_ref(),
+                        hash,
+                        namespace_id,
+                        deadline,
+                        fault_seen,
+                    )
+                    .await
+                {
+                    Ok(opened) => {
+                        let total = opened.total_bytes;
+                        target = Some(opened);
+                        total
+                    }
+                    Err(reason) => {
+                        return self
+                            .respond_error(&mut send, req, reason, rate_per_mb)
+                            .await;
+                    }
                 }
-                Err(_elapsed) => {
-                    self.metrics.node_pull_through_timeout();
-                    let reason = FillOutcome::miss_reason(fault_seen);
-                    return self
-                        .respond_error(&mut send, req, reason, rate_per_mb)
-                        .await;
-                }
-            };
-        let total_bytes = target.total_bytes;
+            }
+        };
 
-        // (4) Size gate on the upstream-claimed total. (`open_pull_leg` already refuses
-        // an oversized header via its `max_blob_size_bytes`; this is a belt-and-braces
-        // wire-reason check.)
+        // (4) Size gate on the claimed total (peeked or upstream-handshaked).
+        // (`open_pull_leg` already refuses an oversized header via its
+        // `max_blob_size_bytes`; this is a belt-and-braces wire-reason check.)
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
         }
 
-        // (5) Sign + send the response up front — it commits to `total_bytes`,
-        // now known from the header handshake, and to the interval negotiated above.
-        let body = StreamResponseBody {
-            hash: req.hash,
-            ok: true,
-            rate_per_mb,
-            total_bytes,
-            pool_id: req.pool_id,
-            timestamp_us: req.timestamp_us,
-            redirect: None,
-        };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
-        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
-            .await?;
+        // (5) The signed `StreamResponse` commits to `total_bytes` (now known) and the
+        // `interval_mb` negotiated above. It is deferred to step (7), AFTER the fill is
+        // claimed — so a peeked geometry that raced to `Owner` opens its pull leg (and
+        // can still cleanly refuse) before we promise `ok: true`.
 
         // (6) The two decoupled legs (ADR 037). The SERVE
         // leg runs HERE on the accept task — it MUST be `Send` (the iroh
@@ -239,153 +244,179 @@ impl ClientHandler {
                 session
             });
 
-        match claim {
-            // OWNER: no live pull covers this hash — drive one. The pull selects on
-            // `session.cancel_token()`; the last observer leaving (teardown below)
-            // cancels it (#1610). The freshly-handshaked `target` feeds the pull.
-            decdn_cache::FillClaim::Owner { session, lease } => {
-                // Seed the shared outboard with proof for held ranges the pull never
-                // admits (`seed_held_outboard`). OUTSIDE the claim lock, so the awaits
-                // are safe.
-                self.seed_held_outboard(hash, &session).await;
+        // Resolve the claim into a uniform shape: the session to serve from, the
+        // optional local pull to drive for it (byte range), the sibling frontiers to
+        // also pace (DECISION-B), and the leases to hold for the serve's lifetime.
+        // `Owner` drives a pull for the whole request; `Mixed` drives one for only the
+        // remainder and attaches a sibling for the overlap; `Attach` drives none.
+        let (serve_session, pull_range, also_pace, leases) = plan_serve(claim, req);
 
-                // The serve leg reads the cache the pull leg fills — same engine, same
-                // hash.
-                let serve_store =
-                    decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
-
-                // Spawn the off-task pull leg on its own current-thread runtime. All
-                // inputs are owned + `'static`; it shares only the session Arc. Its
-                // cancel token is the SESSION's — lease-driven, not a fresh local token.
-                let pull_thread = {
-                    let deps_lock = origin.deps_arc();
-                    let engine = self.cache.clone();
-                    let session = Arc::clone(&session);
-                    let cancel = session.cancel_token().clone();
-                    let offset = req.byte_offset;
-                    let len = req.byte_len;
-                    // Seed-leech cap (ADR 037): enforced in the pull leg's pacer. The
-                    // served client is the accounting key.
-                    let leech_governor = self.leech_governor.clone();
-                    let client_peer = client_node_id.0;
-                    std::thread::Builder::new()
-                        .name("serve-miss-pull".to_string())
-                        .spawn(move || {
-                            match tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                            {
-                                Ok(rt) => rt.block_on(crate::node_origin::run_pull_leg(
-                                    deps_lock,
-                                    target,
-                                    engine,
-                                    hash,
-                                    offset,
-                                    len,
-                                    window,
-                                    Arc::clone(&session),
-                                    leech_governor,
-                                    client_peer,
-                                    cancel,
-                                )),
-                                Err(e) => {
-                                    // The pull could not start: record a terminal error
-                                    // and wake the serve leg so it fails a gap rather
-                                    // than hanging.
-                                    session.mark_ended(Err(decdn_cache::FillError::new(format!(
-                                        "serve-miss pull runtime build failed: {e}"
-                                    ))));
-                                }
-                            }
-                        })
-                };
-                let pull_thread = match pull_thread {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        // The OS refused the thread: fail any attached observer fast
-                        // (`mark_ended`), release the lease, and fail the serve.
-                        session.mark_ended(Err(decdn_cache::FillError::new(format!(
-                            "could not spawn serve-miss pull thread: {e}"
-                        ))));
-                        lease.detach();
-                        return Err(anyhow::anyhow!(
-                            "could not spawn serve-miss pull thread: {e}"
-                        ));
-                    }
-                };
-
-                // Run the serve leg on THIS (accept) task and await it. It owns
-                // termination. It mints its outboard reader from the shared `session`
-                // and reads the pull's terminal signal off it for the no-hang guarantee.
-                let serve_result = self
-                    .serve_leg(
-                        &mut send,
-                        &mut recv,
-                        serve_store,
-                        Arc::clone(&session),
-                        lane,
-                        hash,
-                        lane_key,
-                        client_node_id,
-                        rate_per_mb,
-                        interval_mb,
-                        req.byte_offset,
-                        req.byte_len,
-                        total_bytes,
-                        window,
-                    )
-                    .await;
-
-                // Teardown (LEASE-driven, #1610): drop the observer lease FIRST. If this
-                // was the last observer and the pull is still running, that drop cancels
-                // the session token, stopping the pull; if other observers remain the
-                // pull keeps filling for them. THEN JOIN the pull thread — bounded, since
-                // the pull ends when it finishes filling R or is cancelled, and its
-                // `SettleOnDrop` persists the buyer watermark (#852). Joined off the
-                // async worker via `spawn_blocking`. Never cancel the token directly.
-                lease.detach();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = pull_thread.join();
-                })
-                .await;
-                serve_result
-            }
-            // ATTACH: a live pull already covers this hash. Run a serve leg over the
-            // shared session — NO new pull, NO thread. The `target` handshake opened
-            // above is now unused (a free handshake spent; a follow-up optimization can
-            // peek the registry before handshaking).
-            decdn_cache::FillClaim::Attach { session, lease } => {
-                // Seed held-range proof so this observer's coherent encoder is
-                // self-sufficient, not dependent on the owner's seed-before-spawn
-                // ordering (`seed_held_outboard`; idempotent, near-free on a full miss).
-                self.seed_held_outboard(hash, &session).await;
-                let serve_store =
-                    decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
-                let serve_result = self
-                    .serve_leg(
-                        &mut send,
-                        &mut recv,
-                        serve_store,
-                        Arc::clone(&session),
-                        lane,
-                        hash,
-                        lane_key,
-                        client_node_id,
-                        rate_per_mb,
-                        interval_mb,
-                        req.byte_offset,
-                        req.byte_len,
-                        total_bytes,
-                        window,
-                    )
-                    .await;
-                // Teardown: drop the lease. If this was the last observer, its drop
-                // cancels the session token, which makes the owner's blocked join
-                // return. No pull thread to join here.
-                lease.detach();
-                serve_result
+        // (6b) Owning-race repair: the advisory step-3 peek planned to ATTACH and
+        // secured no `target`, but the peeked session retired before this claim, so the
+        // atomic decision drives a fresh pull (`Owner`, or a `Mixed` remainder). Open the
+        // pull leg now, BEFORE signing `ok: true` (step 7), so a no-provider / deadline
+        // miss still refuses cleanly rather than committing to a stream it can't fill.
+        if pull_range.is_some() && target.is_none() {
+            match self
+                .open_pull_leg_bounded(origin.as_ref(), hash, namespace_id, deadline, fault_seen)
+                .await
+            {
+                Ok(opened) => target = Some(opened),
+                Err(reason) => {
+                    return self
+                        .respond_error(&mut send, req, reason, rate_per_mb)
+                        .await;
+                }
             }
         }
+
+        // (7) Sign + send the response now that the fill mechanism is secured for every
+        // branch (attach: the owner fills; own/mixed: `target` is set by step 3 or 6b).
+        // It commits to `total_bytes`, known from the peek or the header handshake.
+        let body = StreamResponseBody {
+            hash: req.hash,
+            ok: true,
+            rate_per_mb,
+            total_bytes,
+            pool_id: req.pool_id,
+            timestamp_us: req.timestamp_us,
+            redirect: None,
+        };
+        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+            .await?;
+
+        // Seed the shared per-hash outboard with proof for held ranges no pull admits
+        // (`seed_held_outboard`; idempotent). OUTSIDE the claim lock, so awaits are
+        // safe. Every serve leg seeds, so its encoder is self-sufficient regardless of
+        // owner/attach ordering.
+        self.seed_held_outboard(hash, &serve_session).await;
+        // The serve leg reads the cache the pull leg fills — same engine, same hash.
+        let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
+
+        // Spawn the off-task pull leg iff this claim owns one, on its own
+        // current-thread runtime. All inputs are owned + `'static`; it shares only the
+        // session Arc. Its cancel token is the SERVE session's — lease-driven, not a
+        // fresh local token. The handle is PARKED on the session (`set_pull_handle`) so
+        // whichever observer leaves LAST joins it (the owner-join hand-off, #1664),
+        // freeing an owner whose own client finishes first from parking in the join.
+        if let Some((pull_offset, pull_len)) = pull_range {
+            let Some(target) = target else {
+                // Unreachable: step 6b secures a `target` for every owning claim (Owner
+                // or Mixed remainder). Fail the serve rather than panic (anti-panic
+                // policy) — the response is already sent, so a mid-stream error is the
+                // honest outcome; carry the hash + namespace for production debugging.
+                serve_session.mark_ended(Err(decdn_cache::FillError::new(
+                    "serve-miss owning claim without a pull target",
+                )));
+                for lease in leases {
+                    let _ = lease.release();
+                }
+                return Err(anyhow::anyhow!(
+                    "serve-miss owning claim without a pull target (hash {hash}, namespace {namespace_id})"
+                ));
+            };
+            let deps_lock = origin.deps_arc();
+            let engine = self.cache.clone();
+            let session = Arc::clone(&serve_session);
+            let cancel = serve_session.cancel_token().clone();
+            // Seed-leech cap (ADR 037): enforced in the pull leg's pacer. The served
+            // client is the accounting key.
+            let leech_governor = self.leech_governor.clone();
+            let client_peer = client_node_id.0;
+            let spawned = std::thread::Builder::new()
+                .name("serve-miss-pull".to_string())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(crate::node_origin::run_pull_leg(
+                            deps_lock,
+                            target,
+                            engine,
+                            hash,
+                            pull_offset,
+                            pull_len,
+                            window,
+                            Arc::clone(&session),
+                            leech_governor,
+                            client_peer,
+                            cancel,
+                        )),
+                        Err(e) => {
+                            // The pull could not start: record a terminal error and
+                            // wake the serve leg so it fails a gap rather than hanging.
+                            session.mark_ended(Err(decdn_cache::FillError::new(format!(
+                                "serve-miss pull runtime build failed: {e}"
+                            ))));
+                        }
+                    }
+                });
+            match spawned {
+                Ok(handle) => serve_session.set_pull_handle(handle),
+                Err(e) => {
+                    // The OS refused the thread: fail any attached observer fast
+                    // (`mark_ended`), release every lease (no handle parked, so nothing
+                    // to join), and fail the serve.
+                    serve_session.mark_ended(Err(decdn_cache::FillError::new(format!(
+                        "could not spawn serve-miss pull thread: {e}"
+                    ))));
+                    for lease in leases {
+                        let _ = lease.release();
+                    }
+                    return Err(anyhow::anyhow!(
+                        "could not spawn serve-miss pull thread: {e}"
+                    ));
+                }
+            }
+        }
+
+        // Run the serve leg on THIS (accept) task and await it. It owns termination.
+        // It mints its outboard reader from the shared per-hash outboard and reads the
+        // registry-wide fill liveness for the no-hang guarantee, pacing every pull it
+        // draws from (its own plus any attached sibling).
+        let serve_result = self
+            .serve_leg(
+                &mut send,
+                &mut recv,
+                serve_store,
+                Arc::clone(&serve_session),
+                &also_pace,
+                lane,
+                hash,
+                lane_key,
+                client_node_id,
+                rate_per_mb,
+                interval_mb,
+                req.byte_offset,
+                req.byte_len,
+                total_bytes,
+                window,
+            )
+            .await;
+
+        // Teardown (LEASE-driven, #1610): release every lease. A last-out release
+        // cancels the pull (if still running) and hands back the session's parked
+        // pull-thread handle for THIS caller to join off-task — never under the map
+        // lock, never by cancelling the token directly. A non-last-out release returns
+        // at once, leaving the pull filling for the remaining observers. At most one
+        // handle comes back per lease (our own pull, plus a coalesced sibling's pull if
+        // we are its last observer); each `SettleOnDrop` persists the buyer watermark
+        // (#852). Join each off the async worker via `spawn_blocking`.
+        let mut to_join = Vec::new();
+        for lease in leases {
+            if let Some(handle) = lease.release() {
+                to_join.push(handle);
+            }
+        }
+        for handle in to_join {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            })
+            .await;
+        }
+        serve_result
     }
 
     /// Serve a cache miss from the node's OWN configured fs/http/s3 origin by
@@ -564,159 +595,168 @@ impl ClientHandler {
                 session
             });
 
-        match claim {
-            // OWNER: no live pull covers this hash — drive a local origin pull. The pull
-            // selects on `session.cancel_token()`; the last observer leaving (teardown
-            // below) cancels it (#1610).
-            decdn_cache::FillClaim::Owner { session, lease } => {
-                // Seed the shared outboard with proof for held ranges the pull never
-                // admits (`seed_held_outboard`). OUTSIDE the claim lock.
-                self.seed_held_outboard(hash, &session).await;
+        // Resolve the claim into the uniform serve shape (twin of the peer path,
+        // `plan_serve`): the session to serve from, the optional local pull range, the
+        // sibling frontiers to also pace, and the leases to hold. `Owner` drives a
+        // local origin pull for the whole request; `Mixed` for only the remainder,
+        // attaching a sibling for the overlap; `Attach` drives none — the S3-egress
+        // saving, since the origin is fetched once and the observer streams the cache
+        // the owner fills.
+        let (serve_session, pull_range, also_pace, leases) = plan_serve(claim, req);
 
-                // The serve leg reads the cache the pull leg fills — same engine, same
-                // hash.
-                let serve_store =
-                    decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
+        // Seed the shared per-hash outboard with proof for held ranges no pull admits.
+        // OUTSIDE the claim lock; idempotent, so every serve leg is self-sufficient.
+        self.seed_held_outboard(hash, &serve_session).await;
+        // The serve leg reads the cache the pull leg fills — same engine, same hash.
+        let serve_store = decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
 
-                // Spawn the off-task local pull leg on its own current-thread runtime.
-                // All inputs are owned + `'static`; it shares only the session Arc. Its
-                // cancel token is the SESSION's — lease-driven, not a fresh local token.
-                // The `BackendSource` carries a FRESH local bookkeeping `PoolLedger`
-                // (seed ZERO) that `run_local_pull_leg` reads back via `source.ledger()`
-                // and hands to `drive` as the completion frontier (THE CRUX — a
-                // completion counter, never payment).
-                let pull_thread = {
-                    let engine = self.cache.clone();
-                    let metrics = Arc::clone(&self.metrics);
-                    let session = Arc::clone(&session);
-                    let cancel = session.cancel_token().clone();
-                    let offset = req.byte_offset;
-                    let len = req.byte_len;
-                    let leech_governor = self.leech_governor.clone();
-                    let client_peer = client_node_id.0;
-                    let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
-                        decdn_client_pull::Cumulative::default(),
-                    ));
-                    let source = crate::node_origin::BackendSource::new(
-                        engine.clone(),
-                        *hash.as_bytes(),
-                        total_bytes,
-                        ledger,
-                    );
-                    std::thread::Builder::new()
-                        .name("serve-miss-local-pull".to_string())
-                        .spawn(move || {
-                            match tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                            {
-                                Ok(rt) => rt.block_on(crate::node_origin::run_local_pull_leg(
-                                    metrics,
-                                    engine,
-                                    source,
-                                    hash,
-                                    offset,
-                                    len,
-                                    window,
-                                    total_bytes,
-                                    Arc::clone(&session),
-                                    leech_governor,
-                                    client_peer,
-                                    cancel,
-                                )),
-                                Err(e) => {
-                                    // The pull could not start: record a terminal error
-                                    // and wake the serve leg so it fails a gap rather
-                                    // than hanging.
-                                    session.mark_ended(Err(decdn_cache::FillError::new(format!(
-                                        "serve-miss local pull runtime build failed: {e}"
-                                    ))));
-                                }
-                            }
-                        })
-                };
-                let pull_thread = match pull_thread {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        // The OS refused the thread: fail any attached observer fast
-                        // (`mark_ended`), release the lease, and fail the serve.
-                        session.mark_ended(Err(decdn_cache::FillError::new(format!(
-                            "could not spawn serve-miss local pull thread: {e}"
-                        ))));
-                        lease.detach();
-                        return Err(anyhow::anyhow!(
-                            "could not spawn serve-miss local pull thread: {e}"
-                        ));
+        // Spawn the off-task local pull leg iff this claim owns one, on its own
+        // current-thread runtime. All inputs are owned + `'static`; it shares only the
+        // session Arc. Its cancel token is the SERVE session's — lease-driven. The
+        // `BackendSource` carries a FRESH local bookkeeping `PoolLedger` (seed ZERO)
+        // that `run_local_pull_leg` reads back via `source.ledger()` and hands to
+        // `drive` as the completion frontier (THE CRUX — a completion counter, never
+        // payment).
+        if let Some((pull_offset, pull_len)) = pull_range {
+            let engine = self.cache.clone();
+            let metrics = Arc::clone(&self.metrics);
+            let session = Arc::clone(&serve_session);
+            let cancel = serve_session.cancel_token().clone();
+            let leech_governor = self.leech_governor.clone();
+            let client_peer = client_node_id.0;
+            let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
+                decdn_client_pull::Cumulative::default(),
+            ));
+            let source = crate::node_origin::BackendSource::new(
+                engine.clone(),
+                *hash.as_bytes(),
+                total_bytes,
+                ledger,
+            );
+            let spawned = std::thread::Builder::new()
+                .name("serve-miss-local-pull".to_string())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(crate::node_origin::run_local_pull_leg(
+                            metrics,
+                            engine,
+                            source,
+                            hash,
+                            pull_offset,
+                            pull_len,
+                            window,
+                            total_bytes,
+                            Arc::clone(&session),
+                            leech_governor,
+                            client_peer,
+                            cancel,
+                        )),
+                        Err(e) => {
+                            // The pull could not start: record a terminal error and
+                            // wake the serve leg so it fails a gap rather than hanging.
+                            session.mark_ended(Err(decdn_cache::FillError::new(format!(
+                                "serve-miss local pull runtime build failed: {e}"
+                            ))));
+                        }
                     }
-                };
-
-                // Run the serve leg on THIS (accept) task and await it. It owns
-                // termination — mid-stream takedown and client-disconnect are both
-                // handled inside it.
-                let serve_result = self
-                    .serve_leg(
-                        &mut send,
-                        &mut recv,
-                        serve_store,
-                        Arc::clone(&session),
-                        lane,
-                        hash,
-                        lane_key,
-                        client_node_id,
-                        rate_per_mb,
-                        interval_mb,
-                        req.byte_offset,
-                        req.byte_len,
-                        total_bytes,
-                        window,
-                    )
-                    .await;
-
-                // Teardown (LEASE-driven, #1610): drop the observer lease FIRST (last-out
-                // cancels the session token, stopping the pull; otherwise the pull keeps
-                // filling for the remaining observers), THEN JOIN the pull thread —
-                // bounded, since the pull ends when it finishes filling R or is
-                // cancelled. Never cancel the token directly.
-                lease.detach();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = pull_thread.join();
-                })
-                .await;
-                serve_result
+                });
+            match spawned {
+                // Park the handle so whichever observer leaves LAST joins it (#1664).
+                Ok(handle) => serve_session.set_pull_handle(handle),
+                Err(e) => {
+                    // The OS refused the thread: fail any attached observer fast
+                    // (`mark_ended`), release every lease (nothing parked to join), and
+                    // fail the serve.
+                    serve_session.mark_ended(Err(decdn_cache::FillError::new(format!(
+                        "could not spawn serve-miss local pull thread: {e}"
+                    ))));
+                    for lease in leases {
+                        let _ = lease.release();
+                    }
+                    return Err(anyhow::anyhow!(
+                        "could not spawn serve-miss local pull thread: {e}"
+                    ));
+                }
             }
-            // ATTACH: a live same-hash pull already covers this request. Run a serve leg
-            // over the shared session — NO new pull, NO thread. This is the S3-egress
-            // saving: the observer streams the cache the owner fills from origin, so the
-            // origin is fetched once.
-            decdn_cache::FillClaim::Attach { session, lease } => {
-                // Seed held-range proof so this observer's coherent encoder is
-                // self-sufficient (`seed_held_outboard`; idempotent, near-free on a full
-                // miss).
-                self.seed_held_outboard(hash, &session).await;
-                let serve_store =
-                    decdn_cache::NodeRangedStore::new(self.cache.clone(), hash, total_bytes);
-                let serve_result = self
-                    .serve_leg(
-                        &mut send,
-                        &mut recv,
-                        serve_store,
-                        Arc::clone(&session),
-                        lane,
-                        hash,
-                        lane_key,
-                        client_node_id,
-                        rate_per_mb,
-                        interval_mb,
-                        req.byte_offset,
-                        req.byte_len,
-                        total_bytes,
-                        window,
-                    )
-                    .await;
-                // Teardown: drop the lease. If this was the last observer, its drop
-                // cancels the session token, waking the owner's blocked join.
-                lease.detach();
-                serve_result
+        }
+
+        // Run the serve leg on THIS (accept) task and await it. It owns termination —
+        // mid-stream takedown and client-disconnect are both handled inside it — and
+        // paces every pull it draws from (its own plus any attached sibling).
+        let serve_result = self
+            .serve_leg(
+                &mut send,
+                &mut recv,
+                serve_store,
+                Arc::clone(&serve_session),
+                &also_pace,
+                lane,
+                hash,
+                lane_key,
+                client_node_id,
+                rate_per_mb,
+                interval_mb,
+                req.byte_offset,
+                req.byte_len,
+                total_bytes,
+                window,
+            )
+            .await;
+
+        // Teardown (LEASE-driven, #1610): release every lease. A last-out release
+        // cancels the pull (if still running) and hands back the session's parked
+        // pull-thread handle for THIS caller to join off-task — a non-last-out release
+        // returns at once, leaving the pull filling for the remaining observers. Join
+        // each returned handle off the async worker; never cancel a token directly.
+        let mut to_join = Vec::new();
+        for lease in leases {
+            if let Some(handle) = lease.release() {
+                to_join.push(handle);
+            }
+        }
+        for handle in to_join {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            })
+            .await;
+        }
+        serve_result
+    }
+
+    /// Discover + open a bounded upstream pull leg for `hash`, classifying every
+    /// failure into the wire reject reason the caller must respond with. Factored out
+    /// so [`Self::serve_via_window_pull_through`] can open the leg from TWO points —
+    /// up front on a cold miss (step 3), or late when a peeked fill retired between
+    /// the advisory peek and the atomic `claim_fill` (step 6b) — without duplicating
+    /// the timeout + [`crate::node_origin::PullMiss`] classification.
+    ///
+    /// `Ok(target)` is the bound leg (its `total_bytes` is the header-handshaked blob
+    /// length). `Err(reason)` is:
+    /// - a clean miss on THIS tier, or a latched earlier-tier / local fault honored
+    ///   per #1129 / #1560 (a walk that failed on our own broken buyer key is not
+    ///   evidence the blob is absent) — [`FillOutcome::miss_reason`] of
+    ///   `fault_seen || miss.is_local_fault()`;
+    /// - the pull-through deadline elapsing (a slow/absent upstream must not pin the
+    ///   stream) — the timeout metric fires and the reason is `miss_reason(fault_seen)`.
+    async fn open_pull_leg_bounded(
+        &self,
+        origin: &NodeOrigin,
+        hash: Hash,
+        namespace_id: U256,
+        deadline: std::time::Duration,
+        fault_seen: bool,
+    ) -> Result<PullLegTarget, ServeRejectReason> {
+        match tokio::time::timeout(deadline, origin.open_pull_leg(hash, namespace_id)).await {
+            Ok(Ok(target)) => Ok(target),
+            Ok(Err(miss)) => Err(FillOutcome::miss_reason(
+                fault_seen || miss.is_local_fault(),
+            )),
+            Err(_elapsed) => {
+                self.metrics.node_pull_through_timeout();
+                Err(FillOutcome::miss_reason(fault_seen))
             }
         }
     }
@@ -742,6 +782,55 @@ impl ClientHandler {
             for (node, pair) in pairs {
                 session.capture(node, pair);
             }
+        }
+    }
+}
+
+/// The uniform serve shape [`plan_serve`] resolves a [`decdn_cache::FillClaim`] into:
+/// the session to serve `R` from, the byte range of the local pull to drive for it
+/// (`None` when purely attaching), the sibling fill frontiers to also pace
+/// (DECISION-B), and the observer leases to hold for the serve leg's lifetime.
+type ServePlan = (
+    Arc<decdn_cache::FillSession>,
+    Option<(u64, u64)>,
+    Vec<Arc<decdn_cache::FillSession>>,
+    Vec<decdn_cache::ObserverLease>,
+);
+
+/// Resolve a [`decdn_cache::FillClaim`] into the uniform [`ServePlan`] both serve-miss
+/// orchestrations execute.
+///
+/// - [`Owner`](decdn_cache::FillClaim::Owner) → serve from the owner, drive a pull for
+///   the WHOLE request (`req.byte_offset, req.byte_len`), pace nothing else, hold the
+///   owner lease.
+/// - [`Mixed`](decdn_cache::FillClaim::Mixed) → serve from the remainder owner, drive
+///   a pull for only the contiguous remainder, pace the attached sibling too (its pull
+///   produces the overlap this serve leg also bills), hold both leases.
+/// - [`Attach`](decdn_cache::FillClaim::Attach) → serve from the sibling, drive NO
+///   pull, pace nothing else, hold the attach lease.
+fn plan_serve(claim: decdn_cache::FillClaim, req: &StreamRequest) -> ServePlan {
+    match claim {
+        decdn_cache::FillClaim::Owner { session, lease } => (
+            session,
+            Some((req.byte_offset, req.byte_len)),
+            Vec::new(),
+            vec![lease],
+        ),
+        decdn_cache::FillClaim::Mixed {
+            owner,
+            owner_lease,
+            attach,
+            attach_lease,
+            remainder_offset,
+            remainder_len,
+        } => (
+            owner,
+            Some((remainder_offset, remainder_len)),
+            vec![attach],
+            vec![owner_lease, attach_lease],
+        ),
+        decdn_cache::FillClaim::Attach { session, lease } => {
+            (session, None, Vec::new(), vec![lease])
         }
     }
 }

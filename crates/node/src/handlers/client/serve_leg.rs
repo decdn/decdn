@@ -80,6 +80,7 @@ impl ClientHandler {
         recv: &mut RecvStream,
         store: NodeRangedStore,
         session: Arc<FillSession>,
+        also_pace: &[Arc<FillSession>],
         lane: &Arc<Mutex<LaneDeliveryState>>,
         hash: Hash,
         lane_key: LaneKey,
@@ -252,6 +253,25 @@ impl ClientHandler {
                         .served_frontier()
                         .fetch_max(served, Ordering::Relaxed);
                     session.served_advanced().notify_waiters();
+                    // Under partial-overlap coalescing this serve leg is fed by more
+                    // than its own pull: each attached sibling pull produces the OVERLAP
+                    // this leg also consumes and bills. The sibling's `served_paid` is a
+                    // contiguous paid PREFIX, but this leg consumes a SUFFIX of the
+                    // sibling's covered range (starting at `offset`) — so it may only
+                    // EXTEND the sibling's frontier INTO the overlap, never claim the
+                    // sibling's `[start, offset)` prefix, which only the sibling's OWN
+                    // observers pay for. Guard on the sibling having itself already
+                    // cleared up to `offset`: only then is this leg's payment a sound
+                    // prefix extension (each overlap byte is fetched once and recouped by
+                    // the fastest of its shared observers — DECISION-B). Without the
+                    // guard a fast overlap payer would relax the sibling pull's window
+                    // over bytes no one has paid for. Empty in the common N=1 case.
+                    for extra in also_pace {
+                        if extra.served_frontier().load(Ordering::Relaxed) >= offset {
+                            extra.served_frontier().fetch_max(served, Ordering::Relaxed);
+                            extra.served_advanced().notify_waiters();
+                        }
+                    }
                 }
                 // Re-queue deltas the client had not paid yet (a short batch),
                 // preserving order at the front.

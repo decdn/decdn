@@ -37,7 +37,7 @@ use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::client::{ClientFixture, DEPOSIT_MICRO_USDC};
+use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 
@@ -100,11 +100,15 @@ async fn run() -> anyhow::Result<()> {
     })
     .await?
     .context("signer was never registered on-chain (getAuthorization.cap stayed zero)")?;
-    // The self-issued capability delegates the full deposit as the spending cap.
+    // The self-issued capability is UNCAPPED (`U256::MAX`): a self-owned
+    // capability delegates spend to the owner's own key, so the cap bounds
+    // nothing — the pool deposit is the real spending bound (`redeem` pays
+    // `min(desired, cap - spent, remaining)`), and leaving it uncapped keeps a
+    // later `topUp` beyond the opening deposit redeemable.
     assert_eq!(
         auth_after_first.cap,
-        U256::from(DEPOSIT_MICRO_USDC),
-        "registered cap must equal the self-capability's spending cap (the pool deposit)"
+        U256::MAX,
+        "registered cap must be the self-capability's uncapped spending cap (U256::MAX)"
     );
 
     // The lane's cumulative-paid watermark advanced past zero — the on-chain
