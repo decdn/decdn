@@ -35,16 +35,18 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
+use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_incentive::{
-    LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, StreamSlashData, bind_node_id_domain,
-    slash_judge_domain, voucher_domain,
+    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
+    StreamSlashData, bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::client_requester::{PoolContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{
-    ChunkData, ClientMessage, StreamRequest, StreamResponse, StreamResponseBody,
+    ChunkData, ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, StreamResponse,
+    StreamResponseBody,
 };
 use decdn_protocol::{ALPN_CLIENT, encode_stream_request, write_frame};
 use iroh::{Endpoint, EndpointAddr};
@@ -119,6 +121,24 @@ fn fresh_context(pool_id: B256, provider: Address, signer: Arc<PrivateKeySigner>
     }
 }
 
+/// A fresh-lane [`PoolContext`] carrying an ADR 005 client identity binding over
+/// the requester's own node id. The pool-model serve gate refuses any request
+/// that cannot prove ownership of a lane, so every paid pull attaches a binding
+/// signed by the paying key over the connection's node id.
+fn bound_context(
+    pool_id: B256,
+    provider: Address,
+    signer: Arc<PrivateKeySigner>,
+    own_node_id: B256,
+) -> anyhow::Result<PoolContext> {
+    let binding = decdn_node::client_requester::sign_client_binding(
+        &signer,
+        own_node_id,
+        &hop_domains().binding,
+    )?;
+    Ok(fresh_context(pool_id, provider, signer).with_client_binding(binding))
+}
+
 /// Seed the seller store with a fresh lane so the handler admits vouchers on the
 /// `(pool_id, signer, provider)` triple: `signer` is the paying client's key,
 /// `provider` the serving node's operator address, `cap` the pool deposit. The
@@ -165,7 +185,7 @@ fn assert_channel_advanced(
     );
     let only = store
         .get(lane)?
-        .ok_or_else(|| anyhow::anyhow!("{hop}: lane {:?} not in store", lane))?;
+        .ok_or_else(|| anyhow::anyhow!("{hop}: lane {lane:?} not in store"))?;
     // ADR 038: metered quantity is bao wire bytes (content + interleaved Merkle
     // proof), not the content length, so the recorded watermark is the whole-blob
     // wire size — same for every hop, each metered in wire bytes.
@@ -247,7 +267,12 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
 
     let target_a = EndpointAddr::new(a_id).with_ip_addr(addr_a);
-    let ctx_b_to_a = fresh_context(a_pool_id, a_eth.address(), Arc::clone(&b_buyer));
+    let ctx_b_to_a = bound_context(
+        a_pool_id,
+        a_eth.address(),
+        Arc::clone(&b_buyer),
+        B256::from(*b_id.as_bytes()),
+    )?;
     let pulled = stream_fetch(
         &ep_b,
         target_a,
@@ -297,9 +322,16 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     // --- Hop 2: client pulls the blob from B, paying vouchers ------------
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-    let ctx_client_to_b = fresh_context(b_pool_id, b_eth.address(), Arc::clone(&client_signer));
+    let ctx_client_to_b = bound_context(
+        b_pool_id,
+        b_eth.address(),
+        Arc::clone(&client_signer),
+        B256::from(*client_id.as_bytes()),
+    )?;
     let got = stream_fetch(
         &client_ep,
         target_b,
@@ -437,6 +469,7 @@ async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()
 ///
 /// [`ClientHandler`]: decdn_node::handlers::client::ClientHandler
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Result<()> {
     let payload = vec![0x6Du8; PAYLOAD_LEN];
     let hash = decdn_cache::Hash::new(&payload);
@@ -462,7 +495,9 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
 
     // --- Abort: request, read the response + one chunk, then hang up ---------
     {
-        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let client_sk = fresh_key();
+        let client_node_id = B256::from(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
         let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
         let conn = client_ep
             .connect(target_b, ALPN_CLIENT)
@@ -480,7 +515,27 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
             byte_len: 0,
             timestamp_us: 0x00c0_ffee,
         };
-        let req_bytes = encode_stream_request(&req, None)
+        // A bound request: the pool-model serve gate refuses any request without a
+        // verified client binding (it cannot name a lane), so the abort must prove
+        // ownership over the connection's node id before it can reach the stream.
+        let binding_hash = binding_signing_hash(
+            client_node_id,
+            EPHEMERAL_BINDING_NONCE,
+            &hop_domains().binding,
+        );
+        let binding_signature = client_signer
+            .sign_hash_sync(&binding_hash)?
+            .as_bytes()
+            .to_vec();
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: Some(ClientBinding {
+                ethereum_address: client_signer.address().into(),
+                binding_signature,
+            }),
+            capability: None,
+        };
+        let req_bytes = encode_stream_request(&req, Some(&ext))
             .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
         write_frame(&mut send, &req_bytes)
             .await
@@ -518,9 +573,16 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
 
     // Property 2: the same lane still serves. A fresh-context honest pull
     // completes and advances it (the abort left prior state at zero).
-    let (honest_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let honest_sk = fresh_key();
+    let honest_id = honest_sk.public();
+    let (honest_ep, _) = local_endpoint(honest_sk, vec![]).await?;
     let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-    let ctx = fresh_context(pool_id, b_eth.address(), Arc::clone(&client_signer));
+    let ctx = bound_context(
+        pool_id,
+        b_eth.address(),
+        Arc::clone(&client_signer),
+        B256::from(*honest_id.as_bytes()),
+    )?;
     let got = stream_fetch(
         &honest_ep,
         target_b,
