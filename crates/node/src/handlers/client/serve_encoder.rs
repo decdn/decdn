@@ -39,6 +39,21 @@ use tokio::sync::{Notify, mpsc};
 /// first chunk group) before a present-range watch can be opened.
 const WATCH_OPEN_RETRY: Duration = Duration::from_millis(25);
 
+/// Bounded settle between present-range re-checks once the covering fill has ended
+/// CLEANLY (`outcome() == Ok`): a clean pull admitted every byte before it marked
+/// ended, so a read that still finds the leaf missing is only the store's observed
+/// bitfield lagging the admit by a scheduler hop (widened under load / coverage
+/// instrumentation). Re-poll rather than abort the serve. A failed / abandoned pull
+/// never settles this way — it fails fast (no sleep), so this never delays an
+/// unfillable gap.
+const PRESENT_SETTLE_STEP: Duration = Duration::from_millis(2);
+
+/// Cap on the clean-outcome settle above (`PRESENT_SETTLE_STEP × this` ≈ the total
+/// window). Bounds the lag tolerance so a leaf that is genuinely, permanently absent
+/// after a clean pull (which must not happen) still surfaces an error instead of
+/// hanging.
+const PRESENT_SETTLE_MAX_POLLS: u32 = 50;
+
 /// Bounded backpressure between the encoder and the frame consumer: the encoder
 /// parks once this many encoded chunks are buffered ahead of delivery, so the
 /// upstream-paced pull is never outrun by an unbounded local encode.
@@ -102,6 +117,10 @@ impl AsyncSliceReader for AwaitingDataReader {
         // rather than hanging.
         let range = align_range(offset, need, self.total)
             .map_or_else(|_| ChunkRanges::empty(), |a| a.chunk_ranges().clone());
+        // Counts clean-outcome present-range re-polls, so a bitfield lag after a clean
+        // pull settles (bounded by `PRESENT_SETTLE_MAX_POLLS`) instead of aborting the
+        // serve.
+        let mut settle_polls: u32 = 0;
         loop {
             if self.present_covers(offset, need).await? {
                 break;
@@ -115,12 +134,25 @@ impl AsyncSliceReader for AwaitingDataReader {
             let mut ended = Box::pin(liveness.notified());
             ended.as_mut().enable();
 
-            // No live fill still covers this range? A failed / abandoned pull fails
-            // the read; a clean pull means the bytes are authoritatively cached — one
-            // more check settles a lag.
+            // No live fill still covers this range. Re-check presence once more, then
+            // decide on the terminal outcome:
+            // - a clean pull (`Ok`) admitted every byte before it marked ended, so a
+            //   still-missing read is only the observed bitfield lagging the admit by a
+            //   scheduler hop (widened under load / coverage). Settle a BOUNDED window
+            //   of re-polls before concluding the byte is absent, rather than aborting a
+            //   serve whose bytes are in fact cached;
+            // - a failed / abandoned pull (`Err` / `None`) can never make the byte
+            //   present, so fail FAST with no settle.
             if !self.session.range_still_live(&range) {
                 if self.present_covers(offset, need).await? {
                     break;
+                }
+                if matches!(self.session.outcome(), Some(Ok(())))
+                    && settle_polls < PRESENT_SETTLE_MAX_POLLS
+                {
+                    settle_polls += 1;
+                    tokio::time::sleep(PRESENT_SETTLE_STEP).await;
+                    continue;
                 }
                 return Err(match self.session.outcome() {
                     Some(Err(msg)) => io::Error::other(format!(
