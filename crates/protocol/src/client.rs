@@ -3,23 +3,25 @@
 //! `cdn/client/v1` is the paid byte-transfer path (ADR 005 §`cdn/client/v1`):
 //! a payer opens a bidirectional QUIC stream, sends a [`StreamRequest`], and
 //! the delivering node answers with a [`StreamResponse`] followed by a loop of
-//! [`ChunkData`] interleaved with cumulative payment [`Voucher`]s and
-//! [`ClientMessage::VoucherAck`]s, terminating in [`ClientMessage::StreamEnd`].
-//! A delivery or payment fault is signalled by [`StreamError`].
+//! [`ChunkData`] interleaved with cumulative payment [`Voucher`]s, terminating
+//! in [`ClientMessage::StreamEnd`]. Acceptance of a voucher is implicit —
+//! delivery simply continues; only rejection is signalled, via
+//! [`ClientMessage::StreamError`]. A delivery or payment fault is signalled by
+//! [`StreamError`].
 //!
 //! Like [`crate::message`] this is a leaf crate with **no crypto dependency**.
 //! The two signed artifacts on this protocol are produced/verified by
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
-//!     signed body fields `{hash, ok, rate_per_mb, total_bytes, channel_id,
+//!     signed body fields `{hash, ok, rate_per_mb, total_bytes, pool_id,
 //!     timestamp_us, redirect}` (ADR 014 §1), produced by the stream-response
 //!     slash signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
 //!     `error` and `voucher_interval_mb` are unsigned (ADR 005 §Voucher interval
 //!     negotiation).
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
-//!     carries `{signature, amount, nonce}` and the receiver reconstructs the
-//!     full typed data `{channelId, amount, nonce, bytesDelivered, token}` from
-//!     stream context (ADR 005 §Voucher wire format, `decdn_incentive::Voucher`).
+//!     carries `{signature, amount}` and the receiver reconstructs the full typed
+//!     data `{poolId, signer, provider, amount, bytesDelivered}` from stream
+//!     context (ADR 005 §Voucher wire format, `decdn_incentive::Voucher`).
 //!
 //! # Signed-field freezing (ADR 013 §Signed Field Freezing)
 //!
@@ -75,12 +77,6 @@ pub const VOUCHER_SIG_LEN: usize = 65;
 /// [`ClientBinding::validate`].
 pub const BINDING_SIG_LEN: usize = 65;
 
-/// Exact byte length of a provider's `CooperativeClose` waiver signature
-/// (`r‖s‖v`, 32+32+1). Same EOA off-chain EIP-712 signing form as the others
-/// (ADR 024 §Off-Chain ERC-1271 Verification); pinned by
-/// [`CooperativeCloseAuth::validate`]. ADR 003 §Cooperative close.
-pub const COOPERATIVE_CLOSE_SIG_LEN: usize = 65;
-
 /// Top-level protocol enum for `cdn/client/v1`. Variant order is frozen per
 /// ADR 013 — new variants MUST be appended at the end.
 ///
@@ -97,31 +93,22 @@ pub enum ClientMessage {
     StreamResponse(StreamResponse),
     /// discriminant 2 — node → payer, one sequential blob chunk.
     ChunkData(ChunkData),
-    /// discriminant 3 — payer → node, cumulative payment voucher.
+    /// discriminant 3 — payer → node, cumulative payment voucher. Acceptance
+    /// is implicit — delivery simply continues; only rejection is signalled,
+    /// via [`Self::StreamError`].
     Voucher(Voucher),
-    /// discriminant 4 — node → payer, acknowledges an accepted [`Voucher`].
-    VoucherAck,
-    /// discriminant 5 — payer → node, signals the payer received the full blob.
+    /// discriminant 4 — payer → node, signals the payer received the full blob.
     StreamEnd,
-    /// discriminant 6 — node → payer, mid-stream failure (carries
+    /// discriminant 5 — node → payer, mid-stream failure (carries
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
     /// [`StreamResponse::error`].
     StreamError(StreamError),
-    /// discriminant 7 — payer → node, asks the node to co-sign a cooperative
-    /// close at the channel's final state so the payer can settle on-chain
-    /// without the dispute window (ADR 003 §Cooperative close). Standalone
-    /// request/response — not tied to an active delivery stream.
-    CooperativeCloseRequest(CooperativeCloseRequest),
-    /// discriminant 8 — node → payer, the node's `CooperativeClose` waiver over
-    /// the final `(amount, nonce, bytes_delivered)` tuple it holds for the
-    /// channel.
-    CooperativeCloseAuth(CooperativeCloseAuth),
 }
 
 impl crate::framing::TopLevelEnum for ClientMessage {
-    /// `StreamRequest` (0) … `CooperativeCloseAuth` (8). Pinned by
+    /// `StreamRequest` (0) … `StreamError` (5). Pinned by
     /// `client_message_variant_count_matches_discriminants`.
-    const VARIANT_COUNT: u32 = 9;
+    const VARIANT_COUNT: u32 = 6;
 }
 
 impl ClientMessage {
@@ -135,8 +122,8 @@ impl ClientMessage {
     /// `StreamRequest`'s optional [`StreamRequestExt`] travels as separate
     /// trailing bytes (two-phase), so it is *not* reachable from here; validate
     /// it via [`StreamRequestExt::validate`] after [`parse_stream_request_ext`].
-    /// Variants with no value invariants (`VoucherAck`, `StreamEnd`,
-    /// `StreamError`) return `Ok(())`.
+    /// Variants with no value invariants (`StreamEnd`, `StreamError`) return
+    /// `Ok(())`.
     ///
     /// [`ChunkData`] is dispatched here for TOTALITY over the enum, and for nothing more
     /// (#1145 review). Two things this doc used to claim are false, and both would mislead
@@ -163,13 +150,8 @@ impl ClientMessage {
         match self {
             Self::StreamResponse(resp) => resp.validate(),
             Self::Voucher(voucher) => voucher.validate(),
-            Self::CooperativeCloseAuth(auth) => auth.validate(),
             Self::ChunkData(chunk) => chunk.validate(),
-            Self::StreamRequest(_)
-            | Self::VoucherAck
-            | Self::StreamEnd
-            | Self::StreamError(_)
-            | Self::CooperativeCloseRequest(_) => Ok(()),
+            Self::StreamRequest(_) | Self::StreamEnd | Self::StreamError(_) => Ok(()),
         }
     }
 }
@@ -205,13 +187,13 @@ pub struct StreamRequest {
     /// not a trust anchor** — returned bytes are verified against `hash`
     /// independently, so a wrong/hostile value can only fail the fetch, never
     /// corrupt delivery. The node layer converts this to an alloy `U256`;
-    /// keeping it `[u8; 32]` here (like `hash`/`channel_id`) leaves `protocol`
+    /// keeping it `[u8; 32]` here (like `hash`/`pool_id`) leaves `protocol`
     /// alloy-free. Billing-agnostic but load-bearing for routing, so it lives in
     /// the frozen base — every node reads it for origin routing (a node with no
     /// chain origin directory configured resolves nothing from it).
     pub namespace_id: [u8; 32],
-    /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
-    pub channel_id: [u8; 32],
+    /// `poolId = keccak256(owner, poolNonce)` (ADR 005).
+    pub pool_id: [u8; 32],
     /// Resume position in bytes; `0` for a full-blob fetch.
     pub byte_offset: u64,
     /// Upper bound on the requested range: the request covers the half-open span
@@ -245,6 +227,15 @@ pub struct StreamRequestExt {
     /// so a half-populated state (address without signature, or vice versa) is
     /// unrepresentable; absent ⇒ a registered/on-chain client.
     pub binding: Option<ClientBinding>,
+    /// The pool owner's spending capability for this stream's `signer`,
+    /// attached at session start so the delivering node can register the
+    /// signer on that signer's first on-chain redemption (ADR 003 §Capability
+    /// delegation). Node-agnostic: the same capability is valid at every node
+    /// the client streams from, since it grants spend against the pool, not
+    /// against a specific delivering node. Absent ⇒ the node already has the
+    /// signer registered (or the client is relying on a capability it sent on
+    /// an earlier stream to a different node this session).
+    pub capability: Option<WireCapability>,
 }
 
 /// Off-chain ephemeral client identity binding (ADR 003 §Off-Chain Ephemeral
@@ -280,6 +271,47 @@ impl ClientBinding {
     }
 }
 
+/// A pool owner's spending capability, carried inside [`StreamRequestExt`]
+/// (ADR 003 §Capability delegation). `signer` and `pool_id` are not on the
+/// wire — they are derived from stream context, exactly like a [`Voucher`]'s
+/// implicit fields: `signer` is the request's bound Ethereum address
+/// ([`ClientBinding::ethereum_address`], or the registered on-chain signer
+/// when `binding` is absent) and `pool_id` is [`StreamRequest::pool_id`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireCapability {
+    /// Maximum cumulative amount the signer may spend against the pool under
+    /// this grant, big-endian `uint256` (mirrors [`Voucher::amount`] — no
+    /// `U256` in the protocol crate).
+    pub spending_cap: [u8; 32],
+    /// Unix-seconds expiry. After it, vouchers under this capability are no
+    /// longer redeemable.
+    pub expiry: u64,
+    /// EIP-712 owner signature over the capability (`r‖s‖v`, 65 bytes for an
+    /// EOA owner; may be longer for an ERC-1271 contract owner, so unlike
+    /// [`VOUCHER_SIG_LEN`]-pinned signatures this is only checked non-empty at
+    /// the wire boundary — [`WireCapability::validate`]). The cryptographic
+    /// recovery/verification happens in `decdn_incentive`.
+    pub owner_signature: Vec<u8>,
+}
+
+impl WireCapability {
+    /// Validate the wire-level `owner_signature` non-emptiness. Unlike
+    /// [`ClientBinding::validate`] / [`Voucher::validate`] this cannot pin an
+    /// exact length — an ERC-1271 contract signature may be longer than the
+    /// 65-byte EOA form — so this is a floor, not a full shape check.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::EmptyCapabilitySignature`] if `owner_signature`
+    /// is empty.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.owner_signature.is_empty() {
+            return Err(MessageValidationError::EmptyCapabilitySignature);
+        }
+        Ok(())
+    }
+}
+
 impl StreamRequestExt {
     /// Validate the negotiated cadence and (if present) the client binding.
     /// Called by the node on the receive path after [`parse_stream_request_ext`];
@@ -291,7 +323,8 @@ impl StreamRequestExt {
     /// [`MessageValidationError::VoucherIntervalOutOfRange`] if
     /// `voucher_interval_mb` is present and outside `1..=MAX_VOUCHER_INTERVAL_MB`;
     /// [`MessageValidationError::InvalidBindingSigLen`] if a present `binding`
-    /// has a wrong-length signature.
+    /// has a wrong-length signature; [`MessageValidationError::EmptyCapabilitySignature`]
+    /// if a present `capability` has an empty `owner_signature`.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if let Some(mb) = self.voucher_interval_mb
             && (mb == 0 || mb > MAX_VOUCHER_INTERVAL_MB)
@@ -301,6 +334,12 @@ impl StreamRequestExt {
         if let Some(binding) = &self.binding {
             // `?` is not yet stable in `const fn`; match-return instead.
             match binding.validate() {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(capability) = &self.capability {
+            match capability.validate() {
                 Ok(()) => {}
                 Err(e) => return Err(e),
             }
@@ -400,9 +439,9 @@ pub struct StreamResponseBody {
     /// Total blob size in bytes (used for `BlobTooLarge` enforcement on
     /// cache-miss pulls — ADR 005 §`BlobTooLarge` enforcement).
     pub total_bytes: u64,
-    /// `channel_id` echoed from the [`StreamRequest`] (signed, so a node cannot
-    /// silently re-bind the response to a different channel).
-    pub channel_id: [u8; 32],
+    /// `pool_id` echoed from the [`StreamRequest`] (signed, so a node cannot
+    /// silently re-bind the response to a different pool).
+    pub pool_id: [u8; 32],
     /// Requester-generated microsecond timestamp from the [`StreamRequest`],
     /// echoed back unchanged.
     pub timestamp_us: u64,
@@ -586,22 +625,23 @@ impl ChunkData {
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
 ///
-/// Only `{signature, amount, nonce}` travel on the wire; the receiver
-/// reconstructs the full EIP-712 typed data `{channelId, amount, nonce,
-/// bytesDelivered, token}` from stream context (`channel_id` from the
-/// [`StreamRequest`], `token` fixed at channel open, `bytesDelivered` the node's
-/// per-channel cumulative counter). `amount` and `nonce` are 256-bit values in
-/// big-endian bytes — the protocol crate has no `U256`, and truncating to
-/// `u64` would break channels whose on-chain nonce exceeds `u64::MAX`.
+/// Only `{signature, amount}` travel on the wire; the receiver reconstructs
+/// the full EIP-712 typed data `{poolId, signer, provider, amount,
+/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed
+/// for the stream, `bytesDelivered` the node's per-pool cumulative counter).
+/// There is no nonce: `amount` is monotone cumulative spend within the pool,
+/// and it alone orders vouchers and rejects replays — a voucher with an
+/// `amount` no greater than the highest one already accepted is stale.
+/// `amount` is a 256-bit value in big-endian bytes — the protocol crate has
+/// no `U256`, and truncating to `u64` would break pools whose cumulative
+/// spend exceeds `u64::MAX`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).
     pub signature: Vec<u8>,
-    /// Cumulative payment in token base units, big-endian `uint256`.
+    /// Cumulative payment in token base units, big-endian `uint256`. The sole
+    /// ordering and replay key.
     pub amount: [u8; 32],
-    /// Voucher sequence number within the channel (starts at 1), big-endian
-    /// `uint256`.
-    pub nonce: [u8; 32],
 }
 
 impl Voucher {
@@ -618,104 +658,10 @@ impl Voucher {
     }
 }
 
-/// Payer → node request asking the node to co-sign a cooperative close
-/// (ADR 003 §Cooperative close). The node looks up the highest voucher it holds
-/// for `channel_id` and answers with a [`CooperativeCloseAuth`] waiving the
-/// dispute window. The node declares the final `(amount, nonce, bytes_delivered)`
-/// it is willing to settle at.
-///
-/// `client_signature` proves the requester controls the channel's pinned
-/// `voucherSigner` key: an EOA EIP-712 `CooperativeCloseRequest(bytes32
-/// channelId)` signature that MUST recover to it (the same identity the paid
-/// path and on-chain `cooperativeClose` check, never the funder `client`).
-/// Signing a waiver is a durable, one-way commitment (the node stops serving the
-/// channel), and `channel_id` is chain-derivable, so a request that does not
-/// prove control is declined — otherwise any peer could freeze any channel. An
-/// absent (empty) or non-recovering signature is answered by finishing the
-/// stream with no waiver, exactly like the unknown-channel decline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CooperativeCloseRequest {
-    /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
-    pub channel_id: [u8; 32],
-    /// EOA secp256k1 EIP-712 `CooperativeCloseRequest(channelId)` signature
-    /// (`r‖s‖v`, [`COOPERATIVE_CLOSE_SIG_LEN`] bytes) recovering to the channel's
-    /// pinned `voucherSigner`. Empty means "no proof supplied" — the node
-    /// declines.
-    pub client_signature: Vec<u8>,
-}
-
-/// Node → payer cooperative-close waiver (ADR 003 §Cooperative close). The node
-/// declares the final state it holds and signs the on-chain `CooperativeClose`
-/// EIP-712 typed data over `{channelId, amount, nonce, bytesDelivered, token}`.
-///
-/// The payer cross-checks the declared `(amount, nonce, bytes_delivered)`
-/// against a voucher it actually signed, then submits both signatures to
-/// `PaymentChannel.cooperativeClose` for an immediate, window-free settle.
-/// `amount`/`nonce`/`bytes_delivered` are 256-bit big-endian values for the
-/// same reason as [`Voucher`] — no `U256` in the protocol crate.
-///
-/// `last_signature` is the client's OWN last-accepted voucher signature, echoed
-/// back so a client whose persisted watermark lags the node's — it signed
-/// vouchers it did not durably persist before an unclean exit — can verify the
-/// node's declared tuple is one it already signed before settling at it. Without
-/// it such a client can only refuse the declared tuple (it has nothing to check
-/// against its own key): it is not stuck — the `closeChannel` → dispute window →
-/// `settleChannel` fallback remains — but it loses the one-transaction settle
-/// and falls back to submitting a voucher *below* what it actually signed,
-/// underpaying the provider unless the provider disputes. It is the same value
-/// [`WatermarkBundle::last_signature`] carries on the fetch path. An empty
-/// `last_signature` means the node supplied no echo (its stored channel state
-/// carries no signature); a client that cannot verify keeps its refusal, so an
-/// empty echo is never weaker than a full one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CooperativeCloseAuth {
-    /// `channel_id` echoed from the [`CooperativeCloseRequest`].
-    pub channel_id: [u8; 32],
-    /// Cumulative final payment, big-endian `uint256`.
-    pub amount: [u8; 32],
-    /// Final voucher nonce, big-endian `uint256`.
-    pub nonce: [u8; 32],
-    /// Cumulative final bytes delivered, big-endian `uint256`.
-    pub bytes_delivered: [u8; 32],
-    /// Provider's EOA secp256k1 EIP-712 `CooperativeClose` signature (`r‖s‖v`,
-    /// exactly [`COOPERATIVE_CLOSE_SIG_LEN`]).
-    pub signature: Vec<u8>,
-    /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
-    /// voucher whose `(amount, nonce, bytes_delivered)` this auth declares (issue
-    /// #1495). Empty ⇒ not supplied. `Vec<u8>` for the same reason as
-    /// [`WatermarkBundle::last_signature`]. This is a shape carried inside an
-    /// unsigned frame — the client MUST still verify the signature recovers to
-    /// its own voucher-signing address over the declared tuple before trusting
-    /// it.
-    pub last_signature: Vec<u8>,
-}
-
-impl CooperativeCloseAuth {
-    /// Validate the wire-level signature lengths: `signature` is exactly
-    /// [`COOPERATIVE_CLOSE_SIG_LEN`], and `last_signature` is empty (not supplied)
-    /// or exactly [`VOUCHER_SIG_LEN`]. These are shape checks; the cryptographic
-    /// checks (the waiver recovers to the channel's provider, and `last_signature`
-    /// recovers to the client's own voucher-signing key over the declared tuple)
-    /// happen in `decdn_client_pull` once the typed data is reconstructed.
-    pub const fn validate(&self) -> Result<(), MessageValidationError> {
-        if self.signature.len() != COOPERATIVE_CLOSE_SIG_LEN {
-            return Err(MessageValidationError::InvalidCooperativeCloseSigLen {
-                len: self.signature.len(),
-            });
-        }
-        if !self.last_signature.is_empty() && self.last_signature.len() != VOUCHER_SIG_LEN {
-            return Err(MessageValidationError::InvalidVoucherSigLen {
-                len: self.last_signature.len(),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// The node's true watermark for a channel, echoed back on a gated
+/// The node's true watermark for a pool capability, echoed back on a gated
 /// [`StreamError::VoucherRejected`] so a wallet-less client can self-heal
-/// (issue #1481). `amount`/`nonce`/`bytes_delivered` mirror the seller-side
-/// `ChannelState::last_*` fields, 256-bit big-endian for the same reason as
+/// (issue #1481). `amount`/`bytes_delivered` mirror the seller-side
+/// `PoolState::last_*` fields, 256-bit big-endian for the same reason as
 /// [`Voucher`] — no `U256` in the protocol crate. `last_signature` is the
 /// node's stored last-accepted **client** signature (`r‖s‖v`, exactly
 /// [`VOUCHER_SIG_LEN`]) — not a node signature over this bundle — so the
@@ -724,16 +670,14 @@ impl CooperativeCloseAuth {
 pub struct WatermarkBundle {
     /// Cumulative amount of the node's last-accepted voucher, big-endian `uint256`.
     pub amount: [u8; 32],
-    /// Nonce of the node's last-accepted voucher, big-endian `uint256`.
-    pub nonce: [u8; 32],
     /// Cumulative bytes delivered as of the node's last-accepted voucher,
     /// big-endian `uint256`.
     pub bytes_delivered: [u8; 32],
     /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
     /// node's last-accepted voucher. `Vec<u8>` rather than a fixed array,
-    /// mirroring [`Voucher::signature`] and [`CooperativeCloseAuth::signature`]
-    /// — postcard/serde signature fields on this wire are length-prefixed
-    /// `Vec<u8>`, not `[u8; N]` (serde's array impls top out at N=32).
+    /// mirroring [`Voucher::signature`] — postcard/serde signature fields on
+    /// this wire are length-prefixed `Vec<u8>`, not `[u8; N]` (serde's array
+    /// impls top out at N=32).
     pub last_signature: Vec<u8>,
 }
 
@@ -804,23 +748,22 @@ pub enum StreamError {
         reason: VoucherRejectReason,
         /// The node's true watermark plus the client's own last-accepted
         /// signature, attached ONLY on the regression/exhaustion reasons
-        /// (`StaleNonce`, `AmountRegression`, `BytesRegression`,
-        /// `InsufficientDeposit`) and ONLY when the rejected voucher's
-        /// signature recovers to the channel's pinned `voucher_signer`
-        /// (issue #1481 §5 security property — otherwise anyone who guessed
-        /// the chain-derivable `channel_id` could pull the node's watermark).
-        /// A wallet-less client cannot reconstruct its watermark from chain
-        /// (the claim watermark is `0` until settlement), so this lets it
-        /// self-heal: re-seed the ledger's PAYMENT BASELINE to `bytes_delivered`
-        /// (a channel-cumulative counter, NOT a blob `byte_offset`) and re-sign
-        /// from `nonce + 1`. `None` for every
-        /// handler-direct reason (`Expired`, `RetryLater`,
-        /// `CooperativeCloseSigned`, `RateFloorRaised`, …) and whenever the
-        /// signer does not recover to `voucher_signer`.
+        /// (`AmountRegression`, `BytesRegression`, `CapExceeded`) and ONLY
+        /// when the rejected voucher's signature recovers to the
+        /// capability's pinned `voucher_signer` (issue #1481 §5 security
+        /// property — otherwise anyone who guessed the chain-derivable
+        /// `pool_id` could pull the node's watermark). A wallet-less client
+        /// cannot reconstruct its watermark from chain (the claim watermark
+        /// is `0` until settlement), so this lets it self-heal: re-seed the
+        /// ledger's PAYMENT BASELINE to `bytes_delivered` (a pool-cumulative
+        /// counter, NOT a blob `byte_offset`) and re-sign from the new
+        /// baseline. `None` for every handler-direct reason (`RetryLater`,
+        /// `RateFloorRaised`, …) and whenever the signer does not recover to
+        /// `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
-    /// The channel funding this request is owned by a blacklisted origin
-    /// operator (ADR 011 §`StreamRequest` Response). Permanent for this channel:
+    /// The pool funding this request is owned by a blacklisted origin
+    /// operator (ADR 011 §`StreamRequest` Response). Permanent for this pool:
     /// opening a new one under the same address will be refused identically, so
     /// a requester should not retry here or elsewhere with this funder.
     OriginBlacklisted,
@@ -851,21 +794,19 @@ impl StreamError {
 
 /// Why a [`Voucher`] was rejected (ADR 005 §`VoucherRejected` semantics).
 ///
-/// The first eight variants mirror `decdn_incentive::ChannelError` ∪
+/// The first seven variants mirror `decdn_incentive::PoolError` ∪
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
-/// matches those exhaustively so a new `ChannelError` variant fails to compile
+/// matches those exhaustively so a new `PoolError` variant fails to compile
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
 /// variants have no validation-enum counterpart and are emitted directly by the
 /// `cdn/client/v1` handler: [`Self::RetryLater`] is the wire expression of a
-/// transient persist-write failure (`ChannelError::Store`,
+/// transient persist-write failure (`PoolError::Store`,
 /// `decdn_incentive::RetrySignal`), the one rejection where the client should
 /// resend the **same** voucher rather than treat the failure as permanent
-/// (ADR 003 §Off-chain voucher state persistence); [`Self::Expired`] is the
-/// on-chain channel-expiry serve-gate refusal (#751); [`Self::CooperativeCloseSigned`]
-/// is the coop-close waiver refusal (ADR 003 §Cooperative close); and
-/// [`Self::RateFloorRaised`] is the honest-buyer re-quote signal when the live
-/// delivery floor rose above a stream's quoted rate (#1382). Variant order is
-/// frozen — new handler-direct reasons append at the end.
+/// (ADR 003 §Off-chain voucher state persistence); and [`Self::RateFloorRaised`]
+/// is the honest-buyer re-quote signal when the live delivery floor rose above
+/// a stream's quoted rate (#1382). Variant order is frozen — new handler-direct
+/// reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -874,22 +815,21 @@ pub enum VoucherRejectReason {
     /// Signature well-formed but recovers to the wrong signer.
     /// `VoucherError::WrongSigner`.
     WrongSigner,
-    /// `voucher.channel_id` mismatch (also: unknown channel).
-    /// `ChannelError::WrongChannel`.
-    WrongChannel,
-    /// `voucher.token` mismatch — cross-token replay defense.
-    /// `ChannelError::WrongToken`.
-    WrongToken,
-    /// Nonce did not strictly increase. `ChannelError::NonceNotIncreasing`.
-    StaleNonce,
-    /// Cumulative amount regressed. `ChannelError::AmountDecreasing`.
+    /// `voucher.pool_id` mismatch (also: unknown pool). `PoolError::WrongPool`.
+    WrongPool,
+    /// The voucher names a provider node other than the one receiving it —
+    /// a capability voucher scoped to one node redeemed against another.
+    /// `PoolError::WrongProvider`.
+    WrongProvider,
+    /// Cumulative amount regressed. `PoolError::AmountDecreasing`.
     AmountRegression,
-    /// Cumulative bytes delivered regressed. `ChannelError::BytesDecreasing`.
+    /// Cumulative bytes delivered regressed. `PoolError::BytesDecreasing`.
     BytesRegression,
-    /// Voucher amount exceeds the channel deposit.
-    /// `ChannelError::AmountExceedsDeposit`.
-    InsufficientDeposit,
-    /// Transient node-side persist-write failure (`ChannelError::Store`,
+    /// The signer's remaining spending cap is exhausted — the voucher amount
+    /// exceeds what the capability has left to spend, or the capability
+    /// itself has expired. `PoolError::CapExceeded`.
+    CapExceeded,
+    /// Transient node-side persist-write failure (`PoolError::Store`,
     /// surfaced via `decdn_incentive::RetrySignal`). The voucher itself was
     /// valid and in-memory state did not advance, so the client should resend
     /// the **same** voucher on a fresh stream rather than refreshing state or
@@ -897,31 +837,13 @@ pub enum VoucherRejectReason {
     /// never returns this; the `cdn/client/v1` handler emits it directly (ADR
     /// 003 §Off-chain voucher state persistence).
     RetryLater,
-    /// The channel has passed its on-chain `expiresAt`: `withdraw`/`closeChannel`
-    /// now revert and the client may `reclaimExpired` for a full refund, so any
-    /// further delivery would be unpaid. The node refuses to accept the voucher
-    /// (the seller settlement sweep normally closes + retires the channel well
-    /// before this; this gate is the defense-in-depth for a node that was down
-    /// through the close window). The voucher itself may be valid — the client
-    /// should stop streaming on this channel rather than resend (#751). No
-    /// validation-enum counterpart — `voucher_reject_reason` never returns this;
-    /// the `cdn/client/v1` handler emits it directly.
-    Expired,
-    /// The node has signed a cooperative-close waiver for this channel (ADR 003
-    /// §Cooperative close): it has committed to settling at the current
-    /// watermark and serves no further bytes. The voucher itself may be valid —
-    /// the client should stop streaming and submit the cooperative close (or
-    /// fall back to `closeChannel`) rather than resend. No validation-enum
-    /// counterpart — `voucher_reject_reason` never returns this; the
-    /// `cdn/client/v1` handler emits it directly, like `Expired`/`RetryLater`.
-    CooperativeCloseSigned,
     /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
     /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
     /// stream was quoted at, after the signed `StreamResponse` but before this
     /// voucher. The cumulative watermark the voucher carries now prices bytes
-    /// below the live floor, so the node cannot redeem it: `PaymentChannel`
+    /// below the live floor, so the node cannot redeem it: `PaymentPool`'s
     /// `_advanceClaimWatermark` would revert `RateFloorViolation` at settlement
-    /// (the chain keeps no per-channel floor snapshot — #1388). Refusing is the
+    /// (the chain keeps no per-lane floor snapshot — #1388). Refusing is the
     /// node's correct self-protection, and the buyer did nothing wrong: the fix
     /// is to **re-probe/re-quote** at the new floor and open a fresh stream, not
     /// to resend this voucher (which would be rejected identically) or top up.
@@ -933,27 +855,23 @@ pub enum VoucherRejectReason {
 
 impl VoucherRejectReason {
     /// Whether a [`StreamError::VoucherRejected`] carrying this reason is
-    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the four
+    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the three
     /// regression/exhaustion reasons a wallet-less client cannot distinguish
     /// from chain, since its local watermark is the only thing that could be
-    /// wrong. Every handler-direct reason (`Expired`, `RetryLater`,
-    /// `CooperativeCloseSigned`, `RateFloorRaised`, plus the signer/channel/
-    /// token mismatches) is never eligible — a bundle would not help there,
-    /// since the fix is not "resync the watermark".
+    /// wrong. Every handler-direct reason (`RetryLater`, `RateFloorRaised`,
+    /// plus the signer/pool/provider mismatches) is never eligible — a bundle
+    /// would not help there, since the fix is not "resync the watermark".
     ///
     /// Single source of truth for the gate: the node checks this before
     /// attaching a bundle (`crates/node/src/handlers/client/voucher.rs`) and
     /// the client checks it again before trusting one enough to self-heal
     /// (`crates/client-pull/src/lib.rs`) — both call this rather than each
-    /// keeping their own copy of the four-way match.
+    /// keeping their own copy of the three-way match.
     #[must_use]
     pub const fn is_watermark_gated(self) -> bool {
         matches!(
             self,
-            Self::StaleNonce
-                | Self::AmountRegression
-                | Self::BytesRegression
-                | Self::InsufficientDeposit
+            Self::AmountRegression | Self::BytesRegression | Self::CapExceeded
         )
     }
 }
@@ -969,7 +887,7 @@ mod tests {
             ok: true,
             rate_per_mb: 10,
             total_bytes: 4096,
-            channel_id: [9u8; 32],
+            pool_id: [9u8; 32],
             timestamp_us: 1_700_000_000_000_000,
             redirect: None,
         }
@@ -988,7 +906,7 @@ mod tests {
         StreamRequest {
             hash: [1u8; 32],
             namespace_id: [3u8; 32],
-            channel_id: [2u8; 32],
+            pool_id: [2u8; 32],
             byte_offset: 0,
             byte_len: 0,
             timestamp_us: 0xdead_beef,
@@ -1006,6 +924,15 @@ mod tests {
         StreamRequestExt {
             voucher_interval_mb: Some(8),
             binding: Some(sample_binding()),
+            capability: Some(sample_capability()),
+        }
+    }
+
+    fn sample_capability() -> WireCapability {
+        WireCapability {
+            spending_cap: [0x22u8; 32],
+            expiry: 1_800_000_000,
+            owner_signature: vec![0x03u8; VOUCHER_SIG_LEN],
         }
     }
 
@@ -1013,7 +940,6 @@ mod tests {
         Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x11u8; 32],
-            nonce: [0x22u8; 32],
         }
     }
 
@@ -1070,6 +996,60 @@ mod tests {
         bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]); // simulated future field
         assert_eq!(parse_stream_request_ext(&bytes)?, ext);
         Ok(())
+    }
+
+    /// `capability` round-trips both present and absent, independent of
+    /// `binding` (the wire fields are orthogonal — a registered on-chain
+    /// client can still carry a capability, and vice versa).
+    #[test]
+    fn stream_request_ext_capability_roundtrip() -> Result<(), postcard::Error> {
+        let with_cap = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: None,
+            capability: Some(sample_capability()),
+        };
+        let bytes = postcard::to_allocvec(&with_cap)?;
+        let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
+        assert_eq!(with_cap, decoded);
+
+        let without_cap = StreamRequestExt {
+            capability: None,
+            ..with_cap
+        };
+        let bytes = postcard::to_allocvec(&without_cap)?;
+        let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
+        assert_eq!(without_cap, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn wire_capability_rejects_empty_signature() {
+        let cap = WireCapability {
+            spending_cap: [0u8; 32],
+            expiry: 0,
+            owner_signature: Vec::new(),
+        };
+        assert_eq!(
+            cap.validate(),
+            Err(MessageValidationError::EmptyCapabilitySignature)
+        );
+    }
+
+    #[test]
+    fn stream_request_ext_validate_rejects_empty_capability_signature() {
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: None,
+            capability: Some(WireCapability {
+                spending_cap: [0u8; 32],
+                expiry: 0,
+                owner_signature: Vec::new(),
+            }),
+        };
+        assert_eq!(
+            ext.validate(),
+            Err(MessageValidationError::EmptyCapabilitySignature)
+        );
     }
 
     #[test]
@@ -1133,7 +1113,7 @@ mod tests {
     #[test]
     fn stream_error_voucher_rejected_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
-            reason: VoucherRejectReason::StaleNonce,
+            reason: VoucherRejectReason::CapExceeded,
             bundle: None,
         };
         let bytes = postcard::to_allocvec(&e)?;
@@ -1149,10 +1129,9 @@ mod tests {
     #[test]
     fn stream_error_voucher_rejected_with_bundle_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
-            reason: VoucherRejectReason::StaleNonce,
+            reason: VoucherRejectReason::CapExceeded,
             bundle: Some(WatermarkBundle {
                 amount: [0x11u8; 32],
-                nonce: [0x22u8; 32],
                 bytes_delivered: [0x33u8; 32],
                 last_signature: vec![0x44u8; VOUCHER_SIG_LEN],
             }),
@@ -1184,31 +1163,10 @@ mod tests {
             2
         );
         assert_eq!(first_byte(&ClientMessage::Voucher(sample_voucher()))?, 3);
-        assert_eq!(first_byte(&ClientMessage::VoucherAck)?, 4);
-        assert_eq!(first_byte(&ClientMessage::StreamEnd)?, 5);
+        assert_eq!(first_byte(&ClientMessage::StreamEnd)?, 4);
         assert_eq!(
             first_byte(&ClientMessage::StreamError(StreamError::NotFound))?,
-            6
-        );
-        assert_eq!(
-            first_byte(&ClientMessage::CooperativeCloseRequest(
-                CooperativeCloseRequest {
-                    channel_id: [0u8; 32],
-                    client_signature: Vec::new(),
-                }
-            ))?,
-            7
-        );
-        assert_eq!(
-            first_byte(&ClientMessage::CooperativeCloseAuth(CooperativeCloseAuth {
-                channel_id: [0u8; 32],
-                amount: [0u8; 32],
-                nonce: [0u8; 32],
-                bytes_delivered: [0u8; 32],
-                signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
-                last_signature: Vec::new(),
-            }))?,
-            8
+            5
         );
         Ok(())
     }
@@ -1249,15 +1207,12 @@ mod tests {
         for (i, r) in [
             VoucherRejectReason::BadSignature,
             VoucherRejectReason::WrongSigner,
-            VoucherRejectReason::WrongChannel,
-            VoucherRejectReason::WrongToken,
-            VoucherRejectReason::StaleNonce,
+            VoucherRejectReason::WrongPool,
+            VoucherRejectReason::WrongProvider,
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
-            VoucherRejectReason::InsufficientDeposit,
+            VoucherRejectReason::CapExceeded,
             VoucherRejectReason::RetryLater,
-            VoucherRejectReason::Expired,
-            VoucherRejectReason::CooperativeCloseSigned,
             VoucherRejectReason::RateFloorRaised,
         ]
         .into_iter()
@@ -1287,74 +1242,22 @@ mod tests {
     #[test]
     fn client_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
         use crate::framing::TopLevelEnum;
-        assert_eq!(ClientMessage::VARIANT_COUNT, 9);
-        // The last declared variant (`CooperativeCloseAuth`) must encode to
-        // discriminant VARIANT_COUNT - 1. Compare against postcard's own varint
-        // encoding of that index (not `first_byte`/`bytes.first()`) so the pin
-        // survives a future multi-byte discriminant (> 127 variants).
-        let last = ClientMessage::CooperativeCloseAuth(CooperativeCloseAuth {
-            channel_id: [0u8; 32],
-            amount: [0u8; 32],
-            nonce: [0u8; 32],
-            bytes_delivered: [0u8; 32],
-            signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
-            last_signature: Vec::new(),
-        });
+        assert_eq!(ClientMessage::VARIANT_COUNT, 6);
+        // The last declared variant (`StreamError`) must encode to discriminant
+        // VARIANT_COUNT - 1. Compare against postcard's own varint encoding of
+        // that index (not `first_byte`/`bytes.first()`) so the pin survives a
+        // future multi-byte discriminant (> 127 variants).
+        let last = ClientMessage::StreamError(StreamError::NotFound);
         let bytes = postcard::to_allocvec(&last)?;
         let expected_disc = postcard::to_allocvec(&(ClientMessage::VARIANT_COUNT - 1))?;
         assert!(bytes.starts_with(&expected_disc));
         Ok(())
     }
 
-    fn sample_coop_auth() -> CooperativeCloseAuth {
-        CooperativeCloseAuth {
-            channel_id: [7u8; 32],
-            amount: [1u8; 32],
-            nonce: [2u8; 32],
-            bytes_delivered: [3u8; 32],
-            signature: vec![0xABu8; COOPERATIVE_CLOSE_SIG_LEN],
-            last_signature: vec![0xCDu8; VOUCHER_SIG_LEN],
-        }
-    }
-
-    /// The echo rides inside the base message now (#1495 wire break): a single
-    /// `CooperativeCloseAuth` round-trips through the frame with `last_signature`
-    /// intact — no separate trailing extension to parse.
-    #[test]
-    fn cooperative_close_auth_round_trips_with_echo() -> Result<(), crate::framing::FrameError> {
-        let auth = sample_coop_auth();
-        let payload = encode_message(&ClientMessage::CooperativeCloseAuth(auth.clone()))?;
-        let (msg, remainder) = decode_message::<ClientMessage>(&payload)?;
-        assert_eq!(msg, ClientMessage::CooperativeCloseAuth(auth));
-        assert!(remainder.is_empty(), "no trailing extension bytes");
-        Ok(())
-    }
-
-    #[test]
-    fn cooperative_close_auth_validate_accepts_empty_and_full_echo() {
-        // Full echo.
-        assert!(sample_coop_auth().validate().is_ok());
-        // Empty echo (node supplied none).
-        let mut auth = sample_coop_auth();
-        auth.last_signature.clear();
-        assert!(auth.validate().is_ok());
-    }
-
-    #[test]
-    fn cooperative_close_auth_validate_rejects_wrong_len_echo() {
-        let mut auth = sample_coop_auth();
-        auth.last_signature = vec![0u8; VOUCHER_SIG_LEN - 1];
-        assert!(matches!(
-            auth.validate(),
-            Err(MessageValidationError::InvalidVoucherSigLen { len })
-                if len == VOUCHER_SIG_LEN - 1
-        ));
-    }
-
     #[test]
     fn client_message_unknown_discriminant_is_flagged_unsupported() {
-        // Discriminant 9 is the first index past the known set → UNSUPPORTED.
-        assert!(crate::is_unknown_variant::<ClientMessage>(&[9u8, 0, 0]));
+        // Discriminant 6 is the first index past the known set → UNSUPPORTED.
+        assert!(crate::is_unknown_variant::<ClientMessage>(&[6u8, 0, 0]));
         // A known in-range discriminant (1 = StreamResponse) with a bad payload
         // stays MALFORMED.
         assert!(!crate::is_unknown_variant::<ClientMessage>(&[1u8, 0xFF]));
@@ -1371,7 +1274,7 @@ mod tests {
                 ok: true,
                 rate_per_mb: 4,
                 total_bytes: 5,
-                channel_id: [6u8; 32],
+                pool_id: [6u8; 32],
                 timestamp_us: 7,
                 redirect: None,
             },
@@ -1385,7 +1288,7 @@ mod tests {
         expected.push(1u8); // body.ok = true
         expected.push(4u8); // body.rate_per_mb varint
         expected.push(5u8); // body.total_bytes varint
-        expected.extend_from_slice(&[6u8; 32]); // body.channel_id
+        expected.extend_from_slice(&[6u8; 32]); // body.pool_id
         expected.push(7u8); // body.timestamp_us varint
         expected.push(0u8); // body.redirect = None
         expected.push(0u8); // error = None
@@ -1402,14 +1305,12 @@ mod tests {
         let v = Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x01u8; 32],
-            nonce: [0x02u8; 32],
         };
         let bytes = postcard::to_allocvec(&v)?;
         let mut expected = Vec::new();
         expected.push(VOUCHER_SIG_LEN as u8); // signature length prefix (65)
         expected.extend_from_slice(&[0xCDu8; VOUCHER_SIG_LEN]); // signature
         expected.extend_from_slice(&[0x01u8; 32]); // amount (no length prefix)
-        expected.extend_from_slice(&[0x02u8; 32]); // nonce (no length prefix)
         assert_eq!(bytes, expected);
         Ok(())
     }
@@ -1495,7 +1396,6 @@ mod tests {
     fn watermark_bundle_validate_rejects_wrong_len_signature() {
         let b = WatermarkBundle {
             amount: [0u8; 32],
-            nonce: [0u8; 32],
             bytes_delivered: [0u8; 32],
             last_signature: vec![0xCDu8; VOUCHER_SIG_LEN - 1],
         };
@@ -1643,6 +1543,7 @@ mod tests {
             let ext = StreamRequestExt {
                 voucher_interval_mb: Some(mb),
                 binding: None,
+                capability: None,
             };
             assert_eq!(ext.validate(), Ok(()));
         }
@@ -1653,6 +1554,7 @@ mod tests {
         let ext = StreamRequestExt {
             voucher_interval_mb: Some(0),
             binding: None,
+            capability: None,
         };
         assert_eq!(
             ext.validate(),
@@ -1666,6 +1568,7 @@ mod tests {
         let ext = StreamRequestExt {
             voucher_interval_mb: Some(over),
             binding: None,
+            capability: None,
         };
         assert_eq!(
             ext.validate(),
@@ -1681,6 +1584,7 @@ mod tests {
                 ethereum_address: [0u8; 20],
                 binding_signature: vec![0x01; BINDING_SIG_LEN - 1],
             }),
+            capability: None,
         };
         assert_eq!(
             ext.validate(),
@@ -1756,7 +1660,7 @@ mod tests {
                 ..sample_body()
             },
             error: Some(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::StaleNonce,
+                reason: VoucherRejectReason::CapExceeded,
                 bundle: None,
             }),
             ..sample_response()
@@ -1832,7 +1736,6 @@ mod tests {
             ClientMessage::StreamRequest(sample_request()).validate(),
             Ok(())
         );
-        assert_eq!(ClientMessage::VoucherAck.validate(), Ok(()));
         assert_eq!(ClientMessage::StreamEnd.validate(), Ok(()));
         assert_eq!(
             ClientMessage::StreamError(StreamError::NotFound).validate(),
@@ -1875,13 +1778,11 @@ mod tests {
             ClientMessage::StreamResponse(sample_response()),
             ClientMessage::ChunkData(ChunkData::new(vec![0x7u8; 1000])?),
             ClientMessage::Voucher(sample_voucher()),
-            ClientMessage::VoucherAck,
             ClientMessage::StreamEnd,
             ClientMessage::StreamError(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::InsufficientDeposit,
+                reason: VoucherRejectReason::CapExceeded,
                 bundle: Some(WatermarkBundle {
                     amount: [0x01u8; 32],
-                    nonce: [0x02u8; 32],
                     bytes_delivered: [0x03u8; 32],
                     last_signature: vec![0x04u8; VOUCHER_SIG_LEN],
                 }),

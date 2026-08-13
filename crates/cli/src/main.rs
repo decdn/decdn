@@ -47,9 +47,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Bundle(args) => {
             commands::bundle::bundle_dispatch(&args, config_path.as_deref()).await
         }
-        Command::Channel(args) => {
-            commands::channel::channel_dispatch(&args, config_path.as_deref()).await
-        }
+        Command::Pool(args) => commands::pool::pool_dispatch(&args, config_path.as_deref()).await,
         Command::Publish(args) => {
             commands::publish::publish_dispatch(&args, config_path.as_deref()).await
         }

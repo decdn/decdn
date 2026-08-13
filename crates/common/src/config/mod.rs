@@ -80,43 +80,36 @@ const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
 const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
-/// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
-/// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
+/// At this size the ~$0.10 redeem gas is a few percent of the redeemed
+/// amount while bounding unsettled exposure to ~1 USDC per pool (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
 const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
-/// Default self-defense-dispute residual floor: 0.1 USDC (`100_000` `µUSDC`,
-/// #1586). The node reacts to a stale channel close by submitting its
-/// higher-nonce voucher only when the recoverable residual clears this, so a
-/// dust residual never costs more on-chain gas than it recovers. Small — L2
-/// dispute gas is cheap — but non-zero so a near-zero recovery is skipped.
-const DEFAULT_DISPUTE_MIN_RESIDUAL_MICRO_USDC: u64 = 100_000;
-/// Default first-contact `openChannel` deposit: 0.5 USDC (`500_000` `µUSDC`).
+/// Default first-contact pool-open deposit: 0.5 USDC (`500_000` `µUSDC`).
 /// Kept small so an untried node holds little of the buyer's capital on first
 /// contact.
 ///
 /// `pub` so `decdn-cli`'s `--initial-deposit-micro-usdc` resolution shares this
 /// single source of truth with the config resolver rather than duplicating it.
 pub const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
-/// Default refill target every `topUp` restores toward: 10 USDC
-/// (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics recommends a 10 USDC
-/// practical minimum (gas overhead ~2.3%); it is a client-side recommendation,
-/// not an on-chain floor, so the resolved value is escrowed as configured
-/// (#744).
+/// Default refill target every top-up restores the pool balance toward:
+/// 10 USDC (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics recommends a
+/// 10 USDC practical minimum (gas overhead ~2.3%); it is a client-side
+/// recommendation, not an on-chain floor, so the resolved value is escrowed
+/// as configured (#744).
 ///
 /// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
 pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// Default near-expiry margin (seconds) for the reactive mid-pull top-up guard
-/// (#1603): roughly one day. A channel with less than this left to its on-chain
-/// `expires_at` is not reactively topped up, because `topUp` cannot extend expiry,
-/// so a fresh working-deposit escrowed into it could expire before the resumed leg
-/// spends it. One day comfortably clears a normal pull while leaving the operator a
-/// wide margin to reclaim; `0` disables the guard entirely.
-///
-/// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
-pub const DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS: u64 = 86_400;
+/// Default refundable floor `M`: 1 USDC (`1_000_000` `µUSDC`). ADR 003 §
+/// Sizing defines `M = k·ρ·B·Δ` (redeem cadence × rate × credit window ×
+/// round-trip slack); this is a conservative static value at the
+/// redeem-threshold scale, picked so the node keeps enough headroom to cover
+/// one in-flight credit window even against a buyer that stops topping up.
+/// Precise sizing per ADR 003 is governance/ops policy, not a build-time
+/// constant.
+pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -239,7 +232,7 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 /// pass (ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence).
 pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 
-/// Default seconds between authoritative `PaymentChannel.getRateBounds()`
+/// Default seconds between authoritative `PaymentPool.getRateBounds()`
 /// re-reads by the rate-bounds watcher (#1172, ADR 019 §3.1) — the safety-net
 /// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
 pub const DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC: u64 = 3600;
@@ -442,7 +435,7 @@ fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str
 ///
 /// Returns an error if:
 /// - The config file exists but cannot be read or parsed.
-/// - A required field (`rpc_url`, `payment_channel_address`,
+/// - A required field (`rpc_url`, `payment_pool_address`,
 ///   `capacity_bond_address`) is not provided by any source.
 /// - The home directory cannot be determined for default paths.
 pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Result<ResolvedConfig> {
@@ -1187,14 +1180,14 @@ fn resolve_blockchain_into(
         );
     }
 
-    let payment_channel_address = resolve_contract_address(
-        "blockchain.payment_channel_address",
-        "payment_channel_address",
-        "missing required option: --payment-channel-address \
-         (or blockchain.payment_channel_address in config file)",
-        cli.payment_channel_address
+    let payment_pool_address = resolve_contract_address(
+        "blockchain.payment_pool_address",
+        "payment_pool_address",
+        "missing required option: --payment-pool-address \
+         (or blockchain.payment_pool_address in config file)",
+        cli.payment_pool_address
             .clone()
-            .or_else(|| file.and_then(|b| b.payment_channel_address.clone())),
+            .or_else(|| file.and_then(|b| b.payment_pool_address.clone())),
         bag,
     );
 
@@ -1216,15 +1209,15 @@ fn resolve_blockchain_into(
     // and the daemon's runtime guard (#1219) is uniform defense-in-depth rather
     // than the sole check. Skipped when the value is an empty placeholder: the
     // missing/parse problem is already recorded.
-    if !payment_channel_address.is_empty() {
+    if !payment_pool_address.is_empty() {
         bag.check(
-            payment_channel_address
+            payment_pool_address
                 .trim_start_matches("0x")
                 .bytes()
                 .any(|b| b != b'0'),
-            "blockchain.payment_channel_address",
-            "blockchain.payment_channel_address must not be the zero address — \
-             set it to the deployed PaymentChannel contract",
+            "blockchain.payment_pool_address",
+            "blockchain.payment_pool_address must not be the zero address — \
+             set it to the deployed PaymentPool contract",
         );
     }
     if !capacity_bond_address.is_empty() {
@@ -1465,15 +1458,15 @@ fn resolve_blockchain_into(
     let buyer_initial_deposit_micro_usdc = file
         .and_then(|b| b.buyer_initial_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
-    // `openChannel` reverts `ZeroAmount` on a zero deposit, so a configured 0
-    // can never open a channel at all. Reject it here too: the contract is the
+    // `openPool` reverts `ZeroAmount` on a zero deposit, so a configured 0
+    // can never open a pool at all. Reject it here too: the contract is the
     // authority, but catching it at load time beats surfacing it as a failed
     // transaction on the first cache-miss pull.
     bag.check_with(
         buyer_initial_deposit_micro_usdc > 0,
         "blockchain.buyer_initial_deposit_micro_usdc",
         || {
-            "blockchain.buyer_initial_deposit_micro_usdc must be > 0 (openChannel reverts \
+            "blockchain.buyer_initial_deposit_micro_usdc must be > 0 (openPool reverts \
              ZeroAmount on a zero deposit)"
                 .to_string()
         },
@@ -1496,54 +1489,15 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
-    // Near-expiry guard for the reactive mid-pull top-up (#1603). `0` is the legal
-    // "disable the guard" sentinel (always top up, whatever the remaining time), so
-    // there is no `> 0` check — unlike the interval fields above, a 0 here builds no
-    // timer and cannot panic.
-    let buyer_reactive_topup_min_ttl_secs = file
-        .and_then(|b| b.buyer_reactive_topup_min_ttl_secs)
-        .unwrap_or(DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS);
-
-    // Default-on: the one-time max approval is what lets the buyer path open
-    // channels without a manual approve step (ADR 003 § Deposit Economics).
+    // Default-on: the one-time max approval is what lets the buyer path join
+    // pools without a manual approve step (ADR 003 § Deposit Economics).
     let buyer_max_approve = file.and_then(|b| b.buyer_max_approve).unwrap_or(true);
 
-    // Auto-settlement triggers (#742). Both default to disabled (`None`) so
-    // behavior is unchanged unless an operator opts in. A configured `0` is an
-    // operator mistake: a 0 µUSDC value threshold would close on the first
-    // voucher, and a 0 nonce-span threshold would close before any voucher
-    // accrues — both burn gas on a guaranteed dust/no-op close. Reject either.
-    let settlement_auto_threshold_micro_usdc =
-        file.and_then(|b| b.settlement_auto_threshold_micro_usdc);
-    bag.check_with(
-        settlement_auto_threshold_micro_usdc != Some(0),
-        "blockchain.settlement_auto_threshold_micro_usdc",
-        || {
-            "blockchain.settlement_auto_threshold_micro_usdc must be > 0 when set \
-             (a 0 threshold closes the channel on the first voucher); omit the key \
-             to disable auto-settlement"
-                .to_string()
-        },
-    );
-    let settlement_auto_by_voucher_nonce_span =
-        file.and_then(|b| b.settlement_auto_by_voucher_nonce_span);
-    bag.check_with(
-        settlement_auto_by_voucher_nonce_span != Some(0),
-        "blockchain.settlement_auto_by_voucher_nonce_span",
-        || {
-            "blockchain.settlement_auto_by_voucher_nonce_span must be > 0 when set \
-             (a 0 span closes the channel before any voucher accrues); omit the key \
-             to disable the voucher-nonce-span trigger"
-                .to_string()
-        },
-    );
-    // Always-on self-defense reaction (#1586): unlike the auto-settlement
-    // triggers this defaults rather than disabling when absent, and `0` is a
-    // legal value (disable the gas-cost floor — dispute any positive residual),
-    // so there is no `> 0` check.
-    let settlement_dispute_min_residual_micro_usdc = file
-        .and_then(|b| b.settlement_dispute_min_residual_micro_usdc)
-        .unwrap_or(DEFAULT_DISPUTE_MIN_RESIDUAL_MICRO_USDC);
+    // The node's refundable floor `M` (ADR 003 § Sizing). No `> 0` check — `0`
+    // is a legal (if aggressive) operator choice that keeps no reserve at all.
+    let pool_min_remaining_deposit_micro_usdc = file
+        .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
+        .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -1556,7 +1510,7 @@ fn resolve_blockchain_into(
         rpc_url,
         eth_keystore,
         keystore_password_file,
-        payment_channel_address,
+        payment_pool_address,
         capacity_bond_address,
         origin_assignment_address,
         publisher_registry_address,
@@ -1571,11 +1525,8 @@ fn resolve_blockchain_into(
         redeem_interval_secs,
         buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
-        buyer_reactive_topup_min_ttl_secs,
         buyer_max_approve,
-        settlement_auto_threshold_micro_usdc,
-        settlement_auto_by_voucher_nonce_span,
-        settlement_dispute_min_residual_micro_usdc,
+        pool_min_remaining_deposit_micro_usdc,
     }
 }
 
@@ -3186,8 +3137,8 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
         expand_str(&mut b.rpc_url, "blockchain.rpc_url")?;
         expand_path(&mut b.eth_keystore, "blockchain.eth_keystore")?;
         expand_str(
-            &mut b.payment_channel_address,
-            "blockchain.payment_channel_address",
+            &mut b.payment_pool_address,
+            "blockchain.payment_pool_address",
         )?;
         expand_str(
             &mut b.capacity_bond_address,
@@ -3502,12 +3453,12 @@ mod tests {
     #[test]
     fn parse_contract_address_error_names_field_and_format() -> anyhow::Result<()> {
         let lower = GOOD_ADDR.to_lowercase();
-        let Err(err) = parse_contract_address("payment_channel_address", &lower) else {
+        let Err(err) = parse_contract_address("payment_pool_address", &lower) else {
             anyhow::bail!("expected parse_contract_address to fail on lowercase input");
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("invalid payment_channel_address"),
+            msg.contains("invalid payment_pool_address"),
             "missing flag name: {msg}"
         );
         assert!(msg.contains("EIP-55"), "missing format hint: {msg}");
@@ -4238,11 +4189,11 @@ mod tests {
                     ..Default::default()
                 });
             }),
-            ("blockchain.payment_channel_address", |c, v| {
+            ("blockchain.payment_pool_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
                     origin_assignment_address: None,
                     publisher_registry_address: None,
-                    payment_channel_address: Some(v.to_string()),
+                    payment_pool_address: Some(v.to_string()),
                     ..Default::default()
                 });
             }),
@@ -7415,7 +7366,7 @@ swap_pool_address = \"0xPool\"
             ("rpc_url", "DECDN_RPC_URL"),
             ("eth_keystore", "DECDN_ETH_KEYSTORE"),
             ("keystore_password_file", "DECDN_KEYSTORE_PASSWORD_FILE"),
-            ("payment_channel_address", "DECDN_PAYMENT_CHANNEL_ADDRESS"),
+            ("payment_pool_address", "DECDN_PAYMENT_POOL_ADDRESS"),
             ("capacity_bond_address", "DECDN_CAPACITY_BOND_ADDRESS"),
             (
                 "origin_assignment_address",
@@ -7496,7 +7447,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some("0xNOTHEX".to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -7512,7 +7463,7 @@ swap_pool_address = \"0xPool\"
             "error should name capacity_bond_address: {msg}"
         );
         assert!(
-            !msg.contains("payment_channel_address"),
+            !msg.contains("payment_pool_address"),
             "error must not name the valid field: {msg}"
         );
         Ok(())
@@ -7526,7 +7477,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some("0xNOTHEX".to_string()),
+            payment_pool_address: Some("0xNOTHEX".to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -7538,8 +7489,8 @@ swap_pool_address = \"0xPool\"
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("payment_channel_address"),
-            "error should name payment_channel_address: {msg}"
+            msg.contains("payment_pool_address"),
+            "error should name payment_pool_address: {msg}"
         );
         assert!(
             !msg.contains("capacity_bond_address"),
@@ -7559,7 +7510,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -7580,7 +7531,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -7604,7 +7555,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -7628,7 +7579,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -7650,7 +7601,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -7681,7 +7632,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: Some(bogus),
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -7711,7 +7662,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -7752,7 +7703,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: None,
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -8401,7 +8352,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://cli-wins.example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -8413,7 +8364,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: Some("https://file-loses.example/rpc".to_string()),
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
@@ -8423,8 +8374,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -8453,7 +8402,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: Some("https://file-only.example/rpc".to_string()),
             eth_keystore: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
@@ -8463,8 +8412,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -8491,7 +8438,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: None,
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8509,7 +8456,7 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_blockchain_errors_when_payment_channel_address_missing() -> anyhow::Result<()> {
+    fn resolve_blockchain_errors_when_payment_pool_address_missing() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -8517,19 +8464,19 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-            anyhow::bail!("expected error when payment_channel_address missing");
+            anyhow::bail!("expected error when payment_pool_address missing");
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("payment_channel_address"),
-            "error should mention payment_channel_address: {msg}"
+            msg.contains("payment_pool_address"),
+            "error should mention payment_pool_address: {msg}"
         );
         Ok(())
     }
@@ -8543,7 +8490,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8569,7 +8516,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: None,
             content_blacklist_address: None,
@@ -8595,7 +8542,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8622,7 +8569,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some("0x0000000000000000000000000000000000000000".to_string()),
             content_blacklist_address: None,
@@ -8651,7 +8598,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(
@@ -8671,7 +8618,7 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_blockchain_rejects_zero_payment_channel_address() -> anyhow::Result<()> {
+    fn resolve_blockchain_rejects_zero_payment_pool_address() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -8679,18 +8626,18 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some("0x0000000000000000000000000000000000000000".to_string()),
+            payment_pool_address: Some("0x0000000000000000000000000000000000000000".to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
             chain_id: None,
         };
         let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-            anyhow::bail!("expected error for zero payment_channel_address");
+            anyhow::bail!("expected error for zero payment_pool_address");
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("payment_channel_address") && msg.contains("zero address"),
+            msg.contains("payment_pool_address") && msg.contains("zero address"),
             "error should reject the zero address: {msg}"
         );
         Ok(())
@@ -8705,7 +8652,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some("0x0000000000000000000000000000000000000000".to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8736,7 +8683,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8764,7 +8711,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8791,7 +8738,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8821,7 +8768,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8850,7 +8797,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some(String::new()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8876,7 +8823,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8888,7 +8835,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(1),
             event_poll_interval_ms: None,
@@ -8898,8 +8845,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -8927,7 +8872,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -8939,7 +8884,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
@@ -8949,8 +8894,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -8977,7 +8920,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -9008,7 +8951,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9020,7 +8963,7 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_blockchain_rejects_zero_auto_settlement_threshold() -> anyhow::Result<()> {
+    fn resolve_blockchain_applies_default_pool_floor_when_absent() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -9028,122 +8971,22 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
-            capacity_bond_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
-            chain_id: None,
-        };
-        let file = types::BlockchainConfig {
-            content_blacklist_poll_interval_sec: None,
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: None,
-            eth_keystore: None,
-            payment_channel_address: None,
-            capacity_bond_address: None,
-            rpc_watchdog_interval_sec: None,
-            event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
-            redeem_threshold_micro_usdc: None,
-            redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
-            buyer_working_deposit_micro_usdc: None,
-            buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: Some(0),
-            settlement_auto_by_voucher_nonce_span: None,
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
-            content_blacklist_address: None,
-            chain_id: None,
-            ..Default::default()
-        };
-        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-            anyhow::bail!("expected error when auto-settlement value threshold is 0");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("settlement_auto_threshold_micro_usdc"),
-            "error should name the field: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_blockchain_rejects_zero_auto_settlement_voucher_nonce_span() -> anyhow::Result<()> {
-        let dir = data_dir_with_keystore()?;
-        let cli = BlockchainArgs {
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: Some("https://example/rpc".to_string()),
-            eth_keystore: None,
-            keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
-            capacity_bond_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
-            chain_id: None,
-        };
-        let file = types::BlockchainConfig {
-            content_blacklist_poll_interval_sec: None,
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: None,
-            eth_keystore: None,
-            payment_channel_address: None,
-            capacity_bond_address: None,
-            rpc_watchdog_interval_sec: None,
-            event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
-            redeem_threshold_micro_usdc: None,
-            redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
-            buyer_working_deposit_micro_usdc: None,
-            buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: Some(0),
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
-            content_blacklist_address: None,
-            chain_id: None,
-            ..Default::default()
-        };
-        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-            anyhow::bail!("expected error when auto-settlement voucher nonce span is 0");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("settlement_auto_by_voucher_nonce_span"),
-            "error should name the field: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_blockchain_auto_settlement_disabled_by_default() -> anyhow::Result<()> {
-        // Absent keys => both auto-settlement triggers disabled (`None`), so a
-        // node that never sets them behaves exactly as before #742.
-        let dir = data_dir_with_keystore()?;
-        let cli = BlockchainArgs {
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: Some("https://example/rpc".to_string()),
-            eth_keystore: None,
-            keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
-        assert_eq!(resolved.settlement_auto_threshold_micro_usdc, None);
-        assert_eq!(resolved.settlement_auto_by_voucher_nonce_span, None);
+        assert_eq!(
+            resolved.pool_min_remaining_deposit_micro_usdc,
+            DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC
+        );
         Ok(())
     }
 
     #[test]
-    fn resolve_blockchain_accepts_positive_auto_settlement_thresholds() -> anyhow::Result<()> {
+    fn resolve_blockchain_threads_explicit_pool_floor() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -9151,42 +8994,20 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            content_blacklist_poll_interval_sec: None,
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: None,
-            eth_keystore: None,
-            payment_channel_address: None,
-            capacity_bond_address: None,
-            rpc_watchdog_interval_sec: None,
-            event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
-            redeem_threshold_micro_usdc: None,
-            redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
-            buyer_working_deposit_micro_usdc: None,
-            buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: Some(50_000_000),
-            settlement_auto_by_voucher_nonce_span: Some(1_000),
+            pool_min_remaining_deposit_micro_usdc: Some(2_500_000),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
-            content_blacklist_address: None,
-            chain_id: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
-        assert_eq!(
-            resolved.settlement_auto_threshold_micro_usdc,
-            Some(50_000_000)
-        );
-        assert_eq!(resolved.settlement_auto_by_voucher_nonce_span, Some(1_000));
+        assert_eq!(resolved.pool_min_remaining_deposit_micro_usdc, 2_500_000);
         Ok(())
     }
 
@@ -9200,7 +9021,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9212,7 +9033,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(0),
             event_poll_interval_ms: None,
@@ -9222,8 +9043,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9244,7 +9063,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9256,7 +9075,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
             event_poll_interval_ms: None,
@@ -9266,8 +9085,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9295,7 +9112,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9318,7 +9135,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -9330,7 +9147,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
@@ -9340,8 +9157,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: Some(0),
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9368,7 +9183,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -9380,7 +9195,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
@@ -9390,8 +9205,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: Some(2_000_000),
             buyer_working_deposit_micro_usdc: Some(1_000_000),
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9418,7 +9231,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9430,7 +9243,7 @@ swap_pool_address = \"0xPool\"
             publisher_registry_address: None,
             rpc_url: None,
             eth_keystore: None,
-            payment_channel_address: None,
+            payment_pool_address: None,
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
@@ -9440,8 +9253,6 @@ swap_pool_address = \"0xPool\"
             buyer_initial_deposit_micro_usdc: Some(500_000),
             buyer_working_deposit_micro_usdc: Some(0),
             buyer_max_approve: None,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
             content_blacklist_address: None,
@@ -9463,7 +9274,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9487,7 +9298,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: None,
@@ -9524,7 +9335,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9552,7 +9363,7 @@ swap_pool_address = \"0xPool\"
             rpc_url: Some("https://example/rpc".to_string()),
             eth_keystore: None,
             keystore_password_file: None,
-            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
@@ -9780,7 +9591,7 @@ swap_pool_address = \"0xPool\"
         r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
@@ -9790,7 +9601,7 @@ subscribe_global = false
 
     fn blockchain_toml_body(
         rpc_url: &str,
-        payment_channel_address: &str,
+        payment_pool_address: &str,
         capacity_bond_address: &str,
         rpc_watchdog_interval_sec: Option<u64>,
     ) -> String {
@@ -9801,7 +9612,7 @@ subscribe_global = false
             r#"
 [blockchain]
 rpc_url = "{rpc_url}"
-payment_channel_address = "{payment_channel_address}"
+payment_pool_address = "{payment_pool_address}"
 capacity_bond_address = "{capacity_bond_address}"
 {watchdog}[gossip]
 subscribe_global = false
@@ -9876,7 +9687,7 @@ subscribe_global = false
         )?;
         let mut args = run_args_with_data_dir(dir.path());
         args.blockchain.rpc_url = Some("https://override.example/rpc".to_string());
-        args.blockchain.payment_channel_address = Some(GOOD_ADDR.to_string());
+        args.blockchain.payment_pool_address = Some(GOOD_ADDR.to_string());
         args.blockchain.capacity_bond_address = Some(ALT_ADDR_3.to_string());
 
         let resolved = resolve_config(Some(&path), &args)?;
@@ -9889,7 +9700,7 @@ subscribe_global = false
             "override-layer rpc_url should win, got {}",
             resolved.blockchain.rpc_url,
         );
-        assert_eq!(resolved.blockchain.payment_channel_address, GOOD_ADDR);
+        assert_eq!(resolved.blockchain.payment_pool_address, GOOD_ADDR);
         assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_3);
         Ok(())
     }
@@ -9918,7 +9729,7 @@ subscribe_global = false
             "file-only rpc_url should be used, got {}",
             resolved.blockchain.rpc_url,
         );
-        assert_eq!(resolved.blockchain.payment_channel_address, ALT_ADDR_1);
+        assert_eq!(resolved.blockchain.payment_pool_address, ALT_ADDR_1);
         assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_2);
         assert_eq!(
             resolved.blockchain.rpc_watchdog_interval_sec,
@@ -9960,7 +9771,7 @@ subscribe_global = false
         let body = r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#;
         let dir = data_dir_with_keystore()?;
@@ -10011,7 +9822,7 @@ region = "US"
 
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [cache]
@@ -10046,7 +9857,7 @@ denied_hashes = ["{shared}"]
 region = "USA"
 
 [blockchain]
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
@@ -10101,7 +9912,7 @@ relay_urls = ["https://ok.example", "not a url"]
 
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
@@ -10135,7 +9946,7 @@ subscribe_global = false
         // out of it so this is a single, clean problem.
         let body = r#"
 [blockchain]
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
@@ -10175,7 +9986,7 @@ subscribe_global = false
         let body = r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [gossip]
@@ -10217,7 +10028,7 @@ subscribe_global = false
         let body = r#"
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
@@ -10261,7 +10072,7 @@ region = "USA"
 
 [blockchain]
 rpc_url = "https://example/rpc"
-payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
@@ -10865,7 +10676,7 @@ bind_port = 12345
         // (all-lowercase / bad-checksum values are rejected there, not at parse time).
         // Absent fields are skipped — the client sample carries only a subset.
         for (field, addr) in [
-            ("payment_channel_address", &chain.payment_channel_address),
+            ("payment_pool_address", &chain.payment_pool_address),
             ("capacity_bond_address", &chain.capacity_bond_address),
             ("slash_judge_address", &chain.slash_judge_address),
             (

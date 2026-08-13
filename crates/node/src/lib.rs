@@ -30,6 +30,7 @@ pub(crate) mod net;
 pub mod node_origin;
 pub mod onchain_tx;
 pub mod payment_settlement;
+pub mod pool_view;
 pub(crate) mod prune_guard;
 pub mod rate_bounds;
 pub mod rate_bounds_watcher;

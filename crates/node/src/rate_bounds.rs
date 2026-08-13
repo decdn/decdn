@@ -3,7 +3,7 @@
 //! The seller raises its advertised `rate_per_mb` to a governance-set floor
 //! before signing a `ProbeResponse` / `StreamResponse` and enforces the same
 //! floor again at voucher settlement. The floor lives on-chain in
-//! `PaymentChannel.getRateBounds()`; the node reads it once at startup and then
+//! `PaymentPool.getRateBounds()`; the node reads it once at startup and then
 //! tracks `RateBoundsUpdated` events so a governance retune reaches a running
 //! node without a restart.
 //!
@@ -21,7 +21,7 @@
 //! Do **not** pin a quote-time floor across a stream and reuse it to accept
 //! that stream's later vouchers. The hard per-byte floor enforced at voucher
 //! acceptance (`handlers/client/voucher.rs`) mirrors the on-chain
-//! `PaymentChannel._advanceClaimWatermark` check, which reads the **live**
+//! `PaymentPool.redeem` rate-floor check, which reads the **live**
 //! `deliveryFloor` at settlement — there is no per-channel floor snapshot on
 //! chain. A voucher priced below the live floor is unredeemable
 //! (`RateFloorViolation`), so the acceptance check must read the live floor too;
@@ -81,7 +81,7 @@ impl RateBounds {
 /// rejecting anything the node could not honour.
 ///
 /// Two arms, both fail-closed, both unreachable against a correctly-deployed
-/// `PaymentChannel` (which caps the floor at `MAX_RATE_PER_MB` itself) — so
+/// `PaymentPool` (which caps the floor at `MAX_RATE_PER_MB` itself) — so
 /// reaching either means the deployment predates that cap, and the only remedy
 /// is a governance `setRateBounds`. Lives here as a free function rather than
 /// inline in bring-up so both arms are reachable from a unit test; inline they

@@ -68,16 +68,15 @@ pub enum NodeCommand {
     /// routing-table degradation without scraping Prometheus or reading
     /// logs.
     Status(StatusArgs),
-    /// Print a live snapshot of the running node's open payment channels
-    /// via `admin_v1_channels` (issue #749): per channel the last-accepted
-    /// nonce, outstanding accrued claim (micro-USDC), escrowed deposit,
-    /// time since the last voucher, and whether the accrued claim has
-    /// reached the configured redemption threshold. Lets operators spot
-    /// channels approaching settlement, stale channels, or unusually high
-    /// outstanding balances before they become a liquidity risk — without
-    /// scraping metrics or reading logs. Same admin-URL resolution and
-    /// timeout semantics as `decdn node health`.
-    Channels(ChannelsArgs),
+    /// Print a live snapshot of the running node's lanes via
+    /// `admin_v1_lanes` (issue #749): per lane the outstanding accrued
+    /// claim (micro-USDC), time since the last voucher, and whether the
+    /// accrued claim has reached the configured redemption threshold.
+    /// Lets operators spot lanes approaching settlement, stale lanes, or
+    /// unusually high outstanding balances before they become a
+    /// liquidity risk — without scraping metrics or reading logs. Same
+    /// admin-URL resolution and timeout semantics as `decdn node health`.
+    Lanes(LanesArgs),
     /// Show cumulative per-region bandwidth (bytes in/out) from the running
     /// node via `admin_v1_regionStats` (issue #750). Same admin-URL
     /// resolution and timeout semantics as `decdn node health`.
@@ -177,7 +176,7 @@ pub enum NodeCommand {
     /// `--key iroh` rebinds the wire node id through
     /// `CapacityBond.bindNodeId`. One transaction, no downtime beyond a
     /// restart, and the Ethereum address — with the bond, the declared tier,
-    /// `firstBondedAt`, and every open payment channel — is untouched. The old
+    /// `firstBondedAt`, and every lane funded against this operator — is untouched. The old
     /// and new node ids swap slashability in the same block, so there is no
     /// window in which the operator cannot be slashed.
     ///
@@ -196,7 +195,7 @@ pub enum NodeCommand {
     RotateKey(RotateKeyArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getRegisteredNodes` (#1481). Maps node-ids/regions to
-    /// operator Ethereum addresses — the input `decdn channel open
+    /// operator Ethereum addresses — the input `decdn pool open
     /// --provider-address` needs — without spending anything: it builds a
     /// signer-less read-only provider and never loads a keystore, unlike
     /// every other on-chain `node` subcommand above.
@@ -271,11 +270,11 @@ pub struct StatusArgs {
     pub timeout_ms: u64,
 }
 
-/// `decdn node channels` — list open payment channels via
-/// `admin_v1_channels` (issue #749). Same admin-URL resolution and
+/// `decdn node lanes` — list open payment lanes via
+/// `admin_v1_lanes` (issue #749). Same admin-URL resolution and
 /// timeout semantics as `decdn node health`.
 #[derive(Args, Debug)]
-pub struct ChannelsArgs {
+pub struct LanesArgs {
     /// Base URL of the node's admin HTTP surface.
     ///
     /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
@@ -294,7 +293,7 @@ pub struct ChannelsArgs {
     pub config: Option<PathBuf>,
 
     /// Emit the admin response body as JSON instead of the human-readable
-    /// summary + channel table.
+    /// summary + lane table.
     #[arg(long)]
     pub json: bool,
 
@@ -633,7 +632,7 @@ pub struct RegisterArgs {
 pub enum RotateKeyTarget {
     /// The iroh Ed25519 node key — the wire `NodeId`. One `bindNodeId`
     /// transaction; the Ethereum address, bond, declared tier,
-    /// `firstBondedAt`, and every open payment channel survive untouched.
+    /// `firstBondedAt`, and every lane funded against this operator survive untouched.
     #[value(name = "iroh")]
     Iroh,
     /// The secp256k1 Ethereum signing key. No rebinding API exists for the

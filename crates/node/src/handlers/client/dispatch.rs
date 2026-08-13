@@ -3,11 +3,10 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_GROUP_BYTES, CacheError, ChannelId, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, Hash, MB_BYTES, Mutex, OwnedSemaphorePermit,
+    Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
+    FillOutcome, FirstMessage, Hash, LaneKey, MB_BYTES, Mutex, OwnedSemaphorePermit,
     REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, VarInt, min_payment, read_first_message, reset_stream,
-    verify_binding,
+    StreamReadError, StreamResponseBody, VarInt, read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -122,23 +121,15 @@ impl ClientHandler {
         };
 
         // Stream-cap exhausted: reset the stream with no signed response.
-        // Signing a `StreamResponse` (or a cooperative-close waiver) per rejected
-        // request would let a request flood amplify into CPU exhaustion (an ECDSA
-        // signature per reject) — the cap exists to shed load, not to add work to
-        // the reject path.
+        // Signing a `StreamResponse` per rejected request would let a request
+        // flood amplify into CPU exhaustion (an ECDSA signature per reject) — the
+        // cap exists to shed load, not to add work to the reject path.
         if permit.is_none() {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(());
         }
 
-        // A cooperative-close request is a standalone sign-and-reply exchange,
-        // not a delivery (ADR 003 §Cooperative close).
-        let (req, ext) = match first {
-            FirstMessage::Delivery(req, ext) => (req, ext),
-            FirstMessage::CooperativeClose(cc) => {
-                return self.handle_cooperative_close(send, cc).await;
-            }
-        };
+        let FirstMessage::Delivery(req, ext) = first;
         let _stream_guard = self.metrics.inbound_stream_guard();
 
         // Verify an ephemeral client binding if present (ADR 005 §Client
@@ -186,11 +177,10 @@ impl ClientHandler {
         // caller having priced the request exactly once.
         //
         // Deliberately BELOW the binding block. Every exit above this point — a
-        // first-message read error, the stream-cap shed, a cooperative close, a
-        // malformed binding — returns without signing a `StreamResponse`, so none
-        // of them ever quotes a rate, and pricing them would meter a clamp for a
-        // request that never had a price. (The cooperative close does sign: an
-        // EIP-712 waiver, which carries no rate.)
+        // first-message read error, the stream-cap shed, a malformed binding —
+        // returns without signing a `StreamResponse`, so none of them ever quotes
+        // a rate, and pricing them would meter a clamp for a request that never
+        // had a price.
         let rate_per_mb = self.clamped_rate();
 
         // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
@@ -243,53 +233,77 @@ impl ClientHandler {
                 .await;
         }
 
-        // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
-        // any StreamRequest that presents a channel funded by that operator
-        // address"). `state.client` is that funding address — the same field the
-        // in-flight takedown re-checks read. This gate is keyed on the FUNDER
-        // and must NEVER be re-keyed onto `voucher_signer`: a blacklisted funder
-        // can pin a clean throwaway key as its signer, so checking the signer
-        // would let it buy delivery behind a delegate. The owner-mismatch gate
-        // further down asks the unrelated *signer* question.
-        //
-        // This must sit ABOVE the availability check, not after channel
-        // resolution: every cache-miss arm below `return`s its own refusal, so a
-        // gate placed downstream is simply never reached on a miss and the
-        // blacklisted funder gets `NotFound` instead. That is the one answer
-        // `wire_error`'s doc says must never be given here — a client told
-        // `NotFound` retries elsewhere and pays again, when in fact every node
-        // will refuse it. It also silently under-counted the operator's own
-        // compliance metric by the whole cache-miss fraction.
-        //
-        // Resolving the channel early is a `HashMap` lookup, so the cost is
-        // nil; `pull_authorized` keeps its own check as the spend-side backstop.
-        //
-        // The resolved `Arc` is KEPT rather than dropped at the end of this gate:
-        // the pre-spend deposit floor in the cache-miss arm below needs the same
-        // channel, and re-resolving it would take the map lock a second time for
-        // no reason. `None` means the channel is unknown, which both gates treat
-        // as "not my business" — an unknown channel cannot make this node spend,
-        // because `pull_authorized` refuses it before every fill tier.
-        let known_channel = self
-            .channels
-            .lock()
-            .await
-            .get(&ChannelId::from(req.channel_id))
-            .cloned();
-        if let Some(channel) = &known_channel {
-            let funder = channel.lock().await.state.client;
-            if self.content_deny.is_origin_denied(&funder) {
-                tracing::warn!(%funder, "refusing delivery on a channel funded by a blacklisted origin");
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::OriginDenied,
-                        rate_per_mb,
-                    )
-                    .await;
-            }
+        // Resolve the lane key early. The seller keys a lane by
+        // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
+        // the request, the signer from the verified client binding, the provider
+        // from this node's own Ethereum identity. An unbound request cannot name
+        // a lane, so it resolves to `None` — which every downstream gate treats
+        // as "not my business" (it cannot make this node spend, because
+        // `pull_authorized` refuses it before every fill tier).
+        let self_operator = self.eth_signer.address();
+        let lane_key = verified_client.map(|signer| LaneKey {
+            pool_id: B256::from(req.pool_id),
+            signer,
+            provider: self_operator,
+        });
+
+        // Cached `getPool` view (owner + remaining), read ONCE and reused by the
+        // funder gate here, the capability owner check, and the floor-`M` solvency
+        // gates below. `None` — no pool-view wired, an unknown pool, or a read
+        // fault — makes the fail-open gates fail open: a transient RPC blip must
+        // not refuse paying clients, and the open-time hash gates plus the first
+        // voucher's on-chain `redeem` still carry compliance and revenue.
+        let pool_status = match self.pool_view.as_ref() {
+            Some(view) => view.status(B256::from(req.pool_id)).await,
+            None => None,
+        };
+
+        // Serve-path origin-blacklist gate (ADR 011 §On Blacklist Event): refuse a
+        // pool whose FUNDER (`getPool.owner`) is on the operator's local
+        // `denied_origins` or the on-chain origin blacklist. The funding address is
+        // the pool OWNER from `getPool.owner`, threaded here via the cached
+        // pool-view. The two questions are kept distinct — spend authority is a
+        // signer question, compliance a funder question — so a blacklisted funder
+        // is refused here even under a clean delegate signer.
+        if let Some(status) = pool_status
+            && self.content_deny.is_origin_denied(&status.owner)
+        {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::OriginDenied,
+                    rate_per_mb,
+                )
+                .await;
         }
+
+        // Capability intake + lane registration (ADR 003 §Capability delegation).
+        // A bound request whose extension carries a `capability` whose owner
+        // signature verifies against the pool owner (a) registers the lane so the
+        // voucher path serves `(pool_id, signer, this operator)` and (b) persists
+        // the owner-signed grant for the redeemer. A forged-owner grant is dropped
+        // — never registered, never persisted — so it cannot revert the redeemer's
+        // `redeemMany` batch. Best-effort otherwise.
+        if let (Some(signer), Some(capability)) = (verified_client, ext.capability.as_ref()) {
+            self.intake_capability(
+                B256::from(req.pool_id),
+                signer,
+                pool_status.map(|s| s.owner),
+                capability,
+            )
+            .await;
+        }
+
+        // Resolve the live lane AFTER intake, so a lane just registered from this
+        // request's own capability is visible to the spend + serve gates below.
+        // The resolved `Arc` is KEPT rather than dropped: the cache-miss arm below
+        // reuses the same lane, and re-resolving it would take the map lock again
+        // for no reason.
+        let known_lane = match lane_key {
+            Some(key) => self.lanes.lock().await.get(&key).cloned(),
+            None => None,
+        };
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
@@ -406,31 +420,37 @@ impl ClientHandler {
                 // the tier that fronts UPSTREAM spend. Do not delete it on the
                 // strength of this floor alone.
                 //
-                // Skipped for an unknown channel: `pull_authorized` already
-                // refuses those before every tier, so there is no spend to gate.
-                if let Some(channel) = &known_channel {
+                // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
+                // front any fill when the pool's on-chain **remaining**
+                // (`getPool.deposit − getPool.totalRedeemed`) minus the refundable
+                // floor `M` cannot cover the reserved credit window: see
+                // [`ClientHandler::pool_remaining_covers_window`], the pure policy
+                // this site calls. `reserved` is one credit window, capped by the
+                // request's own aligned span when it bounds itself.
+                //
+                // `remaining` comes from the cached `getPool` view resolved above;
+                // a `None` view fails open (the on-chain `redeem` is the backstop).
+                // Skipped for an unknown lane — `pull_authorized` refuses those
+                // before every tier, so no spend happens there anyway.
+                if known_lane.is_some()
+                    && let Some(status) = pool_status
+                {
                     let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
                     let window = self.credit_window(interval_bytes);
-                    // `u64::MAX` stands in for the unknown blob size: both of
-                    // `align_range`'s clamps to it become no-ops, so this is the
-                    // aligned span the serve path would bill, never less.
                     let reserved = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
                         window
                     };
-                    let floor = min_payment(reserved, rate_per_mb);
-                    let (deposit, last_amount) = {
-                        let guard = channel.lock().await;
-                        (guard.state.deposit, guard.state.last_amount())
-                    };
-                    let headroom = deposit.saturating_sub(last_amount);
-                    if headroom < floor {
+                    if !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb) {
+                        let headroom = status
+                            .remaining
+                            .saturating_sub(self.pool_min_remaining_deposit);
                         self.log_deposit_refusal(
-                            ChannelId::from(req.channel_id),
+                            B256::from(req.pool_id),
                             hash,
                             headroom,
-                            floor,
+                            decdn_incentive::min_payment(reserved, rate_per_mb),
                         );
                         return self
                             .respond_error(
@@ -499,19 +519,26 @@ impl ClientHandler {
                                 // response, so no coalescing decision happens here.
                                 Ok(Some(_)) => {
                                     // Boxed: the serve future is large
-                                    // (clippy::large_futures).
-                                    return Box::pin(self.serve_via_backend_origin(
-                                        send,
-                                        recv,
-                                        &req,
-                                        &ext,
-                                        hash,
-                                        client_node_id,
-                                        total,
-                                        fault_seen,
-                                        rate_per_mb,
-                                    ))
-                                    .await;
+                                    // (clippy::large_futures). `pull_authorized`
+                                    // (checked in the `if` above) guarantees a
+                                    // lane, so the extraction always matches.
+                                    if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
+                                        return Box::pin(self.serve_via_backend_origin(
+                                            send,
+                                            recv,
+                                            &req,
+                                            &ext,
+                                            hash,
+                                            client_node_id,
+                                            lk,
+                                            ln,
+                                            total,
+                                            pool_status.map(|s| s.remaining),
+                                            fault_seen,
+                                            rate_per_mb,
+                                        ))
+                                        .await;
+                                    }
                                 }
                                 // Size known but no published outboard — not
                                 // serviceable via the range encoder. Degrade to the
@@ -609,18 +636,25 @@ impl ClientHandler {
                     // orchestration claims the fill (owner-or-attach) internally after
                     // signing the response, so two concurrent same-hash misses share one
                     // upstream pull (no double spend, #305) without a decision here.
-                    return Box::pin(self.serve_via_window_pull_through(
-                        send,
-                        recv,
-                        &req,
-                        &ext,
-                        hash,
-                        client_node_id,
-                        Arc::clone(origin),
-                        fault_seen,
-                        rate_per_mb,
-                    ))
-                    .await;
+                    // `pull_authorized` (the `if` above) guarantees a lane, so the
+                    // extraction always matches.
+                    if let (Some(lk), Some(ln)) = (lane_key, known_lane.as_ref()) {
+                        return Box::pin(self.serve_via_window_pull_through(
+                            send,
+                            recv,
+                            &req,
+                            &ext,
+                            hash,
+                            client_node_id,
+                            lk,
+                            ln,
+                            Arc::clone(origin),
+                            pool_status.map(|s| s.remaining),
+                            fault_seen,
+                            rate_per_mb,
+                        ))
+                        .await;
+                    }
                 } else {
                     // Buffered pull-through (#831): used when
                     // the window provider is unset or for a resumed request.
@@ -736,20 +770,31 @@ impl ClientHandler {
             }
         }
 
-        // Resolve the channel (must be pre-persisted — see module docs / #327).
-        let channel_id = ChannelId::from(req.channel_id);
-        let channel = self.channels.lock().await.get(&channel_id).cloned();
-
-        // An unknown / never-opened channel is refused *before* any bytes are
-        // signed or served. Otherwise up to one voucher interval (the negotiated
-        // cadence, by default 1 MB) — or the entire blob, if smaller — ships free
-        // before `collect_voucher` rejects with `WrongChannel` mid-stream (#848).
-        // The mid-stream `WrongChannel` reason cannot ride in the initial
-        // `StreamResponse`, so use the delivery-side `NotFound` here (also
-        // mirrors the owner-mismatch gate below and avoids leaking channel
-        // existence).
-        let Some(channel) = channel else {
-            tracing::warn!(%channel_id, "stream request on unknown channel; refusing pre-serve");
+        // Resolve the lane (must be pre-persisted — see module docs / #327).
+        // The lane is keyed by `(pool_id, bound_signer, this operator)`; a
+        // request with no verified binding cannot name a lane, and a bound client
+        // whose signer has no lane for this pool resolves to `None`. Both are
+        // refused pre-serve as an unknown lane, subsuming the old owner-mismatch
+        // gate: a binding that does not match the lane's signer simply resolves
+        // to no lane. The mid-stream reason cannot ride in the initial
+        // `StreamResponse`, so use the delivery-side `NotFound` here (avoids
+        // leaking lane existence).
+        let Some(lane_key) = lane_key else {
+            tracing::warn!("stream request with no verified binding; refusing pre-serve");
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::OwnerMismatch,
+                    rate_per_mb,
+                )
+                .await;
+        };
+        let Some(lane) = known_lane else {
+            tracing::warn!(
+                ?lane_key,
+                "stream request on unknown lane; refusing pre-serve"
+            );
             return self
                 .respond_error(
                     &mut send,
@@ -760,113 +805,38 @@ impl ClientHandler {
                 .await;
         };
 
-        // A channel with a signed cooperative-close waiver is being settled at
-        // its final watermark — the node committed to serving no further bytes
-        // on it (ADR 003 §Cooperative close). Refuse new delivery, collapsing to
-        // `NotFound` so it stays wire-indistinguishable from an unknown channel.
-        // The in-flight backstop is in `collect_voucher` (a stream already
-        // running when the waiver was signed stops at its next voucher).
-        if channel.lock().await.state.cooperative_close_signed() {
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::CooperativeCloseSigned,
-                    rate_per_mb,
-                )
-                .await;
-        }
-
-        // A verified client binding MUST match the channel's pinned
-        // `voucher_signer`. This is a SIGNER question, not a funder one: the
-        // signer is the only identity whose vouchers this channel accepts, so a
-        // binding for anything else — including the channel's own funder, when
-        // it delegated signing — would fail `WrongSigner` at the first voucher
-        // regardless. Refuse before delivering any bytes, closing the leech for
-        // bound clients. Unbound connections fall back to the voucher-signature
-        // gate; an on-chain NodeId→address lookup that would close the residual
-        // for unbound peers is out of scope (#327).
-        if let Some(client) = verified_client {
-            let authorized_signer = channel.lock().await.state.voucher_signer;
-            if client != authorized_signer {
-                tracing::warn!(%client, %authorized_signer, "binding does not authorize this channel");
-                return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::OwnerMismatch,
-                        rate_per_mb,
-                    )
-                    .await;
-            }
-        }
-
-        // Pre-flight deposit gate — the direct-serve twin of the pull-through
+        // Pre-flight floor-M gate — the direct-serve twin of the pull-through
         // guard in `window.rs` (keep the two in step). Without it the node signs
-        // `ok: true` and streams a full credit window before `stage_voucher`'s
-        // `AmountExceedsDeposit` can fire at the first voucher boundary, so a
-        // channel that cannot cover even that first window gets it free on every
-        // request (#1516).
+        // `ok: true` and streams a full credit window before the first voucher's
+        // pool-solvency check can fire, so a pool that cannot cover even that
+        // first window gets it free on every request (#1516).
         //
-        // The quantity is remaining HEADROOM, not the gross deposit: both the
-        // off-chain check (`ChannelState::stage_voucher`) and the on-chain one
-        // (`PaymentChannel._advanceClaimWatermark`) compare the *cumulative*
-        // voucher amount against the deposit, so a long-lived channel with most
-        // of its deposit already claimed has only `deposit - last_amount` left.
+        // In the shared-payment-pool model the quantity is the pool's on-chain
+        // **remaining** (`getPool.deposit − getPool.totalRedeemed`) minus the
+        // refundable floor `M`, checked against the credit-window cost via
+        // [`ClientHandler::pool_remaining_covers_window`]. `guard_bytes` is the
+        // chunk-group-aligned span (what `export_bao_range_stream` bills),
+        // capped by the credit window.
         //
-        // The ceiling is the CREDIT WINDOW, not one interval: `deliver` streams
-        // while `delivered - paid < credit_window(interval_bytes)`, so with
-        // `credit_window_bytes` configured (#1477) the node fronts a whole window
-        // before it collects anything. Gating on one interval would let enabling
-        // a credit window silently re-open the hole.
-        //
-        // ... but capped by the request's own span, or a legitimately funded
-        // sub-interval fetch (a small blob, or a bounded range) would be refused
-        // for not covering a window it will never use.
-        //
-        // The span is the CHUNK-GROUP-ALIGNED one, not the requested one, because
-        // that is what gets billed: `export_bao_range_stream` snaps the range out
-        // to the enclosing 16 KiB group boundaries (a bao proof anchors whole
-        // groups) and `deliver` does NOT trim back — the receiver discards the
-        // leading bytes itself. Pricing the *requested* span would under-reserve
-        // by up to two groups (~32 KiB, ~3% of a default 1 MiB window), which for
-        // a two-byte range request is four orders of magnitude. That is not the
-        // by-design looseness below; it is the wrong quantity.
-        //
-        // What remains loose is only bao's proof interleave: `guard_bytes` counts
-        // CONTENT bytes while billing counts WIRE bytes. State the residual as an
-        // ABSOLUTE bound, because the fraction is misleading — the boundary proof
-        // is `64 * log2(blob_groups / range_groups)`, so it amortizes to ~0.4% of
-        // a whole blob or a window-sized range but reaches ~8% of a *single*
-        // 16 KiB group of a multi-gigabyte blob. Either way it is at most ~1.3 KiB
-        // per request, against the 1 MiB (or wider) window that used to ship free.
-        // Deliberate, and in the safe direction — the gate can only ever *serve* a
-        // request it should have refused, never refuse one that could pay — and
-        // the mid-stream ceiling remains the exact authority.
-        //
-        // A zero-length blob yields a zero ceiling and passes (#1054).
-        //
-        // The bounds check above rejected `byte_offset >= total_bytes`, so the
-        // span arithmetic never clamps to zero. That is the load-bearing property,
-        // not underflow: a clamped span of 0 would zero the ceiling and wave every
-        // request through.
-        //
-        // This is a per-request floor, NOT a reservation: two concurrent streams
-        // on one channel can each pass and jointly exceed the headroom. The
-        // mid-stream ceiling bounds each STREAM to one window of unbilled egress,
-        // but nothing caps the aggregate at the deposit — what bounds N is the
-        // per-connection stream cap. Same in `window.rs`.
+        // `remaining` comes from the cached `getPool` view resolved above. When it
+        // is `Some`, refuse `InsufficientDeposit` if the pool's remaining minus the
+        // refundable floor `M` can no longer cover the reserved credit window; a
+        // `None` view fails open (see the gate's construction above).
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
         let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
             .min(self.credit_window(interval_bytes));
-        let ceiling = min_payment(guard_bytes, rate_per_mb);
-        let (deposit, last_amount) = {
-            let guard = channel.lock().await;
-            (guard.state.deposit, guard.state.last_amount())
-        };
-        let headroom = deposit.saturating_sub(last_amount);
-        if headroom < ceiling {
-            self.log_deposit_refusal(channel_id, hash, headroom, ceiling);
+        if let Some(status) = pool_status
+            && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
+        {
+            let headroom = status
+                .remaining
+                .saturating_sub(self.pool_min_remaining_deposit);
+            self.log_deposit_refusal(
+                B256::from(req.pool_id),
+                hash,
+                headroom,
+                decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+            );
             return self
                 .respond_error(
                     &mut send,
@@ -883,7 +853,7 @@ impl ClientHandler {
             ok: true,
             rate_per_mb,
             total_bytes,
-            channel_id: req.channel_id,
+            pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
@@ -899,8 +869,8 @@ impl ClientHandler {
             req.byte_offset,
             req.byte_len,
             total_bytes,
-            channel_id,
-            Some(&channel),
+            lane_key,
+            Some(&lane),
             client_node_id,
             rate_per_mb,
             interval_mb,

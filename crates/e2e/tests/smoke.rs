@@ -9,11 +9,11 @@
 //! appeal), `g_node_06_unbond.rs` (capacity reduction and the unbonding
 //! window), `g_gov_02_rate_bounds.rs` and `g_gov_03_real_evidence.rs`
 //! (governance → daemon, and daemon signatures as on-chain evidence),
-//! `g_origin_01_publish.rs` (namespace lifecycle), and the `cli_*` files
-//! (publish, setup, fetch resume / top-up, bundle pull). Feature-scoped
-//! journeys sit beside them on the same fixtures —
-//! `coop_close_watermark_reconcile.rs` and `origin_stream_while_store.rs` — so
-//! the directory listing, not this paragraph, is the authority on coverage.
+//! `g_origin_01_publish.rs` (namespace lifecycle), the `cli_*` files (publish,
+//! setup, fetch resume / top-up, bundle pull), and `anvil_pool_redeem.rs` (the
+//! capability-registration + voucher redemption path). Feature-scoped journeys
+//! sit beside them on the same fixtures — e.g. `origin_stream_while_store.rs` —
+//! so the directory listing, not this paragraph, is the authority on coverage.
 //!
 //! The gap is G-NODE-08 — content published to a namespace becoming servable
 //! *as an origin*, which needs `OriginAssignment` publisher vetting, a seated
@@ -108,30 +108,37 @@ async fn run() -> anyhow::Result<()> {
         "delivered bytes must match the blob"
     );
 
-    // ---- Cross-layer: the daemon reports *the* channel we paid through — not
-    // merely that some channel exists. Match on the exact on-chain channelId,
-    // then check the counterparty + deposit it reports. The poll closure
-    // propagates the real admin error rather than swallowing it into a generic
-    // timeout.
-    let expected_cid = outcome.channel_id;
+    // ---- Cross-layer: the daemon reports a lane on *the* pool we paid through —
+    // not merely that some lane exists. Match on the exact on-chain poolId, then
+    // check the signer (reported as the snapshot counterparty) it names. The poll
+    // closure propagates the real admin error rather than swallowing it into a
+    // generic timeout. The admin surface keys each snapshot by the lane's pool id.
+    let expected_pid = outcome.pool_id;
     let snapshot = poll(Duration::from_secs(30), || async {
-        let c = admin.channels().await.context("admin channels")?;
-        Ok(c.channels.into_iter().find(|s| {
-            s.channel_id
-                .parse::<B256>()
-                .is_ok_and(|id| id == expected_cid)
-        }))
+        let c = admin.lanes().await.context("admin lanes")?;
+        Ok(c.lanes
+            .into_iter()
+            .find(|s| s.pool_id.parse::<B256>().is_ok_and(|id| id == expected_pid)))
     })
     .await?
-    .with_context(|| format!("daemon admin RPC never reported the paid channel {expected_cid}"))?;
+    .with_context(|| {
+        format!("daemon admin RPC never reported a lane on the paid pool {expected_pid}")
+    })?;
     assert_eq!(
         snapshot.counterparty,
         client.address().to_string(),
-        "reported channel counterparty must be the buyer"
+        "reported lane signer must be the buyer"
     );
+
+    // The pool deposit lives on-chain, not per-lane in the node's store, so the
+    // admin snapshot reports 0 for it; read the pool record directly to confirm
+    // the opened deposit landed.
+    let pool =
+        e2e_assert::read_pool(chain.admin(), chain.addrs().payment_pool, expected_pid).await?;
     assert_eq!(
-        snapshot.deposit_micro_usdc, DEPOSIT_MICRO_USDC,
-        "reported channel deposit must match the opened deposit"
+        pool.deposit,
+        U256::from(DEPOSIT_MICRO_USDC),
+        "on-chain pool deposit must match the opened deposit"
     );
 
     // ---- Cross-layer: delivery landed on-chain — the seller redeemed the

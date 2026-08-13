@@ -142,7 +142,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.bond.hasRole(d.bond.PAUSER_ROLE(), emergencyMultisig), "bond pauser");
         assertTrue(d.router.hasRole(d.router.PAUSER_ROLE(), emergencyMultisig), "router pauser");
         assertTrue(d.slashAppeal.hasRole(d.slashAppeal.PAUSER_ROLE(), emergencyMultisig), "slashAppeal pauser");
-        assertTrue(d.paymentChannel.hasRole(d.paymentChannel.PAUSER_ROLE(), emergencyMultisig), "paymentChannel pauser");
+        assertTrue(d.paymentPool.hasRole(d.paymentPool.PAUSER_ROLE(), emergencyMultisig), "paymentPool pauser");
         assertTrue(d.slashJudge.hasRole(d.slashJudge.PAUSER_ROLE(), emergencyMultisig), "slashJudge pauser");
     }
 
@@ -178,8 +178,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // fails here independently of the heavier E2E flow.
     function test_crossContractWiring_newContractPeerRoles() public view {
         assertTrue(
-            d.router.hasRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentChannel)),
-            "paymentChannel holds ROUTER_CALLER_ROLE on router"
+            d.router.hasRole(d.router.ROUTER_CALLER_ROLE(), address(d.paymentPool)),
+            "paymentPool holds ROUTER_CALLER_ROLE on router"
         );
         assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
         assertEq(d.originAssignment.contentBlacklist(), address(d.blacklist), "originAssignment blacklist binding");

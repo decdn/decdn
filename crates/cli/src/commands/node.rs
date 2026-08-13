@@ -19,9 +19,9 @@ use decdn_client_pull::discovery::{self, NodeCandidate, SELECT_K, select_candida
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, BindingStatus, ChannelSnapshot, ChannelsResponse,
-    DrainRequest, DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView,
-    PeersResponse, RegionStatsResponse, ReloadResponse, StatusResponse,
+    AdminRpcClient, AnnounceResponse, BindingStatus, DrainRequest, DrainResponse, EvictRequest,
+    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, PeerView, PeersResponse,
+    RegionStatsResponse, ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -63,7 +63,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Peers(p) => peers(p, global_config).await,
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
-        cli::NodeCommand::Channels(c) => channels(c, global_config).await,
+        cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
         cli::NodeCommand::RegionStats(r) => region_stats(r, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
@@ -646,12 +646,9 @@ pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> any
     Ok(())
 }
 
-/// `decdn node channels`: call `admin_v1_channels` on the running node and
-/// print a snapshot of its open payment channels (issue #749).
-pub async fn channels(
-    args: &cli::ChannelsArgs,
-    global_config: Option<&Path>,
-) -> anyhow::Result<()> {
+/// `decdn node lanes`: call `admin_v1_lanes` on the running node and
+/// print a snapshot of its open payment lanes (issue #749).
+pub async fn lanes(args: &cli::LanesArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.timeout_ms > 0,
         "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
@@ -666,56 +663,56 @@ pub async fn channels(
         .build(&url)
         .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
 
-    let parsed: ChannelsResponse = client
-        .channels()
+    let parsed: LanesResponse = client
+        .lanes()
         .await
         .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
 
     if args.json {
         let pretty =
-            serde_json::to_string_pretty(&parsed).context("failed to encode channels as JSON")?;
+            serde_json::to_string_pretty(&parsed).context("failed to encode lanes as JSON")?;
         println!("{pretty}");
     } else {
         let mut stdout = io::stdout().lock();
-        write_channels_table(&mut stdout, &parsed).context("failed to write channels table")?;
+        write_lanes_table(&mut stdout, &parsed).context("failed to write lanes table")?;
     }
 
     Ok(())
 }
 
-/// Write the payment-channel table to `w`. Pure function (takes `&mut impl
+/// Write the lane table to `w`. Pure function (takes `&mut impl
 /// Write`) so the formatting is unit-testable without an HTTP hop,
 /// mirroring [`write_peers_table`] / [`write_status`]. A summary line
 /// carries the redemption threshold as a stable `key=value` token; the
-/// per-channel table follows. USDC amounts are rendered from micro-USDC.
-fn write_channels_table(w: &mut impl io::Write, resp: &ChannelsResponse) -> io::Result<()> {
+/// per-lane table follows. USDC amounts are rendered from micro-USDC.
+fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result<()> {
     writeln!(
         w,
-        "redeem_threshold={} channels={}",
+        "redeem_threshold={} lanes={}",
         format_usdc(resp.redeem_threshold_micro_usdc),
-        resp.channels.len(),
+        resp.lanes.len(),
     )?;
-    if resp.channels.is_empty() {
-        return writeln!(w, "(no open channels)");
+    if resp.lanes.is_empty() {
+        return writeln!(w, "(no open lanes)");
     }
-    // Fixed-column layout: channel preview | counterparty preview | voucher
+    // Fixed-column layout: lane preview | counterparty preview | voucher
     // signer preview | nonce | outstanding | deposit | last-voucher age |
     // eligible.
     writeln!(
         w,
         "{:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} ELIGIBLE",
-        "CHANNEL", "COUNTERPARTY", "SIGNER", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
+        "LANE", "COUNTERPARTY", "SIGNER", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
     )?;
-    for c in &resp.channels {
-        write_channel_row(w, c)?;
+    for c in &resp.lanes {
+        write_lane_row(w, c)?;
     }
     Ok(())
 }
 
-/// Render one channel as a fixed-column row. Split out so the column
+/// Render one lane as a fixed-column row. Split out so the column
 /// formatting stays in one place and the loop body reads as a single call.
-fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<()> {
-    let channel = short_node_id(&c.channel_id);
+fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
+    let lane = short_node_id(&c.pool_id);
     let counterparty = short_node_id(&c.counterparty);
     // A pre-delegation server omits `voucher_signer` entirely (the DTO field is
     // `#[serde(default)]`), so an empty string means "this node cannot tell" —
@@ -728,7 +725,7 @@ fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<
     let last_voucher = match c.seconds_since_last_voucher {
         // No voucher seen since this process started — distinct from
         // "<1s ago" so operators know the activity clock has no record
-        // (a freshly-restarted node, or a channel that has never billed).
+        // (a freshly-restarted node, or a lane that has never billed).
         None => "never".to_string(),
         // Reuse `format_age` (microsecond input) by scaling the whole-second
         // wire value; `saturating_mul` clamps the (unrealistic) overflow on an
@@ -739,7 +736,7 @@ fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
-        "{channel:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {last_voucher:>12} \
+        "{lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {last_voucher:>12} \
          {eligible}",
         c.last_nonce,
         format_usdc(c.outstanding_micro_usdc),
@@ -787,7 +784,7 @@ pub async fn region_stats(
 
 /// Write the per-region bandwidth table to `w`. Pure function (takes
 /// `&mut impl Write`) so the formatting is unit-testable without an HTTP hop,
-/// mirroring [`write_channels_table`]. Byte counts are raw decimal so a
+/// mirroring [`write_lanes_table`]. Byte counts are raw decimal so a
 /// scraping script sees a stable shape.
 fn write_region_stats_table(w: &mut impl io::Write, resp: &RegionStatsResponse) -> io::Result<()> {
     writeln!(w, "regions={}", resp.regions.len())?;
@@ -1375,7 +1372,7 @@ fn node_id_hex(node_id: &PublicKey) -> String {
 
 /// Write the `decdn node lookup` result as a human table. Pure (`&mut impl
 /// Write`) so the layout is unit-testable without a chain or network,
-/// mirroring [`write_peers_table`] / [`write_channels_table`]. The RTT column
+/// mirroring [`write_peers_table`] / [`write_lanes_table`]. The RTT column
 /// is only rendered when at least one row was probed, so the unprobed listing
 /// path doesn't show a column of nothing.
 fn write_lookup_table(w: &mut impl io::Write, rows: &[LookupRow]) -> io::Result<()> {
@@ -1415,7 +1412,7 @@ fn write_lookup_table(w: &mut impl io::Write, rows: &[LookupRow]) -> io::Result<
 }
 
 /// `--json` array element for `decdn node lookup` — mirrors the
-/// `channel list --json` convention (stable string encoding, one Serialize
+/// `lane list --json` convention (stable string encoding, one Serialize
 /// view per row). `node_id`/`eth_address` are `0x…` hex strings;
 /// `region_hint` is `null` for a node with no (or unparseable) region hint;
 /// `rtt_ms` is omitted entirely from the object whenever it is unknown — both
@@ -1965,17 +1962,17 @@ mod tests {
         Ok(())
     }
 
-    fn mk_channel(
-        channel_id: &str,
+    fn mk_lane(
+        pool_id: &str,
         counterparty: &str,
         last_nonce: u64,
         outstanding: u64,
         deposit: u64,
         secs_since: Option<u64>,
         eligible: bool,
-    ) -> ChannelSnapshot {
-        ChannelSnapshot {
-            channel_id: channel_id.to_string(),
+    ) -> LaneSnapshot {
+        LaneSnapshot {
+            pool_id: pool_id.to_string(),
             counterparty: counterparty.to_string(),
             // Self-signing default; the delegated and legacy-empty renderings
             // get their own dedicated test rather than an eighth parameter.
@@ -2031,25 +2028,25 @@ mod tests {
     }
 
     #[test]
-    fn write_channels_table_empty_emits_sentinel() -> anyhow::Result<()> {
-        let resp = ChannelsResponse {
-            channels: Vec::new(),
+    fn write_lanes_table_empty_emits_sentinel() -> anyhow::Result<()> {
+        let resp = LanesResponse {
+            lanes: Vec::new(),
             redeem_threshold_micro_usdc: 1_000_000,
         };
         let mut buf = Vec::<u8>::new();
-        write_channels_table(&mut buf, &resp)?;
+        write_lanes_table(&mut buf, &resp)?;
         let s = String::from_utf8(buf)?;
         // Summary line still prints the threshold, then the sentinel.
         assert!(s.contains("redeem_threshold=1.000000"), "{s}");
-        assert!(s.contains("channels=0"), "{s}");
-        assert!(s.contains("(no open channels)"), "{s}");
+        assert!(s.contains("lanes=0"), "{s}");
+        assert!(s.contains("(no open lanes)"), "{s}");
         // No table header when there are no rows.
-        assert!(!s.contains("CHANNEL"), "header must be omitted: {s}");
+        assert!(!s.contains("LANE"), "header must be omitted: {s}");
         Ok(())
     }
 
     #[test]
-    fn write_channels_table_renders_header_and_rows() -> anyhow::Result<()> {
+    fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
         // The DTO documents `counterparty` as an EIP-55 mixed-case
         // checksummed address (`alloy`'s `Address` Display), so the
         // fixture must be a real checksummed string — a lowercase
@@ -2066,10 +2063,10 @@ mod tests {
             counterparty.to_lowercase(),
             "fixture must be a mixed-case EIP-55 address: {counterparty}"
         );
-        let resp = ChannelsResponse {
+        let resp = LanesResponse {
             redeem_threshold_micro_usdc: 1_000_000,
-            channels: vec![
-                mk_channel(
+            lanes: vec![
+                mk_lane(
                     &format!("0x{}", "a".repeat(64)),
                     &counterparty,
                     7,
@@ -2078,7 +2075,7 @@ mod tests {
                     Some(90),
                     true,
                 ),
-                mk_channel(
+                mk_lane(
                     &format!("0x{}", "c".repeat(64)),
                     &format!("0x{}", "d".repeat(40)),
                     0,
@@ -2090,18 +2087,18 @@ mod tests {
             ],
         };
         let mut buf = Vec::<u8>::new();
-        write_channels_table(&mut buf, &resp)?;
+        write_lanes_table(&mut buf, &resp)?;
         let s = String::from_utf8(buf)?;
-        assert!(s.contains("channels=2"), "{s}");
-        assert!(s.contains("CHANNEL"), "header missing: {s}");
+        assert!(s.contains("lanes=2"), "{s}");
+        assert!(s.contains("LANE"), "header missing: {s}");
         assert!(s.contains("OUTSTANDING"), "header missing: {s}");
         assert!(s.contains("ELIGIBLE"), "header missing: {s}");
         // First row: USDC-formatted amounts, 90s → "1m ago", eligible "yes".
         assert!(s.contains("2.500000"), "outstanding USDC missing: {s}");
         assert!(s.contains("10.000000"), "deposit USDC missing: {s}");
         assert!(s.contains("1m ago"), "last-voucher age missing: {s}");
-        // Channel id preview is the short form.
-        assert!(s.contains("0xaaaaaaaaaa"), "channel preview missing: {s}");
+        // Lane id preview is the short form.
+        assert!(s.contains("0xaaaaaaaaaa"), "lane preview missing: {s}");
         // Counterparty preview is the short form AND preserves the EIP-55
         // mixed case verbatim — `short_node_id` truncates to 12 chars, so
         // assert the row carries that checksummed prefix unchanged (a
@@ -2120,14 +2117,14 @@ mod tests {
         Ok(())
     }
 
-    /// The SIGNER column: a delegated channel renders the delegate (not the
+    /// The SIGNER column: a delegated lane renders the delegate (not the
     /// funder), and a pre-delegation server — which omits `voucher_signer`
     /// entirely — renders `?` rather than echoing the funder.
     #[test]
-    fn write_channels_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
+    fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
         let funder = format!("0x{}", "1".repeat(40));
         let delegate = format!("0x{}", "2".repeat(40));
-        let mut delegated = mk_channel(
+        let mut delegated = mk_lane(
             &format!("0x{}", "a".repeat(64)),
             &funder,
             1,
@@ -2137,7 +2134,7 @@ mod tests {
             false,
         );
         delegated.voucher_signer = delegate.clone();
-        let mut legacy = mk_channel(
+        let mut legacy = mk_lane(
             &format!("0x{}", "b".repeat(64)),
             &funder,
             1,
@@ -2149,11 +2146,11 @@ mod tests {
         legacy.voucher_signer = String::new();
 
         let mut buf = Vec::<u8>::new();
-        write_channels_table(
+        write_lanes_table(
             &mut buf,
-            &ChannelsResponse {
+            &LanesResponse {
                 redeem_threshold_micro_usdc: 1_000_000,
-                channels: vec![delegated, legacy],
+                lanes: vec![delegated, legacy],
             },
         )?;
         let s = String::from_utf8(buf)?;
@@ -2188,9 +2185,9 @@ mod tests {
         assert_eq!(format_usdc(12_345_678), "12.345678");
     }
 
-    /// `decdn node channels --json` serializes the `ChannelsResponse`
+    /// `decdn node lanes --json` serializes the `LanesResponse`
     /// DTO with `serde_json::to_string_pretty` (the seam the `--json`
-    /// branch in [`channels`] uses). Assert the pretty encoding (a)
+    /// branch in [`lanes`] uses). Assert the pretty encoding (a)
     /// round-trips back to the same value and (b) carries every
     /// load-bearing field with its wire key, so a rename or a
     /// skipped-field regression on the DTO breaks here rather than only
@@ -2198,12 +2195,12 @@ mod tests {
     /// the peers `--json` path. The counterparty is a real EIP-55
     /// checksummed address so the JSON reflects production output.
     #[test]
-    fn channels_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
+    fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
         let counterparty =
             alloy::primitives::address!("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").to_string();
-        let resp = ChannelsResponse {
+        let resp = LanesResponse {
             redeem_threshold_micro_usdc: 1_000_000,
-            channels: vec![mk_channel(
+            lanes: vec![mk_lane(
                 &format!("0x{}", "a".repeat(64)),
                 &counterparty,
                 7,
@@ -2227,10 +2224,10 @@ mod tests {
         // generated client deserializes this exact shape. (The DTO doesn't
         // derive `PartialEq`, so assert the reconstructed fields directly
         // rather than comparing whole structs.)
-        let back: ChannelsResponse = serde_json::from_str(&pretty)?;
+        let back: LanesResponse = serde_json::from_str(&pretty)?;
         assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
-        assert_eq!(back.channels.len(), 1);
-        let bc = back.channels.first().expect("one channel");
+        assert_eq!(back.lanes.len(), 1);
+        let bc = back.lanes.first().expect("one lane");
         assert_eq!(bc.counterparty, counterparty);
         assert_eq!(bc.last_nonce, 7);
         assert_eq!(bc.outstanding_micro_usdc, 2_500_000);
@@ -2242,7 +2239,7 @@ mod tests {
         // checksummed counterparty verbatim (mixed-case preserved).
         let value: serde_json::Value = serde_json::from_str(&pretty)?;
         assert_eq!(value["redeem_threshold_micro_usdc"], 1_000_000);
-        let chans = value["channels"].as_array().expect("channels array");
+        let chans = value["lanes"].as_array().expect("lanes array");
         assert_eq!(chans.len(), 1);
         let c0 = &chans[0];
         assert_eq!(c0["counterparty"].as_str(), Some(counterparty.as_str()));

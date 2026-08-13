@@ -289,7 +289,7 @@ async fn run() -> anyhow::Result<()> {
     // what lets a node sign refusals freely (ADR 014 § Rate manipulation): you
     // cannot overcharge on a delivery you declined.
     let refusal = client
-        .refused_stream(&chain, &node, session.channel_id(), absent, stream_ts)
+        .refused_stream(&chain, &node, session.pool_id(), absent, stream_ts)
         .await?;
     anyhow::ensure!(!refusal.body.ok, "the captured refusal must be ok:false");
     anyhow::ensure!(

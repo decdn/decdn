@@ -2,8 +2,8 @@
 //! Bodies split from `mod.rs` (#1254).
 
 use super::{
-    Address, CacheError, ChannelId, ClientHandler, Duration, FillOutcome, Hash, RangePullOutcome,
-    StreamRequest,
+    Address, B256, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneKey,
+    RangePullOutcome, StreamRequest,
 };
 
 impl ClientHandler {
@@ -38,39 +38,24 @@ impl ClientHandler {
         let Some(client) = verified_client else {
             return false;
         };
-        let chan = self
-            .channels
-            .lock()
-            .await
-            .get(&ChannelId::from(req.channel_id))
-            .cloned();
-        match chan {
-            Some(chan) => {
-                let state = &chan.lock().await.state;
-                // Ownership is a *signer* question: only the pinned voucher
-                // signer can pay for this upstream pull, so only it can
-                // authorize the spend.
-                if state.voucher_signer != client {
-                    return false;
-                }
-                // Compliance is a *funder* question (ADR 011), and must NEVER be
-                // re-keyed onto the signer: never front upstream USDC on a
-                // channel funded by a blacklisted address, even when a clean
-                // delegate key is doing the signing. Equally, a blacklisted
-                // signer over a clean funder is not a compliance event — the
-                // deny-set names the funding address, so that is the only
-                // address this checks. `dispatch.rs`'s serve gate keys on the
-                // same funder; the two gates agree on the subject.
-                //
-                // Unreachable by construction today: every `pull_authorized`
-                // call site sits below the `dispatch.rs` funder gate, which
-                // already refuses a blacklisted funder. It stays as a backstop
-                // so a future caller wired in *above* that gate cannot spend
-                // upstream USDC on a blacklisted funder.
-                !self.content_deny.is_origin_denied(&state.client)
-            }
-            None => false,
-        }
+        // Spend authority is a *signer* question: only the capability's pinned
+        // signer can pay for this upstream pull, so only it can authorize the
+        // spend. In the shared-payment-pool model the lane is keyed by that
+        // signer directly, so authority reduces to "does a lane exist for
+        // `(pool_id, bound_signer, this operator)`?" — the seller resolves the
+        // lane from exactly that triple (brief §E1).
+        let lane_key = LaneKey {
+            pool_id: B256::from(req.pool_id),
+            signer: client,
+            provider: self.eth_signer.address(),
+        };
+        // This is a lane-membership (spend-authority) check only. The spend-side
+        // origin-blacklist gate (ADR 011) keys on the pool FUNDER
+        // (`getPool.owner`), and it runs at the serve gate's open-time funder
+        // check in `dispatch.rs`, which precedes every fill tier — a blacklisted
+        // funder is refused there before this authority check is ever reached, so
+        // no fill fronts USDC on a blacklisted funder's behalf.
+        self.lanes.lock().await.contains_key(&lane_key)
     }
 
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The

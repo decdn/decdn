@@ -14,7 +14,7 @@ import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
-import { PaymentChannel } from "../src/PaymentChannel.sol";
+import { PaymentPool } from "../src/PaymentPool.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
@@ -161,7 +161,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         d.registry = PublisherRegistry(address(0x06));
         d.timelock = TimelockController(payable(address(0x07)));
         d.governor = DecdnGovernor(payable(address(0x08)));
-        d.paymentChannel = PaymentChannel(address(0x09));
+        d.paymentPool = PaymentPool(address(0x09));
         d.slashJudge = SlashJudge(address(0x0A));
         d.originAssignment = OriginAssignment(address(0x0B));
         d.vettingPolicy = ManualVettingPolicy(address(0x0C));
@@ -187,7 +187,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.PublisherRegistry"), address(0x06), "PublisherRegistry");
         assertEq(json.readAddress(".contracts.TimelockController"), address(0x07), "Timelock");
         assertEq(json.readAddress(".contracts.DecdnGovernor"), address(0x08), "Governor");
-        assertEq(json.readAddress(".contracts.PaymentChannel"), address(0x09), "PaymentChannel");
+        assertEq(json.readAddress(".contracts.PaymentPool"), address(0x09), "PaymentPool");
         assertEq(json.readAddress(".contracts.SlashJudge"), address(0x0A), "SlashJudge");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
         assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");

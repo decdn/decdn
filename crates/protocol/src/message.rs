@@ -113,14 +113,6 @@ pub enum MessageValidationError {
     /// recovers the bound address.
     #[error("ClientBinding.binding_signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidBindingSigLen { len: usize },
-    /// A wire [`crate::client::CooperativeCloseAuth`]'s `signature` is not
-    /// [`crate::client::COOPERATIVE_CLOSE_SIG_LEN`] bytes. The provider's
-    /// cooperative-close waiver is the same EOA off-chain signing form (ADR 024
-    /// §Off-Chain ERC-1271 Verification); receivers reject deviations before
-    /// `decdn_incentive` recovers the provider address (ADR 003 §Cooperative
-    /// close).
-    #[error("CooperativeCloseAuth.signature has invalid length {len} (EOA form is 65 bytes)")]
-    InvalidCooperativeCloseSigLen { len: usize },
     /// A negotiated `voucher_interval_mb` is outside `1..=MAX_VOUCHER_INTERVAL_MB`
     /// (ADR 003 §Voucher Interval Negotiation). Zero would never require a
     /// voucher; an oversized value opens an unbounded unvouchered-byte window
@@ -167,6 +159,13 @@ pub enum MessageValidationError {
     /// `try_from` decode gate, as above.
     #[error("ChunkData payload of {len} bytes exceeds CHUNK_SIZE ({max})", max = crate::CHUNK_SIZE)]
     ChunkTooLarge { len: usize },
+    /// A wire [`crate::client::WireCapability`]'s `owner_signature` is empty.
+    /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
+    /// ERC-1271 contract-signer form may be longer, so only the non-empty
+    /// floor is a wire-level check; the rest is `decdn_incentive`'s job
+    /// (ADR 024 §Off-Chain ERC-1271 Verification).
+    #[error("WireCapability.owner_signature is empty")]
+    EmptyCapabilitySignature,
 }
 
 /// Top-level protocol enum for `cdn/probe/v1`. Variant order is frozen per

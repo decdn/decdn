@@ -8,14 +8,14 @@
 //! (`serve_via_window_pull_through` → `CacheEngine::claim_fill`): the first miss
 //! OWNS the single upstream pull for the hash, the overlapping second ATTACHES as
 //! an observer and streams the same filling cache — each downstream client over
-//! its OWN send stream, metering its OWN egress against its OWN channel.
+//! its OWN send stream, metering its OWN egress against its OWN lane.
 //!
 //! This closes the gap `coalesce_two_clients` calls out in its header: that proof
 //! coalesces on the OWN-ORIGIN path only (the server eats its own fs-origin egress
 //! once, no upstream payment), because the harness could not express a node paying
 //! an upstream. Two pieces of net-new harness make it expressible here:
 //!   * `ChainFixture::fund_node_as_buyer` — mints the server operator the USDC a
-//!     buyer channel escrows (the daemon self-approves the `PaymentChannel` at
+//!     buyer pool escrows (the daemon self-approves the `PaymentPool` at
 //!     buyer bootstrap, so minting is the fixture's whole job).
 //!   * cross-node discovery — the provider is seated as an authorized origin for a
 //!     namespace via `OriginAssignment.addOrigin`, and the server is given the
@@ -29,13 +29,13 @@
 //!      its own handshake unused — only the owner's `run_pull_leg` scores a
 //!      `Delivered` outcome, which is what bumps this counter.)
 //!   2. Both clients receive the full blob, byte-exact.
-//!   3. The two clients settle on DISTINCT downstream channels, each accruing its
-//!      OWN egress payment, the two amounts near-equal — so neither channel was
+//!   3. The two clients settle on DISTINCT downstream lanes, each accruing its
+//!      OWN egress payment, the two amounts near-equal — so neither lane was
 //!      billed the other's bytes (no cross-client leakage).
 //!   4. The upstream pull was genuinely PAID: the PROVIDER reports exactly one
-//!      buyer channel — funded by the server's operator — with a non-zero settled
-//!      claim. A single such channel (not two) is the upstream face of the
-//!      coalescing: one pull, one channel, paid once.
+//!      buyer lane — funded by the server's operator — with a non-zero settled
+//!      claim. A single such lane (not two) is the upstream face of the
+//!      coalescing: one pull, one lane, paid once.
 //!
 //! Gated behind `anvil-e2e` (off by default). Requires `anvil` + `forge` on
 //! `PATH` and a prior build of the `decdn-node` binary:
@@ -76,7 +76,7 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// chunk-log 4 == 16 KiB chunk groups).
 const CHUNK_GROUP: usize = 16 * 1024;
 
-/// USDC (base units) minted to the server operator so its buyer channel to the
+/// USDC (base units) minted to the server operator so its buyer pool to the
 /// provider never starves: far above the 0.5 USDC initial + 10 USDC working
 /// deposit a single pull can escrow. Mirrors the client fixture's own mint.
 const SERVER_BUYER_USDC: u64 = 1_000_000_000;
@@ -96,59 +96,58 @@ fn make_blob(len: usize) -> Vec<u8> {
 }
 
 /// Read the `outstanding_micro_usdc` (cumulative accrued voucher claim) a node
-/// reports for `channel_id`, polling until a non-zero claim is visible or the
-/// budget expires. A settled full delivery has a non-zero cumulative claim; the
-/// node records it before the client's `fetch_once` returns, but the admin
-/// surface reads the persisted store, so a short poll rides out the fsync gap.
-async fn settled_outstanding(node: &NodeFixture, channel_id: B256) -> anyhow::Result<u64> {
+/// reports for the lane on `pool_id`, polling until a non-zero claim is visible
+/// or the budget expires. A settled full delivery has a non-zero cumulative
+/// claim; the node records it before the client's `fetch_once` returns, but the
+/// admin surface reads the persisted store, so a short poll rides out the fsync
+/// gap.
+async fn settled_outstanding(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u64> {
     let admin = node.admin_client()?;
-    let wanted = channel_id;
+    let wanted = pool_id;
     let snapshot = poll(Duration::from_secs(30), || async {
-        let resp = admin.channels().await.context("admin channels")?;
+        let resp = admin.lanes().await.context("admin lanes")?;
         Ok(resp
-            .channels
+            .lanes
             .into_iter()
-            .find(|s| s.channel_id.parse::<B256>().is_ok_and(|id| id == wanted))
+            .find(|s| s.pool_id.parse::<B256>().is_ok_and(|id| id == wanted))
             .filter(|s| s.outstanding_micro_usdc > 0))
     })
     .await?
-    .with_context(|| {
-        format!("node never reported a non-zero settled claim for channel {wanted}")
-    })?;
+    .with_context(|| format!("node never reported a non-zero settled claim for pool {wanted}"))?;
     Ok(snapshot.outstanding_micro_usdc)
 }
 
-/// Time to keep observing the provider's channel store AFTER the first paid
-/// channel appears, so a second one lagging through the persisted-store fsync
-/// window is caught rather than raced past. Sized as several `wait_for_channel`
-/// / redeem poll cadences (~500ms), comfortably inside the overall budget.
-const UPSTREAM_CHANNEL_SETTLE_WINDOW: Duration = Duration::from_secs(3);
+/// Time to keep observing the provider's lane store AFTER the first paid lane
+/// appears, so a second one lagging through the persisted-store fsync window is
+/// caught rather than raced past. Sized as several `wait_for_pool` / redeem poll
+/// cadences (~500ms), comfortably inside the overall budget.
+const UPSTREAM_LANE_SETTLE_WINDOW: Duration = Duration::from_secs(3);
 
-/// Poll the PROVIDER's channel store for the buyer channels funded by `payer`
-/// (the server operator) that have accrued a non-zero settled claim, returning
-/// `(count, total_outstanding_micro_usdc)`. Proves the upstream pull moved real
-/// money server → provider, and that it did so over exactly ONE channel.
+/// Poll the PROVIDER's lane store for the buyer lanes funded by `payer` (the
+/// server operator, the pool owner) that have accrued a non-zero settled claim,
+/// returning `(count, total_outstanding_micro_usdc)`. Proves the upstream pull
+/// moved real money server → provider, and that it did so over exactly ONE lane.
 ///
-/// Returning on the FIRST sighting of any paid channel would undercount: a
-/// SECOND paid channel — the signature of a coalescing regression that opened
-/// two upstream pulls — can surface a beat later through the same fsync window,
-/// and a single read would race past it and let a caller's `== 1` assertion pass
-/// falsely. So this waits for at least one paid channel, then keeps observing for
-/// [`UPSTREAM_CHANNEL_SETTLE_WINDOW`] and returns the MAXIMUM paid-channel count
-/// seen — a lagging second channel then correctly fails the assertion. The total
-/// is the sum at that maximum.
-async fn provider_channels_from(
+/// Returning on the FIRST sighting of any paid lane would undercount: a SECOND
+/// paid lane — the signature of a coalescing regression that opened two upstream
+/// pulls — can surface a beat later through the same fsync window, and a single
+/// read would race past it and let a caller's `== 1` assertion pass falsely. So
+/// this waits for at least one paid lane, then keeps observing for
+/// [`UPSTREAM_LANE_SETTLE_WINDOW`] and returns the MAXIMUM paid-lane count seen —
+/// a lagging second lane then correctly fails the assertion. The total is the sum
+/// at that maximum.
+async fn provider_lanes_from(
     provider: &NodeFixture,
     payer: Address,
 ) -> anyhow::Result<(usize, u64)> {
     let admin = provider.admin_client()?;
     let payer_hex = payer.to_string();
 
-    // (1) Ride out the fsync window: wait until at least one paid channel funded
-    // by `payer` is visible before starting to count.
+    // (1) Ride out the fsync window: wait until at least one paid lane funded by
+    // `payer` is visible before starting to count.
     poll(Duration::from_secs(30), || async {
-        let resp = admin.channels().await.context("admin channels")?;
-        let any_paid = resp.channels.iter().any(|s| {
+        let resp = admin.lanes().await.context("admin lanes")?;
+        let any_paid = resp.lanes.iter().any(|s| {
             s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
         });
         Ok(any_paid.then_some(()))
@@ -159,14 +158,14 @@ async fn provider_channels_from(
     })?;
 
     // (2) Observe a stability window and take the max count seen, so a second
-    // paid channel that surfaces late is not missed.
+    // paid lane that surfaces late is not missed.
     let mut max_count = 0usize;
     let mut total_at_max = 0u64;
-    let deadline = tokio::time::Instant::now() + UPSTREAM_CHANNEL_SETTLE_WINDOW;
+    let deadline = tokio::time::Instant::now() + UPSTREAM_LANE_SETTLE_WINDOW;
     loop {
-        let resp = admin.channels().await.context("admin channels")?;
+        let resp = admin.lanes().await.context("admin lanes")?;
         let paid: Vec<u64> = resp
-            .channels
+            .lanes
             .into_iter()
             .filter(|s| {
                 s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
@@ -195,6 +194,7 @@ async fn two_clients_coalesce_one_paid_upstream_pull() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::similar_names)] // pid_a/pid_b, paid_a/paid_b — per-client a/b pairs read clearly
 async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -240,12 +240,12 @@ async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
     let client_a = ClientFixture::new(&chain).await?;
     let client_b = ClientFixture::new(&chain).await?;
 
-    // Open + register both downstream channels (sequentially — this is set-up),
+    // Open + register both downstream pools (sequentially — this is set-up),
     // each proven live by its warm-up delivery. The warm-up must carry the
     // provider's namespace: the server holds the warm blob no more than the main
     // one, so its warm-up is itself a node-to-node miss that only discovers the
     // provider under that namespace. `open_session_in_namespace` returns once the
-    // server's serve path has actually served this channel.
+    // server's serve path has actually served this pool.
     let (mut sess_a, _) = client_a
         .open_session_in_namespace(&chain, &server, warm_hash, namespace)
         .await
@@ -254,11 +254,11 @@ async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
         .open_session_in_namespace(&chain, &server, warm_hash, namespace)
         .await
         .context("client B session set-up")?;
-    let cid_a = sess_a.channel_id();
-    let cid_b = sess_b.channel_id();
+    let pid_a = sess_a.pool_id();
+    let pid_b = sess_b.pool_id();
     anyhow::ensure!(
-        cid_a != cid_b,
-        "the two clients must fund DISTINCT channels (got {cid_a} twice)"
+        pid_a != pid_b,
+        "the two clients must fund DISTINCT pools (got {pid_a} twice)"
     );
 
     // Baseline the server's upstream-pull-success counter AFTER warm-up: client
@@ -272,7 +272,7 @@ async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
     // The proof: both clients fetch the SAME missing blob CONCURRENTLY. The first
     // miss owns the single upstream pull from the provider; the overlapping second
     // attaches as an observer and streams the same filling cache. Each pays its
-    // OWN egress on its OWN downstream channel.
+    // OWN egress on its OWN downstream lane.
     let fa = client_a.fetch_once(&mut sess_a, hash, 0, namespace);
     let fb = client_b.fetch_once(&mut sess_b, hash, 0, namespace);
     let (bytes_a, bytes_b) = tokio::try_join!(fa, fb).context("concurrent coalesced fetch")?;
@@ -305,12 +305,12 @@ async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
          (expected +1, got {pull_before} -> {pull_after})"
     );
 
-    // (3) Two INDEPENDENT downstream per-channel settlements, no cross-client
-    // leakage. Each channel accrued its own egress payment; the two amounts are
+    // (3) Two INDEPENDENT downstream per-lane settlements, no cross-client
+    // leakage. Each lane accrued its own egress payment; the two amounts are
     // near-equal because each client received the same warm-up + blob bytes. A
-    // leak would show one channel carrying ~both deliveries and the other ~zero.
-    let paid_a = settled_outstanding(&server, cid_a).await?;
-    let paid_b = settled_outstanding(&server, cid_b).await?;
+    // leak would show one lane carrying ~both deliveries and the other ~zero.
+    let paid_a = settled_outstanding(&server, pid_a).await?;
+    let paid_b = settled_outstanding(&server, pid_b).await?;
     anyhow::ensure!(
         paid_a > 0 && paid_b > 0,
         "each client must settle its OWN non-zero egress claim (A={paid_a}, B={paid_b})"
@@ -322,21 +322,21 @@ async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
     // tighter than the ~2x / ~0 split a cross-client leak would produce.
     anyhow::ensure!(
         hi <= lo + lo / 4,
-        "the two downstream settlements must be near-equal — a large gap means one channel was \
+        "the two downstream settlements must be near-equal — a large gap means one lane was \
          billed the other's bytes (A={paid_a}, B={paid_b})"
     );
 
-    // (4) The upstream pull was genuinely PAID, and over exactly ONE channel. The
-    // provider reports a single buyer channel funded by the server operator with a
+    // (4) The upstream pull was genuinely PAID, and over exactly ONE lane. The
+    // provider reports a single buyer lane funded by the server operator with a
     // non-zero settled claim — the coalesced pull's single voucher stream. Two
-    // channels here would mean the server opened a second upstream pull; zero would
+    // lanes here would mean the server opened a second upstream pull; zero would
     // mean it never paid at all (an own-origin fill, not the node-to-node path).
-    let (upstream_channels, upstream_paid) =
-        provider_channels_from(&provider, server.operator_addr()).await?;
+    let (upstream_lanes, upstream_paid) =
+        provider_lanes_from(&provider, server.operator_addr()).await?;
     anyhow::ensure!(
-        upstream_channels == 1,
-        "the coalesced pull must settle over EXACTLY ONE server->provider channel, got \
-         {upstream_channels}"
+        upstream_lanes == 1,
+        "the coalesced pull must settle over EXACTLY ONE server->provider lane, got \
+         {upstream_lanes}"
     );
     anyhow::ensure!(
         upstream_paid > 0,

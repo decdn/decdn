@@ -72,12 +72,12 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_channels_open{instance=~\"$instance\"}",
+          "expr": "decdn_lanes_open{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
       ],
-      "title": "Channels open",
+      "title": "Lanes open",
       "type": "stat"
     },
     {
@@ -340,8 +340,8 @@
         },
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_unknown_channel_total{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "unknown channel",
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_unknown_lane_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "unknown lane",
           "refId": "B"
         },
         {
@@ -502,7 +502,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_channels_open{instance=~\"$instance\"}",
+          "expr": "decdn_lanes_open{instance=~\"$instance\"}",
           "legendFormat": "open — {{instance}}",
           "refId": "A"
         },
@@ -513,7 +513,7 @@
           "refId": "B"
         }
       ],
-      "title": "Open channels and voucher nonce gaps",
+      "title": "Open lanes and voucher nonce gaps",
       "type": "timeseries"
     },
     {
@@ -531,12 +531,12 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_channel_deposit_usdc{instance=~\"$instance\"}",
+          "expr": "decdn_pool_deposit_usdc{instance=~\"$instance\"}",
           "legendFormat": "open USDC — {{instance}}",
           "refId": "A"
         }
       ],
-      "title": "Open-channel USDC exposure",
+      "title": "Pool USDC exposure",
       "type": "timeseries"
     }
   ],

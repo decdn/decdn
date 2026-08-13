@@ -1,6 +1,6 @@
 //! Live anvil-backed e2e for the CLI `decdn fetch` **streaming + resumable
 //! download** path (#1120, #1122), driving the shipped `decdn` binary against a
-//! real node over a real paid `cdn/client/v1` channel.
+//! real node over a real paid `cdn/client/v1` stream.
 //!
 //! Why the whole binary rather than a unit test: the driver/store unit tests in
 //! `decdn-client-pull` already prove the gap-driven fetch verifies every byte,
@@ -82,8 +82,8 @@ use decdn_client_pull::ClientRangedStore;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
-use decdn_incentive::buyer_channel::BuyerChannelStore;
-use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
+use decdn_incentive::buyer_pool::BuyerPoolStore;
+use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
@@ -185,7 +185,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // Funded buyer with an on-disk keystore under a `0o700` client data dir (the
-    // `RedbBuyerChannelStore` the CLI opens enforces the mode; `tempdir` is
+    // `RedbBuyerPoolStore` the CLI opens enforces the mode; `tempdir` is
     // `0o755`).
     let client_dir = tempfile::tempdir().context("client tempdir")?;
     #[cfg(unix)]
@@ -232,7 +232,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- Journey 1: a clean fetch ----
     //
     // The node accepts vouchers only once its chain watcher has decoded the
-    // `ChannelOpened` event (~500ms poll), so the first run races it. Retry until
+    // `PoolOpened` event (~500ms poll), so the first run races it. Retry until
     // observation lands, exactly as the manifest e2e does.
     let before_clean = billed_bytes(client_dir.path(), node.operator_addr())?;
     run_fetch_until_ready(client_dir.path(), &args).await?;
@@ -450,25 +450,32 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cumulative bytes the buyer has paid the provider for, read from the persisted
-/// channel watermark. The store is reopened per call because the CLI subprocess
-/// owns it between calls.
+/// Cumulative bytes the buyer has paid `provider` for, read from the persisted
+/// pool's `(signer, provider)` lane watermark. The store is reopened per call
+/// because the CLI subprocess owns it between calls. One buyer signs one pool, so
+/// the highest lane watermark naming `provider` across the tracked pools is the
+/// cumulative bytes billed to it.
 fn billed_bytes(
     data_dir: &std::path::Path,
     provider: alloy::primitives::Address,
 ) -> anyhow::Result<u64> {
     // Before the first fetch there is no store yet — nothing has been billed.
-    let Ok(store) = RedbBuyerChannelStore::open(data_dir) else {
+    let Ok(store) = RedbBuyerPoolStore::open(data_dir) else {
         return Ok(0);
     };
-    let Some(state) = store.get_by_provider(provider).context("read channel")? else {
-        return Ok(0);
-    };
-    Ok(u64::try_from(state.last_bytes_delivered).unwrap_or(u64::MAX))
+    let mut billed = U256::ZERO;
+    for pool in store.load_all().context("load buyer pools")?.pools {
+        for (lane, progress) in pool.lanes() {
+            if lane.provider == provider {
+                billed = billed.max(progress.last_bytes);
+            }
+        }
+    }
+    Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
 /// Run `decdn fetch`, retrying until the node's chain watcher has observed the
-/// freshly-opened channel (`decdn fetch` has no internal retry for that race).
+/// freshly-opened pool (`decdn fetch` has no internal retry for that race).
 async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
@@ -496,9 +503,10 @@ async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> a
 
 /// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` from
 /// `node` over the explicit-node path, with chain coordinates as flags so no
-/// config file is needed. `--capacity-bond-address` is omitted deliberately: the
-/// node holds the blob, so the (unbound) fetch never needs reactive origin
-/// pull-through.
+/// config file is needed. `--capacity-bond-address` is required: it is the
+/// EIP-712 `verifyingContract` the buyer signs its ADR 005 client identity
+/// binding against, and the node refuses to serve a paid request that carries no
+/// verified binding — even for a blob it already holds.
 fn fetch_argv(
     chain: &ChainFixture,
     node: &NodeFixture,
@@ -520,8 +528,10 @@ fn fetch_argv(
         format!("{}", node.operator_addr()),
         "--rpc-url".into(),
         chain.rpc_url(),
-        "--payment-channel-address".into(),
-        format!("{}", chain.addrs().payment_channel),
+        "--payment-pool-address".into(),
+        format!("{}", chain.addrs().payment_pool),
+        "--capacity-bond-address".into(),
+        format!("{}", chain.addrs().capacity_bond),
         "--slash-judge-address".into(),
         format!("{}", chain.addrs().slash_judge),
         "--chain-id".into(),

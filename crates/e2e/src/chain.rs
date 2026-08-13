@@ -177,7 +177,7 @@ pub struct EvidencePair<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct ContractAddrs {
     pub capacity_bond: Address,
-    pub payment_channel: Address,
+    pub payment_pool: Address,
     pub fee_router: Address,
     pub token: Address,
     pub slash_judge: Address,
@@ -2124,7 +2124,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
     };
     Ok(ContractAddrs {
         capacity_bond: get("CapacityBond")?,
-        payment_channel: get("PaymentChannel")?,
+        payment_pool: get("PaymentPool")?,
         fee_router: get("FeeRouter")?,
         token: get("Token")?,
         slash_judge: get("SlashJudge")?,

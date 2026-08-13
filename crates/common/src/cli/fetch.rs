@@ -3,13 +3,12 @@
 //!
 //! The paying sibling of [`super::probe::ProbeArgs`]: a one-shot client command
 //! that dials a node by explicit `--node-id`/`--addr`/`--relay-url` (or
-//! auto-discovers one, #936) and pays per-MB from a `PaymentChannel`. The
-//! channel is **auto-opened and reused** (#940): `fetch` looks up a live channel
-//! with `--provider-address` in its persistent buyer-channel store, resuming
-//! that channel's voucher watermark; if none exists it opens (and funds) one
-//! on-chain and records it. `--channel-id` (#1481) is the escape hatch for
-//! publisher-pays: it adopts an existing channel by id instead of deriving one
-//! from `--provider-address`.
+//! auto-discovers one, #936) and pays per-MB from the caller's own
+//! `PaymentPool` deposit. The pool is **auto-opened and reused**: `fetch`
+//! looks up the caller's live pool in its persistent buyer-pool store, resuming
+//! its per-`(signer, provider)` lane watermark for the chosen provider; if none
+//! exists it opens (and funds) one on-chain and records it. One pool fans out
+//! to every provider the caller pays (ADR 003) — there is no per-provider open.
 //!
 //! The on-chain coordinates (RPC, contract addresses, chain id, keystore, data
 //! dir) resolve **flag > `[blockchain]`/`[identity]` config > default**, so a
@@ -54,9 +53,8 @@ fn parse_region_flag(raw: &str) -> Result<String, String> {
 /// rather than by clap, because the relay (`network.relay_urls`, #935) and the
 /// chain coordinates (`[blockchain]`) can come from config, which clap cannot
 /// see. `--node-id` requires `--provider-address` at the clap layer; the reverse
-/// pairing (`--provider-address` needs `--channel-id` OR `--node-id`) is enforced
-/// in `validate()`, so `--provider-address` can guard the `--channel-id` adopt
-/// path standalone (#1492). `--addr` requires `--node-id` at the clap layer.
+/// pairing (`--provider-address` needs `--node-id`) is enforced in `validate()`.
+/// `--addr` requires `--node-id` at the clap layer.
 #[derive(Debug, Clone, Args)]
 pub struct ClientFetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
@@ -77,33 +75,27 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "URL")]
     pub relay_url: Option<String>,
 
-    /// The delivering node's Ethereum address (0x-prefixed hex). The channel is
-    /// opened/reused against it, and the response `slash_sig` must recover to it
-    /// (ADR 014 §1); a mismatch aborts the pull. Omit it when auto-discovering
-    /// (no `--node-id`): it is derived from the selected node's registry entry.
+    /// The delivering node's Ethereum address (0x-prefixed hex). The caller's
+    /// pool lane for this provider is opened/reused against it, and the
+    /// response `slash_sig` must recover to it (ADR 014 §1); a mismatch aborts
+    /// the pull. Omit it when auto-discovering (no `--node-id`): it is derived
+    /// from the selected node's registry entry.
     ///
-    /// Not a bare clap `requires` (#1492): it may stand alone alongside
-    /// `--channel-id`, where it only GUARDS the adopted channel's on-chain
-    /// provider. On the auto-open path it still needs `--node-id`; that pairing is
-    /// enforced in `validate()`, not by clap.
+    /// Requires `--node-id` (enforced in `validate()`, not by clap) — on its
+    /// own it names no node to dial.
     #[arg(long, value_name = "0xADDR")]
     pub provider_address: Option<String>,
 
-    /// Adopt an existing channel by id (publisher-pays); skips auto-open. The
-    /// channel's voucherSigner must be a key in your keystore.
-    #[arg(long, value_name = "0xHASH")]
-    pub channel_id: Option<String>,
-
-    /// JSON-RPC endpoint for on-chain channel open. Overrides
+    /// JSON-RPC endpoint for on-chain pool open. Overrides
     /// `blockchain.rpc_url` from config.
     #[arg(long, value_name = "URL")]
     pub rpc_url: Option<String>,
 
-    /// `PaymentChannel` contract address (0x hex) — the voucher EIP-712
-    /// `verifyingContract` and the `openChannel` target. Overrides
-    /// `blockchain.payment_channel_address`.
+    /// `PaymentPool` contract address (0x hex) — the voucher EIP-712
+    /// `verifyingContract` and the `openPool` target. Overrides
+    /// `blockchain.payment_pool_address`.
     #[arg(long, value_name = "0xADDR")]
-    pub payment_channel_address: Option<String>,
+    pub payment_pool_address: Option<String>,
 
     /// `SlashJudge` contract address (0x hex) — the `slash_sig` EIP-712
     /// `verifyingContract`. Overrides `blockchain.slash_judge_address`.
@@ -177,13 +169,13 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// Deposit (`µUSDC`) to escrow when OPENING a new channel (ignored on reuse).
+    /// Deposit (`µUSDC`) to escrow when OPENING a new pool (ignored on reuse).
     /// Overrides `blockchain.buyer_initial_deposit_micro_usdc`; default 0.5 USDC.
     /// Escrowed as configured (no on-chain floor; only a non-zero requirement).
     #[arg(long, value_name = "MICRO_USDC")]
     pub initial_deposit_micro_usdc: Option<u64>,
 
-    /// Deposit (`µUSDC`) each top-up refills the channel toward once it has served
+    /// Deposit (`µUSDC`) each top-up refills the pool toward once it has served
     /// verified bytes. Overrides `blockchain.buyer_working_deposit_micro_usdc`;
     /// default 10 USDC. `0` disables top-up.
     #[arg(long, value_name = "MICRO_USDC")]
@@ -242,6 +234,23 @@ pub struct ClientFetchArgs {
     /// never be detected.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
+
+    /// Adopt a delegated pool + capability instead of opening/reusing the
+    /// caller's OWN pool. Pass the `dcap1:` token printed by `decdn pool assign`:
+    /// it names the pool and authorizes THIS client's loaded key to spend against
+    /// it up to the owner-set cap. The loaded keystore MUST be the delegate signer
+    /// the token authorizes (a mismatch aborts). The delegate does not own the
+    /// pool, so reactive top-up is disabled on this path — an exhausted cap or
+    /// drained pool needs the owner to top up or re-issue a higher-cap capability.
+    /// Mutually exclusive with `--capability-file`.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "capability_file")]
+    pub capability: Option<String>,
+
+    /// Read the `dcap1:` capability token from a file (its whole trimmed
+    /// contents) rather than the command line, keeping it out of shell history
+    /// and the process table. Mutually exclusive with `--capability`.
+    #[arg(long, value_name = "PATH", conflicts_with = "capability")]
+    pub capability_file: Option<PathBuf>,
 }
 
 impl ClientFetchArgs {
@@ -344,7 +353,7 @@ impl ClientFetchArgs {
     ///
     /// When `--timeout-ms` does not exceed twice `--stall-timeout-ms`.
     ///
-    /// When `--provider-address` is set without either `--channel-id` or `--node-id`.
+    /// When `--provider-address` is set without `--node-id`.
     pub fn validate(&self) -> anyhow::Result<()> {
         let need = self.stall_timeout_ms.saturating_mul(2);
         anyhow::ensure!(
@@ -358,19 +367,38 @@ impl ClientFetchArgs {
             need,
         );
 
-        // #1492: `--provider-address` is either the delivering node's address on
-        // the explicit/auto-open path (where it pairs with `--node-id`) or a
-        // mismatch guard on the `--channel-id` adopt path. Standing alone it has
-        // no node to dial and no channel to guard, so it is meaningless — the
-        // clap `requires` that used to block this was relaxed to allow the
-        // channel-id pairing, so the rule lives here now.
+        // `--provider-address` is the delivering node's address on the
+        // explicit-node path, where it pairs with `--node-id`. Standing alone it
+        // names no node to dial, so it is meaningless.
         anyhow::ensure!(
-            self.provider_address.is_none() || self.channel_id.is_some() || self.node_id.is_some(),
-            "--provider-address needs a target: pair it with --channel-id (to guard \
-             the adopted channel's on-chain provider) or with --node-id (the delivering \
-             node). Alone it has neither a node to dial nor a channel to guard",
+            self.provider_address.is_none() || self.node_id.is_some(),
+            "--provider-address requires --node-id (the delivering node to dial); alone it \
+             names no node",
         );
         Ok(())
+    }
+
+    /// The `dcap1:` capability token this fetch adopts, if any: the inline
+    /// `--capability` value, or the trimmed contents of `--capability-file`.
+    /// `None` selects the self-owned pool path (unchanged). Clap's
+    /// `conflicts_with` guarantees at most one of the two is set.
+    ///
+    /// # Errors
+    ///
+    /// When `--capability-file` is set but the file cannot be read.
+    pub fn resolve_capability_token(&self) -> anyhow::Result<Option<String>> {
+        if let Some(token) = &self.capability {
+            return Ok(Some(token.clone()));
+        }
+        match &self.capability_file {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    anyhow::anyhow!("read --capability-file {}: {e}", path.display())
+                })?;
+                Ok(Some(raw.trim().to_string()))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -612,47 +640,19 @@ mod tests {
         assert_eq!(small.hard_cap(), huge.hard_cap());
     }
 
-    /// `--channel-id` (#1481, publisher-pays adopt-by-id) is optional and stands
-    /// alone: the adopt path derives the node to dial from the channel's on-chain
-    /// provider, so it needs neither `--node-id` nor `--provider-address` (the
-    /// latter is only an optional guard here — see the `validate()` tests).
-    #[test]
-    fn channel_id_is_optional_and_stands_alone() {
-        assert_eq!(parse(&[]).channel_id, None, "the flag stays optional");
-        let id = "0x1111111111111111111111111111111111111111111111111111111111111111"; // 66 chars, arbitrary opaque string at the clap layer
-        assert_eq!(parse(&["--channel-id", id]).channel_id.as_deref(), Some(id));
-    }
-
-    /// #1492: `--provider-address` no longer clap-`requires` `--node-id`; the pairing
-    /// rule moved into `validate()`. It may stand alone ONLY alongside `--channel-id`
-    /// (where it guards the channel's on-chain provider). On the auto-open path it still
-    /// needs an explicit node.
-    #[test]
-    fn provider_address_may_guard_channel_id_without_node_id() {
-        let id = "0x1111111111111111111111111111111111111111111111111111111111111111";
-        let addr = "0x0000000000000000000000000000000000000001";
-        // Parses at the clap layer (no `requires` error) ...
-        let c = parse(&["--channel-id", id, "--provider-address", addr]);
-        // ... and passes the runtime rule.
-        assert!(
-            c.validate().is_ok(),
-            "provider-address guarding channel-id is allowed"
-        );
-    }
-
+    /// `--provider-address` alone (no `--node-id`) names no node to dial and is
+    /// rejected by `validate()`, even though clap itself admits it (the `requires`
+    /// pairing runs only from `--node-id`'s side, so this direction needs its own
+    /// runtime check).
     #[test]
     fn provider_address_alone_is_rejected_by_validate() {
         let addr = "0x0000000000000000000000000000000000000001";
-        // Clap now admits it (no `requires`), but validate() rejects it.
         let c = parse(&["--provider-address", addr]);
         let err = c
             .validate()
-            .expect_err("provider-address needs channel-id or node-id");
+            .expect_err("provider-address alone names no node");
         let msg = err.to_string();
-        assert!(
-            msg.contains("--channel-id") && msg.contains("--node-id"),
-            "the error names both ways to satisfy the flag: {msg}"
-        );
+        assert!(msg.contains("--node-id"), "{msg}");
     }
 
     #[test]
@@ -668,6 +668,40 @@ mod tests {
         assert!(
             TestCli::try_parse_from(["test", "--node-id", "n"]).is_err(),
             "--node-id without --provider-address is a parse error"
+        );
+    }
+
+    /// No capability flag => the self-owned path (`None`), unchanged.
+    #[test]
+    fn capability_token_absent_is_none() {
+        assert_eq!(parse(&[]).resolve_capability_token().unwrap(), None);
+    }
+
+    /// `--capability` returns the inline token verbatim.
+    #[test]
+    fn capability_token_inline_is_returned() {
+        let token = parse(&["--capability", "dcap1:abc"])
+            .resolve_capability_token()
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("dcap1:abc"));
+    }
+
+    /// `--capability-file` returns the file's trimmed contents; the two forms are
+    /// mutually exclusive at the clap layer.
+    #[test]
+    fn capability_token_from_file_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.txt");
+        std::fs::write(&path, "  dcap1:fromfile\n").unwrap();
+        let token = parse(&["--capability-file", path.to_str().unwrap()])
+            .resolve_capability_token()
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("dcap1:fromfile"));
+
+        assert!(
+            TestCli::try_parse_from(["test", "--capability", "dcap1:a", "--capability-file", "x",])
+                .is_err(),
+            "--capability and --capability-file are mutually exclusive"
         );
     }
 }

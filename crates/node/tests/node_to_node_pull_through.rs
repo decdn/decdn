@@ -10,8 +10,8 @@
 //! Each hop reuses the complete protocol halves shipped in PR #733:
 //! [`ClientHandler`] (server) and [`stream_fetch`] (requester). The test
 //! asserts the bytes survive both paid hops intact (hash-verified inside
-//! `stream_fetch`) and that *both* off-chain payment channels advance
-//! (nonce / bytes-delivered / cumulative amount).
+//! `stream_fetch`) and that *both* off-chain pool lanes advance
+//! (bytes-delivered / cumulative amount).
 //!
 //! **Boundary (deliberately not covered here).** The runtime orchestration is
 //! out of scope for this file. The cache-engine hook that, on a miss, discovers
@@ -35,16 +35,18 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
+use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_incentive::{
-    ChannelState, ChannelStateStore, MemoryChannelStateStore, StreamSlashData, bind_node_id_domain,
-    slash_judge_domain, voucher_domain,
+    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
+    StreamSlashData, bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
-use decdn_node::client_requester::{ChannelContext, stream_fetch};
+use decdn_node::client_requester::{PoolContext, stream_fetch};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{
-    ChunkData, ClientMessage, StreamRequest, StreamResponse, StreamResponseBody,
+    ChunkData, ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, StreamResponse,
+    StreamResponseBody,
 };
 use decdn_protocol::{ALPN_CLIENT, encode_stream_request, write_frame};
 use iroh::{Endpoint, EndpointAddr};
@@ -56,13 +58,12 @@ use support::{
 };
 
 const CHAIN_ID: u64 = 421_614;
-const TOKEN: Address = Address::repeat_byte(0x22);
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// 1.5 MiB → crosses one 1-MiB voucher interval plus a closing voucher, so each
-/// hop's channel advances to nonce 2 (mirrors `client_loopback.rs`).
+/// hop's lane advances through two vouchers (mirrors `client_loopback.rs`).
 const PAYLOAD_LEN: usize = 1_572_864;
 /// Distinct per-hop rates: A charges B `RATE_A`, B charges the client `RATE_B`.
-/// The two channels' cumulative `amount`s must reflect their *own* rate, proving
+/// The two lanes' cumulative `amount`s must reflect their *own* rate, proving
 /// pricing is per-server (no cross-talk between B's buyer and seller roles).
 const RATE_A: u64 = 10;
 const RATE_B: u64 = 13;
@@ -104,50 +105,87 @@ fn hop_domains() -> HandlerDomains {
     }
 }
 
-/// A fresh-channel [`ChannelContext`] (all `prior_*` at zero) for `signer`
-/// paying on `channel_id`.
-fn fresh_context(channel_id: B256, signer: Arc<PrivateKeySigner>) -> ChannelContext {
-    ChannelContext {
-        channel_id,
-        token: TOKEN,
+/// A fresh-lane [`PoolContext`] (all `prior_*` at zero) for `signer` paying
+/// `provider` on `pool_id`.
+fn fresh_context(pool_id: B256, provider: Address, signer: Arc<PrivateKeySigner>) -> PoolContext {
+    PoolContext {
+        pool_id,
+        provider,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         client_signer: signer,
         voucher_domain: hop_domains().voucher,
-        prior_nonce: U256::ZERO,
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
         client_binding: None,
+        capability: None,
     }
 }
 
-/// Assert that `store` holds **exactly** the channel `channel_id` and that it
-/// advanced as expected after one full delivery: two vouchers (interval +
-/// closing), full byte count, and the `expected_amount(rate)` cumulative amount.
+/// A fresh-lane [`PoolContext`] carrying an ADR 005 client identity binding over
+/// the requester's own node id. The pool-model serve gate refuses any request
+/// that cannot prove ownership of a lane, so every paid pull attaches a binding
+/// signed by the paying key over the connection's node id.
+fn bound_context(
+    pool_id: B256,
+    provider: Address,
+    signer: Arc<PrivateKeySigner>,
+    own_node_id: B256,
+) -> anyhow::Result<PoolContext> {
+    let binding = decdn_node::client_requester::sign_client_binding(
+        &signer,
+        own_node_id,
+        &hop_domains().binding,
+    )?;
+    Ok(fresh_context(pool_id, provider, signer).with_client_binding(binding))
+}
+
+/// Seed the seller store with a fresh lane so the handler admits vouchers on the
+/// `(pool_id, signer, provider)` triple: `signer` is the paying client's key,
+/// `provider` the serving node's operator address, `cap` the pool deposit. The
+/// handler hydrates its in-memory lane map from `load_all` at construction, so a
+/// lane recorded before `build_server` is served from the first voucher on.
+fn seed_lane(
+    store: &MemoryPoolStateStore,
+    pool_id: B256,
+    signer: Address,
+    provider: Address,
+) -> anyhow::Result<()> {
+    store.record(&LaneState::hydrate(
+        pool_id,
+        signer,
+        provider,
+        U256::from(DEPOSIT_MICRO_USDC), // cap
+        0,                              // expiry: 0 = untracked, never expires
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    Ok(())
+}
+
+/// Assert that `store` holds **exactly** the lane `lane` and that it advanced as
+/// expected after one full delivery: full byte count and the
+/// `expected_amount(rate)` cumulative amount.
 ///
-/// The exactness (`len() == 1` + matching id + rate-derived amount) is what
+/// The exactness (`len() == 1` + matching lane + rate-derived amount) is what
 /// makes this a real two-hop assertion rather than two single hops: a bug that
-/// charged the wrong channel, applied the wrong rate, or leaked B's buyer-role
-/// state into its seller store would change the count or the amount.
+/// charged the wrong lane, applied the wrong rate, or leaked B's buyer-role state
+/// into its seller store would change the count or the amount.
 fn assert_channel_advanced(
-    store: &MemoryChannelStateStore,
+    store: &MemoryPoolStateStore,
     hop: &str,
-    channel_id: B256,
+    lane: LaneKey,
     rate: u64,
 ) -> anyhow::Result<()> {
     let persisted = store.load_all()?;
     anyhow::ensure!(
         persisted.len() == 1,
-        "{hop}: expected exactly one channel, got {}",
+        "{hop}: expected exactly one lane, got {}",
         persisted.len()
     );
     let only = store
-        .get(channel_id)?
-        .ok_or_else(|| anyhow::anyhow!("{hop}: channel {channel_id} not in store"))?;
-    anyhow::ensure!(
-        only.last_nonce() == U256::from(2u64),
-        "{hop}: nonce {}",
-        only.last_nonce()
-    );
+        .get(lane)?
+        .ok_or_else(|| anyhow::anyhow!("{hop}: lane {lane:?} not in store"))?;
     // ADR 038: metered quantity is bao wire bytes (content + interleaved Merkle
     // proof), not the content length, so the recorded watermark is the whole-blob
     // wire size — same for every hop, each metered in wire bytes.
@@ -172,7 +210,7 @@ fn build_server(
     server_id: iroh::PublicKey,
     server_eth: &Arc<PrivateKeySigner>,
     cache: CacheEngine,
-    store: Arc<dyn ChannelStateStore>,
+    store: Arc<dyn PoolStateStore>,
     rate: u64,
 ) -> anyhow::Result<Arc<decdn_node::handlers::client::ClientHandler>> {
     let metrics = Arc::new(Metrics::new());
@@ -206,17 +244,16 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
 
-    // Node B's buyer identity (B pays A on the A↔B channel).
+    // Node B's buyer identity (B pays A on the A↔B lane).
     let b_buyer = Arc::new(PrivateKeySigner::random());
-    let a_channel_id = B256::repeat_byte(0xA1);
-    let store_a = Arc::new(MemoryChannelStateStore::new());
-    store_a.record(&ChannelState::new(
-        a_channel_id,
-        b_buyer.address(),
-        b_buyer.address(),
-        TOKEN,
-        U256::from(DEPOSIT_MICRO_USDC),
-    ))?;
+    let a_pool_id = B256::repeat_byte(0xA1);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    let a_lane = LaneKey {
+        pool_id: a_pool_id,
+        signer: b_buyer.address(),
+        provider: a_eth.address(),
+    };
+    seed_lane(&store_a, a_pool_id, b_buyer.address(), a_eth.address())?;
 
     let handler_a = build_server(a_id, &a_eth, cache_a, store_a.clone(), RATE_A)?;
     let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -230,7 +267,12 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
 
     let target_a = EndpointAddr::new(a_id).with_ip_addr(addr_a);
-    let ctx_b_to_a = fresh_context(a_channel_id, Arc::clone(&b_buyer));
+    let ctx_b_to_a = bound_context(
+        a_pool_id,
+        a_eth.address(),
+        Arc::clone(&b_buyer),
+        B256::from(*b_id.as_bytes()),
+    )?;
     let pulled = stream_fetch(
         &ep_b,
         target_a,
@@ -247,7 +289,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         pulled.as_ref() == payload.as_slice(),
         "hop 1 bytes mismatch"
     );
-    assert_channel_advanced(&store_a, "A<->B", a_channel_id, RATE_A)?;
+    assert_channel_advanced(&store_a, "A<->B", a_lane, RATE_A)?;
 
     // --- Step 2: build B's cache from the pulled bytes -------------------
     // Stand-in for the runtime wiring this file leaves out: a real node's
@@ -262,23 +304,34 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     // --- Node B: server toward the client --------------------------------
     let b_eth = Arc::new(PrivateKeySigner::random());
     let client_signer = Arc::new(PrivateKeySigner::random());
-    let b_channel_id = B256::repeat_byte(0xB2);
-    let store_b = Arc::new(MemoryChannelStateStore::new());
-    store_b.record(&ChannelState::new(
-        b_channel_id,
+    let b_pool_id = B256::repeat_byte(0xB2);
+    let store_b = Arc::new(MemoryPoolStateStore::new());
+    let b_lane = LaneKey {
+        pool_id: b_pool_id,
+        signer: client_signer.address(),
+        provider: b_eth.address(),
+    };
+    seed_lane(
+        &store_b,
+        b_pool_id,
         client_signer.address(),
-        client_signer.address(),
-        TOKEN,
-        U256::from(DEPOSIT_MICRO_USDC),
-    ))?;
+        b_eth.address(),
+    )?;
 
     let handler_b = build_server(b_id, &b_eth, cache_b, store_b.clone(), RATE_B)?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     // --- Hop 2: client pulls the blob from B, paying vouchers ------------
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-    let ctx_client_to_b = fresh_context(b_channel_id, Arc::clone(&client_signer));
+    let ctx_client_to_b = bound_context(
+        b_pool_id,
+        b_eth.address(),
+        Arc::clone(&client_signer),
+        B256::from(*client_id.as_bytes()),
+    )?;
     let got = stream_fetch(
         &client_ep,
         target_b,
@@ -293,11 +346,11 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     .await?;
     // End-to-end: the blob originated at A and survived both paid hops intact.
     anyhow::ensure!(got.as_ref() == payload.as_slice(), "hop 2 bytes mismatch");
-    assert_channel_advanced(&store_b, "B<->client", b_channel_id, RATE_B)?;
+    assert_channel_advanced(&store_b, "B<->client", b_lane, RATE_B)?;
 
     // Cross-hop isolation: serving the client (hop 2) must not have touched the
-    // A<->B channel. Re-assert A's channel is unchanged at hop-1's accounting.
-    assert_channel_advanced(&store_a, "A<->B after hop 2", a_channel_id, RATE_A)?;
+    // A<->B lane. Re-assert A's lane is unchanged at hop-1's accounting.
+    assert_channel_advanced(&store_a, "A<->B after hop 2", a_lane, RATE_A)?;
 
     client_ep.close().await;
     ep_b.close().await;
@@ -361,6 +414,7 @@ async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()
     let target_a = EndpointAddr::new(a_id).with_ip_addr(addr_a);
     let ctx = fresh_context(
         B256::repeat_byte(0xA1),
+        Address::repeat_byte(0x55), // provider (never reached)
         Arc::new(PrivateKeySigner::random()),
     );
 
@@ -415,6 +469,7 @@ async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()
 ///
 /// [`ClientHandler`]: decdn_node::handlers::client::ClientHandler
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Result<()> {
     let payload = vec![0x6Du8; PAYLOAD_LEN];
     let hash = decdn_cache::Hash::new(&payload);
@@ -425,15 +480,14 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
     let b_id = b_sk.public();
     let b_eth = Arc::new(PrivateKeySigner::random());
     let client_signer = Arc::new(PrivateKeySigner::random());
-    let channel_id = B256::repeat_byte(0xC1);
-    let store = Arc::new(MemoryChannelStateStore::new());
-    store.record(&ChannelState::new(
-        channel_id,
-        client_signer.address(),
-        client_signer.address(),
-        TOKEN,
-        U256::from(DEPOSIT_MICRO_USDC),
-    ))?;
+    let pool_id = B256::repeat_byte(0xC1);
+    let store = Arc::new(MemoryPoolStateStore::new());
+    let lane = LaneKey {
+        pool_id,
+        signer: client_signer.address(),
+        provider: b_eth.address(),
+    };
+    seed_lane(&store, pool_id, client_signer.address(), b_eth.address())?;
 
     let handler = build_server(b_id, &b_eth, cache, store.clone(), RATE_B)?;
     let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -441,7 +495,9 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
 
     // --- Abort: request, read the response + one chunk, then hang up ---------
     {
-        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let client_sk = fresh_key();
+        let client_node_id = B256::from(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
         let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
         let conn = client_ep
             .connect(target_b, ALPN_CLIENT)
@@ -454,12 +510,32 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
         let req = StreamRequest {
             hash: *hash.as_bytes(),
             namespace_id: decdn_protocol::client::NO_NAMESPACE,
-            channel_id: channel_id.into(),
+            pool_id: pool_id.into(),
             byte_offset: 0,
             byte_len: 0,
             timestamp_us: 0x00c0_ffee,
         };
-        let req_bytes = encode_stream_request(&req, None)
+        // A bound request: the pool-model serve gate refuses any request without a
+        // verified client binding (it cannot name a lane), so the abort must prove
+        // ownership over the connection's node id before it can reach the stream.
+        let binding_hash = binding_signing_hash(
+            client_node_id,
+            EPHEMERAL_BINDING_NONCE,
+            &hop_domains().binding,
+        );
+        let binding_signature = client_signer
+            .sign_hash_sync(&binding_hash)?
+            .as_bytes()
+            .to_vec();
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: Some(ClientBinding {
+                ethereum_address: client_signer.address().into(),
+                binding_signature,
+            }),
+            capability: None,
+        };
+        let req_bytes = encode_stream_request(&req, Some(&ext))
             .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
         write_frame(&mut send, &req_bytes)
             .await
@@ -483,28 +559,30 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
         client_ep.close().await;
     }
 
-    // Property 1: no voucher accepted — the channel never advanced. Both nonce
-    // and bytes-delivered must still read zero (their initial state); checking
-    // bytes too rules out any partial accounting committed for the unpaid chunk.
+    // Property 1: no voucher accepted — the lane never advanced.
+    // Bytes-delivered must still read zero (its initial state), ruling out any
+    // partial accounting committed for the unpaid chunk.
     let after_abort = store
-        .get(channel_id)?
-        .ok_or_else(|| anyhow::anyhow!("channel vanished after the abort"))?;
-    anyhow::ensure!(
-        after_abort.last_nonce() == U256::ZERO,
-        "an aborted pull advanced the channel to nonce {}",
-        after_abort.last_nonce()
-    );
+        .get(lane)?
+        .ok_or_else(|| anyhow::anyhow!("lane vanished after the abort"))?;
     anyhow::ensure!(
         after_abort.last_bytes_delivered() == U256::ZERO,
         "an aborted pull committed {} bytes of accounting",
         after_abort.last_bytes_delivered()
     );
 
-    // Property 2: the same channel still serves. A fresh-context honest pull
+    // Property 2: the same lane still serves. A fresh-context honest pull
     // completes and advances it (the abort left prior state at zero).
-    let (honest_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let honest_sk = fresh_key();
+    let honest_id = honest_sk.public();
+    let (honest_ep, _) = local_endpoint(honest_sk, vec![]).await?;
     let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
-    let ctx = fresh_context(channel_id, Arc::clone(&client_signer));
+    let ctx = bound_context(
+        pool_id,
+        b_eth.address(),
+        Arc::clone(&client_signer),
+        B256::from(*honest_id.as_bytes()),
+    )?;
     let got = stream_fetch(
         &honest_ep,
         target_b,
@@ -521,7 +599,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
         got.as_ref() == payload.as_slice(),
         "honest pull bytes mismatch"
     );
-    assert_channel_advanced(&store, "reused after abort", channel_id, RATE_B)?;
+    assert_channel_advanced(&store, "reused after abort", lane, RATE_B)?;
 
     honest_ep.close().await;
     ep_b.close().await;
@@ -558,7 +636,7 @@ async fn lying_upstream(
         rate_per_mb,
         total_bytes: u64::try_from(served.len())
             .map_err(|_| anyhow::anyhow!("served len overflows u64"))?,
-        channel_id: req.channel_id,
+        pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
         redirect: None,
     };
@@ -586,13 +664,13 @@ async fn lying_upstream(
         .await?;
     }
 
-    // Accept the closing voucher the requester pays for the bytes it received,
-    // so it proceeds to the integrity check (the unit under test) rather than
-    // bailing early on a rejected voucher.
+    // Read the closing voucher the requester pays for the bytes it received.
+    // Acceptance is implicit — continued delivery is the ack (ADR 005), so the
+    // upstream sends no explicit reply and moves straight to `StreamEnd`, letting
+    // the requester proceed to the integrity check (the unit under test) rather
+    // than bailing early on a rejected voucher.
     match read_client_msg(&mut recv).await? {
-        ClientMessage::Voucher(_) => {
-            write_client_msg(&mut send, &ClientMessage::VoucherAck).await?;
-        }
+        ClientMessage::Voucher(_) => {}
         _ => anyhow::bail!("lying upstream: expected a Voucher"),
     }
     write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
@@ -649,6 +727,7 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     let target = EndpointAddr::new(up_id).with_ip_addr(addr_up);
     let ctx = fresh_context(
         B256::repeat_byte(0xD1),
+        upstream_eth.address(),
         Arc::new(PrivateKeySigner::random()),
     );
     let result = stream_fetch(

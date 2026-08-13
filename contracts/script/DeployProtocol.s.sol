@@ -360,7 +360,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "SlashAppeal", address(d.slashAppeal));
         vm.serializeAddress(contracts, "OriginAssignment", address(d.originAssignment));
         vm.serializeAddress(contracts, "ManualVettingPolicy", address(d.vettingPolicy));
-        vm.serializeAddress(contracts, "PaymentChannel", address(d.paymentChannel));
+        vm.serializeAddress(contracts, "PaymentPool", address(d.paymentPool));
         vm.serializeAddress(contracts, "SlashJudge", address(d.slashJudge));
         vm.serializeAddress(contracts, "TimelockController", address(d.timelock));
         string memory contractsJson = vm.serializeAddress(contracts, "Token", address(d.token));

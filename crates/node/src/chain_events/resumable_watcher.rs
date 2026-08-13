@@ -923,7 +923,7 @@ mod tests {
                 cold_start: ColdStart::Head,
                 checkpoint: Checkpoint {
                     store,
-                    key: CheckpointKey::ChannelOpened,
+                    key: CheckpointKey::PoolOpened,
                 },
                 reorg_margin: 0,
             },
@@ -962,7 +962,7 @@ mod tests {
         let cfg = tick_cfg(provider.clone(), Arc::clone(&store));
         let load = |store: &MemoryCheckpointStore| {
             store
-                .load_checkpoint(CheckpointKey::ChannelOpened)
+                .load_checkpoint(CheckpointKey::PoolOpened)
                 .ok()
                 .flatten()
         };
@@ -1028,7 +1028,7 @@ mod tests {
         assert_eq!(cursor, Some(26), "cursor retained");
         assert_eq!(sink.applied, 0);
         let stored = store
-            .load_checkpoint(CheckpointKey::ChannelOpened)
+            .load_checkpoint(CheckpointKey::PoolOpened)
             .ok()
             .flatten();
         assert_eq!(stored, None, "idle tick persists nothing");
@@ -1092,7 +1092,7 @@ mod tests {
             cold_start: ColdStart::Head,
             checkpoint: Checkpoint {
                 store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
-                key: CheckpointKey::ChannelOpened,
+                key: CheckpointKey::PoolOpened,
             },
             reorg_margin: 0,
         };
@@ -1225,7 +1225,7 @@ mod tests {
              window's start; progress is not discarded by the cancel"
         );
         let stored = store
-            .load_checkpoint(CheckpointKey::ChannelOpened)
+            .load_checkpoint(CheckpointKey::PoolOpened)
             .ok()
             .flatten();
         assert_eq!(
@@ -1240,7 +1240,7 @@ mod tests {
             cold_start: ColdStart::Head,
             checkpoint: Checkpoint {
                 store: Arc::new(FailingLoadStore),
-                key: CheckpointKey::ChannelOpened,
+                key: CheckpointKey::PoolOpened,
             },
             reorg_margin: MARGIN,
         }
@@ -1269,13 +1269,13 @@ mod tests {
         const FROM_BLOCK: u64 = 500;
 
         let store = Arc::new(MemoryCheckpointStore::default());
-        let recorded = store.record_checkpoint(CheckpointKey::ChannelOpened, CHECKPOINT);
+        let recorded = store.record_checkpoint(CheckpointKey::PoolOpened, CHECKPOINT);
         assert!(recorded.is_ok(), "seeding the checkpoint must succeed");
         let start = CursorStart::FromCheckpoint {
             cold_start: ColdStart::Head,
             checkpoint: Checkpoint {
                 store,
-                key: CheckpointKey::ChannelOpened,
+                key: CheckpointKey::PoolOpened,
             },
             reorg_margin: MARGIN,
         };

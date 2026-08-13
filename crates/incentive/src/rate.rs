@@ -1,7 +1,7 @@
 //! Rate enforcement for incremental voucher payments.
 //!
 //! Each voucher carries cumulative `amount` and `bytes_delivered`. Between
-//! two vouchers on the same channel, the increments must satisfy
+//! two vouchers on the same lane, the increments must satisfy
 //! `amount_delta / bytes_delta >= rate_per_mb` — i.e. the client paid at
 //! least the advertised rate for the bytes delivered. Underpayment beyond a
 //! tolerance threshold (rounding error, edge-MB padding) indicates a faulty
@@ -94,7 +94,7 @@ pub fn verify_rate(
 /// This is the exact lower bound [`verify_rate`] enforces at zero tolerance and
 /// the same arithmetic the buyer's voucher signer uses to price an interval
 /// (`bytes * rate / MB`, rounded up). It is intended for pre-flight cost
-/// estimation — e.g. gating a speculative pull on the requesting channel's
+/// estimation — e.g. gating a speculative pull on the requesting lane's
 /// remaining deposit covering the worst-case blob cost (#856).
 ///
 /// Saturating on the (practically unreachable) multiply overflow: a saturated
@@ -111,7 +111,7 @@ pub fn min_payment(bytes: u64, rate_per_mb: u64) -> U256 {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RateError {
     /// Voucher delta included zero bytes — cannot be priced. The node should
-    /// reject it before it advances channel state.
+    /// reject it before it advances lane state.
     #[error("voucher carries zero bytes_delta — cannot enforce rate")]
     ZeroBytes,
     /// Effective rate is below the advertised rate by more than the

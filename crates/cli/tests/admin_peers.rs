@@ -32,11 +32,11 @@ use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
 use decdn_common::cli::{
-    AnnounceArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs, StatusArgs,
+    AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs, PeersArgs, ReloadArgs, StatusArgs,
 };
 use decdn_gossip::PeerTable;
-use decdn_incentive::{ChannelState, ChannelStateStore, MemoryChannelStateStore, VoucherActivity};
-use decdn_node::admin::{self, AdminState, ChannelStatusHandles, DhtStatusHandles, DrainTrigger};
+use decdn_incentive::{LaneState, MemoryPoolStateStore, PoolStateStore, VoucherActivity};
+use decdn_node::admin::{self, AdminState, DhtStatusHandles, DrainTrigger, LaneStatusHandles};
 use decdn_node::dht::routing::NodeId;
 use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
@@ -281,45 +281,40 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `admin_v1_channels` round-trips through real HTTP via jsonrpsee's
-/// generated client (issue #749): a store seeded with two channels
+/// `admin_v1_lanes` round-trips through real HTTP via jsonrpsee's
+/// generated client (issue #749): a store seeded with two lanes
 /// surfaces both, ordered by descending outstanding (no activity
 /// recorded), with the configured threshold echoed and eligibility
 /// computed against it.
 #[tokio::test]
-async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
+async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     use alloy::primitives::{Address, U256};
 
-    let token: Address = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse()?;
-    // `signer_byte` distinguishes the pinned voucher signer from the funder so
-    // the admin surface is proven to report both, not the funder twice.
-    let mk =
-        |id_byte: u8, signer_byte: u8, amount: u64, deposit: u64, nonce: u64| -> ChannelState {
-            let mut id = [0u8; 32];
-            id[31] = id_byte;
-            let mut client = [0u8; 20];
-            client[19] = id_byte;
-            let mut signer = [0u8; 20];
-            signer[19] = signer_byte;
-            ChannelState::hydrate(
-                id.into(),
-                Address::from(client),
-                Address::from(signer),
-                token,
-                U256::from(deposit),
-                U256::from(amount),
-                U256::from(nonce),
-                U256::from(amount),
-                None,
-                0,
-                false,
-            )
-        };
+    // A lane is keyed by `(pool_id, signer, provider)`; the admin surface
+    // reports the pool id as the lane id and the signer as both
+    // counterparty and voucher signer (the shared-pool model has no separate
+    // delegate at the lane level — see `decdn_node::admin::build_lane_snapshots`).
+    let mk = |pool_byte: u8, signer_byte: u8, last_amount: u64| -> LaneState {
+        let mut id = [0u8; 32];
+        id[31] = pool_byte;
+        let mut signer = [0u8; 20];
+        signer[19] = signer_byte;
+        let provider = Address::repeat_byte(0xEE);
+        LaneState::hydrate(
+            id.into(),
+            Address::from(signer),
+            provider,
+            U256::from(1_000_000_000u64), // cap — irrelevant to the snapshot
+            0,                            // expiry — untracked
+            U256::from(last_amount),
+            U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
+            None,
+        )
+    };
 
-    let store = Arc::new(MemoryChannelStateStore::new());
-    // Channel 1 delegates signing to a distinct key; channel 2 self-signs.
-    store.record(&mk(1, 0xAA, 2_000_000, 10_000_000, 5))?;
-    store.record(&mk(2, 2, 100_000, 5_000_000, 2))?;
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&mk(1, 0xAA, 2_000_000))?;
+    store.record(&mk(2, 0xBB, 100_000))?;
 
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
@@ -333,61 +328,51 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
     )
-    .with_channels(ChannelStatusHandles {
-        channel_store: store as Arc<dyn ChannelStateStore>,
+    .with_lanes(LaneStatusHandles {
+        pool_store: store as Arc<dyn PoolStateStore>,
         voucher_activity: Arc::new(VoucherActivity::new()),
         redeem_threshold_micro_usdc: 1_000_000,
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.channels().await?;
+    let resp = client.lanes().await?;
     assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
-    assert_eq!(resp.channels.len(), 2);
+    assert_eq!(resp.lanes.len(), 2);
     // No activity → ordered by descending outstanding.
     let first = resp
-        .channels
+        .lanes
         .first()
-        .ok_or_else(|| anyhow::anyhow!("missing first channel"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing first lane"))?;
     assert_eq!(first.outstanding_micro_usdc, 2_000_000);
-    assert_eq!(first.last_nonce, 5);
+    // The shared-pool model tracks no per-voucher nonce; the admin surface
+    // reports 0 unconditionally.
+    assert_eq!(first.last_nonce, 0);
     assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
-    assert!(first.channel_id.starts_with("0x"));
+    assert!(first.pool_id.starts_with("0x"));
     assert!(first.counterparty.starts_with("0x"));
     assert_eq!(
-        first.voucher_signer,
-        Address::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA
-        ])
-        .to_string(),
-        "the delegated voucher signer must reach the admin surface"
-    );
-    assert_ne!(
         first.voucher_signer, first.counterparty,
-        "funder and signer must not collapse onto one address"
+        "the shared-pool model reports the lane signer as both fields"
     );
     assert_eq!(first.seconds_since_last_voucher, None);
     let second = resp
-        .channels
+        .lanes
         .get(1)
-        .ok_or_else(|| anyhow::anyhow!("missing second channel"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing second lane"))?;
     assert_eq!(second.outstanding_micro_usdc, 100_000);
     assert!(!second.settlement_eligible, "0.1 USDC < 1 USDC threshold");
-    assert_eq!(
-        second.voucher_signer, second.counterparty,
-        "a self-signing channel reports the funder as its signer"
-    );
 
     let _ = stop_tx.send(());
     join.await?;
     Ok(())
 }
 
-/// `admin_v1_channels` on a node with no channel handles wired returns
+/// `admin_v1_lanes` on a node with no lane handles wired returns
 /// an empty list and a zero threshold over the wire — exercising the
-/// `with_channels`-absent path end-to-end.
+/// `with_lanes`-absent path end-to-end.
 #[tokio::test]
-async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
+async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
@@ -403,8 +388,8 @@ async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.channels().await?;
-    assert!(resp.channels.is_empty());
+    let resp = client.lanes().await?;
+    assert!(resp.lanes.is_empty());
     assert_eq!(resp.redeem_threshold_micro_usdc, 0);
 
     let _ = stop_tx.send(());
@@ -412,20 +397,20 @@ async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()
     Ok(())
 }
 
-/// CLI `channels` against a dropped listener surfaces the
+/// CLI `lanes` against a dropped listener surfaces the
 /// connection-refused hint, same as the peers path.
 #[tokio::test]
-async fn cli_channels_surfaces_connection_refused() -> anyhow::Result<()> {
+async fn cli_lanes_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
     drop(listener);
 
-    let args = ChannelsArgs {
+    let args = LanesArgs {
         admin_url: Some(format!("http://{addr}")),
         config: None,
         json: false,
         timeout_ms: 2_000,
     };
-    let err = commands::channels(&args, None)
+    let err = commands::lanes(&args, None)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?

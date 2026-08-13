@@ -270,7 +270,7 @@ async fn run_deploy_script(
 
 /// The deployed contract addresses this test threads into `ResolvedConfig`.
 struct DeployedAddrs {
-    payment_channel: Address,
+    payment_pool: Address,
     capacity_bond: Address,
     slash_judge: Address,
     content_blacklist: Address,
@@ -288,7 +288,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<DeployedAddrs> {
             .parse()?)
     };
     Ok(DeployedAddrs {
-        payment_channel: get("PaymentChannel")?,
+        payment_pool: get("PaymentPool")?,
         capacity_bond: get("CapacityBond")?,
         slash_judge: get("SlashJudge")?,
         content_blacklist: get("ContentBlacklist")?,
@@ -332,7 +332,7 @@ fn build_config(
             rpc_url,
             eth_keystore: keystore_path,
             keystore_password_file: Some(password_file),
-            payment_channel_address: addrs.payment_channel.to_string(),
+            payment_pool_address: addrs.payment_pool.to_string(),
             capacity_bond_address: addrs.capacity_bond.to_string(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 250,
@@ -341,13 +341,10 @@ fn build_config(
             redeem_interval_secs: 300,
             buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
-            buyer_reactive_topup_min_ttl_secs: 86_400,
             // No on-chain approval tx at bring-up: keeps the (unregistered,
             // gas-funded-but-otherwise-inert) node's boot path chain-write-free.
             buyer_max_approve: false,
-            settlement_auto_threshold_micro_usdc: None,
-            settlement_auto_by_voucher_nonce_span: None,
-            settlement_dispute_min_residual_micro_usdc: 100_000,
+            pool_min_remaining_deposit_micro_usdc: 1_000_000,
             slash_judge_address: addrs.slash_judge.to_string(),
             content_blacklist_address: Some(addrs.content_blacklist.to_string()),
             content_blacklist_poll_interval_sec: 600,

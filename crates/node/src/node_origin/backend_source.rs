@@ -28,7 +28,7 @@
 //! is `Done` only once the ledger's committed `bytes` reach the gap end. An unpaid
 //! source whose `finish` never advanced a ledger would leave that frontier at zero
 //! and the gap loop would re-draw forever. So this source carries a fresh, LOCAL
-//! bookkeeping [`ChannelLedger`] (`self_pay`) and, on [`BlobSource::finish`],
+//! bookkeeping [`PoolLedger`] (`self_pay`) and, on [`BlobSource::finish`],
 //! advances it by exactly the leg's drained WIRE bytes at rate 0 — `committed.bytes`
 //! moves so the frontier reaches the gap end, while `committed.amount` stays 0 so
 //! nothing resembling a payment or a deposit-exhaustion is ever computed. This is
@@ -44,7 +44,7 @@ use decdn_bao_range::AlignedRange;
 use decdn_cache::{CacheEngine, Hash};
 use decdn_client_pull::sink::StashedFault;
 use decdn_client_pull::source::SourceFuture;
-use decdn_client_pull::{BlobSource, ChannelLedger, UpstreamPullHeader, VoucherProgress};
+use decdn_client_pull::{BlobSource, PoolLedger, UpstreamPullHeader, VoucherProgress};
 use iroh_io::AsyncStreamReader;
 
 /// The node's unpaid own-origin [`BlobSource`] for Flow A.
@@ -59,7 +59,7 @@ pub(crate) struct BackendSource {
     root: [u8; 32],
     total_bytes: u64,
     /// Local completion bookkeeping ONLY — no channel, no chain, no counterparty.
-    self_pay: Arc<ChannelLedger>,
+    self_pay: Arc<PoolLedger>,
 }
 
 #[allow(dead_code, reason = "wired by FA.2/FA.3 orchestration")]
@@ -72,7 +72,7 @@ impl BackendSource {
         engine: CacheEngine,
         root: [u8; 32],
         total_bytes: u64,
-        self_pay: Arc<ChannelLedger>,
+        self_pay: Arc<PoolLedger>,
     ) -> Self {
         Self {
             engine,
@@ -88,7 +88,7 @@ impl BackendSource {
     /// loop reads for completion is the one `finish` moves — the whole point of THE
     /// CRUX in the module docs. Returned as a fresh handle onto the shared ledger,
     /// never a second ledger.
-    pub(crate) fn ledger(&self) -> Arc<ChannelLedger> {
+    pub(crate) fn ledger(&self) -> Arc<PoolLedger> {
         Arc::clone(&self.self_pay)
     }
 }
@@ -164,7 +164,6 @@ impl BlobSource for BackendSource {
                 self.self_pay
                     .issue(reader.wire_len, 0, |_next| async { Ok(()) })
                     .await?;
-                let _ = self.self_pay.resolve_ack();
             }
             Ok(VoucherProgress::from_cumulative(
                 self.self_pay.committed(),
@@ -234,7 +233,7 @@ mod tests {
         CacheEngine, Hash, Origin, OriginFetch, OriginKind, OriginPullError, OriginRangeFetch,
         OriginRangeRequest, OutboardFetch,
     };
-    use decdn_client_pull::{BlobSource, ChannelLedger, Cumulative, IngestStore, VoucherProgress};
+    use decdn_client_pull::{BlobSource, Cumulative, IngestStore, PoolLedger, VoucherProgress};
     use iroh_io::AsyncStreamReader;
 
     use super::BackendSource;
@@ -335,8 +334,8 @@ mod tests {
         (0..size).map(|i| (i % 251) as u8).collect()
     }
 
-    fn fresh_ledger() -> Arc<ChannelLedger> {
-        Arc::new(ChannelLedger::new(Cumulative::default()))
+    fn fresh_ledger() -> Arc<PoolLedger> {
+        Arc::new(PoolLedger::new(Cumulative::default()))
     }
 
     /// (a) Full-miss whole-blob: `BackendSource::open` yields wire that a fresh
@@ -423,8 +422,12 @@ mod tests {
         Ok(())
     }
 
-    /// (c) `finish` returns a cumulative whose `bytes` advanced by the leg's wire
-    /// (at amount 0), so a `drive` over this source could reach completion.
+    /// (c) `finish` advances the shared ledger's committed `bytes` by the leg's
+    /// wire (at amount 0), so a `drive` over this source reaches completion — the
+    /// driver reads `ledger.committed().bytes` for the paid frontier and discards
+    /// `finish`'s returned progress. That progress is amount-keyed for buyer
+    /// voucher persistence, so a rate-0 self-pay reports no advance (`None`):
+    /// there is nothing to pay yourself, and nothing to persist.
     #[tokio::test]
     async fn backend_source_finish_advances_completion_counter() -> anyhow::Result<()> {
         let data = test_blob();
@@ -447,17 +450,14 @@ mod tests {
         assert!(expected_wire > 0, "a non-empty blob has non-zero wire");
 
         let progress: VoucherProgress = source.finish(reader).await?;
-        let (nonce, bytes, amount) = progress
-            .acked()
-            .ok_or_else(|| anyhow::anyhow!("finish must report an advanced cumulative"))?;
-        assert_eq!(nonce, U256::from(1u64), "one completion voucher issued");
-        assert_eq!(
-            bytes,
-            U256::from(expected_wire),
-            "committed bytes advance by the leg's wire (completion frontier)"
+        // A rate-0 self-pay is not a payment: amount did not rise past the seed,
+        // so there is nothing to persist as a buyer voucher.
+        assert!(
+            progress.advanced().is_none(),
+            "own-origin self-pay never advances the payment watermark"
         );
-        assert_eq!(amount, U256::ZERO, "rate 0 — never a payment");
-        // The shared ledger reflects the same advance.
+        // The completion frontier the driver actually reads: the shared ledger's
+        // committed bytes advanced by the leg's wire, at amount 0.
         assert_eq!(ledger.committed().bytes, U256::from(expected_wire));
         assert_eq!(ledger.committed().amount, U256::ZERO);
         Ok(())

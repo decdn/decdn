@@ -11,7 +11,7 @@ use std::time::Instant;
 use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_cache::CacheMetrics;
-use decdn_incentive::ChannelOpenFailureReason;
+use decdn_incentive::PoolOpenFailureReason;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -163,10 +163,10 @@ pub struct DecdnMetrics {
     pub active_connections: Gauge,
     /// Currently open paid delivery streams, split by node direction.
     streams_active: Family<StreamLabels, Gauge>,
-    /// Currently open inbound payment channels.
-    pub channels_open: Gauge,
-    /// Total raw USDC deposits across open inbound payment channels.
-    pub channel_deposit_usdc: Gauge,
+    /// Currently open inbound serve lanes (distinct `(pool, signer, provider)` keys).
+    pub lanes_open: Gauge,
+    /// Total raw USDC deposits across the pools currently paying this node.
+    pub pool_deposit_usdc: Gauge,
     /// `cdn/client/v1` connections closed by the application-layer idle reaper
     /// (ADR 005 §Connection lifetime): no stream for `APP_IDLE_TIMEOUT` after the
     /// last one closed. A sustained rate flags peers parking streamless
@@ -255,7 +255,7 @@ pub struct DecdnMetrics {
     /// one labeled *reason split*, which is not the same as the crate's only
     /// `Family` — `streams_active` is another. Every
     /// other reason-style split in this crate — `dispatch_rejected_*`,
-    /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`, and gossip's
+    /// `probe_rate_limit_rejected_*`, `pool_open_failures_*`, and gossip's
     /// `gossip_messages_rejected_clock_skew` — fans out to sibling unlabeled
     /// counters, and that stays the default for a new split: sibling counters
     /// need no `EncodeLabelSet` type, no pre-materialization to keep a series
@@ -290,7 +290,7 @@ pub struct DecdnMetrics {
     pub rate_bounds_clamp_events: Counter,
     /// Vouchers refused because their cumulative `amount / bytes_delivered`
     /// watermark fell below the configured per-byte price floor (`delivery_floor`)
-    /// at zero tolerance, mirroring the on-chain `PaymentChannel`
+    /// at zero tolerance, mirroring the on-chain `PaymentPool`
     /// `RateFloorViolation` settlement check (which likewise floors the cumulative
     /// claim, #846). Only increments when `delivery_floor > 0` (i.e. the node has
     /// synced on-chain bounds); at the default floor of `0` the check is inert and
@@ -464,13 +464,13 @@ pub struct DecdnMetrics {
     /// consecutive sweeps. Operator-visible name:
     /// `decdn_buyer_reclaim_failures_total`.
     pub buyer_reclaim_failures: Counter,
-    /// Buyer-channel rows omitted from a successful store hydration because
+    /// Buyer-pool rows omitted from a successful store hydration because
     /// their persisted values could not be decoded. Counted once per skipped
     /// row per load attempt, so a persistent malformed row keeps the alert
     /// active while healthy rows continue through buyer maintenance. Operator-
     /// visible name:
-    /// `decdn_buyer_channel_store_skipped_undecodable_records_total`.
-    pub buyer_channel_store_skipped_undecodable_records: Counter,
+    /// `decdn_buyer_pool_store_skipped_undecodable_records_total`.
+    pub buyer_pool_store_skipped_undecodable_records: Counter,
     /// Idle buyer channels cooperatively closed by the reconcile sweep (#972),
     /// reclaiming their deposit early instead of waiting for on-chain expiry. A
     /// healthy capital-efficiency signal — each increment is one deposit freed
@@ -826,18 +826,18 @@ pub struct DecdnMetrics {
     ///
     /// [`Outcome::RegionLatencyMismatch`]: decdn_reputation::Outcome::RegionLatencyMismatch
     pub node_region_latency_penalty: Counter,
-    /// `decdn_node_pull_channel_open_failures_total` (#831): a buyer
+    /// `decdn_node_pull_pool_open_failures_total` (#831): a buyer
     /// `open_or_reuse_channel` failed before a pull could start. This is the
     /// node's own payment-side fault (gas, RPC, expired channel), NOT the
     /// provider's — a sustained rate means node→node buying is wedged. This is
     /// the *unlabeled total* across all causes; the
-    /// `channel_open_failures_*_total` family below (#966) breaks the
+    /// `pool_open_failures_*_total` family below (#966) breaks the
     /// `openChannel`-tx failures out by cause so an operator can tell a
     /// misconfiguration (`insufficient_deposit`) from infrastructure
     /// (`rpc_error`). It also covers store/expired-reclaim causes the by-reason
     /// family does not, so the two are not expected to sum equal.
-    pub node_pull_channel_open_failures: Counter,
-    /// `decdn_channel_open_failures_insufficient_deposit_total` (#966): a buyer
+    pub node_pull_pool_open_failures: Counter,
+    /// `decdn_pool_open_failures_insufficient_deposit_total` (#966): a buyer
     /// `openChannel` tx reverted because the node's USDC balance/allowance could
     /// not cover the deposit, or the deposit was zero — either as requested, or
     /// as the balance delta actually received under a fee-on-transfer token.
@@ -851,20 +851,20 @@ pub struct DecdnMetrics {
     /// three sibling counters (mirroring `dht_rate_limit_rejected_*`); the
     /// `reason` value is the field-name token. The `OpenMetrics` encoder appends
     /// the `_total` suffix.
-    pub channel_open_failures_insufficient_deposit: Counter,
-    /// `decdn_channel_open_failures_contract_revert_total` (#966): a buyer
+    pub pool_open_failures_insufficient_deposit: Counter,
+    /// `decdn_pool_open_failures_contract_revert_total` (#966): a buyer
     /// `openChannel` tx reverted on-chain for a reason other than insufficient
     /// deposit (provider not active, a paused contract, a mined revert whose
     /// reason is not recoverable from the receipt). The deposit was not
     /// escrowed; the cause is on-chain state, not this node's wallet or RPC.
-    pub channel_open_failures_contract_revert: Counter,
-    /// `decdn_channel_open_failures_rpc_error_total` (#966): a buyer
+    pub pool_open_failures_contract_revert: Counter,
+    /// `decdn_pool_open_failures_rpc_error_total` (#966): a buyer
     /// `openChannel` submit or receipt wait failed at the transport layer (no
     /// revert data) — connectivity, a timed-out receipt, a nonce blip. A
     /// *transient infrastructure* signal; retrying typically clears it. Pair
     /// with the two reverting counters above to tell "operator under-funded the
     /// wallet" from "the RPC endpoint is flaky".
-    pub channel_open_failures_rpc_error: Counter,
+    pub pool_open_failures_rpc_error: Counter,
     /// `decdn_node_pull_too_large_total` (#840): a selected upstream claimed a
     /// `total_bytes` above this node's `max_blob_size` ceiling, so the buyer
     /// rejected it before buffering. Like a channel-open failure this is a
@@ -915,45 +915,21 @@ pub struct DecdnMetrics {
     /// sustained rate means this node's buyer channels are drifting out of sync
     /// with what upstreams accept.
     pub node_pull_voucher_rejected: Counter,
-    /// `decdn_node_pull_channel_retired_total` (#1145 review): a channel was SETTLED
-    /// on-chain — the upstream rejected our voucher with `CooperativeCloseSigned` — so
-    /// its row was dropped and the next pull to that provider opens a fresh channel.
-    ///
-    /// Only that one reject reason lands here, and the narrowness is the point. The row
-    /// is this node's only handle on the escrowed deposit (`reclaimExpired` needs the
-    /// `channel_id`; both recovery sweeps enumerate the store), so dropping it is safe
-    /// ONLY once the channel is settled and there is no remainder to reclaim. Every other
-    /// terminal rejection — a desync, a drained-for-this-voucher balance, an expiry —
-    /// keeps its row and lands on `node_pull_channel_wedged_total` instead.
-    ///
-    /// A steady trickle here is healthy: cooperative closes are the normal end of a
-    /// channel's life.
-    pub node_pull_channel_retired: Counter,
-    /// `decdn_node_pull_channel_wedged_total` (#1145 review): an upstream rejected our
-    /// voucher on terms this channel cannot recover from, while its deposit is STILL
+    /// `decdn_node_pull_pool_wedged_total` (#1145 review): an upstream rejected our
+    /// voucher on terms this lane cannot recover from, while the pool's deposit is STILL
     /// ESCROWED — a nonce/amount/bytes desync, a balance too small for this voucher, or an
     /// expiry.
     ///
-    /// The row is KEPT (it is the only thing that can still reclaim the deposit) and the
-    /// provider is suppressed, so this node cannot use that provider again until the
-    /// channel expires and the reclaim sweep refunds it.
+    /// The pool row is KEPT (it is the only thing that can still reclaim the deposit) and
+    /// the provider is suppressed, so this node cannot use that provider again until the
+    /// pool expires and the reclaim sweep refunds it.
     ///
-    /// **Any sustained rate is money at rest.** Each tick is a channel whose deposit is
+    /// **Any sustained rate is money at rest.** Each tick is a pool whose deposit is
     /// locked up until expiry and a provider this node has taken out of rotation. A spike
     /// means buyer watermarks are drifting out of sync with what upstreams have committed
-    /// — the desync tracked in #1122 — and the deposit sizing and channel count should be
+    /// — the desync tracked in #1122 — and the deposit sizing and pool count should be
     /// reviewed alongside it.
-    pub node_pull_channel_wedged: Counter,
-    /// `decdn_node_pull_channel_retire_failure_total` (#1145 review): the store write that
-    /// retires a settled channel's row FAILED, so the row survives and the next pull will
-    /// reuse the closed channel and be rejected again until it expires.
-    ///
-    /// Its own series rather than borrowing `node_pull_progress_persist_failure_total`,
-    /// which means something else entirely (a voucher WATERMARK write failed). Sharing it
-    /// made a node whose every retire write fails indistinguishable from one that never
-    /// needed to retire — `node_pull_channel_retired_total` would read `0` either way —
-    /// while its persist-failure series climbed for a reason its own docs ruled out.
-    pub node_pull_channel_retire_failure: Counter,
+    pub node_pull_pool_wedged: Counter,
     /// `decdn_node_pull_refused_total` (#1144): a selected upstream refused
     /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
     /// wire code, including the `InternalError` that DOES tar the provider's
@@ -1011,11 +987,11 @@ pub struct DecdnMetrics {
     /// candidate and fails identically on all of them. Read the rate, not the absolute,
     /// and do not infer the number of affected requests from it.
     pub node_pull_local_fault: Counter,
-    /// `decdn_node_pull_channel_open_pending_total` (#1143): a buyer channel open
+    /// `decdn_node_pull_pool_open_pending_total` (#1143): a buyer channel open
     /// was still in flight when the per-candidate budget expired, so the pull moved
     /// to the next candidate while the open continued in the background.
     ///
-    /// NOT a failure — kept separate from `node_pull_channel_open_failures` because
+    /// NOT a failure — kept separate from `node_pull_pool_open_failures` because
     /// the diagnosis is different: a failure says the tx reverted or the wallet is
     /// under-funded, whereas this says the open is simply *not done yet*. It scores no
     /// reputation: a wedged open is our lane, not evidence about the peer.
@@ -1030,7 +1006,7 @@ pub struct DecdnMetrics {
     /// is why they share a counter. But the *diagnosis* is not: reconcile runs at every
     /// boot, so a restart produces a burst here that means nothing is wrong. Read a
     /// sustained rate as a chain-lane signal only once it outlives a restart.
-    pub node_pull_channel_open_pending: Counter,
+    pub node_pull_pool_open_pending: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer channel's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the channel's
@@ -1091,25 +1067,6 @@ pub struct DecdnMetrics {
     /// it alongside `decdn_buyer_topup_failure_total`, which the latter two also tick
     /// and the first does not.
     pub node_pull_reactive_topup_refused: Counter,
-    /// `decdn_node_pull_reactive_topup_near_expiry_total` (#1603): a mid-pull
-    /// top-up the node WOULD have funded — genuine exhaustion, corroborated by our
-    /// own ledger — was declined because the channel had less than
-    /// `blockchain.buyer_reactive_topup_min_ttl_secs` left to its on-chain
-    /// `expires_at`.
-    ///
-    /// `topUp` cannot extend expiry, so funding here would escrow a fresh
-    /// working-deposit into a channel that may expire before the resumed leg can
-    /// spend it — stranding capital until `reclaimExpired`. The pull ends cleanly on
-    /// the original exhaustion instead: the near-expiry channel is wedged
-    /// (`OurDeadChannel` — row KEPT for the reclaim sweep, provider suppressed until
-    /// its imminent expiry), and a later miss opens a fresh, full-lifetime channel.
-    ///
-    /// Distinct from `_refused`, which is an exhaustion claim our ledger CONTRADICTS
-    /// (a lying peer) or a funding failure — there the channel had headroom in time,
-    /// just not in the node's favour. A sustained rate here means channels are being
-    /// opened too close to expiry for the blob sizes this node pulls, or the margin
-    /// is mis-sized for the chain lane.
-    pub node_pull_reactive_topup_near_expiry: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -1203,7 +1160,7 @@ pub struct DecdnMetrics {
     /// deliberately evicted between probe and stream (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because a plain counter
     /// field carries no label dimension, and the wire `StreamError` deliberately
-    /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_channel`,
+    /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_lane`,
     /// `owner_mismatch`) (#876). Visible name:
     /// `decdn_serve_stream_rejected_evicted_since_probe_total`.
     pub serve_stream_rejected_evicted_since_probe: Counter,
@@ -1220,13 +1177,13 @@ pub struct DecdnMetrics {
     /// `max_blob_size_bytes`. Visible name:
     /// `decdn_serve_stream_rejected_blob_too_large_total`.
     pub serve_stream_rejected_blob_too_large: Counter,
-    /// `serve_stream` requests refused on an unknown / never-opened channel
+    /// `serve_stream` requests refused on an unknown / never-opened lane
     /// (#848). Wire-indistinguishable from `cache_miss`/`owner_mismatch` (all
-    /// signed as `NotFound` to avoid leaking channel existence), so this
+    /// signed as `NotFound` to avoid leaking lane existence), so this
     /// server-side counter is the only place the distinction lives — a rising
-    /// value isolates an unknown-channel abuse campaign. Visible name:
-    /// `decdn_serve_stream_rejected_unknown_channel_total`.
-    pub serve_stream_rejected_unknown_channel: Counter,
+    /// value isolates an unknown-lane abuse campaign. Visible name:
+    /// `decdn_serve_stream_rejected_unknown_lane_total`.
+    pub serve_stream_rejected_unknown_lane: Counter,
     /// `serve_stream` requests refused because a verified client binding does
     /// not authorize the named channel (#327). Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
@@ -1256,7 +1213,7 @@ pub struct DecdnMetrics {
     /// New delivery refused because the channel has a signed cooperative-close
     /// waiver (ADR 003 §Cooperative close) — the node committed to settling at
     /// the watermark and serves no further bytes. Wire-indistinguishable from
-    /// `unknown_channel` (signed as `NotFound`), so this counter is the only
+    /// `unknown_lane` (signed as `NotFound`), so this counter is the only
     /// place the distinction lives. Visible name:
     /// `decdn_serve_stream_rejected_cooperative_close_signed_total`.
     pub serve_stream_rejected_cooperative_close_signed: Counter,
@@ -1564,10 +1521,10 @@ impl Metrics {
         Arc::clone(&self.cache)
     }
 
-    /// Replace the inbound channel gauges with a snapshot from the live store.
-    pub(crate) fn set_inbound_channel_snapshot(&self, open: usize, deposit: U256) {
-        self.decdn.channels_open.set(sat(open));
-        self.decdn.channel_deposit_usdc.set(sat_u256(deposit));
+    /// Replace the inbound lane gauges with a snapshot from the live store.
+    pub(crate) fn set_inbound_lane_snapshot(&self, open: usize, deposit: U256) {
+        self.decdn.lanes_open.set(sat(open));
+        self.decdn.pool_deposit_usdc.set(sat_u256(deposit));
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
@@ -1588,22 +1545,22 @@ impl Metrics {
     }
 
     /// Record a buyer `openChannel`-tx failure broken out by cause (#966): bumps
-    /// the `decdn_channel_open_failures_{reason}_total` sibling counter for
+    /// the `decdn_pool_open_failures_{reason}_total` sibling counter for
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
     /// in [`crate::node_origin`]. Distinct from
-    /// [`Self::node_pull_channel_open_failure`], the unlabeled total (which also
+    /// [`Self::node_pull_pool_open_failure`], the unlabeled total (which also
     /// counts store/expired-reclaim causes that never reach the `openChannel`
     /// tx).
-    pub fn channel_open_failure_by_reason(&self, reason: ChannelOpenFailureReason) {
+    pub fn pool_open_failure_by_reason(&self, reason: PoolOpenFailureReason) {
         match reason {
-            ChannelOpenFailureReason::InsufficientDeposit => {
-                self.decdn.channel_open_failures_insufficient_deposit.inc();
+            PoolOpenFailureReason::InsufficientDeposit => {
+                self.decdn.pool_open_failures_insufficient_deposit.inc();
             }
-            ChannelOpenFailureReason::ContractRevert => {
-                self.decdn.channel_open_failures_contract_revert.inc();
+            PoolOpenFailureReason::ContractRevert => {
+                self.decdn.pool_open_failures_contract_revert.inc();
             }
-            ChannelOpenFailureReason::RpcError => {
-                self.decdn.channel_open_failures_rpc_error.inc();
+            PoolOpenFailureReason::RpcError => {
+                self.decdn.pool_open_failures_rpc_error.inc();
             }
         }
     }
@@ -1613,7 +1570,7 @@ impl Metrics {
     /// `decdn_probe_hold_unavailable_total` (#1443). Hand-written rather than
     /// a `recorders!` entry because the pre-materialized child handles live on
     /// `Metrics`, whereas `recorders!` only reaches `self.decdn.$field`. Same
-    /// enum-dispatch shape as [`Self::channel_open_failure_by_reason`], though
+    /// enum-dispatch shape as [`Self::pool_open_failure_by_reason`], though
     /// that one's counters *are* siblings on `self.decdn`. Pairs with the
     /// structured `debug!` at each call site in [`crate::handlers::probe`].
     pub fn probe_hold_unavailable(&self, reason: ProbeHoldUnavailableReason) {
@@ -1896,13 +1853,13 @@ recorders! {
     /// threshold `error!` in `reclaim_once`.
     buyer_reclaim_failure => buyer_reclaim_failures.inc();
 
-    /// Buyer-channel rows skipped as undecodable during one successful store
+    /// Buyer-pool rows skipped as undecodable during one successful store
     /// hydration (#1271). Counted once per skipped row per load attempt (each of
     /// the startup, reconcile, and reclaim loads bumps it), so a persistent
     /// malformed row keeps the escrowed-but-untracked alert active. The
     /// `usize` count is saturated into the `u64` counter.
-    buyer_channel_store_skipped_undecodable_records(count: usize)
-        => buyer_channel_store_skipped_undecodable_records.inc_by(u64::try_from(count).unwrap_or(u64::MAX));
+    buyer_pool_store_skipped_undecodable_records(count: usize)
+        => buyer_pool_store_skipped_undecodable_records.inc_by(u64::try_from(count).unwrap_or(u64::MAX));
 
     /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
     /// reclaiming its deposit early (#972).
@@ -2088,7 +2045,7 @@ recorders! {
     node_region_latency_penalty => node_region_latency_penalty.inc();
 
     /// A buyer channel open/reuse failed before a pull could start (#831).
-    node_pull_channel_open_failure => node_pull_channel_open_failures.inc();
+    node_pull_pool_open_failure => node_pull_pool_open_failures.inc();
 
     /// A selected upstream claimed a `total_bytes` above this node's
     /// `max_blob_size` ceiling and the buyer rejected it before buffering
@@ -2116,8 +2073,8 @@ recorders! {
     /// `max_blob_size_bytes` (#876).
     serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
-    /// Record a `serve_stream` request refused on an unknown channel (#876).
-    serve_stream_rejected_unknown_channel => serve_stream_rejected_unknown_channel.inc();
+    /// Record a `serve_stream` request refused on an unknown lane (#876).
+    serve_stream_rejected_unknown_lane => serve_stream_rejected_unknown_lane.inc();
 
     /// Record a `serve_stream` request refused because the client binding did
     /// not authorize the named channel (#876).
@@ -2196,17 +2153,10 @@ recorders! {
     /// buyer payment-side fault, so it does not score the provider's reputation.
     node_pull_voucher_rejected => node_pull_voucher_rejected.inc();
 
-    /// A channel was settled on-chain (`CooperativeCloseSigned`), so its row was dropped
-    /// and the next pull to that provider opens a fresh one (#1145 review).
-    node_pull_channel_retired => node_pull_channel_retired.inc();
-
-    /// A channel can no longer pay but its deposit is still escrowed, so the row was KEPT
-    /// for the reclaim sweep and the provider suppressed instead (#1145 review). Money at
-    /// rest — see the counter's docs.
-    node_pull_channel_wedged => node_pull_channel_wedged.inc();
-
-    /// The store write retiring a settled channel's row failed (#1145 review).
-    node_pull_channel_retire_failure => node_pull_channel_retire_failure.inc();
+    /// A lane can no longer pay but the pool's deposit is still escrowed, so the row was
+    /// KEPT for the reclaim sweep and the provider suppressed instead (#1145 review).
+    /// Money at rest — see the counter's docs.
+    node_pull_pool_wedged => node_pull_pool_wedged.inc();
 
     /// A selected upstream refused delivery up front (#1144). Counts every wire
     /// code; only `InternalError` also scores the provider's reputation.
@@ -2228,7 +2178,7 @@ recorders! {
 
     /// A buyer channel open outlived the per-candidate budget (#1143). The open
     /// continues in the background; the pull moves on. No reputation effect.
-    node_pull_channel_open_pending => node_pull_channel_open_pending.inc();
+    node_pull_pool_open_pending => node_pull_pool_open_pending.inc();
 
     /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
     /// failed (#852); the channel's stored progress now lags the upstream.
@@ -2250,11 +2200,6 @@ recorders! {
     /// exhaustion our own ledger contradicts, a failed funding tx, or a top-up that
     /// credited nothing (#1530).
     node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
-
-    /// A mid-pull top-up the node would have funded was declined because the channel
-    /// was within its near-expiry margin — `topUp` cannot extend expiry, so the pull
-    /// ends cleanly rather than escrow into a channel that may expire first (#1603).
-    node_pull_reactive_topup_near_expiry => node_pull_reactive_topup_near_expiry.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
     node_pull_through_timeout => node_pull_through_timeouts.inc();
@@ -2511,95 +2456,6 @@ watcher_downtime_recorders! {
     down_seconds: settlement_watcher_down_seconds;
 }
 
-/// Which side of a `PaymentChannel` the shared settle-finalization helper
-/// ([`crate::payment_settlement::settle_pass`]) is running for, so the same
-/// `settleChannel` → revert-resolution state machine routes its outcome to the
-/// correct metric family. The seller path keeps its full
-/// `settlement_finalize_*` breakdown (revenue-critical); the buyer path
-/// (#988, a self-refund with the expiry-reclaim safety net) folds that into the
-/// compact `buyer_settle_ok` / `buyer_settle_deferred` pair.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SettleParty {
-    /// This node is the provider finalizing a client's drawn-down channel.
-    Seller,
-    /// This node is the buyer reclaiming its own deposit after a unilateral
-    /// close of an unreachable provider's channel.
-    Buyer,
-}
-
-impl SettleParty {
-    /// `settleChannel` landed (or the channel was already `Closed` on re-read).
-    pub(crate) fn finalize_ok(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_finalize_ok(),
-            Self::Buyer => m.buyer_settle_ok(),
-        }
-    }
-
-    /// `settleChannel` reverted on-chain (raw count). For the buyer this is a
-    /// no-op: the revert is always reclassified by one of the resolution arms
-    /// below, so counting it here too would double-count against the compact
-    /// `buyer_settle_*` pair.
-    pub(crate) fn finalize_reverted(self, m: &Metrics) {
-        if let Self::Seller = self {
-            m.settlement_finalize_reverted();
-        }
-    }
-
-    /// `settleChannel().send()` errored on a transient RPC fault.
-    pub(crate) fn finalize_transient_send(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_finalize_transient_send(),
-            Self::Buyer => m.buyer_settle_deferred(),
-        }
-    }
-
-    /// `get_receipt()` errored after a successful submit (transient RPC fault).
-    pub(crate) fn finalize_transient_receipt(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_finalize_transient_receipt(),
-            Self::Buyer => m.buyer_settle_deferred(),
-        }
-    }
-
-    /// A reverted settle re-read as already-`Closed` (a co-settler finalized
-    /// first). For the buyer the deposit is recovered either way, so this is a
-    /// success.
-    pub(crate) fn finalize_confirmed_closed(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_finalize_confirmed_closed(),
-            Self::Buyer => m.buyer_settle_ok(),
-        }
-    }
-
-    /// A reverted settle re-read as still-`Closing` (a dispute extended the
-    /// window); the gate is re-stamped and retried.
-    pub(crate) fn finalize_restamped(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_finalize_restamped(),
-            Self::Buyer => m.buyer_settle_deferred(),
-        }
-    }
-
-    /// A reverted settle left unresolved (the confirming read errored or
-    /// returned an unexpected status); the entry is kept for the next sweep.
-    pub(crate) fn finalize_confirm_failed(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_finalize_confirm_failed(),
-            Self::Buyer => m.buyer_settle_deferred(),
-        }
-    }
-
-    /// A pending-settle store write (`forget_pending` / re-stamp
-    /// `record_pending`) returned a `StoreError` and was swallowed.
-    pub(crate) fn pending_persist_failure(self, m: &Metrics) {
-        match self {
-            Self::Seller => m.settlement_pending_persist_failure(),
-            Self::Buyer => m.buyer_settle_deferred(),
-        }
-    }
-}
-
 /// Bind the `/metrics` HTTP listener synchronously so startup can fail fast
 /// if the port is unavailable. The returned listener is consumed by [`serve`].
 ///
@@ -2828,8 +2684,8 @@ mod tests {
         for name in [
             "decdn_streams_active{direction=\"inbound\"}",
             "decdn_streams_active{direction=\"outbound\"}",
-            "decdn_channels_open",
-            "decdn_channel_deposit_usdc",
+            "decdn_lanes_open",
+            "decdn_pool_deposit_usdc",
             "decdn_node_uptime_seconds",
         ] {
             assert!(
@@ -3360,10 +3216,10 @@ mod tests {
     }
 
     #[test]
-    fn buyer_channel_skipped_undecodable_metric_starts_at_zero_and_increments() {
-        // #1271. The struct field is `buyer_channel_store_skipped_undecodable_records`;
+    fn buyer_pool_skipped_undecodable_metric_starts_at_zero_and_increments() {
+        // #1271. The struct field is `buyer_pool_store_skipped_undecodable_records`;
         // the OpenMetrics encoder appends `_total`, so the exported name is
-        // `decdn_buyer_channel_store_skipped_undecodable_records_total` — the
+        // `decdn_buyer_pool_store_skipped_undecodable_records_total` — the
         // operator-visible name the observability appendix and any escrowed-but-
         // untracked alert reference. Pin the suffixed form: a rename that re-added
         // `_total` would emit `..._total_total` (the same footgun the cache GC and
@@ -3374,19 +3230,19 @@ mod tests {
         assert!(
             has_metric_line(
                 &text,
-                "decdn_buyer_channel_store_skipped_undecodable_records_total",
+                "decdn_buyer_pool_store_skipped_undecodable_records_total",
                 0
             ),
             "skipped-undecodable counter should be exposed at zero on a fresh registry:\n{text}"
         );
 
-        metrics.buyer_channel_store_skipped_undecodable_records(2);
+        metrics.buyer_pool_store_skipped_undecodable_records(2);
 
         let text = metrics.encode().unwrap();
         assert!(
             has_metric_line(
                 &text,
-                "decdn_buyer_channel_store_skipped_undecodable_records_total",
+                "decdn_buyer_pool_store_skipped_undecodable_records_total",
                 2
             ),
             "expected the per-load skipped count (2) to increment the counter:\n{text}"
@@ -3451,7 +3307,7 @@ mod tests {
             "decdn_serve_stream_rejected_cache_miss_total",
             "decdn_serve_stream_rejected_internal_error_total",
             "decdn_serve_stream_rejected_blob_too_large_total",
-            "decdn_serve_stream_rejected_unknown_channel_total",
+            "decdn_serve_stream_rejected_unknown_lane_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
@@ -3480,7 +3336,7 @@ mod tests {
         metrics.serve_stream_rejected_cache_miss();
         metrics.serve_stream_rejected_internal_error();
         metrics.serve_stream_rejected_blob_too_large();
-        metrics.serve_stream_rejected_unknown_channel();
+        metrics.serve_stream_rejected_unknown_lane();
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_cooperative_close_signed();
@@ -3712,60 +3568,6 @@ mod tests {
             ("decdn_buyer_unilateral_close_rpc_failure_total", 2),
             ("decdn_buyer_unilateral_close_ok_total", 3),
             ("decdn_buyer_settle_ok_total", 4),
-            ("decdn_buyer_settle_deferred_total", 5),
-        ] {
-            assert!(
-                has_metric_line(&text, name, want),
-                "expected {name} == {want}:\n{text}"
-            );
-        }
-    }
-
-    #[test]
-    fn settle_party_routes_finalize_signals_to_the_right_family() {
-        // #988/#989. The shared settle-finalize state machine is party-agnostic;
-        // `SettleParty` is what keeps the buyer self-refund metrics from polluting
-        // the revenue-critical seller settlement metrics. Drive every finalize
-        // signal for BOTH parties on one registry and assert the split.
-        let m = Arc::new(Metrics::new());
-
-        // Seller: full breakdown, each signal to its own counter.
-        SettleParty::Seller.finalize_ok(&m);
-        SettleParty::Seller.finalize_reverted(&m);
-        SettleParty::Seller.finalize_transient_send(&m);
-        SettleParty::Seller.finalize_transient_receipt(&m);
-        SettleParty::Seller.finalize_confirmed_closed(&m);
-        SettleParty::Seller.finalize_restamped(&m);
-        SettleParty::Seller.finalize_confirm_failed(&m);
-        SettleParty::Seller.pending_persist_failure(&m);
-
-        // Buyer: compact pair. ok + confirmed_closed → buyer_settle_ok (deposit
-        // recovered either way); reverted is a no-op (reclassified by a
-        // resolution arm); everything else → buyer_settle_deferred.
-        SettleParty::Buyer.finalize_ok(&m); // → buyer_settle_ok
-        SettleParty::Buyer.finalize_confirmed_closed(&m); // → buyer_settle_ok
-        SettleParty::Buyer.finalize_reverted(&m); // → no-op (avoids double count)
-        SettleParty::Buyer.finalize_transient_send(&m); // → buyer_settle_deferred
-        SettleParty::Buyer.finalize_transient_receipt(&m); // → buyer_settle_deferred
-        SettleParty::Buyer.finalize_restamped(&m); // → buyer_settle_deferred
-        SettleParty::Buyer.finalize_confirm_failed(&m); // → buyer_settle_deferred
-        SettleParty::Buyer.pending_persist_failure(&m); // → buyer_settle_deferred
-
-        let text = m.encode().unwrap();
-        for (name, want) in [
-            // Seller family: one each.
-            ("decdn_settlement_finalize_ok_total", 1),
-            ("decdn_settlement_finalize_reverted_total", 1),
-            ("decdn_settlement_finalize_transient_send_total", 1),
-            ("decdn_settlement_finalize_transient_receipt_total", 1),
-            ("decdn_settlement_finalize_confirmed_closed_total", 1),
-            ("decdn_settlement_finalize_restamped_total", 1),
-            ("decdn_settlement_finalize_confirm_failed_total", 1),
-            ("decdn_settlement_pending_persist_failures_total", 1),
-            // Buyer family: ok = 2 (ok + confirmed_closed), deferred = 5
-            // (transient_send + transient_receipt + restamped + confirm_failed +
-            // persist_failure), reverted not counted.
-            ("decdn_buyer_settle_ok_total", 2),
             ("decdn_buyer_settle_deferred_total", 5),
         ] {
             assert!(
@@ -4262,9 +4064,9 @@ mod tests {
     }
 
     #[test]
-    fn channel_open_failures_by_reason_label_distinct_counters() {
+    fn pool_open_failures_by_reason_label_distinct_counters() {
         // The three buyer `openChannel` failure classes (#966) must each land
-        // in their own `decdn_channel_open_failures_{reason}_total` sibling
+        // in their own `decdn_pool_open_failures_{reason}_total` sibling
         // counter — that label split is the whole point of the issue, so a
         // bump on one reason must NOT leak into another.
         let metrics = Metrics::new();
@@ -4273,9 +4075,9 @@ mod tests {
         // render `(no data)` before the first failure.
         let text = metrics.encode().unwrap();
         for name in [
-            "decdn_channel_open_failures_insufficient_deposit_total",
-            "decdn_channel_open_failures_contract_revert_total",
-            "decdn_channel_open_failures_rpc_error_total",
+            "decdn_pool_open_failures_insufficient_deposit_total",
+            "decdn_pool_open_failures_contract_revert_total",
+            "decdn_pool_open_failures_rpc_error_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
@@ -4285,21 +4087,18 @@ mod tests {
 
         // Bump each reason a distinct number of times so a cross-wired counter
         // is caught by the mismatched count, not just a nonzero value.
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::InsufficientDeposit);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::InsufficientDeposit);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::ContractRevert);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::RpcError);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::RpcError);
-        metrics.channel_open_failure_by_reason(ChannelOpenFailureReason::RpcError);
+        metrics.pool_open_failure_by_reason(PoolOpenFailureReason::InsufficientDeposit);
+        metrics.pool_open_failure_by_reason(PoolOpenFailureReason::InsufficientDeposit);
+        metrics.pool_open_failure_by_reason(PoolOpenFailureReason::ContractRevert);
+        metrics.pool_open_failure_by_reason(PoolOpenFailureReason::RpcError);
+        metrics.pool_open_failure_by_reason(PoolOpenFailureReason::RpcError);
+        metrics.pool_open_failure_by_reason(PoolOpenFailureReason::RpcError);
 
         let text = metrics.encode().unwrap();
         for (name, expected) in [
-            (
-                "decdn_channel_open_failures_insufficient_deposit_total",
-                2u64,
-            ),
-            ("decdn_channel_open_failures_contract_revert_total", 1),
-            ("decdn_channel_open_failures_rpc_error_total", 3),
+            ("decdn_pool_open_failures_insufficient_deposit_total", 2u64),
+            ("decdn_pool_open_failures_contract_revert_total", 1),
+            ("decdn_pool_open_failures_rpc_error_total", 3),
         ] {
             assert!(
                 has_metric_line(&text, name, expected),
@@ -4308,10 +4107,10 @@ mod tests {
         }
 
         // The by-reason family is independent of the unlabeled total — bumping
-        // a reason does NOT touch `node_pull_channel_open_failures` (that total
+        // a reason does NOT touch `node_pull_pool_open_failures` (that total
         // is bumped separately, and also covers non-tx causes).
         assert!(
-            has_metric_line(&text, "decdn_node_pull_channel_open_failures_total", 0),
+            has_metric_line(&text, "decdn_node_pull_pool_open_failures_total", 0),
             "unlabeled total must not move when only the by-reason helper is called:\n{text}"
         );
     }

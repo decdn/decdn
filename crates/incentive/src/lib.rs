@@ -1,56 +1,62 @@
 //! Incentive layer for deCDN.
 //!
-//! Manages off-chain USDC payment channels, bonding interactions via
-//! `CapacityBond`, and voucher lifecycle (creation, validation,
-//! on-chain settlement).
+//! Manages off-chain USDC payment pools, bonding interactions via
+//! `CapacityBond`, and voucher lifecycle (creation, validation, on-chain
+//! settlement).
 //!
 //! Exposes the off-chain payment-voucher primitives — EIP-712
 //! signing/verification ([`voucher`]) — required for `cdn/client/v1`, the
 //! keystore→signer bridge ([`eth_identity`], #406) used by both
 //! `decdn key-gen` and the runtime to load a `PrivateKeySigner`, and the
 //! `alloy::sol!` contract bindings for the on-chain surface the node consumes
-//! ([`capacity_bond`] reads, [`payment_channel`] reads + writes, [`erc20`]
-//! approve). The seller-side on-chain settlement path (#327 — `ChannelOpened`
-//! → persist, threshold/shutdown `withdraw` + `closeChannel`, `ChannelSettled`
-//! → forget) is fully driven by the `decdn-node` runtime. So is the buyer-side
-//! cache-miss path (one-time USDC approve, `openChannel`/`topUp`,
-//! `reclaimExpired` on abandonment; bookkeeping in [`buyer_channel`]): the
-//! runtime bootstraps the approval and the reclaim sweep, and its node-to-node
-//! pull-through origin drives `openChannel` and voucher signing on a miss.
+//! ([`capacity_bond`] reads, [`payment_pool`] reads + writes, [`erc20`]
+//! approve). A `PaymentPool` fans one owner's deposit out across many capped
+//! signers and many nodes: the owner opens a pool with `openPool`, authorizes
+//! each signer off-chain with a [`capability::Capability`], and a signer's
+//! per-`(pool, provider)` voucher lane accrues cumulative amount/bytes as
+//! `redeem`/`redeemMany` pays it down. The seller-side on-chain settlement
+//! path (`PoolOpened`/`Redeemed` → persist per-lane watermark in
+//! [`lane::LaneState`], `PoolCloseInitiated` → grace-window monitor,
+//! `PoolReclaimed` → forget) is fully driven by the `decdn-node` runtime. So
+//! is the buyer-side cache-miss path (one-time USDC approve,
+//! `openPool`/`topUp`, `closePool` + `reclaim` on abandonment; bookkeeping in
+//! [`buyer_pool`]): the runtime bootstraps the approval and the reclaim
+//! sweep, and its node-to-node pull-through origin drives pool open/reuse
+//! and voucher signing on a miss.
 //!
-//! Stale-close defense is the one payment-channel surface this crate does not
-//! reach, and it is not built on either side yet. Per
+//! Stale-close defense is the one payment surface this crate does not reach,
+//! and it is not built on either side yet. Per
 //! `adr/appendix-fraud-detection.md` it needs no watchtower role, no escrow
-//! contract, and no wire protocol: `disputeChannel` is permissionless, so the
-//! primary mechanism is a local in-process monitor that follows
-//! `ChannelCloseInitiated` on the node's own channels and re-submits its latest
-//! voucher (operator-arranged redundancy and the dispute window back it). That
-//! monitor is deferred (#324) — the runtime observes the event but never
-//! disputes — so the [`payment_channel`] bindings here carry the close/withdraw
-//! surface and deliberately omit `disputeChannel`.
+//! contract, and no wire protocol: redemption against an owner's
+//! `PoolCloseInitiated` grace window is permissionless, so the primary
+//! mechanism is a local in-process monitor that follows the event on the
+//! node's own pools and re-submits its latest voucher (operator-arranged
+//! redundancy and the dispute window back it). That monitor is deferred
+//! (#324) — the runtime observes the event but never redeems on its own
+//! behalf outside the normal path.
 
 pub mod bind_sig;
-pub mod buyer_channel;
+pub mod buyer_pool;
 // NOTE: no outer `///` docs on these two — each module's `//!` header is its
 // documentation. An outer doc here would be a second copy free to drift, and
 // rustdoc merges it with the `//!` block and resolves the result in *this*
 // module's scope, silently breaking the module's own intra-doc links.
 #[cfg(feature = "redb")]
-pub mod buyer_channel_redb;
+pub mod buyer_pool_redb;
 #[cfg(feature = "buyer-store-core")]
-pub mod buyer_channel_table;
+pub mod buyer_pool_table;
+pub mod capability;
+pub mod capability_grant;
 pub mod capacity_bond;
-pub mod channel;
-pub mod channel_open_error;
 pub mod client_bridge;
 pub mod content_blacklist;
-pub mod coop_close_request;
-pub mod cooperative_close;
 pub mod erc20;
 pub mod eth_identity;
+pub mod lane;
 pub mod node_register;
 pub mod origin_assignment;
-pub mod payment_channel;
+pub mod payment_pool;
+pub mod pool_open_error;
 pub mod probe_sig;
 pub mod publisher_registry;
 pub mod rate;
@@ -71,30 +77,27 @@ pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
     bind_node_id_domain, binding_signing_hash, register_node_signing_hash, verify_binding,
 };
-pub use buyer_channel::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, BuyerProgressError,
-    DepositOutcome, MemoryBuyerChannelStore,
+pub use buyer_pool::{
+    AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore,
+    BuyerProgressError, DepositOutcome, MemoryBuyerPoolStore,
 };
-pub use channel::{ChannelError, ChannelId, ChannelState, VoucherApplied};
-pub use channel_open_error::ChannelOpenFailureReason;
+pub use capability::{Capability, CapabilityError, SignedCapability};
+pub use capability_grant::{CapabilityGrant, GrantError, GrantOwnerError};
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
 };
-pub use coop_close_request::{
-    COOP_CLOSE_REQUEST_SIG_LEN, CoopCloseRequestError, coop_close_request_signing_hash,
-    recover_coop_close_request, sign_coop_close_request,
-};
-pub use cooperative_close::{CooperativeClose, SignedCooperativeClose};
 pub use erc20::Erc20;
+pub use lane::{LaneKey, LaneState, PoolError, PoolId, VoucherApplied};
+pub use pool_open_error::PoolOpenFailureReason;
 pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
     slash_judge_domain,
 };
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
-    ChannelStateStore, CheckpointKey, KeyedCheckpointStore, MemoryChannelStateStore,
-    MemoryPendingSettleStore, PendingSettle, PendingSettleStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, MemoryPendingSettleStore, MemoryPoolStateStore,
+    PendingSettle, PendingSettleStore, PoolStateStore, StoreError,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use swap_balancer::BalancerV3Venue;

@@ -12,28 +12,28 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-# Shared buyer-channel redb table (`buyer_channel_table`, #1246): the on-disk
+# Shared buyer-pool redb table (`buyer_pool_table`, #1246): the on-disk
 # record codec plus the table operations, over a caller-supplied
-# `redb::Database`. The node's combined seller+buyer `channels.redb` store
+# `redb::Database`. The node's combined seller+buyer `pools.redb` store
 # enables *only* this and keeps its own file + per-op transaction wiring (redb
 # forbids two `Database` handles on one file), so both buyer stores share one
 # definition of the on-disk format without the node adopting
-# `RedbBuyerChannelStore`.
+# `RedbBuyerPoolStore`.
 #
 # NOTE: `dep:redb` must stay spelled here. An optional dependency has to be
 # referenced as `dep:<name>` by some feature or Cargo rejects the manifest
 # outright ("optional dependency `redb` is not included in any feature"), and
 # the explicit `redb` feature below shadows the name so it cannot serve that
 # role itself.
-buyer-store-core = ["dep:redb", "dep:postcard"]
-# Persistent buyer-only store (`buyer_channel_redb`): adds
-# `RedbBuyerChannelStore` (its own `buyer-channels.redb` file + open guards) on
-# top of the shared table. Off by default so the contracts/voucher logic doesn't
-# link `redb`; the CLI (`decdn fetch`, #940) enables it for cross-invocation
-# channel reuse. (Only `redb` is avoided — `postcard` arrives unconditionally
-# via `decdn-protocol` no matter what is enabled here.)
+buyer-store-core = ["dep:redb"]
+# Persistent buyer-only store (`buyer_pool_redb`): adds `RedbBuyerPoolStore`
+# (its own `buyer-pools.redb` file + open guards) on top of the shared table.
+# Off by default so the contracts/voucher logic doesn't link `redb`; the CLI
+# (`decdn fetch`, #940) enables it for cross-invocation pool reuse. (Only
+# `redb` is avoided — `postcard` arrives unconditionally via
+# `decdn-protocol` no matter what is enabled here.)
 redb = ["buyer-store-core"]
-# Exposes `BuyerChannelTable::insert_raw`, which writes raw bytes past the
+# Exposes `BuyerPoolTable::insert_raw`, which writes raw bytes past the
 # encoder to seed an undecodable row. Gated so a corruption-seeding writer stays
 # out of the shipped API, but NOT `#[cfg(test)]`: a cross-crate `cfg(test)` does
 # not propagate, and `decdn-node`'s `insert_raw_buyer_record` seam (its #763
@@ -56,7 +56,12 @@ rand = { workspace = true }
 rpassword = { workspace = true }
 zeroize = { workspace = true }
 redb = { workspace = true, optional = true }
-postcard = { workspace = true, optional = true }
+# Non-optional: the `capability_grant` delegation-token codec postcard-encodes
+# the grant on every build. `decdn-protocol` already links postcard, so a direct
+# dependency here adds no binary weight.
+postcard = { workspace = true }
+# `dcap1:` delegation-token base64url alphabet (`capability_grant`).
+base64 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

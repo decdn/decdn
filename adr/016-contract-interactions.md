@@ -43,7 +43,7 @@ classDiagram
     class PaymentPool {
         +openPool(deposit)
         +redeem(poolId, signer, provider, cumulative, bytes, sig, cap)
-        +redeemMany(entries)
+        +redeemMany(capabilities, vouchers)
         +closePool(poolId)
         +reclaim(poolId)
     }
@@ -670,7 +670,7 @@ Every state-mutating function that makes an external call is listed below with i
 | `openPool(deposit)` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions. Names no provider — node-active gating is off-chain at node selection, not at open. |
 | `topUp()` | `IERC20.safeTransferFrom()` | `nonReentrant`, checks-effects-interactions |
 | `redeem(poolId, signer, provider, cumulative, bytesDelivered, voucherSig, capability)` | `IERC20.safeTransfer()` (paid amount to FeeRouter), `FeeRouter.routeSettlement(operator, bytesPaid, paid)` where `paid = min(desired, capRoom, remaining)` (`desired = cumulative − lane.paid`) and `bytesPaid = mulDiv(bytesDelta, paid, desired)` — the **paid-proportional** byte count. The lane watermark advances by `paid`, not to `cumulative`, so a partially-drained draw is retriable; `redeem` reverts `NothingToRedeem` (no state written) when `paid == 0`. FeeRouter performs the split internally | `nonReentrant`, checks-effects-interactions; FeeRouter is `nonReentrant`-guarded on `routeSettlement` to defend against re-entry through the operator-base `safeTransfer` |
-| `redeemMany(entries[])` | Per-entry `IERC20.safeTransfer()` + `FeeRouter.routeSettlement(...)` for each entry that pays `> 0`; entries that would pay `0` (drained pool, stale/paid voucher, expired capability, cap reached) are **skipped, not reverted** | `nonReentrant`, checks-effects-interactions; reverts only on a bad signature or `provider != msg.sender` |
+| `redeemMany(capabilities[], vouchers[])` | Registers each capability (idempotent), then per-voucher `IERC20.safeTransfer()` + `FeeRouter.routeSettlement(...)` for each voucher that pays `> 0`; vouchers that would pay `0` (drained pool, stale/paid voucher, expired capability, cap reached, or an uncovered signer) are **skipped, not reverted** | `nonReentrant`, checks-effects-interactions; reverts only on a bad voucher signature, `provider != msg.sender`, or a bad capability owner-signature |
 | `reclaim()` | `IERC20.safeTransfer()` (remainder to owner) | `nonReentrant`, checks-effects-interactions |
 
 #### CapacityBond

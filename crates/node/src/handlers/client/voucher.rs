@@ -1,12 +1,12 @@
-//! Voucher collection / payment loop + cooperative-close authorization.
-//! Bodies split from `mod.rs` (#1254). Group-commit batching added in #1483.
+//! Per-lane voucher collection / payment loop. Bodies split from `mod.rs`
+//! (#1254). Group-commit batching added in #1483.
 
 use super::{
-    Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
-    ChannelState, ClientHandler, ClientMessage, CooperativeClose, CooperativeCloseAuth,
-    CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError, RecvStream, SendStream,
-    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, WatermarkBundle, verify_rate,
-    voucher_reject_reason, wire_voucher_to_signed,
+    Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ClientHandler,
+    DEFAULT_TOLERANCE_BPS, Hash, LaneDeliveryState, LaneKey, LaneState, Mutex, RateError,
+    RecvStream, RetrySignal, SendStream, SignedVoucher, U256, VOUCHER_READ_TIMEOUT,
+    VoucherRejectReason, WatermarkBundle, verify_rate, voucher_reject_reason,
+    wire_voucher_to_signed,
 };
 
 /// A voucher that passed the node-side verify half against the advancing
@@ -15,66 +15,63 @@ struct StagedVoucher {
     /// Bytes this voucher pays for (its interval delta) — for `paid` accounting,
     /// the audit receipt, and per-region / seed-leech crediting.
     delta_bytes: u64,
-    /// The client's wire nonce (big-endian), for the audit receipt (#248/#803).
-    wire_nonce: [u8; 32],
-    /// Whether accepting this voucher skipped nonce values (#747 gap metric).
-    gapped: bool,
+    /// The voucher's cumulative amount (big-endian), for the audit receipt
+    /// (#248/#803). Amount is the pool voucher's sole ordering key — there is no
+    /// nonce.
+    amount: [u8; 32],
 }
 
 /// A voucher that passed the node-side verify half, carrying the advanced
 /// candidate state, its cumulative byte watermark, and the staged bookkeeping.
 struct VerifiedVoucher {
-    next_state: ChannelState,
+    next_state: LaneState,
     new_bytes: U256,
     staged: StagedVoucher,
 }
 
 /// Why the node-side verify half stopped the batch at a voucher (#1483). The
-/// valid prefix is committed + acked before this is acted on.
+/// valid prefix is committed before this is acted on.
+#[derive(Debug)]
 enum VerifyStop {
     /// Reject cleanly with this wire reason, then finish the stream (#751).
     /// The optional [`WatermarkBundle`] rides the wallet-less-resume path
     /// (#1481 §5): it is `Some` only for a watermark-gated regression/exhaustion
-    /// reason whose rejected voucher recovers to the channel's pinned
-    /// `voucher_signer`, and carries the node's true watermark so an authorized
-    /// funder can re-seed and resume. Every other reason carries `None`.
+    /// reason whose rejected voucher recovers to the lane's pinned `signer`, and
+    /// carries the node's true watermark so an authorized funder can re-seed and
+    /// resume. Every other reason carries `None`.
     Reject(VoucherRejectReason, Option<WatermarkBundle>),
     /// Fail the stream — there is no wire reason for this fault (a buyer
-    /// underpayment), and the client is blocked awaiting `VoucherAck` so it
-    /// cannot resend mid-stream (ADR 003 §Voucher withholding).
+    /// underpayment), and delivery simply stops (ADR 003 §Voucher withholding).
     Bail(String),
 }
 
 impl ClientHandler {
-    /// Collect, durably commit, and acknowledge a **batch** of cumulative
+    /// Collect, durably commit, and continue serving a **batch** of cumulative
     /// vouchers with a single fsync (#1483, group commit).
     ///
     /// `deltas` are the completed interval sizes the serve loop has delivered and
     /// not yet recouped, drained front-to-back (a closing partial is just the
     /// last entry). The batch reads at most `deltas.len()` vouchers: the first
     /// blocking (so the loop makes progress and parks awaiting a voucher exactly
-    /// as before), the rest gathered under [`ClientHandler::commit_interval`] so
-    /// a client that pauses payment is never waited on longer than that. Each
-    /// voucher is verified against an advancing candidate; because vouchers are
-    /// cumulative, the whole batch commits as ONE `store.record` of the final
+    /// as before), the rest gathered under [`ClientHandler::commit_interval`].
+    /// Each voucher is verified against an advancing candidate; because vouchers
+    /// are cumulative, the whole batch commits as ONE `store.record` of the final
     /// candidate — the highest voucher supersedes every earlier one, so a single
     /// fsync amortizes across the batch with no loss.
     ///
     /// **Durability ordering (ADR 003 §Off-chain voucher state persistence).**
-    /// Nothing is acknowledged before it is durable: the fsynced commit runs
-    /// first, then a `VoucherAck` is written per committed voucher. A commit
-    /// failure fails the WHOLE batch — every voucher gets `RetryLater`, none an
-    /// ack — and in-memory state is left unchanged, so the client resends the
-    /// batch on a fresh stream. Delaying the ack by one commit interval is free
-    /// throughput-wise because #1477's credit window keeps it off the delivery
-    /// critical path; it spends window headroom, sized by
-    /// `credit_window >= throughput * (RTT + commit_interval)`.
+    /// Acceptance is **implicit**: the fsynced commit runs first, then the node
+    /// simply keeps delivering — no positive `VoucherAck` is written; only a
+    /// rejection is ever signalled. A commit failure fails the WHOLE batch — every
+    /// voucher gets `RetryLater`, and in-memory state is left unchanged — so the
+    /// client resends the batch on a fresh stream (#527). Delaying the durable
+    /// swap by one commit interval is free throughput-wise because #1477's credit
+    /// window keeps it off the delivery critical path.
     ///
-    /// On a mid-batch verify rejection, the valid prefix is committed + acked
-    /// first (one fsync), then the offending voucher's rejection is written —
-    /// faithful to the pre-batch per-voucher order. Returns the number of
-    /// committed vouchers (so the loop advances `paid` and re-queues any deltas
-    /// the client had not yet sent) and whether the stream must end.
+    /// On a mid-batch verify rejection, the valid prefix is committed first (one
+    /// fsync), then the offending voucher's rejection is written. Returns the
+    /// number of committed vouchers (so the loop advances `paid` and re-queues any
+    /// deltas the client had not yet sent) and whether the stream must end.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn collect_voucher_batch(
         &self,
@@ -82,17 +79,17 @@ impl ClientHandler {
         recv: &mut RecvStream,
         reader: &mut BufferedVoucherReader,
         hash: Hash,
-        channel_id: ChannelId,
-        channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
+        lane_key: LaneKey,
+        lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
         deltas: &[u64],
     ) -> anyhow::Result<BatchOutcome> {
-        // Unknown channel (#327 boundary): `serve_stream` refuses an unknown
-        // channel pre-serve, so this arm is unreachable from the sole callers
-        // (which always forward `Some`); kept as a defensive backstop.
-        let Some(channel) = channel else {
-            self.write_reject(send, VoucherRejectReason::WrongChannel, None)
+        // Unknown lane (#327 boundary): `serve_stream` refuses an unknown lane
+        // pre-serve, so this arm is unreachable from the sole callers (which
+        // always forward `Some`); kept as a defensive backstop.
+        let Some(lane) = lane else {
+            self.write_reject(send, VoucherRejectReason::WrongPool, None)
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
@@ -101,12 +98,10 @@ impl ClientHandler {
         };
 
         // (1) GATHER — read up to `deltas.len()` wire vouchers WITHOUT holding
-        // the per-channel lock (a network read must not block same-channel
-        // streams). The first read blocks under `VOUCHER_READ_TIMEOUT` (a stalled
-        // client still errors out); the rest wait only `commit_interval`, so a
-        // client that stops paying flushes the batch it has instead of stalling.
-        // The reader is cancellation-safe, so a `commit_interval` timeout mid-frame
-        // buffers the partial for the next call rather than tearing the stream.
+        // the per-lane lock (a network read must not block same-lane streams).
+        // The first read blocks under `VOUCHER_READ_TIMEOUT`; the rest wait only
+        // `commit_interval`, so a client that stops paying flushes the batch it
+        // has instead of stalling. The reader is cancellation-safe.
         let mut wires = Vec::with_capacity(deltas.len());
         {
             let first = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
@@ -125,30 +120,22 @@ impl ClientHandler {
             }
         }
 
-        // (2) VERIFY under the per-channel lock (so the watermark checked is the
+        // (2) VERIFY under the per-lane lock (so the watermark checked is the
         // watermark committed) against an advancing candidate. The candidate is a
         // CLONE — `guard.state` is only swapped after the durable commit below,
         // preserving the #527 invariant.
-        let guard = channel.lock().await;
+        let guard = lane.lock().await;
 
-        // Channel-level gates, checked once for the batch (ADR 003). A batch spans
-        // milliseconds, so a mid-batch expiry / cooperative-close race is bounded
-        // exactly as the pre-batch per-interval check bounded it.
-        if crate::payment_settlement::is_expired(
-            crate::payment_settlement::unix_now(),
-            guard.state.expires_at,
-        ) {
+        // Capability-expiry gate, checked once for the batch (ADR 003
+        // §Capability delegation). A batch spans milliseconds, so a mid-batch
+        // expiry race is bounded exactly as the pre-batch per-interval check
+        // bounded it. `expiry == 0` means "not tracked" and never expires. An
+        // expired grant surfaces as `CapExceeded` (its cap is exhausted for all
+        // practical purposes — the on-chain `redeem` would revert identically).
+        let expiry = guard.state.expiry;
+        if expiry != 0 && crate::payment_settlement::unix_now() >= expiry {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::Expired, None)
-                .await?;
-            return Ok(BatchOutcome {
-                committed: 0,
-                stop: BatchStop::Rejected,
-            });
-        }
-        if guard.state.cooperative_close_signed() {
-            drop(guard);
-            self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned, None)
+            self.write_reject(send, VoucherRejectReason::CapExceeded, None)
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
@@ -177,14 +164,13 @@ impl ClientHandler {
             }
         }
 
-        // (3) COMMIT the verified prefix with ONE fsync, then ack after.
+        // (3) COMMIT the verified prefix with ONE fsync, then keep serving.
         let committed = staged.len();
         if committed > 0 {
             match self
                 .commit_batch(
-                    send,
                     guard,
-                    channel_id,
+                    lane_key,
                     hash,
                     client_node_id,
                     candidate,
@@ -193,13 +179,11 @@ impl ClientHandler {
                 )
                 .await?
             {
-                // Durable commit failed → the WHOLE batch is RetryLater; nothing
-                // was acked and in-memory state did not advance. A pending verify
-                // rejection is overridden — durability failure is the actionable
-                // signal, and the client must resend the same vouchers.
+                // Durable commit failed → the WHOLE batch is RetryLater; in-memory
+                // state did not advance. A pending verify rejection is overridden —
+                // durability failure is the actionable signal, and the client must
+                // resend the same vouchers.
                 CommitOutcome::StoreFailed => {
-                    // `RetryLater` is never a watermark-gated reason, so no
-                    // bundle is ever attached here (#1481 §5).
                     self.write_reject(send, VoucherRejectReason::RetryLater, None)
                         .await?;
                     return Ok(BatchOutcome {
@@ -222,10 +206,6 @@ impl ClientHandler {
                 stop: BatchStop::Continue,
             }),
             Some(VerifyStop::Reject(reason, bundle)) => {
-                // The wallet-less-resume bundle (if any) was built inside
-                // `verify_voucher` while the per-channel guard was still held —
-                // it reports the committed-prefix watermark for a gated reason
-                // whose voucher recovered to the pinned signer (#1481 §5).
                 self.write_reject(send, reason, bundle).await?;
                 Ok(BatchOutcome {
                     committed,
@@ -238,9 +218,9 @@ impl ClientHandler {
 
     /// The node-side verify half for ONE voucher, evaluated against the advancing
     /// candidate (`state` / `cumulative_bytes`) with no durable side effect. Two
-    /// distinct rate checks, mirroring the pre-batch `collect_voucher`:
+    /// distinct rate checks:
     /// - the per-delta **advertised-rate** check bails on a genuine underpayment
-    ///   (no wire reason, the client is blocked awaiting an ack so cannot resend);
+    ///   (no wire reason; delivery just stops);
     /// - the cumulative **live-floor** check rejects cleanly with
     ///   `RateFloorRaised` when a governance floor raise made the quote stale
     ///   (#1382), else bails.
@@ -248,7 +228,7 @@ impl ClientHandler {
     /// See [`Self::collect_voucher_batch`] for the durable-commit half.
     fn verify_voucher(
         &self,
-        state: &ChannelState,
+        state: &LaneState,
         cumulative_bytes: U256,
         wire: &decdn_protocol::client::Voucher,
         rate_per_mb: u64,
@@ -260,8 +240,6 @@ impl ClientHandler {
 
         // Advertised-rate check (ADR 003 §Voucher withholding). Match every
         // `RateError` arm (#845) so a future variant is a build failure here.
-        // `ZeroBytes`/`Overflow` cannot occur (`delta_bytes > 0`) but are rejected
-        // defensively.
         match verify_rate(
             amount_delta,
             U256::from(delta_bytes),
@@ -282,9 +260,9 @@ impl ClientHandler {
         }
 
         // Hard per-byte price floor (#846), checked on the CUMULATIVE watermark
-        // the voucher carries (mirrors the on-chain `_advanceClaimWatermark`
-        // `RateFloorViolation` guard at ZERO tolerance). Snapshot the live floor
-        // once so the check and the rejection classification cannot disagree.
+        // the voucher carries (mirrors the on-chain `redeem` `RateFloorViolation`
+        // guard at ZERO tolerance). Snapshot the live floor once so the check and
+        // the rejection classification cannot disagree.
         let live_floor = self.rate_bounds.floor();
         match verify_rate(amount, new_bytes, live_floor, 0) {
             Ok(()) => {}
@@ -294,16 +272,11 @@ impl ClientHandler {
                     // A governance floor raise landed between the signed quote and
                     // this voucher (#1382): the buyer is honest, its quote is
                     // stale. Surface the typed re-quote signal in-band.
-                    // `RateFloorRaised` is not a watermark-gated reason (#1481 §5),
-                    // so no bundle is attached.
                     return Err(VerifyStop::Reject(
                         VoucherRejectReason::RateFloorRaised,
                         None,
                     ));
                 }
-                // The floor did NOT rise above the quote, yet the cumulative
-                // payment is still under it — a genuine underpayment the per-delta
-                // tolerance let through. The buyer's fault; fail the stream.
                 return Err(VerifyStop::Bail(format!(
                     "voucher below the cumulative rate floor for {delta_bytes} delivered bytes"
                 )));
@@ -315,39 +288,40 @@ impl ClientHandler {
             }
         }
 
-        let Ok(signed) = wire_voucher_to_signed(wire, state.channel_id, state.token, new_bytes)
+        // Reconstruct the signed voucher from wire + lane context (`pool_id`,
+        // `signer`, `provider`, and the cumulative `bytes_delivered` are not on
+        // the wire — ADR 005 §Voucher wire format).
+        let Ok(signed) =
+            wire_voucher_to_signed(wire, state.pool_id, state.signer, state.provider, new_bytes)
         else {
-            // `BadSignature` is not a watermark-gated reason (#1481 §5).
             return Err(VerifyStop::Reject(VoucherRejectReason::BadSignature, None));
         };
 
         // Validate + advance the candidate in memory only (no store). Cumulative
-        // vouchers mean the returned `next_state` supersedes `state`, so the batch
-        // records only the final candidate (one fsync). A validation error maps to
-        // its wire reject reason; `stage_voucher` never touches a store, so it can
-        // never surface `RetryLater` here (that is reserved for the commit).
+        // vouchers mean the returned `next` supersedes `state`, so the batch
+        // records only the final candidate (one fsync). `stage_voucher` never
+        // touches a store, so it can never surface `RetryLater` here.
         match state.stage_voucher(&signed, &self.voucher_domain) {
-            Ok((next_state, applied)) => Ok(VerifiedVoucher {
+            Ok((next_state, _applied)) => Ok(VerifiedVoucher {
                 next_state,
                 new_bytes,
                 staged: StagedVoucher {
                     delta_bytes,
-                    wire_nonce: wire.nonce,
-                    gapped: applied.is_gapped(),
+                    amount: wire.amount,
                 },
             }),
             Err(e) => {
-                // Map to the wire reject reason; a non-mappable store/validation
-                // error falls back to `RetryLater` (never watermark-gated). This
-                // preserves the pre-batch `voucher_reject_reason` classification.
-                let reason = voucher_reject_reason(&e).unwrap_or(VoucherRejectReason::RetryLater);
+                // Map to the wire reject reason. `Err(RetrySignal)` (a transient
+                // store failure) cannot occur here — `stage_voucher` touches no
+                // store — so a defensive fallback maps it to `RetryLater`.
+                let reason = match voucher_reject_reason(&e) {
+                    Ok(reason) => reason,
+                    Err(RetrySignal) => VoucherRejectReason::RetryLater,
+                };
                 // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
                 // reason whose rejected voucher recovers to the pinned signer,
                 // attach the node's true watermark so an authorized funder can
-                // re-seed and resume. `signed` is the SAME reconstructed voucher
-                // just validated above; `state` is the advancing candidate under
-                // the still-held per-channel guard, so its `last_*` is exactly the
-                // committed-prefix watermark the client should resume from.
+                // re-seed and resume.
                 let bundle = self.watermark_bundle_for_reject(reason, &signed, state);
                 Err(VerifyStop::Reject(reason, bundle))
             }
@@ -357,37 +331,34 @@ impl ClientHandler {
     /// Build the wallet-less-resume [`WatermarkBundle`] for a rejected voucher
     /// (#1481 §5), or `None` when the voucher is not eligible. Returns `Some`
     /// only when ALL hold:
-    /// - `reason` is one of the four watermark-gated regression/exhaustion
-    ///   reasons (`StaleNonce` / `AmountRegression` / `BytesRegression` /
-    ///   `InsufficientDeposit`) — every other reason is never gated;
-    /// - the `rejected` voucher's signature recovers to `state.voucher_signer`,
-    ///   the channel's pinned signer — otherwise anyone who guessed the
-    ///   chain-derivable `channel_id` could pull a channel's private watermark
-    ///   with a garbage voucher;
-    /// - the channel has a prior accepted voucher (`last_signature` is `Some`)
-    ///   to echo back.
+    /// - `reason` is one of the watermark-gated regression/exhaustion reasons
+    ///   (`AmountRegression` / `BytesRegression` / `CapExceeded`);
+    /// - the `rejected` voucher's signature recovers to `state.signer`, the
+    ///   lane's pinned capability signer — otherwise anyone who guessed the
+    ///   chain-derivable `pool_id` could pull a lane's private watermark;
+    /// - the lane has a prior accepted voucher (`last_signature` is `Some`) to
+    ///   echo back.
     ///
-    /// The watermark reported is `state`'s last-accepted amount / nonce / bytes.
-    /// In the batched flow `state` is the advancing candidate, so this is the
+    /// The watermark reported is `state`'s last-accepted amount / bytes. In the
+    /// batched flow `state` is the advancing candidate, so this is the
     /// committed-prefix watermark; the caller reads it while still holding the
-    /// per-channel guard, before the commit swaps it into the live state.
+    /// per-lane guard, before the commit swaps it into the live state.
     fn watermark_bundle_for_reject(
         &self,
         reason: VoucherRejectReason,
         rejected: &SignedVoucher,
-        state: &ChannelState,
+        state: &LaneState,
     ) -> Option<WatermarkBundle> {
         if !reason.is_watermark_gated() {
             return None;
         }
         let recovered = rejected.recover_signer(&self.voucher_domain).ok()?;
-        if recovered != state.voucher_signer {
+        if recovered != state.signer {
             return None;
         }
         let last_signature = state.last_signature()?;
         Some(WatermarkBundle {
             amount: state.last_amount().to_be_bytes(),
-            nonce: state.last_nonce().to_be_bytes(),
             bytes_delivered: state.last_bytes_delivered().to_be_bytes(),
             last_signature: last_signature.to_vec(),
         })
@@ -395,24 +366,24 @@ impl ClientHandler {
 
     /// Durably commit the advanced `candidate` (ONE fsynced `store.record`, held
     /// on the blocking pool so it never blocks a runtime worker), swap it into
-    /// the live channel state, then write one `VoucherAck` per staged voucher and
-    /// run each voucher's post-commit bookkeeping (#1483).
+    /// the live lane state, then run each voucher's post-commit bookkeeping
+    /// (#1483). Acceptance is **implicit** — no positive message is written; the
+    /// caller simply keeps delivering.
     ///
-    /// `guard` is the per-channel lock, still held from verification so no
+    /// `guard` is the per-lane lock, still held from verification so no
     /// concurrent voucher advances the watermark between the value checked and
-    /// the value committed; it is dropped once the commit lands, before any
-    /// network write. On a store failure `guard.state` is NOT advanced and
-    /// [`CommitOutcome::StoreFailed`] is returned so the caller rejects the whole
-    /// batch with `RetryLater` — never acking un-durable state (#527, ADR 003).
+    /// the value committed; it is dropped once the commit lands. On a store
+    /// failure `guard.state` is NOT advanced and [`CommitOutcome::StoreFailed`]
+    /// is returned so the caller rejects the whole batch with `RetryLater` (#527,
+    /// ADR 003).
     #[allow(clippy::too_many_arguments)]
     async fn commit_batch(
         &self,
-        send: &mut SendStream,
-        mut guard: tokio::sync::MutexGuard<'_, ChannelDeliveryState>,
-        channel_id: ChannelId,
+        mut guard: tokio::sync::MutexGuard<'_, LaneDeliveryState>,
+        lane_key: LaneKey,
         hash: Hash,
         client_node_id: B256,
-        candidate: ChannelState,
+        candidate: LaneState,
         candidate_bytes: U256,
         staged: &[StagedVoucher],
     ) -> anyhow::Result<CommitOutcome> {
@@ -426,228 +397,289 @@ impl ClientHandler {
 
         if let Err(e) = record_res {
             // Transient store failure (#527): in-memory state did not advance.
-            // Surface `RetryLater` to the caller (which finishes the stream
-            // cleanly); MUST NOT `VoucherAck` (ADR 003 §355).
+            // Surface `RetryLater` to the caller; MUST NOT continue delivering on
+            // un-durable state.
             drop(guard);
-            tracing::warn!(error = %e, "channel store batch commit failed; rejecting with RetryLater");
+            tracing::warn!(error = %e, "lane store batch commit failed; rejecting with RetryLater");
             return Ok(CommitOutcome::StoreFailed);
         }
 
         // Durable. Advance in-memory state to the final cumulative watermark and
-        // release the lock before any network write.
+        // release the lock before any further work.
         guard.state = candidate;
         guard.bytes_delivered_cumulative = candidate_bytes;
         drop(guard);
 
-        // Post-commit, per-voucher bookkeeping + one `VoucherAck` each. All
-        // side effects here are best-effort and off the durability path.
+        // Post-commit, per-voucher bookkeeping. All side effects here are
+        // best-effort and off the durability path. No positive ack is written —
+        // acceptance is implicit and the caller keeps delivering.
         for s in staged {
-            self.record_receipt(hash, s.delta_bytes, client_node_id, s.wire_nonce);
+            self.record_receipt(hash, s.delta_bytes, client_node_id, s.amount);
             if let Some(acc) = self.region_accountant.as_ref() {
                 acc.record_served(&client_node_id.0, s.delta_bytes).await;
             }
             if let Some(gov) = self.leech_governor.as_ref() {
                 gov.record_served(&client_node_id.0, s.delta_bytes);
             }
-            if s.gapped {
-                self.metrics.voucher_nonce_gap();
-            }
-            self.write_message(send, &ClientMessage::VoucherAck).await?;
         }
 
-        // Channel-level, once per batch: stamp the admin last-voucher clock and
-        // hint the settlement service that the accrued claim advanced (#749/#327).
+        // Lane-level, once per batch: stamp the admin last-voucher clock and hint
+        // the settlement service that the accrued claim advanced (#749/#327).
         if let Some(activity) = self.voucher_activity.as_ref() {
-            activity.touch(channel_id);
+            activity.touch(lane_key);
         }
         if let Some(tx) = self.redeem_hint.as_ref()
-            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(channel_id)
+            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(lane_key)
         {
             self.metrics.redeem_hint_dropped();
         }
         Ok(CommitOutcome::Committed)
     }
-
-    /// Answer a [`CooperativeCloseRequest`] (ADR 003 §Cooperative close): sign a
-    /// `CooperativeClose` waiver over the channel's current voucher watermark and
-    /// reply with a [`CooperativeCloseAuth`] so the client can settle on-chain
-    /// without the dispute window.
-    ///
-    /// Best-effort by design: an unknown channel is answered by finishing the
-    /// stream with no auth, and the client falls back to `closeChannel`. A channel
-    /// with no accepted voucher yet (`last_nonce == 0`) is NOT declined — the node
-    /// signs a waiver over the zero tuple so the funder reclaims the deposit
-    /// window-free via `cooperativeClose(id, 0, 0, 0, ...)` (#1539). Signing
-    /// happens before the waiver flag is persisted, and the flag is persisted
-    /// (durably, mirroring #527) before
-    /// the auth is sent — so a store failure leaves the channel still serveable
-    /// and the node has not handed out a waiver it won't remember. Once flagged,
-    /// the node serves no further bytes on the channel (the `serve_stream` and
-    /// `collect_voucher_batch` gates).
-    pub(super) async fn handle_cooperative_close(
-        &self,
-        mut send: SendStream,
-        req: CooperativeCloseRequest,
-    ) -> anyhow::Result<()> {
-        let channel_id = ChannelId::from(req.channel_id);
-        let Some(channel) = self.channels.lock().await.get(&channel_id).cloned() else {
-            // Unknown channel — no waiver to give. Finish cleanly; client falls back.
-            let _ = send.finish();
-            return Ok(());
-        };
-
-        let auth = {
-            // Hold the per-channel lock across read-watermark → sign → persist so
-            // a concurrent voucher cannot advance the watermark between the value
-            // we sign and the flag we set. Signing is local and fast.
-            let mut guard = channel.lock().await;
-
-            // Ownership gate. Signing a waiver is a DURABLE, one-way commitment —
-            // the node then serves no further bytes on the channel (the
-            // `serve_stream` and `collect_voucher` gates) — and `channel_id =
-            // keccak256(client, provider, nonce)` is chain-derivable, so this
-            // request MUST prove control of the channel's `voucher_signer` key.
-            // The requester signs an off-chain EIP-712 `CooperativeCloseRequest`
-            // (recovered under the same `PaymentChannel` voucher domain); we
-            // refuse unless it recovers to `state.voucher_signer`. Without this,
-            // any peer that can name a channel id could force the node to sign a
-            // waiver and permanently freeze the channel.
-            //
-            // Checked against `voucher_signer`, not the funder `client` — a
-            // SIGNER question, matching the delivery path's owner-match gate and
-            // the on-chain `cooperativeClose`, which verifies the client voucher
-            // against `ch.voucherSigner` (never `ch.client`). The funder role
-            // authorizes nothing by signature, so a delegated channel's funder
-            // could neither complete the on-chain close nor should it be able to
-            // freeze the channel. This is the cooperative-close analogue of the
-            // owner-match gate the cooperative-close branch returns above, before
-            // that gate runs.
-            //
-            // Decline == finish the stream with no waiver, byte-for-byte the
-            // unknown-channel decline above, so an unauthorized request stays
-            // wire-indistinguishable and leaks neither channel existence nor the
-            // watermark. The otherwise-invisible refusal is metered so operators
-            // can see the probing.
-            let authorized_signer = guard.state.voucher_signer;
-            let authorized = matches!(
-                decdn_incentive::recover_coop_close_request(
-                    B256::from(req.channel_id),
-                    &req.client_signature,
-                    &self.voucher_domain,
-                ),
-                Ok(recovered) if recovered == authorized_signer
-            );
-            if !authorized {
-                drop(guard);
-                self.metrics.cooperative_close_request_unauthorized();
-                tracing::warn!(
-                    %channel_id,
-                    "cooperative-close request without a valid voucher-signer signature; declining"
-                );
-                let _ = send.finish();
-                return Ok(());
-            }
-
-            // A channel that never accepted a voucher (`last_nonce == 0`) is not
-            // declined (#1539): the node signs a waiver over the zero tuple so the
-            // funder reclaims the deposit in one `cooperativeClose(id, 0, 0, 0,
-            // ...)` — window-free — instead of the `closeChannelWithoutVoucher` →
-            // dispute-window → `settleChannel` fallback. The node is owed nothing
-            // either way, so cooperating costs it nothing; the auth gate above
-            // (proving control of `voucher_signer`) already bounds this to the
-            // channel's own signer, so it is neither a griefing vector nor a leak
-            // to any third party.
-            let close = CooperativeClose {
-                channel_id,
-                amount: guard.state.last_amount(),
-                nonce: guard.state.last_nonce(),
-                bytes_delivered: guard.state.last_bytes_delivered(),
-                token: guard.state.token,
-            };
-            let signed = close
-                .sign(self.eth_signer.as_ref(), &self.voucher_domain)
-                .map_err(|e| anyhow::anyhow!("cooperative-close waiver signing failed: {e}"))?;
-            // Persist the no-longer-serving flag before returning the waiver. On a
-            // store failure this propagates (no auth sent) and the channel stays
-            // serveable — safe. `mark_cooperative_close_signed` performs a
-            // synchronous fsynced redb write, which must not block a runtime
-            // worker — run it on the blocking pool against a clone and commit back
-            // only on `Ok`, mirroring `apply_voucher` / `update_channel_deposit`.
-            let mut candidate = guard.state.clone();
-            let store = Arc::clone(&self.channel_state_store);
-            let (mark_res, candidate) = tokio::task::spawn_blocking(move || {
-                let res = candidate.mark_cooperative_close_signed(&*store);
-                (res, candidate)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("cooperative-close mark task failed: {e}"))?;
-            mark_res?;
-            guard.state = candidate;
-            // Echo the client's own last-accepted voucher signature (#1495). It
-            // is the signature over exactly the tuple declared below — both are
-            // read from the same `guard.state` under the same guard, and
-            // `ChannelState::accept_voucher` writes all four together only after
-            // verifying the signature against `voucher_signer` — so any stored
-            // signature is genuine and can never be paired with a different
-            // tuple. A client whose persisted watermark lags can therefore verify
-            // against its own key that the tuple is one it already signed,
-            // instead of dead-ending on the over-claim refusal and falling back
-            // to the slow `closeChannel` path with a voucher that underpays us.
-            // Same value and same purpose as `WatermarkBundle::last_signature` on
-            // the fetch path (#1481).
-            //
-            // An empty echo sends the auth with no reconcile evidence: the client
-            // cannot verify and keeps its refusal. Two disjoint causes reach it:
-            //
-            //   * `last_nonce == 0` — a zero-voucher close (#1539). Nothing was
-            //     ever signed, so there is genuinely nothing to echo, and the
-            //     client's authorized watermark is also zero so it never reaches
-            //     the reconcile branch. This is normal, not an anomaly — do NOT
-            //     meter it.
-            //   * `last_nonce != 0` with no stored signature — a **schema-v1 store
-            //     record**, since `accept_voucher` writes nonce and signature
-            //     together, so a non-zero nonce with no signature can only be a
-            //     pre-v2 row. That strands exactly the lagging client #1495 exists
-            //     for, so meter it rather than letting a stale row look like a
-            //     normal waiver.
-            let last_signature = if let Some(sig) = guard.state.last_signature() {
-                sig.to_vec()
-            } else {
-                if guard.state.last_nonce() != U256::ZERO {
-                    self.metrics.cooperative_close_auth_no_echo();
-                    tracing::warn!(
-                        %channel_id,
-                        nonce = %guard.state.last_nonce(),
-                        "cooperative-close: channel has an accepted voucher but no stored \
-                         signature (pre-v2 store record); sending the waiver with no echo — a \
-                         client whose watermark lags cannot reconcile and will fall back to \
-                         closeChannel"
-                    );
-                }
-                Vec::new()
-            };
-            CooperativeCloseAuth {
-                channel_id: req.channel_id,
-                amount: guard.state.last_amount().to_be_bytes(),
-                nonce: guard.state.last_nonce().to_be_bytes(),
-                bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
-                signature: signed.signature.as_bytes().to_vec(),
-                last_signature,
-            }
-        };
-
-        self.write_message(&mut send, &ClientMessage::CooperativeCloseAuth(auth))
-            .await?;
-        let _ = send.finish();
-        Ok(())
-    }
 }
 
 /// Outcome of the durable half of a voucher batch ([`ClientHandler::commit_batch`]).
 enum CommitOutcome {
-    /// The batch fsynced, state advanced, and every voucher was acked.
+    /// The batch fsynced and in-memory state advanced.
     Committed,
-    /// The fsynced `store.record` failed; in-memory state is unchanged and no
-    /// voucher was acked. The caller rejects the whole batch with `RetryLater`.
+    /// The fsynced `store.record` failed; in-memory state is unchanged. The
+    /// caller rejects the whole batch with `RetryLater`.
     StoreFailed,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, U256};
+    use decdn_incentive::store::{PoolStateStore, StoreError};
+    use decdn_incentive::{LaneKey, LaneState};
+    use tokio::sync::Mutex;
+
+    use super::super::{LaneDeliveryState, handler_over_store};
+    use super::{CommitOutcome, StagedVoucher};
+    use crate::metrics::Metrics;
+    use decdn_cache::Hash;
+
+    /// A [`PoolStateStore`] whose `record` always fails, to drive the #527
+    /// durable-commit failure path. Reads succeed (empty) so hydration is clean.
+    #[derive(Debug)]
+    struct FailingRecordStore;
+
+    impl PoolStateStore for FailingRecordStore {
+        fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn record(&self, _state: &LaneState) -> Result<(), StoreError> {
+            Err(StoreError::Backend("injected record failure".to_string()))
+        }
+        fn forget(&self, _key: LaneKey) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn get(&self, _key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+            Ok(None)
+        }
+    }
+
+    /// #527: a failed durable `record` in `commit_batch` leaves the in-memory lane
+    /// state UNCHANGED and reports [`CommitOutcome::StoreFailed`] (which the batch
+    /// path turns into `RetryLater` with `committed == 0`). Serving MUST NOT
+    /// continue on un-durable state — a restart would otherwise reopen the
+    /// voucher-replay window.
+    #[tokio::test]
+    async fn store_failure_rejects_batch_with_retry_later_no_state_advance() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_over_store(
+            &metrics,
+            Arc::new(FailingRecordStore) as Arc<dyn PoolStateStore>,
+        )
+        .await;
+
+        let lane_key = LaneKey {
+            pool_id: alloy::primitives::B256::repeat_byte(0x33),
+            signer: Address::repeat_byte(0x44),
+            provider: Address::repeat_byte(0x55),
+        };
+        // Seed the live lane at amount/bytes zero.
+        let seed = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::from(1_000_000u64), // cap
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState {
+            state: seed,
+            bytes_delivered_cumulative: U256::ZERO,
+        }));
+        handler
+            .lanes
+            .lock()
+            .await
+            .insert(lane_key, Arc::clone(&lane));
+
+        // An advanced candidate the commit would swap in on success.
+        let candidate = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::from(1_000_000u64),
+            0,
+            U256::from(500u64),
+            U256::from(500u64),
+            Some([7u8; 65]),
+        );
+        let staged = vec![StagedVoucher {
+            delta_bytes: 500,
+            amount: U256::from(500u64).to_be_bytes(),
+        }];
+
+        let guard = lane.lock().await;
+        let outcome = handler
+            .commit_batch(
+                guard,
+                lane_key,
+                Hash::from_bytes([9u8; 32]),
+                alloy::primitives::B256::repeat_byte(0x66),
+                candidate,
+                U256::from(500u64),
+                &staged,
+            )
+            .await
+            .expect("commit_batch returns Ok(StoreFailed), never Err, on a store fault");
+        assert!(
+            matches!(outcome, CommitOutcome::StoreFailed),
+            "a record failure must surface as StoreFailed"
+        );
+
+        // The in-memory lane state did NOT advance past the seed.
+        let after = lane.lock().await;
+        assert_eq!(
+            after.state.last_amount(),
+            U256::ZERO,
+            "the committed watermark must stay at the seed after a store failure"
+        );
+        assert_eq!(
+            after.bytes_delivered_cumulative,
+            U256::ZERO,
+            "the cumulative byte counter must not advance on an un-durable batch"
+        );
+    }
+
+    /// #527 success twin of the store-failure test: a valid signed voucher
+    /// verifies against a fresh lane (advancing the in-memory CANDIDATE to its
+    /// cumulative amount/bytes without touching the store), and a successful
+    /// `commit_batch` then advances the LIVE lane's persisted watermark.
+    #[tokio::test]
+    async fn staged_voucher_advances_candidate_lane() {
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+            as Arc<dyn PoolStateStore>;
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        // `handler_over_store` builds all three EIP-712 domains from this literal,
+        // so the voucher signer must sign over the same one.
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let signer_key = PrivateKeySigner::random();
+        let signer = signer_key.address();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        // Seed a fresh lane at a zero watermark with an ample cap.
+        let lane_key = LaneKey {
+            pool_id,
+            signer,
+            provider,
+        };
+        let seed = LaneState::hydrate(
+            pool_id,
+            signer,
+            provider,
+            U256::MAX,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState {
+            state: seed,
+            bytes_delivered_cumulative: U256::ZERO,
+        }));
+        handler
+            .lanes
+            .lock()
+            .await
+            .insert(lane_key, Arc::clone(&lane));
+
+        // A cumulative voucher paying exactly one MB from zero, signed by the
+        // lane's pinned signer over the lane context.
+        let rate_per_mb = 1_000_000u64;
+        let delta = decdn_incentive::rate::BYTES_PER_MB;
+        let new_bytes = U256::from(delta);
+        let amount = decdn_incentive::min_payment(delta, rate_per_mb);
+        let signed_voucher = decdn_incentive::Voucher {
+            pool_id,
+            signer,
+            provider,
+            amount,
+            bytes_delivered: new_bytes,
+        }
+        .sign(&signer_key, &domain)
+        .expect("sign voucher");
+        let wire = decdn_protocol::client::Voucher {
+            signature: signed_voucher.signature.as_bytes().to_vec(),
+            amount: amount.to_be_bytes(),
+        };
+
+        // verify_voucher advances the CANDIDATE in memory only (no store write).
+        let snapshot = lane.lock().await.state.clone();
+        let verified = handler
+            .verify_voucher(&snapshot, U256::ZERO, &wire, rate_per_mb, delta)
+            .expect("a well-formed voucher verifies against a fresh lane");
+        assert_eq!(
+            verified.new_bytes, new_bytes,
+            "the candidate advances to the voucher's cumulative bytes"
+        );
+        assert_eq!(
+            verified.next_state.last_amount(),
+            amount,
+            "the candidate advances to the voucher's cumulative amount"
+        );
+
+        // A successful commit advances the LIVE lane's durable watermark.
+        let guard = lane.lock().await;
+        let outcome = handler
+            .commit_batch(
+                guard,
+                lane_key,
+                Hash::from_bytes([1u8; 32]),
+                B256::repeat_byte(0x66),
+                verified.next_state,
+                verified.new_bytes,
+                &[verified.staged],
+            )
+            .await
+            .expect("commit_batch returns Ok on a clean record");
+        assert!(
+            matches!(outcome, CommitOutcome::Committed),
+            "a clean record commits the batch"
+        );
+
+        let after = lane.lock().await;
+        assert_eq!(
+            after.state.last_amount(),
+            amount,
+            "the committed watermark advanced to the voucher amount"
+        );
+        assert_eq!(
+            after.bytes_delivered_cumulative, new_bytes,
+            "the cumulative byte counter advanced to the voucher's bytes"
+        );
+    }
 }

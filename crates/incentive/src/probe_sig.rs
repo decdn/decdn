@@ -26,7 +26,7 @@
 //! ```
 //!
 //! The `SlashJudge` contract uses its own domain separator (distinct from
-//! `CapacityBond` / `PaymentChannel`) to prevent cross-contract
+//! `CapacityBond` / `PaymentPool`) to prevent cross-contract
 //! signature replay (ADR 014 §EIP-712 Type Definitions).
 //!
 //! # `ProbeResponse` type

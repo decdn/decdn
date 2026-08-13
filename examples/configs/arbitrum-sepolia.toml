@@ -39,7 +39,7 @@ chain_id = 421614
 # Required. Settlement gateway, operator bond, and the slash-signature verifying
 # contract. A wrong/missing slash_judge_address silently produces signatures no
 # verifier accepts, so resolution fails fast if it is absent.
-payment_channel_address = "0x62B911B7CdEA5eedFB7dC0E2343440516fB8cb43"
+payment_pool_address    = "0x62B911B7CdEA5eedFB7dC0E2343440516fB8cb43"
 capacity_bond_address   = "0x2F08aE39B0127C92d56F9E5eAd20692b217dDc58"
 slash_judge_address     = "0xa9feAb7c1a82e32a2A52c40aD545C0111eC3A2b4"
 

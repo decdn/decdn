@@ -293,47 +293,44 @@ impl NodeFixture {
         self.origin_dir.path()
     }
 
-    /// Poll `admin_v1_channels` until the daemon's settlement watcher has
-    /// registered `channel_id` (or `timeout` elapses).
+    /// Poll `admin_v1_lanes` until the daemon reports a lane on `pool_id` (or
+    /// `timeout` elapses). The admin surface keys each snapshot by the lane's
+    /// `pool_id`, so a matching entry means the node has accepted at least one
+    /// voucher against this pool.
     ///
-    /// The pre-observation window and a genuine refusal are the SAME wire
-    /// `NotFound` (`ServeRejectReason::wire_error` collapses both), so a journey
-    /// that must assert on a single refusal cannot use
-    /// [`crate::client::ClientFixture::fetch`]'s retry loop to ride the window
-    /// out. Waiting on the node's own view of the channel narrows it.
+    /// A lane exists in the node's store **only after** the first voucher lands:
+    /// the node registers no lane at pool-open time — it reads the pool live via
+    /// `getPool` on the serve path and creates the lane when it intakes the
+    /// capability + first voucher. So this returns only once a paid fetch has
+    /// already run on the pool; it cannot be used to wait *before* the first
+    /// delivery.
     ///
-    /// **On its own it does not close that window.** `admin_v1_channels` reads
-    /// the *persisted* channel store, whereas `serve_stream` / `pull_authorized`
-    /// gate on `ClientHandler`'s in-memory map — and `register_open_channel`
-    /// awaits the store fsync *before* inserting into that map. So this can
-    /// return while the serve path still answers `UnknownChannel`.
-    ///
-    /// Prefer [`crate::client::ClientFixture::open_session`], which pairs this
-    /// with a retried warm-up fetch; a served blob is what actually proves the
-    /// live map is populated. Call this directly only to assert on the node's
-    /// bookkeeping itself.
-    pub async fn wait_for_channel(
+    /// Prefer [`crate::client::ClientFixture::open_session`], which drives a
+    /// retried warm-up fetch and so both creates the lane and proves the serve
+    /// path accepts the pool. Call this directly only to assert on the node's
+    /// per-lane bookkeeping itself.
+    pub async fn wait_for_pool(
         &self,
-        channel_id: alloy::primitives::B256,
+        pool_id: alloy::primitives::B256,
         timeout: Duration,
     ) -> anyhow::Result<()> {
         let admin = self.admin_client()?;
-        let wanted = channel_id.to_string();
+        let wanted = pool_id.to_string();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let known = admin
-                .channels()
+                .lanes()
                 .await
-                .context("admin channels")?
-                .channels
+                .context("admin lanes")?
+                .lanes
                 .into_iter()
-                .any(|c| c.channel_id.eq_ignore_ascii_case(&wanted));
+                .any(|c| c.pool_id.eq_ignore_ascii_case(&wanted));
             if known {
                 return Ok(());
             }
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
-                "node never observed channel {wanted} within {timeout:?}"
+                "node never reported a lane on pool {wanted} within {timeout:?}"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -658,7 +655,7 @@ bind_port = {bind_port}
 rpc_url = "{rpc_url}"
 eth_keystore = '{keystore}'
 chain_id = {chain_id}
-payment_channel_address = "{payment_channel}"
+payment_pool_address = "{payment_pool}"
 capacity_bond_address = "{capacity_bond}"
 slash_judge_address = "{slash_judge}"
 slash_appeal_address = "{slash_appeal}"
@@ -696,7 +693,7 @@ metrics_bind = "127.0.0.1"
         rpc_url = c.rpc_url,
         keystore = c.keystore.display(),
         chain_id = c.chain_id,
-        payment_channel = a.payment_channel,
+        payment_pool = a.payment_pool,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
         slash_appeal = a.slash_appeal,
@@ -844,7 +841,7 @@ mod tests {
     fn render_config_emits_parseable_toml() {
         let addrs = ContractAddrs {
             capacity_bond: Address::from([0x11; 20]),
-            payment_channel: Address::from([0x22; 20]),
+            payment_pool: Address::from([0x22; 20]),
             fee_router: Address::from([0x33; 20]),
             token: Address::from([0x44; 20]),
             slash_judge: Address::from([0x55; 20]),
@@ -911,7 +908,7 @@ mod tests {
     fn sample_rendered_config() -> String {
         let addrs = ContractAddrs {
             capacity_bond: Address::from([0x11; 20]),
-            payment_channel: Address::from([0x22; 20]),
+            payment_pool: Address::from([0x22; 20]),
             fee_router: Address::from([0x33; 20]),
             token: Address::from([0x44; 20]),
             slash_judge: Address::from([0x55; 20]),

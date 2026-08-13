@@ -1,45 +1,46 @@
-//! EIP-712 payment vouchers for the `PaymentChannel` contract.
+//! EIP-712 payment vouchers for the `PaymentPool` contract.
 //!
 //! Vouchers are off-chain signed messages a client (payer) issues to a node
-//! (payee) as content is delivered. Each voucher carries a cumulative `amount`
-//! of `USDC` base units (`µUSDC`) and a cumulative `bytes_delivered` count.
-//! The delivering node holds the latest voucher and submits it on-chain to
-//! close and settle the channel.
+//! (provider) as content is delivered. Each voucher carries a cumulative
+//! `amount` of `USDC` base units (`µUSDC`) and a cumulative `bytes_delivered`
+//! count, scoped to a `(pool_id, signer, provider)` lane. The delivering node
+//! holds the latest voucher and redeems it on-chain against the pool.
 //!
 //! The signed payload follows ADR 003 §EIP-712 Voucher Signature exactly so
-//! that an off-chain Rust signature byte-matches what the on-chain contract's
-//! `closeChannel` / `disputeChannel` will accept.
+//! that an off-chain Rust signature byte-matches what the on-chain
+//! `PaymentPool.redeem` accepts.
 //!
 //! # Domain
 //!
 //! ```text
 //! EIP712Domain {
-//!     name: "PaymentChannel",
+//!     name: "PaymentPool",
 //!     version: "1",
 //!     chainId: <L2 chain id>,
-//!     verifyingContract: <PaymentChannel deployment address>,
+//!     verifyingContract: <PaymentPool deployment address>,
 //! }
 //! ```
 //!
 //! # Voucher type
 //!
 //! ```text
-//! Voucher(bytes32 channelId,uint256 amount,uint256 nonce,
-//!         uint256 bytesDelivered,address token)
+//! Voucher(bytes32 poolId,address signer,address provider,
+//!         uint256 amount,uint256 bytesDelivered)
 //! ```
 //!
-//! Nonces start at 1; nonce 0 is the on-chain sentinel for "no voucher
-//! submitted" (ADR 003 §Voucher Nonce Convention).
+//! There is no nonce: `amount` is the sole monotone ordering and replay key —
+//! a voucher whose `amount` is no greater than the highest already accepted is
+//! stale (ADR 003 §Voucher ordering).
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::signers::SignerSync;
 use alloy::sol_types::{SolStruct, eip712_domain};
 
-/// EIP-712 domain `name` field. Must match the `PaymentChannel`
-/// contract's domain exactly — a mismatch produces a different digest and
-/// every signature fails on-chain.
-pub const DOMAIN_NAME: &str = "PaymentChannel";
+/// EIP-712 domain `name` field. Must match the `PaymentPool` contract's
+/// domain exactly — a mismatch produces a different digest and every
+/// signature fails on-chain.
+pub const DOMAIN_NAME: &str = "PaymentPool";
 
 /// EIP-712 domain `version` field.
 pub const DOMAIN_VERSION: &str = "1";
@@ -58,11 +59,11 @@ mod sol_types {
     alloy::sol! {
         #[allow(non_snake_case, missing_debug_implementations)]
         struct Voucher {
-            bytes32 channelId;
+            bytes32 poolId;
+            address signer;
+            address provider;
             uint256 amount;
-            uint256 nonce;
             uint256 bytesDelivered;
-            address token;
         }
     }
 }
@@ -70,7 +71,7 @@ mod sol_types {
 use sol_types::Voucher as VoucherSol;
 
 /// Construct the EIP-712 domain used to sign vouchers for a given
-/// `PaymentChannel` deployment.
+/// `PaymentPool` deployment.
 #[must_use]
 pub fn voucher_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
     eip712_domain! {
@@ -83,32 +84,33 @@ pub fn voucher_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domai
 
 /// A payment voucher in its unsigned form.
 ///
-/// All amounts are cumulative across the channel's lifetime — a voucher with
-/// `amount = 100` does not mean "pay 100 more" but "the total claimable is
-/// 100." `nonce` and `bytes_delivered` are cumulative likewise.
+/// All amounts are cumulative across the lane's lifetime — a voucher with
+/// `amount = 100` does not mean "pay 100 more" but "the total claimable on
+/// this lane is 100." `bytes_delivered` is cumulative likewise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Voucher {
-    /// `channelId = keccak256(client, provider, channelNonce)` per ADR 003.
-    pub channel_id: B256,
+    /// The pool this voucher draws from — the on-chain `PaymentPool` deposit id.
+    pub pool_id: B256,
+    /// The address whose EIP-712 signature authorizes this voucher (the
+    /// capability signer the pool owner delegated spend to).
+    pub signer: Address,
+    /// The provider node this voucher pays — a capability voucher is scoped to
+    /// one provider and is invalid if redeemed against another.
+    pub provider: Address,
     /// Cumulative payment in token base units (`µUSDC` for `USDC`).
     pub amount: U256,
-    /// Voucher sequence number within the channel; starts at 1.
-    pub nonce: U256,
-    /// Cumulative bytes delivered against this channel.
+    /// Cumulative bytes delivered against this lane.
     pub bytes_delivered: U256,
-    /// `ERC-20` token address (`USDC` — the only token bound by
-    /// `PaymentChannel`).
-    pub token: Address,
 }
 
 impl Voucher {
     const fn to_sol(&self) -> VoucherSol {
         VoucherSol {
-            channelId: self.channel_id,
+            poolId: self.pool_id,
+            signer: self.signer,
+            provider: self.provider,
             amount: self.amount,
-            nonce: self.nonce,
             bytesDelivered: self.bytes_delivered,
-            token: self.token,
         }
     }
 
@@ -141,9 +143,9 @@ impl Voucher {
 
 /// A voucher together with its EIP-712 signature.
 ///
-/// Holding a `SignedVoucher` is sufficient for a node to settle the channel —
-/// the signature recovers the client's address, which the contract then
-/// matches against `channel.client`.
+/// Holding a `SignedVoucher` is sufficient for a node to redeem against the
+/// pool — the signature recovers the capability signer's address, which the
+/// contract then matches against the registered capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedVoucher {
     pub voucher: Voucher,
@@ -202,7 +204,7 @@ pub enum VoucherError {
     #[error("voucher signature is malformed")]
     InvalidSignature,
     /// The signature is well-formed but recovers to an address that does not
-    /// match the expected signer — e.g., the channel's client field.
+    /// match the expected signer — e.g., the lane's pinned capability signer.
     #[error("voucher signed by {recovered}, expected {expected}")]
     WrongSigner {
         expected: Address,
@@ -219,11 +221,11 @@ mod tests {
 
     fn sample_voucher() -> Voucher {
         Voucher {
-            channel_id: b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+            pool_id: b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+            signer: address!("00000000000000000000000000000000000000a1"),
+            provider: address!("00000000000000000000000000000000000000b2"),
             amount: U256::from(10_000_000u64), // 10 USDC at 6 decimals
-            nonce: U256::from(1u64),
             bytes_delivered: U256::from(1_048_576u64), // 1 MB
-            token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), // USDC mainnet
         }
     }
 
@@ -292,7 +294,7 @@ mod tests {
     fn high_s_voucher_signature_rejected() -> anyhow::Result<()> {
         // A malicious client can flip a valid voucher signature to its
         // non-canonical high-`s` twin. alloy's recovery would normalize and
-        // accept it, but the on-chain `PaymentChannel` reverts (#836). The
+        // accept it, but the on-chain `PaymentPool` reverts (#836). The
         // off-chain accept-set must match: reject the twin, accept the original.
         let signer = PrivateKeySigner::random();
         let domain = sample_domain();
@@ -368,12 +370,28 @@ mod tests {
     }
 
     #[test]
-    fn tampered_nonce_rejected() -> anyhow::Result<()> {
+    fn tampered_signer_rejected() -> anyhow::Result<()> {
         let signer = PrivateKeySigner::random();
         let domain = sample_domain();
         let mut signed = sample_voucher().sign(&signer, &domain)?;
 
-        signed.voucher.nonce += U256::from(1u64);
+        signed.voucher.signer = address!("000000000000000000000000000000000000dead");
+
+        let err = err_of(signed.verify_signer(signer.address(), &domain))?;
+        anyhow::ensure!(
+            matches!(err, VoucherError::WrongSigner { .. }),
+            "expected WrongSigner, got: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_provider_rejected() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let domain = sample_domain();
+        let mut signed = sample_voucher().sign(&signer, &domain)?;
+
+        signed.voucher.provider = address!("000000000000000000000000000000000000beef");
 
         let err = err_of(signed.verify_signer(signer.address(), &domain))?;
         anyhow::ensure!(
@@ -400,28 +418,12 @@ mod tests {
     }
 
     #[test]
-    fn tampered_channel_id_rejected() -> anyhow::Result<()> {
+    fn tampered_pool_id_rejected() -> anyhow::Result<()> {
         let signer = PrivateKeySigner::random();
         let domain = sample_domain();
         let mut signed = sample_voucher().sign(&signer, &domain)?;
 
-        signed.voucher.channel_id = B256::ZERO;
-
-        let err = err_of(signed.verify_signer(signer.address(), &domain))?;
-        anyhow::ensure!(
-            matches!(err, VoucherError::WrongSigner { .. }),
-            "expected WrongSigner, got: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn tampered_token_rejected() -> anyhow::Result<()> {
-        let signer = PrivateKeySigner::random();
-        let domain = sample_domain();
-        let mut signed = sample_voucher().sign(&signer, &domain)?;
-
-        signed.voucher.token = address!("0000000000000000000000000000000000000000");
+        signed.voucher.pool_id = B256::ZERO;
 
         let err = err_of(signed.verify_signer(signer.address(), &domain))?;
         anyhow::ensure!(
@@ -441,7 +443,7 @@ mod tests {
         // Canonical EIP-712 type-string per ADR 003 §EIP-712 Voucher
         // Signature. Single space between Solidity type and field name; no
         // other whitespace; fields in declaration order.
-        let canonical: &[u8] = b"Voucher(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)";
+        let canonical: &[u8] = b"Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered)";
         let expected = keccak256(canonical);
         let actual = VoucherSol::eip712_type_hash(&sample_voucher().to_sol());
         anyhow::ensure!(
@@ -499,11 +501,11 @@ mod tests {
         let address = signer.address();
 
         let voucher = Voucher {
-            channel_id: B256::repeat_byte(0xAA),
+            pool_id: B256::repeat_byte(0xAA),
+            signer: address,
+            provider: address!("00000000000000000000000000000000000000b2"),
             amount: U256::from(1_000_000u64),
-            nonce: U256::from(1u64),
             bytes_delivered: U256::from(1_048_576u64),
-            token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
         };
         let domain = voucher_domain(
             421_614,
@@ -520,27 +522,27 @@ mod tests {
     }
 
     /// Pin the EIP-712 domain `name`/`version` to the on-chain contract's
-    /// constructor args — `PaymentChannel.sol` calls `EIP712("PaymentChannel",
-    /// "1")`. A divergence here makes every `closeChannel`/`withdraw` revert
-    /// with the contract's `InvalidVoucherSignature` even though off-chain
+    /// constructor args — `PaymentPool.sol` calls `EIP712("PaymentPool",
+    /// "1")`. A divergence here makes every `redeem` revert with the
+    /// contract's `InvalidVoucherSignature` even though off-chain
     /// `verify_signer` passes, so the literal is asserted directly rather than
     /// derived from `DOMAIN_NAME` (which would let a regression slip through).
     #[test]
-    fn domain_matches_payment_channel_contract() {
+    fn domain_matches_payment_pool_contract() {
         assert_eq!(
-            DOMAIN_NAME, "PaymentChannel",
-            "voucher domain name must match PaymentChannel.sol EIP712 ctor"
+            DOMAIN_NAME, "PaymentPool",
+            "voucher domain name must match PaymentPool.sol EIP712 ctor"
         );
         assert_eq!(
             DOMAIN_VERSION, "1",
-            "voucher domain version must match PaymentChannel.sol EIP712 ctor"
+            "voucher domain version must match PaymentPool.sol EIP712 ctor"
         );
     }
 }
 
 /// Property-based tests for the EIP-712 voucher core (#740). The example-based
 /// `tests` module above pins fixed vectors and single-field tamper cases with
-/// small values; these sweep the full `U256` keyspace for `amount` / `nonce` /
+/// small values; these sweep the full `U256` keyspace for `amount` /
 /// `bytes_delivered` with the dangerous boundaries (`0`, `u64::MAX`,
 /// `U256::MAX`) heavily over-sampled (see [`any_u256`]), to catch any silent
 /// truncation or accept-invalid path before mainnet. We trust `alloy` for the
@@ -598,18 +600,18 @@ mod prop_tests {
     fn any_voucher() -> impl Strategy<Value = Voucher> {
         (
             any_b256(),
-            any_u256(),
-            any_u256(),
-            any_u256(),
             any_address(),
+            any_address(),
+            any_u256(),
+            any_u256(),
         )
             .prop_map(
-                |(channel_id, amount, nonce, bytes_delivered, token)| Voucher {
-                    channel_id,
+                |(pool_id, signer, provider, amount, bytes_delivered)| Voucher {
+                    pool_id,
+                    signer,
+                    provider,
                     amount,
-                    nonce,
                     bytes_delivered,
-                    token,
                 },
             )
     }
@@ -617,7 +619,7 @@ mod prop_tests {
     proptest! {
         /// Signing then recovering returns the signer's own address, and
         /// `verify_signer` accepts it — for every voucher across the full
-        /// `U256` range, including `amount = 0`, `nonce = U256::MAX`, and
+        /// `U256` range, including `amount = 0` and
         /// `bytes_delivered = u64::MAX`. A truncation in the digest path would
         /// surface here as a recovered-address mismatch.
         #[test]
@@ -660,35 +662,35 @@ mod prop_tests {
             voucher in any_voucher(),
             chain_id in any::<u64>(),
             verifying in any_address(),
-            other_channel in any_b256(),
+            other_pool in any_b256(),
+            other_signer in any_address(),
+            other_provider in any_address(),
             other_amount in any_u256(),
-            other_nonce in any_u256(),
             other_bytes in any_u256(),
-            other_token in any_address(),
         ) {
-            prop_assume!(other_channel != voucher.channel_id);
+            prop_assume!(other_pool != voucher.pool_id);
+            prop_assume!(other_signer != voucher.signer);
+            prop_assume!(other_provider != voucher.provider);
             prop_assume!(other_amount != voucher.amount);
-            prop_assume!(other_nonce != voucher.nonce);
             prop_assume!(other_bytes != voucher.bytes_delivered);
-            prop_assume!(other_token != voucher.token);
 
             let domain = voucher_domain(chain_id, verifying);
             let base = voucher.signing_hash(&domain);
 
-            let with_channel = Voucher { channel_id: other_channel, ..voucher.clone() };
-            prop_assert_ne!(with_channel.signing_hash(&domain), base, "channel_id not bound");
+            let with_pool = Voucher { pool_id: other_pool, ..voucher.clone() };
+            prop_assert_ne!(with_pool.signing_hash(&domain), base, "pool_id not bound");
+
+            let with_signer = Voucher { signer: other_signer, ..voucher.clone() };
+            prop_assert_ne!(with_signer.signing_hash(&domain), base, "signer not bound");
+
+            let with_provider = Voucher { provider: other_provider, ..voucher.clone() };
+            prop_assert_ne!(with_provider.signing_hash(&domain), base, "provider not bound");
 
             let with_amount = Voucher { amount: other_amount, ..voucher.clone() };
             prop_assert_ne!(with_amount.signing_hash(&domain), base, "amount not bound");
 
-            let with_nonce = Voucher { nonce: other_nonce, ..voucher.clone() };
-            prop_assert_ne!(with_nonce.signing_hash(&domain), base, "nonce not bound");
-
             let with_bytes = Voucher { bytes_delivered: other_bytes, ..voucher.clone() };
             prop_assert_ne!(with_bytes.signing_hash(&domain), base, "bytes_delivered not bound");
-
-            let with_token = Voucher { token: other_token, ..voucher.clone() };
-            prop_assert_ne!(with_token.signing_hash(&domain), base, "token not bound");
         }
 
         /// The domain is binding: a voucher signed under one `(chain_id,

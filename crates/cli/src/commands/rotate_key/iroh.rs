@@ -5,7 +5,7 @@
 //! `nodeId → address` mapping and writes the new one in the same call, so the
 //! two ids swap slashability atomically and the operator is never unslashable
 //! mid-rotation. Everything keyed on the Ethereum address — the bond, the
-//! declared tier, `firstBondedAt`, every open payment channel, and every
+//! declared tier, `firstBondedAt`, every open payment pool, and every
 //! voucher already signed against one — is untouched, because the address does
 //! not change.
 //!
@@ -769,9 +769,9 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
     // getting it wrong is what makes people avoid rotating at all.
     writeln!(
         w,
-        "Your bond, declared capacity, firstBondedAt, and every open payment channel are NOT \
+        "Your bond, declared capacity, firstBondedAt, and every open payment pool are NOT \
          affected — all of them key on the Ethereum address, which does not change. Vouchers \
-         already signed against those channels still settle. The old and new node ids swap \
+         already signed against those pools still settle. The old and new node ids swap \
          slashability in the same transaction, so there is no unslashable window."
     )?;
     writeln!(
@@ -1263,10 +1263,10 @@ mod tests {
     }
 
     /// The reassurance is the disclosure's job — an operator who believes
-    /// rotating costs them their bond or their open channels will not rotate a
+    /// rotating costs them their bond or their open payment pools will not rotate a
     /// compromised key, which is strictly worse than rotating one.
     #[test]
-    fn disclosure_says_the_bond_and_channels_survive() {
+    fn disclosure_says_the_bond_and_pools_survive() {
         let s = disclosure(&plan(true, true));
         assert!(s.contains("NOT affected"), "{s}");
         assert!(s.contains("still settle"), "names the voucher case: {s}");

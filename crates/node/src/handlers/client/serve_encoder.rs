@@ -7,7 +7,9 @@
 //!
 //! - leaf DATA comes from [`AwaitingDataReader`], which blocks on the store's
 //!   present-range watch until the leaf's content lands (racing the pull's terminal
-//!   signal for the no-hang guarantee), then reads it;
+//!   signal for the no-hang guarantee), then reads it; once the covering pull ends
+//!   cleanly the range is durably stored, so it reads straight from the store rather
+//!   than waiting on the observed bitfield, which can lag the admit;
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
 //!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture;
 //! - the encoded bytes are pushed through a bounded channel ([`ChannelWriter`]) and
@@ -115,24 +117,42 @@ impl AsyncSliceReader for AwaitingDataReader {
             let mut ended = Box::pin(liveness.notified());
             ended.as_mut().enable();
 
-            // No live fill still covers this range? A failed / abandoned pull fails
-            // the read; a clean pull means the bytes are authoritatively cached — one
-            // more check settles a lag.
+            // No live fill still covers this range. Decide on the terminal outcome:
             if !self.session.range_still_live(&range) {
-                if self.present_covers(offset, need).await? {
-                    break;
+                match self.session.outcome() {
+                    // A clean pull admitted every byte of its range to the store
+                    // BEFORE it marked ended, so the bytes are durably stored and the
+                    // authoritative ranged read below returns them. Read them straight
+                    // from the store rather than re-gating on the observed present
+                    // bitfield: that bitfield is served through the store actor's
+                    // `observe`, which can lag the durable admit by a store-actor hop
+                    // when the actor is starved of CPU (a slow, coverage-instrumented
+                    // run). Gating on it — as a wall-clock-bounded present-poll did —
+                    // aborts a serve whose bytes are in fact readable the moment the
+                    // lag exceeds the ceiling. The durable ranged read has no such lag,
+                    // so a clean outcome is proof the range is readable: break to it.
+                    // Timing-INDEPENDENT — the decision rests on the outcome, never a
+                    // wall clock.
+                    Some(Ok(())) => break,
+                    // A failed pull can never make the byte present — fail fast.
+                    Some(Err(msg)) => {
+                        return Err(io::Error::other(format!(
+                            "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
+                        )));
+                    }
+                    // No recorded outcome, yet nothing live covers the range:
+                    // `range_still_live` and `outcome` are read separately, so a fill
+                    // can retire between them. A fresh present check settles that benign
+                    // gap before declaring no coverer.
+                    None => {
+                        if self.present_covers(offset, need).await? {
+                            break;
+                        }
+                        return Err(io::Error::other(format!(
+                            "no live fill covers content [{offset}, +{len}); every covering pull ended"
+                        )));
+                    }
                 }
-                return Err(match self.session.outcome() {
-                    Some(Err(msg)) => io::Error::other(format!(
-                        "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
-                    )),
-                    Some(Ok(())) => io::Error::other(format!(
-                        "upstream pull completed but content [{offset}, +{len}) is missing"
-                    )),
-                    None => io::Error::other(format!(
-                        "no live fill covers content [{offset}, +{len}); every covering pull ended"
-                    )),
-                });
             }
 
             // Ensure a watch is open; it errors until the blob materializes —
