@@ -518,7 +518,7 @@ pub struct ClientHandler {
     lanes: Arc<Mutex<HashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>>,
     /// Serializes absolute lane snapshots without holding the lane map while
     /// individual lane state (which may be fsync-bound) is locked.
-    channel_metrics_refresh: Mutex<()>,
+    lane_metrics_refresh: Mutex<()>,
     /// Redeem-hint sender to the on-chain settlement service (#327), set at
     /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
@@ -666,7 +666,7 @@ impl ClientHandler {
         // Deposit is a pool-level, on-chain quantity (getPool), not carried per
         // lane, so the seller-side snapshot reports lane count only.
         deps.metrics
-            .set_inbound_channel_snapshot(map.len(), U256::ZERO);
+            .set_inbound_lane_snapshot(map.len(), U256::ZERO);
         Ok(Self {
             node_id: deps.node_id,
             metrics: deps.metrics,
@@ -682,7 +682,7 @@ impl ClientHandler {
             capability_sink: deps.capability_sink,
             pool_view: deps.pool_view,
             lanes: Arc::new(Mutex::new(map)),
-            channel_metrics_refresh: Mutex::new(()),
+            lane_metrics_refresh: Mutex::new(()),
             redeem_hint: deps.redeem_hint,
             voucher_activity: deps.voucher_activity,
             region_accountant: deps.region_accountant,
@@ -859,7 +859,7 @@ impl ClientHandler {
                 bytes_delivered_cumulative: bytes,
             }))
         });
-        self.refresh_channel_metrics().await;
+        self.refresh_lane_metrics().await;
         Ok(())
     }
 
@@ -871,7 +871,7 @@ impl ClientHandler {
     /// Propagates a [`StoreError`] if the durable delete fails.
     pub async fn forget_lane(&self, key: LaneKey) -> Result<(), StoreError> {
         self.lanes.lock().await.remove(&key);
-        self.refresh_channel_metrics().await;
+        self.refresh_lane_metrics().await;
         // Drop the in-memory last-voucher stamp too (issue #749 review):
         // `touch` inserts per-lane with no eviction, so without this a settled
         // lane's `Instant` would linger for the whole process lifetime — a slow
@@ -1082,12 +1082,12 @@ impl ClientHandler {
         Some(guard.state.clone())
     }
 
-    async fn refresh_channel_metrics(&self) {
-        let _refresh = self.channel_metrics_refresh.lock().await;
+    async fn refresh_lane_metrics(&self) {
+        let _refresh = self.lane_metrics_refresh.lock().await;
         let open = self.lanes.lock().await.len();
         // Deposit is a pool-level, on-chain quantity (getPool), not carried per
         // lane, so the seller-side snapshot reports lane count only.
-        self.metrics.set_inbound_channel_snapshot(open, U256::ZERO);
+        self.metrics.set_inbound_lane_snapshot(open, U256::ZERO);
     }
 }
 
@@ -1457,9 +1457,9 @@ mod tests {
                 bytes_delivered_cumulative: U256::ZERO,
             })),
         );
-        handler.refresh_channel_metrics().await;
+        handler.refresh_lane_metrics().await;
         let encoded = metrics.encode().expect("metrics encode");
-        assert!(encoded.lines().any(|line| line == "decdn_channels_open 1"));
+        assert!(encoded.lines().any(|line| line == "decdn_lanes_open 1"));
     }
 
     #[test]

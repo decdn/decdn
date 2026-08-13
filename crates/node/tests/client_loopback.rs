@@ -2854,9 +2854,9 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_unknown_channel_total 1"
+            "decdn_serve_stream_rejected_unknown_lane_total 1"
         ),
-        "unknown-channel refusal must bump its reason counter"
+        "unknown-lane refusal must bump its reason counter"
     );
 
     client_ep.close().await;
@@ -4509,16 +4509,16 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     }
 
     // Pool model: a valid binding for an address with no lane on this pool
-    // resolves to no lane, so the refusal is the unknown-channel arm — the
+    // resolves to no lane, so the refusal is the unknown-lane arm — the
     // owner-mismatch gate is subsumed into lane resolution (a wrong signer simply
     // owns no lane). Wire-indistinguishable from a cache miss (all `NotFound`), so
     // only the reason counter proves which arm ran (#876).
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_unknown_channel_total 1"
+            "decdn_serve_stream_rejected_unknown_lane_total 1"
         ),
-        "a bound-but-laneless request must bump the unknown-channel counter"
+        "a bound-but-laneless request must bump the unknown-lane counter"
     );
 
     client_ep.close().await;
@@ -4656,13 +4656,13 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
     }
     // Pool model: the funder holds no lane on this delegated pool (the lane is
     // keyed by the delegate signer), so its binding resolves to no lane and the
-    // refusal is the unknown-channel arm.
+    // refusal is the unknown-lane arm.
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_unknown_channel_total 1"
+            "decdn_serve_stream_rejected_unknown_lane_total 1"
         ),
-        "the funder binding must bump the unknown-channel counter"
+        "the funder binding must bump the unknown-lane counter"
     );
 
     client_ep.close().await;

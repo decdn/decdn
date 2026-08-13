@@ -387,7 +387,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
 
         let load = store.load_all().context("hydrate persisted buyer pools")?;
-        metrics.buyer_channel_store_skipped_undecodable_records(load.skipped.len());
+        metrics.buyer_pool_store_skipped_undecodable_records(load.skipped.len());
         info!(
             %payment_pool_addr,
             %token,
@@ -425,7 +425,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// not restated as an ordinary skipped candidate.
     fn reuse_or_report(&self) -> Result<Option<BuyerPoolState>> {
         self.store.get_by_owner(self.owner).map_err(|err| {
-            self.metrics.node_pull_channel_open_failure();
+            self.metrics.node_pull_pool_open_failure();
             error!(
                 error = %format!("{err:#}"),
                 "buyer pool store read failed; this node can neither open nor reuse its \
@@ -486,7 +486,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             // store is how we collect the result — the same read a later reuse does.
             Ok(Ok(())) => {
                 let state = self.reuse_or_report()?.ok_or_else(|| {
-                    self.metrics.node_pull_channel_open_failure();
+                    self.metrics.node_pull_pool_open_failure();
                     error!(
                         "buyer pool opened on-chain but is not present in the store — a deposit \
                          is escrowed against a row we cannot see"
@@ -597,7 +597,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// ([`OpenReported`] + [`LocalPullFault`]), since every future open would fail.
     fn join_or_spawn_open(&self, deposit_hint: U256) -> Result<SharedOpen> {
         let mut slot = self.open_in_flight.lock().map_err(|err| {
-            self.metrics.node_pull_channel_open_failure();
+            self.metrics.node_pull_pool_open_failure();
             error!(%err, "open_in_flight mutex poisoned; this node must be restarted");
             anyhow::anyhow!("open_in_flight mutex poisoned: {err}")
                 .context(OpenReported)
@@ -886,7 +886,7 @@ async fn run_open<P: Provider + Clone>(
         Ok(None) => {}
         Err(err) => {
             error!(%err, "buyer pool store read failed under the open slot; cannot open a pool");
-            metrics.node_pull_channel_open_failure();
+            metrics.node_pull_pool_open_failure();
             return Err(anyhow::Error::new(err))
                 .context("look up the node's buyer pool under the open slot")
                 .context(OpenReported)
@@ -898,7 +898,7 @@ async fn run_open<P: Provider + Clone>(
         .await
         .inspect_err(|err| {
             error!(error = %format!("{err:#}"), "buyer pool open failed");
-            metrics.node_pull_channel_open_failure();
+            metrics.node_pull_pool_open_failure();
         })?;
 
     if let Err(err) = store.record(&opened.state) {
@@ -912,7 +912,7 @@ async fn run_open<P: Provider + Clone>(
             "buyer pool opened on-chain but its row could not be persisted; the deposit is \
              escrowed but UNTRACKED — reconcile against the tx"
         );
-        metrics.node_pull_channel_open_failure();
+        metrics.node_pull_pool_open_failure();
         return Err(anyhow::Error::new(err))
             .context("persist opened buyer pool")
             .context(OpenReported)

@@ -2538,8 +2538,8 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     // the mechanism it exists for. The split also matters operationally: "pending"
     // says the node's chain lane is slower than `CHANNEL_OPEN_CALLER_BUDGET`, while
     // "failure" says the tx reverted or the wallet is under-funded.
-    assert_counter(&b_metrics, "node_pull_channel_open_pending_total", 2)?;
-    assert_counter(&b_metrics, "node_pull_channel_open_failures_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_pool_open_pending_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_pool_open_failures_total", 0)?;
 
     ep_b.close().await;
     ep_a.close().await;
@@ -3541,7 +3541,7 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
         // means deleting either of the first two arms changes this assertion too.
         assert_counter(
             &b_metrics,
-            "node_pull_channel_open_failures_total",
+            "node_pull_pool_open_failures_total",
             if expect_open_failure_counter {
                 attempts
             } else {
@@ -5458,7 +5458,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
 /// (expiry-gated) hands the dead channel back and re-wedges it on the next miss.
 ///
 /// Fail-on-revert: drop the `provider_is_wedged` filter in `probe_and_rank` and the second
-/// pull re-selects A, re-wedging it — `node_pull_channel_wedged_total` becomes 2, not 1.
+/// pull re-selects A, re-wedging it — `node_pull_pool_wedged_total` becomes 2, not 1.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<()> {
@@ -5539,7 +5539,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     .map_err(|_| anyhow::anyhow!("pull 1 never ended"))?
     .map_err(|e| anyhow::anyhow!("pull 1: {e}"))?;
     anyhow::ensure!(matches!(got1, OriginFetch::NotFound), "pull 1 must refuse");
-    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
 
     // Pull 2 (hash2, a DIFFERENT blob): A is wedged provider-wide, so `probe_and_rank` must skip
     // it. With no other provider, the pull finds no candidate and returns NotFound WITHOUT
@@ -5557,7 +5557,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     );
     // The load-bearing assertion: still ONE wedge, not two. A re-selected-and-re-wedged
     // provider would tick this to 2 — which is exactly what dropping the filter does.
-    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
 
     ep_b.close().await;
     ep_a.close().await;
@@ -5585,7 +5585,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 /// Driven through the REAL receive loop, for the reason the sibling test above spells out: an
 /// assertion against `classify_pull_failure`'s ladder alone would pass with the bug restored,
 /// because the classifier was never the thing that was broken. The counter that proves the
-/// remedy ran is `node_pull_channel_wedged_total` — reachable only if the code survived the
+/// remedy ran is `node_pull_pool_wedged_total` — reachable only if the code survived the
 /// receive loop AND `pull_verdict` unwrapped it back out of the refusal.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
@@ -5672,7 +5672,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
     // `pull_verdict` routed it to `voucher_verdict` rather than leaving it a bare refusal.
     // With the bug, it is `node_pull_refused_total` that ticks and this stays 0 — the
     // channel is left in the store to be handed back on every subsequent miss.
-    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 0)?;
 
@@ -11979,7 +11979,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         "A must not be pulled for hash2 while H (ranked first) delivers, got {}",
         streams_a.load(Ordering::SeqCst)
     );
-    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_pool_wedged_total", 0)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
 
     // Fetch #2 (hash1): H is tried first and honestly refuses (its cache holds
@@ -12001,7 +12001,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         "A must be pulled exactly once (the hash1 wedge), got {}",
         streams_a.load(Ordering::SeqCst)
     );
-    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 1)?;
     let probes_a_after_wedge = probes_a.load(Ordering::SeqCst);
 
@@ -12044,7 +12044,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     );
     // No second wedge event — the sibling cold-path test's load-bearing counter,
     // asserted here for the hit path.
-    assert_counter(&b_metrics, "node_pull_channel_wedged_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
     // The entry WAS consulted (H survived the filters), so fetch #3 is a hit.
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;

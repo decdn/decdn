@@ -103,10 +103,10 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
 /// emitting a structured-log line with the failure-class `reason` (#966).
 ///
-/// Bumps the unlabeled `node_pull_channel_open_failures` total and, when the
+/// Bumps the unlabeled `node_pull_pool_open_failures` total and, when the
 /// error chain carries a [`PoolOpenFailureReason`] (attached by the
 /// `open_channel` kernel for the three `openChannel`-tx failure classes), the
-/// matching `decdn_channel_open_failures_{reason}_total` sibling counter.
+/// matching `decdn_pool_open_failures_{reason}_total` sibling counter.
 ///
 /// Three outcomes are NOT failures and return before that: [`PoolOpenPending`] (the
 /// open outlived our budget and continues in the background), a reserved slot (a
@@ -157,7 +157,7 @@ fn record_pool_open_failure(
     // the channel open." So the comment was sending an operator to a knob its own config
     // documentation calls inert for this symptom.
     if err.downcast_ref::<PoolOpenPending>().is_some() {
-        deps.metrics.node_pull_channel_open_pending();
+        deps.metrics.node_pull_pool_open_pending();
         debug!(%provider_addr, %err, "node-origin: pool open still in flight; trying the next candidate");
         return PullMiss::Clean;
     }
@@ -201,10 +201,10 @@ fn record_pool_open_failure(
         // one arm above — the marker is the contract, not this arm's guesswork.
         return PullMiss::Clean;
     }
-    deps.metrics.node_pull_channel_open_failure();
+    deps.metrics.node_pull_pool_open_failure();
     let reason = err.downcast_ref::<PoolOpenFailureReason>().copied();
     if let Some(reason) = reason {
-        deps.metrics.channel_open_failure_by_reason(reason);
+        deps.metrics.pool_open_failure_by_reason(reason);
     }
     // `warn!`, not `debug!`. Everything the open task raises is `OpenReported` and
     // returned above, so what reaches here is raised OUTSIDE the task — which makes this
@@ -2181,7 +2181,7 @@ fn wedged_channel(
     reason: VoucherRejectReason,
     channel: Option<B256>,
 ) {
-    deps.metrics.node_pull_channel_wedged();
+    deps.metrics.node_pull_pool_wedged();
     // Immediate cover: suppress this (peer, hash) for the short refusal TTL so a retry for the
     // SAME blob does not re-present the same voucher before the provider-wide horizon lands.
     deps.negative_cache.record_failure_with_ttl(

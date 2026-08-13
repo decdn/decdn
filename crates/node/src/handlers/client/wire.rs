@@ -118,7 +118,7 @@ impl ClientHandler {
             ServeRejectReason::InternalError => self.metrics.serve_stream_rejected_internal_error(),
             ServeRejectReason::BlobTooLarge => self.metrics.serve_stream_rejected_blob_too_large(),
             ServeRejectReason::UnknownChannel => {
-                self.metrics.serve_stream_rejected_unknown_channel();
+                self.metrics.serve_stream_rejected_unknown_lane();
             }
             ServeRejectReason::OwnerMismatch => self.metrics.serve_stream_rejected_owner_mismatch(),
             ServeRejectReason::InsufficientDeposit => {
