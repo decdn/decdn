@@ -1,7 +1,7 @@
 //! G-GOV-02 end-to-end: a ratified governance parameter reaches a live daemon
 //! (#1041).
 //!
-//! The parameter under test is `PaymentChannel`'s delivery-rate floor
+//! The parameter under test is `PaymentPool`'s delivery-rate floor
 //! (`getRateBounds()`). The daemon seeds its clamp from an
 //! authoritative startup read and then tracks `RateBoundsUpdated`
 //! (`crates/node/src/rate_bounds_watcher.rs`, #1172), so a governance retune is
@@ -16,7 +16,7 @@
 //!    (ADR-036 served bytes × age ramp) at the proposal snapshot.
 //! 3. **Ratify.** propose → warp `votingDelay` → `castVote(For)` → warp
 //!    `votingPeriod` → `queue`, with the executed action
-//!    `PaymentChannel.setRateBounds(50)`.
+//!    `PaymentPool.setRateBounds(50)`.
 //! 4. **Negative — pre-timelock.** With the proposal queued but the Timelock
 //!    delay not yet elapsed, chain state *and* the live daemon must still be on
 //!    the old floor: `getRateBounds()` is `1` and the probe still quotes 10,
@@ -27,8 +27,8 @@
 //!    quote is now governed by a value that arrived over the wire, not config.
 //! 6. **Paid path.** The reprice must also govern what the daemon *sells* at,
 //!    not just what it advertises. A fresh paid fetch settles on-chain, and the
-//!    settled voucher is read back to confirm the blob was sold at the new floor
-//!    — settling alone proves little, since the on-chain floor check rejects
+//!    settled lane watermark is read back to confirm the blob was sold at the new
+//!    floor — settling alone proves little, since the on-chain floor check rejects
 //!    only *under*-payment, so an over-priced sale would settle just as cleanly.
 //! 7. **Negative — out-of-safety-bounds.** `setRateBounds` reverts with
 //!    `RateBoundsInvalid` for `floor < MIN_RATE_FLOOR` and for a floor above
@@ -71,14 +71,14 @@ use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::{SolCall, SolError};
 use anyhow::Context;
-use decdn_e2e::bindings::{DecdnGovernor, PaymentChannel, TimelockController};
+use decdn_e2e::bindings::{DecdnGovernor, PaymentPool, TimelockController};
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
 
-/// `PaymentChannel`'s governance write + safety-bound error. The production
-/// `decdn_incentive` binding covers the channel-lifecycle and settlement surface,
+/// `PaymentPool`'s governance write + safety-bound error. The production
+/// `decdn_incentive` binding covers the pool-lifecycle and settlement surface,
 /// and carries the two rate-bounds members the daemon needs — `getRateBounds()`
 /// and the `RateBoundsUpdated` event its watcher subscribes to — but declares no
 /// governance setters and no custom errors at all. The Timelock-executed setter
@@ -100,7 +100,7 @@ mod gov_abi {
 
     alloy::sol! {
         #[sol(rpc)]
-        contract PaymentChannelGov {
+        contract PaymentPoolGov {
             /// Thrown by `setRateBounds` (and the constructor) when
             /// `newFloor < MIN_RATE_FLOOR` or `newFloor > MAX_RATE_PER_MB`.
             error RateBoundsInvalid(uint256 deliveryFloor);
@@ -110,11 +110,11 @@ mod gov_abi {
     }
 }
 
-use gov_abi::PaymentChannelGov;
+use gov_abi::PaymentPoolGov;
 
 const MIB: usize = 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
-/// `PaymentChannel.BYTES_PER_MB` — the divisor in the per-byte price floor.
+/// `PaymentPool.BYTES_PER_MB` — the divisor in the per-byte price floor.
 const BYTES_PER_MB: u64 = 1_048_576;
 
 /// The floor the deploy script ships (`BaseProtocolDeploy.PAYMENT_DELIVERY_FLOOR`).
@@ -164,7 +164,7 @@ async fn run() -> anyhow::Result<()> {
         .try_init();
 
     let chain = ChainFixture::launch().await?;
-    let payment_channel = chain.addrs().payment_channel;
+    let payment_pool = chain.addrs().payment_pool;
 
     // ---- One bonded operator, daemon running. It is both the node under test
     // (its live probe quote is the observable) and the voter — nothing here
@@ -191,7 +191,7 @@ async fn run() -> anyhow::Result<()> {
     // ramp, serve real bytes, then cross an epoch boundary so those bytes sit in
     // a fully-elapsed epoch inside the trailing window at the proposal snapshot.
     // The delivery is settled *before* the retune on purpose: raising the
-    // delivery floor tightens `PaymentChannel`'s settlement-side
+    // delivery floor tightens `PaymentPool`'s settlement-side
     // `RateFloorViolation` check, so a voucher priced at the old rate must land
     // on-chain while the old floor is still in force.
     time::increase_time(chain.admin(), 185 * DAY).await?;
@@ -213,7 +213,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- Ratify the new floor: propose → vote → queue. Stops short of
     // `execute` so the pre-timelock negative below is a real observation.
     let mut retune = Proposal::new(
-        payment_channel,
+        payment_pool,
         set_rate_bounds_calldata(U256::from(NEW_FLOOR)),
         format!("retune the delivery rate floor to {NEW_FLOOR}"),
     );
@@ -277,10 +277,10 @@ async fn run() -> anyhow::Result<()> {
     // regression where the two disagree.
     //
     // Settling is necessary but NOT sufficient to prove that: the on-chain floor
-    // check (`PaymentChannel._advanceClaimWatermark` → `RateFloorViolation`) is
+    // check (`PaymentPool._advanceClaimWatermark` → `RateFloorViolation`) is
     // one-sided — it rejects paying too *little*, so a node that sold above the
     // floor would settle perfectly cleanly. The price itself is therefore the
-    // observable, read back off the channel the vouchers were signed against.
+    // observable, read back off the pool the vouchers were signed against.
     //
     // Note the under-pricing direction never reaches the chain at all: the node
     // applies the same floor check at zero tolerance before countersigning
@@ -318,7 +318,9 @@ async fn run() -> anyhow::Result<()> {
     // prices its delta with `div_ceil`, so a different interval split could round
     // a micro-USDC up. The regression this leg exists to catch — selling at the
     // unclamped configured rate — is nowhere near the tolerance.
-    let (amount, billed_bytes) = settled_amount_and_bytes(&chain, paid.channel_id).await?;
+    let (amount, billed_bytes) =
+        settled_amount_and_bytes(&chain, paid.pool_id, client.address(), node.operator_addr())
+            .await?;
     assert!(
         billed_bytes >= U256::from(2 * MIB),
         "the settled voucher must cover the whole blob, got {billed_bytes} billed bytes"
@@ -346,7 +348,7 @@ async fn run() -> anyhow::Result<()> {
     simulate_set_rate_bounds(&chain, timelock, U256::from(2))
         .await
         .context("an in-bounds floor must simulate cleanly from the Timelock")?;
-    expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
+    expect_revert::<_, PaymentPoolGov::RateBoundsInvalid>(
         simulate_set_rate_bounds(&chain, timelock, U256::ZERO).await,
         "setRateBounds below MIN_RATE_FLOOR",
     )?;
@@ -368,7 +370,7 @@ async fn run() -> anyhow::Result<()> {
     )
     .await
     .context("the wire cap itself must be accepted — the guard is `>`, not `>=`")?;
-    expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
+    expect_revert::<_, PaymentPoolGov::RateBoundsInvalid>(
         simulate_set_rate_bounds(
             &chain,
             timelock,
@@ -377,7 +379,7 @@ async fn run() -> anyhow::Result<()> {
         .await,
         "setRateBounds above the MAX_RATE_PER_MB wire cap",
     )?;
-    expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
+    expect_revert::<_, PaymentPoolGov::RateBoundsInvalid>(
         simulate_set_rate_bounds(&chain, timelock, U256::from(u64::MAX)).await,
         "setRateBounds at the u64 cap, far above the wire cap",
     )?;
@@ -385,7 +387,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- ...and the Governor cannot smuggle one past that check either: a
     // fully ratified out-of-bounds proposal reverts at `execute`, with
     // `RateBoundsInvalid` reaching the caller intact. The revert originates two
-    // frames down (Governor → Timelock → PaymentChannel), but OZ 5.1.0's
+    // frames down (Governor → Timelock → PaymentPool), but OZ 5.1.0's
     // `TimelockController._execute` re-reverts through `Address.verifyCallResult`,
     // which bubbles the raw returndata verbatim — so the selector survives and
     // this negative can be held to the same standard as the static calls above.
@@ -393,7 +395,7 @@ async fn run() -> anyhow::Result<()> {
     // passing here: every assertion below is equally satisfied by "the
     // transaction never landed", so `is_err()` alone would prove nothing.
     let mut bad = Proposal::new(
-        payment_channel,
+        payment_pool,
         set_rate_bounds_calldata(U256::ZERO),
         "retune the delivery rate floor below the safety floor".to_owned(),
     );
@@ -402,7 +404,7 @@ async fn run() -> anyhow::Result<()> {
     // the safety-bounds rejection under test. That says nothing about Timelock
     // readiness — a separate state machine, warped inside the call below.
     bad.propose_and_queue(&chain, node.operator()).await?;
-    expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
+    expect_revert::<_, PaymentPoolGov::RateBoundsInvalid>(
         bad.try_execute_after_timelock(&chain, node.operator())
             .await?,
         "executing an out-of-safety-bounds proposal",
@@ -430,7 +432,7 @@ async fn run() -> anyhow::Result<()> {
     // separates "the newest value is stored" from "the largest value is stored":
     // the quote must fall back to the configured rate the clamp no longer binds.
     let mut release = Proposal::new(
-        payment_channel,
+        payment_pool,
         set_rate_bounds_calldata(U256::from(RELEASED_FLOOR)),
         format!("retune the delivery rate floor to {RELEASED_FLOOR}"),
     );
@@ -675,9 +677,9 @@ impl Proposal {
     }
 }
 
-/// ABI-encoded `PaymentChannel.setRateBounds(floor)`.
+/// ABI-encoded `PaymentPool.setRateBounds(floor)`.
 fn set_rate_bounds_calldata(floor: U256) -> Bytes {
-    PaymentChannelGov::setRateBoundsCall { newFloor: floor }
+    PaymentPoolGov::setRateBoundsCall { newFloor: floor }
         .abi_encode()
         .into()
 }
@@ -692,24 +694,31 @@ fn mined(status: bool, what: &str) -> anyhow::Result<()> {
 // Contract-side assertions
 // ---------------------------------------------------------------------------
 
-/// The settled `(claimedAmount, claimedBytes)` watermark for `channel_id` — what
-/// the node actually charged, in micro-USDC against bao wire bytes. Read after a
-/// paid fetch so the leg above can assert on price rather than on the mere fact
-/// that settlement succeeded.
+/// The settled `(amount, bytesDelivered)` watermark for the `(signer, provider)`
+/// lane on `pool_id` — what the node actually charged, in micro-USDC against bao
+/// wire bytes. Read after a paid fetch so the leg above can assert on price rather
+/// than on the mere fact that settlement succeeded. `signer` is the buyer/client
+/// address (the pool owner, which self-signs its own vouchers); `provider` is the
+/// node operator.
 async fn settled_amount_and_bytes(
     chain: &ChainFixture,
-    channel_id: B256,
+    pool_id: B256,
+    signer: Address,
+    provider: Address,
 ) -> anyhow::Result<(U256, U256)> {
-    let ch = PaymentChannel::new(chain.addrs().payment_channel, chain.admin())
-        .getChannel(channel_id)
-        .call()
-        .await
-        .context("getChannel")?;
-    Ok((ch.claimedAmount, ch.claimedBytes))
+    let lane = decdn_e2e::assert::read_watermark(
+        chain.admin(),
+        chain.addrs().payment_pool,
+        pool_id,
+        signer,
+        provider,
+    )
+    .await?;
+    Ok((lane.amount, lane.bytesDelivered))
 }
 
 async fn read_rate_bounds(chain: &ChainFixture) -> anyhow::Result<U256> {
-    PaymentChannel::new(chain.addrs().payment_channel, chain.admin())
+    PaymentPool::new(chain.addrs().payment_pool, chain.admin())
         .getRateBounds()
         .call()
         .await
@@ -729,7 +738,7 @@ async fn simulate_set_rate_bounds(
     caller: Address,
     floor: U256,
 ) -> Result<(), alloy::contract::Error> {
-    PaymentChannelGov::new(chain.addrs().payment_channel, chain.admin())
+    PaymentPoolGov::new(chain.addrs().payment_pool, chain.admin())
         .setRateBounds(floor)
         .from(caller)
         .call()

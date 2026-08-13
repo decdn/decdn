@@ -16,7 +16,7 @@
 //!    authenticates the peer key in the QUIC handshake, so this is checked by
 //!    dialing both ids at the same socket.
 //! 3. **Money is untouched.** The bond, tier, `firstBondedAt`, and the open
-//!    channel all key on the Ethereum address, which does not change — and a
+//!    payment pool all key on the Ethereum address, which does not change — and a
 //!    delivery paid for before the rotation still settles on-chain after it.
 //!
 //! **What the settlement leg does and does not pin.** The node redeems on its
@@ -133,7 +133,7 @@ async fn run_rotation() -> anyhow::Result<()> {
     let client = ClientFixture::new(&chain).await?;
     let paid = client.fetch(&chain, &node, hash, U256::ZERO).await?;
     assert_eq!(paid.bytes, payload, "delivered bytes must match the blob");
-    let pre_rotation_channel = paid.channel_id;
+    let pre_rotation_pool = paid.pool_id;
 
     // ---- 2a. `--dry-run` previews the rebinding and writes nothing. The branch
     // sits above the confirmation gate and the send, so a regression that moved
@@ -293,28 +293,30 @@ async fn run_rotation() -> anyhow::Result<()> {
         served >= content_bytes && served <= wire_bytes,
         "settled bytes {served} must land in [{content_bytes}, {wire_bytes}]"
     );
-    let channel = decdn_e2e::assert::read_channel(
+    let lane = decdn_e2e::assert::read_watermark(
         chain.admin(),
-        chain.addrs().payment_channel,
-        pre_rotation_channel,
+        chain.addrs().payment_pool,
+        pre_rotation_pool,
+        client.address(),
+        operator,
     )
     .await?;
-    assert_eq!(
-        channel.provider, operator,
-        "the pre-rotation channel still names the same provider — it keys on the Ethereum \
-         address, which rotation does not change"
+    assert!(
+        lane.bytesDelivered > U256::ZERO,
+        "the pre-rotation pool's lane to this operator still carries the settled watermark — the \
+         lane keys on the operator's Ethereum address, which rotation does not change"
     );
 
-    // Forwards: a fresh channel against the NEW identity is payable, so the
+    // Forwards: a fresh pool against the NEW identity is payable, so the
     // rotated node is earning again and not merely reachable.
     let after = client.fetch(&chain, &node, hash, U256::ZERO).await?;
     assert_eq!(
         after.bytes, payload,
-        "the rotated node must deliver over a freshly paid channel"
+        "the rotated node must deliver over a freshly paid pool"
     );
     assert_ne!(
-        after.channel_id, pre_rotation_channel,
-        "the post-rotation fetch must be a genuinely new channel, not a replay of the old one"
+        after.pool_id, pre_rotation_pool,
+        "the post-rotation fetch must be a genuinely new pool, not a replay of the old one"
     );
 
     Ok(())
