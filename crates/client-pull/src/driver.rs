@@ -88,7 +88,14 @@ use crate::{
 pub trait PacingWait: Send + Sync {
     /// Resolve once the caller judges it worth re-deciding (e.g. the served-paid
     /// frontier advanced, or a bounded poll interval elapsed).
-    fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    ///
+    /// `observed` is the served-paid frontier value the caller's `Wait` decision was
+    /// computed from. An implementor backed by an edge-triggered wakeup (a
+    /// [`tokio::sync::Notify`], which stores no permit across `notify_waiters`) MUST
+    /// register its wakeup BEFORE re-reading the live frontier and return immediately
+    /// if it already moved past `observed` — otherwise an advance that races between
+    /// the decision and the park is lost and the caller wedges forever (#1673).
+    fn wait(&self, observed: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Read the channel context's current deposit through the shared handle. A tiny
@@ -420,7 +427,11 @@ where
             PaceDecision::Done => return Ok(()),
             PaceDecision::Wait => {
                 if let Some(hook) = pacing_wait {
-                    hook.wait().await;
+                    // Hand the hook the frontier value THIS decision read, so it can
+                    // register its wakeup then re-check for an advance that raced the
+                    // decision — closing the lost-wakeup that wedged the window-paused
+                    // pull under CI scheduling gaps (#1673).
+                    hook.wait(state.served_paid_frontier).await;
                     continue;
                 }
                 anyhow::bail!(
@@ -1302,7 +1313,10 @@ mod tests {
     }
 
     impl super::PacingWait for CountingWait {
-        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        fn wait(
+            &self,
+            _observed: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async {})
         }
@@ -1385,7 +1399,10 @@ mod tests {
     }
 
     impl super::PacingWait for BumpServedPaidWait {
-        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        fn wait(
+            &self,
+            _observed: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
             self.served_paid
                 .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async {})

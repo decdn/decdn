@@ -125,15 +125,38 @@ pub(crate) struct PullLegTarget {
 /// pull re-decides exactly when a downstream voucher clears.
 struct ServedPaidWait {
     served_paid_advanced: Arc<Notify>,
+    /// The live shared served-paid frontier (the SAME atomic the pacer reads through
+    /// `served_paid`). Re-read AFTER the wakeup is registered so an advance that raced
+    /// the pacer's `Wait` decision is not waited on forever — `Notify::notify_waiters`
+    /// stores no permit, so without this re-check the window-paused pull wedges (the
+    /// #1673 CI-starvation hang).
+    served_paid: Arc<AtomicU64>,
     /// Bumps `node_pull_through_window_paused` on each pause — the pull hit its ADR
     /// 037 window and is waiting for downstream payment to clear.
     metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl PacingWait for ServedPaidWait {
-    fn wait(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn wait(&self, observed: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // The pull hit its ADR 037 window: count the pause (the decision was `Wait`),
+        // independent of whether we then park or short-circuit on a raced advance.
         self.metrics.node_pull_through_window_paused();
-        Box::pin(async move { self.served_paid_advanced.notified().await })
+        Box::pin(async move {
+            // Register the wakeup FIRST, then re-read the frontier. `notify_waiters`
+            // wakes only waiters registered at the moment it fires and stores no
+            // permit, so the serve leg's `served_advanced().notify_waiters()` that
+            // lands between the pacer reading `observed` and this park would be lost —
+            // wedging the pull (#1673). Arm the waiter, THEN check: if the frontier
+            // already moved past `observed`, the advance we would wait for has already
+            // happened, so re-decide at once instead of parking on a notify that will
+            // never repeat. Any advance AFTER this arm wakes the registered waiter.
+            let mut notified = Box::pin(self.served_paid_advanced.notified());
+            notified.as_mut().enable();
+            if self.served_paid.load(Ordering::Relaxed) > observed {
+                return;
+            }
+            notified.await;
+        })
     }
 }
 
@@ -605,6 +628,7 @@ pub(crate) async fn run_pull_leg(
     };
     let pacing_wait = ServedPaidWait {
         served_paid_advanced: Arc::clone(session.served_advanced()),
+        served_paid: Arc::clone(session.served_frontier()),
         metrics: Arc::clone(&deps.metrics),
     };
 
@@ -883,6 +907,7 @@ pub(crate) async fn run_local_pull_leg(
     };
     let pacing_wait = ServedPaidWait {
         served_paid_advanced: Arc::clone(session.served_advanced()),
+        served_paid: Arc::clone(session.served_frontier()),
         metrics: Arc::clone(&metrics),
     };
 
@@ -1393,5 +1418,81 @@ mod local_pull_leg_tests {
             "a corrupt own origin must terminate the leg with a local Err"
         );
         Ok(())
+    }
+}
+
+/// Regression coverage for the window-pause lost-wakeup that wedged
+/// [`run_pull_leg`] / [`run_local_pull_leg`] under CI scheduling gaps (#1673).
+/// [`ServedPaidWait`] is edge-triggered on a [`Notify`], which stores no permit
+/// across `notify_waiters`, so a serve-leg advance that races the pacer's `Wait`
+/// decision must be caught by re-reading the frontier AFTER arming the waiter — not
+/// waited on forever.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
+mod served_paid_wait_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::ServedPaidWait;
+    use crate::metrics::Metrics;
+    use decdn_client_pull::PacingWait;
+
+    fn wait_hook(advanced: &Arc<Notify>, frontier: &Arc<AtomicU64>) -> ServedPaidWait {
+        ServedPaidWait {
+            served_paid_advanced: Arc::clone(advanced),
+            served_paid: Arc::clone(frontier),
+            metrics: Arc::new(Metrics::new()),
+        }
+    }
+
+    /// THE #1673 race: the serve leg advances the frontier and fires
+    /// `notify_waiters()` in the gap between the pacer reading `observed` and the
+    /// pull parking. The notify wakes nobody (no waiter registered, no permit
+    /// stored). The fixed `wait` must re-read the frontier after arming and return
+    /// at once — the old edge-triggered wait wedged here forever.
+    #[tokio::test]
+    async fn a_racing_advance_before_the_park_is_not_lost() {
+        let advanced = Arc::new(Notify::new());
+        let frontier = Arc::new(AtomicU64::new(0));
+        let hook = wait_hook(&advanced, &frontier);
+
+        // The advance + notify land BEFORE `wait` is polled — the lost-wakeup window.
+        frontier.store(64 * 1024, Ordering::Relaxed);
+        advanced.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(5), hook.wait(0))
+            .await
+            .expect("wait must observe the raced advance, not wedge on a lost notify");
+    }
+
+    /// The ordinary path still parks and wakes: with no advance yet, `wait` blocks,
+    /// then resolves on a later `notify_waiters()` from the serve leg.
+    #[tokio::test]
+    async fn a_later_advance_wakes_the_parked_wait() {
+        let advanced = Arc::new(Notify::new());
+        let frontier = Arc::new(AtomicU64::new(0));
+        let hook = wait_hook(&advanced, &frontier);
+
+        let advance = {
+            let advanced = Arc::clone(&advanced);
+            let frontier = Arc::clone(&frontier);
+            async move {
+                // Let `wait` arm + park first, then advance and notify.
+                tokio::task::yield_now().await;
+                frontier.store(64 * 1024, Ordering::Relaxed);
+                advanced.notify_waiters();
+            }
+        };
+        tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(5), hook.wait(0))
+                    .await
+                    .expect("a later advance must wake the parked wait");
+            },
+            advance,
+        );
     }
 }
