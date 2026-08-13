@@ -423,6 +423,7 @@ async fn spawn_pipelined_server(
 async fn open_paid_stream(
     conn: &Connection,
     hash: [u8; 32],
+    ext: Option<&StreamRequestExt>,
 ) -> anyhow::Result<(SendStream, RecvStream)> {
     let (mut send, mut recv) = conn
         .open_bi()
@@ -437,7 +438,7 @@ async fn open_paid_stream(
         timestamp_us: 0x0012_61a0,
     };
     let payload =
-        encode_stream_request(&req, None).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+        encode_stream_request(&req, ext).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
     write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
@@ -512,7 +513,7 @@ async fn serve_streams_a_full_credit_window_ahead_of_payment() -> anyhow::Result
     const WINDOW: u64 = 8 * 1024 * 1024;
     let payload = vec![0x11u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, _signer, _deposit) = seeded_store()?;
+    let (store, signer, _deposit) = seeded_store()?;
 
     let (target, _server_eth, server_ep, server_task) =
         spawn_pipelined_server(cache, Arc::clone(&store), Some(WINDOW)).await?;
@@ -523,7 +524,9 @@ async fn serve_streams_a_full_credit_window_ahead_of_payment() -> anyhow::Result
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     // A full window arrives ahead of ANY voucher (pipelined past one interval)...
     read_exact_chunks(&mut recv, WINDOW).await?;
     // ...and not one byte more (exposure bounded to exactly the window).
@@ -545,7 +548,7 @@ async fn serve_streams_a_full_credit_window_ahead_of_payment() -> anyhow::Result
 async fn serve_without_a_credit_window_is_stop_and_wait() -> anyhow::Result<()> {
     let payload = vec![0x22u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, _signer, _deposit) = seeded_store()?;
+    let (store, signer, _deposit) = seeded_store()?;
 
     let (target, _server_eth, server_ep, server_task) =
         spawn_pipelined_server(cache, Arc::clone(&store), None).await?;
@@ -556,7 +559,9 @@ async fn serve_without_a_credit_window_is_stop_and_wait() -> anyhow::Result<()> 
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     // Exactly one interval, then a park: the pre-credit-window cadence.
     read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
@@ -587,7 +592,9 @@ async fn paying_a_voucher_slides_the_credit_window_forward() -> anyhow::Result<(
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
     // Fill the window, then confirm the server has parked.
     read_exact_chunks(&mut recv, WINDOW).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
@@ -765,7 +772,9 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
         .connect(target, ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
 
     // Read the full window ahead of any payment — the server has now delivered
     // exactly `intervals` completed intervals and parks awaiting their vouchers.
@@ -782,16 +791,31 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
         .await?;
     }
 
+    // Acceptance is implicit (no ack), so the commit lands asynchronously. Wait
+    // for the durable watermark to reach the batch's highest voucher — once all
+    // eight are persisted, the fsync count is final and the group-commit invariant
+    // is checkable.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let persisted = loop {
+        let row = counting
+            .get(lane_key(signer.address()))?
+            .filter(|r| r.last_bytes_delivered() == U256::from(WINDOW));
+        if let Some(row) = row {
+            break row;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the burst never committed to WINDOW bytes; record_count = {}",
+            counting.record_count()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     // The eight vouchers committed with ONE fsync — the group-commit invariant.
     anyhow::ensure!(
         counting.record_count() == 1,
         "expected exactly ONE record for {intervals} vouchers, got {}",
         counting.record_count()
     );
-    // And the persisted watermark advanced to the batch's highest voucher.
-    let persisted = counting
-        .get(lane_key(signer.address()))?
-        .ok_or_else(|| anyhow::anyhow!("lane row missing after commit"))?;
     anyhow::ensure!(
         persisted.last_bytes_delivered() == U256::from(WINDOW),
         "persisted bytes must be the batch's highest, got {}",
@@ -841,7 +865,9 @@ async fn group_commit_failure_rejects_whole_batch_with_retry_later() -> anyhow::
         .connect(target, ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
 
     read_exact_chunks(&mut recv, WINDOW).await?;
 
@@ -3361,9 +3387,11 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A channel past its on-chain `expiresAt` is refused in-band with
-/// `VoucherRejected { Expired }` and the stream finishes cleanly (no QUIC reset)
-/// — the client reads an actionable reason instead of an opaque drop (#751).
+/// A lane whose capability `expiry` is already in the past is refused in-band and
+/// the stream finishes cleanly (no QUIC reset) — the client reads an actionable
+/// reason instead of an opaque drop (#751). In the shared-payment-pool model an
+/// expired grant surfaces as `VoucherRejected { CapExceeded }` (its cap is
+/// exhausted for all vouchers past expiry); the separate `Expired` reason is gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 4096];
@@ -3425,8 +3453,8 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
     .err()
     .ok_or_else(|| anyhow::anyhow!("expired channel must reject the voucher"))?;
     anyhow::ensure!(
-        err.to_string().contains("Expired"),
-        "error should surface the Expired rejection: {err}"
+        err.to_string().contains("CapExceeded"),
+        "error should surface the expired grant as CapExceeded: {err}"
     );
 
     client_ep.close().await;
