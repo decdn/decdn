@@ -29,7 +29,7 @@ use bytes::BytesMut;
 use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use decdn_cache::{CacheEngine, Hash, HttpOrigin, Origin};
 use decdn_incentive::{
-    ChannelState, ChannelStateStore, EPHEMERAL_BINDING_NONCE, MemoryChannelStateStore, Voucher,
+    EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
     bind_node_id_domain, binding_signing_hash, signed_to_wire_voucher, slash_judge_domain,
     voucher_domain,
 };
@@ -51,7 +51,6 @@ use support::{
 };
 
 const CHAIN_ID: u64 = 421_614;
-const TOKEN: Address = Address::repeat_byte(0x22);
 const RATE_PER_MB: u64 = 10;
 
 fn slash_dom() -> Eip712Domain {
@@ -82,13 +81,14 @@ fn blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
     (blob, ob.data, hash)
 }
 
-/// Register a single channel owned by `client` and build a `ClientHandler` over
-/// a cache whose only origin is `origin_uri`. Returns the handler, a cache
-/// clone (so the test can inspect `has` after delivery), and the `Metrics`
-/// handle (so a test can assert per-reason reject counters).
+/// Register a single lane spending `pool_id` (capability signer `client`, paying
+/// the node operator `server_eth`) and build a `ClientHandler` over a cache whose
+/// only origin is `origin_uri`. Returns the handler, a cache clone (so the test
+/// can inspect `has` after delivery), and the `Metrics` handle (so a test can
+/// assert per-reason reject counters).
 async fn handler_over_http_origin(
     origin_uri: &str,
-    channel_id: B256,
+    pool_id: B256,
     client: Address,
     server_eth: &Arc<PrivateKeySigner>,
     server_id: iroh::PublicKey,
@@ -99,13 +99,16 @@ async fn handler_over_http_origin(
     Arc<Metrics>,
     tempfile::TempDir,
 )> {
-    let store = Arc::new(MemoryChannelStateStore::new());
-    store.record(&ChannelState::new(
-        channel_id,
-        client,
-        client,
-        TOKEN,
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id,
+        client,               // capability signer
+        server_eth.address(), // provider (the serving node operator)
         U256::from(10_000_000u64),
+        0, // expiry: 0 = untracked, never expires
+        U256::ZERO,
+        U256::ZERO,
+        None,
     ))?;
 
     let cache_dir = tempfile::tempdir()?;
@@ -114,7 +117,7 @@ async fn handler_over_http_origin(
 
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let store_dyn: Arc<dyn ChannelStateStore> = store;
+    let store_dyn: Arc<dyn PoolStateStore> = store;
     let handler = build_handler_full_configured(
         server_id,
         server_eth,
@@ -158,7 +161,8 @@ async fn ranged_paid_pull(
     target: EndpointAddr,
     client_node_id: B256,
     client_eth: &Arc<PrivateKeySigner>,
-    channel_id: B256,
+    pool_id: B256,
+    provider: Address,
     hash: Hash,
     byte_offset: u64,
     byte_len: u64,
@@ -185,11 +189,12 @@ async fn ranged_paid_pull(
             ethereum_address: client_eth.address().into(),
             binding_signature,
         }),
+        capability: None,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        channel_id: channel_id.into(),
+        pool_id: pool_id.into(),
         byte_offset,
         byte_len,
         timestamp_us: 0x9001,
@@ -237,7 +242,6 @@ async fn ranged_paid_pull(
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
     let mut unvouchered: u64 = 0;
-    let mut nonce: u64 = 0;
     loop {
         match read_client_msg(&mut recv).await? {
             ClientMessage::ChunkData(chunk) => {
@@ -248,31 +252,29 @@ async fn ranged_paid_pull(
                 let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
                 let closing = cumulative >= expected_wire && unvouchered > 0;
                 if boundary || closing {
-                    nonce += 1;
+                    // Cumulative amount over the lane's lifetime — vouchers are
+                    // monotone in `amount` (there is no nonce), so the running
+                    // cumulative is both the payment and the replay-ordering key.
                     let amount = U256::from(cumulative)
                         .saturating_mul(U256::from(rate))
                         .div_ceil(U256::from(MB_BYTES));
                     let signed = Voucher {
-                        channel_id,
+                        pool_id,
+                        signer: client_eth.address(),
+                        provider,
                         amount,
-                        nonce: U256::from(nonce),
                         bytes_delivered: U256::from(cumulative),
-                        token: TOKEN,
                     }
                     .sign(client_eth.as_ref(), &voucher_dom())
                     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+                    // Acceptance is implicit — continued delivery is the ack (ADR
+                    // 005), so no reply is read here; a rejection would arrive as a
+                    // mid-stream `StreamError` and is caught by the loop's arm below.
                     write_client_msg(
                         &mut send,
                         &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
                     )
                     .await?;
-                    match read_client_msg(&mut recv).await? {
-                        ClientMessage::VoucherAck => {}
-                        ClientMessage::StreamError(e) => {
-                            anyhow::bail!("voucher rejected: {e:?}")
-                        }
-                        other => anyhow::bail!("expected VoucherAck, got {other:?}"),
-                    }
                     unvouchered = 0;
                 }
             }
@@ -389,14 +391,15 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x42);
+    let pool_id = B256::repeat_byte(0x42);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -417,7 +420,8 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
         target,
         client_node_id,
         &client_eth,
-        channel_id,
+        pool_id,
+        provider,
         hash,
         req_off,
         req_len,
@@ -501,15 +505,16 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x43);
+    let pool_id = B256::repeat_byte(0x43);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     // Enable the buffered whole-blob pull-through the fallback relies on.
     let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -530,7 +535,8 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
         target,
         client_node_id,
         &client_eth,
-        channel_id,
+        pool_id,
+        provider,
         hash,
         req_off,
         req_len,
@@ -606,14 +612,15 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x44);
+    let pool_id = B256::repeat_byte(0x44);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -640,11 +647,12 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let ext = StreamRequestExt {
         voucher_interval_mb: None,
         binding: None,
+        capability: None,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        channel_id: channel_id.into(),
+        pool_id: pool_id.into(),
         byte_offset: 16 * 1024,
         byte_len: 32 * 1024,
         timestamp_us: 0x9001,
@@ -720,14 +728,15 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x46);
+    let pool_id = B256::repeat_byte(0x46);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -748,7 +757,8 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
         target,
         client_node_id,
         &client_eth,
-        channel_id,
+        pool_id,
+        provider,
         hash,
         req_off,
         0, // byte_len == 0 → resume to end
@@ -794,14 +804,15 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x47);
+    let pool_id = B256::repeat_byte(0x47);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -830,7 +841,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        channel_id: channel_id.into(),
+        pool_id: pool_id.into(),
         byte_offset: 16 * 1024,
         byte_len: blob_size,
         timestamp_us: 0x9001,
@@ -927,14 +938,15 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x51);
+    let pool_id = B256::repeat_byte(0x51);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -957,7 +969,8 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         target,
         client_node_id,
         &client_eth,
-        channel_id,
+        pool_id,
+        provider,
         hash,
         0,
         0,
@@ -1057,14 +1070,15 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x52);
+    let pool_id = B256::repeat_byte(0x52);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -1110,7 +1124,8 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         target,
         client_node_id,
         &client_eth,
-        channel_id,
+        pool_id,
+        provider,
         hash,
         0,
         0,
@@ -1237,14 +1252,15 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
         .mount(&server)
         .await;
 
-    let channel_id = B256::repeat_byte(0x53);
+    let pool_id = B256::repeat_byte(0x53);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
-        channel_id,
+        pool_id,
         client_eth.address(),
         &server_eth,
         server_id,
@@ -1269,7 +1285,8 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
             target,
             client_node_id,
             &client_eth,
-            channel_id,
+            pool_id,
+            provider,
             hash,
             0,
             0,
@@ -1337,9 +1354,9 @@ fn spawn_server_concurrent(
 #[allow(clippy::too_many_arguments)]
 async fn handler_two_channels_over_http_origin(
     origin_uri: &str,
-    owner_channel: B256,
+    owner_pool: B256,
     client_a: Address,
-    waiter_channel: B256,
+    waiter_pool: B256,
     client_b: Address,
     server_eth: &Arc<PrivateKeySigner>,
     server_id: iroh::PublicKey,
@@ -1350,14 +1367,17 @@ async fn handler_two_channels_over_http_origin(
     Arc<Metrics>,
     tempfile::TempDir,
 )> {
-    let store = Arc::new(MemoryChannelStateStore::new());
-    for (id, client) in [(owner_channel, client_a), (waiter_channel, client_b)] {
-        store.record(&ChannelState::new(
-            id,
-            client,
-            client,
-            TOKEN,
+    let store = Arc::new(MemoryPoolStateStore::new());
+    for (pool_id, client) in [(owner_pool, client_a), (waiter_pool, client_b)] {
+        store.record(&LaneState::hydrate(
+            pool_id,
+            client,               // capability signer
+            server_eth.address(), // provider
             U256::from(10_000_000u64),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
         ))?;
     }
 
@@ -1367,7 +1387,7 @@ async fn handler_two_channels_over_http_origin(
 
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let store_dyn: Arc<dyn ChannelStateStore> = store;
+    let store_dyn: Arc<dyn PoolStateStore> = store;
     let handler = build_handler_full_configured(
         server_id,
         server_eth,
@@ -1447,20 +1467,21 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
 
     // Two clients, two independently-funded channels: coalescing keys on the hash,
     // and separate channels keep each delivery's vouchers monotonic.
-    let owner_channel = B256::repeat_byte(0x61);
-    let waiter_channel = B256::repeat_byte(0x62);
+    let owner_pool = B256::repeat_byte(0x61);
+    let waiter_pool = B256::repeat_byte(0x62);
     let owner_eth = Arc::new(PrivateKeySigner::random());
     let waiter_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     // A generous pull-through deadline so the coalesced waiter WAITS on the
     // in-flight entry (populate) instead of a bare presence check.
     let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
         &server.uri(),
-        owner_channel,
+        owner_pool,
         owner_eth.address(),
-        waiter_channel,
+        waiter_pool,
         waiter_eth.address(),
         &server_eth,
         server_id,
@@ -1490,7 +1511,8 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
             owner_target,
             owner_node_id,
             &owner_eth,
-            owner_channel,
+            owner_pool,
+            provider,
             owner_hash,
             0,
             0,
@@ -1504,7 +1526,8 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
         waiter_target,
         waiter_node_id,
         &waiter_eth,
-        waiter_channel,
+        waiter_pool,
+        provider,
         hash,
         0,
         0,
@@ -1638,6 +1661,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
     let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
         &server.uri(),
         channel_a,
@@ -1671,6 +1695,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
             node_a,
             &first_signer,
             channel_a,
+            provider,
             hash_a,
             0,
             0,
@@ -1686,6 +1711,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
             node_b,
             &second_signer,
             channel_b,
+            provider,
             hash_b,
             0,
             0,

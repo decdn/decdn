@@ -22,7 +22,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
-use decdn_incentive::ChannelStateStore;
+use decdn_incentive::PoolStateStore;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
@@ -259,7 +259,7 @@ pub fn build_handler_full(
     metrics: &Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
-    store: Arc<dyn ChannelStateStore>,
+    store: Arc<dyn PoolStateStore>,
     rate: u64,
     domains: &HandlerDomains,
     max_blob_size_bytes: u64,
@@ -289,7 +289,7 @@ pub fn build_handler_full_with_receipts(
     metrics: &Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
-    store: Arc<dyn ChannelStateStore>,
+    store: Arc<dyn PoolStateStore>,
     receipt_log: Arc<dyn ReceiptLog>,
     rate: u64,
     domains: &HandlerDomains,
@@ -325,7 +325,7 @@ pub fn build_handler_full_with_sink(
     metrics: &Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
-    store: Arc<dyn ChannelStateStore>,
+    store: Arc<dyn PoolStateStore>,
     receipt_sink: Arc<dyn ReceiptSink>,
     rate: u64,
     domains: &HandlerDomains,
@@ -356,7 +356,7 @@ fn client_handler_deps(
     metrics: &Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
-    store: Arc<dyn ChannelStateStore>,
+    store: Arc<dyn PoolStateStore>,
     receipt_sink: Arc<dyn ReceiptSink>,
     rate: u64,
     domains: &HandlerDomains,
@@ -382,6 +382,9 @@ fn client_handler_deps(
         // Empty by default; a test needing a populated deny-set overwrites the
         // `content_deny` field via the `configure` closure of `build_handler_with`.
         Arc::new(decdn_node::content_deny::ContentDenylist::empty()),
+        // No refundable-floor gate in the loopback fixtures: a seeded lane serves
+        // from the first voucher regardless of the pool's remaining deposit.
+        alloy::primitives::U256::ZERO,
     )
 }
 
@@ -398,7 +401,7 @@ pub fn build_handler_full_configured(
     metrics: &Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
-    store: Arc<dyn ChannelStateStore>,
+    store: Arc<dyn PoolStateStore>,
     rate: u64,
     domains: &HandlerDomains,
     max_blob_size_bytes: u64,
