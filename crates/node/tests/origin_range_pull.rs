@@ -350,6 +350,7 @@ async fn count_requests(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one linear integration-test scenario, not real complexity
 async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result<()> {
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
@@ -617,7 +618,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
+    let _provider = server_eth.address();
     let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         pool_id,
@@ -809,7 +810,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
+    let _provider = server_eth.address();
     let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         pool_id,

@@ -865,6 +865,7 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
 /// gap). Detached, so every failure leg reports for itself — by the time it fails
 /// there may be nobody waiting to observe the `Err`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
 async fn run_open<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn BuyerPoolStore>,
@@ -944,6 +945,7 @@ async fn reclaim_loop<P: Provider + Clone>(
 /// One reclaim pass. Reads the node's tracked pool; if the on-chain pool has been
 /// closed (`disputeDeadline > 0`) and its grace window has elapsed, submits
 /// `reclaim` and forgets the row on success.
+#[allow(clippy::cognitive_complexity)]
 async fn reclaim_once<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn BuyerPoolStore>,

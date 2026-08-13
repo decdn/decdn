@@ -623,7 +623,7 @@ mod tests {
         let delta = decdn_incentive::rate::BYTES_PER_MB;
         let new_bytes = U256::from(delta);
         let amount = decdn_incentive::min_payment(delta, rate_per_mb);
-        let signed = decdn_incentive::Voucher {
+        let signed_voucher = decdn_incentive::Voucher {
             pool_id,
             signer,
             provider,
@@ -633,7 +633,7 @@ mod tests {
         .sign(&signer_key, &domain)
         .expect("sign voucher");
         let wire = decdn_protocol::client::Voucher {
-            signature: signed.signature.as_bytes().to_vec(),
+            signature: signed_voucher.signature.as_bytes().to_vec(),
             amount: amount.to_be_bytes(),
         };
 

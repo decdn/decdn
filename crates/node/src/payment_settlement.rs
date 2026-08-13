@@ -158,8 +158,7 @@ impl std::fmt::Debug for PaidWatermarks {
         let len = self
             .inner
             .lock()
-            .map(|m| m.len())
-            .unwrap_or_else(|p| p.into_inner().len());
+            .map_or_else(|p| p.into_inner().len(), |m| m.len());
         f.debug_struct("PaidWatermarks")
             .field("lanes", &len)
             .finish()
@@ -279,7 +278,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             paid: paid.clone(),
             capabilities: Arc::clone(&capabilities),
             redeem_tx: redeem_tx.clone(),
-            redeem_threshold,
             metrics: Arc::clone(&metrics),
         };
         let cfg = WatcherConfig::new(
@@ -504,7 +502,6 @@ struct PoolSettlementSink<P: Provider + Clone> {
     paid: PaidWatermarks,
     capabilities: Arc<dyn CapabilitySource>,
     redeem_tx: mpsc::Sender<LaneKey>,
-    redeem_threshold: U256,
     metrics: Arc<Metrics>,
 }
 
@@ -624,6 +621,7 @@ impl<P: Provider + Clone> PoolSettlementSink<P> {
 
     /// Forget every lane of a reclaimed `pool_id` this node provides — the pool is
     /// `Closed`, so no further voucher can be redeemed against it.
+    #[allow(clippy::cognitive_complexity)]
     async fn forget_pool_lanes(&self, pool_id: PoolId) {
         let states = match self.store.load_all() {
             Ok(s) => s,
@@ -753,7 +751,7 @@ enum RedeemPlan {
     /// This lane's highest voucher should be redeemed. `register` is `Some` on the
     /// signer's first redemption (attach the capability) and `None` afterward.
     Redeem {
-        voucher: PaymentPool::RedeemVoucher,
+        voucher: Box<PaymentPool::RedeemVoucher>,
         register: Option<PaymentPool::CapabilityReg>,
     },
 }
@@ -803,35 +801,33 @@ async fn plan_redeem<P: Provider + Clone>(
         .await
         .context("getAuthorization for redemption")?;
     let register = if auth.cap.is_zero() {
-        match capabilities.registration_material(&key) {
-            Some(material) => Some(PaymentPool::CapabilityReg {
-                poolId: key.pool_id,
-                signer: key.signer,
-                spendingCap: material.spending_cap,
-                expiry: material.expiry,
-                ownerSig: material.owner_sig,
-            }),
-            None => {
-                warn!(
-                    pool_id = %key.pool_id,
-                    signer = %key.signer,
-                    "signer not registered on-chain and no capability held; skipping redemption"
-                );
-                return Ok(RedeemPlan::Skip);
-            }
-        }
+        let Some(material) = capabilities.registration_material(&key) else {
+            warn!(
+                pool_id = %key.pool_id,
+                signer = %key.signer,
+                "signer not registered on-chain and no capability held; skipping redemption"
+            );
+            return Ok(RedeemPlan::Skip);
+        };
+        Some(PaymentPool::CapabilityReg {
+            poolId: key.pool_id,
+            signer: key.signer,
+            spendingCap: material.spending_cap,
+            expiry: material.expiry,
+            ownerSig: material.owner_sig,
+        })
     } else {
         None
     };
 
-    let voucher = PaymentPool::RedeemVoucher {
+    let voucher = Box::new(PaymentPool::RedeemVoucher {
         poolId: key.pool_id,
         signer: key.signer,
         provider: key.provider,
         cumulative: owed,
         bytesDelivered: st.last_bytes_delivered(),
         voucherSig: Bytes::from(normalize_voucher_signature(sig_bytes)),
-    };
+    });
     Ok(RedeemPlan::Redeem { voucher, register })
 }
 
@@ -841,6 +837,7 @@ async fn plan_redeem<P: Provider + Clone>(
 /// NOT seed the paid cache: the `PoolRedeemed` event this tx emits is the single
 /// write path for the paid side.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -979,7 +976,7 @@ async fn redeem_sweep<P: Provider + Clone>(
                 {
                     caps.push(reg);
                 }
-                vouchers.push(voucher);
+                vouchers.push(*voucher);
             }
             Err(err) => {
                 metrics.redemption_failure();
@@ -998,6 +995,7 @@ async fn redeem_sweep<P: Provider + Clone>(
 /// the single write path for the paid side. A batch that reverts (a structurally
 /// invalid entry — bad signature, wrong provider, bad owner-signature) or fails to
 /// send records one `redemption_failure`; the next tick re-prepares and retries.
+#[allow(clippy::cognitive_complexity)]
 async fn submit_redeem_many<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     caps: Vec<PaymentPool::CapabilityReg>,
@@ -1327,7 +1325,7 @@ mod tests {
         let deb = DebouncedCheckpointStore::with_params(
             Arc::clone(&inner),
             10,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             Box::new(Instant::now),
         );
         let key = CheckpointKey::PoolOpened;

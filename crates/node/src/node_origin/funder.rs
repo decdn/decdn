@@ -15,7 +15,7 @@
 //! it reads the pool's current spendable — `deposit - committed`, off the shared
 //! [`PoolContext`] the driver mutates and the shared [`PoolLedger`] the pull
 //! commits through — and asks `top_up_pool` for `current_spendable + additional`.
-//! That drives spendable up by exactly `additional`, matching resume::fund's own
+//! That drives spendable up by exactly `additional`, matching `resume::fund`'s own
 //! use of `top_up_pool` (which targets `working_deposit` of spendable directly).
 //!
 //! The pool has no expiry, so a `topUp` strands nothing time-bound — the node
@@ -242,7 +242,7 @@ mod tests {
         let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
         let f = NodeFunder::new(opener.clone(), test_ctx(deposit), test_ledger(committed));
 
-        f.top_up(additional).await.expect("top-up should succeed");
+        let _ = f.top_up(additional).await.expect("top-up should succeed");
 
         // current spendable = 1000 - 600 = 400; target = 400 + 250 = 650.
         assert_eq!(opener.last_target(), Some(U256::from(650u64)));

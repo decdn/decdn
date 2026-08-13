@@ -44,37 +44,6 @@ pub(crate) enum TxOutcome {
     Timeout,
 }
 
-/// A payload-free discriminant of [`TxOutcome`], so a site's terminal
-/// classification (which outcomes are success vs retry) can be expressed as a
-/// pure function and unit-tested without a live provider.
-///
-/// Contract: this variant set stays 1:1 with [`TxOutcome`], and every match
-/// that classifies a `TxKind` (here and at the call sites) must be exhaustive —
-/// no `_` arm. A wildcard would silently fold a newly added terminal into an
-/// existing action bucket instead of forcing the deliberate re-review that
-/// adding a `TxOutcome` variant should trigger at each decision point.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TxKind {
-    Landed,
-    Reverted,
-    SendErr,
-    ReceiptErr,
-    Timeout,
-}
-
-impl TxOutcome {
-    /// The payload-free discriminant of this outcome.
-    pub(crate) const fn kind(&self) -> TxKind {
-        match self {
-            TxOutcome::Landed(_) => TxKind::Landed,
-            TxOutcome::Reverted(_) => TxKind::Reverted,
-            TxOutcome::SendErr(_) => TxKind::SendErr,
-            TxOutcome::ReceiptErr(_) => TxKind::ReceiptErr,
-            TxOutcome::Timeout => TxKind::Timeout,
-        }
-    }
-}
-
 /// Drive an already-issued `.send()` to a classified [`TxOutcome`].
 ///
 /// `sent` is the result of `contract.<method>(..).send().await`. When
@@ -110,16 +79,6 @@ pub(crate) async fn send_and_await_receipt(
 mod tests {
     use super::*;
 
-    #[test]
-    fn timeout_reports_its_kind() {
-        // `kind()` is the bridge that lets provider-free tests pin a site's
-        // outcome→action mapping (see the buyer-ladder tests). The receipt- and
-        // error-carrying variants need a live provider to construct and are
-        // covered by the anvil e2e; `Timeout` is the one payload-free arm and
-        // pins that the discriminant is wired.
-        assert_eq!(TxOutcome::Timeout.kind(), TxKind::Timeout);
-    }
-
     #[tokio::test]
     async fn failed_send_classifies_as_send_err() {
         // The one classification branch of the core that needs no live provider:
@@ -130,6 +89,5 @@ mod tests {
         let send_err = alloy::transports::TransportErrorKind::custom_str("boom");
         let outcome = send_and_await_receipt(Err(send_err.into()), None).await;
         assert!(matches!(outcome, TxOutcome::SendErr(_)));
-        assert_eq!(outcome.kind(), TxKind::SendErr);
     }
 }

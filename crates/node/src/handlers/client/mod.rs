@@ -486,7 +486,7 @@ pub struct ClientHandler {
     eth_signer: Arc<PrivateKeySigner>,
     /// `SlashJudge` EIP-712 domain for `StreamResponse.slash_sig`.
     slash_domain: Eip712Domain,
-    /// `PaymentChannel` EIP-712 domain for voucher verification.
+    /// `PaymentPool` EIP-712 domain for voucher verification.
     voucher_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
     bind_domain: Eip712Domain,
@@ -1185,7 +1185,7 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
             // trailing bytes don't couple to them (ADR 005 two-phase). Gate here
             // rather than at each use: an out-of-range `voucher_interval_mb` is a
             // protocol error per ADR 003 §Voucher Interval Negotiation, and this
-            // wire boundary is its only enforcement point — `PaymentChannel`
+            // wire boundary is its only enforcement point — `PaymentPool`
             // holds no cadence parameter to check it against.
             ext.validate().map_err(|e| StreamReadError {
                 err: anyhow::anyhow!("stream request ext rejected: {e}"),
@@ -1630,10 +1630,10 @@ mod tests {
     /// #1382 / #1388: the hard per-byte voucher floor must track the LIVE
     /// delivery floor, NOT the floor snapshotted when the quote was signed.
     ///
-    /// The on-chain `PaymentChannel._advanceClaimWatermark` enforces the floor
-    /// against the live `deliveryFloor` storage slot at settlement — there is no
-    /// per-channel floor snapshot (the `Channel` struct carries none), and
-    /// `setRateBounds` overwrites it globally. So a node that accepted a voucher
+    /// The on-chain `PaymentPool._redeemVoucher` enforces the floor against the
+    /// live `deliveryFloor` storage slot at settlement — there is no per-lane
+    /// floor snapshot (the `Pool` struct carries none), and `setRateBounds`
+    /// overwrites it globally. So a node that accepted a voucher
     /// priced below the live floor could never redeem it (`RateFloorViolation`).
     /// When a governance floor raise lands mid-stream, a voucher paying the old
     /// quoted rate MUST therefore be rejected: the buyer did nothing wrong, but
@@ -1804,7 +1804,7 @@ mod tests {
         let expiry = 1_900_000_000u64;
 
         let make_wire = |key: &PrivateKeySigner| -> decdn_protocol::client::WireCapability {
-            let signed = Capability {
+            let signed_cap = Capability {
                 signer,
                 spending_cap,
                 pool_id,
@@ -1815,7 +1815,7 @@ mod tests {
             decdn_protocol::client::WireCapability {
                 spending_cap: spending_cap.to_be_bytes(),
                 expiry,
-                owner_signature: signed.signature.as_bytes().to_vec(),
+                owner_signature: signed_cap.signature.as_bytes().to_vec(),
             }
         };
 
