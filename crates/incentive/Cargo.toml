@@ -25,7 +25,7 @@ categories.workspace = true
 # outright ("optional dependency `redb` is not included in any feature"), and
 # the explicit `redb` feature below shadows the name so it cannot serve that
 # role itself.
-buyer-store-core = ["dep:redb", "dep:postcard"]
+buyer-store-core = ["dep:redb"]
 # Persistent buyer-only store (`buyer_pool_redb`): adds `RedbBuyerPoolStore`
 # (its own `buyer-pools.redb` file + open guards) on top of the shared table.
 # Off by default so the contracts/voucher logic doesn't link `redb`; the CLI
@@ -56,7 +56,12 @@ rand = { workspace = true }
 rpassword = { workspace = true }
 zeroize = { workspace = true }
 redb = { workspace = true, optional = true }
-postcard = { workspace = true, optional = true }
+# Non-optional: the `capability_grant` delegation-token codec postcard-encodes
+# the grant on every build. `decdn-protocol` already links postcard, so a direct
+# dependency here adds no binary weight.
+postcard = { workspace = true }
+# `dcap1:` delegation-token base64url alphabet (`capability_grant`).
+base64 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

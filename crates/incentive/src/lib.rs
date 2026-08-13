@@ -46,6 +46,7 @@ pub mod buyer_pool_redb;
 #[cfg(feature = "buyer-store-core")]
 pub mod buyer_pool_table;
 pub mod capability;
+pub mod capability_grant;
 pub mod capacity_bond;
 pub mod client_bridge;
 pub mod content_blacklist;
@@ -81,6 +82,7 @@ pub use buyer_pool::{
     BuyerProgressError, DepositOutcome, MemoryBuyerPoolStore,
 };
 pub use capability::{Capability, CapabilityError, SignedCapability};
+pub use capability_grant::{CapabilityGrant, GrantError, GrantOwnerError};
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
