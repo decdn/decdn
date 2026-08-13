@@ -1236,6 +1236,7 @@ async fn stall_delivery_at_closing_voucher(
     conn: &Connection,
     hash: [u8; 32],
     expected_wire: u64,
+    ext: Option<&StreamRequestExt>,
 ) -> anyhow::Result<StalledDelivery> {
     let (mut send, mut recv) = conn
         .open_bi()
@@ -1251,7 +1252,7 @@ async fn stall_delivery_at_closing_voucher(
         timestamp_us: 0x0012_61a0,
     };
     let payload =
-        encode_stream_request(&req, None).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+        encode_stream_request(&req, ext).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
     write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
@@ -1378,8 +1379,15 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
         .connect(fx.target.clone(), ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let stalled =
-        stall_delivery_at_closing_voucher(&conn, *blob.hash.as_bytes(), blob.wire_bytes).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+    let stalled = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob.hash.as_bytes(),
+        blob.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
 
     // The reaper is disabled while the stream is in flight: no close, however many
     // idle windows pass. `idle * 5` is well past the window yet far short of the
@@ -1440,8 +1448,15 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
         .connect(fx.target.clone(), ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let stalled =
-        stall_delivery_at_closing_voucher(&conn, *blob.hash.as_bytes(), blob.wire_bytes).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+    let stalled = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob.hash.as_bytes(),
+        blob.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
 
     // Park past `connect + idle` so the two candidate origins are unambiguously
     // separated: a clock counting from accept is already due when we pay.
@@ -1504,13 +1519,19 @@ async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> 
         .connect(fx.target.clone(), ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
     let mut totals = VoucherTotals::default();
     let mut final_completion = Instant::now();
 
     for round in 1..=3 {
-        let stalled =
-            stall_delivery_at_closing_voucher(&conn, *blob.hash.as_bytes(), blob.wire_bytes)
-                .await?;
+        let stalled = stall_delivery_at_closing_voucher(
+            &conn,
+            *blob.hash.as_bytes(),
+            blob.wire_bytes,
+            Some(&ext),
+        )
+        .await?;
         let (completed_at, settled) = stalled.pay_and_finish(&fx.client_signer, totals).await?;
         totals = settled;
         final_completion = completed_at;
@@ -1577,12 +1598,22 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
         .connect(fx.target.clone(), ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let stalled_a =
-        stall_delivery_at_closing_voucher(&conn, *blob_a.hash.as_bytes(), blob_a.wire_bytes)
-            .await?;
-    let stalled_b =
-        stall_delivery_at_closing_voucher(&conn, *blob_b.hash.as_bytes(), blob_b.wire_bytes)
-            .await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+    let stalled_a = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_a.hash.as_bytes(),
+        blob_a.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+    let stalled_b = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_b.hash.as_bytes(),
+        blob_b.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
 
     let (_first_completed_at, totals) = stalled_a
         .pay_and_finish(&fx.client_signer, VoucherTotals::default())
