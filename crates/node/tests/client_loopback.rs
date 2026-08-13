@@ -4048,10 +4048,15 @@ fn content_with_origins(
 }
 
 /// [`spawn_handler_server_with_metrics`] with an ADR 011 origin deny-set wired in.
+/// `owner` is the pool's funder as the serve gate reads it from `getPool.owner`
+/// (via a stub pool-view); the origin-blacklist gate refuses a pool whose owner
+/// is on the deny-set. Pool `remaining` is unbounded so only the deny-set — not
+/// the floor-`M` gate — can refuse.
 async fn spawn_handler_server_with_deny(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     deny: Arc<decdn_node::content_deny::ContentDenylist>,
+    owner: Address,
 ) -> anyhow::Result<(
     EndpointAddr,
     Arc<PrivateKeySigner>,
@@ -4074,7 +4079,13 @@ async fn spawn_handler_server_with_deny(
         RATE_PER_MB,
         0,
         16,
-        |deps| deps.content_deny = deny,
+        |deps| {
+            deps.content_deny = deny;
+            deps.pool_view = Some(Arc::new(FixedRemainingPoolView {
+                owner,
+                remaining: U256::MAX,
+            }));
+        },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -4315,7 +4326,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
     ));
 
     let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_deny(cache, store, deny).await?;
+        spawn_handler_server_with_deny(cache, store, deny, funder).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, signer, deposit);
@@ -4676,7 +4687,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
         &content_with_origins(&[funder.address()]),
     ));
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_deny(cache, store, deny).await?;
+        spawn_handler_server_with_deny(cache, store, deny, funder.address()).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -4804,8 +4815,13 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
     // Starts empty — nothing is denied at open time, so the request is admitted
     // and the cut-off can only come from the mid-stream re-check.
     let deny = Arc::new(decdn_node::content_deny::ContentDenylist::empty());
-    let (target, server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_deny(cache, Arc::clone(&store), Arc::clone(&deny)).await?;
+    let (target, server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_deny(
+        cache,
+        Arc::clone(&store),
+        Arc::clone(&deny),
+        funder.address(),
+    )
+    .await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = channel_context(&client_ep, Arc::clone(&delegate), U256::from(10_000_000u64));
@@ -5375,6 +5391,8 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
 async fn spawn_counting_pull_server_with_deny(
     store: Arc<dyn PoolStateStore>,
     denied: &[alloy::primitives::Address],
+    remaining: U256,
+    owner: Address,
 ) -> anyhow::Result<(
     EndpointAddr,
     Arc<std::sync::atomic::AtomicUsize>,
@@ -5415,6 +5433,7 @@ async fn spawn_counting_pull_server_with_deny(
         |deps| {
             deps.pull_through = Some(std::time::Duration::from_secs(10));
             deps.content_deny = deny;
+            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -5423,9 +5442,13 @@ async fn spawn_counting_pull_server_with_deny(
     Ok((target, hits, server_ep, server_task, cache_tmp, metrics))
 }
 
-/// [`spawn_counting_pull_server_with_deny`] with an empty deny-set.
+/// [`spawn_counting_pull_server_with_deny`] with an empty deny-set. `remaining`
+/// is the pool headroom the floor-`M` pull-path gate reads through the stub
+/// pool-view; `owner` is a benign, non-denied funder.
 async fn spawn_counting_pull_server(
     store: Arc<dyn PoolStateStore>,
+    remaining: U256,
+    owner: Address,
 ) -> anyhow::Result<(
     EndpointAddr,
     Arc<std::sync::atomic::AtomicUsize>,
@@ -5434,7 +5457,7 @@ async fn spawn_counting_pull_server(
     tempfile::TempDir,
     Arc<Metrics>,
 )> {
-    spawn_counting_pull_server_with_deny(store, &[]).await
+    spawn_counting_pull_server_with_deny(store, &[], remaining, owner).await
 }
 
 /// #1519, the headline case: an underfunded channel must not make the node spend.
@@ -5464,8 +5487,9 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Pool remaining 9 sits one base unit under the window's cost of 10.
     let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
-        spawn_counting_pull_server(store_dyn).await?;
+        spawn_counting_pull_server(store_dyn, U256::from(9u64), signer.address()).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5542,8 +5566,9 @@ async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Pool remaining exactly equals the window's cost of 10 — the funded boundary.
     let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
-        spawn_counting_pull_server(store_dyn).await?;
+        spawn_counting_pull_server(store_dyn, U256::from(10u64), signer.address()).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5614,8 +5639,10 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         Some([0x33; 65]),
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Gross deposit 10 USDC, but only 5 remaining after prior redeems — one below
+    // the window cost of 10.
     let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
-        spawn_counting_pull_server(store_dyn).await?;
+        spawn_counting_pull_server(store_dyn, U256::from(5u64), client.address()).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5802,7 +5829,13 @@ async fn a_request_rejected_before_pricing_does_not_clamp_the_rate() -> anyhow::
 async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> anyhow::Result<()> {
     let (store, funder, delegate) = delegate_signer_store()?;
     let (target, hits, server_ep, server_task, _cache_tmp, _metrics) =
-        spawn_counting_pull_server_with_deny(store, &[funder.address()]).await?;
+        spawn_counting_pull_server_with_deny(
+            store,
+            &[funder.address()],
+            U256::MAX,
+            funder.address(),
+        )
+        .await?;
 
     let delegate_sk = fresh_key();
     let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
@@ -5841,9 +5874,17 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
 /// every channel that exists today no other test can tell them apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> anyhow::Result<()> {
-    let (store, _funder, delegate) = delegate_signer_store()?;
+    let (store, funder, delegate) = delegate_signer_store()?;
+    // The funder (pool owner) is clean; only the delegate signer is on the
+    // deny-set, and the signer's membership is not a compliance event.
     let (target, hits, server_ep, server_task, _cache_tmp, _metrics) =
-        spawn_counting_pull_server_with_deny(store, &[delegate.address()]).await?;
+        spawn_counting_pull_server_with_deny(
+            store,
+            &[delegate.address()],
+            U256::MAX,
+            funder.address(),
+        )
+        .await?;
 
     let delegate_sk = fresh_key();
     let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
