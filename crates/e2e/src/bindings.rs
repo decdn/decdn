@@ -2,11 +2,13 @@
 //! drive, which the production `decdn-incentive` bindings (read/seller-only)
 //! deliberately omit.
 //!
-//! The seller-path reads — `getChannel`, the `Channel` struct, the `Status`
-//! enum — are reused from [`decdn_incentive::payment_channel::PaymentChannel`]
-//! (the same ABI the runtime decodes) rather than re-declared, so the
-//! load-bearing `Channel` layout has a single source of truth. Everything here
-//! is buyer/operator/publisher setup the seller binding does not expose.
+//! The pool surface — `openPool`, `getPool`, `getAuthorization`, `getWatermark`,
+//! `ownerPoolNonce`, the `Pool`/`Authorization`/`Lane` structs, and the
+//! `PoolOpened`/`PoolRedeemed` events — is reused from
+//! [`decdn_incentive::payment_pool::PaymentPool`] (the same ABI the runtime
+//! decodes) rather than re-declared, so the load-bearing pool layout has a
+//! single source of truth. Everything here is buyer/operator/publisher setup
+//! the production binding does not add on top.
 
 // The `sol!`-generated bindings use patterns the workspace clippy denies (raw
 // indexing into ABI fixed-size byte arrays, `unwrap` on infallible
@@ -25,8 +27,10 @@
     non_camel_case_types
 )]
 
-// Reuse the production seller-path binding for the `Channel` struct + reads.
-pub use decdn_incentive::payment_channel::PaymentChannel;
+// Reuse the production pool binding for the `Pool`/`Authorization`/`Lane`
+// structs + reads (`getPool`/`getAuthorization`/`getWatermark`) and the
+// owner/redeemer writes (`openPool`/`topUp`/`redeem`/`redeemMany`).
+pub use decdn_incentive::payment_pool::PaymentPool;
 // Reuse the node-side ContentBlacklist binding (read view + membership events +
 // governance add/remove writes) — same ABI the runtime watcher decodes.
 pub use decdn_incentive::content_blacklist::ContentBlacklist;
@@ -122,24 +126,6 @@ alloy::sol! {
         // distributes it 50% to the recorded challenger and 50% to the burn.
         function escrowedTotal() external view returns (uint256);
         function finalizeUnappealedSlash(uint256 slashId) external;
-    }
-
-    /// Buyer-side `openChannel` plus the channel-derivation reads.
-    ///
-    /// NOTE: `openChannel` is now **duplicated** — the production binding in
-    /// `decdn_incentive::payment_channel::PaymentChannel` grew the buyer write
-    /// too (#744), so this declaration is redundant and must be kept in sync
-    /// with `contracts/src/PaymentChannel.sol` by hand. Collapsing onto the
-    /// production binding is worthwhile cleanup, but out of scope here.
-    ///
-    /// `voucherSigner` pins the voucher-signing address; the contract resolves
-    /// the zero address to `msg.sender` (self-signing).
-    #[sol(rpc)]
-    contract PaymentChannelOpen {
-        function openChannel(address provider, uint256 deposit, address voucherSigner)
-            external
-            returns (bytes32 channelId);
-        function clientChannelNonce(address client) external view returns (uint256);
     }
 
     /// `FeeRouter.bytesPerEpoch` — governance-canonical served-bytes counter

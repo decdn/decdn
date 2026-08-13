@@ -1,12 +1,12 @@
 //! B3.5 money proof — two real paying clients coalesce onto ONE serve-miss fill,
-//! each paying its OWN egress on its OWN channel (#1656).
+//! each paying its OWN egress on its OWN pool lane (#1656).
 //!
 //! Two independently-funded `cdn/client/v1` buyers fetch the SAME missing blob
 //! from ONE pull-through node CONCURRENTLY. The node runs the range-aware
 //! coalescing serve-miss (`CacheEngine::claim_fill`): the first miss OWNS a single
 //! upstream fill for the hash, the overlapping second ATTACHES as an observer and
 //! streams the same filling cache — each over its OWN send stream, metering its
-//! OWN egress against its OWN channel and voucher collection. The single fill
+//! OWN egress against its OWN pool lane and voucher collection. The single fill
 //! promotes the blob to the node's cache exactly once.
 //!
 //! This is an **own-origin** coalescing proof: the node's single upstream fill is
@@ -15,13 +15,13 @@
 //! node-to-node *paid* upstream variant is not expressible in this harness: a
 //! `NodeFixture` is funded only for its seller/operator role (a TOKEN capacity
 //! bond via `ChainFixture::onboard_operator`), never with USDC or a
-//! `PaymentChannel` approval for a *buyer* role, and there is no fixture to fund a
+//! `PaymentPool` approval for a *buyer* role, and there is no fixture to fund a
 //! node as an upstream-paying buyer, nor cross-node DHT / on-chain
 //! `OriginAssignment` discovery wiring between two `NodeFixture`s. Building either
 //! would be net-new harness infrastructure. The own-origin path exercises the
 //! IDENTICAL `claim_fill` / `FillSession` coalescing machinery
 //! (`serve_via_backend_origin`, the peer twin's own-origin sibling), so the
-//! downstream money property this test proves — N independent per-channel ledgers,
+//! downstream money property this test proves — N independent per-pool ledgers,
 //! no cross-client leakage — is exactly the same on both paths.
 //!
 //! What this test asserts (executable proof of incentive sign-off point (b)):
@@ -29,10 +29,10 @@
 //!      tier (`decdn_local_outboard_serves_total` advances by exactly 2 across the
 //!      two concurrent fetches — neither was a cache hit).
 //!   2. Both clients receive the full blob, byte-exact.
-//!   3. The two clients settle on DISTINCT channels, each accruing its OWN egress
+//!   3. The two clients settle on DISTINCT pools, each accruing its OWN egress
 //!      payment (`outstanding_micro_usdc > 0`), the two amounts near-equal — so
-//!      neither channel was billed the other's bytes (no cross-client leakage: a
-//!      leak would show one channel at ~2x and the other at ~0, or one carrying
+//!      neither pool was billed the other's bytes (no cross-client leakage: a
+//!      leak would show one pool at ~2x and the other at ~0, or one carrying
 //!      the sum).
 //!   4. Removing the origin and fetching once more from a third client still
 //!      delivers the blob byte-exact — proving the concurrent misses promoted a
@@ -106,13 +106,14 @@ fn make_blob(len: usize) -> Vec<u8> {
 }
 
 /// Read the `outstanding_micro_usdc` (cumulative accrued voucher claim) the node
-/// reports for `channel_id`, polling until a non-zero claim is visible or the
-/// budget expires. A settled full delivery has a non-zero cumulative claim; the
-/// node records it before the client's `fetch_once` returns, but the admin
-/// surface reads the persisted store, so a short poll rides out the fsync gap.
-async fn settled_outstanding(node: &NodeFixture, channel_id: B256) -> anyhow::Result<u64> {
+/// reports for the lane on `pool_id`, polling until a non-zero claim is visible
+/// or the budget expires. A settled full delivery has a non-zero cumulative
+/// claim; the node records it before the client's `fetch_once` returns, but the
+/// admin surface reads the persisted store, so a short poll rides out the fsync
+/// gap.
+async fn settled_outstanding(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u64> {
     let admin = node.admin_client()?;
-    let wanted = channel_id;
+    let wanted = pool_id;
     let snapshot = poll(Duration::from_secs(30), || async {
         let resp = admin.channels().await.context("admin channels")?;
         Ok(resp
@@ -122,9 +123,7 @@ async fn settled_outstanding(node: &NodeFixture, channel_id: B256) -> anyhow::Re
             .filter(|s| s.outstanding_micro_usdc > 0))
     })
     .await?
-    .with_context(|| {
-        format!("node never reported a non-zero settled claim for channel {wanted}")
-    })?;
+    .with_context(|| format!("node never reported a non-zero settled claim for pool {wanted}"))?;
     Ok(snapshot.outstanding_micro_usdc)
 }
 
@@ -145,11 +144,11 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
     let node = NodeFixture::launch_pull_through_cache(&chain, "US", &[]).await?;
 
     // A small warm-up blob (own-origin, with outboard) both clients fetch first
-    // during session set-up. Fetching it registers each channel in the node's
+    // during session set-up. Fetching it creates each pool lane in the node's
     // live serve map, so the later concurrent fetches race the miss path from a
-    // clean start with NO per-fetch channel-observation delay — the two misses
+    // clean start with NO per-fetch pool-readiness delay — the two misses
     // therefore overlap deterministically rather than one racing ahead while the
-    // other is still waiting for its `ChannelOpened` event.
+    // other is still waiting for the serve path to accept its pool.
     let warm = make_blob(3 * CHUNK_GROUP + 7);
     let warm_hash = node.seed_origin_blob_with_outboard(&warm)?;
 
@@ -162,9 +161,9 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
     let client_a = ClientFixture::new(&chain).await?;
     let client_b = ClientFixture::new(&chain).await?;
 
-    // Open + register both channels (sequentially — this is set-up), each proven
+    // Open + register both pools (sequentially — this is set-up), each proven
     // live by its warm-up delivery. `open_session` returns only once the node's
-    // serve path has actually served this channel, so both are ready to stream.
+    // serve path has actually served this pool, so both are ready to stream.
     let (mut sess_a, _) = client_a
         .open_session(&chain, &node, warm_hash)
         .await
@@ -173,11 +172,11 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
         .open_session(&chain, &node, warm_hash)
         .await
         .context("client B session set-up")?;
-    let cid_a = sess_a.channel_id();
-    let cid_b = sess_b.channel_id();
+    let pid_a = sess_a.pool_id();
+    let pid_b = sess_b.pool_id();
     anyhow::ensure!(
-        cid_a != cid_b,
-        "the two clients must fund DISTINCT channels (got {cid_a} twice)"
+        pid_a != pid_b,
+        "the two clients must fund DISTINCT pools (got {pid_a} twice)"
     );
 
     // Baseline the own-origin serve-tier counter AFTER warm-up: client A's warm-up
@@ -189,7 +188,7 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
     // The proof: both clients fetch the SAME missing blob CONCURRENTLY. The first
     // miss owns the single own-origin fill; the overlapping second attaches as an
     // observer and streams the same filling cache. Each pays its OWN egress on its
-    // OWN channel.
+    // OWN pool lane.
     let fa = client_a.fetch_once(&mut sess_a, hash, 0, U256::ZERO);
     let fb = client_b.fetch_once(&mut sess_b, hash, 0, U256::ZERO);
     let (bytes_a, bytes_b) = tokio::try_join!(fa, fb).context("concurrent coalesced fetch")?;
@@ -222,12 +221,12 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
          (expected +2, got {tier_before} -> {tier_after})"
     );
 
-    // (3) Two INDEPENDENT per-channel settlements, no cross-client leakage. Each
-    // channel accrued its own egress payment; the two amounts are near-equal
-    // because each client received the same warm-up + blob bytes. A leak would
-    // show one channel carrying ~both deliveries (the sum) and the other near zero.
-    let paid_a = settled_outstanding(&node, cid_a).await?;
-    let paid_b = settled_outstanding(&node, cid_b).await?;
+    // (3) Two INDEPENDENT per-pool settlements, no cross-client leakage. Each
+    // lane accrued its own egress payment; the two amounts are near-equal because
+    // each client received the same warm-up + blob bytes. A leak would show one
+    // lane carrying ~both deliveries (the sum) and the other near zero.
+    let paid_a = settled_outstanding(&node, pid_a).await?;
+    let paid_b = settled_outstanding(&node, pid_b).await?;
     anyhow::ensure!(
         paid_a > 0 && paid_b > 0,
         "each client must settle its OWN non-zero egress claim (A={paid_a}, B={paid_b})"
@@ -239,8 +238,8 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
     // tighter than the ~2x / ~0 split a cross-client leak would produce.
     anyhow::ensure!(
         hi <= lo + lo / 4,
-        "the two per-channel settlements must be near-equal — a large gap means one \
-         channel was billed the other's bytes (A={paid_a}, B={paid_b})"
+        "the two per-pool settlements must be near-equal — a large gap means one \
+         pool was billed the other's bytes (A={paid_a}, B={paid_b})"
     );
 
     // (4) The concurrent misses promoted a complete, byte-exact cache entry.

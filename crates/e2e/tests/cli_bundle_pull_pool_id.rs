@@ -1,23 +1,21 @@
-//! Live anvil-backed e2e for `decdn bundle pull --channel-id` (issue #1481): the
-//! publisher-pays *adopt-by-id* path, extended from `decdn fetch` to bundle pull.
+//! Live anvil-backed e2e for `decdn bundle pull` over a shared payment pool: one
+//! pool funds every entry in the bundle.
 //!
 //! Shape: deploy the protocol, launch a provider node serving two small blobs,
-//! have a buyer open one payment channel on-chain, then `bundle pull` a
-//! two-entry manifest with `--channel-id` and NO channel pre-recorded in the
-//! client store. The whole bundle must adopt that single channel (hydrating it
-//! from chain on the first entry, reusing it for the second) and land both
-//! files — proving the `Payment::Adopt` branch pins every entry to the channel's
-//! provider and pays them all from it.
+//! then `bundle pull` a two-entry manifest with the buyer's chain coordinates
+//! and NO pool pre-recorded in the client store. The CLI opens one pool on the
+//! first entry, reuses it for the second, and lands both files — proving the
+//! whole bundle pays every provider it touches from the caller's single shared
+//! pool (ADR 003), with no per-provider open.
 //!
-//! `--provider-address` is passed too, standing alone as the mismatch guard
-//! against the channel's on-chain provider (the #1492 decouple): it is accepted
-//! without being the thing that locates the node.
+//! `--provider-address` is passed alongside `--node-id` to pin every entry to
+//! this one node, so both entries share the same `(signer, provider)` lane.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH`:
 //!
 //! ```bash
-//! cargo nextest run -p decdn-e2e --features anvil-e2e cli_bundle_pull_channel_id
+//! cargo nextest run -p decdn-e2e --features anvil-e2e cli_bundle_pull_pool_id
 //! ```
 
 #![cfg(feature = "anvil-e2e")]
@@ -31,38 +29,35 @@
     clippy::duration_suboptimal_units
 )]
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel};
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
-use decdn_incentive::buyer_channel::BuyerChannelStore;
-use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
+use decdn_incentive::buyer_pool::BuyerPoolStore;
+use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
-use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::voucher_domain;
+use decdn_incentive::lane::LaneKey;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
-const KEYSTORE_PASSWORD: &str = "bundle-adopt-e2e-password";
+const KEYSTORE_PASSWORD: &str = "bundle-pool-e2e-password";
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cli_bundle_pull_adopts_one_channel_for_the_whole_bundle() -> anyhow::Result<()> {
+async fn cli_bundle_pull_uses_one_pool_for_the_whole_bundle() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
-        .context("cli bundle pull --channel-id e2e exceeded the overall timeout")??;
+        .context("cli bundle pull pool e2e exceeded the overall timeout")??;
     Ok(())
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one sequential end-to-end journey: each step depends on the previous step's channel \
+    reason = "one sequential end-to-end journey: each step depends on the previous step's pool \
               state, so decomposing it would thread state through helpers without reducing the \
               journey's length or making it easier to follow"
 )]
@@ -75,11 +70,11 @@ async fn run() -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
-    // Two distinct served blobs → a two-entry bundle. Fetching both on ONE
-    // adopted channel is the point: the second entry must reuse the channel the
-    // first hydrated, serialized by the per-provider voucher lock.
-    let blob_a = b"decdn bundle-pull adopt e2e blob A (#1481)".to_vec();
-    let blob_b = b"decdn bundle-pull adopt e2e blob B (#1481) - a second entry".to_vec();
+    // Two distinct served blobs → a two-entry bundle. Fetching both on ONE pool is
+    // the point: the second entry reuses the pool the first opened, serialized by
+    // the per-provider voucher lane lock.
+    let blob_a = b"decdn bundle-pull pool e2e blob A".to_vec();
+    let blob_b = b"decdn bundle-pull pool e2e blob B - a second entry".to_vec();
     let hash_a = Hash::new(&blob_a);
     let hash_b = Hash::new(&blob_b);
     let (node, hashes) =
@@ -92,8 +87,7 @@ async fn run() -> anyhow::Result<()> {
     let provider_addr = node.operator_addr();
 
     // Funded buyer with an on-disk keystore under a `0o700` client data dir (the
-    // `RedbBuyerChannelStore` the CLI opens enforces the mode; `tempdir` is
-    // `0o755`).
+    // `RedbBuyerPoolStore` the CLI opens enforces the mode; `tempdir` is `0o755`).
     let client_dir = tempfile::tempdir().context("client tempdir")?;
     #[cfg(unix)]
     std::fs::set_permissions(
@@ -115,37 +109,6 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    // Open ONE channel on-chain against the node's operator. voucherSigner ZERO =
-    // self-signing (the funder signs), and the funder is our buyer whose key is in
-    // the keystore — so the channel is adoptable. Crucially we do NOT record it in
-    // the client store: `bundle pull --channel-id` must hydrate it from chain.
-    let buyer_provider = chain.provider_for(&buyer);
-    let pc = PaymentChannel::new(chain.addrs().payment_channel, buyer_provider.clone());
-    ensure_allowance(
-        &buyer_provider,
-        chain.usdc(),
-        buyer_addr,
-        chain.addrs().payment_channel,
-        None,
-    )
-    .await
-    .context("approve PaymentChannel")?;
-    let deposit = U256::from(DEPOSIT_MICRO_USDC);
-    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_channel);
-    let opened = open_channel(
-        &pc,
-        Arc::new(buyer.clone()),
-        &voucher_dom,
-        chain.usdc(),
-        buyer_addr,
-        provider_addr,
-        deposit,
-        Address::ZERO,
-    )
-    .await
-    .context("open buyer channel")?;
-    let channel_id = opened.state.channel_id;
-
     // A local v1 manifest naming both served blobs. `-i` means no manifest blob
     // is fetched first; the entries are pulled directly.
     let out_dir = client_dir.path().join("out");
@@ -160,16 +123,15 @@ async fn run() -> anyhow::Result<()> {
     let args = bundle_pull_argv(
         &chain,
         &node,
-        channel_id,
         &manifest_path,
         &out_dir,
         client_dir.path(),
         &keystore,
     );
 
-    // The node accepts vouchers only once its chain watcher has decoded the
-    // `ChannelOpened` event (~500ms poll), so the first run races it. Retry until
-    // observation lands, exactly as the fetch e2e does.
+    // The node serves the freshly-opened pool once its `getPool` view resolves it
+    // (right after `openPool` mines), so the first run can race that resolution.
+    // Retry until it lands, exactly as the fetch e2e does.
     run_bundle_pull_until_ready(client_dir.path(), &args).await?;
 
     // Both entries landed with the served bytes.
@@ -178,22 +140,33 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(got_a == blob_a, "a.bin mismatch: {} bytes", got_a.len());
     anyhow::ensure!(got_b == blob_b, "b.bin mismatch: {} bytes", got_b.len());
 
-    // The adopted channel was hydrated into the client store and actually paid:
-    // its persisted watermark advanced past zero, and it is the SAME channel id we
-    // opened (adopt, not a fresh auto-open).
-    let store = RedbBuyerChannelStore::open(client_dir.path()).context("reopen client store")?;
+    // The CLI opened exactly one pool for this owner, recorded it in the client
+    // store, and paid the bundle from it: the pool's `(signer, provider)` lane
+    // watermark advanced past zero for the one provider both entries share.
+    let store = RedbBuyerPoolStore::open(client_dir.path()).context("reopen client store")?;
     let state = store
-        .get_by_channel_id(channel_id)
-        .context("read adopted channel")?
-        .ok_or_else(|| anyhow::anyhow!("adopted channel {channel_id} was not persisted"))?;
+        .get_by_owner(buyer_addr)
+        .context("read buyer pool")?
+        .ok_or_else(|| anyhow::anyhow!("no pool was recorded for owner {buyer_addr}"))?;
     anyhow::ensure!(
-        state.provider == provider_addr,
-        "adopted channel provider {} != node operator {provider_addr}",
-        state.provider
+        state.owner == buyer_addr,
+        "recorded pool owner {} != buyer {buyer_addr}",
+        state.owner
     );
+    let lane = LaneKey {
+        pool_id: state.pool_id,
+        signer: buyer_addr,
+        provider: provider_addr,
+    };
+    let progress = state
+        .lane_progress(lane)
+        .ok_or_else(|| anyhow::anyhow!("no lane progress recorded for provider {provider_addr}"))?;
     anyhow::ensure!(
-        state.last_bytes_delivered > U256::ZERO,
-        "the adopted channel must have paid for the bundle; watermark did not advance"
+        progress.last_bytes > U256::ZERO && progress.last_amount > U256::ZERO,
+        "the pool must have paid for the bundle; lane watermark did not advance \
+         (bytes={}, amount={})",
+        progress.last_bytes,
+        progress.last_amount
     );
 
     // `NodeFixture` tears the daemon down on drop; there is nothing to await.
@@ -201,8 +174,8 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `decdn bundle pull`, retrying until the node's chain watcher has observed
-/// the freshly-opened channel (the CLI has no internal retry for that race).
+/// Run `decdn bundle pull`, retrying until the node's serve path resolves the
+/// freshly-opened pool (the CLI has no internal retry for that race).
 async fn run_bundle_pull_until_ready(
     data_dir: &std::path::Path,
     args: &[String],
@@ -225,31 +198,29 @@ async fn run_bundle_pull_until_ready(
             String::from_utf8_lossy(&output.stderr)
         );
         tracing::debug!(
-            "bundle pull not ready; retrying after watcher catch-up:\n{}",
+            "bundle pull not ready; retrying after serve-path catch-up:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 }
 
-/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to adopt
-/// `channel_id` and pull a local manifest over the explicit-node path, with chain
-/// coordinates as flags so no config file is needed. `--capacity-bond-address` is
-/// omitted deliberately: `--node-id` locates the node, so the adopt path never
-/// reads the registry. `--provider-address` is passed standing alone as the
-/// channel-provider mismatch guard (#1492).
+/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
+/// local manifest over the explicit-node path, with chain coordinates as flags so
+/// no config file is needed. `--provider-address` pins every entry to this one
+/// node (and one lane). `--capacity-bond-address` is required even on the
+/// explicit-node path: it is the EIP-712 `verifyingContract` the buyer signs its
+/// ADR 005 client identity binding against, and the node refuses to serve a paid
+/// request that carries no verified binding.
 fn bundle_pull_argv(
     chain: &ChainFixture,
     node: &NodeFixture,
-    channel_id: B256,
     manifest: &std::path::Path,
     out_dir: &std::path::Path,
     data_dir: &std::path::Path,
     keystore: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "--channel-id".into(),
-        format!("{channel_id:#x}"),
         "-i".into(),
         manifest.display().to_string(),
         "-o".into(),
@@ -262,8 +233,10 @@ fn bundle_pull_argv(
         format!("{}", node.operator_addr()),
         "--rpc-url".into(),
         chain.rpc_url(),
-        "--payment-channel-address".into(),
-        format!("{}", chain.addrs().payment_channel),
+        "--payment-pool-address".into(),
+        format!("{}", chain.addrs().payment_pool),
+        "--capacity-bond-address".into(),
+        format!("{}", chain.addrs().capacity_bond),
         "--slash-judge-address".into(),
         format!("{}", chain.addrs().slash_judge),
         "--chain-id".into(),

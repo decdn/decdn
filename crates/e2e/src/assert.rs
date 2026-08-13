@@ -1,15 +1,15 @@
 //! On-chain assertion helpers: typed reads of the state journeys check
-//! (channel records, operator bond activity) and typed revert matching.
-//! Daemon-side assertions go through the admin RPC client on
-//! [`crate::node::NodeFixture`]; delivered-bytes assertions come from
-//! [`crate::client::FetchOutcome`].
+//! (pool records, per-lane watermarks, capability authorizations, operator bond
+//! activity) and typed revert matching. Daemon-side assertions go through the
+//! admin RPC client on [`crate::node::NodeFixture`]; delivered-bytes assertions
+//! come from [`crate::client::FetchOutcome`].
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolError;
 use anyhow::Context;
 
-use crate::bindings::{CapacityBond, PaymentChannel, PaymentChannelOpen};
+use crate::bindings::{CapacityBond, PaymentPool};
 
 /// Assert an alloy contract call reverted with exactly `E`, matching on the
 /// 4-byte selector. Distinguishes the guard under test from a transport fault
@@ -65,18 +65,50 @@ fn assert_revert_data<E: SolError>(
     Ok(())
 }
 
-/// Full on-chain `Channel` record (reuses the production seller-path binding's
-/// struct, the single source of truth for the ABI layout).
-pub async fn read_channel<P: Provider>(
+/// Full on-chain `Pool` record (reuses the production pool binding's struct, the
+/// single source of truth for the ABI layout).
+pub async fn read_pool<P: Provider>(
     provider: &P,
-    payment_channel: Address,
-    channel_id: B256,
-) -> anyhow::Result<PaymentChannel::Channel> {
-    PaymentChannel::new(payment_channel, provider)
-        .getChannel(channel_id)
+    payment_pool: Address,
+    pool_id: B256,
+) -> anyhow::Result<PaymentPool::Pool> {
+    PaymentPool::new(payment_pool, provider)
+        .getPool(pool_id)
         .call()
         .await
-        .context("getChannel")
+        .context("getPool")
+}
+
+/// A signer's `(cap, expiry, spent)` authorization against a pool. A zero `cap`
+/// and zero `expiry` means the signer is not yet registered — the pre-condition
+/// a first redemption clears when it registers the owner-signed capability.
+pub async fn read_authorization<P: Provider>(
+    provider: &P,
+    payment_pool: Address,
+    pool_id: B256,
+    signer: Address,
+) -> anyhow::Result<PaymentPool::Authorization> {
+    PaymentPool::new(payment_pool, provider)
+        .getAuthorization(pool_id, signer)
+        .call()
+        .await
+        .context("getAuthorization")
+}
+
+/// A `(signer, provider)` lane's cumulative-paid `(amount, bytesDelivered)`
+/// watermark — the on-chain figure a `PoolRedeemed` advances.
+pub async fn read_watermark<P: Provider>(
+    provider: &P,
+    payment_pool: Address,
+    pool_id: B256,
+    signer: Address,
+    provider_addr: Address,
+) -> anyhow::Result<PaymentPool::Lane> {
+    PaymentPool::new(payment_pool, provider)
+        .getWatermark(pool_id, signer, provider_addr)
+        .call()
+        .await
+        .context("getWatermark")
 }
 
 /// Whether `operator` is on-chain `isActive` (bonded + registered).
@@ -92,31 +124,29 @@ pub async fn operator_active<P: Provider>(
         .context("isActive")
 }
 
-/// `channelId = keccak256(abi.encodePacked(client, provider, channelNonce))`,
-/// matching `PaymentChannel.openChannel`. Lets a caller derive the id without
-/// parsing the `ChannelOpened` receipt.
+/// `poolId = keccak256(abi.encodePacked(owner, ownerPoolNonce))`, matching
+/// `PaymentPool.openPool`. Lets a caller derive the id without parsing the
+/// `PoolOpened` receipt.
 #[must_use]
-pub fn channel_id(client: Address, provider: Address, channel_nonce: u64) -> B256 {
-    let mut packed = Vec::with_capacity(72);
-    packed.extend_from_slice(client.as_slice());
-    packed.extend_from_slice(provider.as_slice());
-    packed.extend_from_slice(&U256::from(channel_nonce).to_be_bytes::<32>());
+pub fn pool_id(owner: Address, owner_pool_nonce: u64) -> B256 {
+    let mut packed = Vec::with_capacity(52);
+    packed.extend_from_slice(owner.as_slice());
+    packed.extend_from_slice(&U256::from(owner_pool_nonce).to_be_bytes::<32>());
     alloy::primitives::keccak256(&packed)
 }
 
-/// The next channel nonce `openChannel` will assign to `client` (the public
-/// mapping getter), so a test can derive the resulting `channelId` ahead of the
-/// open.
-pub async fn client_channel_nonce<P: Provider>(
+/// The next pool nonce `openPool` will assign to `owner` (the public mapping
+/// getter), so a test can derive the resulting `poolId` ahead of the open.
+pub async fn owner_pool_nonce<P: Provider>(
     provider: &P,
-    payment_channel: Address,
-    client: Address,
+    payment_pool: Address,
+    owner: Address,
 ) -> anyhow::Result<U256> {
-    PaymentChannelOpen::new(payment_channel, provider)
-        .clientChannelNonce(client)
+    PaymentPool::new(payment_pool, provider)
+        .ownerPoolNonce(owner)
         .call()
         .await
-        .context("clientChannelNonce")
+        .context("ownerPoolNonce")
 }
 
 #[cfg(test)]
@@ -125,26 +155,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channel_id_matches_packed_keccak() {
-        // `keccak256(abi.encodePacked(client, provider, uint256(nonce)))` — the
-        // derivation `PaymentChannel.openChannel` uses. `expected` is an
-        // independent Foundry-produced vector (not recomputed from this Rust
-        // code), so a wrong *original* packing — field order, endianness, nonce
-        // width — is caught, not just a later refactor. The packed preimage is
-        // 20-byte client ‖ 20-byte provider ‖ 32-byte big-endian uint256(7);
-        // regenerate the expected hash with:
+    fn pool_id_matches_packed_keccak() {
+        // `keccak256(abi.encodePacked(owner, uint256(nonce)))` — the derivation
+        // `PaymentPool.openPool` uses. `expected` is an independent Foundry-produced
+        // vector (not recomputed from this Rust code), so a wrong *original* packing
+        // — field order, endianness, nonce width — is caught, not just a later
+        // refactor. The packed preimage is 20-byte owner ‖ 32-byte big-endian
+        // uint256(7); regenerate the expected hash with:
         //   cast keccak 0x0000000000000000000000000000000000000001\
-        //                 0000000000000000000000000000000000000002\
         //                 0000000000000000000000000000000000000000000000000000000000000007
-        let client: Address = "0x0000000000000000000000000000000000000001"
-            .parse()
-            .unwrap();
-        let provider: Address = "0x0000000000000000000000000000000000000002"
+        let owner: Address = "0x0000000000000000000000000000000000000001"
             .parse()
             .unwrap();
         let expected = alloy::primitives::b256!(
-            "0xf8ca1ac6826b46e04989b1fb54c7e400ae0d611a635ab73fa7a95b28d5f46eda"
+            "0xb04aad3ec8e9b0d16a001f5bfe99a4b491a4397ce09795032b68ffd53dd08ee9"
         );
-        assert_eq!(channel_id(client, provider, 7), expected);
+        assert_eq!(pool_id(owner, 7), expected);
     }
 }
