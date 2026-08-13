@@ -70,7 +70,7 @@ const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// The delegate's FINITE cumulative spend ceiling — 5 USDC. Deliberately not the
 /// deposit and emphatically not `U256::MAX`: the on-chain registered cap must
 /// read back as exactly this, proving the delegated capability (not a self-cap)
-/// drove the registration. It dwarfs the ~20 µUSDC one 2 MiB delivery costs, so
+/// drove the registration. It dwarfs the ~20 `µUSDC` one 2 MiB delivery costs, so
 /// it never binds during the fetch.
 const DELEGATE_CAP_MICRO_USDC: u64 = 5_000_000;
 /// Capability lifetime handed to `pool assign` (`--expiry-secs`). The exact
@@ -402,7 +402,7 @@ async fn run_cli_capture(
         "{what} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(String::from_utf8(output.stdout).with_context(|| format!("{what} stdout was not UTF-8"))?)
+    String::from_utf8(output.stdout).with_context(|| format!("{what} stdout was not UTF-8"))
 }
 
 /// Run `decdn fetch`, retrying until the node's chain watcher has observed the

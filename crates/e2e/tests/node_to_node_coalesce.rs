@@ -194,6 +194,7 @@ async fn two_clients_coalesce_one_paid_upstream_pull() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::similar_names)] // pid_a/pid_b, paid_a/paid_b — per-client a/b pairs read clearly
 async fn run_node_to_node_coalesce() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

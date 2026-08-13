@@ -1,5 +1,6 @@
 ---
 source: crates/protocol/tests/public_api.rs
+assertion_line: 54
 expression: public_api.to_string()
 ---
 pub mod decdn_protocol
@@ -60,6 +61,7 @@ pub decdn_protocol::client::StreamRequest::pool_id: [u8; 32]
 pub decdn_protocol::client::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::client::StreamRequestExt
 pub decdn_protocol::client::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
+pub decdn_protocol::client::StreamRequestExt::capability: core::option::Option<decdn_protocol::client::WireCapability>
 pub decdn_protocol::client::StreamRequestExt::voucher_interval_mb: core::option::Option<u64>
 impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
@@ -89,6 +91,12 @@ pub decdn_protocol::client::WatermarkBundle::bytes_delivered: [u8; 32]
 pub decdn_protocol::client::WatermarkBundle::last_signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::WatermarkBundle
 pub const fn decdn_protocol::client::WatermarkBundle::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::client::WireCapability
+pub decdn_protocol::client::WireCapability::expiry: u64
+pub decdn_protocol::client::WireCapability::owner_signature: alloc::vec::Vec<u8>
+pub decdn_protocol::client::WireCapability::spending_cap: [u8; 32]
+impl decdn_protocol::client::WireCapability
+pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_SIZE: usize
 pub const decdn_protocol::client::DEFAULT_VOUCHER_INTERVAL_MB: u64
@@ -215,6 +223,7 @@ pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
 pub decdn_protocol::message::MessageValidationError::ChunkTooLarge
 pub decdn_protocol::message::MessageValidationError::ChunkTooLarge::len: usize
+pub decdn_protocol::message::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::message::MessageValidationError::EmptyChunk
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen::len: usize
@@ -306,6 +315,7 @@ pub decdn_protocol::GossipPayload::NodeAnnounce(decdn_protocol::gossip::NodeAnno
 pub enum decdn_protocol::MessageValidationError
 pub decdn_protocol::MessageValidationError::ChunkTooLarge
 pub decdn_protocol::MessageValidationError::ChunkTooLarge::len: usize
+pub decdn_protocol::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::MessageValidationError::EmptyChunk
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen::len: usize
@@ -476,6 +486,7 @@ pub decdn_protocol::StreamRequest::pool_id: [u8; 32]
 pub decdn_protocol::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::StreamRequestExt
 pub decdn_protocol::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
+pub decdn_protocol::StreamRequestExt::capability: core::option::Option<decdn_protocol::client::WireCapability>
 pub decdn_protocol::StreamRequestExt::voucher_interval_mb: core::option::Option<u64>
 impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>

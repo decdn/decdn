@@ -850,10 +850,9 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     anyhow::ensure!(
         settled_amount <= ceiling,
         "the lane must not have double-paid the prefix delivered before the top-up: \
-         settled {} µUSDC, but the whole-blob WIRE cost at {MULTI_RATE_PER_MB} µUSDC/MB is \
+         settled {settled_amount} µUSDC, but the whole-blob WIRE cost at {MULTI_RATE_PER_MB} µUSDC/MB is \
          {wire_floor} µUSDC (content-only cost {true_cost}); tight ceiling {ceiling} allows \
-         under one re-fetched chunk group — a double-pay would settle a full interval higher",
-        settled_amount
+         under one re-fetched chunk group — a double-pay would settle a full interval higher"
     );
     // Lower bound: no under-pay. The whole blob's wire bytes were paid at least
     // once. The wire-vs-content bug skipped ~one proof's worth of delivered
@@ -861,10 +860,9 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // content-only `true_cost`, which is why the floor must be `wire_floor`).
     anyhow::ensure!(
         settled_amount >= wire_floor,
-        "the lane under-paid: settled {} µUSDC, below the whole-blob WIRE cost of \
+        "the lane under-paid: settled {settled_amount} µUSDC, below the whole-blob WIRE cost of \
          {wire_floor} µUSDC (content-only {true_cost}) — resuming past the true content paid \
-         frontier would skip billing the delivered-but-unpaid tail exactly like this",
-        settled_amount
+         frontier would skip billing the delivered-but-unpaid tail exactly like this"
     );
 
     drop(node);
@@ -1143,16 +1141,14 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
 
     anyhow::ensure!(
         settled_amount >= wire_floor,
-        "under-pay across two top-ups: settled {} µUSDC, below the whole-blob WIRE cost of \
+        "under-pay across two top-ups: settled {settled_amount} µUSDC, below the whole-blob WIRE cost of \
          {wire_floor} µUSDC. A second-leg paid frontier derived from a stale baseline \
-         overshoots the true one and skips billing exactly this way",
-        settled_amount
+         overshoots the true one and skips billing exactly this way"
     );
     anyhow::ensure!(
         settled_amount <= ceiling,
-        "double-pay across two top-ups: settled {} µUSDC against a whole-blob WIRE cost of \
-         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid 4 MiB interval would add 8000000",
-        settled_amount
+        "double-pay across two top-ups: settled {settled_amount} µUSDC against a whole-blob WIRE cost of \
+         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid 4 MiB interval would add 8000000"
     );
 
     // Both top-ups landed on-chain and are reflected locally. Each one restores
