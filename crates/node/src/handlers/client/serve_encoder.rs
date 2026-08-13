@@ -122,6 +122,18 @@ impl AsyncSliceReader for AwaitingDataReader {
                 if self.present_covers(offset, need).await? {
                     break;
                 }
+                // DIAG#1673: capture-on-failure — the coherent encoder's data reader
+                // is failing a leaf because no live fill still covers it. This is the
+                // deepest mid-stream close site: it becomes the `next_frame` error the
+                // serve leg propagates. Record the pull outcome + coverage state.
+                eprintln!(
+                    "DIAG#1673 data_reader.dead_range offset={offset} len={len} \
+                     range_live={} pull_outcome={:?} observers={} cancelled={}",
+                    self.session.range_still_live(&range),
+                    self.session.outcome(),
+                    self.session.observer_count(),
+                    self.session.is_cancelled(),
+                );
                 return Err(match self.session.outcome() {
                     Some(Err(msg)) => io::Error::other(format!(
                         "upstream pull failed before content [{offset}, +{len}) landed: {msg}"

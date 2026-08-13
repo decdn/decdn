@@ -334,6 +334,9 @@ impl ClientHandler {
                 // or Mixed remainder). Fail the serve rather than panic (anti-panic
                 // policy) — the response is already sent, so a mid-stream error is the
                 // honest outcome; carry the hash + namespace for production debugging.
+                eprintln!(
+                    "DIAG#1673 window.owner_without_target hash={hash} namespace={namespace_id}"
+                );
                 serve_session.mark_ended(Err(decdn_cache::FillError::new(
                     "serve-miss owning claim without a pull target",
                 )));
@@ -375,6 +378,9 @@ impl ClientHandler {
                         Err(e) => {
                             // The pull could not start: record a terminal error and
                             // wake the serve leg so it fails a gap rather than hanging.
+                            eprintln!(
+                                "DIAG#1673 window.peer_pull_runtime_build_failed hash={hash} err={e}"
+                            );
                             session.mark_ended(Err(decdn_cache::FillError::new(format!(
                                 "serve-miss pull runtime build failed: {e}"
                             ))));
@@ -387,6 +393,7 @@ impl ClientHandler {
                     // The OS refused the thread: fail any attached observer fast
                     // (`mark_ended`), release every lease (no handle parked, so nothing
                     // to join), and fail the serve.
+                    eprintln!("DIAG#1673 window.peer_pull_thread_spawn_failed hash={hash} err={e}");
                     serve_session.mark_ended(Err(decdn_cache::FillError::new(format!(
                         "could not spawn serve-miss pull thread: {e}"
                     ))));
@@ -696,6 +703,9 @@ impl ClientHandler {
                         Err(e) => {
                             // The pull could not start: record a terminal error and
                             // wake the serve leg so it fails a gap rather than hanging.
+                            eprintln!(
+                                "DIAG#1673 window.local_pull_runtime_build_failed hash={hash} err={e}"
+                            );
                             session.mark_ended(Err(decdn_cache::FillError::new(format!(
                                 "serve-miss local pull runtime build failed: {e}"
                             ))));
@@ -709,6 +719,9 @@ impl ClientHandler {
                     // The OS refused the thread: fail any attached observer fast
                     // (`mark_ended`), release every lease (nothing parked to join), and
                     // fail the serve.
+                    eprintln!(
+                        "DIAG#1673 window.local_pull_thread_spawn_failed hash={hash} err={e}"
+                    );
                     serve_session.mark_ended(Err(decdn_cache::FillError::new(format!(
                         "could not spawn serve-miss local pull thread: {e}"
                     ))));

@@ -146,7 +146,22 @@ impl ClientHandler {
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.
-        let mut next_chunk = producer.next_frame().await?;
+        let mut next_chunk = match producer.next_frame().await {
+            Ok(frame) => frame,
+            Err(e) => {
+                // DIAG#1673: capture-on-failure — the very first frame faulted (a
+                // gap the pull could not fill, or a proof/verify error). This is one
+                // of the mid-stream close sites under investigation.
+                eprintln!(
+                    "DIAG#1673 serve_leg.first_frame hash={hash} off={offset} end={end} \
+                     pull_outcome={:?} observers={} cancelled={} err={e:#}",
+                    session.outcome(),
+                    session.observer_count(),
+                    session.is_cancelled(),
+                );
+                return Err(e);
+            }
+        };
 
         loop {
             // Progress trackers for the no-progress guard below: an iteration that
@@ -175,6 +190,17 @@ impl ClientHandler {
                     .write_message(send, &ClientMessage::ChunkData(frame))
                     .await
                 {
+                    // DIAG#1673: capture-on-failure — a downstream write failed
+                    // mid-stream (the #856 client-disconnect shape). Records where the
+                    // serve closed so CI can distinguish a real client drop from a
+                    // server-side teardown that manifests as the client's `early eof`.
+                    eprintln!(
+                        "DIAG#1673 serve_leg.write hash={hash} delivered={delivered} paid={paid} \
+                         pull_outcome={:?} observers={} cancelled={} err={e:#}",
+                        session.outcome(),
+                        session.observer_count(),
+                        session.is_cancelled(),
+                    );
                     self.metrics.node_pull_through_client_abandoned();
                     return Err(e);
                 }
@@ -184,7 +210,22 @@ impl ClientHandler {
                     pending.push_back(unvouchered);
                     unvouchered = 0;
                 }
-                next_chunk = producer.next_frame().await?;
+                next_chunk = match producer.next_frame().await {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        // DIAG#1673: capture-on-failure — a mid-range frame faulted
+                        // (the coherent encoder hit a gap the pull could not fill, or
+                        // a proof/verify error). A prime mid-stream close site.
+                        eprintln!(
+                            "DIAG#1673 serve_leg.next_frame hash={hash} delivered={delivered} \
+                             paid={paid} pull_outcome={:?} observers={} cancelled={} err={e:#}",
+                            session.outcome(),
+                            session.observer_count(),
+                            session.is_cancelled(),
+                        );
+                        return Err(e);
+                    }
+                };
             }
             let done_delivering = next_chunk.is_none();
 
@@ -226,6 +267,15 @@ impl ClientHandler {
                 {
                     Ok(outcome) => outcome,
                     Err(e) => {
+                        // DIAG#1673: capture-on-failure — a transport drop or an
+                        // underpayment bail (#856/#857) inside voucher collection.
+                        eprintln!(
+                            "DIAG#1673 serve_leg.collect_voucher hash={hash} delivered={delivered} \
+                             paid={paid} pull_outcome={:?} observers={} cancelled={} err={e:#}",
+                            session.outcome(),
+                            session.observer_count(),
+                            session.is_cancelled(),
+                        );
                         // A transport drop or an underpayment bail (#856/#857): meter
                         // the client-abandon, then propagate so the caller drops
                         // the pull leg and bounds the upstream spend.
@@ -292,6 +342,16 @@ impl ClientHandler {
                     // so a node paying upstream for a client that won't pay is
                     // alertable.
                     BatchStop::Rejected => {
+                        // DIAG#1673: capture-on-failure — a voucher was rejected /
+                        // hit `RetryLater`; the serve stops WITHOUT `StreamEnd`, which
+                        // the client sees as `early eof`.
+                        eprintln!(
+                            "DIAG#1673 serve_leg.voucher_rejected hash={hash} delivered={delivered} \
+                             paid={paid} pull_outcome={:?} observers={} cancelled={}",
+                            session.outcome(),
+                            session.observer_count(),
+                            session.is_cancelled(),
+                        );
                         self.metrics.node_pull_through_client_abandoned();
                         return Ok(());
                     }
@@ -313,6 +373,15 @@ impl ClientHandler {
             // taken-down blob is the pull leg's own takedown handling, reached when
             // this return drops it.
             if collected_any && !done && self.takedown_landed(hash, Some(funder)) {
+                // DIAG#1673: capture-on-failure — an in-flight takedown terminated the
+                // serve mid-stream. Not expected in these tests, but recorded so CI can
+                // rule it out as the mid-stream close cause.
+                eprintln!(
+                    "DIAG#1673 serve_leg.takedown hash={hash} delivered={delivered} paid={paid} \
+                     observers={} cancelled={}",
+                    session.observer_count(),
+                    session.is_cancelled(),
+                );
                 self.terminate_for_takedown(send, recv, hash);
                 return Ok(());
             }
@@ -333,6 +402,22 @@ impl ClientHandler {
             let made_delivery_progress = delivered > delivered_at_iter_start;
             let made_payment_progress = committed_this_iter > 0;
             if !made_delivery_progress && !made_payment_progress {
+                // DIAG#1673: capture-on-failure — the no-progress guard fired: no new
+                // byte delivered AND no voucher cleared this iteration. Under CI
+                // coverage-starvation a starved pull leg could leave the serve unable to
+                // deliver while the client is still paying, tripping this guard and
+                // stopping WITHOUT `StreamEnd` — exactly the `early eof` symptom. Prime
+                // suspect: record the full state (done_delivering, pending, unvouchered).
+                eprintln!(
+                    "DIAG#1673 serve_leg.no_progress hash={hash} delivered={delivered} paid={paid} \
+                     done_delivering={done_delivering} pending={} unvouchered={unvouchered} \
+                     next_chunk_is_some={} pull_outcome={:?} observers={} cancelled={}",
+                    pending.len(),
+                    next_chunk.is_some(),
+                    session.outcome(),
+                    session.observer_count(),
+                    session.is_cancelled(),
+                );
                 // The client stopped paying (#856 drop-after-fill): meter the abandon,
                 // then stop cleanly.
                 self.metrics.node_pull_through_client_abandoned();
@@ -343,7 +428,19 @@ impl ClientHandler {
         // Fully delivered and fully paid: signal clean completion. Every byte was
         // bao-verified into the cache by the pull leg's admit before this leg read
         // it, so the served bytes are sound.
-        self.write_message(send, &ClientMessage::StreamEnd).await?;
+        // DIAG#1673: capture-on-failure — the clean completion marker. Present so a
+        // failing CI job shows whether a serve leg reached `StreamEnd` at all (and for
+        // which hash), separating "closed early" from "the OTHER leg is the failure".
+        if let Err(e) = self.write_message(send, &ClientMessage::StreamEnd).await {
+            eprintln!(
+                "DIAG#1673 serve_leg.stream_end_write_failed hash={hash} delivered={delivered} \
+                 paid={paid} err={e:#}",
+            );
+            return Err(e);
+        }
+        eprintln!(
+            "DIAG#1673 serve_leg.stream_end_ok hash={hash} delivered={delivered} paid={paid}"
+        );
         let _ = send.finish();
         Ok(())
     }
