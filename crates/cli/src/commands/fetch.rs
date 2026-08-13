@@ -305,10 +305,10 @@ impl ProxyWarmingParams {
 /// needs `has_blob` + RTT; the chosen node's delivery is fully verified
 /// downstream. Errors if none of the probed candidates hold it.
 ///
-/// Every candidate is probed on equal footing: unlike the pre-pool
-/// `PaymentChannel` model, opening cost is provider-independent here — the
-/// caller has ONE pool that fans out to every provider (ADR 003), so there is
-/// no per-provider "already funded" distinction left to prefer.
+/// Every candidate is probed on equal footing: opening cost is
+/// provider-independent, because the caller has ONE pool that fans out to
+/// every provider (ADR 003), so there is no per-provider "already funded"
+/// distinction to prefer.
 ///
 /// When `warming` is enabled (opt-in, #1174/ADR 037) and the best holder is
 /// distant, this may instead return a probed **non-holder** that is measurably
@@ -993,10 +993,9 @@ where
 /// exhaustion and that budget/attempts remain); this only executes the
 /// on-chain move and returns the [`DepositOutcome`] for the driver to credit.
 ///
-/// Unlike the pre-pool `PaymentChannel` model, there is no funder-vs-delegate
-/// split here: the CLI fetcher is always its own pool owner, so `top_up` is
-/// unconditionally authorized (`topUp` is owner-only on-chain, and owner ==
-/// signer on this path).
+/// There is no funder-vs-delegate split here: the CLI fetcher is always its
+/// own pool owner, so `top_up` is unconditionally authorized (`topUp` is
+/// owner-only on-chain, and owner == signer on this path).
 struct CliFunder<'a, P> {
     contract: &'a PaymentPool::PaymentPoolInstance<P>,
     rpc: &'a P,
@@ -1155,9 +1154,8 @@ pub(crate) fn attach_client_binding(
 /// and persist a new one. A reused pool whose remaining deposit has run low is
 /// auto-refilled on-chain via `topUp` before it is returned — see
 /// [`refill_amount`] for the policy. There is no pool expiry (ADR 003), so
-/// unlike the pre-pool `PaymentChannel` model there is no replace-on-expiry
-/// branch: the same pool is reused for the caller's whole lifetime, across
-/// every provider.
+/// there is no replace-on-expiry branch: the same pool is reused for the
+/// caller's whole lifetime, across every provider.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_or_reuse_pool<P>(
     store: &RedbBuyerPoolStore,

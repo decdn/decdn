@@ -54,7 +54,7 @@ pub const KNOWN_CHAINS: &[KnownChain] = &[KnownChain {
 /// deploy script recorded it.
 #[derive(Debug)]
 pub struct ChainAddresses {
-    pub payment_channel: String,
+    pub payment_pool: String,
     pub capacity_bond: String,
     pub slash_judge: String,
     pub content_blacklist: String,
@@ -111,7 +111,7 @@ impl KnownChain {
         };
 
         Ok(ChainAddresses {
-            payment_channel: contract("PaymentChannel")?,
+            payment_pool: contract("PaymentPool")?,
             capacity_bond: contract("CapacityBond")?,
             slash_judge: contract("SlashJudge")?,
             content_blacklist: contract("ContentBlacklist")?,
@@ -178,7 +178,7 @@ mod tests {
             // applies to a user-supplied address — a bad-checksum manifest is
             // caught here at CI, not on an operator's first `config validate`.
             for (field, value) in [
-                ("payment_channel", &addrs.payment_channel),
+                ("payment_pool", &addrs.payment_pool),
                 ("capacity_bond", &addrs.capacity_bond),
                 ("slash_judge", &addrs.slash_judge),
                 ("content_blacklist", &addrs.content_blacklist),

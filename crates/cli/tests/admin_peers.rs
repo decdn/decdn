@@ -32,11 +32,11 @@ use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
 use decdn_common::cli::{
-    AnnounceArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, PeersArgs, ReloadArgs, StatusArgs,
+    AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs, PeersArgs, ReloadArgs, StatusArgs,
 };
 use decdn_gossip::PeerTable;
 use decdn_incentive::{LaneState, MemoryPoolStateStore, PoolStateStore, VoucherActivity};
-use decdn_node::admin::{self, AdminState, ChannelStatusHandles, DhtStatusHandles, DrainTrigger};
+use decdn_node::admin::{self, AdminState, DhtStatusHandles, DrainTrigger, LaneStatusHandles};
 use decdn_node::dht::routing::NodeId;
 use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
@@ -281,19 +281,19 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `admin_v1_channels` round-trips through real HTTP via jsonrpsee's
-/// generated client (issue #749): a store seeded with two channels
+/// `admin_v1_lanes` round-trips through real HTTP via jsonrpsee's
+/// generated client (issue #749): a store seeded with two lanes
 /// surfaces both, ordered by descending outstanding (no activity
 /// recorded), with the configured threshold echoed and eligibility
 /// computed against it.
 #[tokio::test]
-async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
+async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     use alloy::primitives::{Address, U256};
 
     // A lane is keyed by `(pool_id, signer, provider)`; the admin surface
-    // reports the pool id as the channel id and the signer as both
+    // reports the pool id as the lane id and the signer as both
     // counterparty and voucher signer (the shared-pool model has no separate
-    // delegate at the lane level — see `decdn_node::admin::build_channel_snapshots`).
+    // delegate at the lane level — see `decdn_node::admin::build_lane_snapshots`).
     let mk = |pool_byte: u8, signer_byte: u8, last_amount: u64| -> LaneState {
         let mut id = [0u8; 32];
         id[31] = pool_byte;
@@ -328,28 +328,28 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
     )
-    .with_channels(ChannelStatusHandles {
-        channel_store: store as Arc<dyn PoolStateStore>,
+    .with_lanes(LaneStatusHandles {
+        pool_store: store as Arc<dyn PoolStateStore>,
         voucher_activity: Arc::new(VoucherActivity::new()),
         redeem_threshold_micro_usdc: 1_000_000,
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.channels().await?;
+    let resp = client.lanes().await?;
     assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
-    assert_eq!(resp.channels.len(), 2);
+    assert_eq!(resp.lanes.len(), 2);
     // No activity → ordered by descending outstanding.
     let first = resp
-        .channels
+        .lanes
         .first()
-        .ok_or_else(|| anyhow::anyhow!("missing first channel"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing first lane"))?;
     assert_eq!(first.outstanding_micro_usdc, 2_000_000);
     // The shared-pool model tracks no per-voucher nonce; the admin surface
     // reports 0 unconditionally.
     assert_eq!(first.last_nonce, 0);
     assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
-    assert!(first.channel_id.starts_with("0x"));
+    assert!(first.pool_id.starts_with("0x"));
     assert!(first.counterparty.starts_with("0x"));
     assert_eq!(
         first.voucher_signer, first.counterparty,
@@ -357,9 +357,9 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
     );
     assert_eq!(first.seconds_since_last_voucher, None);
     let second = resp
-        .channels
+        .lanes
         .get(1)
-        .ok_or_else(|| anyhow::anyhow!("missing second channel"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing second lane"))?;
     assert_eq!(second.outstanding_micro_usdc, 100_000);
     assert!(!second.settlement_eligible, "0.1 USDC < 1 USDC threshold");
 
@@ -368,11 +368,11 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `admin_v1_channels` on a node with no channel handles wired returns
+/// `admin_v1_lanes` on a node with no lane handles wired returns
 /// an empty list and a zero threshold over the wire — exercising the
-/// `with_channels`-absent path end-to-end.
+/// `with_lanes`-absent path end-to-end.
 #[tokio::test]
-async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
+async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
@@ -388,8 +388,8 @@ async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.channels().await?;
-    assert!(resp.channels.is_empty());
+    let resp = client.lanes().await?;
+    assert!(resp.lanes.is_empty());
     assert_eq!(resp.redeem_threshold_micro_usdc, 0);
 
     let _ = stop_tx.send(());
@@ -397,20 +397,20 @@ async fn channels_without_handles_returns_empty_over_http() -> anyhow::Result<()
     Ok(())
 }
 
-/// CLI `channels` against a dropped listener surfaces the
+/// CLI `lanes` against a dropped listener surfaces the
 /// connection-refused hint, same as the peers path.
 #[tokio::test]
-async fn cli_channels_surfaces_connection_refused() -> anyhow::Result<()> {
+async fn cli_lanes_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
     drop(listener);
 
-    let args = ChannelsArgs {
+    let args = LanesArgs {
         admin_url: Some(format!("http://{addr}")),
         config: None,
         json: false,
         timeout_ms: 2_000,
     };
-    let err = commands::channels(&args, None)
+    let err = commands::lanes(&args, None)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?

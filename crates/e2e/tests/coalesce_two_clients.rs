@@ -115,11 +115,11 @@ async fn settled_outstanding(node: &NodeFixture, pool_id: B256) -> anyhow::Resul
     let admin = node.admin_client()?;
     let wanted = pool_id;
     let snapshot = poll(Duration::from_secs(30), || async {
-        let resp = admin.channels().await.context("admin channels")?;
+        let resp = admin.lanes().await.context("admin lanes")?;
         Ok(resp
-            .channels
+            .lanes
             .into_iter()
-            .find(|s| s.channel_id.parse::<B256>().is_ok_and(|id| id == wanted))
+            .find(|s| s.pool_id.parse::<B256>().is_ok_and(|id| id == wanted))
             .filter(|s| s.outstanding_micro_usdc > 0))
     })
     .await?

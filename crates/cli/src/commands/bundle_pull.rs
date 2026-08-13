@@ -12,8 +12,7 @@
 //!
 //! **One shared pool.** The whole bundle pulls from the caller's single
 //! `PaymentPool` deposit (ADR 003) — opened once and reused across every
-//! provider the manifest touches, unlike the pre-pool `PaymentChannel` model's
-//! per-provider open. Two concurrency guards follow from that: a per-provider
+//! provider the manifest touches. Two concurrency guards follow from that: a per-provider
 //! async mutex serializes voucher signing on that provider's lane (vouchers are
 //! cumulative per `(signer, provider)` lane, so two in-flight fetches sharing
 //! one lane would race it), and a single global mutex serializes every
@@ -495,10 +494,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// fetches on it would race). Lazily created; held only across one entry's
     /// fetch.
     locks: RefCell<HashMap<Address, Rc<tokio::sync::Mutex<()>>>>,
-    /// Serializes every pool open-or-reuse across the whole bundle. Unlike the
-    /// pre-pool `PaymentChannel` model — where distinct providers held distinct
-    /// channels and could open concurrently — the bundle's every entry shares
-    /// ONE `PaymentPool` deposit (ADR 003), so its on-chain state (deposit,
+    /// Serializes every pool open-or-reuse across the whole bundle. The
+    /// bundle's every entry shares ONE `PaymentPool` deposit (ADR 003), so
+    /// distinct providers cannot open concurrently: its on-chain state (deposit,
     /// standing USDC allowance) is one resource regardless of which provider an
     /// entry is bound for. Taken around the whole open-or-reuse call (which may
     /// also perform a low-water top-up) and released before streaming, so

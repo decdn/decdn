@@ -232,7 +232,7 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 /// pass (ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence).
 pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 
-/// Default seconds between authoritative `PaymentChannel.getRateBounds()`
+/// Default seconds between authoritative `PaymentPool.getRateBounds()`
 /// re-reads by the rate-bounds watcher (#1172, ADR 019 §3.1) — the safety-net
 /// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
 pub const DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC: u64 = 3600;
@@ -1458,15 +1458,15 @@ fn resolve_blockchain_into(
     let buyer_initial_deposit_micro_usdc = file
         .and_then(|b| b.buyer_initial_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
-    // `openChannel` reverts `ZeroAmount` on a zero deposit, so a configured 0
-    // can never open a channel at all. Reject it here too: the contract is the
+    // `openPool` reverts `ZeroAmount` on a zero deposit, so a configured 0
+    // can never open a pool at all. Reject it here too: the contract is the
     // authority, but catching it at load time beats surfacing it as a failed
     // transaction on the first cache-miss pull.
     bag.check_with(
         buyer_initial_deposit_micro_usdc > 0,
         "blockchain.buyer_initial_deposit_micro_usdc",
         || {
-            "blockchain.buyer_initial_deposit_micro_usdc must be > 0 (openChannel reverts \
+            "blockchain.buyer_initial_deposit_micro_usdc must be > 0 (openPool reverts \
              ZeroAmount on a zero deposit)"
                 .to_string()
         },

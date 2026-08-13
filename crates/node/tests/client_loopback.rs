@@ -3075,9 +3075,9 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
 
 /// The #1516 gate reserves remaining HEADROOM, not the gross deposit. Both
 /// deposit authorities — `LaneState::stage_voucher` off-chain and
-/// `PaymentChannel._advanceClaimWatermark` on-chain — compare the *cumulative*
-/// voucher amount, so a long-lived channel that has already claimed most of its
-/// deposit has almost nothing left to spend. Here the gross deposit (100) is ten
+/// `PaymentPool._redeemVoucher` on-chain — compare the *cumulative*
+/// voucher amount, so a long-lived lane that has already claimed most of its
+/// cap has almost nothing left to spend. Here the gross deposit (100) is ten
 /// times the window's cost and would sail through a gross-deposit check, while
 /// the real headroom (5) cannot cover it. The `last_*` fields are private
 /// (#751), so the spent-down watermark is built via `hydrate`.

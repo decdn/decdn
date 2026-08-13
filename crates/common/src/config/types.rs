@@ -183,7 +183,7 @@ pub struct BlockchainConfig {
     /// cadence so live-RPC load is unchanged). Values below
     /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
     pub event_poll_interval_ms: Option<u64>,
-    /// Seconds between authoritative `PaymentChannel.getRateBounds()` re-reads
+    /// Seconds between authoritative `PaymentPool.getRateBounds()` re-reads
     /// by the rate-bounds watcher (#1172, ADR 019 §3.1). This is the safety-net
     /// cadence *in addition to* the `RateBoundsUpdated` event subscription
     /// (which follows [`Self::event_poll_interval_ms`]); it reconciles any log
@@ -504,7 +504,7 @@ pub struct CacheConfig {
     /// default for the initial network: enabling it makes the node front USDC
     /// egress to fill misses (bounded by `blockchain.buyer_working_deposit_micro_usdc`
     /// and the upstream's per-MB rate), and the serving path only triggers it
-    /// behind a valid, channel-bound client so an unpaid request cannot drive
+    /// behind a valid, pool-bound client so an unpaid request cannot drive
     /// egress.
     pub node_to_node_pull_through_enabled: Option<bool>,
     /// Number of discovered providers to probe before ranking on a
@@ -762,7 +762,7 @@ pub struct PaymentConfig {
     /// before signing a `ProbeResponse` (ADR 005 §Rate bounds validation).
     ///
     /// Since #1172 this no longer governs the live clamp: the node reads
-    /// `PaymentChannel.getRateBounds()` at startup and overwrites this value
+    /// `PaymentPool.getRateBounds()` at startup and overwrites this value
     /// before it serves anything, then tracks `RateBoundsUpdated`. Setting it
     /// only affects the window before that read completes (and a failed read
     /// refuses startup outright), so treat the on-chain value as authoritative.
@@ -1072,7 +1072,7 @@ pub struct ContentConfig {
     /// silently leave content served. Duplicates are de-duplicated, not
     /// rejected — a repeated deny is still a deny.
     pub denied_hashes: Option<Vec<String>>,
-    /// Operator addresses whose payment channels this node refuses to serve.
+    /// Operator addresses whose payment pools this node refuses to serve.
     /// `0x`-prefixed hex, checksum-agnostic (any case accepted); the zero
     /// address is rejected.
     pub denied_origins: Option<Vec<String>>,

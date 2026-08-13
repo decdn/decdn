@@ -388,94 +388,92 @@ pub struct StatusResponse {
     pub republish: RepublishHealth,
 }
 
-/// JSON view of one open payment channel emitted by `admin_v1_channels`
-/// (issue #749). Defined separately from `decdn-incentive`'s internal
-/// `ChannelState` so the replay-critical `last_*` accessors, the `U256`
-/// money types, and any future internal fields can't leak into the wire
-/// format: every field here is a plain owned wire value. Shared between
-/// the server (serializes) and `decdn node channels` (deserializes via
-/// the generated client).
+/// JSON view of one lane this node provides against a `PaymentPool`,
+/// emitted by `admin_v1_lanes` (issue #749). A lane is keyed by
+/// `(pool_id, signer, provider)` — [`decdn_incentive::LaneKey`]. Defined
+/// separately from `decdn-incentive`'s internal `LaneState` so the
+/// replay-critical `last_*` accessors, the `U256` money types, and any
+/// future internal fields can't leak into the wire format: every field
+/// here is a plain owned wire value. Shared between the server
+/// (serializes) and `decdn node lanes` (deserializes via the generated
+/// client).
 ///
 /// Money amounts are reported in **micro-USDC** (`u64`) — the same base
 /// unit `blockchain.redeem_threshold_micro_usdc` is configured in. The
-/// underlying `ChannelState` carries them as `U256`; the server narrows
-/// with `u64::try_from(...).unwrap_or(u64::MAX)`, so a value that somehow
+/// underlying `LaneState` carries them as `U256`; the server narrows with
+/// `u64::try_from(...).unwrap_or(u64::MAX)`, so a value that somehow
 /// exceeded `u64::MAX` micro-USDC (~1.8e13 USDC — unreachable for a real
-/// channel bounded by the on-chain deposit) saturates rather than wraps.
+/// pool) saturates rather than wraps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelSnapshot {
-    /// Lowercase hex of the on-chain `channelId` (`keccak256(client,
-    /// provider, channelNonce)` per ADR 003), `0x`-prefixed — same
-    /// 32-byte encoding `alloy`'s `B256` `Display` produces.
-    pub channel_id: String,
-    /// The client (buyer) Ethereum address that **funded** the channel —
-    /// the deposit owner and refund destination, and the subject of the
-    /// ADR-011 blacklist gates. Rendered as an EIP-55 mixed-case
-    /// checksummed hex string (`0x`-prefixed) — `alloy`'s `Address`
-    /// `Display`. Note this differs from [`PeerView::node_id`], which is
-    /// plain lowercase hex of an iroh public key (a different identity
-    /// type, not an EVM address). It is *not* necessarily the voucher
-    /// signer — see [`Self::voucher_signer`].
+pub struct LaneSnapshot {
+    /// Lowercase hex of the on-chain `PaymentPool` id (`LaneKey::pool_id`),
+    /// `0x`-prefixed — same 32-byte encoding `alloy`'s `B256` `Display`
+    /// produces. Shared by every lane drawing from the same pool.
+    pub pool_id: String,
+    /// The pool owner's Ethereum address — the deposit owner and refund
+    /// destination, and the subject of the ADR-011 blacklist gates.
+    /// Rendered as an EIP-55 mixed-case checksummed hex string
+    /// (`0x`-prefixed) — `alloy`'s `Address` `Display`. Note this differs
+    /// from [`PeerView::node_id`], which is plain lowercase hex of an iroh
+    /// public key (a different identity type, not an EVM address). It is
+    /// *not* necessarily the voucher signer — see [`Self::voucher_signer`].
     pub counterparty: String,
-    /// The address pinned on-chain at `openChannel` as this channel's
-    /// voucher signer: the EIP-712 recovery target for every voucher, in
-    /// the same EIP-55 rendering as [`Self::counterparty`]. Equal to
-    /// `counterparty` for the ordinary self-signing case (the contract
-    /// resolves a zero `voucherSigner` argument to `msg.sender`), and a
-    /// distinct delegate key when the funder delegated signing.
+    /// The capability signer authorizing vouchers on this lane
+    /// (`LaneKey::signer`): the EIP-712 recovery target for every voucher,
+    /// in the same EIP-55 rendering as [`Self::counterparty`]. Equal to
+    /// `counterparty` for the ordinary self-signing case, and a distinct
+    /// delegate key when the pool owner delegated signing.
     pub voucher_signer: String,
-    /// Sequence number of the most-recently-accepted voucher
-    /// (`ChannelState::last_nonce`). `0` before any voucher has been
-    /// applied — matches the on-chain `claimedNonce == 0` sentinel.
+    /// Sequence number of the most-recently-accepted voucher. Not tracked
+    /// in the shared-pool model (a pool has no per-lane nonce), so this
+    /// always reports `0`.
     pub last_nonce: u64,
     /// Cumulative amount of the most-recently-accepted voucher, in
-    /// micro-USDC (`ChannelState::last_amount`). This is the node's
-    /// total accrued claim on the channel — the figure that crosses the
+    /// micro-USDC (`LaneState::last_amount`). This is the node's total
+    /// accrued claim on this lane — the figure that crosses the
     /// redemption threshold. `0` before any voucher.
     pub outstanding_micro_usdc: u64,
-    /// On-chain escrowed deposit backing the channel, in micro-USDC
-    /// (`ChannelState::deposit`). Vouchers can never exceed this, so
-    /// `outstanding_micro_usdc / deposit_micro_usdc` is the channel's
-    /// drawn-down fraction — operators watch channels approaching full
-    /// draw-down as a liquidity signal.
+    /// Not tracked in the shared-pool model (the pool's deposit is shared
+    /// across every lane it funds, so no single lane owns a deposit), so
+    /// this always reports `0`.
     pub deposit_micro_usdc: u64,
     /// Whole seconds since this process last accepted a voucher on this
-    /// channel, or `None` when no voucher has been observed *since the
-    /// node started*. The activity clock is in-memory: a channel
-    /// hydrated from `channels.redb` at boot reports `None` until its
-    /// next voucher, because the persisted `ChannelState` carries no
-    /// last-voucher wall-clock. Operators use this to spot stale
-    /// channels (high `outstanding` but no recent vouchers).
+    /// lane, or `None` when no voucher has been observed *since the node
+    /// started*. The activity clock is in-memory: a lane hydrated from
+    /// `lanes.redb` at boot reports `None` until its next voucher, because
+    /// the persisted `LaneState` carries no last-voucher wall-clock.
+    /// Operators use this to spot stale lanes (high `outstanding` but no
+    /// recent vouchers).
     pub seconds_since_last_voucher: Option<u64>,
     /// `true` when the accrued claim (`outstanding_micro_usdc`) has
     /// reached the node's configured redemption threshold
-    /// (`blockchain.redeem_threshold_micro_usdc`), i.e. the redeemer
-    /// would `withdraw` this channel on its next tick. This is an
-    /// **upper-bound** signal: the admin surface does not read the
-    /// on-chain `withdrawnAmount`, so it compares the full accrued claim
-    /// (not the un-redeemed delta) against the threshold. A channel that
-    /// already redeemed up to its current claim may still report `true`
-    /// until the next voucher advances it — surfaced so operators can
-    /// see which channels are *at or above* the redemption bar.
+    /// (`blockchain.redeem_threshold_micro_usdc`), i.e. the redeemer would
+    /// redeem this lane on its next tick. This is an **upper-bound**
+    /// signal: the admin surface does not read the on-chain redeemed
+    /// amount, so it compares the full accrued claim (not the
+    /// un-redeemed delta) against the threshold. A lane that already
+    /// redeemed up to its current claim may still report `true` until the
+    /// next voucher advances it — surfaced so operators can see which
+    /// lanes are *at or above* the redemption bar.
     pub settlement_eligible: bool,
 }
 
-/// Response body for `admin_v1_channels` (issue #749). Shared between the
-/// server (serializes), `decdn node channels` (deserializes via the
+/// Response body for `admin_v1_lanes` (issue #749). Shared between the
+/// server (serializes), `decdn node lanes` (deserializes via the
 /// generated client), and the integration tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelsResponse {
-    /// One entry per channel the node currently tracks. Ordering is most
-    /// recently active first (channels with a known last-voucher time
-    /// ahead of those without), then by descending outstanding amount —
-    /// the on-call use case is "which channels are closest to a
-    /// settlement / liquidity event?".
-    pub channels: Vec<ChannelSnapshot>,
+pub struct LanesResponse {
+    /// One entry per lane the node currently tracks. Ordering is most
+    /// recently active first (lanes with a known last-voucher time ahead
+    /// of those without), then by descending outstanding amount — the
+    /// on-call use case is "which lanes are closest to a settlement /
+    /// liquidity event?".
+    pub lanes: Vec<LaneSnapshot>,
     /// The node's configured redemption threshold in micro-USDC
     /// (`blockchain.redeem_threshold_micro_usdc`). Echoed once at the top
-    /// level — rather than repeated per channel — so the renderer can
-    /// show the bar each [`ChannelSnapshot::settlement_eligible`] is
-    /// measured against without the operator cross-referencing the config.
+    /// level — rather than repeated per lane — so the renderer can show
+    /// the bar each [`LaneSnapshot::settlement_eligible`] is measured
+    /// against without the operator cross-referencing the config.
     pub redeem_threshold_micro_usdc: u64,
 }
 
@@ -592,13 +590,13 @@ pub const DHT_UNAVAILABLE_CODE: i32 = -32_005;
 /// The server also logs the poisoning at `error` level.
 pub const DHT_POISONED_CODE: i32 = -32_006;
 
-/// JSON-RPC error code: `admin_v1_channels` could not read the channel
-/// state store (issue #749) — e.g. the redb load failed or a poisoned
+/// JSON-RPC error code: `admin_v1_lanes` could not read the pool state
+/// store (issue #749) — e.g. the redb load failed or a poisoned
 /// in-memory mutex. A read-side fault distinct from the cache/DHT codes
-/// so an operator script can tell "channel snapshot is unavailable right
+/// so an operator script can tell "lane snapshot is unavailable right
 /// now" from a generic transport failure. The server also logs the
 /// underlying store error.
-pub const CHANNEL_STORE_ERROR_CODE: i32 = -32_007;
+pub const POOL_STORE_ERROR_CODE: i32 = -32_007;
 
 /// JSON-RPC error code: `admin_v1_slashes` was called on a node whose slash
 /// watcher is not wired (e.g. no `slash_judge_address`, or a test/CLI-only
@@ -698,19 +696,18 @@ pub trait AdminRpc {
     #[method(name = "status")]
     async fn status(&self) -> RpcResult<StatusResponse>;
 
-    /// Return a live snapshot of every open payment channel this node
-    /// tracks (issue #749): per channel the last-accepted nonce,
-    /// outstanding accrued claim, escrowed deposit, time since the last
-    /// voucher (in-memory, `None` after a restart until the next
-    /// voucher), and whether the accrued claim has reached the
-    /// redemption threshold. Backs `decdn node channels`, giving
-    /// operators a single view to spot channels approaching settlement,
-    /// stale channels, or unusually high outstanding balances before
-    /// they become a liquidity risk — without scraping metrics or logs.
-    /// Returns [`CHANNEL_STORE_ERROR_CODE`] if the channel state store
-    /// cannot be read.
-    #[method(name = "channels")]
-    async fn channels(&self) -> RpcResult<ChannelsResponse>;
+    /// Return a live snapshot of every lane this node provides against a
+    /// `PaymentPool` (issue #749): per lane the outstanding accrued claim,
+    /// time since the last voucher (in-memory, `None` after a restart
+    /// until the next voucher), and whether the accrued claim has reached
+    /// the redemption threshold. Backs `decdn node lanes`, giving
+    /// operators a single view to spot lanes approaching settlement,
+    /// stale lanes, or unusually high outstanding balances before they
+    /// become a liquidity risk — without scraping metrics or logs.
+    /// Returns [`POOL_STORE_ERROR_CODE`] if the pool state store cannot
+    /// be read.
+    #[method(name = "lanes")]
+    async fn lanes(&self) -> RpcResult<LanesResponse>;
 
     /// Return cumulative per-region bandwidth (issue #750): bytes served to
     /// and pulled from each region, keyed by the counterparty peer's
@@ -835,16 +832,16 @@ mod tests {
         assert_eq!(back.republish.scheduled_records, 5);
     }
 
-    /// `ChannelsResponse` round-trips through serde unchanged — guards the
-    /// nested `ChannelSnapshot` shape both the server and `decdn node
-    /// channels` (de)serialize (issue #749).
+    /// `LanesResponse` round-trips through serde unchanged — guards the
+    /// nested `LaneSnapshot` shape both the server and `decdn node
+    /// lanes` (de)serialize (issue #749).
     #[test]
-    fn channels_response_round_trips() {
-        let resp = ChannelsResponse {
+    fn lanes_response_round_trips() {
+        let resp = LanesResponse {
             redeem_threshold_micro_usdc: 1_000_000,
-            channels: vec![
-                ChannelSnapshot {
-                    channel_id: "0xabcd".to_string(),
+            lanes: vec![
+                LaneSnapshot {
+                    pool_id: "0xabcd".to_string(),
                     counterparty: "0x00aa".to_string(),
                     voucher_signer: "0x00cc".to_string(),
                     last_nonce: 7,
@@ -853,8 +850,8 @@ mod tests {
                     seconds_since_last_voucher: Some(42),
                     settlement_eligible: true,
                 },
-                ChannelSnapshot {
-                    channel_id: "0xbeef".to_string(),
+                LaneSnapshot {
+                    pool_id: "0xbeef".to_string(),
                     counterparty: "0x00bb".to_string(),
                     voucher_signer: "0x00bb".to_string(),
                     last_nonce: 0,
@@ -865,13 +862,12 @@ mod tests {
                 },
             ],
         };
-        let json = serde_json::to_string(&resp).expect("serialize ChannelsResponse");
-        let back: ChannelsResponse =
-            serde_json::from_str(&json).expect("deserialize ChannelsResponse");
+        let json = serde_json::to_string(&resp).expect("serialize LanesResponse");
+        let back: LanesResponse = serde_json::from_str(&json).expect("deserialize LanesResponse");
         assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
-        assert_eq!(back.channels.len(), 2);
-        let first = back.channels.first().expect("first channel");
-        assert_eq!(first.channel_id, "0xabcd");
+        assert_eq!(back.lanes.len(), 2);
+        let first = back.lanes.first().expect("first lane");
+        assert_eq!(first.pool_id, "0xabcd");
         assert_eq!(first.counterparty, "0x00aa");
         assert_eq!(
             first.voucher_signer, "0x00cc",
@@ -882,7 +878,7 @@ mod tests {
         assert_eq!(first.deposit_micro_usdc, 10_000_000);
         assert_eq!(first.seconds_since_last_voucher, Some(42));
         assert!(first.settlement_eligible);
-        let second = back.channels.get(1).expect("second channel");
+        let second = back.lanes.get(1).expect("second lane");
         assert_eq!(second.seconds_since_last_voucher, None);
         assert!(!second.settlement_eligible);
     }

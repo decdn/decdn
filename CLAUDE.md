@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
+Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC shared payment pools. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
 **Status: Early implementation.** Cargo workspace with 12 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
 
@@ -56,10 +56,10 @@ crates/
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   client-pull/  — reusable `cdn/client/v1` paid-pull requester (`stream_fetch`) + buyer-side channel open: signs the request, verifies the signed `StreamResponse`, pays cumulative vouchers at each interval, assembles the blob. Shared by `node` (node-to-node miss pulls, #317) and `cli` (client fetch / bundle pull)
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
-  incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
+  incentive/    — shared payment pools, staking, vouchers (alloy for Ethereum)
   reputation/   — reputation scoring (ADR 008): local per-peer EWMA only; no gossip aggregation
   e2e/          — test-only (`publish = false`) cross-layer Rust↔contract fixtures (#1028): `ChainFixture` (anvil + the production `DeployProtocol` script), `NodeFixture` (daemon subprocess + admin RPC), `ClientFixture` (real paid client path). Test targets are gated behind the `anvil-e2e` feature
-contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, PaymentChannel, SlashAppeal, SlashJudge, OriginAssignment, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites, plus Ed25519Verifier + BondMath helpers)
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, PaymentPool, SlashAppeal, SlashJudge, OriginAssignment, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites, plus Ed25519Verifier + BondMath helpers)
 ```
 
 **Dependency flow** (normal deps; `→` reads "depends on"): `node → cache, client-pull, gossip, incentive, reputation, protocol, common`; `cli → client-pull, incentive, common, protocol`; `client-pull → incentive, common, protocol, bao-range`; `incentive → common, protocol`; `cache → config-types, protocol, bao-range`; `common → config-types, protocol` (no longer `→ cache`, #578); `gossip → protocol`; `reputation → protocol`. Three true leaves — `protocol`, `config-types`, `bao-range` — so the publisher CLI links no blob store / AWS SDK. `e2e` depends on most of the graph and nothing depends on it; likewise nothing depends on `cli`. Both are sinks.

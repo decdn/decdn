@@ -1,8 +1,7 @@
 //! `decdn pool` — client-side payment-pool lifecycle.
 //!
 //! One `PaymentPool` deposit fans out to every provider its owner pays
-//! (ADR 003) — there is no per-provider pool, unlike the pre-pool
-//! `PaymentChannel` model this replaces. `open` escrows a fresh deposit,
+//! (ADR 003) — there is no per-provider pool. `open` escrows a fresh deposit,
 //! `top-up` adds funds to a pool the caller owns, `close` starts the
 //! grace-window close, and `reclaim` refunds the residual once that window has
 //! elapsed. `list`/`status` is a read-only dump of the tracked buyer pools and

@@ -115,12 +115,10 @@ async fn run() -> anyhow::Result<()> {
     // generic timeout. The admin surface keys each snapshot by the lane's pool id.
     let expected_pid = outcome.pool_id;
     let snapshot = poll(Duration::from_secs(30), || async {
-        let c = admin.channels().await.context("admin channels")?;
-        Ok(c.channels.into_iter().find(|s| {
-            s.channel_id
-                .parse::<B256>()
-                .is_ok_and(|id| id == expected_pid)
-        }))
+        let c = admin.lanes().await.context("admin lanes")?;
+        Ok(c.lanes
+            .into_iter()
+            .find(|s| s.pool_id.parse::<B256>().is_ok_and(|id| id == expected_pid)))
     })
     .await?
     .with_context(|| {

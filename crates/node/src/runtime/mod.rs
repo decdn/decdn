@@ -2070,12 +2070,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             refresh_clock: Arc::clone(&bucket_refresh_clock),
             refresh_interval: crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
         })
-        // Payment-channel introspection for `admin_v1_channels` (issue #749).
-        // Shares the same persistent channel-state store the client handler
-        // and settlement service use, plus the in-memory voucher-activity
+        // Lane introspection for `admin_v1_lanes` (issue #749). Shares the
+        // same persistent lane-state store the client handler and
+        // settlement service use, plus the in-memory voucher-activity
         // clock — read-only here.
-        .with_channels(admin::ChannelStatusHandles {
-            channel_store: Arc::clone(&infra.channel_state_store),
+        .with_lanes(admin::LaneStatusHandles {
+            pool_store: Arc::clone(&infra.channel_state_store),
             voucher_activity: Arc::clone(&ch.voucher_activity),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })

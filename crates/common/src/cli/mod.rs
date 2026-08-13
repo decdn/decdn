@@ -29,9 +29,9 @@ pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateAr
 pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
-    AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DeregisterArgs, DrainArgs, EvictArgs,
-    HealthArgs, LookupArgs, NodeArgs, NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs,
-    ReloadArgs, RotateKeyArgs, RotateKeyTarget, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
+    AnnounceArgs, BondArgs, ChainArgs, DeregisterArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
+    LookupArgs, NodeArgs, NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs, ReloadArgs,
+    RotateKeyArgs, RotateKeyTarget, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
 };
 pub use pool::{
     PoolArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs, PoolOpenArgs,

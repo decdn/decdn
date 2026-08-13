@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 use alloy::primitives::U256;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
-    AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CHANNEL_STORE_ERROR_CODE,
-    CONFIG_PATH_UNSET_CODE, ChannelSnapshot, ChannelsResponse, DHT_POISONED_CODE,
-    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
-    HealthResponse, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
+    AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE,
+    DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview,
+    EvictRequest, EvictResponse, HealthResponse, LaneSnapshot, LanesResponse,
+    POOL_STORE_ERROR_CODE, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
     RecordStoreHealth, RegionStatsResponse, ReloadResponse, RepublishHealth, RoutingHealth,
     SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
     parse_hash_arg,
@@ -103,15 +103,15 @@ pub struct AdminState {
     /// [`AdminState::with_dht`]). The `status` RPC returns
     /// [`DHT_UNAVAILABLE_CODE`] when this is `None`.
     dht: Option<DhtStatusHandles>,
-    /// Payment-channel introspection handles backing `admin_v1_channels`
-    /// (issue #749). `None` when the channel subsystem isn't wired (the
+    /// Lane introspection handles backing `admin_v1_lanes`
+    /// (issue #749). `None` when the lane subsystem isn't wired (the
     /// unit tests that exercise the cache/peer-table methods build
     /// `AdminState` without it; the production runtime always attaches it
-    /// via [`AdminState::with_channels`]). The `channels` RPC returns an
+    /// via [`AdminState::with_lanes`]). The `lanes` RPC returns an
     /// empty list (not an error) when this is `None` — a node with no
-    /// payment surface legitimately has zero channels to report, and the
+    /// payment surface legitimately has zero lanes to report, and the
     /// CLI's empty-table sentinel covers it.
-    channels: Option<ChannelStatusHandles>,
+    lanes: Option<LaneStatusHandles>,
     /// Per-region bandwidth accountant (issue #750), attached via
     /// [`AdminState::with_region_accountant`]. `None` → `region_stats` returns
     /// an empty list (a node with no accounting wired has nothing to report).
@@ -127,35 +127,35 @@ pub struct AdminState {
     binding: BindingReport,
 }
 
-/// Read-only payment-channel handles the `admin_v1_channels` handler
-/// snapshots (issue #749). Each is an `Arc` clone of state the runtime
-/// already owns and shares with the `cdn/client/v1` handler and the
-/// settlement service, so attaching this to [`AdminState`] adds read
-/// access, not new ownership. Bundled into one struct so the
-/// `with_channels` builder stays a single argument.
+/// Read-only lane handles the `admin_v1_lanes` handler snapshots (issue
+/// #749). Each is an `Arc` clone of state the runtime already owns and
+/// shares with the `cdn/client/v1` handler and the settlement service, so
+/// attaching this to [`AdminState`] adds read access, not new ownership.
+/// Bundled into one struct so the `with_lanes` builder stays a single
+/// argument.
 #[derive(Clone)]
-pub struct ChannelStatusHandles {
-    /// Persistent per-channel voucher state (same handle the client
-    /// handler commits accepted vouchers to). Read via `load_all` to
-    /// build the snapshot — the freshest committed `last_*` per channel.
-    pub channel_store: Arc<dyn PoolStateStore>,
+pub struct LaneStatusHandles {
+    /// Persistent per-lane voucher state (same handle the client handler
+    /// commits accepted vouchers to). Read via `load_all` to build the
+    /// snapshot — the freshest committed `last_*` per lane.
+    pub pool_store: Arc<dyn PoolStateStore>,
     /// In-memory last-voucher clock (same handle the client handler
     /// stamps on each accepted voucher). Read for
-    /// `seconds_since_last_voucher`; `None` per channel until this
-    /// process sees a voucher for it.
+    /// `seconds_since_last_voucher`; `None` per lane until this process
+    /// sees a voucher for it.
     pub voucher_activity: Arc<VoucherActivity>,
     /// Configured redemption threshold in micro-USDC
-    /// (`blockchain.redeem_threshold_micro_usdc`). A channel whose
-    /// accrued claim has reached this is reported `settlement_eligible`.
+    /// (`blockchain.redeem_threshold_micro_usdc`). A lane whose accrued
+    /// claim has reached this is reported `settlement_eligible`.
     pub redeem_threshold_micro_usdc: u64,
 }
 
 // `AdminState` derives `Debug`, so the bundled handles must too. The
 // trait-object `Arc<dyn PoolStateStore>` carries no `Debug` bound, so
 // hand-roll a terse impl that names the struct without formatting the handles.
-impl std::fmt::Debug for ChannelStatusHandles {
+impl std::fmt::Debug for LaneStatusHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChannelStatusHandles")
+        f.debug_struct("LaneStatusHandles")
             .field(
                 "redeem_threshold_micro_usdc",
                 &self.redeem_threshold_micro_usdc,
@@ -338,7 +338,7 @@ impl AdminState {
             drain_trigger,
             metrics,
             dht: None,
-            channels: None,
+            lanes: None,
             region_accountant: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
@@ -366,13 +366,13 @@ impl AdminState {
         self
     }
 
-    /// Attach payment-channel introspection handles so `admin_v1_channels`
-    /// can report open-channel state (issue #749). The production runtime
-    /// calls this once after `new`; without it, `channels` returns an
-    /// empty list with the default-zero threshold.
+    /// Attach lane introspection handles so `admin_v1_lanes` can report
+    /// lane state (issue #749). The production runtime calls this once
+    /// after `new`; without it, `lanes` returns an empty list with the
+    /// default-zero threshold.
     #[must_use]
-    pub fn with_channels(mut self, channels: ChannelStatusHandles) -> Self {
-        self.channels = Some(channels);
+    pub fn with_lanes(mut self, lanes: LaneStatusHandles) -> Self {
+        self.lanes = Some(lanes);
         self
     }
 
@@ -725,14 +725,14 @@ impl AdminRpcServer for AdminRpcImpl {
         })
     }
 
-    async fn channels(&self) -> RpcResult<ChannelsResponse> {
-        // No channel subsystem wired (unit tests / a node with no payment
+    async fn lanes(&self) -> RpcResult<LanesResponse> {
+        // No lane subsystem wired (unit tests / a node with no payment
         // surface): report an empty list rather than an error. Zero
-        // channels is a legitimate state, and the CLI renders the
+        // lanes is a legitimate state, and the CLI renders the
         // empty-table sentinel for it.
-        let Some(ch) = self.state.channels.as_ref() else {
-            return Ok(ChannelsResponse {
-                channels: Vec::new(),
+        let Some(ch) = self.state.lanes.as_ref() else {
+            return Ok(LanesResponse {
+                lanes: Vec::new(),
                 redeem_threshold_micro_usdc: 0,
             });
         };
@@ -742,8 +742,8 @@ impl AdminRpcServer for AdminRpcImpl {
         // on the blocking pool so we don't stall a runtime worker, then
         // build the wire DTOs off the loaded `Vec` — the cheap part. A
         // store failure surfaces as a specific RPC error so the operator
-        // sees "channel snapshot unavailable" rather than a transport fault.
-        let store = Arc::clone(&ch.channel_store);
+        // sees "lane snapshot unavailable" rather than a transport fault.
+        let store = Arc::clone(&ch.pool_store);
         let states = tokio::task::spawn_blocking(move || store.load_all())
             .await
             .map_err(|join_err| {
@@ -758,27 +758,27 @@ impl AdminRpcServer for AdminRpcImpl {
                 tracing::error!(
                     error = %join_err,
                     cause,
-                    "channel-store load task did not complete"
+                    "pool-store load task did not complete"
                 );
                 ErrorObjectOwned::owned(
-                    CHANNEL_STORE_ERROR_CODE,
-                    "channel state store load task failed",
+                    POOL_STORE_ERROR_CODE,
+                    "pool state store load task failed",
                     None::<()>,
                 )
             })?
             .map_err(|store_err| {
-                tracing::error!(error = %store_err, "admin_v1_channels could not load channel store");
+                tracing::error!(error = %store_err, "admin_v1_lanes could not load pool store");
                 ErrorObjectOwned::owned(
-                    CHANNEL_STORE_ERROR_CODE,
-                    format!("channel state store load failed: {store_err}"),
+                    POOL_STORE_ERROR_CODE,
+                    format!("pool state store load failed: {store_err}"),
                     None::<()>,
                 )
             })?;
 
         let threshold = U256::from(ch.redeem_threshold_micro_usdc);
-        let channels = build_channel_snapshots(&states, threshold, &ch.voucher_activity);
-        Ok(ChannelsResponse {
-            channels,
+        let lanes = build_lane_snapshots(&states, threshold, &ch.voucher_activity);
+        Ok(LanesResponse {
+            lanes,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
         })
     }
@@ -829,35 +829,35 @@ impl AdminRpcServer for AdminRpcImpl {
     }
 }
 
-/// Build the wire `ChannelSnapshot` list from loaded channel states, the
+/// Build the wire `LaneSnapshot` list from loaded lane states, the
 /// redemption `threshold` (in micro-USDC as a `U256`), and the in-memory
 /// voucher-activity clock. Pure (no I/O, no locks beyond the activity
 /// read) so it's unit-testable without a store or an async runtime.
 ///
-/// Ordering: channels with a known last-voucher age first (most recently
+/// Ordering: lanes with a known last-voucher age first (most recently
 /// active ahead of those with `None`), then by descending outstanding
-/// amount — the on-call use case is "which channels are closest to a
+/// amount — the on-call use case is "which lanes are closest to a
 /// settlement / liquidity event?". `U256` amounts narrow to `u64`
-/// micro-USDC via `try_from(...).unwrap_or(u64::MAX)`; a real channel is
+/// micro-USDC via `try_from(...).unwrap_or(u64::MAX)`; a real pool is
 /// bounded by its on-chain deposit so the saturation arm is unreachable.
-fn build_channel_snapshots(
+fn build_lane_snapshots(
     states: &[LaneState],
     threshold: U256,
     activity: &VoucherActivity,
-) -> Vec<ChannelSnapshot> {
-    let mut snapshots: Vec<ChannelSnapshot> = states
+) -> Vec<LaneSnapshot> {
+    let mut snapshots: Vec<LaneSnapshot> = states
         .iter()
         .map(|state| {
             let outstanding = state.last_amount();
-            ChannelSnapshot {
+            LaneSnapshot {
                 // A lane is keyed by `(pool_id, signer, provider)`. The admin
-                // surface reports the pool id as the channel id; the signer as
+                // surface reports the pool id as the lane id; the signer as
                 // both counterparty and voucher signer (the shared-pool model
                 // has no separate delegate). There is no per-voucher nonce —
                 // cumulative amount is the sole ordering key — so `last_nonce`
                 // reports 0, and the pool-level deposit is not carried per lane
                 // so `deposit_micro_usdc` reports 0.
-                channel_id: state.pool_id.to_string(),
+                pool_id: state.pool_id.to_string(),
                 counterparty: state.signer.to_string(),
                 voucher_signer: state.signer.to_string(),
                 last_nonce: 0,
@@ -910,14 +910,14 @@ pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
             tracing::warn!(
                 %addr,
                 "admin server is binding all interfaces (non-loopback); the admin RPC is \
-                 unauthenticated and can drain channels, trigger announces, and read peer \
+                 unauthenticated and can drain lanes, trigger announces, and read peer \
                  state — gate it behind loopback or a private network"
             );
         } else {
             tracing::warn!(
                 %addr,
                 "admin server is binding a non-loopback address; the admin RPC is \
-                 unauthenticated and can drain channels, trigger announces, and read peer \
+                 unauthenticated and can drain lanes, trigger announces, and read peer \
                  state — restrict reachability to trusted operators"
             );
         }
@@ -2093,7 +2093,7 @@ mod tests {
         assert_eq!(err.code(), DHT_POISONED_CODE);
     }
 
-    // ---- admin_v1_channels (issue #749) ----
+    // ---- admin_v1_lanes (issue #749) ----
 
     use alloy::primitives::Address;
     use decdn_incentive::MemoryPoolStateStore;
@@ -2103,7 +2103,7 @@ mod tests {
     /// also the reported counterparty in the shared-pool model); `last_amount`
     /// is the lane's cumulative claim. The provider is a fixed non-signer
     /// address so a signer/provider transposition would be caught.
-    fn mk_channel(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
+    fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
         let mut id = [0u8; 32];
         id[31] = pool_byte;
         let mut signer = [0u8; 20];
@@ -2121,16 +2121,16 @@ mod tests {
         )
     }
 
-    /// `build_channel_snapshots` maps each [`LaneState`] to its wire DTO:
+    /// `build_lane_snapshots` maps each [`LaneState`] to its wire DTO:
     /// hex ids, narrowed amounts, and threshold-based eligibility. A lane
     /// at/above the threshold is eligible; one below is not. In the shared-pool
     /// model the per-lane deposit and nonce are not tracked, so both report 0.
     #[test]
-    fn build_channel_snapshots_maps_fields_and_eligibility() {
-        let states = vec![mk_channel(1, 0xAA, 2_500_000), mk_channel(2, 0xBB, 500_000)];
+    fn build_lane_snapshots_maps_fields_and_eligibility() {
+        let states = vec![mk_lane(1, 0xAA, 2_500_000), mk_lane(2, 0xBB, 500_000)];
         let activity = VoucherActivity::new();
         let threshold = U256::from(1_000_000u64);
-        let snaps = build_channel_snapshots(&states, threshold, &activity);
+        let snaps = build_lane_snapshots(&states, threshold, &activity);
         assert_eq!(snaps.len(), 2);
         // No activity recorded → both have `None`; within the `None`
         // group ordering is by descending outstanding, so the
@@ -2140,9 +2140,9 @@ mod tests {
         assert_eq!(first.deposit_micro_usdc, 0);
         assert_eq!(first.last_nonce, 0);
         assert!(
-            first.channel_id.starts_with("0x"),
-            "channel_id must be 0x-hex: {}",
-            first.channel_id
+            first.pool_id.starts_with("0x"),
+            "pool_id must be 0x-hex: {}",
+            first.pool_id
         );
         assert!(
             first.counterparty.starts_with("0x"),
@@ -2165,44 +2165,44 @@ mod tests {
     /// Threshold boundary: outstanding exactly equal to the threshold is
     /// eligible (`>=`), matching the redeemer's `< threshold` short-circuit.
     #[test]
-    fn build_channel_snapshots_threshold_is_inclusive() {
-        let states = vec![mk_channel(1, 0xAA, 1_000_000)];
+    fn build_lane_snapshots_threshold_is_inclusive() {
+        let states = vec![mk_lane(1, 0xAA, 1_000_000)];
         let activity = VoucherActivity::new();
-        let snaps = build_channel_snapshots(&states, U256::from(1_000_000u64), &activity);
+        let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &activity);
         assert!(
             snaps.first().expect("snapshot").settlement_eligible,
             "outstanding == threshold must be eligible (>=)"
         );
     }
 
-    /// A channel with recorded voucher activity sorts ahead of one with
+    /// A lane with recorded voucher activity sorts ahead of one with
     /// none, and reports `Some(age)`.
     #[test]
-    fn build_channel_snapshots_orders_active_channels_first() {
-        let active = mk_channel(1, 0xAA, 100);
-        let idle = mk_channel(2, 0xBB, 9_000_000);
+    fn build_lane_snapshots_orders_active_lanes_first() {
+        let active = mk_lane(1, 0xAA, 100);
+        let idle = mk_lane(2, 0xBB, 9_000_000);
         let activity = VoucherActivity::new();
         activity.touch(active.key());
         // `idle` has a much larger outstanding, but no activity — the
-        // active channel must still sort first (recency beats size).
-        let snaps = build_channel_snapshots(&[idle, active], U256::from(1_000_000u64), &activity);
+        // active lane must still sort first (recency beats size).
+        let snaps = build_lane_snapshots(&[idle, active], U256::from(1_000_000u64), &activity);
         let first = snaps.first().expect("first snapshot");
         assert!(
             first.seconds_since_last_voucher.is_some(),
-            "active channel (with a touch) must sort first"
+            "active lane (with a touch) must sort first"
         );
         assert_eq!(first.outstanding_micro_usdc, 100);
     }
 
-    /// `admin_v1_channels` with no channel handles wired returns an empty
+    /// `admin_v1_lanes` with no lane handles wired returns an empty
     /// list and a zero threshold (not an error) — a node with no payment
     /// surface legitimately has nothing to report.
     #[tokio::test]
-    async fn channels_without_handles_returns_empty() {
+    async fn lanes_without_handles_returns_empty() {
         let (state, _tmp) = state_with(vec![]).await;
         let rpc = AdminRpcImpl::new(state);
-        let resp = rpc.channels().await.expect("channels ok");
-        assert!(resp.channels.is_empty());
+        let resp = rpc.lanes().await.expect("lanes ok");
+        assert!(resp.lanes.is_empty());
         assert_eq!(resp.redeem_threshold_micro_usdc, 0);
     }
 
@@ -2242,30 +2242,30 @@ mod tests {
         assert_eq!(de.bytes_out, 4096);
     }
 
-    /// End-to-end through the RPC method: a store seeded with two channels
+    /// End-to-end through the RPC method: a store seeded with two lanes
     /// surfaces both, with the configured threshold echoed and eligibility
     /// computed against it.
     #[tokio::test]
-    async fn channels_rpc_reports_seeded_store() -> anyhow::Result<()> {
+    async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
         let store = Arc::new(MemoryPoolStateStore::new());
-        store.record(&mk_channel(1, 0xAA, 2_000_000))?;
-        store.record(&mk_channel(2, 0xBB, 100_000))?;
+        store.record(&mk_lane(1, 0xAA, 2_000_000))?;
+        store.record(&mk_lane(2, 0xBB, 100_000))?;
 
         let (state, _tmp) = state_with(vec![]).await;
-        let handles = ChannelStatusHandles {
-            channel_store: store as Arc<dyn PoolStateStore>,
+        let handles = LaneStatusHandles {
+            pool_store: store as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::new(VoucherActivity::new()),
             redeem_threshold_micro_usdc: 1_000_000,
         };
-        let rpc = AdminRpcImpl::new(state.with_channels(handles));
-        let resp = rpc.channels().await.expect("channels ok");
+        let rpc = AdminRpcImpl::new(state.with_lanes(handles));
+        let resp = rpc.lanes().await.expect("lanes ok");
         assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
-        assert_eq!(resp.channels.len(), 2);
+        assert_eq!(resp.lanes.len(), 2);
         // Both have no activity → ordered by descending outstanding.
-        let first = resp.channels.first().expect("first");
+        let first = resp.lanes.first().expect("first");
         assert_eq!(first.outstanding_micro_usdc, 2_000_000);
         assert!(first.settlement_eligible);
-        let second = resp.channels.get(1).expect("second");
+        let second = resp.lanes.get(1).expect("second");
         assert_eq!(second.outstanding_micro_usdc, 100_000);
         assert!(!second.settlement_eligible);
         Ok(())
@@ -2280,17 +2280,17 @@ mod tests {
     /// Here the handler side is represented by a `touch` on the shared `Arc`
     /// (the exact operation the accept path performs — `client_loopback`'s
     /// `accepted_voucher_advances_shared_activity_clock` proves the handler
-    /// actually invokes it). We build the `channels()` reader from that SAME
-    /// `Arc` and assert it now reports `Some(age)` for the touched channel,
-    /// and that the active channel sorts ahead of the idle one (recency).
+    /// actually invokes it). We build the `lanes()` reader from that SAME
+    /// `Arc` and assert it now reports `Some(age)` for the touched lane,
+    /// and that the active lane sorts ahead of the idle one (recency).
     #[tokio::test]
-    async fn channels_rpc_reflects_touch_through_shared_activity_arc() -> anyhow::Result<()> {
+    async fn lanes_rpc_reflects_touch_through_shared_activity_arc() -> anyhow::Result<()> {
         let store = Arc::new(MemoryPoolStateStore::new());
         // `active` has the smaller claim; `idle` the larger. Without a touch,
         // `idle` would sort first (descending outstanding). A touch on
         // `active` must flip that — proving the reader sees the write.
-        let active = mk_channel(1, 0xAA, 100);
-        let idle = mk_channel(2, 0xBB, 9_000_000);
+        let active = mk_lane(1, 0xAA, 100);
+        let idle = mk_lane(2, 0xBB, 9_000_000);
         let active_id = active.key();
         store.record(&active)?;
         store.record(&idle)?;
@@ -2300,35 +2300,35 @@ mod tests {
         activity.touch(active_id);
 
         let (state, _tmp) = state_with(vec![]).await;
-        let handles = ChannelStatusHandles {
-            channel_store: store as Arc<dyn PoolStateStore>,
+        let handles = LaneStatusHandles {
+            pool_store: store as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::clone(&activity),
             redeem_threshold_micro_usdc: 1_000_000,
         };
-        let rpc = AdminRpcImpl::new(state.with_channels(handles));
-        let resp = rpc.channels().await.expect("channels ok");
-        assert_eq!(resp.channels.len(), 2);
+        let rpc = AdminRpcImpl::new(state.with_lanes(handles));
+        let resp = rpc.lanes().await.expect("lanes ok");
+        assert_eq!(resp.lanes.len(), 2);
 
-        let first = resp.channels.first().expect("first");
+        let first = resp.lanes.first().expect("first");
         assert!(
             first.seconds_since_last_voucher.is_some(),
-            "the touched channel must report Some(age) through the shared Arc, \
+            "the touched lane must report Some(age) through the shared Arc, \
              not None — a different Arc would read None"
         );
         assert_eq!(
             first.outstanding_micro_usdc, 100,
-            "the touched (active) channel must sort first despite the smaller claim"
+            "the touched (active) lane must sort first despite the smaller claim"
         );
-        // The untouched channel still reads None through the same reader.
-        let second = resp.channels.get(1).expect("second");
+        // The untouched lane still reads None through the same reader.
+        let second = resp.lanes.get(1).expect("second");
         assert_eq!(second.seconds_since_last_voucher, None);
         Ok(())
     }
 
     /// A store whose `load_all` errors surfaces as
-    /// [`CHANNEL_STORE_ERROR_CODE`] rather than a generic transport fault.
+    /// [`POOL_STORE_ERROR_CODE`] rather than a generic transport fault.
     #[tokio::test]
-    async fn channels_rpc_surfaces_store_load_failure() {
+    async fn lanes_rpc_surfaces_store_load_failure() {
         use decdn_incentive::{LaneKey, StoreError};
 
         #[derive(Debug)]
@@ -2349,14 +2349,14 @@ mod tests {
         }
 
         let (state, _tmp) = state_with(vec![]).await;
-        let handles = ChannelStatusHandles {
-            channel_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
+        let handles = LaneStatusHandles {
+            pool_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::new(VoucherActivity::new()),
             redeem_threshold_micro_usdc: 1_000_000,
         };
-        let rpc = AdminRpcImpl::new(state.with_channels(handles));
-        let err = rpc.channels().await.expect_err("expected store-load error");
-        assert_eq!(err.code(), CHANNEL_STORE_ERROR_CODE);
+        let rpc = AdminRpcImpl::new(state.with_lanes(handles));
+        let err = rpc.lanes().await.expect_err("expected store-load error");
+        assert_eq!(err.code(), POOL_STORE_ERROR_CODE);
     }
 
     /// `bind` accepts both loopback and non-loopback addresses; the

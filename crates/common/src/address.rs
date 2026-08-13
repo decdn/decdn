@@ -50,16 +50,16 @@ mod tests {
 
     #[test]
     fn parse_nonzero_address_accepts_a_real_address() {
-        let addr = parse_nonzero_address(NONZERO, "payment_channel_address")
+        let addr = parse_nonzero_address(NONZERO, "payment_pool_address")
             .expect("a non-zero address parses");
         assert_eq!(addr, NONZERO.parse::<Address>().expect("valid hex"));
     }
 
     #[test]
     fn parse_nonzero_address_rejects_the_zero_address() {
-        let err = parse_nonzero_address(ZERO, "payment_channel_address").unwrap_err();
+        let err = parse_nonzero_address(ZERO, "payment_pool_address").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("payment_channel_address"), "labelled: {err}");
+        assert!(msg.contains("payment_pool_address"), "labelled: {err}");
         assert!(msg.contains("must not be the zero address"), "{err}");
     }
 

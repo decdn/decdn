@@ -478,7 +478,7 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
          chain_id = {chain_id}\n\
          # eth_keystore = \"~/.decdn/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
          # --- Contract addresses (from deployments/{chain_id}.json) ---\n\
-         payment_pool_address       = \"{payment_channel}\"\n\
+         payment_pool_address       = \"{payment_pool}\"\n\
          capacity_bond_address      = \"{capacity_bond}\"\n\
          slash_judge_address        = \"{slash_judge}\"\n\
          content_blacklist_address  = \"{content_blacklist}\"\n\
@@ -494,7 +494,7 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
         label = chain.label,
         chain_id = chain.chain_id,
         rpc = chain.public_rpc,
-        payment_channel = a.payment_channel,
+        payment_pool = a.payment_pool,
         capacity_bond = a.capacity_bond,
         slash_judge = a.slash_judge,
         content_blacklist = a.content_blacklist,
@@ -1091,7 +1091,7 @@ mod tests {
         // Every manifest-derived address is filled in (not left commented), and
         // equals the manifest exactly.
         let a = chain.addresses().expect("addresses");
-        assert_eq!(bc.payment_pool_address, Some(a.payment_channel));
+        assert_eq!(bc.payment_pool_address, Some(a.payment_pool));
         assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));
         assert_eq!(bc.slash_judge_address, Some(a.slash_judge));
         assert_eq!(bc.content_blacklist_address, Some(a.content_blacklist));

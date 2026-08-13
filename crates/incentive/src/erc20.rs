@@ -1,8 +1,8 @@
 //! Minimal ERC-20 ABI binding for the buyer-side USDC approval flow (#744).
 //!
-//! Opening a `PaymentChannel` escrows the deposit via
+//! Opening a `PaymentPool` escrows the deposit via
 //! `usdc.safeTransferFrom(client, contract, deposit)`, so the buyer node must
-//! hold a standing ERC-20 allowance for the `PaymentChannel` contract. Per
+//! hold a standing ERC-20 allowance for the `PaymentPool` contract. Per
 //! ADR 003 § Deposit Economics the node issues a one-time max approval at
 //! startup; this binding exposes just the calls that flow needs:
 //!
@@ -11,13 +11,13 @@
 //! - `approve(spender, amount)` — set the one-time max allowance;
 //! - `balanceOf(account)` — optional pre-open balance check.
 //!
-//! The `PaymentChannel.usdc()` view resolves the token address at runtime, so
+//! The `PaymentPool.usdc()` view resolves the token address at runtime, so
 //! no token address is hard-coded here.
 
 // The `sol!`-generated bindings include macro-emitted code that uses patterns
 // workspace clippy denies (raw indexing, `unwrap` on infallible conversions).
 // These allows scope the relaxation to this module only — same posture as
-// `payment_channel` and `capacity_bond`.
+// `payment_pool` and `capacity_bond`.
 #[allow(
     clippy::expect_used,
     clippy::indexing_slicing,

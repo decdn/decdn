@@ -22,7 +22,7 @@
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing, `unwrap` on infallible
 // conversions). These allows scope the relaxation to this module only —
-// same posture as `erc20`, `capacity_bond`, `payment_channel`.
+// same posture as `erc20`, `capacity_bond`, `payment_pool`.
 #[allow(
     clippy::expect_used,
     clippy::indexing_slicing,

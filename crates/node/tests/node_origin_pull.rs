@@ -12447,10 +12447,11 @@ fn honest_bao_wire_from(payload: &[u8], byte_offset: u64) -> Result<Vec<u8>> {
 
 /// The on-chain deposit an upstream can see, shared with the buyer's opener.
 ///
-/// A real `PaymentChannel` rejects a voucher whose cumulative `amount` exceeds the
-/// escrowed deposit (`AmountExceedsDeposit` -> `VoucherRejectReason::CapExceeded`),
-/// and a real `topUp` raises that ceiling. Modelling it as one shared cell is what
-/// makes the round trip real here: [`FundingOpener::top_up_channel`] raises the same
+/// A real lane rejects a voucher whose cumulative `amount` exceeds the
+/// signer's capability cap (`VoucherRejectReason::CapExceeded`), and a real
+/// `topUp` raises the pool's escrowed deposit backing that cap. Modelling it
+/// as one shared cell is what makes the round trip real here:
+/// [`FundingOpener::top_up_channel`] raises the same
 /// number the server enforces, so the resumed leg succeeds for the RIGHT reason
 /// rather than because the fixture stopped objecting.
 type SharedDeposit = Arc<Mutex<U256>>;

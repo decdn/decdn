@@ -762,8 +762,8 @@ pub enum StreamError {
         /// `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
-    /// The channel funding this request is owned by a blacklisted origin
-    /// operator (ADR 011 §`StreamRequest` Response). Permanent for this channel:
+    /// The pool funding this request is owned by a blacklisted origin
+    /// operator (ADR 011 §`StreamRequest` Response). Permanent for this pool:
     /// opening a new one under the same address will be refused identically, so
     /// a requester should not retry here or elsewhere with this funder.
     OriginBlacklisted,
@@ -841,9 +841,9 @@ pub enum VoucherRejectReason {
     /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
     /// stream was quoted at, after the signed `StreamResponse` but before this
     /// voucher. The cumulative watermark the voucher carries now prices bytes
-    /// below the live floor, so the node cannot redeem it: `PaymentChannel`
+    /// below the live floor, so the node cannot redeem it: `PaymentPool`'s
     /// `_advanceClaimWatermark` would revert `RateFloorViolation` at settlement
-    /// (the chain keeps no per-channel floor snapshot — #1388). Refusing is the
+    /// (the chain keeps no per-lane floor snapshot — #1388). Refusing is the
     /// node's correct self-protection, and the buyer did nothing wrong: the fix
     /// is to **re-probe/re-quote** at the new floor and open a fresh stream, not
     /// to resend this voucher (which would be rejected identically) or top up.

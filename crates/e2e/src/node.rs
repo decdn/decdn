@@ -293,17 +293,17 @@ impl NodeFixture {
         self.origin_dir.path()
     }
 
-    /// Poll `admin_v1_channels` until the daemon reports a lane on `pool_id` (or
+    /// Poll `admin_v1_lanes` until the daemon reports a lane on `pool_id` (or
     /// `timeout` elapses). The admin surface keys each snapshot by the lane's
     /// `pool_id`, so a matching entry means the node has accepted at least one
     /// voucher against this pool.
     ///
     /// A lane exists in the node's store **only after** the first voucher lands:
-    /// unlike the retired channel model, the node registers no lane at pool-open
-    /// time — it reads the pool live via `getPool` on the serve path and creates
-    /// the lane when it intakes the capability + first voucher. So this returns
-    /// only once a paid fetch has already run on the pool; it cannot be used to
-    /// wait *before* the first delivery.
+    /// the node registers no lane at pool-open time — it reads the pool live via
+    /// `getPool` on the serve path and creates the lane when it intakes the
+    /// capability + first voucher. So this returns only once a paid fetch has
+    /// already run on the pool; it cannot be used to wait *before* the first
+    /// delivery.
     ///
     /// Prefer [`crate::client::ClientFixture::open_session`], which drives a
     /// retried warm-up fetch and so both creates the lane and proves the serve
@@ -319,12 +319,12 @@ impl NodeFixture {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let known = admin
-                .channels()
+                .lanes()
                 .await
-                .context("admin channels")?
-                .channels
+                .context("admin lanes")?
+                .lanes
                 .into_iter()
-                .any(|c| c.channel_id.eq_ignore_ascii_case(&wanted));
+                .any(|c| c.pool_id.eq_ignore_ascii_case(&wanted));
             if known {
                 return Ok(());
             }
