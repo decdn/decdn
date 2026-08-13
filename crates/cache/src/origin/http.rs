@@ -93,10 +93,30 @@ impl HttpOrigin {
         // serve `{base}/{hex}` directly anyway (query/fragment are
         // already rejected by `parse_origin_url`), so a redirect was
         // never a legitimate response shape.
+        // `pool_max_idle_per_host(0)` disables reqwest's idle keep-alive pool: every
+        // request opens a fresh connection and closes it when done, so no connection is
+        // ever reused across two callers. This is REQUIRED for correctness, not tuning
+        // (#1673). The own-origin serve-miss pull leg runs on an EPHEMERAL per-serve
+        // current-thread runtime that the orchestration drops the instant that serve
+        // finishes (`serve_via_backend_origin` in the node crate). Because this
+        // `HttpOrigin`'s `Client` is shared (one per engine, cloned across serves), a
+        // pooled keep-alive connection first driven on serve A's runtime could be
+        // reused by a concurrent serve B — and when serve A finishes and its runtime is
+        // dropped, that connection's hyper dispatch task dies under B, failing B's
+        // in-flight GET with "dispatch task is gone: runtime dropped the dispatch task"
+        // (a mid-stream close the paying client sees as `early eof`). Under CI
+        // coverage-starvation the drop-while-in-flight window is wide, so two disjoint
+        // concurrent own-origin pulls flake; on fast cores it almost never lands. With
+        // no idle pool each serve opens its own connection on its own runtime, so a
+        // finishing serve's runtime teardown can never strand another's request. The
+        // own-origin path fetches few, large ranges, so the per-request handshake cost
+        // amortizes over big transfers. The stable-pull-runtime fix that would let us
+        // restore origin keep-alive is tracked in #1675.
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(user_agent)
             .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
             .no_gzip()
             .no_deflate()
             .no_brotli()
