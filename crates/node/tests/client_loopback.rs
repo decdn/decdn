@@ -271,6 +271,24 @@ fn channel_context(
     }
 }
 
+/// The UNBOUND requester context (`client_binding: None`): the honest requester
+/// sends no ADR 005 identity binding, so the seller cannot resolve a lane signer
+/// and refuses the serve. Used by the control tests that prove the binding is
+/// what unlocks the paid path.
+fn unbound_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> PoolContext {
+    PoolContext {
+        pool_id: pool_id(),
+        provider: operator_addr(),
+        deposit,
+        client_signer,
+        voucher_domain: payment_domain(),
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+        client_binding: None,
+        capability: None,
+    }
+}
+
 /// Full happy path: a 1.5 MiB blob crosses one voucher-interval boundary plus a
 /// closing voucher (two vouchers), the requester hash-verifies the bytes, and
 /// the persisted channel state advances to nonce 2 / full byte count.
@@ -2418,13 +2436,20 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     let s1 = after1
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
-    anyhow::ensure!(s1.last_bytes_delivered() == U256::from(payload.len()));
+    // ADR 038: the metered/persisted quantity is the bao verified-stream wire
+    // size, not the payload content length.
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    anyhow::ensure!(
+        s1.last_bytes_delivered() == U256::from(wire),
+        "stream-1 bytes: {} (expected {wire})",
+        s1.last_bytes_delivered()
+    );
 
-    // Stream 2: resume from the channel's advanced state.
+    // Stream 2: resume from the channel's advanced state. Each `stream_fetch`
+    // opens a fresh connection, so the resume request re-sends the binding.
     let ctx2 = PoolContext {
         prior_bytes_delivered: s1.last_bytes_delivered(),
         prior_amount: s1.last_amount(),
-        client_binding: None,
         ..channel_context(&client_ep, Arc::clone(&client_signer), deposit)
     };
     let got2 = stream_fetch(
@@ -2447,7 +2472,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        s2.last_bytes_delivered() == U256::from(2 * payload.len()),
+        s2.last_bytes_delivered() == U256::from(2 * wire),
         "cumulative bytes: {}",
         s2.last_bytes_delivered()
     );
@@ -2729,7 +2754,15 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     let (target, _server_eth, server_ep, server_task, metrics) =
         spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // A bound client whose lane is not in the (empty) store: the binding
+    // resolves a lane key, but no lane exists for it, so the serve is refused as
+    // an unknown channel (#848). Drive the raw path so we read the server's first
+    // reply directly.
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let signer = PrivateKeySigner::random();
+    let ext = binding_ext(&signer, client_node_id)?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -2738,9 +2771,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
         byte_len: 0,
         timestamp_us: 0x5678,
     };
-    // No binding, no channel: the pure free-egress case (#848). Drive the raw
-    // path so we read the server's first reply directly.
-    match raw_request(&client_ep, target, &req, None).await? {
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => {
             anyhow::ensure!(
                 !resp.body.ok,
@@ -4343,15 +4374,17 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
     }
 
-    // Wire-indistinguishable from a cache miss or unknown channel (all
-    // `NotFound`), so only the reason counter proves the owner-mismatch arm
-    // ran (#876).
+    // Pool model: a valid binding for an address with no lane on this pool
+    // resolves to no lane, so the refusal is the unknown-channel arm — the
+    // owner-mismatch gate is subsumed into lane resolution (a wrong signer simply
+    // owns no lane). Wire-indistinguishable from a cache miss (all `NotFound`), so
+    // only the reason counter proves which arm ran (#876).
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_owner_mismatch_total 1"
+            "decdn_serve_stream_rejected_unknown_channel_total 1"
         ),
-        "owner-mismatch refusal must bump its reason counter"
+        "a bound-but-laneless request must bump the unknown-channel counter"
     );
 
     client_ep.close().await;
@@ -4487,12 +4520,15 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
     }
+    // Pool model: the funder holds no lane on this delegated pool (the lane is
+    // keyed by the delegate signer), so its binding resolves to no lane and the
+    // refusal is the unknown-channel arm.
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_owner_mismatch_total 1"
+            "decdn_serve_stream_rejected_unknown_channel_total 1"
         ),
-        "the refusal must be the owner-mismatch arm, not some other NotFound"
+        "the funder binding must bump the unknown-channel counter"
     );
 
     client_ep.close().await;
@@ -6015,7 +6051,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // No `with_client_binding`: `verified_client` stays `None`.
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = unbound_context(Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
@@ -6084,7 +6120,7 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // No client binding => `pull_authorized` fails, so the reactive pull never
     // runs and the serve path reaches a plain `CacheMiss` on origin-held content.
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = unbound_context(Arc::clone(&signer), deposit);
 
     let Err(err) = stream_fetch(
         &client_ep,
@@ -6262,7 +6298,9 @@ async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
         spawn_local_populate_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    // No client binding: reactive local populate must stay gated on proven
+    // channel ownership, so the unbound request is refused.
+    let ctx = unbound_context(Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
