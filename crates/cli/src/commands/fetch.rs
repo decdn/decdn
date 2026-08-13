@@ -1232,10 +1232,15 @@ where
             }
             store.get_by_pool_id(state.pool_id)?.unwrap_or(state)
         };
+        // Uncapped: a self-owned capability delegates spend to the owner's own
+        // key, so the pool deposit — not the capability cap — is the real
+        // spending bound. Capping at `state.deposit` here would freeze the
+        // on-chain cap at the pre-top-up deposit (`_registerCapability` is
+        // idempotent past first redemption) and reject spend past it.
         let capability = issue_self_capability(
             signer.as_ref(),
             state.pool_id,
-            state.deposit,
+            U256::MAX,
             SELF_CAPABILITY_EXPIRY,
             voucher_domain,
         )?;

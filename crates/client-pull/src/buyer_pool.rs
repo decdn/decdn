@@ -286,10 +286,15 @@ pub async fn open_pool<P: Provider + Clone>(
     // over-state a pool against the shared USDC balance.
     let credited = opened.deposit;
     let state = BuyerPoolState::new(pool_id, owner, token, credited);
+    // A self-owned capability delegates spend to the owner's OWN key, so the cap
+    // bounds nothing a delegated capability would: the pool deposit is already
+    // the real spending bound (`redeem` pays min(desired, cap-spent, remaining),
+    // and `remaining` is the pool balance). Leave it uncapped so a later `topUp`
+    // beyond the opening deposit is redeemable too.
     let capability = issue_self_capability(
         signer.as_ref(),
         pool_id,
-        credited,
+        U256::MAX,
         SELF_CAPABILITY_EXPIRY,
         voucher_domain,
     )?;

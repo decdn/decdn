@@ -799,10 +799,13 @@ impl ClientFixture {
             chain.usdc(),
             U256::from(DEPOSIT_MICRO_USDC),
         );
+        // Uncapped, matching production self-issue: the delegate IS the pool
+        // owner, so the pool deposit — not the capability cap — is the real
+        // spending bound.
         let capability = decdn_client_pull::buyer_pool::issue_self_capability(
             self.signer.as_ref(),
             pool_id,
-            U256::from(DEPOSIT_MICRO_USDC),
+            U256::MAX,
             u64::MAX,
             &voucher_dom,
         )

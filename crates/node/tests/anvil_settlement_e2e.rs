@@ -75,8 +75,8 @@ use decdn_client_pull::buyer_pool::issue_self_capability;
 use decdn_client_pull::sign_client_binding;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolStore, KeyedCheckpointStore, MemoryBuyerPoolStore, PoolStateStore, bind_node_id_domain,
-    register_node_signing_hash, slash_judge_domain, voucher_domain,
+    BuyerPoolStore, KeyedCheckpointStore, MemoryBuyerPoolStore, PoolStateStore,
+    bind_node_id_domain, register_node_signing_hash, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::BuyerPoolService;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
@@ -169,7 +169,10 @@ fn e2e_head<P>(provider: &P) -> Arc<dyn HeadSource>
 where
     P: Provider + Clone + 'static,
 {
-    Arc::new(SharedHead::new(provider.clone(), Duration::from_millis(250)))
+    Arc::new(SharedHead::new(
+        provider.clone(),
+        Duration::from_millis(250),
+    ))
 }
 
 /// Current Unix time in seconds — the base for a generous capability expiry.
@@ -548,9 +551,8 @@ async fn run_e2e() -> anyhow::Result<()> {
                 // Owner-signed capability intake: the serve gate persists a
                 // presented capability so the redeemer registers the signer on
                 // its first redemption.
-                deps.capability_sink = Some(
-                    cap_store as Arc<dyn decdn_node::channel_store::CapabilitySink>,
-                );
+                deps.capability_sink =
+                    Some(cap_store as Arc<dyn decdn_node::channel_store::CapabilitySink>);
                 // Cached `getPool` view so the capability-intake gate can confirm
                 // the on-chain pool owner; without it the capability is dropped
                 // and no lane registers.
@@ -558,7 +560,8 @@ async fn run_e2e() -> anyhow::Result<()> {
                     view_provider,
                     payment_pool,
                     Duration::from_millis(250),
-                )) as Arc<dyn decdn_node::pool_view::PoolView>);
+                ))
+                    as Arc<dyn decdn_node::pool_view::PoolView>);
             },
         )?
     };
@@ -598,7 +601,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         .get_receipt()
         .await?;
     usdc_client
-        .approve(payment_pool, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
+        .approve(
+            payment_pool,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64),
+        )
         .send()
         .await?
         .get_receipt()
@@ -630,10 +636,13 @@ async fn run_e2e() -> anyhow::Result<()> {
     // delegates spend to its own key) plus the ADR 005 ownership binding. The
     // handler verifies the capability against the on-chain pool owner (`pool_view`)
     // and registers the `(pool_id, client, node)` lane so it accepts vouchers.
+    // Uncapped, matching production self-issue: the delegate IS the pool
+    // owner, so the pool deposit — not the capability cap — is the real
+    // spending bound.
     let capability = issue_self_capability(
         client_signer.as_ref(),
         pool_id,
-        deposit,
+        U256::MAX,
         unix_now() + 1_000_000,
         &voucher_dom,
     )?;
@@ -661,7 +670,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_secs(30),
     )
     .await?;
-    anyhow::ensure!(got.as_ref() == payload.as_slice(), "seller delivery mismatch");
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "seller delivery mismatch"
+    );
 
     // The redeemer normalizes the voucher `v`-byte and submits `redeem`; the
     // contract's ECDSA.recover accepts it and the lane's on-chain watermark
@@ -720,7 +732,10 @@ async fn run_e2e() -> anyhow::Result<()> {
     let buyer_pool = PaymentPool::new(payment_pool, buyer_provider.clone());
     // Fund the buyer: one pool open + a top-up.
     usdc_admin
-        .mint(buyer_addr, U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64))
+        .mint(
+            buyer_addr,
+            U256::from(DEPOSIT_MICRO_USDC) * U256::from(4u64),
+        )
         .send()
         .await?
         .get_receipt()
@@ -737,7 +752,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_dom.clone(),
         U256::from(DEPOSIT_MICRO_USDC), // initial_deposit
         U256::from(DEPOSIT_MICRO_USDC), // working_deposit (graduation not under test here)
-        true,                           // fresh buyer identity → issue the one-time max USDC approval
+        true, // fresh buyer identity → issue the one-time max USDC approval
         Arc::new(Metrics::new()),
     )
     .await?;

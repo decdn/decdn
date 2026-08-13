@@ -286,7 +286,12 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         signer: client_signer.address(),
         provider: b_eth.address(),
     };
-    seed_lane(&store_b, b_pool_id, client_signer.address(), b_eth.address())?;
+    seed_lane(
+        &store_b,
+        b_pool_id,
+        client_signer.address(),
+        b_eth.address(),
+    )?;
 
     let handler_b = build_server(b_id, &b_eth, cache_b, store_b.clone(), RATE_B)?;
     let task_b = spawn_server(ep_b.clone(), handler_b);

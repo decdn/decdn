@@ -585,29 +585,15 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 18_000_000;
 const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
 
-#[ignore = "reproduces a genuine reactive-top-up-vs-capability-cap defect in the pool model; \
-            see the doc comment"]
-// A single-invocation reactive MID-STREAM top-up cannot extend a fetch past its
-// initial capability cap, so the exhausting voucher is rejected `CapExceeded`
-// instead of being covered by the top-up. Two production facts combine:
-//
-//   * `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the self-capability
-//     with `spending_cap = state.deposit` — the deposit at fetch START — not the
-//     buyer's `working_deposit` spending ceiling.
-//   * `PaymentPool._registerCapability` (contracts/src/PaymentPool.sol §597) is
-//     idempotent: `if (a.cap != 0 || a.expiry != 0) return;`. The node registers
-//     the signer's cap on the FIRST redemption and never raises it, even when a
-//     later capability carries a higher cap.
-//
-// So the cap is pinned at the initial deposit. The mid-fetch `topUp` (CliFunder)
-// raises the pool's on-chain DEPOSIT but not the registered cap, and the voucher
-// that crosses the initial cap is rejected `CapExceeded` — the delivery cannot
-// finish. The cross-invocation `run_topup_fetch_until_ready` path in this file's
-// other reactive test sidesteps it only because a fresh invocation re-registers
-// nothing new either; it succeeds when the FIRST redemption already sees the
-// refilled deposit. The fix is to sign the self-capability with
-// `spending_cap = working_deposit` so a reactive top-up stays within the
-// registered cap. Un-ignore once that lands.
+// A single-invocation reactive MID-STREAM top-up extends a fetch past its
+// opening deposit: `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the
+// self-capability with `spending_cap = U256::MAX`, so the on-chain cap
+// `PaymentPool._registerCapability` fixes at first redemption never binds. The
+// pool deposit — not the capability cap — is the real spending bound, and
+// `redeem` pays `min(desired, cap-spent, remaining)` against whatever the
+// deposit is at redemption time, including a `topUp` that lands mid-stream.
+// This exercises the multi-interval case: several intervals deliver against
+// the opening deposit before a top-up-funded voucher crosses it.
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_multi_interval_topup()))

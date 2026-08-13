@@ -297,10 +297,14 @@ fn pin_ctx(
     // Re-issue the self-owned capability from the owner key: it is node-agnostic
     // (valid at every provider this pool pays) and cheap to regenerate, so both
     // the fresh-open and the reused-pool paths present one without a stored copy.
+    // Uncapped: the delegate IS the owner, so the pool deposit — not the
+    // capability cap — is the real spending bound; a finite cap here would pin
+    // the on-chain cap below a later `topUp` (`_registerCapability` is
+    // idempotent past first redemption) and reject spend past it.
     let capability = issue_self_capability(
         signer.as_ref(),
         state.pool_id,
-        state.deposit,
+        U256::MAX,
         SELF_CAPABILITY_EXPIRY,
         voucher_domain,
     )?;
