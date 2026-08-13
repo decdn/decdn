@@ -7,7 +7,10 @@
 //! fresh deposit (`openPool`); `top-up` adds funds to a pool the caller owns;
 //! `close` starts the on-chain grace-window close (`closePool`); `reclaim`
 //! refunds the residual once that window has elapsed (`reclaim`, callable by
-//! anyone). Each of `top-up`/`close`/`reclaim` takes the target pool
+//! anyone); `assign` issues an owner-signed spending capability delegating a
+//! bounded spend on the pool to a delegate signer key, printing the `dcap1:`
+//! token to hand off. Each of `top-up`/`close`/`reclaim`/`assign` takes the
+//! target pool
 //! explicitly via `--pool` — there is no implicit per-provider lookup, because
 //! one pool fans out to every provider the owner pays (ADR 003).
 
@@ -44,6 +47,45 @@ pub enum PoolCommand {
     /// elapsed (`reclaim`; callable by anyone, but only the owner receives
     /// funds).
     Reclaim(PoolReclaimArgs),
+    /// Issue an owner-signed spending capability delegating a bounded spend on
+    /// a pool the caller owns to a delegate `--signer` key, and print the
+    /// `dcap1:` token to hand to that delegated client (ADR 003 §Capability
+    /// delegation). Offline-capable: only the owner keystore is required to
+    /// sign; the on-chain owner check is a best-effort warning.
+    Assign(PoolAssignArgs),
+}
+
+/// `decdn pool assign` flags.
+#[derive(Args, Debug)]
+pub struct PoolAssignArgs {
+    /// The pool to delegate spend on (0x-prefixed 32-byte `poolId`). The caller
+    /// must own it — the capability is signed with the owner keystore.
+    #[arg(long, value_name = "0xHASH")]
+    pub pool: String,
+
+    /// The delegate's Ethereum address (0x-prefixed) — the voucher-signing key
+    /// authorized to spend against the pool under this capability.
+    #[arg(long, value_name = "0xADDR")]
+    pub signer: String,
+
+    /// The delegate's cumulative spend ceiling, in micro-USDC (USDC base units).
+    #[arg(long, value_name = "MICRO_USDC")]
+    pub cap_micro_usdc: u64,
+
+    /// Capability lifetime in seconds from now — the absolute Unix expiry is
+    /// `now + this`. Mutually exclusive with `--expiry-at`; exactly one is
+    /// required.
+    #[arg(long, value_name = "SECS", conflicts_with = "expiry_at")]
+    pub expiry_secs: Option<u64>,
+
+    /// Absolute Unix-seconds expiry. Mutually exclusive with `--expiry-secs`;
+    /// exactly one is required.
+    #[arg(long, value_name = "UNIX_TS", conflicts_with = "expiry_secs")]
+    pub expiry_at: Option<u64>,
+
+    /// Shared chain + store coordinates.
+    #[command(flatten)]
+    pub chain: PoolChainArgs,
 }
 
 /// `decdn pool open` flags.

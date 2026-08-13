@@ -381,7 +381,15 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
     let disc = client_endpoint::client_discovery(config_path)?;
     let file = load_file_config(config_path)?;
-    let chain = fetch::resolve_chain(common, &file)?;
+    let mut chain = fetch::resolve_chain(common, &file)?;
+
+    // Delegated adoption: `--capability`/`--capability-file` names a pool the
+    // caller does NOT own and a capability authorizing this client's key to
+    // spend against it (every entry pulls from that one pool). `None` => the
+    // unchanged self-owned pool path; a delegated grant also disables reactive
+    // top-up in `chain`.
+    let grant = fetch::resolve_delegation_grant(common, &mut chain)?;
+
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
@@ -428,6 +436,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         candidates,
         common,
         namespace_id,
+        grant,
         locks: RefCell::new(HashMap::new()),
         open_lock: tokio::sync::Mutex::new(()),
     };
@@ -485,6 +494,11 @@ struct PullCtx<'a, P: Provider + Clone> {
     explicit: Option<FetchTarget>,
     candidates: Option<Vec<NodeCandidate>>,
     common: &'a ClientFetchArgs,
+    /// Delegated capability adopted for every entry (`--capability`), or `None`
+    /// for the self-owned pool path. When `Some`, every entry presents this
+    /// owner-signed grant instead of opening/reusing the caller's own pool, and
+    /// reactive top-up is disabled (the delegate owns no pool to fund).
+    grant: Option<decdn_incentive::CapabilityGrant>,
     /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
     /// `--namespace <id>` as a big-endian `uint256`; `NO_NAMESPACE` when the flag
     /// was omitted.
@@ -571,31 +585,54 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // value (it wraps it in `Arc<Mutex>` so its source and driver can share a
         // mid-fetch top-up's new deposit), so this binding just supplies it once
         // and moves it in below.
-        let ctx = {
-            // The global pool lock: every entry — regardless of provider —
-            // shares the one on-chain pool this bundle pulls from.
-            let _open_guard = self.open_lock.lock().await;
-            fetch::open_or_reuse_pool(
+        // Delegated: adopt the pool + capability from the token (the whole
+        // binding+capability context is built by the shared helper). Self-owned:
+        // open-or-reuse the caller's pool under the global open lock, then attach
+        // the ADR 005 client binding. Both yield a ready-to-drive context.
+        // Delegated (`--capability`): every entry adopts the named pool + owner
+        // capability (no open). Self-owned: open-or-reuse the caller's pool under
+        // the global open lock, then attach the ADR 005 client binding.
+        let ctx = if let Some(grant) = &self.grant {
+            fetch::build_delegated_pool_ctx(
                 self.store,
                 self.contract,
-                self.rpc,
                 self.signer,
                 self.voucher_dom,
                 provider,
                 self.self_address,
-                self.chain.payment_pool,
-                self.chain.initial_deposit,
-                self.chain.working_deposit,
-                self.chain.max_approve,
+                self.chain,
+                self.endpoint,
+                grant,
             )
             .await?
+        } else {
+            let ctx = {
+                // The global pool lock: every entry — regardless of provider —
+                // shares the one on-chain pool this bundle pulls from.
+                let _open_guard = self.open_lock.lock().await;
+                fetch::open_or_reuse_pool(
+                    self.store,
+                    self.contract,
+                    self.rpc,
+                    self.signer,
+                    self.voucher_dom,
+                    provider,
+                    self.self_address,
+                    self.chain.payment_pool,
+                    self.chain.initial_deposit,
+                    self.chain.working_deposit,
+                    self.chain.max_approve,
+                )
+                .await?
+            };
+            // Attach the ADR 005 client binding, exactly as
+            // `fetch::build_pool_ctx` does on its open path. Without it the
+            // request carries no verified buyer identity, so the node's
+            // `pull_authorized` gate never fires a cache-miss origin pull and
+            // `--namespace` would be inert here. Signed outside `open_lock` — it
+            // touches no on-chain state.
+            fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?
         };
-        // Attach the ADR 005 client binding, exactly as `fetch::build_pool_ctx`
-        // does on its open path. Without it the request carries no verified
-        // buyer identity, so the node's `pull_authorized` gate never fires a
-        // cache-miss origin pull and `--namespace` would be inert here. Signed
-        // outside `open_lock` — it touches no on-chain state.
-        let ctx = fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?;
 
         let mut target = EndpointAddr::new(node_id);
         // `--addr` only applies to the explicit-node path (clap requires
@@ -649,7 +686,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // progress bar: per-entry byte bars would interleave illegibly across a
         // manifest's many concurrent pulls, so the callback and finish hook are
         // both no-ops (#1118 scopes the byte bar to single-blob `fetch`).
-        fetch::drive_fetch(
+        let result = fetch::drive_fetch(
             &deps,
             ctx,
             target,
@@ -660,8 +697,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             None,
             || {},
         )
-        .await?;
-        Ok(())
+        .await;
+        // On the delegated path a terminal `CapExceeded` reconnects to the
+        // owner-side remedy (the delegate cannot top up), the same as `fetch`.
+        match (result, self.grant.is_some()) {
+            (Ok(_bytes), _) => Ok(()),
+            (Err(err), true) => Err(fetch::annotate_delegated_exhaustion(err)),
+            (Err(err), false) => Err(err),
+        }
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest

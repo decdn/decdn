@@ -34,8 +34,8 @@ pub use node::{
     RotateKeyArgs, RotateKeyTarget, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
 };
 pub use pool::{
-    PoolArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs, PoolOpenArgs,
-    PoolReclaimArgs, PoolTopUpArgs,
+    PoolArgs, PoolAssignArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs,
+    PoolOpenArgs, PoolReclaimArgs, PoolTopUpArgs,
 };
 pub use probe::ProbeArgs;
 pub use publish::{

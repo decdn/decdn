@@ -11,6 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -21,7 +22,7 @@ use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore, Dep
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{PoolId, voucher_domain};
+use decdn_incentive::{Capability, CapabilityGrant, PoolId, voucher_domain};
 use serde::Serialize;
 
 use decdn_client_pull::provider;
@@ -34,6 +35,7 @@ pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> 
         cli::PoolCommand::TopUp(a) => top_up_cmd(a, config_path).await,
         cli::PoolCommand::Close(a) => close(a, config_path).await,
         cli::PoolCommand::Reclaim(a) => reclaim(a, config_path).await,
+        cli::PoolCommand::Assign(a) => assign(a, config_path).await,
     }
 }
 
@@ -379,6 +381,143 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     }
 }
 
+/// Resolve the capability's absolute Unix-seconds expiry from the mutually
+/// exclusive `--expiry-secs` (relative to now) / `--expiry-at` (absolute)
+/// flags. Exactly one is required, and the result must lie in the future — a
+/// capability that expires at or before now is dead on arrival (the node stops
+/// accepting its vouchers immediately).
+fn resolve_expiry(
+    now: u64,
+    expiry_secs: Option<u64>,
+    expiry_at: Option<u64>,
+) -> anyhow::Result<u64> {
+    let expiry = match (expiry_secs, expiry_at) {
+        (Some(secs), None) => now.checked_add(secs).ok_or_else(|| {
+            anyhow::anyhow!("--expiry-secs {secs} overflows the Unix epoch from now ({now})")
+        })?,
+        (None, Some(at)) => at,
+        // clap `conflicts_with` rules out `(Some, Some)`; this leaves `(None, None)`.
+        _ => anyhow::bail!("exactly one of --expiry-secs or --expiry-at is required"),
+    };
+    anyhow::ensure!(
+        expiry > now,
+        "capability expiry {expiry} is not in the future (now is {now}); it would be dead on \
+         arrival — pick a later --expiry-at or a positive --expiry-secs"
+    );
+    Ok(expiry)
+}
+
+/// Current Unix time in whole seconds.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Render an absolute Unix-seconds expiry as `"<ts> (in Nd Nh Nm)"` relative to
+/// `now`. The relative tail is what an operator actually reasons about; the raw
+/// timestamp is kept for an exact, timezone-free reference.
+fn format_expiry(expiry: u64, now: u64) -> String {
+    let remaining = expiry.saturating_sub(now);
+    let days = remaining / 86_400;
+    let hours = (remaining % 86_400) / 3_600;
+    let mins = (remaining % 3_600) / 60;
+    format!("Unix {expiry} (in {days}d {hours}h {mins}m)")
+}
+
+/// `decdn pool assign`: issue an owner-signed spending capability delegating a
+/// bounded spend on a pool the caller owns to a delegate `--signer` key, and
+/// print the `dcap1:` token to hand to that delegated client (ADR 003
+/// §Capability delegation).
+///
+/// The capability is signed offline with the owner keystore against the pool's
+/// EIP-712 domain (`PaymentPool` address + chain id). The on-chain owner check
+/// is best-effort: a mismatch (or an unreachable RPC) only warns, because
+/// offline issuance is valid — the node is the one that enforces the owner
+/// signature against the pool's on-chain owner at redemption time.
+async fn assign(args: &cli::PoolAssignArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    let pool_id = parse_pool_id(&args.pool)?;
+    let signer_addr = super::chain_ctx::parse_nonzero_address(&args.signer, "--signer")?;
+
+    let now = unix_now();
+    let expiry = resolve_expiry(now, args.expiry_secs, args.expiry_at)?;
+
+    let owner_signer = load_buyer_signer(&chain.keystore)?;
+    let owner = owner_signer.address();
+    let domain = voucher_domain(chain.chain_id, chain.payment_pool);
+    let spending_cap = U256::from(args.cap_micro_usdc);
+
+    let capability = Capability {
+        signer: signer_addr,
+        spending_cap,
+        pool_id,
+        expiry,
+    };
+    let signed = capability.sign(&owner_signer, &domain)?;
+    let grant = CapabilityGrant::from_signed_capability(&signed);
+    let token = grant.to_token();
+
+    // The owner the node will recover from the token — by construction this is
+    // the keystore we just signed with, so it doubles as a codec round-trip
+    // check before the token ever leaves the machine.
+    let recovered = grant
+        .owner(&domain)
+        .map_err(|e| anyhow::anyhow!("re-recovering the owner from the fresh token failed: {e}"))?;
+
+    // Best-effort on-chain owner check. Offline issuance is valid, so an
+    // unreachable RPC or a mismatch only warns — the serving node enforces the
+    // owner signature against the pool's real owner at redemption.
+    match provider::build_provider(&chain.rpc_url, &owner_signer) {
+        Ok(rpc) => {
+            let contract = PaymentPool::new(chain.payment_pool, rpc);
+            warn_if_not_on_chain_owner(&contract, pool_id, owner).await;
+        }
+        Err(e) => eprintln!(
+            "warning: could not build an RPC provider to check the on-chain owner of pool \
+             {pool_id} ({e}); issuing anyway — the node verifies the owner signature at redemption"
+        ),
+    }
+
+    println!("pool:         {pool_id}");
+    println!("delegate:     {signer_addr} (the voucher-signing key this authorizes)");
+    println!(
+        "spending cap: {} USDC ({} µUSDC)",
+        format_usdc_u256(spending_cap),
+        args.cap_micro_usdc
+    );
+    println!("expiry:       {}", format_expiry(expiry, now));
+    println!("owner:        {recovered} (recovered from the signature)");
+    println!("Token (give this to the delegated client):");
+    println!("{token}");
+    Ok(())
+}
+
+/// Warn on stderr when the pool's on-chain `owner` is not `expected`, or when
+/// the read cannot be performed. Never fails the command — offline/degraded
+/// issuance stays valid.
+async fn warn_if_not_on_chain_owner<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pool_id: PoolId,
+    expected: Address,
+) where
+    P: alloy::providers::Provider + Clone,
+{
+    match contract.getPool(pool_id).call().await {
+        Ok(pool) if pool.owner == expected => {}
+        Ok(pool) => eprintln!(
+            "warning: pool {pool_id} on-chain owner {} is not this keystore's address {expected} \
+             — a capability signed by a non-owner is rejected at redemption; issuing anyway",
+            pool.owner
+        ),
+        Err(e) => eprintln!(
+            "warning: could not read pool {pool_id} on-chain to confirm ownership ({e}); issuing \
+             anyway — the node verifies the owner signature at redemption"
+        ),
+    }
+}
+
 /// `decdn pool list` / `status`: read-only dump of the tracked buyer pools and
 /// their per-lane voucher watermark. Reads only the buyer store — no chain,
 /// keystore, or network access.
@@ -529,6 +668,36 @@ fn short_hex(hex: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_expiry_absolute_and_relative_agree() {
+        let now = 1_000_000u64;
+        // Relative: now + secs.
+        assert_eq!(resolve_expiry(now, Some(3_600), None).unwrap(), now + 3_600);
+        // Absolute: used verbatim when in the future.
+        assert_eq!(resolve_expiry(now, None, Some(now + 10)).unwrap(), now + 10);
+    }
+
+    #[test]
+    fn resolve_expiry_rejects_missing_and_past() {
+        let now = 1_000_000u64;
+        // Neither flag: clap normally guards this, but the handler still refuses.
+        let missing = resolve_expiry(now, None, None).unwrap_err();
+        assert!(missing.to_string().contains("exactly one"), "{missing}");
+        // An absolute expiry at/behind now is dead on arrival.
+        let past = resolve_expiry(now, None, Some(now)).unwrap_err();
+        assert!(past.to_string().contains("not in the future"), "{past}");
+    }
+
+    #[test]
+    fn format_expiry_breaks_out_days_hours_minutes() {
+        let now = 1_000_000u64;
+        // 1 day + 2 hours + 3 minutes ahead.
+        let expiry = now + 86_400 + 2 * 3_600 + 3 * 60;
+        let rendered = format_expiry(expiry, now);
+        assert!(rendered.contains(&format!("Unix {expiry}")), "{rendered}");
+        assert!(rendered.contains("in 1d 2h 3m"), "{rendered}");
+    }
 
     fn args() -> cli::PoolChainArgs {
         cli::PoolChainArgs {

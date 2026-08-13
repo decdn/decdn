@@ -234,6 +234,23 @@ pub struct ClientFetchArgs {
     /// never be detected.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
+
+    /// Adopt a delegated pool + capability instead of opening/reusing the
+    /// caller's OWN pool. Pass the `dcap1:` token printed by `decdn pool assign`:
+    /// it names the pool and authorizes THIS client's loaded key to spend against
+    /// it up to the owner-set cap. The loaded keystore MUST be the delegate signer
+    /// the token authorizes (a mismatch aborts). The delegate does not own the
+    /// pool, so reactive top-up is disabled on this path — an exhausted cap or
+    /// drained pool needs the owner to top up or re-issue a higher-cap capability.
+    /// Mutually exclusive with `--capability-file`.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "capability_file")]
+    pub capability: Option<String>,
+
+    /// Read the `dcap1:` capability token from a file (its whole trimmed
+    /// contents) rather than the command line, keeping it out of shell history
+    /// and the process table. Mutually exclusive with `--capability`.
+    #[arg(long, value_name = "PATH", conflicts_with = "capability")]
+    pub capability_file: Option<PathBuf>,
 }
 
 impl ClientFetchArgs {
@@ -359,6 +376,29 @@ impl ClientFetchArgs {
              names no node",
         );
         Ok(())
+    }
+
+    /// The `dcap1:` capability token this fetch adopts, if any: the inline
+    /// `--capability` value, or the trimmed contents of `--capability-file`.
+    /// `None` selects the self-owned pool path (unchanged). Clap's
+    /// `conflicts_with` guarantees at most one of the two is set.
+    ///
+    /// # Errors
+    ///
+    /// When `--capability-file` is set but the file cannot be read.
+    pub fn resolve_capability_token(&self) -> anyhow::Result<Option<String>> {
+        if let Some(token) = &self.capability {
+            return Ok(Some(token.clone()));
+        }
+        match &self.capability_file {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    anyhow::anyhow!("read --capability-file {}: {e}", path.display())
+                })?;
+                Ok(Some(raw.trim().to_string()))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -628,6 +668,40 @@ mod tests {
         assert!(
             TestCli::try_parse_from(["test", "--node-id", "n"]).is_err(),
             "--node-id without --provider-address is a parse error"
+        );
+    }
+
+    /// No capability flag => the self-owned path (`None`), unchanged.
+    #[test]
+    fn capability_token_absent_is_none() {
+        assert_eq!(parse(&[]).resolve_capability_token().unwrap(), None);
+    }
+
+    /// `--capability` returns the inline token verbatim.
+    #[test]
+    fn capability_token_inline_is_returned() {
+        let token = parse(&["--capability", "dcap1:abc"])
+            .resolve_capability_token()
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("dcap1:abc"));
+    }
+
+    /// `--capability-file` returns the file's trimmed contents; the two forms are
+    /// mutually exclusive at the clap layer.
+    #[test]
+    fn capability_token_from_file_is_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.txt");
+        std::fs::write(&path, "  dcap1:fromfile\n").unwrap();
+        let token = parse(&["--capability-file", path.to_str().unwrap()])
+            .resolve_capability_token()
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("dcap1:fromfile"));
+
+        assert!(
+            TestCli::try_parse_from(["test", "--capability", "dcap1:a", "--capability-file", "x",])
+                .is_err(),
+            "--capability and --capability-file are mutually exclusive"
         );
     }
 }

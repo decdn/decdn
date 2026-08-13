@@ -45,12 +45,14 @@ use decdn_client_pull::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolStore, DepositOutcome};
+use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore, DepositOutcome};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::rate::min_payment;
-use decdn_incentive::{LaneKey, PoolId, bind_node_id_domain, slash_judge_domain, voucher_domain};
+use decdn_incentive::{
+    CapabilityGrant, LaneKey, PoolId, bind_node_id_domain, slash_judge_domain, voucher_domain,
+};
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
@@ -644,7 +646,13 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let disc = client_endpoint::client_discovery(config_path)?;
 
     let file = load_file_config(config_path)?;
-    let chain = resolve_chain(common, &file)?;
+    let mut chain = resolve_chain(common, &file)?;
+
+    // Delegated adoption: `--capability`/`--capability-file` names a pool the
+    // caller does NOT own and a capability authorizing this client's key to
+    // spend against it. `None` => the unchanged self-owned pool path. Disables
+    // reactive top-up in `chain` (a delegate cannot fund an owner's pool).
+    let grant = resolve_delegation_grant(common, &mut chain)?;
 
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
     let store = RedbBuyerPoolStore::open(&chain.data_dir)?;
@@ -678,10 +686,12 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
 
-    // Reuse the caller's live pool (resuming this provider's lane watermark),
-    // else open and persist a new one, with the ADR 005 client binding
-    // attached.
-    let ctx = build_pool_ctx(
+    // Delegated (`--capability`): adopt the named pool + owner capability, no
+    // open. Self-owned: reuse the caller's live pool (resuming this provider's
+    // lane watermark) or open and persist a new one. Both attach the ADR 005
+    // client binding.
+    let ctx = build_ctx_for_fetch(
+        grant.as_ref(),
         &store,
         &contract,
         &rpc,
@@ -770,10 +780,39 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // a harmless no-op on the success/drive-error paths where the hook already
     // cleared the bar before `persist_watermark` ran.
     bar.finish_and_clear();
-    let total_bytes = result?;
+    // On the delegated path a `CapExceeded` is terminal — the delegate cannot
+    // top up an owner's pool — so reconnect it to the owner-side remedy rather
+    // than leaving a bare "voucher rejected: CapExceeded".
+    let total_bytes = match (result, grant.is_some()) {
+        (Ok(bytes), _) => bytes,
+        (Err(err), true) => return Err(annotate_delegated_exhaustion(err)),
+        (Err(err), false) => return Err(err),
+    };
 
     println!("fetched {total_bytes} bytes -> {}", args.output.display());
     Ok(())
+}
+
+/// Reconnect a delegated fetch's terminal `CapExceeded` voucher rejection to
+/// the owner-side remedy: the delegate holds no wallet on this pool, so it
+/// cannot `topUp` and cannot raise its own cap. Any other error passes through
+/// verbatim (a stall, a transport fault, or a `NotFound` already annotated by
+/// [`annotate_unbound_cache_miss`] inside `drive_fetch`).
+pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
+    let is_cap_exceeded = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .is_some_and(|rejected| {
+            rejected.reason == decdn_protocol::client::VoucherRejectReason::CapExceeded
+        });
+    if is_cap_exceeded {
+        err.context(
+            "capability cap or pool balance exhausted — ask the pool owner to top up the pool \
+             or issue a higher-cap capability (a delegated client cannot top up a pool it does \
+             not own)",
+        )
+    } else {
+        err
+    }
 }
 
 /// Shared pull/funding deps [`drive_fetch`] borrows for the lifetime of one
@@ -1083,6 +1122,78 @@ fn delivery_progress() -> (indicatif::ProgressBar, impl Fn(u64, u64) + 'static) 
     (bar, on_progress)
 }
 
+/// Resolve the delegated `--capability`/`--capability-file` token into a
+/// [`CapabilityGrant`], and — when one is present — disable reactive top-up in
+/// `chain` (a delegate owns no pool it could `topUp`). `None` selects the
+/// unchanged self-owned pool path. Shared by `decdn fetch` and `bundle pull`.
+///
+/// # Errors
+///
+/// When `--capability-file` cannot be read, or the token fails to decode.
+pub(crate) fn resolve_delegation_grant(
+    common: &cli::ClientFetchArgs,
+    chain: &mut ResolvedChain,
+) -> anyhow::Result<Option<CapabilityGrant>> {
+    let grant = common
+        .resolve_capability_token()?
+        .map(|token| CapabilityGrant::from_token(&token))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid --capability token: {e}"))?;
+    if grant.is_some() {
+        chain.working_deposit = U256::ZERO;
+    }
+    Ok(grant)
+}
+
+/// Select the pool context for one fetch: the delegated adoption path when a
+/// `--capability` [`CapabilityGrant`] is present (adopt the named pool, present
+/// the owner's capability, no open), else the self-owned open-or-reuse path.
+/// Extracted so `fetch()` stays one readable pass over its stages.
+#[allow(clippy::too_many_arguments)]
+async fn build_ctx_for_fetch<P>(
+    grant: Option<&CapabilityGrant>,
+    store: &RedbBuyerPoolStore,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    rpc: &P,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    provider: Address,
+    self_address: Address,
+    chain: &ResolvedChain,
+    endpoint: &Endpoint,
+) -> anyhow::Result<PoolContext>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    if let Some(grant) = grant {
+        build_delegated_pool_ctx(
+            store,
+            contract,
+            signer,
+            voucher_dom,
+            provider,
+            self_address,
+            chain,
+            endpoint,
+            grant,
+        )
+        .await
+    } else {
+        build_pool_ctx(
+            store,
+            contract,
+            rpc,
+            signer,
+            voucher_dom,
+            provider,
+            self_address,
+            chain,
+            endpoint,
+        )
+        .await
+    }
+}
+
 /// [`open_or_reuse_pool`] plus the ADR 005 client identity binding (#1115):
 /// sign our OWN iroh `NodeId` with the buyer key so the serving node can prove
 /// we own the pool and reactively pull a cache-missed blob from its configured
@@ -1123,6 +1234,93 @@ where
         chain.max_approve,
     )
     .await?;
+    attach_client_binding(ctx, chain, endpoint, signer)
+}
+
+/// Reject a delegated fetch whose loaded key is not the signer the capability
+/// authorizes. The client can only sign vouchers as `self_address`, and a
+/// capability scoped to a different signer would have every voucher rejected as
+/// `WrongSigner` — so fail fast, before any network or on-chain work.
+fn ensure_delegate_signer(self_address: Address, authorized: Address) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        self_address == authorized,
+        "this capability authorizes signer {authorized}, but the loaded key is {self_address} — \
+         load the delegate keystore the pool owner assigned (--keystore / \
+         blockchain.eth_keystore), or ask for a capability issued to {self_address}",
+    );
+    Ok(())
+}
+
+/// Build a [`PoolContext`] that adopts a pool the caller does NOT own, from a
+/// delegated [`CapabilityGrant`] (`decdn pool assign` → `--capability`).
+///
+/// Unlike [`build_pool_ctx`] this opens nothing on-chain and signs no
+/// self-capability: it presents the OWNER's capability (rebuilt from the token)
+/// so the serving node registers this client's signer on its first redemption.
+/// It hard-fails when the loaded keystore is not the delegate the capability
+/// authorizes — the client cannot sign vouchers under a capability scoped to a
+/// different signer, and a node would reject them as `WrongSigner`.
+///
+/// The pool's on-chain row is read once for the informational `deposit` and to
+/// confirm the pool exists (a zero-owner row means it was never opened on this
+/// contract). The lane resumes from any locally-tracked watermark for
+/// `(pool, this signer, provider)`; a delegate that has never streamed this lane
+/// starts at zero. The ADR 005 client binding is attached the same as the
+/// self-owned path — it only authorizes reactive origin pull-through when the
+/// binding owner also owns the pool, which a delegate does not, so a cache miss
+/// still refuses (already-cached content serves and is paid via the capability).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_delegated_pool_ctx<P>(
+    store: &RedbBuyerPoolStore,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    provider: Address,
+    self_address: Address,
+    chain: &ResolvedChain,
+    endpoint: &Endpoint,
+    grant: &CapabilityGrant,
+) -> anyhow::Result<PoolContext>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    ensure_delegate_signer(self_address, grant.signer)?;
+
+    let signed_capability = grant.to_signed_capability().map_err(|e| {
+        anyhow::anyhow!("capability token carries a malformed owner signature: {e}")
+    })?;
+
+    let pool_id = grant.pool_id;
+    let pool = contract
+        .getPool(pool_id)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read on-chain pool {pool_id} for the capability: {e}"))?;
+    anyhow::ensure!(
+        pool.owner != Address::ZERO,
+        "pool {pool_id} named by the capability does not exist on this PaymentPool contract \
+         ({}) — wrong --payment-pool-address/chain, or a stale token",
+        chain.payment_pool,
+    );
+
+    // Resume this delegate's lane watermark if a local record exists; a delegate
+    // that has never streamed this lane starts at zero (a fresh lane).
+    let lane = LaneKey {
+        pool_id,
+        signer: self_address,
+        provider,
+    };
+    let (prior_bytes, prior_amount) = store
+        .get_by_pool_id(pool_id)?
+        .and_then(|state| state.lane_progress(lane))
+        .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
+
+    // A transient state carrying the informational pool facts the context reads
+    // (`pool_id`, `deposit`); it is not persisted (the delegate owns no pool row).
+    let state = BuyerPoolState::new(pool_id, pool.owner, pool.token, pool.deposit);
+    let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
+        .with_provider(provider, prior_bytes, prior_amount)
+        .with_capability(signed_capability);
     attach_client_binding(ctx, chain, endpoint, signer)
 }
 
@@ -1329,6 +1527,8 @@ mod tests {
             max_rate_per_mb: 0,
             stall_timeout_ms: 30_000,
             timeout_ms: 3_600_000,
+            capability: None,
+            capability_file: None,
         }
     }
 
@@ -1356,6 +1556,50 @@ mod tests {
     /// would exercise nothing and pass against a hint that never fires in production.
     fn refusal(error: StreamError) -> anyhow::Error {
         anyhow::Error::new(UpstreamRefused::mid_stream(error))
+    }
+
+    /// The delegated signer gate accepts the authorized key and rejects any
+    /// other, naming both addresses so the operator can see the mismatch.
+    #[test]
+    fn ensure_delegate_signer_matches_or_rejects() {
+        let key = Address::repeat_byte(0xa1);
+        assert!(super::ensure_delegate_signer(key, key).is_ok());
+
+        let other = Address::repeat_byte(0xb2);
+        let err = super::ensure_delegate_signer(other, key)
+            .expect_err("a non-authorized key must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&key.to_string()),
+            "names the authorized signer: {msg}"
+        );
+        assert!(
+            msg.contains(&other.to_string()),
+            "names the loaded key: {msg}"
+        );
+    }
+
+    /// A delegated `CapExceeded` is reconnected to the owner-side remedy; the
+    /// delegate holds no wallet on the pool, so "top up / re-issue" is the fix.
+    #[test]
+    fn delegated_cap_exceeded_gets_the_owner_remedy_hint() {
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::CapExceeded,
+            bundle: None,
+        });
+        let annotated = super::annotate_delegated_exhaustion(err);
+        assert!(
+            annotated.to_string().contains("exhausted"),
+            "expected the exhaustion remedy, got: {annotated}"
+        );
+    }
+
+    /// Any other error passes through the delegated-exhaustion annotator
+    /// untouched — only `CapExceeded` names the owner-side remedy.
+    #[test]
+    fn delegated_non_cap_error_is_untouched() {
+        let annotated = super::annotate_delegated_exhaustion(anyhow::anyhow!("stalled"));
+        assert_eq!(annotated.to_string(), "stalled");
     }
 
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets
