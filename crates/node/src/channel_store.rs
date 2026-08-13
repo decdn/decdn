@@ -1607,8 +1607,12 @@ mod tests {
         })?;
         let seller_set = PendingSettleStore::load_pending(store.as_ref())?;
         let buyer_set = buyer.load_pending()?;
-        anyhow::ensure!(seller_set.len() == 1 && seller_set[0].pool_id == seller_pool);
-        anyhow::ensure!(buyer_set.len() == 1 && buyer_set[0].pool_id == buyer_pool);
+        anyhow::ensure!(
+            seller_set.len() == 1 && seller_set.first().map(|p| p.pool_id) == Some(seller_pool)
+        );
+        anyhow::ensure!(
+            buyer_set.len() == 1 && buyer_set.first().map(|p| p.pool_id) == Some(buyer_pool)
+        );
         Ok(())
     }
 }

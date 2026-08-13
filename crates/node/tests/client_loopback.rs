@@ -116,6 +116,7 @@ const fn pool_id() -> B256 {
 /// the server is built must name the same key the server later runs with. The
 /// loopback servers therefore run this fixed key rather than a random one, and
 /// every lane / voucher `provider` in the suite is [`operator_addr`].
+#[allow(clippy::expect_used)] // fixed-constant key; a bad scalar is a test bug
 fn operator_signer() -> Arc<PrivateKeySigner> {
     Arc::new(
         PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))
@@ -250,6 +251,7 @@ fn build_handler_limited_configured(
 /// paying `client_ep`'s node id. The pool-model serve gate refuses any request
 /// that cannot prove ownership of a lane, so every honest paid fetch attaches a
 /// binding signed by the paying key over the connection's node id.
+#[allow(clippy::expect_used)] // signing a fixed binding cannot fail in-test
 fn channel_context(
     client_ep: &Endpoint,
     client_signer: Arc<PrivateKeySigner>,
