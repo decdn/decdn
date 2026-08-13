@@ -2832,10 +2832,14 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Pool remaining 9 sits one base unit under the window's cost of 10.
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(9u64), None).await?;
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -2846,7 +2850,7 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
     };
     // Raw, so the server's FIRST reply is read directly: an `ok: true` here would
     // mean bytes were already committed to the wire.
-    match raw_request(&client_ep, target, &req, None).await? {
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => {
             anyhow::ensure!(
                 !resp.body.ok,
@@ -2972,31 +2976,15 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
         None,
     ))?;
 
-    // Built inline rather than via `spawn_pipelined_server`, which discards the
-    // metrics handle this test asserts on.
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
+    // Pool remaining 10 covers only the first 1 MiB interval of the 4 MiB window.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    let handler = build_handler_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store_dyn,
-        RATE_PER_MB,
-        |deps| {
-            deps.credit_window_bytes = Some(decdn_cache::Bytes::new(WINDOW));
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(10u64), Some(WINDOW)).await?;
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -3005,7 +2993,7 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
         byte_len: 0,
         timestamp_us: 0x1477,
     };
-    match raw_request(&client_ep, target, &req, None).await? {
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => anyhow::ensure!(
             !resp.body.ok,
             "a deposit covering one interval must not unlock a four-interval window"
@@ -3039,11 +3027,11 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
     let payload = vec![0x5Du8; 1_572_864]; // 1.5 MiB — one credit window costs 10
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
-    let client = PrivateKeySigner::random().address();
+    let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&LaneState::hydrate(
         pool_id(),
-        client,
+        signer.address(),
         operator_addr(),
         U256::from(100u64),
         0,
@@ -3052,10 +3040,15 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
         Some([0x22; 65]),
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Gross deposit 100, but the pool has only 5 remaining after prior redeems —
+    // the headroom the gate reserves against, ten times under the window cost.
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64), None).await?;
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -3064,7 +3057,7 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
         byte_len: 0,
         timestamp_us: 0x5D01,
     };
-    match raw_request(&client_ep, target, &req, None).await? {
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => anyhow::ensure!(
             !resp.body.ok,
             "a spent-down channel must be refused on headroom, not waved through on gross deposit"
@@ -3119,10 +3112,14 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Pool remaining 5 covers the ~0.4 MiB tail (cost 4) but not the whole blob.
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64), None).await?;
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -3131,7 +3128,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         byte_len: 0,
         timestamp_us: 0x9E01,
     };
-    match raw_request(&client_ep, target, &req, None).await? {
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => anyhow::ensure!(
             resp.body.ok,
             "a resume funded for its tail must be served, not refused: {:?}",
@@ -3179,10 +3176,14 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    // Pool remaining exactly equals the window's cost of 10 — the `>=` boundary.
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, U256::from(10u64), None).await?;
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
@@ -3194,7 +3195,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
     // Only the pre-serve verdict is asserted. The transfer may still stop at a
     // later voucher — the ceiling is priced in content bytes while vouchers bill
     // wire bytes — and that is the mid-stream ceiling's job, not the gate's.
-    match raw_request(&client_ep, target, &req, None).await? {
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => anyhow::ensure!(
             resp.body.ok,
             "headroom exactly equal to the ceiling must be served: {:?}",
@@ -3506,6 +3507,67 @@ async fn spawn_handler_server_with_metrics(
         rate,
         max_blob,
         max_streams,
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth, server_ep, server_task, metrics))
+}
+
+/// A [`decdn_node::pool_view::PoolView`] returning a fixed `remaining` (and a
+/// benign, non-denied `owner`) for every pool. The floor-`M` pre-serve deposit
+/// gate reads the pool's on-chain `remaining` through this view; the loopback
+/// suite has no chain, so the deposit-gate tests wire this stub to drive the gate
+/// with a known headroom.
+#[derive(Debug)]
+struct FixedRemainingPoolView {
+    owner: Address,
+    remaining: U256,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for FixedRemainingPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        Some(decdn_node::pool_view::PoolStatus {
+            owner: self.owner,
+            remaining: self.remaining,
+        })
+    }
+}
+
+/// `spawn_handler_server_with_metrics` with a fixed-`remaining` pool-view wired
+/// and an optional credit window — the setup the floor-`M` pre-serve deposit-gate
+/// tests need so the gate reads a known pool headroom.
+async fn spawn_handler_server_with_pool(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    remaining: U256,
+    credit_window: Option<u64>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let owner = operator_addr();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        |deps| {
+            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
+            deps.credit_window_bytes = credit_window.map(decdn_cache::Bytes::new);
+        },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
