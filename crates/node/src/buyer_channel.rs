@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
@@ -47,7 +48,6 @@ use crate::client_requester::buyer_pool::{
 };
 use crate::client_requester::{LocalPullFault, PoolContext};
 use crate::metrics::Metrics;
-use crate::payment_settlement::unix_now;
 
 /// How often the reclaim sweep scans the node's pool for a completed close.
 /// Pool lifetimes are long, so an hourly scan is ample — it matches the seller
@@ -942,6 +942,19 @@ async fn reclaim_loop<P: Provider + Clone>(
     }
 }
 
+/// Chain head block timestamp. The grace-window pre-check compares against
+/// `disputeDeadline`, which the contract set from `block.timestamp`, so it reads
+/// the same clock the contract's `reclaim` gate uses rather than the node's wall
+/// clock.
+async fn head_timestamp<P: Provider>(provider: &P) -> Result<u64> {
+    let block = provider
+        .get_block(BlockId::latest())
+        .await
+        .context("read the latest block for the reclaim grace-window pre-check")?
+        .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
+    Ok(block.header.timestamp)
+}
+
 /// One reclaim pass. Reads the node's tracked pool; if the on-chain pool has been
 /// closed (`disputeDeadline > 0`) and its grace window has elapsed, submits
 /// `reclaim` and forgets the row on success.
@@ -972,9 +985,23 @@ async fn reclaim_once<P: Provider + Clone>(
         }
     };
 
-    // Not closed, or still inside the grace window: nothing to reclaim yet.
-    if pool.disputeDeadline == 0 || unix_now() < pool.disputeDeadline {
+    // Not closed: nothing to reclaim yet.
+    if pool.disputeDeadline == 0 {
         return;
+    }
+
+    // Still inside the grace window: skip the doomed submit. The deadline is
+    // chain time (`closePool` set it from `block.timestamp`), so this pre-check
+    // reads the chain head — not the node's wall clock — to match the
+    // `block.timestamp >= disputeDeadline` gate the contract enforces on
+    // `reclaim`. A head-read failure leaves the check optimistic (attempt the
+    // reclaim; the contract is the authoritative backstop).
+    match head_timestamp(contract.provider()).await {
+        Ok(now) if now < pool.disputeDeadline => return,
+        Ok(_) => {}
+        Err(err) => {
+            debug!(pool_id = %state.pool_id, error = %format!("{err:#}"), "reclaim sweep: chain head read failed; attempting reclaim anyway");
+        }
     }
 
     match contract.reclaim(state.pool_id).send().await {
