@@ -39,20 +39,16 @@ use tokio::sync::{Notify, mpsc};
 /// first chunk group) before a present-range watch can be opened.
 const WATCH_OPEN_RETRY: Duration = Duration::from_millis(25);
 
-/// Bounded settle between present-range re-checks once the covering fill has ended
-/// CLEANLY (`outcome() == Ok`): a clean pull admitted every byte before it marked
-/// ended, so a read that still finds the leaf missing is only the store's observed
-/// bitfield lagging the admit by a scheduler hop (widened under load / coverage
-/// instrumentation). Re-poll rather than abort the serve. A failed / abandoned pull
-/// never settles this way — it fails fast (no sleep), so this never delays an
-/// unfillable gap.
-const PRESENT_SETTLE_STEP: Duration = Duration::from_millis(2);
-
-/// Cap on the clean-outcome settle above (`PRESENT_SETTLE_STEP × this` ≈ the total
-/// window). Bounds the lag tolerance so a leaf that is genuinely, permanently absent
-/// after a clean pull (which must not happen) still surfaces an error instead of
-/// hanging.
-const PRESENT_SETTLE_MAX_POLLS: u32 = 50;
+/// Ceiling on the wait for the observed bitfield to reflect a range that a CLEAN
+/// pull (`outcome() == Ok`) already admitted. A clean outcome GUARANTEES the range
+/// is in the store, so a still-missing read is only the store actor's observed
+/// bitfield lagging the admit completion — a lag that resolves in milliseconds under
+/// any scheduler speed. The wait is therefore timing-INDEPENDENT: it blocks until the
+/// range is observed present, never aborting the serve on a scheduling hiccup. This
+/// ceiling is deliberately generous (seconds, not milliseconds) and is expected to be
+/// unreachable after a clean pull; it exists only so a pathological permanent lag
+/// (e.g. the hash evicted mid-serve) surfaces an error instead of hanging forever.
+const CLEAN_PULL_PRESENT_CEILING: Duration = Duration::from_secs(15);
 
 /// Bounded backpressure between the encoder and the frame consumer: the encoder
 /// parks once this many encoded chunks are buffered ahead of delivery, so the
@@ -106,6 +102,55 @@ impl AwaitingDataReader {
             .map_err(io::Error::other)?;
         Ok(missing.is_empty())
     }
+
+    /// Wait for the observed bitfield to report `[offset, offset + need)` present,
+    /// after the covering pull ended CLEANLY. A clean outcome guarantees the range
+    /// was admitted to the store, so a not-yet-present read is only the store actor's
+    /// observed bitfield lagging the admit completion — not a missing byte. Awaiting
+    /// the present-range watch (re-opening it when it closes on completion) resolves
+    /// that lag under ANY scheduler speed, so the serve never aborts on a scheduling
+    /// hiccup. Bounded by [`CLEAN_PULL_PRESENT_CEILING`], a generous ceiling a clean
+    /// pull is never expected to reach; it exists only so a pathological permanent lag
+    /// (e.g. the hash evicted mid-serve) surfaces an error instead of hanging.
+    async fn await_present_after_clean_pull(&mut self, offset: u64, need: u64) -> io::Result<()> {
+        let deadline = tokio::time::Instant::now() + CLEAN_PULL_PRESENT_CEILING;
+        loop {
+            if self.present_covers(offset, need).await? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "clean pull did not surface content [{offset}, +{need}) within \
+                     {CLEAN_PULL_PRESENT_CEILING:?}"
+                )));
+            }
+            // Ensure a watch is open (it errors only until the blob materializes,
+            // which a clean pull guarantees), then await its next advance — capped by
+            // `WATCH_OPEN_RETRY` so a watch that already closed on completion is
+            // re-opened and re-checked promptly, and the ceiling is honored even
+            // without a fresh advance.
+            if self.watch.is_none() {
+                match self.store.observe().await {
+                    Ok(w) => self.watch = Some(w),
+                    Err(_not_materialized) => {
+                        tokio::time::sleep(WATCH_OPEN_RETRY).await;
+                        continue;
+                    }
+                }
+            }
+            let advanced = async {
+                match self.watch.as_mut() {
+                    Some(w) => w.next().await.map(|_ranges| ()),
+                    None => None,
+                }
+            };
+            match tokio::time::timeout(WATCH_OPEN_RETRY, advanced).await {
+                Ok(Some(())) => {}             // advanced — re-check presence
+                Ok(None) => self.watch = None, // watch closed on completion — re-open
+                Err(_elapsed) => {}            // periodic re-check even without an advance
+            }
+        }
+    }
 }
 
 impl AsyncSliceReader for AwaitingDataReader {
@@ -117,10 +162,6 @@ impl AsyncSliceReader for AwaitingDataReader {
         // rather than hanging.
         let range = align_range(offset, need, self.total)
             .map_or_else(|_| ChunkRanges::empty(), |a| a.chunk_ranges().clone());
-        // Counts clean-outcome present-range re-polls, so a bitfield lag after a clean
-        // pull settles (bounded by `PRESENT_SETTLE_MAX_POLLS`) instead of aborting the
-        // serve.
-        let mut settle_polls: u32 = 0;
         loop {
             if self.present_covers(offset, need).await? {
                 break;
@@ -134,37 +175,40 @@ impl AsyncSliceReader for AwaitingDataReader {
             let mut ended = Box::pin(liveness.notified());
             ended.as_mut().enable();
 
-            // No live fill still covers this range. Re-check presence once more, then
-            // decide on the terminal outcome:
-            // - a clean pull (`Ok`) admitted every byte before it marked ended, so a
-            //   still-missing read is only the observed bitfield lagging the admit by a
-            //   scheduler hop (widened under load / coverage). Settle a BOUNDED window
-            //   of re-polls before concluding the byte is absent, rather than aborting a
-            //   serve whose bytes are in fact cached;
-            // - a failed / abandoned pull (`Err` / `None`) can never make the byte
-            //   present, so fail FAST with no settle.
+            // No live fill still covers this range. Decide on the terminal outcome:
             if !self.session.range_still_live(&range) {
-                if self.present_covers(offset, need).await? {
-                    break;
+                match self.session.outcome() {
+                    // A clean pull admitted every byte of its range before it marked
+                    // ended, so the range is authoritatively in the store. If the
+                    // observed bitfield does not YET reflect the admit, that is the
+                    // store actor's watch lagging the admit completion — a visibility
+                    // lag, never a missing byte. WAIT for the observed range to appear
+                    // rather than aborting the serve; this resolves under ANY scheduler
+                    // speed (timing-independent), bounded only by a generous ceiling a
+                    // clean pull is never expected to reach.
+                    Some(Ok(())) => {
+                        self.await_present_after_clean_pull(offset, need).await?;
+                        break;
+                    }
+                    // A failed pull can never make the byte present — fail fast.
+                    Some(Err(msg)) => {
+                        return Err(io::Error::other(format!(
+                            "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
+                        )));
+                    }
+                    // No recorded outcome, yet nothing live covers the range:
+                    // `range_still_live` and `outcome` are read separately, so a fill
+                    // can retire between them. A fresh present check settles that benign
+                    // gap before declaring no coverer.
+                    None => {
+                        if self.present_covers(offset, need).await? {
+                            break;
+                        }
+                        return Err(io::Error::other(format!(
+                            "no live fill covers content [{offset}, +{len}); every covering pull ended"
+                        )));
+                    }
                 }
-                if matches!(self.session.outcome(), Some(Ok(())))
-                    && settle_polls < PRESENT_SETTLE_MAX_POLLS
-                {
-                    settle_polls += 1;
-                    tokio::time::sleep(PRESENT_SETTLE_STEP).await;
-                    continue;
-                }
-                return Err(match self.session.outcome() {
-                    Some(Err(msg)) => io::Error::other(format!(
-                        "upstream pull failed before content [{offset}, +{len}) landed: {msg}"
-                    )),
-                    Some(Ok(())) => io::Error::other(format!(
-                        "upstream pull completed but content [{offset}, +{len}) is missing"
-                    )),
-                    None => io::Error::other(format!(
-                        "no live fill covers content [{offset}, +{len}); every covering pull ended"
-                    )),
-                });
             }
 
             // Ensure a watch is open; it errors until the blob materializes —
