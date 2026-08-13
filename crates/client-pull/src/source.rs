@@ -1,6 +1,6 @@
 //! The two *sourcing* axes of the gap-driven, range-minimized pull driver
 //! (#1608): [`BlobSource`] — a dumb producer of raw interleaved bao bytes for a
-//! contiguous range — and [`Funder`] — the injected channel top-up seam.
+//! contiguous range — and [`Funder`] — the injected pool top-up seam.
 //!
 //! # Why "dumb"
 //!
@@ -19,12 +19,12 @@
 //!
 //! # The `Funder` seam
 //!
-//! There is no `trait Funder` in the pre-#1608 code: a mid-fetch top-up is the
-//! free function [`crate::buyer_channel::top_up`], called by hand in each caller
-//! (the CLI's `fetch_blob_streaming`, the node's resume loop). [`Funder`] lifts
-//! that into an injected trait so the driver and `PeerSource` stay
-//! chain-handle-agnostic. The reactive-top-up budget is deployment-specific and
-//! travels on the funder ([`Funder::max_topups`] — CLI 3, node 1).
+//! A mid-fetch top-up goes through the injected [`Funder`] trait so the driver
+//! and `PeerSource` stay chain-handle-agnostic: each deployment supplies its own
+//! implementation (the CLI's `CliFunder`, the node's `NodeFunder`) rather than
+//! the driver naming a contract instance directly. The reactive-top-up budget is
+//! deployment-specific and travels on the funder ([`Funder::max_topups`] — CLI 3,
+//! node 1).
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -134,10 +134,10 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
         R: BaoRangeReader + 'a;
 }
 
-/// The injected channel top-up seam. Wraps the deployment's funding path
-/// ([`crate::buyer_channel::top_up`] over the CLI's chain handle; the node's
-/// `top_up_channel` later) so the driver and [`BlobSource`] never name a contract
-/// instance.
+/// The injected pool top-up seam. Wraps the deployment's funding path — the
+/// CLI's `CliFunder` and the node's `NodeFunder`, both driving
+/// `PoolOpener::top_up_pool` over their own chain handle — so the driver and
+/// [`BlobSource`] never name a contract instance.
 ///
 /// A top-up is only ever attempted after a [`crate::pacer::Pacer`] returns
 /// [`crate::pacer::PaceDecision::TopUp`] — i.e. a genuine, ledger-corroborated

@@ -756,7 +756,7 @@ impl CapabilitySink for PersistentPoolStateStore {
 }
 
 /// [`CapabilitySource`](crate::payment_settlement::CapabilitySource) backed by
-/// the persisted [`CAPABILITY_TABLE`]. The seller voucher-intake path persists a
+/// the persisted `CAPABILITY_TABLE`. The seller voucher-intake path persists a
 /// signer's owner-signed capability on first sight; the redeemer reads it here
 /// to register the signer on its first on-chain redemption. A signer with no
 /// persisted capability yields `None` and is safely skipped by the redeemer.

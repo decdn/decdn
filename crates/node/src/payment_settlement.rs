@@ -31,7 +31,7 @@
 //! Buyer-side `openPool`/`topUp`/`reclaim` (node→node cache-miss pulls) is out of
 //! scope here. Structurally this mirrors [`crate::dht::chain_staker_set`]: a
 //! generic-over-`Provider` struct owning background tasks with exponential-backoff
-//! poll retry — the paid-watermark watcher via its [`WatcherHandle`], the redeemer
+//! poll retry — the paid-watermark watcher via its `WatcherHandle`, the redeemer
 //! via a [`JoinHandle`] aborted on shutdown or drop.
 
 use std::collections::{HashMap, HashSet};
@@ -113,7 +113,7 @@ const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The owner-signed capability material a node attaches on a signer's FIRST
 /// redemption to register `authorized[poolId][signer]` on-chain. `spending_cap`
-/// and `expiry` also live on the lane's [`LaneState`]; `owner_sig` is the pool
+/// and `expiry` also live on the lane's `decdn_incentive::LaneState`; `owner_sig` is the pool
 /// owner's EIP-712 signature over the capability (`r‖s‖v`, or a longer
 /// ERC-1271 payload), which the seller intake path persists when it accepts a
 /// lane's first voucher. Every later redemption for that signer omits the
@@ -131,7 +131,7 @@ pub struct CapabilityMaterial {
 /// Source of the first-redemption registration material for a lane's signer.
 ///
 /// `redeem`/`redeemMany` register a signer once, on its first redemption, from an
-/// owner-signed capability. The lane's [`LaneState`] carries the signer's `cap`
+/// owner-signed capability. The lane's `decdn_incentive::LaneState` carries the signer's `cap`
 /// and `expiry`, but not the owner's signature over the capability — that is
 /// persisted by the seller voucher-intake path and surfaced here so the redeemer
 /// can build the on-chain registration payload only when a signer is not yet

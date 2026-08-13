@@ -390,7 +390,7 @@ pub struct StatusResponse {
 
 /// JSON view of one lane this node provides against a `PaymentPool`,
 /// emitted by `admin_v1_lanes` (issue #749). A lane is keyed by
-/// `(pool_id, signer, provider)` — [`decdn_incentive::LaneKey`]. Defined
+/// `(pool_id, signer, provider)` — `decdn_incentive::LaneKey`. Defined
 /// separately from `decdn-incentive`'s internal `LaneState` so the
 /// replay-critical `last_*` accessors, the `U256` money types, and any
 /// future internal fields can't leak into the wire format: every field
