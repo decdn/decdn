@@ -2041,7 +2041,7 @@ mod tests {
         assert!(s.contains("lanes=0"), "{s}");
         assert!(s.contains("(no open lanes)"), "{s}");
         // No table header when there are no rows.
-        assert!(!s.contains("CHANNEL"), "header must be omitted: {s}");
+        assert!(!s.contains("LANE"), "header must be omitted: {s}");
         Ok(())
     }
 
@@ -2090,7 +2090,7 @@ mod tests {
         write_lanes_table(&mut buf, &resp)?;
         let s = String::from_utf8(buf)?;
         assert!(s.contains("lanes=2"), "{s}");
-        assert!(s.contains("CHANNEL"), "header missing: {s}");
+        assert!(s.contains("LANE"), "header missing: {s}");
         assert!(s.contains("OUTSTANDING"), "header missing: {s}");
         assert!(s.contains("ELIGIBLE"), "header missing: {s}");
         // First row: USDC-formatted amounts, 90s → "1m ago", eligible "yes".
