@@ -2539,6 +2539,16 @@ impl CacheEngine {
     /// - [`CacheError::Store`] — a local store fault, an import-task join
     ///   fault, or a read fault on `reader` itself (distinct from corruption —
     ///   see `classify_import_bao_reader_error`).
+    ///
+    /// The `reader` is carried on BOTH result arms: `Ok(reader)` on success and
+    /// `Err((reader, err))` on failure. The error arm hands it back so the
+    /// caller can recover a typed peer fault the reader parked while filling
+    /// (`PullStalled`/`PullTimeout`/`UpstreamRefused`/`UpstreamVoucherRejected`/
+    /// buyer-side `LocalPullFault`) — that parked fault is the real reason the
+    /// stream stopped, and it beats the generic truncated-feed `CacheError` the
+    /// decoder sees. This crate does not read the fault itself (it must not
+    /// depend on `client-pull`); it only returns the reader so the node ingest
+    /// path can.
     pub async fn admit_bao_stream<R>(
         &self,
         hash: Hash,
@@ -2546,7 +2556,7 @@ impl CacheEngine {
         total_bytes: u64,
         mut reader: R,
         session: Option<&Arc<crate::FillSession>>,
-    ) -> CacheResult<R>
+    ) -> Result<R, (R, CacheError)>
     where
         R: AsyncStreamReader + Send,
     {
@@ -2596,37 +2606,53 @@ impl CacheEngine {
         // a closed import task, or a read fault.
         drop(tx);
 
-        let outcome = import.await.map_err(|e| {
-            CacheError::Store(anyhow::anyhow!(
-                "admit_bao_stream: import task join failed: {e}"
-            ))
-        })?;
+        let outcome = match import.await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return Err((
+                    reader,
+                    CacheError::Store(anyhow::anyhow!(
+                        "admit_bao_stream: import task join failed: {e}"
+                    )),
+                ));
+            }
+        };
 
         if let Some(e) = read_err {
             // A local fault reading `reader`, independent of the import
             // task's outcome — surface it rather than whatever (likely
-            // truncated-feed) outcome the import task landed on.
-            return Err(CacheError::Store(
-                anyhow::Error::from(e).context("admit_bao_stream: reader read_bytes failed"),
+            // truncated-feed) outcome the import task landed on. Hand the reader
+            // back so the caller can recover any parked typed peer fault.
+            return Err((
+                reader,
+                CacheError::Store(
+                    anyhow::Error::from(e).context("admit_bao_stream: reader read_bytes failed"),
+                ),
             ));
         }
 
         match outcome {
             Ok(_drained) => {
-                self.protect_partial(hash).await?;
+                if let Err(e) = self.protect_partial(hash).await {
+                    return Err((reader, e));
+                }
                 // The range's data is now cached; capture its outboard proof nodes
                 // into the serve leg's shared session (no-op when no serve leg reads
                 // beside this pull). Front-to-back admits union to the whole tree.
                 // The bytes were just admitted, so this reads the store we just wrote;
                 // an `export_bao` fault here is a genuine store fault, surfaced as one.
                 if let (Some(session), Some(ranges)) = (session, capture_ranges.as_ref()) {
-                    for (node, pair) in self.outboard_pairs(hash, ranges).await? {
+                    let pairs = match self.outboard_pairs(hash, ranges).await {
+                        Ok(pairs) => pairs,
+                        Err(e) => return Err((reader, e)),
+                    };
+                    for (node, pair) in pairs {
                         session.capture(node, pair);
                     }
                 }
                 Ok(reader)
             }
-            Err(e) => Err(classify_import_bao_reader_error(hash, e)),
+            Err(e) => Err((reader, classify_import_bao_reader_error(hash, e))),
         }
     }
 
@@ -6851,7 +6877,8 @@ mod tests {
                 header_less,
                 None,
             )
-            .await?;
+            .await
+            .map_err(|(_reader, e)| e)?;
         anyhow::ensure!(drained.is_empty(), "the wire is fully drained by admit");
         anyhow::ensure!(
             engine2.present_ranges(hash).await?.is_complete(),
@@ -7092,6 +7119,7 @@ mod tests {
         let reader = engine
             .admit_bao_stream(hash, ranges.clone(), total, header_less, None)
             .await
+            .map_err(|(_reader, e)| e)
             .unwrap();
         assert_eq!(reader.len(), 0, "the reader is fully drained");
 
@@ -7118,7 +7146,7 @@ mod tests {
         let byte = corrupt.get_mut(flip_at).expect("non-empty header-less bao");
         *byte ^= 0xFF;
 
-        let err = engine
+        let (_reader, err) = engine
             .admit_bao_stream(hash, ranges, total, Bytes::from(corrupt), None)
             .await
             .unwrap_err();
@@ -7210,7 +7238,9 @@ mod tests {
                             None,
                         )
                         .await
-                        .map_err(|e| crate::OriginPullError::Permanent(anyhow::Error::from(e)))?;
+                        .map_err(|(_reader, e)| {
+                            crate::OriginPullError::Permanent(anyhow::Error::from(e))
+                        })?;
                     Ok(OriginFetch::AlreadyAdmitted)
                 })
             }
