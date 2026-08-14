@@ -28,7 +28,6 @@ use decdn_client_pull::{BaoRangeReader, IngestStore};
 /// admit path captures each admitted range's proof nodes into the serve leg's shared
 /// outboard (#1621 B3, ADR 038) so the serve leg can drive a coherent whole-range
 /// encode while the pull fills incrementally — the node just threads the session in.
-#[allow(dead_code, reason = "wired by Task 11's driver construction")]
 pub(crate) struct NodeAdmitStore {
     inner: NodeRangedStore,
     /// Serve-leg fill session. `None` when no serve leg reads beside this pull (e.g.
@@ -37,7 +36,6 @@ pub(crate) struct NodeAdmitStore {
     session: Option<Arc<FillSession>>,
 }
 
-#[allow(dead_code, reason = "wired by Task 11's driver construction")]
 impl NodeAdmitStore {
     /// Wrap `engine`'s view of `hash` (a `total_bytes`-byte blob) as the node's
     /// pull-leg store. When `session` is wired, the cache's admit path captures each
