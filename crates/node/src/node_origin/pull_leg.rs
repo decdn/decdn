@@ -613,6 +613,7 @@ pub(crate) async fn run_pull_leg(
         Arc::clone(&deps.buyer),
         Arc::clone(&ctx),
         Arc::clone(&ledger),
+        Arc::clone(&deps.metrics),
     );
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,

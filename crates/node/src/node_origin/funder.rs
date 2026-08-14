@@ -50,10 +50,16 @@ use crate::buyer_channel::PoolOpener;
 ///   turns `deposit` into spendable headroom. It is the same ledger the driver
 ///   subtracts to compute the `additional` it passes here, so the two agree on
 ///   what "current spendable" is.
+/// - `metrics`: the node's metrics handle. `top_up` records
+///   `node_pull_reactive_topup` on a headroom-adding success and
+///   `node_pull_reactive_topup_refused` on a no-headroom landing or a
+///   `top_up_pool` error — the one seam both the window-paced serve leg and the
+///   gap-driven pull leg fund through, so metering here covers both.
 pub(crate) struct NodeFunder {
     opener: Arc<dyn PoolOpener>,
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl std::fmt::Debug for NodeFunder {
@@ -67,11 +73,13 @@ impl NodeFunder {
         opener: Arc<dyn PoolOpener>,
         ctx: Arc<Mutex<PoolContext>>,
         ledger: Arc<PoolLedger>,
+        metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
         Self {
             opener,
             ctx,
             ledger,
+            metrics,
         }
     }
 
@@ -101,9 +109,25 @@ impl Funder for NodeFunder {
             // `top_up_pool` targets spendable, so raise the target by exactly
             // `additional` above the current spendable — that is what adds
             // `additional` to the deposit (a `topUp` never touches committed spend).
-            let spendable_target = self.current_spendable().saturating_add(additional);
-            let new_deposit = self.opener.top_up_pool(spendable_target).await?;
-            Ok(DepositOutcome::Added(new_deposit))
+            let current = self.current_spendable();
+            let spendable_target = current.saturating_add(additional);
+            match self.opener.top_up_pool(spendable_target).await {
+                Ok(new_deposit) if new_deposit > current => {
+                    self.metrics.node_pull_reactive_topup();
+                    Ok(DepositOutcome::Added(new_deposit))
+                }
+                Ok(new_deposit) => {
+                    // Landed but added no headroom (a concurrent proactive refill
+                    // already held the slot). The driver treats a non-advancing
+                    // deposit as an unmet top-up.
+                    self.metrics.node_pull_reactive_topup_refused();
+                    Ok(DepositOutcome::Added(new_deposit))
+                }
+                Err(err) => {
+                    self.metrics.node_pull_reactive_topup_refused();
+                    Err(err)
+                }
+            }
         })
     }
 }
@@ -221,7 +245,13 @@ mod tests {
         let deposit = U256::from(1_000u64);
         let additional = U256::from(250u64);
         let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
-        let f = NodeFunder::new(opener.clone(), test_ctx(deposit), test_ledger(U256::ZERO));
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let f = NodeFunder::new(
+            opener.clone(),
+            test_ctx(deposit),
+            test_ledger(U256::ZERO),
+            metrics,
+        );
 
         let outcome = f.top_up(additional).await.expect("top-up should succeed");
 
@@ -240,7 +270,13 @@ mod tests {
         let committed = U256::from(600u64);
         let additional = U256::from(250u64);
         let opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
-        let f = NodeFunder::new(opener.clone(), test_ctx(deposit), test_ledger(committed));
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let f = NodeFunder::new(
+            opener.clone(),
+            test_ctx(deposit),
+            test_ledger(committed),
+            metrics,
+        );
 
         let _ = f.top_up(additional).await.expect("top-up should succeed");
 
@@ -251,10 +287,12 @@ mod tests {
     #[tokio::test]
     async fn top_up_pool_error_propagates() {
         let opener = Arc::new(MockOpener::new(Err("chain rejected".to_string())));
+        let metrics = Arc::new(crate::metrics::Metrics::new());
         let f = NodeFunder::new(
             opener.clone(),
             test_ctx(U256::from(100u64)),
             test_ledger(U256::ZERO),
+            metrics,
         );
 
         let err = f.top_up(U256::from(50u64)).await.unwrap_err();
@@ -266,9 +304,55 @@ mod tests {
     #[test]
     fn max_topups_reports_the_reactive_budget() {
         let opener = Arc::new(MockOpener::new(Ok(U256::ZERO)));
-        let f = NodeFunder::new(opener, test_ctx(U256::ZERO), test_ledger(U256::ZERO));
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let f = NodeFunder::new(
+            opener,
+            test_ctx(U256::ZERO),
+            test_ledger(U256::ZERO),
+            metrics,
+        );
 
         assert_eq!(f.max_topups(), MAX_REACTIVE_TOPUPS);
         assert_eq!(f.max_topups(), 1);
+    }
+
+    /// A headroom-adding top-up bumps `node_pull_reactive_topup_total`; a
+    /// `top_up_pool` failure bumps `node_pull_reactive_topup_refused_total`
+    /// instead (and still propagates the error) — the seam both pull paths
+    /// now share for metering.
+    #[tokio::test]
+    async fn top_up_meters_success_and_refusal() {
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+
+        let ok_opener = Arc::new(MockOpener::new(Ok(U256::from(1_250u64))));
+        let f = NodeFunder::new(
+            ok_opener,
+            test_ctx(U256::from(1_000u64)),
+            test_ledger(U256::ZERO),
+            Arc::clone(&metrics),
+        );
+        let _ = f
+            .top_up(U256::from(250u64))
+            .await
+            .expect("top-up should succeed");
+        let text = metrics.encode().expect("metrics should encode");
+        assert!(
+            text.contains("decdn_node_pull_reactive_topup_total 1"),
+            "expected a headroom-adding top-up to bump the success counter: {text}"
+        );
+
+        let err_opener = Arc::new(MockOpener::new(Err("chain rejected".to_string())));
+        let f = NodeFunder::new(
+            err_opener,
+            test_ctx(U256::from(1_000u64)),
+            test_ledger(U256::ZERO),
+            Arc::clone(&metrics),
+        );
+        let _ = f.top_up(U256::from(250u64)).await;
+        let text = metrics.encode().expect("metrics should encode");
+        assert!(
+            text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
+            "expected a failing top-up to bump the refused counter: {text}"
+        );
     }
 }
