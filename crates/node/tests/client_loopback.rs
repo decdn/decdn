@@ -1395,6 +1395,67 @@ async fn open_expecting_refusal(
     }
 }
 
+/// Open two same-lane streams as concurrently as the harness allows: both
+/// `StreamRequest`s are sent before either `StreamResponse` is read, so the
+/// server genuinely sees the two opens overlapping rather than sequenced by
+/// this test's own await order. Sibling of [`stall_delivery_at_closing_voucher`]
+/// and [`open_expecting_refusal`], for the per-lane admission cap's TOCTOU test.
+async fn race_two_same_lane_opens(
+    conn: &Connection,
+    hash_a: [u8; 32],
+    hash_b: [u8; 32],
+    ext: &StreamRequestExt,
+) -> anyhow::Result<(bool, bool)> {
+    let (mut send_a, mut recv_a) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi a: {e}"))?;
+    let (mut send_b, mut recv_b) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi b: {e}"))?;
+
+    let req_a = StreamRequest {
+        hash: hash_a,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x0012_61a0,
+    };
+    let req_b = StreamRequest {
+        hash: hash_b,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x0012_61a0,
+    };
+    let payload_a = encode_stream_request(&req_a, Some(ext))
+        .map_err(|e| anyhow::anyhow!("encode request a: {e}"))?;
+    let payload_b = encode_stream_request(&req_b, Some(ext))
+        .map_err(|e| anyhow::anyhow!("encode request b: {e}"))?;
+
+    // Both requests are in flight before either response is read.
+    write_frame(&mut send_a, &payload_a)
+        .await
+        .map_err(|e| anyhow::anyhow!("write request a: {e}"))?;
+    write_frame(&mut send_b, &payload_b)
+        .await
+        .map_err(|e| anyhow::anyhow!("write request b: {e}"))?;
+
+    let ok_a = match read_client_msg(&mut recv_a).await? {
+        ClientMessage::StreamResponse(resp) => resp.body.ok,
+        other => anyhow::bail!("expected a StreamResponse for a, got {other:?}"),
+    };
+    let ok_b = match read_client_msg(&mut recv_b).await? {
+        ClientMessage::StreamResponse(resp) => resp.body.ok,
+        other => anyhow::bail!("expected a StreamResponse for b, got {other:?}"),
+    };
+
+    Ok((ok_a, ok_b))
+}
+
 /// Assert `err` is the handler's graceful app-layer idle close: `APP_ERR_NO_ERROR`
 /// (0x00) with reason `"idle"`, not a fault code or a transport reset.
 fn ensure_graceful_idle_close(err: &ConnectionError) -> anyhow::Result<()> {
@@ -1933,6 +1994,198 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
     client_ep.close().await;
     server_ep.close().await;
     server_task.await?;
+    Ok(())
+}
+
+/// A finished stream releases its lane slot: after the first same-lane stream
+/// settles and its `LaneSlot` drops, a later same-lane open on the same
+/// one-floor budget is admitted again. Uses the exact fixture and `remaining =
+/// 50` tuning as `second_same_lane_stream_refused_when_budget_covers_one` above
+/// — it proves the counter decrements on release, not merely that a fresh lane
+/// admits; a leaked slot would refuse (or wedge, since the first stream never
+/// existed to steal capacity from) the second open here.
+#[tokio::test(flavor = "multi_thread")]
+async fn finished_stream_releases_its_lane_slot() -> anyhow::Result<()> {
+    let payload_a = vec![0x71u8; 3 * 1024 * 1024];
+    let payload_b = vec![0x82u8; 2 * 1024 * 1024];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let remaining = U256::from(50u64);
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        remaining,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // Admit, deliver, and fully settle the first stream — its `LaneSlot` drops
+    // once `pay_and_finish` returns.
+    let wire_a = support::bao_wire_len_whole(payload_a.len() as u64);
+    let first =
+        stall_delivery_at_closing_voucher(&conn, *hash_a.as_bytes(), wire_a, Some(&ext)).await?;
+    let (_first_completed_at, totals) = first
+        .pay_and_finish(&signer, VoucherTotals::default())
+        .await?;
+
+    // A later same-lane open now succeeds on the same budget — the slot was
+    // released, not leaked. `stall_delivery_at_closing_voucher` itself asserts
+    // `resp.body.ok`, so a leaked slot fails this call with a refusal error.
+    // The shared lane's cumulative watermark carries forward (as in
+    // `concurrent_same_lane_streams_aggregate_across_the_voucher_interval`
+    // above): the second voucher's `bytes_delivered` must cover both streams.
+    let wire_b = support::bao_wire_len_whole(payload_b.len() as u64);
+    let second =
+        stall_delivery_at_closing_voucher(&conn, *hash_b.as_bytes(), wire_b, Some(&ext)).await?;
+    let _ = second.pay_and_finish(&signer, totals).await?;
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// A single same-lane stream on a one-floor budget is admitted and settles
+/// exactly as before the admission cap — the `n = 1` path applies no
+/// surcharge, only the stream's own guard cost.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
+    let payload = vec![0x93u8; 3 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let remaining = U256::from(50u64);
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        remaining,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    let only = stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire, Some(&ext)).await?;
+    let (_completed_at, totals) = only
+        .pay_and_finish(&signer, VoucherTotals::default())
+        .await?;
+    anyhow::ensure!(
+        totals.wire_bytes == wire,
+        "settled wire bytes: {} (expected the whole blob's {wire})",
+        totals.wire_bytes
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Two simultaneous same-lane opens on a one-floor budget: the lane lock
+/// serializes admission, so exactly one is admitted and the other refused with
+/// `NotFound` — no TOCTOU double-admit. Both requests fit the budget alone
+/// (guards 30 and 20 under `remaining = 50`), so admitting both would only be
+/// possible if the two opens raced past the gate without serializing; which one
+/// wins is scheduling-dependent and is deliberately not asserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
+    let payload_a = vec![0x71u8; 3 * 1024 * 1024];
+    let payload_b = vec![0x82u8; 2 * 1024 * 1024];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let remaining = U256::from(50u64);
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        remaining,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let (a_ok, b_ok) =
+        race_two_same_lane_opens(&conn, *hash_a.as_bytes(), *hash_b.as_bytes(), &ext).await?;
+    assert_ne!(
+        a_ok, b_ok,
+        "exactly one of the two concurrent opens is admitted"
+    );
+
+    // The admitted stream's chunks are left unread here — this test only
+    // exercises the gate, not delivery — so the server side may still be
+    // writing when the endpoints close; that is expected, not an error.
+    drop(conn);
+    client_ep.close().await;
+    server_ep.close().await;
+    let _ = server_task.await;
     Ok(())
 }
 
