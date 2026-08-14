@@ -111,40 +111,6 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
     raw.saturating_sub(state.pending_reclaim)
 }
 
-/// Advance the hysteresis latch for this tick's `effective` footprint and report
-/// whether a sweep should run.
-///
-/// Latch, not a threshold: eviction starts only on a `high_water_bytes` crossing
-/// and continues until `effective` reaches `target_bytes`, so writes hovering at
-/// the trigger cannot thrash the driver. The ≥5-point gap between the two marks
-/// is enforced at config resolution.
-///
-/// Pure and separated from [`tick`] so the boundary cases are directly testable
-/// (the same reason [`reconcile`] is). `state.evicting` after the call is what
-/// the `decdn_cache_evicting` gauge publishes.
-const fn advance_latch(
-    state: &mut DriverState,
-    effective: u64,
-    high_water_bytes: u64,
-    target_bytes: u64,
-) -> bool {
-    if state.evicting {
-        // Latched: keep sweeping until we actually reach target. Note this is
-        // `<=`, so a driver that lands exactly ON target releases the latch —
-        // reaching the goal is finishing, not a reason for one more pass.
-        if effective <= target_bytes {
-            state.evicting = false;
-            return false;
-        }
-        return true;
-    }
-    if effective <= high_water_bytes {
-        return false;
-    }
-    state.evicting = true;
-    true
-}
-
 /// One budget-bounded eviction pass. Releases up to `budget` LRU candidates,
 /// oldest access first, stopping early once the projected effective footprint
 /// reaches `target_bytes`. Returns the number of bytes actually released (to be
@@ -249,46 +215,27 @@ async fn tick(
     let raw = sizes.values().fold(0u64, |acc, sz| acc.saturating_add(*sz));
     let effective = reconcile(state, raw);
 
-    // Gauges report honest raw usage; `pending_reclaim` is driver bookkeeping —
-    // but it is EXPORTED too (#1678), because the gap between "released" and
-    // "reclaimed" is the reclaim-lag signal, and with no admission control it is
-    // the thing that decides whether one is needed.
+    // Gauges report honest raw usage; `pending_reclaim` is driver bookkeeping.
     metrics.bytes.set(as_gauge(raw));
     metrics.pinned_count.set(as_gauge(
         u64::try_from(cache.pinned_snapshot().len()).unwrap_or(u64::MAX),
     ));
-    metrics
-        .pending_reclaim_bytes
-        .set(as_gauge(state.pending_reclaim));
-    // In-flight fills ride this tick rather than their own: the eviction driver
-    // is already the one periodic cache observer, and `total_in_flight_bytes`
-    // walks the registry map under a lock. Sampled BEFORE the latch returns early
-    // below, so the gauge stays live while the cache sits under high-water — the
-    // regime where a burst outrunning reclaim would first show up.
-    metrics
-        .fill_in_flight_bytes
-        .set(as_gauge(cache.total_in_flight_bytes()));
 
-    // Hysteresis latch, advanced as a pure function so a test can just ask what
-    // it does at a boundary (same reasoning as `reconcile`).
-    //
-    // The `evicting` gauge is published on EVERY tick, latched or not — a gauge
-    // that only updated when the driver swept would freeze at its last value
-    // through the whole idle stretch, which is exactly the stretch an operator
-    // reads it to rule out.
-    let sweep_now = advance_latch(state, effective, high_water_bytes, target_bytes);
-    metrics.evicting.set(i64::from(state.evicting));
-    if !sweep_now {
+    // Hysteresis latch: only start evicting on a high-water crossing; once
+    // latched, keep evicting until at/below target, then release.
+    if state.evicting {
+        if effective <= target_bytes {
+            state.evicting = false;
+            return;
+        }
+    } else if effective <= high_water_bytes {
         return;
+    } else {
+        state.evicting = true;
     }
 
     let freed = sweep(cache, metrics, effective, target_bytes, budget, &sizes).await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
-    // Re-publish after the sweep: `pending_reclaim` just grew by everything this
-    // pass released, and that increment is the lag this gauge exists to show.
-    metrics
-        .pending_reclaim_bytes
-        .set(as_gauge(state.pending_reclaim));
 }
 
 /// Run the eviction driver until `shutdown` fires. Intended to be
@@ -428,62 +375,5 @@ mod tests {
         // Only 100 of the 300 pending bytes get reclaimed this cycle.
         assert_eq!(reconcile(&mut state, 900), 700);
         assert_eq!(state.pending_reclaim, 200);
-    }
-
-    // ---- the hysteresis latch, and the gauge that publishes it (#1678) ----
-
-    const HIGH: u64 = 900;
-    const TARGET: u64 = 800;
-
-    #[test]
-    fn latch_stays_clear_below_high_water() {
-        let mut state = DriverState::default();
-        assert!(!advance_latch(&mut state, HIGH, HIGH, TARGET));
-        assert!(
-            !state.evicting,
-            "exactly AT high-water is not yet a crossing"
-        );
-    }
-
-    #[test]
-    fn latch_engages_above_high_water_and_holds_through_the_gap() {
-        let mut state = DriverState::default();
-        assert!(advance_latch(&mut state, HIGH + 1, HIGH, TARGET));
-        assert!(state.evicting);
-
-        // The whole point of the hysteresis gap: back under high-water but not
-        // yet at target, the latch must HOLD. If it cleared here the driver
-        // would stop short of target and re-trigger on the next write, which is
-        // the thrash the gap exists to prevent.
-        assert!(advance_latch(&mut state, HIGH - 1, HIGH, TARGET));
-        assert!(state.evicting);
-    }
-
-    #[test]
-    fn latch_releases_on_reaching_target_exactly() {
-        let mut state = DriverState::default();
-        advance_latch(&mut state, HIGH + 1, HIGH, TARGET);
-        assert!(
-            !advance_latch(&mut state, TARGET, HIGH, TARGET),
-            "landing exactly on target is finishing, not a reason for one more pass"
-        );
-        assert!(!state.evicting);
-    }
-
-    /// The gauge is a direct read of the latch, so a sustained pressure event
-    /// reads as a continuous `1` rather than a series of unrelated spikes —
-    /// which is the distinction it was added to make.
-    #[test]
-    fn the_evicting_gauge_tracks_the_latch_across_a_full_cycle() {
-        let mut state = DriverState::default();
-        let gauge = |s: &DriverState| i64::from(s.evicting);
-
-        assert_eq!(gauge(&state), 0);
-        advance_latch(&mut state, HIGH + 50, HIGH, TARGET);
-        assert_eq!(gauge(&state), 1);
-        advance_latch(&mut state, HIGH - 10, HIGH, TARGET);
-        assert_eq!(gauge(&state), 1, "still latched between the two marks");
-        advance_latch(&mut state, TARGET - 1, HIGH, TARGET);
-        assert_eq!(gauge(&state), 0);
     }
 }

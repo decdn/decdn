@@ -201,11 +201,6 @@ impl ClientHandler {
         // large `total_bytes` costs disk, not RAM — and the disk it costs is
         // bounded by the eviction driver against `cache.cache_size_mb`. A blob
         // this node's disk can hold is a blob this node should warm.
-        //
-        // What replaced the gate is measurement: record the size instead of
-        // refusing it, so an operator can see the distribution the removed cap
-        // used to truncate.
-        self.metrics.record_fill_size(total_bytes);
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known) and the
         // `interval_mb` negotiated above. It is deferred to step (7), AFTER the fill is
@@ -545,8 +540,6 @@ impl ClientHandler {
         // twin of the peer tier above, and streaming for the same reason. The
         // engine's `cache_size_mb` cap still binds on the origin pull itself,
         // which is where an unsigned-length backend can actually lie to us.
-        // Measured, not gated, exactly as on the peer twin.
-        self.metrics.record_fill_size(total_bytes);
 
         // (4) Sign + send the response up front — it commits to `total_bytes`,
         // which the caller already read from the origin size probe, and to the

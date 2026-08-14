@@ -225,41 +225,6 @@ pub struct CacheMetrics {
     /// [`crate::CacheEngine::pinned_snapshot`]. Pinned hashes are LRU-exempt,
     /// so a pinned set approaching the cache size is a starvation risk.
     pub pinned_count: Gauge,
-    /// Bytes released by the eviction driver but not yet reclaimed by the
-    /// iroh-blobs GC sweep (`decdn_cache_pending_reclaim_bytes`, #1678).
-    ///
-    /// **The reclaim-lag signal.** `release_for_eviction` only drops a blob's
-    /// protecting tag; the disk comes back on the independent GC sweep at
-    /// `cache.gc_interval_sec` (300s default), while the driver ticks at
-    /// `eviction_tick_secs` (1s). This gauge is the gap between the two — what
-    /// the driver has already decided to free and is still waiting on.
-    ///
-    /// Read it as a *rate of drain*, not a level: a sawtooth that spikes on a
-    /// sweep and falls to near zero on each GC cycle is healthy. A value that
-    /// stays elevated across several `gc_interval_sec` periods means reclaim is
-    /// not keeping pace with admission, which is the condition that would
-    /// justify the up-front admission reservation #1678 deliberately did not
-    /// build. Making the sweep on-demand instead of interval-driven is blocked
-    /// upstream (#520): iroh-blobs 0.103 keeps `gc_run_once` in a private module.
-    pub pending_reclaim_bytes: Gauge,
-    /// Whether the eviction driver's hysteresis latch is engaged
-    /// (`decdn_cache_evicting`, `1` while evicting, `0` while idle, #1678).
-    ///
-    /// Separates "crossed high-water once" from "has been evicting continuously",
-    /// which `evictions_total` alone cannot: a steady eviction rate looks the
-    /// same whether it comes from one sustained latch or many brief ones, and
-    /// only the former means the cache is genuinely undersized for its traffic.
-    pub evicting: Gauge,
-    /// Σ whole-blob `total_bytes` over every in-flight fill
-    /// (`decdn_cache_fill_in_flight_bytes`, #1678) — inbound content this node is
-    /// committed to landing on disk but has not finished writing.
-    ///
-    /// Deliberately an over-estimate (see
-    /// [`crate::FillRegistry::total_in_flight_bytes`]). Compare
-    /// `bytes + fill_in_flight_bytes` against `size_limit_bytes`: with no
-    /// admission control, that sum is what the budget is actually exposed to,
-    /// and `bytes` alone understates it for exactly as long as a fill runs.
-    pub fill_in_flight_bytes: Gauge,
     /// LRU eviction victims actually released under cache-size pressure
     /// (`decdn_cache_evictions_total`). Bumped once per hash for which
     /// [`crate::CacheEngine::release_for_eviction`] reported a real release

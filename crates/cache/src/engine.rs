@@ -1055,15 +1055,6 @@ impl CacheEngine {
         self.inner.fill_registry.in_flight_total(hash)
     }
 
-    /// Σ `total_bytes` over every live fill — the inbound content this node is
-    /// committed to landing on disk (#1678). See
-    /// [`FillRegistry::total_in_flight_bytes`] for why it over-estimates on
-    /// purpose, and call it on the eviction-sweep cadence, not per request.
-    #[must_use]
-    pub fn total_in_flight_bytes(&self) -> u64 {
-        self.inner.fill_registry.total_in_flight_bytes()
-    }
-
     /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
     /// of the `total`-byte blob `hash`: decide attach/own/mixed AND register any new
     /// owner session under one map-lock acquisition (no plan-then-register TOCTOU

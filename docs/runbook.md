@@ -25,16 +25,6 @@ new content cannot be admitted.
 - `decdn_cache_bytes` against `decdn_cache_size_limit_bytes` — resident
   footprint over the configured budget. The eviction driver (#1173) sets
   both each tick.
-- `decdn_cache_fill_in_flight_bytes` — inbound content committed but not
-  yet written. Add it to `decdn_cache_bytes` for what the budget is really
-  exposed to; there is no up-front admission reservation, so a burst of
-  concurrent fills can overshoot until eviction catches up (#1678).
-- `decdn_cache_evicting` — `1` while the hysteresis latch is engaged. A
-  value stuck at `1` means continuous pressure, not a passing spike.
-- `decdn_cache_pending_reclaim_bytes` — **the reclaim-lag signal.** Bytes
-  released but not yet freed by the GC sweep. Healthy is a sawtooth that
-  drains each `gc_interval_sec`; stuck-high means reclaim is losing to
-  admission.
 - Existing alert `DecdnHighStreamErrorRate` will fire downstream once
   origin writes start to fail, but it is not capacity-specific.
 
@@ -48,16 +38,11 @@ new content cannot be admitted.
    node expected to serve large content needs a budget above the largest
    blob it should hold. `cache_size_mb = 0` is rejected at startup — it
    would refuse every blob rather than disable the cap.
-2. If `decdn_cache_pending_reclaim_bytes` is stuck high, the driver is
-   releasing faster than GC reclaims. Lower `cache.gc_interval_sec` to
-   shorten the window. It cannot be made on-demand yet: iroh-blobs 0.103
-   keeps its sweep function private, tracked in
-   [#520](https://github.com/decdn/decdn/issues/520).
-3. If you moved `cache.cache_dir`, restart the node to pick up the new
+2. If you moved `cache.cache_dir`, restart the node to pick up the new
    value. SIGHUP reload for live re-tune lands with
    [#236](https://github.com/decdn/decdn/issues/236); until then, restart
    is the only path for a `cache_dir` change.
-4. If pruning manually, prefer evicting whole blob files — never truncate.
+3. If pruning manually, prefer evicting whole blob files — never truncate.
    Truncated bytes will fail BLAKE3 verification on read, which is a
    slashing signal (see [Slashing risk](#slashing-risk)).
 

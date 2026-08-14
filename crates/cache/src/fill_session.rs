@@ -816,34 +816,6 @@ impl FillRegistry {
             .map(|session| session.total_bytes())
     }
 
-    /// Σ `total_bytes` over every live fill, across all hashes — how much inbound
-    /// content this node is currently committed to landing on disk (#1678).
-    ///
-    /// **Deliberately an over-estimate, twice over.** `total_bytes` is the WHOLE
-    /// blob length while a session's covered range may be a strict subset, and a
-    /// hash with two concurrent distinct-range pulls counts its size once per
-    /// session. So this is a ceiling on what the in-flight fills could add, not a
-    /// measurement of what they have added. That is the conservative direction
-    /// for a headroom signal: it errs toward reporting pressure that has not
-    /// arrived yet, never toward hiding pressure that has.
-    ///
-    /// Paired with `decdn_cache_bytes` (resident) against
-    /// `decdn_cache_size_limit_bytes` (the budget), this is the input to the
-    /// question #1678 deferred: do fill bursts outrun reclaim badly enough to
-    /// need an up-front admission reservation? Sampled on the eviction driver's
-    /// tick — it is a map walk under the std `Mutex`, so it must not be called
-    /// per request.
-    #[must_use]
-    pub fn total_in_flight_bytes(&self) -> u64 {
-        let map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
-        map.values()
-            .flat_map(|entry| entry.sessions.iter())
-            .filter(|session| !session.is_dead())
-            .fold(0u64, |acc, session| {
-                acc.saturating_add(session.total_bytes())
-            })
-    }
-
     /// Whether any LIVE fill of `hash` still covers `range`. A parked reader calls
     /// this (via [`FillSession::range_still_live`]) to decide "keep awaiting a
     /// capture / present-range advance, or fail because no pull will ever fill this".
@@ -1694,79 +1666,6 @@ mod fill_registry_tests {
             reg.in_flight_total(hash),
             Some(total),
             "a live sibling is reported past the dead session"
-        );
-    }
-
-    // ---- total_in_flight_bytes: the #1678 headroom signal ----
-
-    #[test]
-    fn total_in_flight_bytes_is_zero_on_an_idle_registry() {
-        let reg = Arc::new(FillRegistry::new());
-        assert_eq!(reg.total_in_flight_bytes(), 0);
-    }
-
-    #[test]
-    fn total_in_flight_bytes_sums_across_hashes_and_drains_on_release() {
-        let reg = Arc::new(FillRegistry::new());
-        let (a, b) = (store_hash(0x51), store_hash(0x52));
-        let (ta, tb) = (8 * G, 4 * G);
-
-        let sa = FillSession::new(root(0x51), ta);
-        let lease_a = reg.register_fill(a, &sa);
-        assert_eq!(reg.total_in_flight_bytes(), ta);
-
-        let sb = FillSession::new(root(0x52), tb);
-        let lease_b = reg.register_fill(b, &sb);
-        assert_eq!(
-            reg.total_in_flight_bytes(),
-            ta + tb,
-            "distinct hashes accumulate — this is the sum the disk budget is exposed to"
-        );
-
-        drop(lease_a);
-        assert_eq!(
-            reg.total_in_flight_bytes(),
-            tb,
-            "releasing one fill's last observer removes only its bytes"
-        );
-        drop(lease_b);
-        assert_eq!(
-            reg.total_in_flight_bytes(),
-            0,
-            "the gauge must return to zero, or it reports permanent phantom pressure"
-        );
-    }
-
-    #[test]
-    fn total_in_flight_bytes_counts_the_whole_blob_not_the_covered_range() {
-        // The documented over-estimate, pinned deliberately. A range fill may
-        // cover a sliver today and grow, so the headroom signal reports what the
-        // fill COULD land, not what it has. A future change to charge the
-        // covered range instead would make the gauge under-report pressure —
-        // which is the wrong direction for the decision it feeds.
-        let total = 8 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x53);
-        let session = FillSession::new(root(0x53), total);
-        session.set_covered(ranges(0, G, total));
-        let _lease = reg.register_fill(hash, &session);
-
-        assert_eq!(reg.total_in_flight_bytes(), total);
-    }
-
-    #[test]
-    fn total_in_flight_bytes_excludes_a_dead_session() {
-        let total = 8 * G;
-        let reg = Arc::new(FillRegistry::new());
-        let hash = store_hash(0x54);
-        let session = FillSession::new(root(0x54), total);
-        let _lease = reg.register_fill(hash, &session);
-        session.mark_ended(Err(FillError::new("pull died")));
-
-        assert_eq!(
-            reg.total_in_flight_bytes(),
-            0,
-            "a dead fill lands no more bytes; counting it would strand the gauge high"
         );
     }
 }

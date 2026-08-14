@@ -58,17 +58,6 @@ since project inception and will roll into the first tagged release.
     streams into a bounded sink. `decdn fetch --max-blob-mb` is unaffected and
     now enforced in the CLI, which is the layer that owns the user's disk.
 
-- **New cache observability for admission pressure (#1678).**
-  `decdn_cache_fill_in_flight_bytes` (inbound content committed but not yet
-  written), `decdn_cache_pending_reclaim_bytes` (released but not yet reclaimed —
-  the reclaim-lag signal), `decdn_cache_evicting` (hysteresis latch), and a
-  `decdn_node_fill_size_*` bucket ladder over fill sizes. There is deliberately
-  no up-front admission reservation: eviction remains the sole enforcer, and
-  these metrics exist to show whether fill bursts outrun reclaim badly enough to
-  need one. Making the GC sweep run on demand at the high-water crossing —
-  which would close the lag directly — stays blocked on iroh-blobs keeping
-  `gc_run_once` private ([#520](https://github.com/decdn/decdn/issues/520)).
-
 - **Container image renamed to `decdn-node`, and now published to Docker Hub as
   well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
   the same image is published as `decdn/decdn-node` on Docker Hub. The image

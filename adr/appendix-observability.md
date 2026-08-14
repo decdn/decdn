@@ -107,10 +107,6 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 |--------|------|------|--------|-------------|
 | `decdn_cache_bytes` | Gauge | M | live | Total cache size in bytes (all blobs). Paired with `decdn_cache_size_limit_bytes` for a saturation ratio. |
 | `decdn_cache_size_limit_bytes` | Gauge | R | live | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
-| `decdn_cache_fill_in_flight_bytes` | Gauge | M | live | Sum of whole-blob `total_bytes` over live fills — inbound content committed but not yet written. Over-estimates on purpose. Add to `decdn_cache_bytes` for what the budget is actually exposed to (#1678). |
-| `decdn_cache_pending_reclaim_bytes` | Gauge | M | live | Bytes released by the eviction driver but not yet reclaimed by the GC sweep. The reclaim-lag signal: a healthy value sawtooths each `gc_interval_sec`; stuck-high means reclaim is losing to admission (#1678). |
-| `decdn_cache_evicting` | Gauge | R | live | `1` while the eviction hysteresis latch is engaged, `0` idle. Separates sustained pressure from a passing spike (#1678). |
-| `decdn_node_fill_size_le_1mib_total` … `_gt_1gib_total` | Counter | R | live | Bucket ladder over the signed `total_bytes` of each fill (≤1 MiB, ≤16 MiB, ≤256 MiB, ≤1 GiB, >1 GiB). A bucket ladder rather than a histogram because `iroh_metrics::Histogram` has no `Default` and the metrics-group derive needs one. Traffic in `_gt_1gib` is content the retired 1 GiB `max_blob_size_mb` default would have refused (#1678). |
 | `decdn_cache_hits_total` | Counter | M | live | Probe or stream requests satisfied from local cache. |
 | `decdn_cache_misses_total` | Counter | M | live | Probe or stream requests requiring origin pull or peer pull. |
 | `decdn_cache_bytes_returned_total` | Counter | R | live | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. |
