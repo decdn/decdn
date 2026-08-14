@@ -545,32 +545,6 @@ pub struct CacheConfig {
     /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
     /// here is ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
     pub node_pull_stall_timeout_sec: Option<u64>,
-    /// Window-paced pull-through per-request pipeline window in bytes (#856, ADR
-    /// 037 `pull_ahead_bytes`). Absent =>
-    /// [`crate::config::DEFAULT_PULL_AHEAD_BYTES`] (1 MiB, under the 4 MiB
-    /// voucher interval). The serving node pulls at most this many bytes ahead of what
-    /// the requesting client has paid for, so the loss on an abandoned request
-    /// is bounded to this window rather than the whole blob. Larger keeps the
-    /// upstream pull more pipelined (higher throughput) at a larger per-request
-    /// speculative exposure. The serve loop floors the effective window at one
-    /// voucher interval so it can always make progress, so a value below one
-    /// interval (including `0`) collapses to one-interval pacing, not one chunk.
-    pub pull_ahead_bytes: Option<decdn_config_types::Bytes>,
-    /// Node-wide circuit breaker on aggregate speculative pull-through spend, in
-    /// bytes (#856, ADR 037 `max_unrecouped_leech_bytes`). Absent =>
-    /// [`crate::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES`]. When the rolling
-    /// `Σ(bytes pulled for misses) − Σ(bytes served)` reaches this, speculative
-    /// pull-through pauses and resumes as the node serves and recoups. Bounds
-    /// distributed manufactured-demand abuse in aggregate. `0` disables the
-    /// global cap (the per-request window and per-peer ratio still apply).
-    pub max_unrecouped_leech_bytes: Option<decdn_config_types::Bytes>,
-    /// Per-peer speculative-pull ceiling as a percentage of bytes served to that
-    /// peer (#856, ADR 037 `share_ratio`); `100` == 1.0×. Absent =>
-    /// [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`]. The node will not
-    /// pull more than this ratio of what it has served a peer, plus an opening
-    /// allowance of `pull_ahead_bytes`, bounding concentrated single-peer abuse.
-    /// `0` pins a peer to only the opening window.
-    pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.
@@ -768,18 +742,23 @@ pub struct PaymentConfig {
     /// refuses startup outright), so treat the on-chain value as authoritative.
     /// Absent => `0`.
     pub delivery_floor: Option<u64>,
-    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
-    /// how far past the client's cleared payment the node keeps streaming before
-    /// it must collect a voucher, so paid delivery pipelines instead of stalling a
-    /// round trip at every interval boundary. Bounds the node's credit exposure
-    /// (unbilled egress already on the wire) to exactly this; the client's exposure
-    /// stays zero (vouchers are cumulative over delivered bytes). Absent =>
-    /// [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB). Floored at one
-    /// voucher accounting interval ([`decdn_protocol::VOUCHER_INTERVAL_BYTES`]);
-    /// a value at or below one interval reproduces stop-and-wait delivery. It
-    /// is node-local config, not a governance-owned parameter — no contract
-    /// holds a delivery-window value.
-    pub credit_window_bytes: Option<decdn_config_types::Bytes>,
+    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window). The
+    /// per-stream window ramps toward this cap as the stream pays, bounding the
+    /// node's credit exposure (unbilled egress already on the wire) to
+    /// `paid / credit_ramp_divisor`; the client's exposure stays zero (vouchers
+    /// are cumulative over delivered bytes). Absent =>
+    /// [`crate::config::DEFAULT_CREDIT_MAX`] (64 MiB). Floored at one voucher
+    /// accounting interval ([`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`]);
+    /// a value at or below one interval reproduces the pre-ramp stop-and-wait
+    /// cadence. It is node-local config, not a governance-owned parameter — no
+    /// contract holds a delivery-cadence value.
+    pub credit_max: Option<decdn_config_types::Bytes>,
+    /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
+    /// `paid / credit_ramp_divisor`, floored at one voucher interval and capped at
+    /// [`Self::credit_max`]. Absent => [`crate::config::DEFAULT_CREDIT_RAMP_DIVISOR`]
+    /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
+    /// behavior. It is node-local config, not a governance-owned parameter.
+    pub credit_ramp_divisor: Option<u64>,
     /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
     /// persistence): how long the serve loop waits to gather more vouchers
     /// into one fsynced commit before committing what it has, so a single
@@ -787,11 +766,11 @@ pub struct PaymentConfig {
     /// acknowledged only after the commit is durable, so the replay guard is
     /// unchanged. Absent => [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]
     /// (5 ms). `0` commits each blocking-read batch immediately. Composes with
-    /// [`Self::credit_window_bytes`] via `credit_window ≥ throughput × (RTT +
+    /// [`Self::credit_max`] via `credit_window ≥ throughput × (RTT +
     /// commit_interval)`; bounded above by the window (at most
     /// `credit_window / VOUCHER_INTERVAL_BYTES` vouchers are ever outstanding).
-    /// Like [`Self::credit_window_bytes`] it is node-local, not a
-    /// governance-owned parameter.
+    /// Like [`Self::credit_max`] it is node-local, not a governance-owned
+    /// parameter.
     pub voucher_commit_interval_ms: Option<u64>,
 }
 

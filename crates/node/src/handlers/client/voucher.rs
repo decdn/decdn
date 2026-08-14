@@ -417,9 +417,6 @@ impl ClientHandler {
             if let Some(acc) = self.region_accountant.as_ref() {
                 acc.record_served(&client_node_id.0, s.delta_bytes).await;
             }
-            if let Some(gov) = self.leech_governor.as_ref() {
-                gov.record_served(&client_node_id.0, s.delta_bytes);
-            }
         }
 
         // Lane-level, once per batch: stamp the admin last-voucher clock and hint

@@ -24,7 +24,6 @@ pub mod content_deny;
 pub mod dht;
 pub mod dispatch;
 pub mod handlers;
-pub mod leech_governor;
 pub mod metrics;
 pub(crate) mod net;
 pub mod node_origin;

@@ -86,7 +86,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 - No new wire surface: each source is an ordinary `cdn/client/v1` paid stream, bounded by the existing voucher backpressure. The mechanism is a pure client-side policy.
 - A corrupt or vanished source costs only a unit re-dispatch, never a restart — the verified-range property ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)) localizes every failure.
 - Verification failures cost the source its payment for that range and lower its local reputation score, so multi-source fetch hardens the network against bad sources rather than merely tolerating them.
-- No new node-side abuse surface: a source sees a bounded paid stream identical to today's, so the existing seed-leech caps and deposit guard ([ADR 037](037-regional-proxy-warming.md#seed-leech-caps)) apply unchanged.
+- No new node-side abuse surface: a source sees a bounded paid stream identical to today's, so the existing ramped credit window and deposit guard ([ADR 037 § Node serving](037-regional-proxy-warming.md#node-serving-window-paced-pull-through)) apply unchanged.
 
 ### Negative
 

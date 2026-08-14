@@ -267,13 +267,6 @@ pub fn write_validate_summary<W: std::io::Write>(
             resolved.cache.node_pull_timeout_sec,
             resolved.cache.node_pull_stall_timeout_sec
         )?;
-        writeln!(
-            w,
-            "  pull_through_caps:        pull_ahead_bytes={}, max_unrecouped_leech_bytes={}, share_ratio_percent={}",
-            resolved.cache.pull_ahead_bytes,
-            resolved.cache.max_unrecouped_leech_bytes,
-            resolved.cache.pull_share_ratio_percent
-        )?;
     } else {
         writeln!(w, "  node_to_node_pull:        disabled")?;
     }
@@ -669,14 +662,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall timeout, so every ranked upstream can be tried before falling back (#831, #859)
 # node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
-# pull_ahead_bytes = 1048576               # window-paced pull-through pipeline window (#856, ADR 037); per-request speculative loss is bounded to this many bytes
-# max_unrecouped_leech_bytes = 268435456   # node-wide unrecouped-leech budget in bytes (#856, ADR 037); aggregate speculative spend above this pauses until served bytes recoup it; 0 disables
-# pull_share_ratio_percent = 400           # per-peer pull ceiling as a percent of bytes served to that peer (#856, ADR 037); 100 == 1.0x, plus an opening pull_ahead_bytes allowance
 
 [payment]
 # rate_per_mb = 10
 # delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
-# credit_window_bytes = 8388608            # downstream credit window in bytes (ADR 003 §Credit window); how far past cleared payment the node streams before collecting a voucher; default 8 MiB; floored at one voucher accounting interval (4 MiB)
+# credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one voucher interval (4 MiB)
+# credit_ramp_divisor = 2                  # ramp divisor (ADR 003 §Credit window); window is paid/credit_ramp_divisor, capped at credit_max; 0 opens the full ceiling immediately
 # voucher_commit_interval_ms = 5           # group-commit interval for durable voucher persistence (ADR 003, #1483); 0 commits each batch immediately; default 5ms
 
 [observability]
@@ -929,9 +920,6 @@ mod tests {
             node_pull_probe_fanout,
             node_pull_timeout_sec,
             node_pull_stall_timeout_sec,
-            pull_ahead_bytes,
-            max_unrecouped_leech_bytes,
-            pull_share_ratio_percent,
         } = &config::types::CacheConfig::default();
         let cache = [
             ("cache_dir =", cache_dir.is_none()),
@@ -980,27 +968,20 @@ mod tests {
                 "node_pull_stall_timeout_sec =",
                 node_pull_stall_timeout_sec.is_none(),
             ),
-            ("pull_ahead_bytes =", pull_ahead_bytes.is_none()),
-            (
-                "max_unrecouped_leech_bytes =",
-                max_unrecouped_leech_bytes.is_none(),
-            ),
-            (
-                "pull_share_ratio_percent =",
-                pull_share_ratio_percent.is_none(),
-            ),
         ];
 
         let config::types::PaymentConfig {
             rate_per_mb,
             delivery_floor,
-            credit_window_bytes,
+            credit_max,
+            credit_ramp_divisor,
             voucher_commit_interval_ms,
         } = &config::types::PaymentConfig::default();
         let payment = [
             ("rate_per_mb =", rate_per_mb.is_none()),
             ("delivery_floor =", delivery_floor.is_none()),
-            ("credit_window_bytes =", credit_window_bytes.is_none()),
+            ("credit_max =", credit_max.is_none()),
+            ("credit_ramp_divisor =", credit_ramp_divisor.is_none()),
             (
                 "voucher_commit_interval_ms =",
                 voucher_commit_interval_ms.is_none(),

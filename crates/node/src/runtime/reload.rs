@@ -773,21 +773,13 @@ impl RuntimeReloadState {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
-                pull_ahead_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-                ),
-                max_unrecouped_leech_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-                ),
-                pull_share_ratio_percent: decdn_cache::Percent::new(
-                    decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
-                ),
             },
             // Placeholder rate — `payment.*` is restart-required.
             payment: ResolvedPayment {
                 rate_per_mb: 1,
                 delivery_floor: 0,
-                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
@@ -1034,8 +1026,8 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // `delivery_floor` is governed on-chain via `getRateBounds()`; the
         // other serve knobs are read once at handler construction.
         warn_ignored(
-            "payment.* (rate_per_mb, delivery_floor, credit_window_bytes, \
-             voucher_commit_interval_ms)",
+            "payment.* (rate_per_mb, delivery_floor, credit_max, \
+             credit_ramp_divisor, voucher_commit_interval_ms)",
         );
     }
     if file.gossip.is_some() {
@@ -1107,9 +1099,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
-        pull_ahead_bytes,
-        max_unrecouped_leech_bytes,
-        pull_share_ratio_percent,
     } = c;
     cache_dir.is_some()
         || cache_size_mb.is_some()
@@ -1139,9 +1128,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || node_pull_probe_fanout.is_some()
         || node_pull_timeout_sec.is_some()
         || node_pull_stall_timeout_sec.is_some()
-        || pull_ahead_bytes.is_some()
-        || max_unrecouped_leech_bytes.is_some()
-        || pull_share_ratio_percent.is_some()
 }
 
 /// Whether the file's `[observability]` section sets any field that a
@@ -1256,20 +1242,12 @@ mod tests {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
-                pull_ahead_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-                ),
-                max_unrecouped_leech_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-                ),
-                pull_share_ratio_percent: decdn_cache::Percent::new(
-                    decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
-                ),
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,
                 delivery_floor: 0,
-                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },

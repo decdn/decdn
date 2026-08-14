@@ -174,17 +174,13 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
 
         let interval_bytes = VOUCHER_INTERVAL_BYTES;
-        // The downstream credit window, floored at one interval so the loop can
-        // always make progress and — for the unconfigured default — collapses to
-        // stop-and-wait. See [`ClientHandler::credit_window`].
-        let window = self.credit_window(interval_bytes);
         // Group-commit cap (#1483): at most this many vouchers share one fsync.
-        // Bounded by how many intervals fit in the window — the window caps the
-        // in-flight (delivered-but-unpaid) intervals — so at the one-interval
-        // stop-and-wait floor this is 1 and each recoup collects a single voucher,
-        // exactly the pre-batch cadence. `interval_bytes >= 1` (floored in
-        // `credit_window`), so the division never divides by zero.
-        let batch_cap = usize::try_from(window / interval_bytes.max(1))
+        // Bounded by how many intervals fit in the widest window the ramp can
+        // reach (`credit_max`), so the batch size is stable as the window grows
+        // instead of shrinking and growing on every recompute. `interval_bytes >=
+        // 1` (floored in `credit_window`), so the division never divides by zero.
+        let ceiling = self.credit_window(interval_bytes, u64::MAX);
+        let batch_cap = usize::try_from(ceiling / interval_bytes.max(1))
             .unwrap_or(usize::MAX)
             .max(1);
 
@@ -219,6 +215,12 @@ impl ClientHandler {
         let mut next_chunk = chunks.next_frame().await?;
 
         loop {
+            // The ramped window for the payment confirmed so far (ADR 003 §Credit
+            // window). Recomputed each iteration: as `paid` advances in the recoup
+            // phase the window widens, so a paying stream ramps toward `credit_max`
+            // while a non-payer stays pinned at the one-interval floor.
+            let window = self.credit_window(interval_bytes, paid);
+
             // --- deliver phase: stream chunks while the window has room. The
             // window is checked BEFORE each send, so the frontier
             // `delivered − paid` can overshoot by at most the one chunk that

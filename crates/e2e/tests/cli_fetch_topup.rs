@@ -553,16 +553,18 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 //
 //   * The node's pre-serve floor-M reserve (`pool_remaining_covers_window`,
 //     #1516) refuses to open a stream unless the pool's remaining minus the
-//     refundable floor `M` (default 1 USDC) covers one reserved CREDIT WINDOW.
-//     The window is 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`, two of the fixed
-//     4 MiB voucher accounting intervals — `VOUCHER_INTERVAL_BYTES` in
-//     `decdn_protocol`); at `MULTI_RATE_PER_MB` that window costs
-//     8 * 2_000_000 = 16 USDC, so the initial deposit must clear
-//     16 USDC + M = 17 USDC just to open.
+//     refundable floor `M` (default 1 USDC) covers the reserved CREDIT WINDOW.
+//     The gate prices a cold, unbounded request at `paid = 0` (ADR 003
+//     §Credit window, #1669), which the ramp collapses to its floor — exactly
+//     ONE fixed 4 MiB voucher accounting interval
+//     (`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`); at `MULTI_RATE_PER_MB`
+//     that floor costs 4 * 2_000_000 = 8 USDC, so the initial deposit must clear
+//     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare —
+//     the number is driven by the second bound below, not by this floor.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
 //     voucher still exhausts it mid-stream and the reactive top-up fires.
 //
-// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 16), two whole 4 MiB
+// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 8), two whole 4 MiB
 // intervals are delivered and accepted (cumulative 16 USDC ≤ 18), and the
 // partial third — the blob is just over two intervals — is the one that
 // genuinely exhausts the deposit.
@@ -883,11 +885,13 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // interval, so exactly two reactive top-ups are needed:
 //
 //   * The node's pre-serve deposit gate (#1518) refuses to serve unless headroom
-//     covers one credit window — `DEFAULT_CREDIT_WINDOW_BYTES` (8 MiB) at the
-//     quoted rate = 16_000_000 µUSDC here. So BOTH the initial deposit and the
-//     working target must be >= that, or the resumed open after a top-up is
-//     refused instead of served. This is what puts a hard floor under the blob
-//     size: two top-ups need a blob costing more than `initial + working`.
+//     covers the reserved credit window. For a cold, unbounded request the ramp
+//     (ADR 003 §Credit window, #1669) prices at `paid = 0`, its floor — one 4 MiB
+//     interval, 4 * 2_000_000 = 8_000_000 µUSDC at the quoted rate. So BOTH the
+//     initial deposit and the working target must clear that floor (plus `M`),
+//     or the resumed open after a top-up is refused instead of served. 16M
+//     clears it with headroom — the number below is driven by the delivery
+//     arithmetic, not by this floor.
 //   * Vouchers accumulate 8_000_000 µUSDC per whole 4 MiB interval. Starting at a
 //     16_000_000 deposit: vouchers 1-2 are accepted (cumulative 8M, then exactly
 //     16M — the gate is `>`, so an exact match still clears), and voucher 3 (24M)
@@ -905,7 +909,9 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // left-boundary proof hashes.
 
 const TWO_TOPUP_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, as above
-// Both must clear the 8 MiB credit window at the rate above (16_000_000 µUSDC).
+// Both must clear the ramp-floor 4 MiB credit window at the rate above
+// (8_000_000 µUSDC) — sized well above that floor for the delivery
+// arithmetic explained above.
 const TWO_TOPUP_INITIAL_MICRO_USDC: u64 = 16_000_000;
 const TWO_TOPUP_WORKING_MICRO_USDC: u64 = 16_000_000;
 /// Just over 20 MiB: costs more than `initial + working` (forcing a SECOND

@@ -37,6 +37,7 @@
 
 pub mod bind_sig;
 pub mod buyer_pool;
+pub mod credit;
 // NOTE: no outer `///` docs on these two — each module's `//!` header is its
 // documentation. An outer doc here would be a second copy free to drift, and
 // rustdoc merges it with the `//!` block and resolves the result in *this*
@@ -87,6 +88,7 @@ pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
 };
+pub use credit::ramped_credit_window;
 pub use erc20::Erc20;
 pub use lane::{LaneKey, LaneState, PoolError, PoolId, VoucherApplied};
 pub use pool_open_error::PoolOpenFailureReason;

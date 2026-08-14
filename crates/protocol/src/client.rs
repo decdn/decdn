@@ -694,7 +694,7 @@ impl WatermarkBundle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamError {
     /// Node lacks the blob and cannot reach a provider, or declines to pull
-    /// through (ADR 037 seed-leech caps).
+    /// through (ADR 037 ramped credit window).
     NotFound,
     /// Node is at capacity; try another node.
     Overloaded,

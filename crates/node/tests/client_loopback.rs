@@ -379,14 +379,17 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
 /// One voucher accounting interval — [`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`].
 const HARNESS_INTERVAL_BYTES: u64 = decdn_protocol::client::VOUCHER_INTERVAL_BYTES;
 
-/// Spin up a serving `ClientHandler` with an explicit downstream credit window
-/// (#1477). `credit_window` of `None` leaves the handler at its stop-and-wait
-/// default (window = one interval); `Some(bytes)` opts the serve loop into
-/// pipelining up to `bytes` ahead of cleared payment.
+/// Spin up a serving `ClientHandler` with an explicit downstream credit-window
+/// ceiling and ramp divisor (ADR 003 §Credit window, #1669). The effective
+/// window at any point is `ramped_credit_window(credit_ramp_divisor,
+/// interval, credit_max, paid)`: at `paid = 0` a non-zero divisor floors the
+/// window to one interval (stop-and-wait), while `credit_ramp_divisor = 0`
+/// opens the full `credit_max` immediately regardless of payment.
 async fn spawn_pipelined_server(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
-    credit_window: Option<u64>,
+    credit_max: u64,
+    credit_ramp_divisor: u64,
 ) -> anyhow::Result<(
     EndpointAddr,
     Arc<PrivateKeySigner>,
@@ -410,7 +413,8 @@ async fn spawn_pipelined_server(
         0,
         16,
         |deps| {
-            deps.credit_window_bytes = credit_window.map(decdn_cache::Bytes::new);
+            deps.credit_max = credit_max;
+            deps.credit_ramp_divisor = credit_ramp_divisor;
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -501,60 +505,45 @@ async fn assert_parked_awaiting_voucher(recv: &mut RecvStream) -> anyhow::Result
     }
 }
 
-/// #1477: with a credit window wider than one interval, the serve loop streams a
-/// FULL window ahead of cleared payment instead of stalling a round trip at each
-/// voucher boundary — and never more than the window (the bounded credit
-/// exposure). A client that pays nothing reads exactly the window, then the
-/// server parks awaiting a voucher.
-#[tokio::test(flavor = "multi_thread")]
-async fn serve_streams_a_full_credit_window_ahead_of_payment() -> anyhow::Result<()> {
-    // The window is 8 MiB — two of the fixed 4 MiB voucher intervals. Reading a full
-    // window ahead of ANY voucher is the pipelining claim: the pre-#1477 loop
-    // stalled after one interval, so it could never stream this far ahead of zero
-    // payment. The blob is larger than the window, so the WINDOW — not the blob —
-    // bounds the read-ahead.
-    const WINDOW: u64 = 8 * 1024 * 1024;
-    let payload = vec![0x11u8; 16 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, signer, _deposit) = seeded_store()?;
-
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_pipelined_server(cache, Arc::clone(&store), Some(WINDOW)).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-
-    let client_node_id = B256::from(*client_ep.id().as_bytes());
-    let ext = binding_ext(&signer, client_node_id)?;
-    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    // A full window arrives ahead of ANY voucher (pipelined past one interval)...
-    read_exact_chunks(&mut recv, WINDOW).await?;
-    // ...and not one byte more (exposure bounded to exactly the window).
-    assert_parked_awaiting_voucher(&mut recv).await?;
-
-    conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
-    Ok(())
+/// Sign a single cumulative voucher paying for `bytes_delivered` bytes and
+/// write it to `send`. Acceptance is implicit — the node sends no ack, it
+/// just advances `paid` and (if the wider window has room) keeps delivering.
+async fn pay_cumulative(
+    send: &mut SendStream,
+    signer: &PrivateKeySigner,
+    bytes_delivered: u64,
+) -> anyhow::Result<()> {
+    let amount = min_payment(bytes_delivered, RATE_PER_MB);
+    let voucher = Voucher {
+        pool_id: pool_id(),
+        signer: signer.address(),
+        provider: operator_addr(),
+        amount,
+        bytes_delivered: U256::from(bytes_delivered),
+    }
+    .sign(signer, &payment_domain())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+    )
+    .await
 }
 
-/// #1477 backward-compatibility: an unconfigured credit window (`None`) reads as
-/// one interval, reproducing the pre-credit-window stop-and-wait cadence exactly
-/// — the server delivers a single interval, then parks awaiting its voucher. This
-/// is what keeps a not-yet-pipelined requester (#1484) working against a new
-/// node.
+/// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), a stream that
+/// has paid nothing is served only the floor — one voucher interval — and then
+/// parks, exactly the pre-ramp stop-and-wait cadence. `credit_max` being large
+/// makes no difference at `paid = 0`: the window is `ramped_credit_window`
+/// clamped to the floor until payment clears it.
 #[tokio::test(flavor = "multi_thread")]
-async fn serve_without_a_credit_window_is_stop_and_wait() -> anyhow::Result<()> {
+async fn unpaid_stream_is_served_only_the_floor_then_pauses() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
     let payload = vec![0x22u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
 
     let (target, _server_eth, server_ep, server_task) =
-        spawn_pipelined_server(cache, Arc::clone(&store), None).await?;
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let conn = client_ep
@@ -565,7 +554,7 @@ async fn serve_without_a_credit_window_is_stop_and_wait() -> anyhow::Result<()> 
     let client_node_id = B256::from(*client_ep.id().as_bytes());
     let ext = binding_ext(&signer, client_node_id)?;
     let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    // Exactly one interval, then a park: the pre-credit-window cadence.
+    // Exactly one interval — the ramp floor — then a park.
     read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
@@ -576,18 +565,22 @@ async fn serve_without_a_credit_window_is_stop_and_wait() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// #1477: paying one cumulative voucher frees exactly one interval of credit, so
-/// the server resumes and streams one further interval before parking again — the
-/// window slides forward with payment rather than draining to a hard stop.
+/// #1669: as cumulative `paid` advances, the window ramps past the floor once
+/// `paid` clears `credit_ramp_divisor * floor`. With `credit_ramp_divisor = 1`
+/// the window equals `paid`: after the first interval is paid the window is
+/// still pinned at the floor (`paid == floor`, not yet exceeding it), but after
+/// the SECOND interval is paid (`paid == 2 * floor`) the window doubles, and the
+/// server delivers two further intervals in one pass instead of one before it
+/// parks again — the observable widening this test asserts.
 #[tokio::test(flavor = "multi_thread")]
-async fn paying_a_voucher_slides_the_credit_window_forward() -> anyhow::Result<()> {
-    const WINDOW: u64 = 8 * 1024 * 1024;
+async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
     let payload = vec![0x33u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
 
     let (target, _server_eth, server_ep, server_task) =
-        spawn_pipelined_server(cache, Arc::clone(&store), Some(WINDOW)).await?;
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 1).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let conn = client_ep
@@ -598,32 +591,57 @@ async fn paying_a_voucher_slides_the_credit_window_forward() -> anyhow::Result<(
     let client_node_id = B256::from(*client_ep.id().as_bytes());
     let ext = binding_ext(&signer, client_node_id)?;
     let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    // Fill the window, then confirm the server has parked.
-    read_exact_chunks(&mut recv, WINDOW).await?;
+
+    // Round 1: floor only (paid == 0 during this delivery pass).
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+    pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
+
+    // Round 2: still floor-width — `paid == 1 * floor` does not yet exceed the
+    // floor at divisor 1.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+    pay_cumulative(&mut send, &signer, 2 * HARNESS_INTERVAL_BYTES).await?;
+
+    // Round 3: `paid == 2 * floor` now exceeds the floor, so the window is
+    // `paid / 1 == 2 * floor` — the server delivers TWO intervals in this pass
+    // before parking again, the widened window.
+    read_exact_chunks(&mut recv, 2 * HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
-    // Pay one cumulative voucher covering a single interval.
-    let amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
-    let voucher = Voucher {
-        pool_id: pool_id(),
-        signer: signer.address(),
-        provider: operator_addr(),
-        amount,
-        bytes_delivered: U256::from(HARNESS_INTERVAL_BYTES),
-    }
-    .sign(&signer, &payment_domain())
-    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-    write_client_msg(
-        &mut send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
-    )
-    .await?;
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
 
-    // Acceptance is implicit — the node sends no ack and just keeps delivering.
-    // The accepted voucher freed exactly one interval of credit: the server
-    // streams one further
-    // interval (sliding the window forward), then parks again.
-    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+/// #1669: `credit_ramp_divisor = 0` opens the full `credit_max` ceiling
+/// immediately, regardless of `paid` — the flat-window behavior, now opt-in. A
+/// client that pays nothing still reads a full `credit_max` ahead of any
+/// voucher, and never more than that (the bounded credit exposure).
+#[tokio::test(flavor = "multi_thread")]
+async fn divisor_zero_serves_the_full_credit_max_immediately() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 8 * 1024 * 1024;
+    let payload = vec![0x11u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 0).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    // The full ceiling arrives ahead of ANY voucher...
+    read_exact_chunks(&mut recv, CREDIT_MAX).await?;
+    // ...and not one byte more (exposure bounded to exactly the ceiling).
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
@@ -666,14 +684,17 @@ impl PoolStateStore for CountingRecordStore {
     }
 }
 
-/// Build a pipelined serving handler with an explicit credit window AND
-/// group-commit interval (#1483). A generous `commit_interval_ms` lets the batch
-/// gather a whole burst of vouchers into one fsync deterministically, rather than
-/// flushing on a straggler timeout.
+/// Build a pipelined serving handler with an explicit credit-window ceiling AND
+/// group-commit interval (#1483). `credit_ramp_divisor = 0` opens the full
+/// `credit_max` ceiling immediately (independent of the ramp), so these batching
+/// tests can read a whole window ahead of any payment exactly as before #1669. A
+/// generous `commit_interval_ms` lets the batch gather a whole burst of vouchers
+/// into one fsync deterministically, rather than flushing on a straggler
+/// timeout.
 async fn spawn_batching_server(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
-    credit_window: u64,
+    credit_max: u64,
     commit_interval_ms: u64,
 ) -> anyhow::Result<(
     EndpointAddr,
@@ -698,7 +719,8 @@ async fn spawn_batching_server(
         0,
         16,
         |deps| {
-            deps.credit_window_bytes = Some(decdn_cache::Bytes::new(credit_window));
+            deps.credit_max = credit_max;
+            deps.credit_ramp_divisor = 0;
             deps.voucher_commit_interval = Some(Duration::from_millis(commit_interval_ms));
         },
     )?;
@@ -3021,9 +3043,17 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Pool remaining sits one base unit under the window's cost.
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, deposit, None).await?;
+    // Pool remaining sits one base unit under the floor's cost. A large
+    // `credit_max` makes no difference here — the default (non-zero) ramp
+    // divisor prices the gate at the floor, not the ceiling.
+    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        deposit,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3140,19 +3170,17 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
     Ok(())
 }
 
-/// The gate scales with the configured credit window (#1477), not with one
-/// voucher accounting interval. `deliver` streams while `delivered - paid <
-/// window`, so with an 8 MiB window (two voucher intervals) the node fronts
-/// 8 MiB before it collects anything — and a deposit covering only one
-/// interval's cost is not enough. An interval-sized gate would wave this
-/// through and hand over 8 MiB, which is exactly how enabling a credit
-/// window would silently re-open the hole #1516 closes.
+/// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), the gate
+/// prices at `paid = 0` — the floor, one voucher interval — not the fully-ramped
+/// `credit_max` ceiling. A deposit that covers exactly the floor's cost clears
+/// the gate even though `credit_max` is configured far larger: unlike the
+/// pre-ramp flat window, a big ceiling no longer means the node fronts that much
+/// before the first voucher.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Result<()> {
-    const WINDOW: u64 = 8 * 1024 * 1024;
-    let payload = vec![0x77u8; 12 * 1024 * 1024]; // larger than the window, so the window binds
+async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024; // far wider than the one-interval floor
+    let payload = vec![0x77u8; 8 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let interval_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
 
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -3160,17 +3188,85 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
         pool_id(),
         signer.address(),
         operator_addr(),
-        interval_cost,
+        U256::from(HARNESS_FLOOR_COST),
         0,
         U256::ZERO,
         U256::ZERO,
         None,
     ))?;
 
-    // Pool remaining covers only the first voucher interval of the 8 MiB window.
+    // Pool remaining exactly covers the one-interval floor, not the 64 MiB ceiling.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, interval_cost, Some(WINDOW)).await?;
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        U256::from(HARNESS_FLOOR_COST),
+        CREDIT_MAX,
+        2,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1477,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            resp.body.ok,
+            "a deposit covering the floor must clear the gate regardless of credit_max"
+        ),
+        other => anyhow::bail!("expected a pre-serve StreamResponse acceptance, got {other:?}"),
+    }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1669: `credit_ramp_divisor = 0` opens the full `credit_max` ceiling
+/// immediately — the pre-ramp flat-window behavior, now opt-in — so the
+/// pre-serve gate must reserve the WHOLE ceiling, not the floor. A deposit that
+/// only covers one interval is refused against a wider ceiling, exactly how
+/// enabling the flat window would silently re-open the hole #1516 closes if the
+/// gate only ever priced at the floor.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyhow::Result<()> {
+    const CREDIT_MAX: u64 = 8 * 1024 * 1024; // two voucher intervals — wider than the floor
+    let payload = vec![0x77u8; 12 * 1024 * 1024]; // larger than the ceiling, so the ceiling binds
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(HARNESS_FLOOR_COST),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+
+    // Pool remaining covers only the first 4 MiB voucher interval of the 8 MiB ceiling.
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        U256::from(HARNESS_FLOOR_COST),
+        CREDIT_MAX,
+        0,
+    )
+    .await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3187,7 +3283,7 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         ClientMessage::StreamResponse(resp) => anyhow::ensure!(
             !resp.body.ok,
-            "a deposit covering one interval must not unlock a four-interval window"
+            "a deposit covering one interval must not unlock the whole ceiling"
         ),
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
     }
@@ -3232,9 +3328,15 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Gross deposit 100, but the pool has only 5 remaining after prior redeems —
-    // the headroom the gate reserves against, well under the window cost.
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64), None).await?;
+    // the headroom the gate reserves against, ten times under the window cost.
+    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        U256::from(5u64),
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3304,8 +3406,14 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining 5 covers the ~0.4 MiB tail (cost 4) but not the whole blob.
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64), None).await?;
+    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        U256::from(5u64),
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3369,9 +3477,15 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Pool remaining exactly equals the window's cost — the `>=` boundary.
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, window_cost, None).await?;
+    // Pool remaining exactly equals the floor's cost — the `>=` boundary.
+    let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        window_cost,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3685,14 +3799,21 @@ impl decdn_node::pool_view::PoolView for FixedRemainingPoolView {
     }
 }
 
+/// The harness's fixed one-interval floor cost — `credit_window(interval, paid =
+/// 0)` collapses to one `VOUCHER_INTERVAL_BYTES` (4 MiB) regardless of
+/// `credit_max` whenever `credit_ramp_divisor` is non-zero (ADR 003 §Credit
+/// window, #1669), which at `RATE_PER_MB` costs `min_payment(4 MiB, 10) = 40`.
+const HARNESS_FLOOR_COST: u64 = 40;
+
 /// `spawn_handler_server_with_metrics` with a fixed-`remaining` pool-view wired
-/// and an optional credit window — the setup the floor-`M` pre-serve deposit-gate
-/// tests need so the gate reads a known pool headroom.
+/// and an explicit credit-window ceiling/ramp divisor — the setup the floor-`M`
+/// pre-serve deposit-gate tests need so the gate reads a known pool headroom.
 async fn spawn_handler_server_with_pool(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
     remaining: U256,
-    credit_window: Option<u64>,
+    credit_max: u64,
+    credit_ramp_divisor: u64,
 ) -> anyhow::Result<(
     EndpointAddr,
     Arc<PrivateKeySigner>,
@@ -3716,7 +3837,8 @@ async fn spawn_handler_server_with_pool(
         RATE_PER_MB,
         |deps| {
             deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
-            deps.credit_window_bytes = credit_window.map(decdn_cache::Bytes::new);
+            deps.credit_max = credit_max;
+            deps.credit_ramp_divisor = credit_ramp_divisor;
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -6480,10 +6602,7 @@ async fn spawn_local_and_window_server(
         16,
         |deps| {
             deps.local_populate = Some(Duration::from_secs(20));
-            deps.set_window_pull_through(
-                Arc::new(decdn_node::node_origin::NodeOrigin::new()),
-                decdn_cache::Bytes::new(64 * 1024),
-            );
+            deps.pull_through_origin = Some(Arc::new(decdn_node::node_origin::NodeOrigin::new()));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -6771,10 +6890,8 @@ async fn spawn_fault_server(
             FaultTiers::LocalOnly => deps.local_populate = Some(Duration::from_secs(20)),
             FaultTiers::LocalAndWindow => {
                 deps.local_populate = Some(Duration::from_secs(20));
-                deps.set_window_pull_through(
-                    Arc::new(decdn_node::node_origin::NodeOrigin::new()),
-                    decdn_cache::Bytes::new(64 * 1024),
-                );
+                deps.pull_through_origin =
+                    Some(Arc::new(decdn_node::node_origin::NodeOrigin::new()));
             }
             FaultTiers::Buffered => deps.pull_through = Some(Duration::from_secs(20)),
         },

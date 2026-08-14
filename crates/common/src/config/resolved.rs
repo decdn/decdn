@@ -295,17 +295,6 @@ pub struct ResolvedCache {
     /// never on a large blob or a slow link (#1134). Default
     /// [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
     pub node_pull_stall_timeout_sec: u64,
-    /// Window-paced pull-through pipeline window in bytes (#856, ADR 037
-    /// `pull_ahead_bytes`). Default [`crate::config::DEFAULT_PULL_AHEAD_BYTES`].
-    /// Bounds per-request speculative loss to this window.
-    pub pull_ahead_bytes: decdn_config_types::Bytes,
-    /// Node-wide unrecouped-leech budget in bytes (#856, ADR 037
-    /// `max_unrecouped_leech_bytes`). Default
-    /// [`crate::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES`]; `0` disables.
-    pub max_unrecouped_leech_bytes: decdn_config_types::Bytes,
-    /// Per-peer share ratio as a percentage (#856, ADR 037 `share_ratio`;
-    /// `100` == 1.0×). Default [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`].
-    pub pull_share_ratio_percent: decdn_config_types::Percent,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors
@@ -427,19 +416,19 @@ pub struct ResolvedPayment {
     /// runtime overwrites it from on-chain `getRateBounds()` before serving and
     /// the rate-bounds watcher keeps it current. Default `0`.
     pub delivery_floor: u64,
-    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
-    /// how far past cleared payment the serve loop streams before collecting a
-    /// voucher. Default [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB);
-    /// floored at one voucher accounting interval
-    /// ([`decdn_protocol::VOUCHER_INTERVAL_BYTES`]) by the serve loop, so a
-    /// value at or below one interval is stop-and-wait.
-    pub credit_window_bytes: u64,
+    /// Credit-window ceiling in bytes (ADR 003 §Credit window). The per-stream
+    /// window ramps toward this cap as the stream pays; floored at one voucher
+    /// accounting interval ([`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`]).
+    /// See [`crate::config::DEFAULT_CREDIT_MAX`].
+    pub credit_max: u64,
+    /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.
+    pub credit_ramp_divisor: u64,
     /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
     /// persistence): how long the serve loop waits to batch more vouchers into
     /// one fsynced commit before committing what it has. Default
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 ms); `0` commits
-    /// each blocking-read batch immediately. Bounded above by
-    /// [`Self::credit_window_bytes`].
+    /// each blocking-read batch immediately. Bounded above by the ramped window
+    /// (see [`Self::credit_max`]).
     pub voucher_commit_interval_ms: u64,
 }
 

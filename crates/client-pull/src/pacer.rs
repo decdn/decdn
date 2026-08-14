@@ -176,8 +176,7 @@ pub struct WindowPacer {
 }
 
 impl WindowPacer {
-    /// Construct a window pacer bounded to `window_bytes` (ADR 037's per-pull
-    /// `pull_ahead_bytes`).
+    /// Construct a window pacer bounded to `window_bytes`.
     #[must_use]
     pub const fn new(window_bytes: u64) -> Self {
         Self { window_bytes }
@@ -213,10 +212,39 @@ impl Pacer for WindowPacer {
     }
 }
 
+/// The node pull-leg's ramped pacing policy (ADR 003 §Credit window / ADR 037):
+/// compose [`WindowPacer`] over a window that itself ramps with the downstream
+/// served-paid frontier, so on the fused serve-miss path the upstream pull never
+/// runs further ahead of cleared client payment than the ramped credit window
+/// allows. With a nonzero divisor a non-paying client's request therefore fronts
+/// at most one interval (the floor) of speculative upstream spend, and the window
+/// widens only as the client pays; a divisor of `0` opens the full `credit_max`
+/// from the first byte, the same instant-ceiling behavior as the downstream window.
+#[derive(Debug, Clone, Copy)]
+pub struct RampPacer {
+    pub divisor: u64,
+    pub floor: u64,
+    pub credit_max: u64,
+}
+
+impl Pacer for RampPacer {
+    fn decide(&self, s: &PaceState) -> PaceDecision {
+        let window = decdn_incentive::ramped_credit_window(
+            self.divisor,
+            self.floor,
+            self.credit_max,
+            s.served_paid_frontier,
+        );
+        WindowPacer::new(window).decide(s)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
-    use super::{BudgetPacer, CHUNK_GROUP_BYTES, PaceDecision, PaceState, Pacer, WindowPacer};
+    use super::{
+        BudgetPacer, CHUNK_GROUP_BYTES, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
+    };
     use alloy::primitives::U256;
 
     /// A healthy mid-fetch snapshot: deposit covers the next voucher, range
@@ -414,5 +442,37 @@ mod tests {
         s.served_paid_frontier = 0;
         assert_eq!(WindowPacer::new(10).decide(&s), PaceDecision::Refuse);
         assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Refuse);
+    }
+
+    #[test]
+    fn ramp_pacer_paces_pull_on_the_ramped_window() {
+        // Unpaid: served_paid_frontier = 0 -> window = floor. The pull may run at
+        // most `floor` ahead of the served-paid frontier, then Wait.
+        let floor = 4 * CHUNK_GROUP_BYTES;
+        let pacer = RampPacer {
+            divisor: 2,
+            floor,
+            credit_max: 64 * CHUNK_GROUP_BYTES,
+        };
+        let mut s = healthy();
+        s.served_paid_frontier = 0;
+        s.pulled_frontier = floor; // already floor ahead
+        assert_eq!(pacer.decide(&s), PaceDecision::Wait);
+    }
+
+    #[test]
+    fn ramp_pacer_widens_the_pull_window_as_served_paid_advances() {
+        // served_paid_frontier = 32 groups, divisor 2 -> window 16 groups > floor,
+        // so a pull only `floor` ahead may Draw again.
+        let floor = 4 * CHUNK_GROUP_BYTES;
+        let pacer = RampPacer {
+            divisor: 2,
+            floor,
+            credit_max: 64 * CHUNK_GROUP_BYTES,
+        };
+        let mut s = healthy();
+        s.served_paid_frontier = 32 * CHUNK_GROUP_BYTES;
+        s.pulled_frontier = floor;
+        assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
     }
 }
