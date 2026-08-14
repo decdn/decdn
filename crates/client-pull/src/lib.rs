@@ -4,7 +4,7 @@
 //! `stream_fetch` performs one full delivery exchange against a remote node:
 //! it sends a [`StreamRequest`], validates and verifies the signed
 //! [`StreamResponse`], receives `ChunkData` while paying cumulative vouchers
-//! at each `voucher_interval_mb` boundary, and returns the assembled blob on
+//! at each `VOUCHER_INTERVAL_BYTES` boundary, and returns the assembled blob on
 //! `StreamEnd`. It is the receive-side call site for the #252 rule (reject a
 //! `rate_per_mb == 0` response) and the `slash_sig` verification obligation
 //! (ADR 014 §1).
@@ -94,8 +94,7 @@ use decdn_protocol::client::{
     VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
-    write_frame,
+    ALPN_CLIENT, VOUCHER_INTERVAL_BYTES, decode_message, encode_message, read_frame, write_frame,
 };
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
@@ -262,16 +261,14 @@ pub fn sign_client_binding(
 /// Build the trailing [`StreamRequestExt`] carrying the context's client
 /// identity binding and/or owner capability, or `None` when the context
 /// carries neither — in which case `encode_stream_request` appends no ext
-/// bytes, byte-for-byte the pre-#1115 wire. Shared by `fetch_inner` and
-/// `open_progressive_pull` (both go through `open_stream`), so the capability
-/// rides the same session-start request as the binding. `voucher_interval_mb`
-/// stays `None` so both sides keep negotiating the default cadence.
+/// bytes. Shared by `fetch_inner` and `open_progressive_pull` (both go
+/// through `open_stream`), so the capability rides the same session-start
+/// request as the binding.
 fn client_binding_ext(ctx: &PoolContext) -> Option<StreamRequestExt> {
     if ctx.client_binding.is_none() && ctx.capability.is_none() {
         return None;
     }
     Some(StreamRequestExt {
-        voucher_interval_mb: None,
         binding: ctx.client_binding.clone(),
         capability: ctx.capability.as_ref().map(|signed| WireCapability {
             spending_cap: signed.capability.spending_cap.to_be_bytes(),
@@ -1882,10 +1879,7 @@ async fn fetch_inner_once(
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
-    let interval_bytes = resp
-        .voucher_interval_mb
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
-        .saturating_mul(MB_BYTES);
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
     // Paid/received bytes are **wire** bytes — content plus interleaved bao proof
     // nodes (ADR 038 §Payment metering) — not the content-byte remainder.
     let total_bytes = resp.body.total_bytes;
@@ -2380,10 +2374,7 @@ pub async fn open_progressive_pull(
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
-    let interval_bytes = resp
-        .voucher_interval_mb
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
-        .saturating_mul(MB_BYTES);
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
     // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
     // the window path forwards this stream verbatim and pays the upstream in wire
     // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
@@ -2962,15 +2953,11 @@ mod tests {
             "unbound ctx must yield no ext"
         );
 
-        // Bound ⇒ ext carries exactly the binding, cadence left defaulted.
+        // Bound ⇒ ext carries exactly the binding.
         let binding = sign_client_binding(&signer, B256::repeat_byte(0xAB), &domain)?;
         let ctx = ctx.with_client_binding(binding.clone());
         let ext = client_binding_ext(&ctx)
             .ok_or_else(|| anyhow::anyhow!("bound ctx must yield an ext"))?;
-        anyhow::ensure!(
-            ext.voucher_interval_mb.is_none(),
-            "voucher cadence must stay defaulted"
-        );
         anyhow::ensure!(
             ext.binding == Some(binding),
             "ext must carry the exact binding"
@@ -3615,7 +3602,6 @@ mod tests {
         let response = StreamResponse {
             body: body.clone(),
             error: Some(StreamError::EvictedSinceProbe),
-            voucher_interval_mb: None,
             slash_sig: sig.as_bytes().to_vec(),
         };
         // Precondition the real open stage enforces before ever calling `open`.
@@ -3677,7 +3663,6 @@ mod tests {
                 redirect: None,
             },
             error: None,
-            voucher_interval_mb: None,
             slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
         };
         let err = UpstreamRefused::open(response);

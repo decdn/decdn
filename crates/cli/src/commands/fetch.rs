@@ -537,14 +537,13 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
     //
     // The node's pre-flight reservation is one voucher interval (the ramp floor);
     // the window only widens as this pool pays, so one interval is the true lower
-    // bound on what it reserves before serving. Estimated with the shipped default
-    // interval, since we cannot read the node's config.
+    // bound on what it reserves before serving. Estimated with the fixed
+    // `VOUCHER_INTERVAL_BYTES`, since we cannot read the node's config. The miss
+    // direction is "we stay silent when we could have spoken" — never a fabricated
+    // shortfall — so it is phrased as a possibility and as a lower bound.
     if let Some(quoted_rate) = refused.evidence().map(|resp| resp.body.rate_per_mb) {
         let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
-        let estimate = min_payment(
-            decdn_common::config::DEFAULT_VOUCHER_INTERVAL_MB * decdn_protocol::client::MB_BYTES,
-            quoted_rate,
-        );
+        let estimate = min_payment(decdn_protocol::client::VOUCHER_INTERVAL_BYTES, quoted_rate);
         if quoted_rate > 0 && headroom < estimate {
             causes.push(format!(
                 "this pool's remaining deposit ({headroom}) is below the ~{estimate} the node \

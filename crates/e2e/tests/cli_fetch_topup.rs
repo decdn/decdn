@@ -556,13 +556,11 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 //     refundable floor `M` (default 1 USDC) covers the reserved CREDIT WINDOW.
 //     The gate prices a cold, unbounded request at `paid = 0` (ADR 003
 //     §Credit window, #1669), which the ramp collapses to its floor — exactly
-//     ONE of the daemon's UNCONFIGURED default 4 MiB voucher intervals
-//     (`decdn_common::config::DEFAULT_VOUCHER_INTERVAL_MB`, distinct from the
-//     client-side wire fallback of the same name in `decdn_protocol`, which is
-//     1); at `MULTI_RATE_PER_MB` that floor costs 4 * 2_000_000 = 8 USDC, so
-//     the initial deposit must clear 8 USDC + M = 9 USDC just to open. 18 USDC
-//     clears this with room to spare — the number is driven by the second
-//     bound below, not by this floor.
+//     ONE fixed 4 MiB voucher accounting interval
+//     (`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`); at `MULTI_RATE_PER_MB`
+//     that floor costs 4 * 2_000_000 = 8 USDC, so the initial deposit must clear
+//     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare —
+//     the number is driven by the second bound below, not by this floor.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
 //     voucher still exhausts it mid-stream and the reactive top-up fires.
 //
@@ -571,18 +569,15 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 // partial third — the blob is just over two intervals — is the one that
 // genuinely exhausts the deposit.
 //
-// The interval is left at the daemon's default deliberately, rather than
-// configured down to something smaller: overriding it requires a daemon
-// RESTART (`voucher_interval_mb` is read once at bring-up), and restarting
-// between the pool's on-chain open and this test's later on-chain `topUp`
-// was observed to make the daemon's settlement watcher stop applying
-// `PoolToppedUp` events to its tracked pool state — the admin API kept
-// reporting the pre-top-up deposit indefinitely, well past any poll interval,
-// causing the resumed voucher to be rejected forever. That looks like a real,
-// separate bug in the watcher/restart interaction, out of scope for this fix;
-// avoiding any daemon restart in this test sidesteps it entirely (mirroring
-// the single-voucher test above, which also never restarts the daemon and
-// reliably sees its own top-up applied).
+// A daemon restart between the pool's on-chain open and this test's later
+// on-chain `topUp` was observed to make the daemon's settlement watcher stop
+// applying `PoolToppedUp` events to its tracked pool state — the admin API
+// kept reporting the pre-top-up deposit indefinitely, well past any poll
+// interval, causing the resumed voucher to be rejected forever. That looks
+// like a real, separate bug in the watcher/restart interaction, out of scope
+// for this fix; avoiding any daemon restart in this test sidesteps it
+// entirely (mirroring the single-voucher test above, which also never
+// restarts the daemon and reliably sees its own top-up applied).
 const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 18_000_000;
 const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
 

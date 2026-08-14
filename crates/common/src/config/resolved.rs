@@ -416,19 +416,16 @@ pub struct ResolvedPayment {
     /// runtime overwrites it from on-chain `getRateBounds()` before serving and
     /// the rate-bounds watcher keeps it current. Default `0`.
     pub delivery_floor: u64,
-    /// Voucher cadence advertised in `StreamResponse` for `cdn/client/v1`
-    /// (ADR 003 §Voucher Interval Negotiation); default
-    /// [`crate::config::DEFAULT_VOUCHER_INTERVAL_MB`], range
-    /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`].
-    pub voucher_interval_mb: u64,
-    /// Credit-window ceiling in bytes (ADR 003 §Credit window). See
-    /// [`crate::config::DEFAULT_CREDIT_MAX`].
+    /// Credit-window ceiling in bytes (ADR 003 §Credit window). The per-stream
+    /// window ramps toward this cap as the stream pays; floored at one voucher
+    /// accounting interval ([`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`]).
+    /// See [`crate::config::DEFAULT_CREDIT_MAX`].
     pub credit_max: u64,
     /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.
     pub credit_ramp_divisor: u64,
     /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
-    /// persistence, #1483): how long the serve loop waits to batch more vouchers
-    /// into one fsynced commit before committing what it has. Default
+    /// persistence): how long the serve loop waits to batch more vouchers into
+    /// one fsynced commit before committing what it has. Default
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 ms); `0` commits
     /// each blocking-read batch immediately. Bounded above by the ramped window
     /// (see [`Self::credit_max`]).

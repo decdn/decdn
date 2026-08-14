@@ -292,7 +292,7 @@ pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
 /// Default group-commit interval in milliseconds when
 /// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
-/// state persistence, #1483): 5 ms.
+/// state persistence): 5 ms.
 ///
 /// The serve loop amortizes the per-voucher fsynced redb commit (~3 ms on local
 /// SSD) across a batch — one fsync for several vouchers, each acknowledged only
@@ -302,8 +302,8 @@ pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
 /// interval bounds how long the loop waits for a straggling batch-mate before
 /// committing what it has, so a client that pauses payment is never stalled
 /// longer than this. It is bounded above by the window: at most `credit_window /
-/// voucher_interval` vouchers can be outstanding, so the batch never exceeds
-/// that regardless of this value.
+/// VOUCHER_INTERVAL_BYTES` vouchers can be outstanding, so the batch never
+/// exceeds that regardless of this value.
 ///
 /// **Sizing constraint.** The interval spends credit-window headroom, not
 /// throughput: to keep the link saturated while acknowledgements lag one commit
@@ -316,16 +316,6 @@ pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
 /// parameter — like the voucher interval and the credit window it has no
 /// on-chain counterpart.
 pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
-/// Default voucher cadence a node advertises in `StreamResponse` when
-/// `payment.voucher_interval_mb` is unset (ADR 003 §Voucher Interval
-/// Negotiation): 4 MiB. Coarser than the protocol's wire-level
-/// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (the "neither peer proposed"
-/// fallback, 1 MiB) because per-channel vouchers serialize on one fsynced redb
-/// commit (~3 ms): a larger interval lifts that per-channel throughput cap
-/// linearly without raising the credit exposure, which is the window, not the
-/// interval. Independent of [`DEFAULT_CREDIT_MAX`]; both are set from config
-/// and floored so the window is always at least one interval.
-pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 4;
 
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.
 /// With the default `retained_files` this bounds the audit log to ~640 MiB
@@ -2449,27 +2439,6 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Voucher cadence advertised in `StreamResponse` (ADR 003 §Voucher Interval
-    // Negotiation). Default `DEFAULT_VOUCHER_INTERVAL_MB` (4 MB); hardcoded wire
-    // range 1..=1024 (no on-chain counterpart). File-only (no CLI override) — it
-    // is read once at handler construction, not hot-reloadable.
-    let voucher_interval_mb = file
-        .and_then(|p| p.voucher_interval_mb)
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB);
-    // Lower bound is the literal minimum cadence (1 MB), not the default const:
-    // a future change to DEFAULT_VOUCHER_INTERVAL_MB must not narrow the valid
-    // wire range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
-    bag.check_with(
-        (1..=decdn_protocol::MAX_VOUCHER_INTERVAL_MB).contains(&voucher_interval_mb),
-        "payment.voucher_interval_mb",
-        || {
-            format!(
-                "payment.voucher_interval_mb {voucher_interval_mb} out of range \
-                 [1, {}] (ADR 003 §Voucher Interval Negotiation)",
-                decdn_protocol::MAX_VOUCHER_INTERVAL_MB,
-            )
-        },
-    );
     // Downstream credit-window ceiling (ADR 003 §Credit window). Default 64 MiB;
     // no upper bound beyond the runtime deposit guard — a larger ceiling is more
     // unbilled egress the node fronts once a stream has ramped up, which the
@@ -2484,9 +2453,9 @@ pub fn resolve_payment_into(
     let credit_ramp_divisor = file
         .and_then(|p| p.credit_ramp_divisor)
         .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
-    // Group-commit interval (ADR 003 §Off-chain voucher state persistence,
-    // #1483). Default 5 ms; `0` (commit each blocking-read batch immediately) is
-    // a valid setting, so it merges as a first-class value rather than falling
+    // Group-commit interval (ADR 003 §Off-chain voucher state persistence).
+    // Default 5 ms; `0` (commit each blocking-read batch immediately) is a
+    // valid setting, so it merges as a first-class value rather than falling
     // back to the default.
     let voucher_commit_interval_ms = file
         .and_then(|p| p.voucher_commit_interval_ms)
@@ -2494,7 +2463,6 @@ pub fn resolve_payment_into(
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
-        voucher_interval_mb,
         credit_max,
         credit_ramp_divisor,
         voucher_commit_interval_ms,
@@ -4890,7 +4858,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            voucher_interval_mb: None,
             credit_max: None,
             credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
@@ -4939,7 +4906,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            voucher_interval_mb: None,
             credit_max: None,
             credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
@@ -4960,11 +4926,6 @@ swap_pool_address = \"0xPool\"
             resolved.rate_per_mb == DEFAULT_RATE_PER_MB,
             "got: {}",
             resolved.rate_per_mb
-        );
-        anyhow::ensure!(
-            resolved.voucher_interval_mb == DEFAULT_VOUCHER_INTERVAL_MB,
-            "voucher_interval_mb default, got: {}",
-            resolved.voucher_interval_mb
         );
         anyhow::ensure!(
             resolved.credit_max == DEFAULT_CREDIT_MAX,
@@ -4992,7 +4953,6 @@ swap_pool_address = \"0xPool\"
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
                 delivery_floor: None,
-                voucher_interval_mb: None,
                 credit_max: None,
                 credit_ramp_divisor: None,
                 voucher_commit_interval_ms: set,
@@ -5004,21 +4964,6 @@ swap_pool_address = \"0xPool\"
                 resolved.voucher_commit_interval_ms
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_threads_explicit_voucher_interval() -> anyhow::Result<()> {
-        let file = types::PaymentConfig {
-            rate_per_mb: Some(10),
-            delivery_floor: None,
-            voucher_interval_mb: Some(64),
-            credit_max: None,
-            credit_ramp_divisor: None,
-            voucher_commit_interval_ms: None,
-        };
-        let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
-        anyhow::ensure!(resolved.voucher_interval_mb == 64);
         Ok(())
     }
 
@@ -5043,7 +4988,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
             delivery_floor: None,
-            voucher_interval_mb: None,
             credit_max: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
             credit_ramp_divisor: Some(5),
             voucher_commit_interval_ms: None,
@@ -5059,29 +5003,6 @@ swap_pool_address = \"0xPool\"
             "credit_ramp_divisor threaded, got: {}",
             resolved.credit_ramp_divisor
         );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_rejects_voucher_interval_out_of_range() -> anyhow::Result<()> {
-        for bad in [0u64, decdn_protocol::MAX_VOUCHER_INTERVAL_MB + 1] {
-            let file = types::PaymentConfig {
-                rate_per_mb: Some(10),
-                delivery_floor: None,
-                voucher_interval_mb: Some(bad),
-                credit_max: None,
-                credit_ramp_divisor: None,
-                voucher_commit_interval_ms: None,
-            };
-            let err = resolve_payment(&empty_payment_args(), Some(&file))
-                .err()
-                .ok_or_else(|| anyhow::anyhow!("expected rejection for interval {bad}"))?
-                .to_string();
-            anyhow::ensure!(
-                err.contains("voucher_interval_mb"),
-                "error lacked field context for {bad}: {err}"
-            );
-        }
         Ok(())
     }
 
@@ -9415,7 +9336,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
             delivery_floor: None,
-            voucher_interval_mb: None,
             credit_max: None,
             credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
@@ -9431,7 +9351,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
             delivery_floor: None,
-            voucher_interval_mb: None,
             credit_max: None,
             credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,

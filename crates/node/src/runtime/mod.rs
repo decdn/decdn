@@ -1179,7 +1179,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.receipt_sink),
         cfg.payment.rate_per_mb,
         rate_bounds.clone(),
-        cfg.payment.voucher_interval_mb,
         cfg.cache
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
@@ -3709,7 +3708,6 @@ mod tests {
             payment: ResolvedPayment {
                 rate_per_mb: 10,
                 delivery_floor: 0,
-                voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
                 credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
                 credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:

@@ -105,7 +105,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         payment: ResolvedPayment {
             rate_per_mb: rate,
             delivery_floor: 0,
-            voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,

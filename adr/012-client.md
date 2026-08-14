@@ -100,7 +100,7 @@ Clients manage two independent cryptographic keys.
 - **PoC:** An encrypted keystore file at `~/.decdn/eth_keystore` (Web3 Secret Storage format, EOA) — the documented default. A Safe or other smart-account address is accepted by every contract, since all contracts use `SignatureChecker`. It cannot be *served* as a signer — the node verifies bindings and vouchers off-chain by recovery only ([ADR 024 § Off-Chain ERC-1271 Verification](024-account-abstraction.md#off-chain-erc-1271-verification)) — but it can own a pool and issue a capability to an EOA signer, in which case only the EOA is ever recovered and its vouchers are servable.
 - **Production:** Safe smart wallet, required for the session-key path. 1-of-1 for simplicity, 2-of-3 for high-value accounts. A **session key** authorized via the Safe's Session Key Module handles high-frequency voucher signing — see [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions).
 
-**Voucher signing with session keys:** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 voucher signatures. Hardware wallets require physical confirmation per signature (2–5 seconds each), which is infeasible. A session key solves this: a lightweight secp256k1 key generated at session start, authorized once by the Safe owners, held in memory for the session, signing vouchers at wire speed. It is time-bounded, scope-limited to voucher signatures, and revocable by the Safe owners. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design.
+**Voucher signing with session keys:** At the fixed 4 MiB voucher granularity, a 100 MB download requires 25 EIP-712 voucher signatures. Hardware wallets require physical confirmation per signature (2–5 seconds each), which is infeasible. A session key solves this: a lightweight secp256k1 key generated at session start, authorized once by the Safe owners, held in memory for the session, signing vouchers at wire speed. It is time-bounded, scope-limited to voucher signatures, and revocable by the Safe owners. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design.
 
 A capability-authorized signer already delivers most of that shape without any account-abstraction machinery: a fresh EOA issued a capability is scope-limited to that pool's vouchers, bounded by its `spending_cap`, retired by its `expiry`, and needs no owner confirmation per signature. So it gives scope-limiting, a spending bound, *and* time-bounded revocation — more than an immutable per-channel pin gives. What it does not help is a smart account that must sign for itself. That is what the ERC-7579 session-key path is still for.
 
@@ -187,10 +187,9 @@ in current schema terms:
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
   and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
 
-A client does not configure the voucher cadence: it sends no `voucher_interval_mb` and follows the
-cadence the seller advertises on `cdn/client/v1`
-([ADR 003 § Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), which is
-why a client leaves the `[payment]` section unset.
+The voucher byte-accounting granularity is a fixed protocol constant that every client and node
+reads directly ([ADR 003 § Key parameters](003-payments.md#adr-003-payment-model)), so a client has
+nothing to configure for it — which is why a client leaves the `[payment]` section unset.
 
 The Ed25519 node key and the `peers.json` cache have no config keys of their own: both live inside
 the resolved data dir (see the tree above), so they move with `--data-dir` / `[identity] data_dir`.

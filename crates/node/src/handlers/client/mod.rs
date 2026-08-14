@@ -2,8 +2,10 @@
 //!
 //! Serves the revenue path: a payer opens one bidirectional QUIC stream per
 //! blob, the node answers with a signed [`StreamResponse`], then streams
-//! [`ChunkData`] in `voucher_interval_mb`-sized batches, pausing at each batch
-//! boundary to collect a cumulative payment `Voucher` before continuing, and
+//! [`ChunkData`], collecting a cumulative payment `Voucher` at each
+//! `VOUCHER_INTERVAL_BYTES` boundary and pausing only when the unpaid balance
+//! (`delivered − paid`) reaches the credit window — so delivery pipelines
+//! several intervals ahead of payment rather than stopping at each one — and
 //! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
 //! initial response (`ok: false` + [`StreamError`]); a mid-stream voucher
 //! rejection is sent as a [`ClientMessage::StreamError`] and the stream is
@@ -42,8 +44,8 @@ use decdn_protocol::client::{
     StreamResponseBody, VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,
-    is_unknown_variant, read_frame, write_frame,
+    ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, VOUCHER_INTERVAL_BYTES, decode_message,
+    encode_message, is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -359,7 +361,6 @@ pub struct ClientHandlerDeps {
     /// `getRateBounds()` and updated by the `RateBoundsUpdated` watcher,
     /// replacing the by-value config stand-in.
     pub rate_bounds: crate::rate_bounds::RateBounds,
-    pub voucher_interval_mb: u64,
     pub max_blob_size_bytes: u64,
     pub max_concurrent_streams: usize,
     /// Live content deny-set (ADR 011): the operator's local denylist unioned
@@ -407,7 +408,6 @@ impl std::fmt::Debug for ClientHandlerDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientHandlerDeps")
             .field("node_id", &self.node_id)
-            .field("voucher_interval_mb", &self.voucher_interval_mb)
             .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_concurrent_streams", &self.max_concurrent_streams)
             .finish_non_exhaustive()
@@ -430,7 +430,6 @@ impl ClientHandlerDeps {
         receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
         rate_bounds: crate::rate_bounds::RateBounds,
-        voucher_interval_mb: u64,
         max_blob_size_bytes: u64,
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
@@ -452,7 +451,6 @@ impl ClientHandlerDeps {
             pool_min_remaining_deposit,
             rate_per_mb,
             rate_bounds,
-            voucher_interval_mb,
             max_blob_size_bytes,
             max_concurrent_streams,
             content_deny,
@@ -589,7 +587,6 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps::rate_per_mb`]).
     rate_per_mb: u64,
     rate_bounds: crate::rate_bounds::RateBounds,
-    voucher_interval_mb: u64,
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     /// Throttle state for the insufficient-deposit refusal log (#1520): the
@@ -617,7 +614,6 @@ impl std::fmt::Debug for ClientHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientHandler")
             .field("node_id", &self.node_id)
-            .field("voucher_interval_mb", &self.voucher_interval_mb)
             .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_concurrent_streams", &self.max_concurrent_streams)
             .finish_non_exhaustive()
@@ -684,7 +680,6 @@ impl ClientHandler {
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
-            voucher_interval_mb: deps.voucher_interval_mb,
             max_blob_size_bytes: deps.max_blob_size_bytes,
             max_concurrent_streams: deps.max_concurrent_streams,
             deposit_refusal_last_warn_ms: AtomicU64::new(0),
@@ -1169,10 +1164,9 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
             })?;
             // Value checks are kept out of the parse so forward-compatible
             // trailing bytes don't couple to them (ADR 005 two-phase). Gate here
-            // rather than at each use: an out-of-range `voucher_interval_mb` is a
-            // protocol error per ADR 003 §Voucher Interval Negotiation, and this
-            // wire boundary is its only enforcement point — `PaymentPool`
-            // holds no cadence parameter to check it against.
+            // rather than at each use: a malformed client binding or capability
+            // signature is a protocol error, and this wire boundary is its only
+            // enforcement point.
             ext.validate().map_err(|e| StreamReadError {
                 err: anyhow::anyhow!("stream request ext rejected: {e}"),
                 app_code: APP_ERR_MALFORMED_MESSAGE,
@@ -1312,7 +1306,6 @@ pub(super) async fn handler_over_store(
         ))) as Arc<dyn ReceiptSink>,
         1,
         crate::rate_bounds::RateBounds::new(0),
-        1,
         0,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
@@ -1368,7 +1361,6 @@ mod tests {
             ))) as Arc<dyn ReceiptSink>,
             1,
             crate::rate_bounds::RateBounds::new(0),
-            1,
             0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
@@ -1757,7 +1749,6 @@ mod tests {
             ))) as Arc<dyn ReceiptSink>,
             1,
             crate::rate_bounds::RateBounds::new(0),
-            1,
             0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),

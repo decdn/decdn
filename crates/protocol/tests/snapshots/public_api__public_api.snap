@@ -1,6 +1,5 @@
 ---
 source: crates/protocol/tests/public_api.rs
-assertion_line: 54
 expression: public_api.to_string()
 ---
 pub mod decdn_protocol
@@ -62,14 +61,12 @@ pub decdn_protocol::client::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::client::StreamRequestExt
 pub decdn_protocol::client::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_protocol::client::StreamRequestExt::capability: core::option::Option<decdn_protocol::client::WireCapability>
-pub decdn_protocol::client::StreamRequestExt::voucher_interval_mb: core::option::Option<u64>
 impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::StreamResponse
 pub decdn_protocol::client::StreamResponse::body: decdn_protocol::client::StreamResponseBody
 pub decdn_protocol::client::StreamResponse::error: core::option::Option<decdn_protocol::client::StreamError>
 pub decdn_protocol::client::StreamResponse::slash_sig: alloc::vec::Vec<u8>
-pub decdn_protocol::client::StreamResponse::voucher_interval_mb: core::option::Option<u64>
 impl decdn_protocol::client::StreamResponse
 pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::StreamResponseBody
@@ -99,10 +96,9 @@ impl decdn_protocol::client::WireCapability
 pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_SIZE: usize
-pub const decdn_protocol::client::DEFAULT_VOUCHER_INTERVAL_MB: u64
-pub const decdn_protocol::client::MAX_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
+pub const decdn_protocol::client::VOUCHER_INTERVAL_BYTES: u64
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::client::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
@@ -236,8 +232,6 @@ pub decdn_protocol::message::MessageValidationError::RateIsZero
 pub decdn_protocol::message::MessageValidationError::RateTooLarge
 pub decdn_protocol::message::MessageValidationError::RateTooLarge::rate: u64
 pub decdn_protocol::message::MessageValidationError::StreamErrorWithOk
-pub decdn_protocol::message::MessageValidationError::VoucherIntervalOutOfRange
-pub decdn_protocol::message::MessageValidationError::VoucherIntervalOutOfRange::interval: u64
 pub decdn_protocol::message::MessageValidationError::VoucherRejectedInResponse
 pub enum decdn_protocol::message::ProbeMessage
 pub decdn_protocol::message::ProbeMessage::Request(decdn_protocol::message::ProbeRequest)
@@ -328,8 +322,6 @@ pub decdn_protocol::MessageValidationError::RateIsZero
 pub decdn_protocol::MessageValidationError::RateTooLarge
 pub decdn_protocol::MessageValidationError::RateTooLarge::rate: u64
 pub decdn_protocol::MessageValidationError::StreamErrorWithOk
-pub decdn_protocol::MessageValidationError::VoucherIntervalOutOfRange
-pub decdn_protocol::MessageValidationError::VoucherIntervalOutOfRange::interval: u64
 pub decdn_protocol::MessageValidationError::VoucherRejectedInResponse
 pub enum decdn_protocol::ProbeMessage
 pub decdn_protocol::ProbeMessage::Request(decdn_protocol::message::ProbeRequest)
@@ -487,14 +479,12 @@ pub decdn_protocol::StreamRequest::timestamp_us: u64
 pub struct decdn_protocol::StreamRequestExt
 pub decdn_protocol::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_protocol::StreamRequestExt::capability: core::option::Option<decdn_protocol::client::WireCapability>
-pub decdn_protocol::StreamRequestExt::voucher_interval_mb: core::option::Option<u64>
 impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::StreamResponse
 pub decdn_protocol::StreamResponse::body: decdn_protocol::client::StreamResponseBody
 pub decdn_protocol::StreamResponse::error: core::option::Option<decdn_protocol::client::StreamError>
 pub decdn_protocol::StreamResponse::slash_sig: alloc::vec::Vec<u8>
-pub decdn_protocol::StreamResponse::voucher_interval_mb: core::option::Option<u64>
 impl decdn_protocol::client::StreamResponse
 pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::StreamResponseBody
@@ -516,7 +506,6 @@ pub const decdn_protocol::ALPN_PROBE: &[u8]
 pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_SIZE: usize
-pub const decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::GOSSIP_VERSION: u8
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
@@ -524,12 +513,12 @@ pub const decdn_protocol::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::MAX_MESSAGE_SIZE: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
-pub const decdn_protocol::MAX_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::MB_BYTES: u64
 pub const decdn_protocol::SIGNATURE_LEN: usize
 pub const decdn_protocol::SLASH_SIG_LEN: usize
 pub const decdn_protocol::TOPIC_GLOBAL: &str
 pub const decdn_protocol::TOPIC_REGION_PREFIX: &str
+pub const decdn_protocol::VOUCHER_INTERVAL_BYTES: u64
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize
 pub trait decdn_protocol::TopLevelEnum
 pub const decdn_protocol::TopLevelEnum::VARIANT_COUNT: u32

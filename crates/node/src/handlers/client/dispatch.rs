@@ -4,9 +4,10 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, Hash, LaneKey, MB_BYTES, Mutex, OwnedSemaphorePermit,
-    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, VarInt, read_first_message, reset_stream, verify_binding,
+    FillOutcome, FirstMessage, Hash, LaneKey, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT,
+    RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError,
+    StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message, reset_stream,
+    verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -182,18 +183,6 @@ impl ClientHandler {
         // a rate, and pricing them would meter a clamp for a request that never
         // had a price.
         let rate_per_mb = self.clamped_rate();
-
-        // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
-        // Negotiation): accept the smaller of the proposal and our configured
-        // cadence, never below 1 MB. Resolved here rather than just before signing
-        // so the cache-miss deposit floor below prices against the SAME interval
-        // the serve gate and `deliver` use — otherwise a client proposing a smaller
-        // cadence would be judged against our larger one, making the floor
-        // strictly stricter than the gate it precedes.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
 
         // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
         // step 2: "reject any new StreamRequest for the hash immediately").
@@ -397,8 +386,8 @@ impl ClientHandler {
                 // from an offset) the billed size genuinely is unknowable pre-fill,
                 // so the window stands. Be clear about the residual that leaves:
                 // this guard prices at `paid = 0`, i.e. the ramp floor — one
-                // voucher interval (`DEFAULT_VOUCHER_INTERVAL_MB`, 4 MiB by
-                // default) — not the fully-ramped `credit_max` ceiling (64 MiB),
+                // voucher interval (`VOUCHER_INTERVAL_BYTES`, a fixed 4 MiB) —
+                // not the fully-ramped `credit_max` ceiling (64 MiB by default),
                 // since a cold request has confirmed no payment yet. A channel
                 // funded for the blob but not for a floor interval is refused
                 // cold and served warm. Closing that needs the origin size probe
@@ -427,7 +416,7 @@ impl ClientHandler {
                 if known_lane.is_some()
                     && let Some(status) = pool_status
                 {
-                    let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+                    let interval_bytes = VOUCHER_INTERVAL_BYTES;
                     let window = self.credit_window(interval_bytes, 0);
                     let reserved = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
@@ -519,7 +508,6 @@ impl ClientHandler {
                                             send,
                                             recv,
                                             &req,
-                                            &ext,
                                             hash,
                                             client_node_id,
                                             lk,
@@ -635,7 +623,6 @@ impl ClientHandler {
                             send,
                             recv,
                             &req,
-                            &ext,
                             hash,
                             client_node_id,
                             lk,
@@ -814,7 +801,7 @@ impl ClientHandler {
         // is `Some`, refuse `InsufficientDeposit` if the pool's remaining minus the
         // refundable floor `M` can no longer cover the reserved credit-window
         // floor; a `None` view fails open (see the gate's construction above).
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
             .min(self.credit_window(interval_bytes, 0));
         if let Some(status) = pool_status
@@ -849,7 +836,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
@@ -865,7 +852,6 @@ impl ClientHandler {
             Some(&lane),
             client_node_id,
             rate_per_mb,
-            interval_mb,
         )
         .await
     }
