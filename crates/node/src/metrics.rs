@@ -1200,6 +1200,14 @@ pub struct DecdnMetrics {
     /// more load-bearing, since a third refusal path routes through it.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
+    /// Delivery refused because the lane already has enough concurrent
+    /// same-lane streams in flight that admitting one more would exceed the
+    /// pool's refundable-floor headroom. Wire-indistinguishable from
+    /// `insufficient_deposit` (both signed as `NotFound`), so this counter is
+    /// the only place the distinction lives — a rising value signals a lane
+    /// experiencing sustained concurrency pressure. Visible name:
+    /// `decdn_serve_stream_rejected_lane_at_capacity_total`.
+    pub serve_stream_rejected_lane_at_capacity: Counter,
     /// New delivery refused because the channel has a signed cooperative-close
     /// waiver (ADR 003 §Cooperative close) — the node committed to settling at
     /// the watermark and serves no further bytes. Wire-indistinguishable from
@@ -2073,6 +2081,11 @@ recorders! {
     /// (#856): the requesting channel could not cover the worst-case blob cost,
     /// so no upstream pull was started.
     serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
+
+    /// Record a `serve_stream` delivery refused because the lane already has
+    /// too many concurrent same-lane streams in flight and the pool's
+    /// refundable floor cannot cover the reserved cost of another.
+    serve_stream_rejected_lane_at_capacity => serve_stream_rejected_lane_at_capacity.inc();
 
     /// Record a `serve_stream` delivery refused because the channel has a signed
     /// cooperative-close waiver (ADR 003 §Cooperative close).
@@ -3291,6 +3304,7 @@ mod tests {
             "decdn_serve_stream_rejected_unknown_lane_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
+            "decdn_serve_stream_rejected_lane_at_capacity_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
@@ -3320,6 +3334,7 @@ mod tests {
         metrics.serve_stream_rejected_unknown_lane();
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
+        metrics.serve_stream_rejected_lane_at_capacity();
         metrics.serve_stream_rejected_cooperative_close_signed();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_hash_denied();
