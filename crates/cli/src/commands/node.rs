@@ -332,10 +332,9 @@ pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> any
             serde_json::to_string_pretty(&resp).context("failed to encode reload response")?;
         println!("{pretty}");
     } else {
-        // Two stable, grep-friendly lines so an operator can do
-        // `decdn node reload | grep rate_per_mb=` without `--json`.
+        // Stable, grep-friendly line so an operator can do
+        // `decdn node reload | grep log_level=` without `--json`.
         // Same shape as `decdn node health`'s plain output.
-        println!("rate_per_mb={}", resp.rate_per_mb);
         println!("log_level={}", resp.log_level);
     }
 

@@ -8,7 +8,6 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -165,7 +164,7 @@ fn build_handler_with_probe_limiter(
     let domain = test_slash_domain();
     let handler = Arc::new(ProbeHandler::new(
         server_id,
-        Arc::new(AtomicU64::new(rate)),
+        rate,
         Arc::clone(metrics),
         limiter,
         probe_limiter,
@@ -201,7 +200,7 @@ fn build_handler_with_lane(
     let policy = StakeLanePolicy::new(staker_set, reserved_holds, max_holds);
     let handler = Arc::new(ProbeHandler::new(
         server_id,
-        Arc::new(AtomicU64::new(rate)),
+        rate,
         Arc::clone(metrics),
         limiter,
         permissive_probe_rate_limiter(metrics),

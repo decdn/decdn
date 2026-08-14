@@ -179,38 +179,29 @@ impl NodeFixture {
         &self.config_path
     }
 
-    /// Rewrite `payment.rate_per_mb` in the daemon's config and hot-reload it via
-    /// `admin_v1_reload`, returning the rate the daemon reports post-reload.
+    /// Rewrite `payment.rate_per_mb` in the daemon's config and restart the daemon
+    /// so the new rate takes effect, returning the newly-configured rate.
     ///
-    /// `payment.rate_per_mb` is in the reloadable set (`runtime::reload`), and the
-    /// probe and client handlers both read it through the atomic the reload swaps
-    /// — so this changes the quoted rate of a *running* daemon between two
-    /// requests, with no restart and no reconnect. That is precisely the
-    /// rate bait-and-switch a `SlashJudge` rate challenge exists to punish
-    /// (#1042), induced through the operator's real config surface rather than
-    /// simulated.
+    /// `payment.rate_per_mb` is restart-required — the probe and client handlers
+    /// read it as a value fixed at startup — so repricing a running node means
+    /// rewriting the config and bouncing the process ([`Self::restart`]). The
+    /// captured probe (before) and stream (after) form the bait-and-switch pair a
+    /// `SlashJudge` rate challenge punishes (#1042); the judge sees two
+    /// operator-signed messages within the 30s window, and a restart is fast
+    /// relative to it.
     ///
-    /// The returned value is the daemon's post-reload **configured** rate — a bare
-    /// load of the atomic the reload swapped (`runtime::reload`'s `ReloadSnapshot`),
-    /// read back over the admin RPC. It proves the hot-swap landed; it is *not* the
-    /// rate the node will sign. Clamping into the on-chain `[floor, ceiling]` band
-    /// happens later and per-response, off that same atomic
-    /// (`handlers::client::wire::clamped_rate`, and its probe twin). So a caller
-    /// that needs `stream > probe` must assert on the `rate_per_mb` inside the
-    /// captured `StreamResponse`/`ProbeResponse` — the signed bytes that become
-    /// evidence — never on this return value, which would happily report an
-    /// out-of-band rate the daemon then clamps away.
+    /// The returned value is the configured rate this call wrote. The rate the node
+    /// signs is clamped into the on-chain `[floor, ceiling]` band per response
+    /// (`handlers::client::wire::clamped_rate`, and its probe twin), so a caller
+    /// that needs `stream > probe` asserts on the `rate_per_mb` inside the captured
+    /// `StreamResponse`/`ProbeResponse` — the signed bytes that become evidence.
     pub async fn set_rate_per_mb(&self, rate: u64) -> anyhow::Result<u64> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
         let rewritten = rewrite_rate_per_mb(&config, rate)?;
         std::fs::write(&self.config_path, rewritten).context("write node config")?;
 
-        let resp = self
-            .admin_client()?
-            .reload()
-            .await
-            .context("admin_v1_reload")?;
-        Ok(resp.rate_per_mb)
+        self.restart().await.context("restart after reprice")?;
+        Ok(rate)
     }
 
     /// The daemon's data dir (`0o700` on Unix). Doubles as the `HOME` a journey hands

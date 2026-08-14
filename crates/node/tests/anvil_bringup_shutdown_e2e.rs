@@ -62,7 +62,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::admin::{AdminRpcClient, DrainRequest, HealthResponse};
-use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
+use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
     ResolvedGossip, ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment,
@@ -541,10 +541,6 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     // `runtime::run`. No CLI overrides, and a no-op log-level setter (SIGHUP
     // reload is out of scope for this smoke test).
     let reload_state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,

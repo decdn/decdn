@@ -28,11 +28,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use decdn_common::cli::common::LogLevel;
-use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
+use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
     ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
@@ -240,10 +239,6 @@ async fn persistent_sighup_observes_both_signals() {
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, levels) = recording_setter();
     let state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,
@@ -255,13 +250,9 @@ async fn persistent_sighup_observes_both_signals() {
         &initial,
         setter,
     ));
-    let shared_rate = state.rate_per_mb();
 
-    // First config: rate=11, log_level=info.
-    write_config(
-        &path,
-        "[payment]\nrate_per_mb = 11\n\n[observability]\nlog_level = \"info\"\n",
-    );
+    // First config: log_level=info.
+    write_config(&path, "[observability]\nlog_level = \"info\"\n");
 
     // Spawn the reload loop on a separate task so we can raise signals
     // from this one. Two reloads expected: one per SIGHUP.
@@ -288,13 +279,9 @@ async fn persistent_sighup_observes_both_signals() {
         1,
         "first SIGHUP did not produce a reload within 2s"
     );
-    assert_eq!(shared_rate.load(Ordering::Relaxed), 11);
 
-    // Second config: rate=22, log_level=debug.
-    write_config(
-        &path,
-        "[payment]\nrate_per_mb = 22\n\n[observability]\nlog_level = \"debug\"\n",
-    );
+    // Second config: log_level=debug.
+    write_config(&path, "[observability]\nlog_level = \"debug\"\n");
     raise(Signal::SIGHUP).expect("raise SIGHUP #2");
 
     // Bounded wait for the loop task to finish — it exits after the
@@ -311,7 +298,6 @@ async fn persistent_sighup_observes_both_signals() {
         vec![LogLevel::Info, LogLevel::Debug],
         "both SIGHUPs must produce ordered reloads"
     );
-    assert_eq!(shared_rate.load(Ordering::Relaxed), 22);
 }
 
 /// End-to-end SIGHUP→reload→`ConnectionLimiter::reload` chain (#235).
@@ -329,10 +315,6 @@ async fn sighup_applies_security_changes() {
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, _levels) = recording_setter();
     let state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,
@@ -384,11 +366,12 @@ async fn sighup_applies_security_changes() {
     assert_eq!(err, RejectReason::PerSource);
 }
 
-/// SIGHUP must apply changes to mutable fields (`payment.rate_per_mb`,
-/// `observability.log_level`) while restart-required sections
-/// (`network`, `blockchain`, `cache`, `identity`, `gossip`) surface an
-/// `info`-level "ignoring change to X (requires restart)" notice — never a
-/// silently-applied or silently-dropped value (#499).
+/// SIGHUP must apply changes to the mutable `observability.log_level` while
+/// restart-required sections (`payment`, `network`, `blockchain`, `cache`,
+/// `identity`, `gossip`) surface an `info`-level "ignoring change to X
+/// (requires restart)" notice — never a silently-applied or silently-dropped
+/// value (#499). `payment.rate_per_mb` is restart-required, so a `[payment]`
+/// change earns the notice like any other non-reloadable section.
 ///
 /// The unit tests in `runtime::reload::tests` exercise the section notice
 /// emitter directly and the other tests in this file only ever feed
@@ -400,12 +383,13 @@ async fn sighup_applies_security_changes() {
 /// The notice is unconditional (`warn_restart_required_sections`): it fires
 /// once per restart-required section *present* in the reloaded file,
 /// whether or not the section changed. The two reloads assert that:
-///   - **Reload #1** carries `[network]` → one `network` notice; `[blockchain]`
-///     / `[cache]` (absent from the file) stay silent.
-///   - **Reload #2** carries `[network]` again plus new `[blockchain]` /
-///     `[cache]` / `[identity]` / `[gossip]` → each present section emits one
-///     notice (no cross-reload suppression), all alongside mutable
-///     `payment` / `observability` changes that must still apply.
+///   - **Reload #1** carries `[network]` and `[payment]` → one notice each;
+///     `[blockchain]` / `[cache]` (absent from the file) stay silent.
+///   - **Reload #2** carries `[network]` and `[payment]` again plus new
+///     `[blockchain]` / `[cache]` / `[identity]` / `[gossip]` → each present
+///     restart-required section emits one notice (no cross-reload suppression),
+///     all alongside the mutable `observability.log_level` change that must
+///     still apply.
 ///
 /// Runs on a single-thread runtime so the buffer-capturing subscriber
 /// installed via `set_default` (thread-local) observes the reload, which
@@ -443,10 +427,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     let initial = seed_resolved(10, LogLevel::Info);
     let (setter, levels) = recording_setter();
     let state = Arc::new(RuntimeReloadState::new(
-        PaymentArgs {
-            rate_per_mb: None,
-            delivery_floor: None,
-        },
         ObservabilityArgs {
             log_level: None,
             log_format: None,
@@ -458,7 +438,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         &initial,
         setter,
     ));
-    let shared_rate = state.rate_per_mb();
 
     let mut hup = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -478,10 +457,10 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
             .count()
     };
 
-    // --- Reload #1: mutable fields + a restart-required `[network]`
-    //     section. Mutable changes apply; `[network]` is present so it
-    //     emits exactly one notice; blockchain/cache (not in the file)
-    //     stay silent.
+    // --- Reload #1: a mutable `log_level` + restart-required `[payment]`
+    //     and `[network]` sections. The log_level change applies; `[payment]`
+    //     and `[network]` are present so each emits exactly one notice;
+    //     blockchain/cache (not in the file) stay silent.
     write_config(
         &path,
         "[payment]\n\
@@ -496,15 +475,21 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     state.reload(&path).await.expect("first reload");
 
     assert_eq!(
-        shared_rate.load(Ordering::Relaxed),
-        11,
-        "mutable rate_per_mb must take effect on the first SIGHUP"
+        *levels.lock().unwrap().last().unwrap(),
+        LogLevel::Info,
+        "mutable log_level must take effect on the first SIGHUP"
     );
     let after_first = captured_logs(&log_buf);
     assert_eq!(
         notice_count(&after_first, "network"),
         1,
         "a present restart-required [network] section must emit exactly \
+         one (requires restart) notice, got:\n{after_first}"
+    );
+    assert_eq!(
+        notice_count(&after_first, "payment"),
+        1,
+        "a present restart-required [payment] section must emit exactly \
          one (requires restart) notice, got:\n{after_first}"
     );
     assert_eq!(
@@ -518,17 +503,12 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         "cache absent from the file must not warn, got:\n{after_first}"
     );
     // `[observability]` is present but sets only the hot-reloadable
-    // `log_level`, and `[payment]` is fully reloadable — neither warns
-    // (field-gated notice, not section-presence).
+    // `log_level`, so it does not warn (field-gated notice, not
+    // section-presence).
     assert_eq!(
         notice_count(&after_first, "observability"),
         0,
         "observability with only log_level set (reloadable) must not warn, got:\n{after_first}"
-    );
-    assert_eq!(
-        notice_count(&after_first, "payment"),
-        0,
-        "fully-reloadable [payment] must not warn, got:\n{after_first}"
     );
 
     // Isolate reload #2's notices from reload #1's so the counts below
@@ -537,15 +517,14 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     // fields present in both files).
     log_buf.lock().unwrap().clear();
 
-    // --- Reload #2: mutable fields change (payment/log_level, which apply)
-    //     bundled with restart-required ones. network/blockchain/identity/
+    // --- Reload #2: the mutable `log_level` change applies, bundled with
+    //     restart-required ones. payment/network/blockchain/identity/
     //     gossip/dht/probe/receipts warn on presence; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
     //     pinned_hashes-only edit would not); `[observability]` does NOT warn
-    //     because it sets only the reloadable `log_level`; `[payment]` sets
-    //     only the reloadable `rate_per_mb` and `[security]` is fully
-    //     reloadable, so neither warns. Empty `[dht]`/`[probe]`/`[receipts]`/
-    //     `[security]` tables are "present" so they exercise
+    //     because it sets only the reloadable `log_level`; `[security]` is
+    //     fully reloadable, so it stays silent. Empty `[dht]`/`[probe]`/
+    //     `[receipts]`/`[security]` tables are "present" so they exercise
     //     those emitter branches.
     write_config(
         &path,
@@ -572,14 +551,8 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     hup.recv().await.expect("second SIGHUP");
     state.reload(&path).await.expect("second reload");
 
-    // Mutable fields took effect even though the file also carried
+    // The mutable log_level took effect even though the file also carried
     // restart-required changes.
-    assert_eq!(
-        shared_rate.load(Ordering::Relaxed),
-        22,
-        "mutable rate_per_mb must update even when the file also carries \
-         restart-required changes"
-    );
     assert_eq!(
         levels.lock().unwrap().clone(),
         vec![LogLevel::Info, LogLevel::Debug],
@@ -589,9 +562,10 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     let logs = captured_logs(&log_buf);
 
     // Every section carrying a non-reloadable field emits exactly one
-    // notice — including `[network]`, present again (the notice fires on
-    // field presence, not on a change vs the previous reload).
+    // notice — including `[payment]` and `[network]`, present again (the
+    // notice fires on field presence, not on a change vs the previous reload).
     for section in [
+        "payment",
         "network",
         "blockchain",
         "cache",
@@ -609,11 +583,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         );
     }
 
-    // Fully-reloadable sections, and partially-reloadable ones that set
-    // only their reloadable field, stay silent: `[payment]` and
-    // `[security]` are fully reloadable, and `[observability]` set only
-    // `log_level`.
-    for section in ["payment", "security", "observability"] {
+    // Fully-reloadable `[security]`, and `[observability]` which set only the
+    // reloadable `log_level`, stay silent.
+    for section in ["security", "observability"] {
         assert_eq!(
             notice_count(&logs, section),
             0,

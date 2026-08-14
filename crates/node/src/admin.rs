@@ -589,7 +589,6 @@ impl AdminRpcServer for AdminRpcImpl {
             })?;
         let snap = hook.reload_state.current();
         Ok(ReloadResponse {
-            rate_per_mb: snap.rate_per_mb,
             // After a successful reload `current_log_level` is `Some`;
             // the `unwrap_or` branch is the (unreachable in practice)
             // poisoned-mutex case where `current()` returned `None`.
@@ -1586,9 +1585,9 @@ mod tests {
 
     /// Happy path: a hook pointing at a valid config file applies the
     /// reload via the same `RuntimeReloadState::reload` SIGHUP uses, and
-    /// the response carries the post-reload `rate_per_mb` and
-    /// `log_level`. Asserts both wire-format fields so a regression that
-    /// dropped one (or stringified the level wrong) fails the unit test.
+    /// the response carries the post-reload `log_level`. Asserts the
+    /// wire-format field so a regression that dropped it (or stringified the
+    /// level wrong) fails the unit test.
     #[tokio::test]
     async fn admin_reload_applies_and_returns_post_reload_values() {
         use crate::runtime::RuntimeReloadState;
@@ -1596,15 +1595,10 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("node.toml");
-        std::fs::write(
-            &path,
-            "[payment]\nrate_per_mb = 99\n\n[observability]\nlog_level = \"debug\"\n",
-        )
-        .expect("write config");
+        std::fs::write(&path, "[observability]\nlog_level = \"debug\"\n").expect("write config");
 
         let setter: crate::runtime::LogLevelSetter = Box::new(|_| Ok(()));
         let reload_state = Arc::new(RuntimeReloadState::for_test_with_setter(
-            10,
             LogLevel::Info,
             setter,
         ));
@@ -1626,7 +1620,6 @@ mod tests {
         let rpc = AdminRpcImpl::new(state);
 
         let resp = rpc.reload().await.expect("reload ok");
-        assert_eq!(resp.rate_per_mb, 99);
         assert_eq!(resp.log_level, "debug");
     }
 
@@ -1917,7 +1910,6 @@ mod tests {
 
         let setter: crate::runtime::LogLevelSetter = Box::new(|_| Ok(()));
         let reload_state = Arc::new(RuntimeReloadState::for_test_with_setter(
-            42,
             LogLevel::Info,
             setter,
         ));
@@ -1940,14 +1932,10 @@ mod tests {
 
         let err = rpc.reload().await.expect_err("expected error");
         assert_eq!(err.code(), -32_004);
-        // Previous rate retained — RPC error path didn't accidentally
-        // commit anything to the live state.
-        assert_eq!(
-            reload_state
-                .rate_per_mb()
-                .load(std::sync::atomic::Ordering::Relaxed),
-            42,
-        );
+        // The error path returns `RELOAD_ERROR_CODE` rather than an
+        // accidental `Ok(...)` — the previous-values-retained contract is
+        // exercised by the reload unit tests.
+        let _ = reload_state;
     }
 
     /// Build a `DhtStatusHandles` seeded with two peers in distinct

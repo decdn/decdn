@@ -353,7 +353,9 @@ pub struct ClientHandlerDeps {
     /// longer cover the next credit window. Threaded from config by E4/F; here
     /// it is a plain field the floor-M guard reads.
     pub pool_min_remaining_deposit: U256,
-    pub rate_per_mb: Arc<AtomicU64>,
+    /// The served per-MB price, fixed at startup. Reprice by restarting the
+    /// daemon (see `runtime::reload::warn_restart_required_sections`).
+    pub rate_per_mb: u64,
     /// Live per-MB delivery-rate bounds (#1172). Seeded from on-chain
     /// `getRateBounds()` and updated by the `RateBoundsUpdated` watcher,
     /// replacing the by-value config stand-in.
@@ -424,7 +426,7 @@ impl ClientHandlerDeps {
         bind_domain: Eip712Domain,
         channel_state_store: Arc<dyn PoolStateStore>,
         receipt_sink: Arc<dyn ReceiptSink>,
-        rate_per_mb: Arc<AtomicU64>,
+        rate_per_mb: u64,
         rate_bounds: crate::rate_bounds::RateBounds,
         voucher_interval_mb: u64,
         max_blob_size_bytes: u64,
@@ -598,7 +600,9 @@ pub struct ClientHandler {
     /// before ever reaching the serve refusal. The window-paced serve path
     /// (`window.rs`) is a fourth, independent ladder.
     pub(crate) content_deny: Arc<crate::content_deny::ContentDenylist>,
-    rate_per_mb: Arc<AtomicU64>,
+    /// Served per-MB price, fixed at startup (see
+    /// [`ClientHandlerDeps::rate_per_mb`]).
+    rate_per_mb: u64,
     rate_bounds: crate::rate_bounds::RateBounds,
     voucher_interval_mb: u64,
     max_blob_size_bytes: u64,
@@ -1324,7 +1328,7 @@ pub(super) async fn handler_over_store(
         Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
             crate::receipt_log::NoopReceiptLog,
         ))) as Arc<dyn ReceiptSink>,
-        Arc::new(AtomicU64::new(1)),
+        1,
         crate::rate_bounds::RateBounds::new(0),
         1,
         0,
@@ -1380,7 +1384,7 @@ mod tests {
             Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
-            Arc::new(AtomicU64::new(1)),
+            1,
             crate::rate_bounds::RateBounds::new(0),
             1,
             0,
@@ -1646,7 +1650,7 @@ mod tests {
         let (handler, _dir) = handler_for_tests(&metrics).await;
 
         // Quote-time band: floor == F, a generous ceiling. The advertised
-        // `rate_per_mb` atomic is seeded to 1 in `handler_for_tests`, so
+        // `rate_per_mb` is seeded to 1 in `handler_for_tests`, so
         // set the band's floor to F and clamp will raise the quote to F.
         let f: u64 = 500;
         handler.rate_bounds.store(f);
@@ -1770,7 +1774,7 @@ mod tests {
             Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
-            Arc::new(AtomicU64::new(1)),
+            1,
             crate::rate_bounds::RateBounds::new(0),
             1,
             0,

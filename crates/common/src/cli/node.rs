@@ -101,9 +101,9 @@ pub enum NodeCommand {
     /// fields (issue #373). Equivalent to `kill -HUP <pid>` but goes
     /// through the loopback admin surface, so operator tooling that
     /// already speaks JSON-RPC doesn't need to also know which PID to
-    /// signal. Currently `payment.rate_per_mb` and
-    /// `observability.log_level` are reloadable; other fields are logged
-    /// as ignored. Both paths share the same internal mutex, so a
+    /// signal. Currently `observability.log_level`, `cache.pinned_hashes`,
+    /// `security.*`, and the `[content]` denylist are reloadable; other
+    /// fields are logged as ignored. Both paths share the same internal mutex, so a
     /// concurrent SIGHUP and `decdn node reload` queue rather than
     /// race. Requires the node to have been started with `decdn-node run
     /// --config <path>` — without a path on disk there's nothing to
@@ -654,8 +654,8 @@ pub enum RotateKeyTarget {
 /// reads chain state to pick its next phase rather than trusting a flag.
 ///
 /// Neither path restarts the daemon. The node key is not hot-reloadable
-/// (`admin_v1_reload` and SIGHUP cover `payment.rate_per_mb`,
-/// `observability.log_level`, `cache.pinned_hashes`, and `security.*` — not the
+/// (`admin_v1_reload` and SIGHUP cover `observability.log_level`,
+/// `cache.pinned_hashes`, and `security.*` — not the
 /// iroh endpoint), so the runbook's drain → stop → rotate → restart sequence
 /// stays the operator's to drive, with `decdn node drain` for the first step.
 #[derive(Args, Debug)]

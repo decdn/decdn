@@ -2,7 +2,6 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -117,15 +116,11 @@ impl StakeLanePolicy {
 /// Serves `cdn/probe/v1`: reads a framed [`ProbeMessage::Request`], writes a
 /// framed [`ProbeMessage::Response`].
 ///
-/// `rate_per_mb` is held behind a shared `AtomicU64` so config reload can
-/// swap the value without rebuilding the handler or touching the iroh
-/// `Router`. Reads use `Ordering::Relaxed`: the rate is a single-word
-/// counter with no ordering relationship to other state, and any in-flight
-/// probe simply observes whichever generation of the rate the load happens
-/// to see.
+/// `rate_per_mb` is the served price, fixed at startup. Reprice by restarting
+/// the daemon (see `runtime::reload::warn_restart_required_sections`).
 pub struct ProbeHandler {
     node_id: PublicKey,
-    rate_per_mb: Arc<AtomicU64>,
+    rate_per_mb: u64,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     /// ADR 005 §Probe rate limiting three-layer token-bucket limiter
@@ -172,7 +167,7 @@ impl ProbeHandler {
     #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
     pub fn new(
         node_id: PublicKey,
-        rate_per_mb: Arc<AtomicU64>,
+        rate_per_mb: u64,
         metrics: Arc<Metrics>,
         limiter: Arc<ConnectionLimiter>,
         probe_rate_limiter: Arc<ProbeRateLimiter>,
@@ -497,7 +492,7 @@ impl ProbeHandler {
         // Raise the quoted rate to the governance delivery floor before signing
         // (ADR 005 §Rate bounds validation): clamp-and-warn keeps the node
         // operational across governance transitions.
-        let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
+        let raw_rate = self.rate_per_mb;
         let (rate_per_mb, floor) = self.rate_bounds.raise_to_floor(raw_rate);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();
