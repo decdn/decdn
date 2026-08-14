@@ -695,9 +695,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
 
     // FeeRouter routing: the redeem routed its byte delta into the operator's
-    // per-epoch counter. With two vouchers produced for this 1.5 MiB stream (a
-    // 1 MiB interval voucher, then the closing one), which one the single redeem
-    // lands is timing-dependent, so assert it incremented, not an exact value.
+    // per-epoch counter. Which voucher the single redeem lands on is
+    // timing-dependent, so assert it incremented, not an exact value.
     let epoch = current_epoch(&node_provider).await?;
     let routed = fee_view.bytesPerEpoch(node_addr, epoch).call().await?;
     anyhow::ensure!(

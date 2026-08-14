@@ -375,8 +375,8 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     Ok(())
 }
 
-/// One voucher interval at the harness's hardcoded `voucher_interval_mb = 1`.
-const HARNESS_INTERVAL_BYTES: u64 = 1024 * 1024;
+/// One voucher accounting interval — [`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`].
+const HARNESS_INTERVAL_BYTES: u64 = decdn_protocol::client::VOUCHER_INTERVAL_BYTES;
 
 /// Spin up a serving `ClientHandler` with an explicit downstream credit window
 /// (#1477). `credit_window` of `None` leaves the handler at its stop-and-wait
@@ -507,7 +507,7 @@ async fn assert_parked_awaiting_voucher(recv: &mut RecvStream) -> anyhow::Result
 /// server parks awaiting a voucher.
 #[tokio::test(flavor = "multi_thread")]
 async fn serve_streams_a_full_credit_window_ahead_of_payment() -> anyhow::Result<()> {
-    // The window is 8 MiB — eight of the harness's 1 MiB intervals. Reading a full
+    // The window is 8 MiB — two of the fixed 4 MiB voucher intervals. Reading a full
     // window ahead of ANY voucher is the pipelining claim: the pre-#1477 loop
     // stalled after one interval, so it could never stream this far ahead of zero
     // payment. The blob is larger than the window, so the WINDOW — not the blob —
@@ -708,7 +708,7 @@ async fn spawn_batching_server(
 }
 
 /// Sign the `count` cumulative vouchers that pay for the first `count` completed
-/// 1 MiB intervals of a stream (`bytes_delivered = k * interval`,
+/// voucher intervals of a stream (`bytes_delivered = k * interval`,
 /// `amount = min_payment(...)`, strictly increasing in `amount`), for a client
 /// that bursts them at the server.
 fn burst_vouchers(
@@ -734,12 +734,12 @@ fn burst_vouchers(
 /// #1483: with a credit window several intervals wide, the vouchers that pay for
 /// a window's worth of already-delivered bytes are committed with a SINGLE
 /// fsynced `record` instead of one per voucher — the throughput win. The window
-/// equals the blob (eight 1 MiB intervals); the client reads the whole window,
-/// bursts all eight cumulative vouchers, and the server group-commits them once.
+/// equals the blob; the client reads the whole window, bursts every cumulative
+/// voucher, and the server group-commits them once.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()> {
     const WINDOW: u64 = 8 * 1024 * 1024;
-    let intervals = WINDOW / HARNESS_INTERVAL_BYTES; // 8
+    let intervals = WINDOW / HARNESS_INTERVAL_BYTES;
     // Blob larger than the window so the WINDOW (not the blob) bounds the first
     // batch; the wire delivered up to the window is exactly `intervals` intervals.
     let payload = vec![0x77u8; 16 * 1024 * 1024];
@@ -764,7 +764,7 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
     });
     let store: Arc<dyn PoolStateStore> = Arc::clone(&counting) as Arc<dyn PoolStateStore>;
 
-    // A generous commit interval so the whole eight-voucher burst is gathered into
+    // A generous commit interval so the whole voucher burst is gathered into
     // ONE commit rather than flushed early on a straggler timeout.
     let (target, _server_eth, server_ep, server_task) =
         spawn_batching_server(cache, store, WINDOW, 1_000).await?;
@@ -782,7 +782,7 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
     // exactly `intervals` completed intervals and parks awaiting their vouchers.
     read_exact_chunks(&mut recv, WINDOW).await?;
 
-    // Burst all eight cumulative vouchers — the gather sees the whole batch
+    // Burst all `intervals` cumulative vouchers — the gather sees the whole batch
     // buffered and commits it once. Acceptance is implicit (the node sends no
     // ack), so the batch's effect is observed through the store, not a reply.
     for voucher in burst_vouchers(&signer, intervals)? {
@@ -794,8 +794,8 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
     }
 
     // Acceptance is implicit (no ack), so the commit lands asynchronously. Wait
-    // for the durable watermark to reach the batch's highest voucher — once all
-    // eight are persisted, the fsync count is final and the group-commit invariant
+    // for the durable watermark to reach the batch's highest voucher — once every
+    // voucher is persisted, the fsync count is final and the group-commit invariant
     // is checkable.
     let deadline = Instant::now() + Duration::from_secs(10);
     let persisted = loop {
@@ -812,7 +812,7 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // The eight vouchers committed with ONE fsync — the group-commit invariant.
+    // The whole batch committed with ONE fsync — the group-commit invariant.
     anyhow::ensure!(
         counting.record_count() == 1,
         "expected exactly ONE record for {intervals} vouchers, got {}",
@@ -834,13 +834,13 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
 /// #1483 crash/rollback guard: when the batched commit's fsync fails, the WHOLE
 /// batch is rejected with `RetryLater` and NO voucher is acknowledged — nothing
 /// is ever acked without a durable record (ADR 003 §Off-chain voucher state
-/// persistence). The client bursts eight vouchers; the failing store rejects the
+/// persistence). The client bursts a batch of vouchers; the failing store rejects the
 /// commit; the client sees one `RetryLater` and zero acks, and the watermark
 /// never advances.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_commit_failure_rejects_whole_batch_with_retry_later() -> anyhow::Result<()> {
     const WINDOW: u64 = 8 * 1024 * 1024;
-    let intervals = WINDOW / HARNESS_INTERVAL_BYTES; // 8
+    let intervals = WINDOW / HARNESS_INTERVAL_BYTES;
     let payload = vec![0x33u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -1368,9 +1368,8 @@ fn ensure_graceful_idle_close(err: &ConnectionError) -> anyhow::Result<()> {
 /// phase alone (e.g. by moving the reaper inside `serve_stream`).
 #[tokio::test(flavor = "multi_thread")]
 async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
-    // 64 KiB: far under the fixture's 1 MiB voucher interval (hardcoded in
-    // `build_handler_full_with_sink`), so the delivery has exactly one (closing)
-    // voucher and the park point is unambiguous.
+    // 64 KiB: far under the fixed voucher accounting interval, so the delivery
+    // has exactly one (closing) voucher and the park point is unambiguous.
     let payload = vec![0x3Du8; 64 * 1024];
     let idle = Duration::from_millis(150);
     let fx = idle_fixture(&payload, idle).await?;
@@ -1758,21 +1757,19 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// still hold the last acked watermark so the caller can persist what it paid —
 /// it must NOT reset to `None`.
 ///
-/// Induced deterministically by deposit exhaustion (no mock server): a 1.5 MiB
-/// blob needs two vouchers — cumulative amount 10 then 16 at `RATE_PER_MB` — but
-/// the channel deposit is 12. (Billing is bao WIRE bytes, ADR 038: the 1.5 MiB
-/// payload is `1_578_944` wire bytes, so voucher 1 covers the `1_048_576`-byte
-/// interval for 10 and voucher 2 the `530_368`-byte remainder for a cumulative
-/// 16.) The node acks voucher 1 (amount 10 <= 12) and
-/// rejects voucher 2 (amount 16 > 12) as over-deposit, so the fetch errors after
-/// one acked voucher. `progress.advanced()` must then report voucher 1 (nonce 1),
-/// proving the copy-back in `stream_fetch_tracked` runs on the error path.
+/// Induced deterministically by deposit exhaustion (no mock server): a blob one
+/// voucher interval plus a remainder needs two vouchers — a cumulative amount
+/// for the interval, then a larger cumulative amount for the close — but the
+/// channel deposit only clears the first. The node acks voucher 1 and rejects
+/// voucher 2 as over-deposit, so the fetch errors after one acked voucher.
+/// `progress.advanced()` must then report voucher 1 (nonce 1), proving the
+/// copy-back in `stream_fetch_tracked` runs on the error path.
 ///
-/// The deposit of 12 is load-bearing in both directions: it must clear the #1516
-/// pre-serve gate's ceiling (one credit window at `RATE_PER_MB` = 10) so the
-/// first attempt is actually served, and fall short of voucher 2 so the
-/// mid-stream ceiling is what stops it. An acked nonce of 1 is only reachable
-/// through that exact sequence, so it pins the mid-stream backstop as surely as
+/// The deposit is load-bearing in both directions: it must clear the #1516
+/// pre-serve gate's ceiling (one credit window at `RATE_PER_MB`) so the first
+/// attempt is actually served, and fall short of voucher 2 so the mid-stream
+/// ceiling is what stops it. An acked nonce of 1 is only reachable through
+/// that exact sequence, so it pins the mid-stream backstop as surely as
 /// asserting on the reject reason did.
 ///
 /// The *terminal* error is the voucher rejection itself, and no resume retry is
@@ -1787,13 +1784,16 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// attempt to serve.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
-    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → two vouchers (amount 10 then 15).
+    // 6 MiB — crosses one 4 MiB voucher interval, leaving a closing remainder,
+    // so the transfer needs exactly two vouchers.
+    let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let client_signer = Arc::new(PrivateKeySigner::random());
-    // Between voucher 1's cumulative amount (10) and voucher 2's (15): voucher 1
-    // is acked, voucher 2 is rejected as over-deposit.
-    let deposit = U256::from(12u64);
+    // Exactly voucher 1's cumulative amount: it clears the #1516 pre-serve
+    // ceiling (also one interval, with no configured credit window) and covers
+    // voucher 1, but falls short of voucher 2's larger cumulative amount.
+    let deposit = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&LaneState::hydrate(
         pool_id(),
@@ -2118,13 +2118,14 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
 
 /// Issue #248: every accepted voucher appends one download receipt with the
 /// served blob's hash, the per-interval byte count, the paying client's iroh
-/// node id, and the voucher nonce. A 1.5 MiB blob crosses one interval boundary
-/// plus a closing voucher, so exactly two receipts are recorded (nonces 1, 2),
-/// their `size`s sum to the payload length, and every receipt names the same
-/// hash and client node id.
+/// node id, and the voucher nonce. A blob just over one voucher accounting
+/// interval crosses one interval boundary plus a closing voucher, so exactly
+/// two receipts are recorded (nonces 1, 2), their `size`s sum to the payload
+/// length, and every receipt names the same hash and client node id.
 #[tokio::test(flavor = "multi_thread")]
 async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
-    let payload = vec![0x5Au8; 1_572_864]; // 1.5 MiB — two vouchers at 1 MiB interval.
+    // 6 MiB — crosses one 4 MiB voucher interval, leaving a closing remainder.
+    let payload = vec![0x5Au8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let client_signer = Arc::new(PrivateKeySigner::random());
@@ -2867,16 +2868,19 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 
 /// #1516 pre-serve deposit gate: a known, owned channel whose deposit cannot
 /// cover the first credit window is refused *before* the node signs `ok: true`.
-/// Previously the node signed and streamed a whole window (one 1 MiB interval at
-/// the harness cadence) before `stage_voucher`'s `AmountExceedsDeposit` could
+/// Previously the node signed and streamed a whole window (one voucher
+/// accounting interval) before `stage_voucher`'s `AmountExceedsDeposit` could
 /// fire at the first voucher boundary — a free interval per request, on every
-/// request. The 1.5 MiB blob exceeds the window, so the gate is what stops the
-/// stream, not the blob running out. Deposit 9 sits one base unit under the
-/// window's cost of 10 at `RATE_PER_MB`.
+/// request. The blob exceeds the window, so the gate is what stops the
+/// stream, not the blob running out. The deposit sits one base unit under the
+/// window's cost at `RATE_PER_MB`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
-    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — larger than one credit window
+    // 6 MiB — larger than one credit window (the fixed 4 MiB voucher interval).
+    let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let deposit = window_cost.saturating_sub(U256::from(1u64));
 
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -2884,16 +2888,16 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
         pool_id(),
         signer.address(),
         operator_addr(),
-        U256::from(9u64),
+        deposit,
         0,
         U256::ZERO,
         U256::ZERO,
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Pool remaining 9 sits one base unit under the window's cost of 10.
+    // Pool remaining sits one base unit under the window's cost.
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, U256::from(9u64), None).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, deposit, None).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -2955,17 +2959,17 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
 
 /// The `min(credit window, request span)` term of the #1516 gate. The gate
 /// reserves what the node can actually front before the first voucher, which for
-/// a sub-interval blob is the blob — not a full 1 MiB interval it will never
-/// stream. Reserving a whole interval here would price this request at 10 and
-/// refuse a deposit of 5 that comfortably covers the ~3 the transfer really
-/// costs, turning a correctness fix into a regression for small blobs.
+/// a sub-interval blob is the blob — not a whole voucher interval it will never
+/// stream. Reserving a whole interval here would price this request far above
+/// the ~3 the transfer really costs, and refuse a deposit that comfortably
+/// covers it, turning a correctness fix into a regression for small blobs.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Result<()> {
-    let payload = vec![0x2Cu8; 262_144]; // 256 KiB — a quarter of one voucher interval
+    let payload = vec![0x2Cu8; 262_144]; // 256 KiB — a fraction of one voucher interval
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let signer = Arc::new(PrivateKeySigner::random());
-    let deposit = U256::from(5u64); // < one interval's cost (10), > this blob's (~3)
+    let deposit = U256::from(5u64); // < one interval's cost, > this blob's (~3)
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&LaneState::hydrate(
         pool_id(),
@@ -3011,16 +3015,18 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
 }
 
 /// The gate scales with the configured credit window (#1477), not with one
-/// voucher interval. `deliver` streams while `delivered - paid < window`, so with
-/// a 4 MiB window the node fronts 4 MiB before it collects anything — and a
-/// deposit of 10 covers only the first 1 MiB interval of that. An interval-sized
-/// gate would wave this through (10 >= 10) and hand over 4 MiB, which is exactly
-/// how enabling a credit window would silently re-open the hole #1516 closes.
+/// voucher accounting interval. `deliver` streams while `delivered - paid <
+/// window`, so with an 8 MiB window (two voucher intervals) the node fronts
+/// 8 MiB before it collects anything — and a deposit covering only one
+/// interval's cost is not enough. An interval-sized gate would wave this
+/// through and hand over 8 MiB, which is exactly how enabling a credit
+/// window would silently re-open the hole #1516 closes.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Result<()> {
-    const WINDOW: u64 = 4 * 1024 * 1024;
-    let payload = vec![0x77u8; 8 * 1024 * 1024]; // larger than the window, so the window binds
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let payload = vec![0x77u8; 12 * 1024 * 1024]; // larger than the window, so the window binds
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let interval_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
 
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -3028,17 +3034,17 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
         pool_id(),
         signer.address(),
         operator_addr(),
-        U256::from(10u64),
+        interval_cost,
         0,
         U256::ZERO,
         U256::ZERO,
         None,
     ))?;
 
-    // Pool remaining 10 covers only the first 1 MiB interval of the 4 MiB window.
+    // Pool remaining covers only the first voucher interval of the 8 MiB window.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, U256::from(10u64), Some(WINDOW)).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, interval_cost, Some(WINDOW)).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3083,7 +3089,7 @@ async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Re
 /// (#751), so the spent-down watermark is built via `hydrate`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> {
-    let payload = vec![0x5Du8; 1_572_864]; // 1.5 MiB — one credit window costs 10
+    let payload = vec![0x5Du8; 1_572_864]; // 1.5 MiB — well under one credit window
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let signer = Arc::new(PrivateKeySigner::random());
@@ -3100,7 +3106,7 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Gross deposit 100, but the pool has only 5 remaining after prior redeems —
-    // the headroom the gate reserves against, ten times under the window cost.
+    // the headroom the gate reserves against, well under the window cost.
     let (target, _server_eth, server_ep, server_task, metrics) =
         spawn_handler_server_with_pool(cache, store_dyn, U256::from(5u64), None).await?;
 
@@ -3219,8 +3225,10 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
 /// computed cost is exactly this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {
-    let payload = vec![0xB0u8; 1_572_864]; // 1.5 MiB → one 1 MiB window costs 10
+    // One voucher accounting interval's worth, well under the window.
+    let payload = vec![0xB0u8; 1_572_864];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
 
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -3228,16 +3236,16 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         pool_id(),
         signer.address(),
         operator_addr(),
-        U256::from(10u64),
+        window_cost,
         0,
         U256::ZERO,
         U256::ZERO,
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Pool remaining exactly equals the window's cost of 10 — the `>=` boundary.
+    // Pool remaining exactly equals the window's cost — the `>=` boundary.
     let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, U256::from(10u64), None).await?;
+        spawn_handler_server_with_pool(cache, store_dyn, window_cost, None).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -3269,51 +3277,6 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         ),
         "an exactly-funded channel must not trip the deposit gate"
     );
-
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
-    Ok(())
-}
-
-/// Wire-bounds gate on the client's proposed voucher cadence (ADR 003 §Voucher
-/// Interval Negotiation): `voucher_interval_mb` outside `1..=1024` is a protocol
-/// error, so the node resets the stream instead of clamping the value into range
-/// and serving. Both endpoints of the illegal set are covered — `0` (which a
-/// clamp would silently lift to 1 MB) and `MAX + 1` (which a clamp would silently
-/// drop to the node's configured cadence), the two cases indistinguishable from
-/// an honest proposal once normalized. Driven raw because `stream_fetch` always
-/// proposes `None`.
-#[tokio::test(flavor = "multi_thread")]
-async fn client_out_of_range_voucher_interval_is_refused() -> anyhow::Result<()> {
-    let payload = b"an out-of-range cadence never reaches the serve path".to_vec();
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, _owner, _deposit) = seeded_store()?;
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: 0x00ca_de00,
-    };
-
-    for interval in [0, decdn_protocol::MAX_VOUCHER_INTERVAL_MB + 1] {
-        let ext = StreamRequestExt {
-            voucher_interval_mb: Some(interval),
-            ..Default::default()
-        };
-        let res = raw_request(&client_ep, target.clone(), &req, Some(&ext)).await;
-        anyhow::ensure!(
-            res.is_err(),
-            "voucher_interval_mb {interval} is out of range and must reset the stream, \
-             not be clamped into range; got {res:?}"
-        );
-    }
 
     client_ep.close().await;
     server_ep.close().await;
@@ -4247,7 +4210,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
 /// after the flip.
 #[tokio::test(flavor = "multi_thread")]
 async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
-    // 16 intervals at the harness's 1 MB `voucher_interval_mb`.
+    // 4 voucher accounting intervals at the fixed `VOUCHER_INTERVAL_BYTES`.
     let payload = vec![0x5Au8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
@@ -4809,8 +4772,8 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
 /// run to completion and this test fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> anyhow::Result<()> {
-    // 16 intervals at the harness's 1 MB `voucher_interval_mb`, so plenty of
-    // boundaries remain after the deny-set flip.
+    // 4 voucher accounting intervals at the fixed `VOUCHER_INTERVAL_BYTES`, so
+    // plenty of boundaries remain after the deny-set flip.
     let payload = vec![0x6Bu8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, funder, delegate) = delegate_signer_store()?;
@@ -5476,22 +5439,24 @@ async fn spawn_counting_pull_server(
 /// would bump `cache_miss` instead, and `hits == 0` alone cannot tell them apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let deposit = window_cost.saturating_sub(U256::from(1u64));
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&LaneState::hydrate(
         pool_id(),
         signer.address(),
         operator_addr(),
-        U256::from(9u64),
+        deposit,
         0,
         U256::ZERO,
         U256::ZERO,
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Pool remaining 9 sits one base unit under the window's cost of 10.
+    // Pool remaining sits one base unit under the window's cost.
     let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
-        spawn_counting_pull_server(store_dyn, U256::from(9u64), signer.address()).await?;
+        spawn_counting_pull_server(store_dyn, deposit, signer.address()).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5555,22 +5520,23 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
 /// channels would turn a cold fetch into a permanent refusal on every node.
 #[tokio::test(flavor = "multi_thread")]
 async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&LaneState::hydrate(
         pool_id(),
         signer.address(),
         operator_addr(),
-        U256::from(10u64),
+        window_cost,
         0,
         U256::ZERO,
         U256::ZERO,
         None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Pool remaining exactly equals the window's cost of 10 — the funded boundary.
+    // Pool remaining exactly equals the window's cost — the funded boundary.
     let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
-        spawn_counting_pull_server(store_dyn, U256::from(10u64), signer.address()).await?;
+        spawn_counting_pull_server(store_dyn, window_cost, signer.address()).await?;
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
@@ -5641,8 +5607,8 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         Some([0x33; 65]),
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Gross deposit 10 USDC, but only 5 remaining after prior redeems — one below
-    // the window cost of 10.
+    // Gross deposit 10 USDC, but only 5 remaining after prior redeems — well
+    // below the window cost.
     let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
         spawn_counting_pull_server(store_dyn, U256::from(5u64), client.address()).await?;
 

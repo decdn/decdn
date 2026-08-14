@@ -528,7 +528,6 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
             .as_bytes()
             .to_vec();
         let ext = StreamRequestExt {
-            voucher_interval_mb: None,
             binding: Some(ClientBinding {
                 ethereum_address: client_signer.address().into(),
                 binding_signature,
@@ -648,7 +647,6 @@ async fn lying_upstream(
     let resp = StreamResponse {
         body,
         error: None,
-        voucher_interval_mb: Some(1),
         slash_sig,
     };
     write_client_msg(&mut send, &ClientMessage::StreamResponse(resp)).await?;

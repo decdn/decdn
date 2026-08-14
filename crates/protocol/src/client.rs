@@ -16,8 +16,7 @@
 //!     signed body fields `{hash, ok, rate_per_mb, total_bytes, pool_id,
 //!     timestamp_us, redirect}` (ADR 014 §1), produced by the stream-response
 //!     slash signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
-//!     `error` and `voucher_interval_mb` are unsigned (ADR 005 §Voucher interval
-//!     negotiation).
+//!     `error` is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
 //!     carries `{signature, amount}` and the receiver reconstructs the full typed
 //!     data `{poolId, signer, provider, amount, bytesDelivered}` from stream
@@ -44,25 +43,20 @@ use crate::message::{MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 
 /// Exact byte length of a `ChunkData` payload, except the final chunk which MAY
 /// be smaller (ADR 005 §`cdn/client/v1`, §Partial final chunk). Matches
-/// iroh-blobs' internal 1024-byte chunk granularity; the voucher cadence
-/// (`voucher_interval_mb`, default 1 MiB) is coarser, so a buffering layer sits
+/// iroh-blobs' internal 1024-byte chunk granularity; the voucher accounting
+/// granularity (`VOUCHER_INTERVAL_BYTES`) is coarser, so a buffering layer sits
 /// between the payment and transfer tick rates (ADR 005 §Tradeoffs).
 pub const CHUNK_SIZE: usize = 1024;
 
-/// One megabyte in bytes, the unit of `voucher_interval_mb` and `rate_per_mb`
-/// (ADR 003: 1 MB = 1,048,576 bytes, exactly). The node pauses delivery when
-/// outstanding unvouchered bytes exceed `voucher_interval_mb * MB_BYTES`.
+/// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
+/// of `rate_per_mb` and [`VOUCHER_INTERVAL_BYTES`].
 pub const MB_BYTES: u64 = 1_048_576;
 
-/// Default voucher cadence when neither peer proposes one (ADR 005 §Voucher
-/// interval negotiation).
-pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 1;
-
-/// Hardcoded wire safety ceiling on `voucher_interval_mb` (ADR 003 §Voucher
-/// Interval Negotiation). The negotiated range is 1..=1024 MB. Enforced at the
-/// wire boundary by [`StreamResponse::validate`] and
-/// [`StreamRequestExt::validate`].
-pub const MAX_VOUCHER_INTERVAL_MB: u64 = 1024;
+/// Fixed byte-accounting granularity for cumulative vouchers. Buyer and seller
+/// both step their cumulative `bytes_delivered` in this unit, so each voucher
+/// signs over a byte count both sides derive identically without carrying it on
+/// the wire. 4 MiB.
+pub const VOUCHER_INTERVAL_BYTES: u64 = 4 * MB_BYTES;
 
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
 /// Mirrors [`SLASH_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
@@ -217,11 +211,6 @@ pub const NO_NAMESPACE: [u8; 32] = [0u8; 32];
 /// two-phase pattern (see [`encode_stream_request`] / [`parse_stream_request_ext`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamRequestExt {
-    /// Proposed voucher cadence for this stream in MB; the node answers with an
-    /// equal-or-smaller value in [`StreamResponse::voucher_interval_mb`]. Absent
-    /// ⇒ both sides default to [`DEFAULT_VOUCHER_INTERVAL_MB`]. When present it
-    /// MUST be in `1..=MAX_VOUCHER_INTERVAL_MB` ([`StreamRequestExt::validate`]).
-    pub voucher_interval_mb: Option<u64>,
     /// Off-chain client identity binding (address + attesting signature). Grouped
     /// so a half-populated state (address without signature, or vice versa) is
     /// unrepresentable; absent ⇒ a registered/on-chain client.
@@ -312,24 +301,17 @@ impl WireCapability {
 }
 
 impl StreamRequestExt {
-    /// Validate the negotiated cadence and (if present) the client binding.
-    /// Called by the node on the receive path after [`parse_stream_request_ext`];
-    /// kept separate from parsing so forward-compatible trailing bytes don't
-    /// couple to value checks.
+    /// Validate the (if present) client binding and capability. Called by the
+    /// node on the receive path after [`parse_stream_request_ext`]; kept
+    /// separate from parsing so forward-compatible trailing bytes don't couple
+    /// to value checks.
     ///
     /// # Errors
     ///
-    /// [`MessageValidationError::VoucherIntervalOutOfRange`] if
-    /// `voucher_interval_mb` is present and outside `1..=MAX_VOUCHER_INTERVAL_MB`;
     /// [`MessageValidationError::InvalidBindingSigLen`] if a present `binding`
     /// has a wrong-length signature; [`MessageValidationError::EmptyCapabilitySignature`]
     /// if a present `capability` has an empty `owner_signature`.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
-        if let Some(mb) = self.voucher_interval_mb
-            && (mb == 0 || mb > MAX_VOUCHER_INTERVAL_MB)
-        {
-            return Err(MessageValidationError::VoucherIntervalOutOfRange { interval: mb });
-        }
         if let Some(binding) = &self.binding {
             // `?` is not yet stable in `const fn`; match-return instead.
             match binding.validate() {
@@ -373,8 +355,8 @@ pub fn encode_stream_request(
 /// Parse the trailing [`StreamRequestExt`] bytes returned as the remainder by
 /// [`crate::decode_message`] after a `ClientMessage::StreamRequest`.
 ///
-/// An empty remainder ⇒ [`StreamRequestExt::default`] (no client binding,
-/// default cadence). Trailing bytes beyond the known fields are tolerated for
+/// An empty remainder ⇒ [`StreamRequestExt::default`] (no client binding, no
+/// capability). Trailing bytes beyond the known fields are tolerated for
 /// forward compatibility (ADR 013 §Tier 1): a future optional field appended to
 /// [`StreamRequestExt`] is read by new receivers and skipped by old ones.
 ///
@@ -392,10 +374,10 @@ pub fn parse_stream_request_ext(remainder: &[u8]) -> Result<StreamRequestExt, po
 
 /// Node → payer response to a [`StreamRequest`] (ADR 005 §`cdn/client/v1`).
 ///
-/// The signed [`StreamResponseBody`] is covered by `slash_sig`; `error` and
-/// `voucher_interval_mb` are unsigned. `slash_sig` is mandatory and non-empty
-/// (exactly [`SLASH_SIG_LEN`] bytes); requesters MUST reject missing/zero-length
-/// or zero-`rate_per_mb` responses (enforced via [`StreamResponse::validate`]).
+/// The signed [`StreamResponseBody`] is covered by `slash_sig`; `error` is
+/// unsigned. `slash_sig` is mandatory and non-empty (exactly
+/// [`SLASH_SIG_LEN`] bytes); requesters MUST reject missing/zero-length or
+/// zero-`rate_per_mb` responses (enforced via [`StreamResponse::validate`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
@@ -407,10 +389,6 @@ pub struct StreamResponse {
     /// `ok`/`error` consistency rules and the mid-stream-only exclusion are
     /// enforced by [`StreamResponse::validate`], not just documented.
     pub error: Option<StreamError>,
-    /// The node's accepted voucher cadence in MB (≤ the proposed value).
-    /// Unsigned; absent ⇒ [`DEFAULT_VOUCHER_INTERVAL_MB`] (ADR 005 §Voucher
-    /// interval negotiation).
-    pub voucher_interval_mb: Option<u64>,
     /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
     /// produced by the `decdn_incentive` stream slash signer, analogous to its
     /// `ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`] bytes — *not* a
@@ -459,8 +437,7 @@ impl StreamResponse {
     /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes,
     /// - `ok`/`error` consistency: `ok == true` ⇒ no `error`; `ok == false` ⇒
     ///   exactly one delivery-side `error` (never the mid-stream-only
-    ///   [`StreamError::VoucherRejected`]),
-    /// - `voucher_interval_mb`, when present, within `1..=MAX_VOUCHER_INTERVAL_MB`.
+    ///   [`StreamError::VoucherRejected`]).
     ///
     /// Exposed so requesters re-check on receive and construction sites assert
     /// validity before signing.
@@ -489,11 +466,6 @@ impl StreamResponse {
                 return Err(MessageValidationError::VoucherRejectedInResponse);
             }
             _ => {}
-        }
-        if let Some(mb) = self.voucher_interval_mb
-            && (mb == 0 || mb > MAX_VOUCHER_INTERVAL_MB)
-        {
-            return Err(MessageValidationError::VoucherIntervalOutOfRange { interval: mb });
         }
         Ok(())
     }
@@ -897,7 +869,6 @@ mod tests {
         StreamResponse {
             body: sample_body(),
             error: None,
-            voucher_interval_mb: Some(1),
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         }
     }
@@ -922,7 +893,6 @@ mod tests {
 
     fn sample_ext() -> StreamRequestExt {
         StreamRequestExt {
-            voucher_interval_mb: Some(8),
             binding: Some(sample_binding()),
             capability: Some(sample_capability()),
         }
@@ -1004,7 +974,6 @@ mod tests {
     #[test]
     fn stream_request_ext_capability_roundtrip() -> Result<(), postcard::Error> {
         let with_cap = StreamRequestExt {
-            voucher_interval_mb: None,
             binding: None,
             capability: Some(sample_capability()),
         };
@@ -1038,7 +1007,6 @@ mod tests {
     #[test]
     fn stream_request_ext_validate_rejects_empty_capability_signature() {
         let ext = StreamRequestExt {
-            voucher_interval_mb: None,
             binding: None,
             capability: Some(WireCapability {
                 spending_cap: [0u8; 32],
@@ -1279,7 +1247,6 @@ mod tests {
                 redirect: None,
             },
             error: None,
-            voucher_interval_mb: None,
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         };
         let bytes = postcard::to_allocvec(&resp)?;
@@ -1292,7 +1259,6 @@ mod tests {
         expected.push(7u8); // body.timestamp_us varint
         expected.push(0u8); // body.redirect = None
         expected.push(0u8); // error = None
-        expected.push(0u8); // voucher_interval_mb = None
         expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
         expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
         assert_eq!(bytes, expected);
@@ -1520,8 +1486,7 @@ mod tests {
     }
 
     /// A non-empty-but-malformed remainder MUST error, not silently degrade to
-    /// `default()`. A bare `Some` tag (0x01) for `voucher_interval_mb` with no
-    /// following varint is truncated; `take_from_bytes` rejects it on EOF. This
+    /// `default()`. `take_from_bytes` rejects a truncated encoding on EOF. This
     /// pins the contract a future `unwrap_or_default()` refactor would break.
     #[test]
     fn parse_stream_request_ext_rejects_malformed_remainder() {
@@ -1537,48 +1502,8 @@ mod tests {
     }
 
     #[test]
-    fn stream_request_ext_validate_accepts_interval_bounds() {
-        for mb in [1, MAX_VOUCHER_INTERVAL_MB] {
-            let ext = StreamRequestExt {
-                voucher_interval_mb: Some(mb),
-                binding: None,
-                capability: None,
-            };
-            assert_eq!(ext.validate(), Ok(()));
-        }
-    }
-
-    #[test]
-    fn stream_request_ext_validate_rejects_zero_interval() {
-        let ext = StreamRequestExt {
-            voucher_interval_mb: Some(0),
-            binding: None,
-            capability: None,
-        };
-        assert_eq!(
-            ext.validate(),
-            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: 0 })
-        );
-    }
-
-    #[test]
-    fn stream_request_ext_validate_rejects_oversize_interval() {
-        let over = MAX_VOUCHER_INTERVAL_MB + 1;
-        let ext = StreamRequestExt {
-            voucher_interval_mb: Some(over),
-            binding: None,
-            capability: None,
-        };
-        assert_eq!(
-            ext.validate(),
-            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: over })
-        );
-    }
-
-    #[test]
     fn stream_request_ext_validate_rejects_wrong_len_binding_sig() {
         let ext = StreamRequestExt {
-            voucher_interval_mb: None,
             binding: Some(ClientBinding {
                 ethereum_address: [0u8; 20],
                 binding_signature: vec![0x01; BINDING_SIG_LEN - 1],
@@ -1667,31 +1592,6 @@ mod tests {
         assert_eq!(
             resp.validate(),
             Err(MessageValidationError::VoucherRejectedInResponse)
-        );
-    }
-
-    #[test]
-    fn stream_response_validate_rejects_zero_interval() {
-        let resp = StreamResponse {
-            voucher_interval_mb: Some(0),
-            ..sample_response()
-        };
-        assert_eq!(
-            resp.validate(),
-            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: 0 })
-        );
-    }
-
-    #[test]
-    fn stream_response_validate_rejects_oversize_interval() {
-        let over = MAX_VOUCHER_INTERVAL_MB + 1;
-        let resp = StreamResponse {
-            voucher_interval_mb: Some(over),
-            ..sample_response()
-        };
-        assert_eq!(
-            resp.validate(),
-            Err(MessageValidationError::VoucherIntervalOutOfRange { interval: over })
         );
     }
 
