@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -124,6 +124,37 @@ struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes delivered as of the last accepted voucher.
     bytes_delivered_cumulative: U256,
+    /// Count of same-lane streams currently admitted and delivering. The serve-path
+    /// admission gate charges each already-active stream one credit-window floor of
+    /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
+    /// as an `Arc` so the guard releases lock-free without re-taking the lane mutex.
+    #[allow(dead_code)]
+    active_streams: Arc<AtomicU32>,
+}
+
+/// RAII slot for one admitted same-lane stream. Created under the lane lock after
+/// the admission gate increments [`LaneDeliveryState::active_streams`]; its `Drop`
+/// decrements the same counter on every serve exit — success, error, `?`-return,
+/// client disconnect, panic — so a finished stream always frees its slot. The
+/// decrement is a lock-free `fetch_sub`; a leaked slot would make the lane refuse
+/// new streams forever, so the count is owned by this guard, never decremented by
+/// hand.
+#[allow(dead_code)]
+struct LaneSlot {
+    counter: Arc<AtomicU32>,
+}
+
+impl LaneSlot {
+    #[allow(dead_code)]
+    const fn new(counter: Arc<AtomicU32>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for LaneSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Whether an insufficient-deposit `warn!` is due: `interval` has elapsed since
@@ -653,6 +684,7 @@ impl ClientHandler {
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
                     bytes_delivered_cumulative: bytes,
+                    active_streams: Arc::new(AtomicU32::new(0)),
                 })),
             );
         }
@@ -848,6 +880,7 @@ impl ClientHandler {
             Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
+                active_streams: Arc::new(AtomicU32::new(0)),
             }))
         });
         self.refresh_lane_metrics().await;
@@ -1442,6 +1475,7 @@ mod tests {
                     None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
+                active_streams: Arc::new(AtomicU32::new(0)),
             })),
         );
         handler.refresh_lane_metrics().await;
@@ -1854,6 +1888,22 @@ mod tests {
         assert_eq!(
             ServeRejectReason::LaneAtCapacity.wire_error(),
             StreamError::NotFound
+        );
+    }
+
+    #[test]
+    fn lane_slot_decrements_counter_on_drop() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = Arc::new(AtomicU32::new(0));
+        counter.fetch_add(1, Ordering::Relaxed); // caller increments under lock
+        {
+            let _slot = LaneSlot::new(counter.clone());
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "slot must release on drop"
         );
     }
 }
