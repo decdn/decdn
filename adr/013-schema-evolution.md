@@ -202,7 +202,6 @@ struct StreamRequestBase {
 /// Extension fields — new optional fields are appended here via Tier 1.
 #[derive(Serialize, Deserialize, Default)]
 struct StreamRequestExt {
-    voucher_interval_mb: Option<u64>,
     binding: Option<ClientBinding>,
 }
 
@@ -274,7 +273,7 @@ Messages without extensions (e.g., `StreamEnd`, `ChunkData`) have no trailing by
 - New fields MUST NOT be included in any existing signature computation (see [Signed Field Freezing](#signed-field-freezing)).
 - The base struct is frozen at the protocol version that introduced it. Moving fields between base and extensions is a major change.
 
-This formalizes the pattern used for `voucher_interval_mb` and the optional client identity `binding` in `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) as the standard minor evolution mechanism. The frozen `StreamRequest` base and its separately encoded trailing extensions implement the two-phase layout.
+This formalizes the pattern used for the optional client identity `binding` in `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) as the standard minor evolution mechanism. The frozen `StreamRequest` base and its separately encoded trailing extensions implement the two-phase layout.
 
 #### Tier 2 — Medium (new message types, no ALPN bump)
 
@@ -328,7 +327,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | Message | Signed fields | Unsigned fields (evolvable via Tier 1) |
 | --- | --- | --- |
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
-| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `pool_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
+| `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `pool_id`, `timestamp_us`, `redirect` | `error` |
 | `NodeAnnounce` | `node_id`, `region`, `timestamp_us` | *(none currently — see implementation note)* |
 
 #### Implementation note — separating signed and unsigned fields
