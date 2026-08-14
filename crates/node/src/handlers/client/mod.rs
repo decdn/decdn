@@ -134,10 +134,9 @@ struct LaneDeliveryState {
 /// RAII slot for one admitted same-lane stream. Created under the lane lock after
 /// the admission gate increments [`LaneDeliveryState::active_streams`]; its `Drop`
 /// decrements the same counter on every serve exit — success, error, `?`-return,
-/// client disconnect, panic — so a finished stream always frees its slot. The
-/// decrement is a lock-free `fetch_sub`; a leaked slot would make the lane refuse
-/// new streams forever, so the count is owned by this guard, never decremented by
-/// hand.
+/// client disconnect, panic — so a finished stream always frees its slot. A leaked
+/// slot would make the lane refuse new streams forever, so the count is owned by
+/// this guard, never decremented by hand.
 struct LaneSlot {
     counter: Arc<AtomicU32>,
 }
@@ -150,7 +149,15 @@ impl LaneSlot {
 
 impl Drop for LaneSlot {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        // Saturating decrement. A slot exists only paired with a prior increment,
+        // so the counter is never 0 here today; the saturating floor keeps a future
+        // unpaired slot from underflowing `u32::MAX` and wedging the lane (every
+        // admission then refused) rather than failing safe.
+        let _ = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 }
 
