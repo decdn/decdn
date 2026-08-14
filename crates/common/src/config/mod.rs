@@ -31,13 +31,6 @@ pub use types::FileConfig;
 const DEFAULT_BIND_PORT: u16 = 4433;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
-/// Default maximum single blob size in megabytes (1 GB).
-///
-/// Deliberately well below `DEFAULT_CACHE_SIZE_MB` so a single oversized
-/// blob can't saturate the entire cache and evict all other content in
-/// one fetch. The `max_blob_size_mb < cache_size_mb` invariant is enforced
-/// at config load (see `resolve_cache_into`).
-const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port. Exposed publicly so `decdn node top`
@@ -1532,12 +1525,10 @@ fn resolve_blockchain_into(
 
 /// Resolve cache fields.
 ///
-/// Enforces `max_blob_size_mb < cache_size_mb`: a single blob equal to or
-/// larger than the cache would saturate the store on one fetch and evict
-/// every other entry, making the node a one-shot download target rather
-/// than a useful cache. Equality is rejected along with the greater-than
-/// case because a cache that can hold exactly one blob has the same
-/// failure mode as one that overflows.
+/// Enforces `max_blob_size_mb <= cache_size_mb`: a blob larger than the whole
+/// cache could never be admitted, so a value above the disk budget is a
+/// permanent-reject misconfiguration. Equality is allowed and is the default —
+/// the disk budget is the ceiling, and a node serves any blob it can hold.
 #[cfg(test)]
 fn resolve_cache(
     cli: &crate::cli::run::CacheArgs,
@@ -1569,10 +1560,14 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.cache_size_mb))
         .unwrap_or(DEFAULT_CACHE_SIZE_MB);
 
+    // Unset => the disk budget itself. A node admits any blob its cache can
+    // hold; operators who want a tighter per-blob bound (for example to cap the
+    // RAM the buffered miss tier spends on one pull) set it explicitly below
+    // `cache_size_mb`.
     let max_blob_size_mb = cli
         .max_blob_size_mb
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
-        .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
+        .unwrap_or(cache_size_mb);
 
     // Buyer-side absolute per-MB rate ceiling (#1375); `0` = unlimited (the
     // default). CLI/env override wins over the file, matching every other knob.
@@ -1582,13 +1577,13 @@ fn resolve_cache_into(
         .unwrap_or(0);
 
     bag.check_with(
-        max_blob_size_mb < cache_size_mb,
+        max_blob_size_mb <= cache_size_mb,
         "cache.max_blob_size_mb",
         || {
             format!(
-                "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
-             cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
-             can saturate the cache on one fetch"
+                "cache.max_blob_size_mb ({max_blob_size_mb}) must not exceed \
+             cache.cache_size_mb ({cache_size_mb}); a blob larger than the whole \
+             cache could never be admitted"
             )
         },
     );
@@ -5229,15 +5224,15 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_cache_rejects_max_blob_equal_to_cache_size() -> anyhow::Result<()> {
+    fn resolve_cache_accepts_max_blob_equal_to_cache_size() -> anyhow::Result<()> {
+        // Equality is the default (unset => cache_size_mb) and is allowed:
+        // the disk budget is the admission ceiling.
         let cli = cache_cli(Some(100), Some(100));
-        let err = resolve_cache(&cli, None, Path::new("/tmp"))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for max == cache"))?
-            .to_string();
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            err.contains("max_blob_size_mb") && err.contains("cache_size_mb"),
-            "error lacked context: {err}"
+            resolved.max_blob_size_mb == 100,
+            "max_blob: {}",
+            resolved.max_blob_size_mb
         );
         Ok(())
     }
@@ -5250,7 +5245,7 @@ swap_pool_address = \"0xPool\"
             .ok_or_else(|| anyhow::anyhow!("expected rejection for max > cache"))?
             .to_string();
         anyhow::ensure!(
-            err.contains("strictly less than"),
+            err.contains("must not exceed"),
             "error lacked context: {err}"
         );
         Ok(())
@@ -6993,13 +6988,13 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
-        // Regression guard: if either default changes, the pair must still
-        // satisfy `max_blob < cache_size`. Lives here so a future edit to
-        // the DEFAULT_* constants can't silently reintroduce the #221 bug.
+        // Regression guard: the resolved defaults must satisfy the load-time
+        // `max_blob_size_mb <= cache_size_mb` invariant. The default is
+        // equality (unset => cache_size_mb).
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.max_blob_size_mb < resolved.cache_size_mb,
+            resolved.max_blob_size_mb <= resolved.cache_size_mb,
             "defaults violate invariant: max_blob={} cache_size={}",
             resolved.max_blob_size_mb,
             resolved.cache_size_mb
@@ -9460,7 +9455,8 @@ swap_pool_address = \"0xPool\"
         let cli = empty_cache_args();
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
-        assert_eq!(resolved.max_blob_size_mb, DEFAULT_MAX_BLOB_SIZE_MB);
+        // Unset `max_blob_size_mb` defaults to the disk budget itself.
+        assert_eq!(resolved.max_blob_size_mb, DEFAULT_CACHE_SIZE_MB);
         Ok(())
     }
 
