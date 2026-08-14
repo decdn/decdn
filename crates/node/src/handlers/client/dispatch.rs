@@ -4,12 +4,13 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, Hash, LaneKey, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT,
-    RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError,
-    StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message, reset_stream,
-    verify_binding,
+    FillOutcome, FirstMessage, Hash, LaneKey, LaneSlot, Mutex, OwnedSemaphorePermit,
+    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
+    StreamReadError, StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
+use std::sync::atomic::Ordering;
 
 impl ClientHandler {
     /// Accept the connection-level rate-limit permit, then serve each inbound
@@ -826,6 +827,55 @@ impl ClientHandler {
                 .await;
         }
 
+        // Per-lane concurrent-stream admission cap. The base floor-M gate above
+        // proves this stream's own reserve fits; this gate additionally charges
+        // every same-lane stream ALREADY in flight one credit-window floor, so a
+        // lane cannot put more unpaid egress in flight than its refundable-floor
+        // headroom covers. Checked-and-incremented under the lane lock: two
+        // simultaneous opens serialize here, so neither sees room the other is
+        // about to take (a TOCTOU that would admit N+1). The slot releases on
+        // every serve exit via `LaneSlot`'s drop.
+        //
+        // Only capability-bearing (payable) streams reach here with `known_lane`
+        // set — intake registers the lane from this request's own capability
+        // above, so concurrent first-streams on a fresh lane share one counter.
+        // An unbound request (`known_lane == None`) cannot pay or make the node
+        // spend, so it needs no cap.
+        let mut lane_slot: Option<LaneSlot> = None;
+        if let Some(status) = pool_status {
+            let floor = self.credit_window(interval_bytes, 0);
+            let guard = lane.lock().await;
+            let active = guard.active_streams.clone();
+            let n_active = active.load(Ordering::Relaxed);
+            // `n_active == 0` (the single-stream case) applies no surcharge, so it
+            // is byte-for-byte the current behavior — the base gate already ran.
+            let reserved = guard_bytes.saturating_add(floor.saturating_mul(u64::from(n_active)));
+            if n_active > 0
+                && !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb)
+            {
+                drop(guard);
+                let headroom = status
+                    .remaining
+                    .saturating_sub(self.pool_min_remaining_deposit);
+                self.log_deposit_refusal(
+                    B256::from(req.pool_id),
+                    hash,
+                    headroom,
+                    decdn_incentive::min_payment(reserved, rate_per_mb),
+                );
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::LaneAtCapacity,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
+            active.fetch_add(1, Ordering::Relaxed);
+            lane_slot = Some(LaneSlot::new(active));
+        }
+
         // Build and sign the success response.
         let body = StreamResponseBody {
             hash: req.hash,
@@ -839,6 +889,12 @@ impl ClientHandler {
         let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
+
+        // Hold the admission slot for the rest of this function: `deliver` below
+        // is awaited inline (not spawned), so binding it here — rather than
+        // dropping it at the gate above — keeps it alive for the whole delivery
+        // and releases it on every exit (success, error, `?`-return, panic).
+        let _lane_slot = lane_slot;
 
         // Stream the blob, collecting vouchers at each interval boundary.
         self.deliver(

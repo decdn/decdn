@@ -128,7 +128,6 @@ struct LaneDeliveryState {
     /// admission gate charges each already-active stream one credit-window floor of
     /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
     /// as an `Arc` so the guard releases lock-free without re-taking the lane mutex.
-    #[allow(dead_code)]
     active_streams: Arc<AtomicU32>,
 }
 
@@ -139,13 +138,11 @@ struct LaneDeliveryState {
 /// decrement is a lock-free `fetch_sub`; a leaked slot would make the lane refuse
 /// new streams forever, so the count is owned by this guard, never decremented by
 /// hand.
-#[allow(dead_code)]
 struct LaneSlot {
     counter: Arc<AtomicU32>,
 }
 
 impl LaneSlot {
-    #[allow(dead_code)]
     const fn new(counter: Arc<AtomicU32>) -> Self {
         Self { counter }
     }
@@ -193,7 +190,6 @@ enum ServeRejectReason {
     /// refundable-floor headroom covers. Distinct from [`Self::InsufficientDeposit`]
     /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire,
     /// see [`Self::wire_error`].
-    #[allow(dead_code)]
     LaneAtCapacity,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).

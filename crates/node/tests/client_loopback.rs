@@ -1360,6 +1360,41 @@ impl StalledDelivery {
     }
 }
 
+/// Drive a raw `cdn/client/v1` request expecting a pre-serve refusal: send the
+/// `StreamRequest` and read only the `StreamResponse` — a refused request never
+/// emits `ChunkData`, so there is nothing to stall on. Sibling of
+/// [`stall_delivery_at_closing_voucher`] for gates (like the per-lane admission
+/// cap) that refuse before delivery begins.
+async fn open_expecting_refusal(
+    conn: &Connection,
+    hash: [u8; 32],
+    ext: Option<&StreamRequestExt>,
+) -> anyhow::Result<decdn_protocol::client::StreamResponse> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    let req = StreamRequest {
+        hash,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x0012_61a0,
+    };
+    let payload =
+        encode_stream_request(&req, ext).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamResponse(resp) => Ok(resp),
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+}
+
 /// Assert `err` is the handler's graceful app-layer idle close: `APP_ERR_NO_ERROR`
 /// (0x00) with reason `"idle"`, not a fault code or a transport reset.
 fn ensure_graceful_idle_close(err: &ConnectionError) -> anyhow::Result<()> {
@@ -1816,6 +1851,88 @@ async fn concurrent_same_lane_streams_aggregate_across_the_voucher_interval() ->
     client_ep.close().await;
     fx.server_ep.close().await;
     fx.server_task.await?;
+    Ok(())
+}
+
+/// A lane funded for exactly one credit-window floor admits the first same-lane
+/// stream and refuses a concurrent second with `NotFound` (the wire collapse of
+/// `LaneAtCapacity`), while the admitted stream still delivers and settles.
+///
+/// `remaining = 50`: covers the first stream's own 3 MiB guard (cost 30, so the
+/// base floor-M gate admits it) plus one credit-window floor (`HARNESS_FLOOR_COST
+/// = 40`) — but not a second stream's 2 MiB guard (cost 20) stacked on top of the
+/// floor already charged for the first, still-active stream (20 + 40 = 60 > 50).
+/// This is the exactly-one-floor headroom the admission cap enforces: `remaining`
+/// covers `min_payment(floor, rate)` (40) but not `min_payment(guard_b + floor,
+/// rate)` (60).
+#[tokio::test(flavor = "multi_thread")]
+async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Result<()> {
+    let payload_a = vec![0x71u8; 3 * 1024 * 1024];
+    let payload_b = vec![0x82u8; 2 * 1024 * 1024];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let remaining = U256::from(50u64);
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        remaining,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // First same-lane stream: admitted, parked mid-delivery (holds its slot).
+    let wire_a = support::bao_wire_len_whole(payload_a.len() as u64);
+    let first =
+        stall_delivery_at_closing_voucher(&conn, *hash_a.as_bytes(), wire_a, Some(&ext)).await?;
+
+    // Second concurrent same-lane stream: refused with NotFound.
+    let refusal = open_expecting_refusal(&conn, *hash_b.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "second same-lane stream must be refused while budget covers only one floor"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    // The admitted stream still settles cleanly once its slot is the only one
+    // left, proving the cap released and did not wedge the lane.
+    let _ = first
+        .pay_and_finish(&signer, VoucherTotals::default())
+        .await?;
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
     Ok(())
 }
 
