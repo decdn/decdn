@@ -236,6 +236,8 @@ where
 ///   when the body fit under `buffered_max_bytes` and was drained
 ///   in-loop. The returned stream yields the buffered bytes once and
 ///   then completes.
+/// - `Ok(OriginFetch::AlreadyAdmitted)` when the origin admitted the blob
+///   into the store itself — passed through unchanged, nothing to buffer.
 /// - `Err(OriginPullError::Permanent)` on permanent or exhausted
 ///   failure.
 pub async fn retry_fetch(
@@ -247,8 +249,13 @@ pub async fn retry_fetch(
 ) -> Result<OriginFetch, OriginPullError> {
     run_with_retry(policy, metrics, hash, || async {
         let fetch = origin.fetch(hash, max_bytes).await?;
-        let OriginFetch::Found { stream, size_hint } = fetch else {
-            return Ok(OriginFetch::NotFound);
+        let (stream, size_hint) = match fetch {
+            OriginFetch::Found { stream, size_hint } => (stream, size_hint),
+            OriginFetch::NotFound => return Ok(OriginFetch::NotFound),
+            // The origin already admitted the blob into the store directly
+            // (node-to-node pull, #1682) — nothing here to buffer or retry
+            // classification for; pass it straight through.
+            OriginFetch::AlreadyAdmitted => return Ok(OriginFetch::AlreadyAdmitted),
         };
         if should_buffer(size_hint, policy.buffered_max_bytes) {
             // Pre-stream cap: a `size_hint` over `max_bytes` should

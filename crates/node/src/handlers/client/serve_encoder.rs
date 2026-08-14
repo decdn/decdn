@@ -428,6 +428,7 @@ mod tests {
         engine
             .admit_bao_stream(hash, ranges, total, MemReader { wire }, Some(session))
             .await
+            .map_err(|(_reader, e)| e)
             .expect("admit range");
     }
 

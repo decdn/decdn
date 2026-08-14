@@ -31,7 +31,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -56,9 +56,9 @@ use tracing::debug;
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
-use super::resume::{SETTLE_POLL_STEP, settle_wait_budget};
+use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::{
-    NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleDeps, SettleOnDrop, bind_upstream_ctx,
+    NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleOnDrop, bind_upstream_ctx,
     cached_candidates, classify_pull_failure, discover, lane_ledger, now_micros, probe_and_rank,
     record_outcome, record_pool_open_failure,
 };
@@ -80,7 +80,7 @@ const CHUNK_BYTES: u64 = 1024;
 /// close handshake to roughly three seconds on bad connectivity and returns much
 /// faster in the usual case (instant on loopback), so this comfortably covers the
 /// drain without holding the pull thread for longer than a real close would take.
-const ABANDON_DRAIN: Duration = Duration::from_secs(3);
+pub(super) const ABANDON_DRAIN: Duration = Duration::from_secs(3);
 
 /// A discovered, channel-open upstream ready to be pulled from by [`drive`], plus
 /// the `total_bytes` the caller needs to sign its `StreamResponse`. Everything a
@@ -512,7 +512,7 @@ pub(crate) async fn run_pull_leg(
     // disconnect / done). Held as a local so its `Drop` runs on all three, on THIS
     // pull-thread runtime.
     let _settle = SettleOnDrop {
-        deps: SettleDeps::Shared(Arc::clone(&deps_lock)),
+        deps: Arc::clone(&deps_lock),
         provider_addr,
         pool_id,
         prior_amount,
@@ -552,6 +552,10 @@ pub(crate) async fn run_pull_leg(
         Arc::clone(&deps.buyer),
         Arc::clone(&ctx),
         Arc::clone(&ledger),
+        Arc::clone(&deps.metrics),
+        // The window-paced serve-miss leg does not derive a refuse-metering signal
+        // from this flag; `NodeFunder` still records its own success/refusal metrics.
+        Arc::new(AtomicBool::new(false)),
     );
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,

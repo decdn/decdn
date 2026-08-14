@@ -752,6 +752,9 @@ mod tests {
         match origin.fetch(hash, 1024).await? {
             OriginFetch::NotFound => Ok(()),
             OriginFetch::Found { .. } => anyhow::bail!("expected NotFound"),
+            OriginFetch::AlreadyAdmitted => {
+                anyhow::bail!("FilesystemOrigin never admits directly; expected NotFound")
+            }
         }
     }
 
