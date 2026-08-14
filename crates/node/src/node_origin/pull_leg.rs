@@ -614,6 +614,9 @@ pub(crate) async fn run_pull_leg(
         Arc::clone(&ctx),
         Arc::clone(&ledger),
         Arc::clone(&deps.metrics),
+        // The window-paced serve-miss leg does not derive a refuse-metering signal
+        // from this flag; `NodeFunder` still records its own success/refusal metrics.
+        Arc::new(AtomicBool::new(false)),
     );
     let config = DriveConfig {
         working_deposit: deps.config.working_deposit,

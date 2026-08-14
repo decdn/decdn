@@ -377,21 +377,39 @@ where
         let committed = ledger.committed();
         let remaining_deposit = locked_deposit(ctx)?.saturating_sub(committed.amount);
 
-        // The gap's PAID content frontier — the completion signal. Anchor the leg on
-        // the first pass at `gap_start` with the current committed baseline (fresh /
-        // cross-invocation: `paid_wire == 0`, so the frontier is `gap_start` and
-        // nothing already-paid is re-pulled). `content_paid_frontier` inverts the
-        // wire cost of ONE contiguous delivery from `leg_start`, so it MUST be priced
-        // per-leg: `leg_anchor` re-anchors on every successful open to the previous
-        // paid frontier, keeping the frontier monotonic and never summing two legs'
-        // (proof-duplicating) wire encodings, which would map PAST the true paid
-        // frontier and under-pay.
+        // Anchor the leg on the first pass at `gap_start` with the current committed
+        // baseline (fresh / cross-invocation: `paid_wire == 0`, so the frontier is
+        // `gap_start` and nothing already-paid is re-pulled). `content_paid_frontier`
+        // inverts the wire cost of ONE contiguous delivery from `leg_start`, so it
+        // MUST be priced per-leg: `leg_anchor` re-anchors on every successful open to
+        // the previous paid frontier, keeping the frontier monotonic and never summing
+        // two legs' (proof-duplicating) wire encodings, which would map PAST the true
+        // paid frontier and under-pay.
         let (leg_start, leg_baseline) = *leg_anchor.get_or_insert((gap_start, committed.bytes));
         let paid_wire_this_leg =
             u64::try_from(committed.bytes.saturating_sub(leg_baseline)).unwrap_or(u64::MAX);
+        // The gap's PAID content frontier, clamped to the store's DELIVERED frontier:
+        // a gap is done — and may resume — only at bytes that are BOTH paid AND
+        // present, tracking the MIN of the two. `content_paid_frontier` prices ONE
+        // leg's paid wire, but the `PoolLedger` is SHARED by every concurrent pull on
+        // the channel (`BuyerLedgers`), so a concurrent pull's acked vouchers inflate
+        // `committed.bytes` — and thus `paid_wire_this_leg` — past what THIS leg
+        // delivered. Left unclamped, that overshoot makes `paid_cleared` report the
+        // gap `Done` (or trips the `paid_frontier >= gap_end` spin-guard in the Draw
+        // arm) before the bytes are in the store, so `drive` returns `Ok` with the
+        // blob incomplete and never finalizes it: success for a blob that is not
+        // there. Clamping to `delivered_frontier` restores the
+        // `.min(resume_offset(decoded_len))` guard the pre-drive resume loop held
+        // (`resume.rs::resume_frontier`). On a solo pull and the whole client path
+        // delivery runs AHEAD of payment (ADR 003's credit window), so
+        // `delivered_frontier >= paid_frontier` and the clamp is a NO-OP — resume
+        // still starts at the true paid frontier and the delivered-but-unpaid tail is
+        // still re-billed (no under-pay). It bites ONLY when a shared-ledger
+        // concurrent pull overshoots this leg's delivery.
         let paid_frontier =
             crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire_this_leg)
-                .min(gap_end);
+                .min(gap_end)
+                .min(delivered_frontier);
         let paid_cleared = paid_frontier.saturating_sub(gap_start);
 
         let state = PaceState {
@@ -493,8 +511,9 @@ where
                 // bytes idempotently and the pull re-bills them, so the credit-window
                 // tail the store checkpointed ahead of payment is finally paid.
                 if paid_frontier >= gap_end {
-                    // Fully paid — the pacer should have returned `Done`; guard
-                    // against a spin.
+                    // Paid AND delivered to the gap end (`paid_frontier` is clamped to
+                    // the delivered frontier above) — the pacer should have returned
+                    // `Done`; guard against a spin.
                     return Ok(());
                 }
                 let resume_start = paid_frontier;

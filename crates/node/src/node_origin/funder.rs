@@ -21,6 +21,7 @@
 //! The pool has no expiry, so a `topUp` strands nothing time-bound — the node
 //! funds its own pool freely, and there is no near-expiry refusal to derive.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alloy::primitives::U256;
@@ -60,6 +61,11 @@ pub(crate) struct NodeFunder {
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
     metrics: Arc<crate::metrics::Metrics>,
+    /// Set the first time a top-up ADDS headroom, so the caller can tell a pull
+    /// that never funded itself (an extortion refusal to meter) from one that
+    /// did. Shared with `pull_from_candidate`, which reads it after the drive
+    /// thread joins.
+    funded: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for NodeFunder {
@@ -74,12 +80,14 @@ impl NodeFunder {
         ctx: Arc<Mutex<PoolContext>>,
         ledger: Arc<PoolLedger>,
         metrics: Arc<crate::metrics::Metrics>,
+        funded: Arc<AtomicBool>,
     ) -> Self {
         Self {
             opener,
             ctx,
             ledger,
             metrics,
+            funded,
         }
     }
 }
@@ -109,6 +117,10 @@ impl Funder for NodeFunder {
             match self.opener.top_up_pool(spendable_target).await {
                 Ok(new_deposit) if new_deposit > current_deposit => {
                     self.metrics.node_pull_reactive_topup();
+                    // Record the headroom-adding success so a later terminal
+                    // `CapExceeded` on this pull is NOT metered as a refusal — a pull
+                    // that funded itself is not being extorted.
+                    self.funded.store(true, Ordering::Relaxed);
                     Ok(DepositOutcome::Added(new_deposit))
                 }
                 Ok(new_deposit) => {
@@ -233,6 +245,10 @@ mod tests {
         }))
     }
 
+    fn test_funded() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     /// With nothing committed, spendable == deposit, so the target `top_up_pool`
     /// receives is `deposit + additional`.
     #[tokio::test]
@@ -246,6 +262,7 @@ mod tests {
             test_ctx(deposit),
             test_ledger(U256::ZERO),
             metrics,
+            test_funded(),
         );
 
         let outcome = f.top_up(additional).await.expect("top-up should succeed");
@@ -271,6 +288,7 @@ mod tests {
             test_ctx(deposit),
             test_ledger(committed),
             metrics,
+            test_funded(),
         );
 
         let _ = f.top_up(additional).await.expect("top-up should succeed");
@@ -288,6 +306,7 @@ mod tests {
             test_ctx(U256::from(100u64)),
             test_ledger(U256::ZERO),
             metrics,
+            test_funded(),
         );
 
         let err = f.top_up(U256::from(50u64)).await.unwrap_err();
@@ -305,6 +324,7 @@ mod tests {
             test_ctx(U256::ZERO),
             test_ledger(U256::ZERO),
             metrics,
+            test_funded(),
         );
 
         assert_eq!(f.max_topups(), MAX_REACTIVE_TOPUPS);
@@ -325,6 +345,7 @@ mod tests {
             test_ctx(U256::from(1_000u64)),
             test_ledger(U256::ZERO),
             Arc::clone(&metrics),
+            test_funded(),
         );
         let _ = f
             .top_up(U256::from(250u64))
@@ -342,6 +363,7 @@ mod tests {
             test_ctx(U256::from(1_000u64)),
             test_ledger(U256::ZERO),
             Arc::clone(&metrics),
+            test_funded(),
         );
         let _ = f.top_up(U256::from(250u64)).await;
         let text = metrics.encode().expect("metrics should encode");
@@ -369,6 +391,7 @@ mod tests {
             test_ctx(deposit),
             test_ledger(committed),
             Arc::clone(&metrics),
+            test_funded(),
         );
 
         let outcome = f

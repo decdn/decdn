@@ -65,6 +65,7 @@ use resume::{SETTLE_POLL_STEP, settle_wait_budget};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1891,6 +1892,11 @@ async fn pull_from_candidate(
     let cancel = CancellationToken::new();
     let cancel_for_thread = cancel.clone();
     let _cancel_guard = cancel.drop_guard();
+    // Set on the drive thread the first time a reactive top-up ADDS headroom, so the
+    // refuse-metering below can tell a pull that never funded itself (an extortion
+    // `CapExceeded` to meter) from one that did (already metered on the wire).
+    let reactive_funded = Arc::new(AtomicBool::new(false));
+    let reactive_funded_for_thread = Arc::clone(&reactive_funded);
     let join = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1930,6 +1936,7 @@ async fn pull_from_candidate(
                 Arc::clone(&ctx),
                 Arc::clone(&ledger_for_drive),
                 metrics,
+                reactive_funded_for_thread,
             );
             // Whole blob: offset 0, len `total_bytes`. `drive` derives missing ranges
             // from the ranged store, so a mid-pull top-up resumes by re-deriving gaps
@@ -2018,6 +2025,25 @@ async fn pull_from_candidate(
             Ok(())
         }
         Err(err) => {
+            // Meter a refused reactive top-up (#1600): the upstream ended the pull with
+            // `CapExceeded` while OUR ledger still had headroom — an attempt to make us
+            // escrow more USDC on its unsupported word. The driver's `genuine_exhaustion`
+            // saw the contradiction and never issued a `TopUp`, so `NodeFunder` was never
+            // called and nothing else meters this; without it, a lying peer is invisible.
+            // Guarded on `working_deposit != 0` (reactive top-up enabled) and on this pull
+            // NOT having funded itself — a pull that already topped up was metered on the
+            // wire (`node_pull_reactive_topup`) and is not being extorted. No double-count
+            // with `NodeFunder`'s own refused metering, which fires only when `top_up_pool`
+            // is actually called, which does not happen on this refuse path. No escrow, no
+            // bytes: the fetch still misses.
+            if !deps.config.working_deposit.is_zero()
+                && !reactive_funded.load(Ordering::Relaxed)
+                && err
+                    .downcast_ref::<UpstreamVoucherRejected>()
+                    .is_some_and(|r| r.reason == VoucherRejectReason::CapExceeded)
+            {
+                deps.metrics.node_pull_reactive_topup_refused();
+            }
             let verdict =
                 classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), &err);
             Err(PullMiss::for_verdict(verdict))
