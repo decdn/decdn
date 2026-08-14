@@ -683,7 +683,7 @@ impl Origin for S3Origin {
             // then back to `Stream<io::Result<Bytes>>` via
             // `ReaderStream`. Chunks reach iroh-blobs'
             // `add_stream` without the body ever sitting in
-            // process memory in full — a 10 GB S3 object no longer
+            // process memory in full — a 10 GB S3 object never
             // pins 10 GB of RSS.
             //
             // **Operator-visible diagnostics for body errors:**

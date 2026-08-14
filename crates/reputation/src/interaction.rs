@@ -34,8 +34,8 @@ pub(crate) fn speed_score_from_transfer(bytes: u64, elapsed: Duration, reference
 
 /// Log-normalized delivery-speed score in `[0, 1]` (ADR 008 §Local Score
 /// Calculation). `reference_bps` is the throughput that scores ~1.0. The log
-/// shape means throughput above the old flat baseline is **no longer
-/// saturated** — a materially faster node scores strictly higher. Returns
+/// shape keeps throughput from saturating — a materially faster node scores
+/// strictly higher. Returns
 /// `0.0` for non-positive / non-finite input or a zero reference.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn speed_score_from_bps(bytes_per_sec: f64, reference_bps: u64) -> f64 {

@@ -104,22 +104,22 @@ Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected 
 
 | Metric | Type | Description |
 |---|---|---|
-| `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` | three counters, unlabeled | Probes rejected by the rate limiter, one sibling counter per layer that rejected first. Sibling counters rather than a `layer` label, per the convention settled in #1475 — see [appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels). The single labelled `decdn_probe_rate_limit_rejections_total` this row used to name was never exported. |
+| `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` | three counters, unlabeled | Probes rejected by the rate limiter, one sibling counter per layer that rejected first. Sibling counters rather than a `layer` label, per the sibling-counter convention — see [appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels). No single labelled `decdn_probe_rate_limit_rejections_total` counter exists; the three sibling counters above are the only export. |
 
 ### `cdn/client/v1` — paid delivery protocol
 
-Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node). A delivering node MAY satisfy a request for a blob it does not hold by pulling through from the network — not only from its own configured origin — and serving the result, governed by the seed-leech caps in [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality); this is the mechanism that warms a regional copy. A warming proxy holds no record at probe time and answers `has_blob: false` to any probe, so it never advertises a blob it lacks (cf. § Probe interaction). `NotFound` is returned only when the node neither holds the blob nor can reach a provider for it, or declines to pull through under its seed-leech policy.
+Used for all paid delivery: client→node and node→node (cache miss pull from an origin-backed or cached node). A delivering node MAY satisfy a request for a blob it does not hold by pulling through from the network — not only from its own configured origin — and serving the result, governed by the ramped credit window in [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality); this is the mechanism that warms a regional copy. A warming proxy holds no record at probe time and answers `has_blob: false` to any probe, so it never advertises a blob it lacks (cf. § Probe interaction). `NotFound` is returned only when the node neither holds the blob nor can reach a provider for it, or declines to pull through under its window policy.
 
 ```mermaid
 sequenceDiagram
     participant P as Payer
     participant D as Delivering Node
 
-    P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us, voucher_interval_mb?}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, voucher_interval_mb?, slash_sig}
+    P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, slash_sig}
 
     alt ok = true
-        loop Every voucher_interval_mb (default 1 MB)
+        loop Every 4 MiB
             D->>P: ChunkData {bytes} (1024-byte chunks)
             P->>D: Voucher {sig, amt} (cumulative USDC)
         end
@@ -141,7 +141,6 @@ struct StreamRequest {
     byte_offset: u64,
     byte_len: u64,       // 0 = to end-of-blob; else bound the range to [byte_offset, byte_offset + byte_len)
     timestamp_us: u64,
-    voucher_interval_mb: Option<u64>,
     // Ephemeral client binding (optional; required on first request per connection)
     ethereum_address: Option<Address>,
     binding_signature: Option<Bytes>,  // EIP-712 BindNodeId signature
@@ -177,17 +176,17 @@ The requester MUST enforce:
 
 #### Bounded byte ranges
 
-`byte_offset` is the start of a request; `byte_len` bounds its **end**. A request expresses the half-open range `[byte_offset, byte_offset + byte_len)`, with `byte_len == 0` meaning "to end-of-blob" (the prior whole-tail behavior, so an absent/zero value is the unchanged default). A bounded range lets a node scope a cache-miss **origin** fetch to exactly the requested bytes rather than pulling the whole blob to serve a fraction of it — see [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard). It also scopes payment: `total_bytes` in `StreamResponse` stays the **full blob size** — the buyer derives remaining bytes as `total_bytes - byte_offset`, and the serving node needs the blob size to frame bao verification of the range — while the **delivered, metered** byte count for a bounded request is `min(byte_len, total_bytes - byte_offset)`, or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
+`byte_offset` is the start of a request; `byte_len` bounds its **end**. A request expresses the half-open range `[byte_offset, byte_offset + byte_len)`, with `byte_len == 0` meaning "to end-of-blob" (whole-tail behavior, so an absent or zero value is the default). A bounded range lets a node scope a cache-miss **origin** fetch to exactly the requested bytes rather than pulling the whole blob to serve a fraction of it — see [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard). It also scopes payment: `total_bytes` in `StreamResponse` stays the **full blob size** — the buyer derives remaining bytes as `total_bytes - byte_offset`, and the serving node needs the blob size to frame bao verification of the range — while the **delivered, metered** byte count for a bounded request is `min(byte_len, total_bytes - byte_offset)`, or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
 
 `byte_len` is part of the base `StreamRequest` (not an optional extension): it is billing-relevant — a node that ignored it would over-deliver and over-bill with no slash evidence — so it must be understood by every node. Because `cdn/client/v1` is pre-finalisation (no testnet deployment), this is a **straight in-place addition** to the message, not a Tier-3 evolution: there is no version bump and no compatibility shim ([ADR 013 § Schema evolution](013-schema-evolution.md#adr-013-schema-evolution)). The node MUST reject a `byte_offset + byte_len` that overflows or exceeds the blob size with a `StreamError`.
 
-#### Voucher interval negotiation
+#### Voucher granularity and credit window
 
-The optional `voucher_interval_mb` field in `StreamRequest` proposes a larger-than-default voucher cadence for this stream (see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)). If present, the node responds with its accepted interval in `StreamResponse.voucher_interval_mb` — equal to or smaller than the proposed value. If absent from either message, both sides default to 1 MB. The `voucher_interval_mb` field is **not** covered by `slash_sig` because it is a delivery-layer optimization, not security-relevant — the node can always enforce a smaller interval unilaterally by pausing delivery.
+The `cdn/client/v1` byte-accounting granularity is fixed at 4 MiB (`VOUCHER_INTERVAL_BYTES`). Both the payer and the delivering node derive interval boundaries from this constant, so it carries no wire field and there is nothing to negotiate.
 
 The protocol is self-enforcing: payer stops sending vouchers → delivering node stops sending chunks; delivering node stops sending chunks → payer stops sending vouchers.
 
-Delivery and payment are not lock-stepped at the interval, though. A node streams within a **credit window** of several intervals ([ADR 003 — Credit Window](003-payments.md#credit-window)): it keeps sending chunks while the unpaid balance stays within the window and pauses only when it would exceed it. There is no per-voucher acknowledgement on the wire — the payer sends a cumulative voucher at each interval and the node's continued delivery is the implicit acknowledgement; a voucher the node did not accept simply stops delivery, and the payer resends the (cumulative) voucher. The window is delivery-layer node policy — it appears in no wire field and is never negotiated — and it bounds the node's credit exposure to exactly one window of unbilled egress while leaving the payer's exposure at zero (vouchers remain cumulative over bytes already received). At a window of one interval this reduces to strict stop-and-wait, which is what keeps the two ends interoperable regardless of which pipelines.
+Delivery and payment are not lock-stepped at the interval, though. A node streams within a **credit window** of several intervals ([ADR 003 — Credit Window](003-payments.md#credit-window)): it keeps sending chunks while the unpaid balance stays within the window and pauses only when it would exceed it. There is no per-voucher acknowledgement on the wire — the payer sends a cumulative voucher at each interval and the node's continued delivery is the implicit acknowledgement; a voucher the node did not accept simply stops delivery, and the payer resends the (cumulative) voucher. The window is delivery-layer node policy — it appears in no wire field — and it bounds the node's credit exposure to exactly one window of unbilled egress while leaving the payer's exposure at zero (vouchers remain cumulative over bytes already received). At a window of one interval this reduces to strict stop-and-wait, which is what keeps the two ends interoperable regardless of which pipelines.
 
 > **Relationship to iroh-blobs:** The `cdn/client/v1` protocol wraps iroh-blobs' verified streaming within its own message framing. iroh-blobs provides BLAKE3 tree-hash verification at the chunk level; `ChunkData` payloads carry the bao interleaved verified-stream encoding (chunk-group data with the proof nodes that anchor it to the root), alongside the payment and delivery control messages (`Voucher`, `StreamEnd`, `StreamError`) that iroh-blobs' native transfer protocol does not support. The BLAKE3 content hash in `StreamRequest` is the iroh-blobs hash, and verification uses iroh-blobs' incremental tree-hash mechanism — receivers need not buffer the full blob before confirming integrity, and a range beginning at any `byte_offset` is verifiable against the root on its own. See [ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1) for the verification model and wire encoding.
 
@@ -242,7 +241,7 @@ sequenceDiagram
     C->>N: Voucher {sig, amt} (sent on any active stream)
 ```
 
-The payer maintains **one aggregate byte counter per `(signer, provider)` lane** — the streams from one signer to one node. When the counter crosses the next voucher interval boundary (default 1 MB; negotiable per-stream — see [ADR 003 — Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), it issues the next cumulative voucher on any active stream sharing that lane. When streams on the same lane have different negotiated intervals, the effective interval for the lane is the **minimum** across all active streams. The delivering node tracks total bytes sent across all streams on the lane and **pauses all of them** once the unpaid balance reaches its [credit window](003-payments.md#credit-window) — the self-enforcing threshold is applied collectively, not per-stream. (The window is at least one effective interval, so this generalizes the per-interval pause rather than replacing it: a node running stop-and-wait pauses at one interval of deficit.)
+The payer maintains **one aggregate byte counter per `(signer, provider)` lane** — the streams from one signer to one node. When the counter crosses the next voucher interval boundary (4 MiB, `VOUCHER_INTERVAL_BYTES`), it issues the next cumulative voucher on any active stream sharing that lane. The delivering node tracks total bytes sent across all streams on the lane and **pauses all of them** once the unpaid balance reaches its [credit window](003-payments.md#credit-window) — the self-enforcing threshold is applied collectively, not per-stream. (The window is at least one interval, so this generalizes the per-interval pause rather than replacing it: a node running stop-and-wait pauses at one interval of deficit.)
 
 Implementation constraint: the payer must have a single voucher-signing task per lane aggregating byte counts from all its streams, not independent per-stream voucher logic.
 
@@ -257,7 +256,7 @@ A node signals a stream failure by returning a `StreamError` code. Delivery-side
 
 ```rust
 enum StreamError {
-    NotFound,          // Node does not hold the blob and cannot reach a provider, or declines to pull through (ADR 037 seed-leech caps)
+    NotFound,          // Node does not hold the blob and cannot reach a provider, or declines to pull through (ADR 037 ramped credit window)
     Overloaded,        // Node is at capacity; try another node
     BlobTooLarge,      // Blob exceeds this node's configured max_blob_size; do not retry this node
     InternalError,     // Unexpected failure; do not retry this node
@@ -367,7 +366,7 @@ AwaitingResponse ──StreamResponse{ok: true}──► Streaming
 - **Voucher-before-response:** Receiving a `Voucher` on a stream that has not yet received its own `StreamResponse` is a protocol error; that stream MUST be closed. Vouchers on other streams sharing the same lane are unaffected — the rule is per-stream, not per-lane.
 - **Partial final chunk:** The last `ChunkData` before `StreamEnd` MAY be smaller than 1,024 bytes. Receivers MUST accept partial chunks at stream end.
 - **Non-empty chunk:** A `ChunkData` MUST carry at least one byte. "Partial" permits a *smaller* final chunk, never an *empty* one: senders MUST NOT emit a zero-length `ChunkData` (a blob with no bytes goes straight to `StreamEnd`), and receivers MUST reject one as a protocol error rather than ignoring it. The floor is what makes every frame a unit of progress — an empty frame advances neither the receiver's cumulative byte count nor its voucher accounting, so an unbounded run of them would drive a receive loop without delivering anything, never tripping the overrun guard. Requesters bound the streaming stage by *inactivity*, and that bound is sound only because "a frame arrived" and "bytes made progress" are the same statement; without the floor a peer could hold the deadline open indefinitely with padding, and a stalled-peer signal that can be spoofed cannot be allowed to affect reputation.
-- **Voucher pacing:** The node pauses delivery when outstanding (unvouchered) bytes exceed `voucher_interval_mb × 1,048,576` bytes (the MB value in bytes). Delivery resumes when the client sends a `Voucher` covering the outstanding balance.
+- **Voucher pacing:** The node pauses delivery when outstanding (unvouchered) bytes exceed `VOUCHER_INTERVAL_BYTES` (4 MiB). Delivery resumes when the client sends a `Voucher` covering the outstanding balance.
 
 #### Per-lane voucher coordinator
 
@@ -402,9 +401,8 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 - Probe RTT includes iroh's NAT traversal overhead on first connection, inflating the latency estimate. Reusing existing connections for probes gives a cleaner signal.
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (a separate system) provides the longer-term signal.
-- The `cdn/client/v1` voucher cadence (default 1 MB, negotiable up to ~1 GB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); payment and transfer layers operate at different tick rates, requiring a buffering layer between them
+- The `cdn/client/v1` voucher granularity (4 MiB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); payment and transfer layers operate at different tick rates, requiring a buffering layer between them
 - Concurrent streams sharing a `pool_id` require the payer to maintain a single aggregate byte counter and voucher-signing task per channel; per-stream independence is lost for payment tracking
 - The delivering node enforces the voucher deficit threshold across all streams collectively — a slow voucher on one stream pauses all streams on that lane
 - Different ALPNs require separate QUIC connections; probing via `cdn/probe/v1` then fetching via `cdn/client/v1` incurs two handshake costs to the same peer. Two connections per node interaction is acceptable at a smaller scale. **Future optimization:** investigate iroh ALPN multiplexing (negotiating multiple ALPNs on a single connection) or a unified `cdn/v2` ALPN combining probe and delivery as sub-protocols within one connection. The overhead is ~1 additional RTT per node interaction — significant for latency-sensitive clients but not a correctness issue
-- The `voucher_interval_mb` field in `StreamRequest`/`StreamResponse` is optional and defaults to 1 MB if absent, following the standard minor evolution mechanism defined in [ADR 013](013-schema-evolution.md#adr-013-schema-evolution); mandatory field additions require a major version bump (`cdn/client/v2`)
 - `StreamRequest` includes a requester-generated `timestamp_us` echoed by the node in `StreamResponse`. Rate manipulation is an **immediate offense** ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)): two signed messages from the same NodeId — `ProbeResponse{rate=R₁, timestamp_us=T}` and `StreamResponse{rate=R₂, timestamp_us=T+Δ}` — with `Δ < 30s` and `R₂ > R₁` are non-repudiable on-chain evidence. The node's last probe-quoted rate is binding for any stream opened within the 30-second window; legitimate rate increases require honoring old quotes for that window or pausing new connections during the propagation gap. Rate decreases (`R₂ < R₁`) are unconstrained — slashing is one-directional

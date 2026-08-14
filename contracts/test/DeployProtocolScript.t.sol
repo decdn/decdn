@@ -85,7 +85,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     function test_readConfig_appliesDefaultsForOptionalVars() public view {
         DeployConfig memory cfg = this.externalReadConfig();
         assertEq(address(cfg.usdc), TEST_USDC, "usdc");
-        // `_readConfig` no longer resolves the verifier — `run()` deploys it
+        // `_readConfig` does not resolve the verifier — `run()` deploys it
         // in-broadcast (#669), so the config field is left zero here.
         assertEq(address(cfg.ed25519Verifier), address(0), "ed25519 resolved at deploy time");
         assertEq(cfg.emergencyMultisig, TEST_MULTISIG, "multisig");

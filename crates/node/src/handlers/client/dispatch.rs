@@ -1,12 +1,13 @@
 //! Connection accept loop + per-stream dispatch state machine.
-//! Bodies split from `mod.rs` (#1254); see there for the struct + shared types.
+//! See `mod.rs` for the struct + shared types.
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, Hash, LaneKey, MB_BYTES, Mutex, OwnedSemaphorePermit,
-    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, VarInt, read_first_message, reset_stream, verify_binding,
+    FillOutcome, FirstMessage, Hash, LaneKey, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT,
+    RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError,
+    StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message, reset_stream,
+    verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -182,18 +183,6 @@ impl ClientHandler {
         // a rate, and pricing them would meter a clamp for a request that never
         // had a price.
         let rate_per_mb = self.clamped_rate();
-
-        // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
-        // Negotiation): accept the smaller of the proposal and our configured
-        // cadence, never below 1 MB. Resolved here rather than just before signing
-        // so the cache-miss deposit floor below prices against the SAME interval
-        // the serve gate and `deliver` use — otherwise a client proposing a smaller
-        // cadence would be judged against our larger one, making the floor
-        // strictly stricter than the gate it precedes.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
 
         // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
         // step 2: "reject any new StreamRequest for the hash immediately").
@@ -395,38 +384,30 @@ impl ClientHandler {
                 //
                 // For an UNBOUNDED request (`byte_len == 0`: whole blob, or a tail
                 // from an offset) the billed size genuinely is unknowable pre-fill,
-                // so the window stands. Be clear about the residual that leaves,
-                // because it is not small: at stock config the window is 8 MiB
-                // (`DEFAULT_CREDIT_WINDOW_BYTES`, over a 4 MiB
-                // `DEFAULT_VOUCHER_INTERVAL_MB`), so a cold 100 KiB whole-blob
-                // fetch is priced at 8 MiB while the same blob served warm is
-                // priced at 100 KiB. A channel funded for the blob but not for a
-                // window is refused cold and served warm. Closing that needs the
-                // origin size probe to run before the floor, which is a larger
-                // change than this one.
+                // so the window stands. Be clear about the residual that leaves:
+                // this guard prices at `paid = 0`, i.e. the ramp floor — one
+                // voucher interval (`VOUCHER_INTERVAL_BYTES`, a fixed 4 MiB) —
+                // not the fully-ramped `credit_max` ceiling (64 MiB by default),
+                // since a cold request has confirmed no payment yet. A channel
+                // funded for the blob but not for a floor interval is refused
+                // cold and served warm. Closing that needs the origin size probe
+                // to run before the floor, which is a larger change than this one.
                 //
-                // `window.rs` keeps its own guard. The honest relationship is
-                // narrower than "two separate guards": at default settings its
-                // `else` arm resolves to `max(pull_ahead, interval, credit_window)`
-                // = the credit window = this same floor, so it is redundant
-                // there. (Not because `DEFAULT_PULL_AHEAD_BYTES` equals one
-                // interval — it is 1 MiB against a 4 MiB default interval. The
-                // `.max(credit_window(..))` term is what makes them coincide.) It
-                // diverges once either `max_blob_size_bytes` is finite (it then
-                // reserves the whole-blob cost) or `pull_ahead_bytes` is raised
-                // above the window — nothing validates that pair against each
-                // other. Neither direction is guaranteed stricter: a 1 MiB blob cap
-                // under an 8 MiB window makes it WEAKER than this floor. It is also
-                // the tier that fronts UPSTREAM spend. Do not delete it on the
-                // strength of this floor alone.
+                // `window.rs` keeps its own guard. Its window is exactly
+                // `self.credit_window(interval_bytes, 0)` — the same ramp-floor
+                // computation this site uses — so the two guards are redundant at
+                // this floor. It is also the tier that fronts UPSTREAM spend (the
+                // pull leg's `RampPacer`, #1669, paces against the SAME ramp as it
+                // pays). Do not delete it on the strength of this floor alone.
                 //
                 // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
                 // front any fill when the pool's on-chain **remaining**
                 // (`getPool.deposit − getPool.totalRedeemed`) minus the refundable
-                // floor `M` cannot cover the reserved credit window: see
+                // floor `M` cannot cover the reserved credit-window floor: see
                 // [`ClientHandler::pool_remaining_covers_window`], the pure policy
-                // this site calls. `reserved` is one credit window, capped by the
-                // request's own aligned span when it bounds itself.
+                // this site calls. `reserved` is one interval (the ramp floor at
+                // `paid = 0`), capped by the request's own aligned span when it
+                // bounds itself.
                 //
                 // `remaining` comes from the cached `getPool` view resolved above;
                 // a `None` view fails open (the on-chain `redeem` is the backstop).
@@ -435,8 +416,8 @@ impl ClientHandler {
                 if known_lane.is_some()
                     && let Some(status) = pool_status
                 {
-                    let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-                    let window = self.credit_window(interval_bytes);
+                    let interval_bytes = VOUCHER_INTERVAL_BYTES;
+                    let window = self.credit_window(interval_bytes, 0);
                     let reserved = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
@@ -527,14 +508,12 @@ impl ClientHandler {
                                             send,
                                             recv,
                                             &req,
-                                            &ext,
                                             hash,
                                             client_node_id,
                                             lk,
                                             ln,
                                             total,
                                             pool_status.map(|s| s.remaining),
-                                            fault_seen,
                                             rate_per_mb,
                                         ))
                                         .await;
@@ -608,7 +587,8 @@ impl ClientHandler {
                 // upstream cost before any downstream voucher), it runs the pull
                 // leg (fill the cache from upstream) beside the serve leg (stream
                 // the filling cache to the paying client), so the per-request
-                // speculative exposure is bounded to `pull_ahead_bytes`.
+                // speculative exposure is bounded to the ramped credit window
+                // (#1669).
                 //
                 // It requires `byte_offset == 0 && byte_len == 0` (a whole-blob
                 // request). This is a conservative constraint on the ROUTING, not a
@@ -643,7 +623,6 @@ impl ClientHandler {
                             send,
                             recv,
                             &req,
-                            &ext,
                             hash,
                             client_node_id,
                             lk,
@@ -774,11 +753,10 @@ impl ClientHandler {
         // The lane is keyed by `(pool_id, bound_signer, this operator)`; a
         // request with no verified binding cannot name a lane, and a bound client
         // whose signer has no lane for this pool resolves to `None`. Both are
-        // refused pre-serve as an unknown lane, subsuming the old owner-mismatch
-        // gate: a binding that does not match the lane's signer simply resolves
-        // to no lane. The mid-stream reason cannot ride in the initial
-        // `StreamResponse`, so use the delivery-side `NotFound` here (avoids
-        // leaking lane existence).
+        // refused pre-serve as an unknown lane: a binding that does not match the
+        // lane's signer resolves to no lane. The mid-stream reason cannot ride in
+        // the initial `StreamResponse`, so use the delivery-side `NotFound` here
+        // (avoids leaking lane existence).
         let Some(lane_key) = lane_key else {
             tracing::warn!("stream request with no verified binding; refusing pre-serve");
             return self
@@ -807,24 +785,25 @@ impl ClientHandler {
 
         // Pre-flight floor-M gate — the direct-serve twin of the pull-through
         // guard in `window.rs` (keep the two in step). Without it the node signs
-        // `ok: true` and streams a full credit window before the first voucher's
+        // `ok: true` and streams a full interval before the first voucher's
         // pool-solvency check can fire, so a pool that cannot cover even that
-        // first window gets it free on every request (#1516).
+        // first interval gets it free on every request (#1516).
         //
         // In the shared-payment-pool model the quantity is the pool's on-chain
         // **remaining** (`getPool.deposit − getPool.totalRedeemed`) minus the
         // refundable floor `M`, checked against the credit-window cost via
         // [`ClientHandler::pool_remaining_covers_window`]. `guard_bytes` is the
-        // chunk-group-aligned span (what `export_bao_range_stream` bills),
-        // capped by the credit window.
+        // chunk-group-aligned span (what `export_bao_range_stream` bills), capped
+        // by the credit-window floor at `paid = 0` — the ramp has not started yet
+        // on a fresh request.
         //
         // `remaining` comes from the cached `getPool` view resolved above. When it
         // is `Some`, refuse `InsufficientDeposit` if the pool's remaining minus the
-        // refundable floor `M` can no longer cover the reserved credit window; a
-        // `None` view fails open (see the gate's construction above).
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // refundable floor `M` can no longer cover the reserved credit-window
+        // floor; a `None` view fails open (see the gate's construction above).
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
-            .min(self.credit_window(interval_bytes));
+            .min(self.credit_window(interval_bytes, 0));
         if let Some(status) = pool_status
             && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
         {
@@ -857,7 +836,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
@@ -873,7 +852,6 @@ impl ClientHandler {
             Some(&lane),
             client_node_id,
             rate_per_mb,
-            interval_mb,
         )
         .await
     }

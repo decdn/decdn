@@ -113,17 +113,6 @@ pub enum MessageValidationError {
     /// recovers the bound address.
     #[error("ClientBinding.binding_signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidBindingSigLen { len: usize },
-    /// A negotiated `voucher_interval_mb` is outside `1..=MAX_VOUCHER_INTERVAL_MB`
-    /// (ADR 003 §Voucher Interval Negotiation). Zero would never require a
-    /// voucher; an oversized value opens an unbounded unvouchered-byte window
-    /// (and `interval * MB_BYTES` can overflow `u64`) — the inverse of #378 for
-    /// the rate field. Enforced via [`crate::client::StreamResponse::validate`]
-    /// / [`crate::client::StreamRequestExt::validate`].
-    #[error(
-        "voucher_interval_mb {interval} out of range (1..={max})",
-        max = crate::client::MAX_VOUCHER_INTERVAL_MB
-    )]
-    VoucherIntervalOutOfRange { interval: u64 },
     /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
     /// `error`. A node MUST NOT both promise to serve and report a failure
     /// (ADR 005 §`cdn/client/v1`). Enforced via
@@ -426,7 +415,7 @@ mod tests {
 
     // Issue #378: the wire boundary MUST reject `rate_per_mb` above
     // MAX_RATE_PER_MB so a malicious peer cannot feed an overflow-inducing
-    // value into the client selection score. The hook now lives on the
+    // value into the client selection score. The hook lives on the
     // signed body field.
     #[test]
     fn probe_response_body_decode_rejects_rate_above_max() -> Result<(), postcard::Error> {

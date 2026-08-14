@@ -25,7 +25,7 @@ This appendix answers one question: **how does the codebase express the non-cont
 - **Contracts are not a seam.** The on-chain surface is production-shaped on every network, including the Sepolia testnet PoC. The only contract-side seam is *deployed contract vs in-process test double* for unit/integration harnesses with no chain, never "PoC stub contract → production contract." Simplified launch economics are the same contracts with different governance-set parameters (`FeeRouter.setShares(...)` etc., per [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)), not a reduced surface.
 - **Solidity selection is outside Rust.** Which contract addresses a network points at is a Foundry deploy-script / chain-id-keyed-config concern, the standard Foundry pattern, not a Rust feature.
 
-### Discovery-provider seam (#818)
+### Discovery-provider seam
 
 The `node` runtime's wiring (`build_endpoint`) selects which NodeId→address discovery the iroh endpoint uses. The leaf crates and the config schema do **not**. `common` config carries plain Strings (`network.discovery.{pkarr_url, dns_origin, peers}`). Resolution validates them with the same parsers the node uses: parseable URL, non-empty origin, valid iroh NodeId (the canonical 64-char lowercase-hex form), parseable `SocketAddr`. The node parses them into iroh providers (`PkarrPublisher` / `DnsAddressLookup` / `MemoryLookup`) and composes them via `Endpoint::builder().address_lookup(..)`.
 

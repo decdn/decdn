@@ -30,7 +30,7 @@ The Ethereum key is the same secp256k1 key the node already holds for staking an
 
 ```
 ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, voucher_interval_mb?, slash_sig}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, slash_sig}
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
@@ -203,7 +203,7 @@ The check applies at initialization too — neither contract may be deployed wit
 
 #### Challenge front-running mitigation (commit–reveal)
 
-**Vector (#854).** Each `submit*Challenge` discloses the full slashable evidence (`probeResponseData`, `streamResponseData`, the operator's `slash_sig`s) in its calldata. If that were the only step, a mempool watcher could copy a pending honest challenge, resubmit it with their own address as `msg.sender`, and become the recorded challenger — capturing the 50% finality reward ([§ Integration](#integration-with-existing-contracts); distributed by `finalizeUnappealedSlash` per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)). The challenge bond round-trips, so only the *reward* is at risk, but that reward is the entire incentive for off-path witnesses, so leaving it MEV-extractable hollows out the enforcement layer. `usedEvidenceHash` only prevents a double-slash; the reward slot is otherwise strict first-lander.
+**Vector.** Each `submit*Challenge` discloses the full slashable evidence (`probeResponseData`, `streamResponseData`, the operator's `slash_sig`s) in its calldata. If that were the only step, a mempool watcher could copy a pending honest challenge, resubmit it with their own address as `msg.sender`, and become the recorded challenger — capturing the 50% finality reward ([§ Integration](#integration-with-existing-contracts); distributed by `finalizeUnappealedSlash` per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)). The challenge bond round-trips, so only the *reward* is at risk, but that reward is the entire incentive for off-path witnesses, so leaving it MEV-extractable hollows out the enforcement layer. `usedEvidenceHash` only prevents a double-slash; the reward slot is otherwise strict first-lander.
 
 **Mechanism.** Every challenge is a two-phase commit–reveal:
 
@@ -244,8 +244,8 @@ The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are s
 | --- | --- | --- | --- | --- | --- |
 | `MAX_EVIDENCE_AGE_US` | `SlashJudge` | 5 days | 1 day | 30 days | `< CapacityBond.unbondingPeriod` (paired) |
 | `MAX_FUTURE_SKEW_US` | `SlashJudge` | 60 s | (fixed) | (fixed) | — |
-| `MIN_REVEAL_DELAY` | `SlashJudge` | 60 s | (fixed) | (fixed) | commit–reveal maturation (#854) |
-| `REVEAL_WINDOW` | `SlashJudge` | 1 day | (fixed) | (fixed) | commit–reveal expiry (#854) |
+| `MIN_REVEAL_DELAY` | `SlashJudge` | 60 s | (fixed) | (fixed) | commit–reveal maturation |
+| `REVEAL_WINDOW` | `SlashJudge` | 1 day | (fixed) | (fixed) | commit–reveal expiry |
 | Challenge bond | `SlashJudge` | (per [ADR 009](009-governance.md#governable-parameters-with-safety-bounds)) | 1 TOKEN | 1,000 TOKEN | — |
 
 The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contracts. Setter paths on both `SlashJudge` and `CapacityBond` enforce the post-update inequality at the contract layer (see [Interaction with unbonding period](#interaction-with-unbonding-period) for the exact revert conditions); violating updates revert atomically with the setter call. `MAX_FUTURE_SKEW_US` is fixed at 60 seconds at deployment and not governable — it absorbs NTP drift between challenger and evidence-signing node and has no economic surface that varies by network conditions. Challenge bond bounds are canonical in [ADR 009](009-governance.md#governable-parameters-with-safety-bounds); listed here for completeness.
@@ -270,7 +270,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 ### Positive
 
-- Both slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
+- Both slashable offenses have a concrete, gas-efficient on-chain evidence path. Slashing is enforceable.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
 - `slash_sig` reuses the existing NodeId-to-Ethereum-address binding in `CapacityBond` — no new on-chain registration step.
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.

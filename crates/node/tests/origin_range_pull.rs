@@ -37,7 +37,7 @@ use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
 use decdn_protocol::{
-    ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, encode_stream_request, write_frame,
+    ALPN_CLIENT, MB_BYTES, VOUCHER_INTERVAL_BYTES, encode_stream_request, write_frame,
 };
 use iroh::EndpointAddr;
 use iroh::endpoint::SendStream;
@@ -184,7 +184,6 @@ async fn ranged_paid_pull(
         .as_bytes()
         .to_vec();
     let ext = StreamRequestExt {
-        voucher_interval_mb: None,
         binding: Some(ClientBinding {
             ethereum_address: client_eth.address().into(),
             binding_signature,
@@ -234,10 +233,7 @@ async fn ranged_paid_pull(
             .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
-    let interval_bytes = resp
-        .voucher_interval_mb
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
-        .saturating_mul(MB_BYTES);
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -646,7 +642,6 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
     let ext = StreamRequestExt {
-        voucher_interval_mb: None,
         binding: None,
         capability: None,
     };

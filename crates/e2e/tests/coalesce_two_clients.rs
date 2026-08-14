@@ -1,4 +1,4 @@
-//! B3.5 money proof — two real paying clients coalesce onto ONE serve-miss fill,
+//! Money proof — two real paying clients coalesce onto ONE serve-miss fill,
 //! each paying its OWN egress on its OWN pool lane (#1656).
 //!
 //! Two independently-funded `cdn/client/v1` buyers fetch the SAME missing blob
@@ -52,8 +52,7 @@
 //!     tier is metered per request (owner AND observer both bump it), and there is
 //!     no owner-vs-observer counter, so `decdn_local_outboard_serves_total` alone
 //!     cannot distinguish one coalesced fill from two independent ones. This e2e
-//!     therefore stays focused on the two-independent-settlements proof, per the
-//!     B3.5 brief's sanctioned scope.
+//!     therefore stays focused on the two-independent-settlements proof.
 //!
 //! Gated behind `anvil-e2e` (off by default). Requires `anvil` + `forge` on
 //! `PATH` and a prior build of the `decdn-node` binary:

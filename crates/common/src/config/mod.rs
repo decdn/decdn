@@ -31,13 +31,6 @@ pub use types::FileConfig;
 const DEFAULT_BIND_PORT: u16 = 4433;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
-/// Default maximum single blob size in megabytes (1 GB).
-///
-/// Deliberately well below `DEFAULT_CACHE_SIZE_MB` so a single oversized
-/// blob can't saturate the entire cache and evict all other content in
-/// one fetch. The `max_blob_size_mb < cache_size_mb` invariant is enforced
-/// at config load (see `resolve_cache_into`).
-const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port. Exposed publicly so `decdn node top`
@@ -68,10 +61,8 @@ const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 /// unchanged from before #1011; it also overrides alloy's 250 ms localhost
 /// default, which the receipt heartbeat would otherwise use against a dev anvil.
 const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
-/// Minimum chain-event poll interval. The floor is unchanged from #1011; its
-/// reason is not. The long-lived `eth_newFilter` streams it was originally sized
-/// against are gone — #1106 replaced them with `eth_getLogs` polling, so no
-/// `eth_getFilterChanges` is issued anywhere on the node. At 250 ms the node's
+/// Minimum chain-event poll interval. The node polls chain events with
+/// `eth_getLogs` and issues no `eth_getFilterChanges` anywhere. At 250 ms the node's
 /// ~6 watcher loops would each scan `[cursor, head]` four times a second against
 /// one endpoint, tripping provider rate limits and burning paid quota just as the
 /// original flood did. The same floor bounds the receipt-heartbeat consumer.
@@ -288,67 +279,43 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// a total miss: 167.5 s at defaults.
 pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
-/// Default window-paced pull-through pipeline window (#856, ADR 037
-/// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
-/// most this many bytes ahead of the requesting client's cleared payment, so an
-/// abandoned request costs at most this window of upstream spend, not the whole
-/// blob.
-pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
-/// Default downstream paid-delivery credit window (ADR 003 §Credit window): 8
-/// MiB. The serve loop keeps streaming while `delivered − paid ≤ credit_window`,
-/// so paid delivery pipelines behind this bound instead of stalling a full round
-/// trip at every voucher interval. At the 4 MiB default interval this is two
-/// intervals of headroom, which keeps ~150 MiB/s reachable at a 50 ms RTT (a
-/// stop-and-wait 1 MiB interval caps at ~19 MiB/s there). It is the node's whole
-/// credit exposure — unbilled egress already on the wire — and is strictly
-/// cheaper than the speculative USDC the node already fronts on an upstream pull
-/// ([`DEFAULT_PULL_AHEAD_BYTES`]); the client's exposure stays zero because
-/// vouchers are cumulative over bytes already delivered.
-pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// Default downstream credit-window ceiling (ADR 003 §Credit window): 64 MiB. A
+/// stream's window ramps from one voucher interval toward this cap in proportion
+/// to what the stream has already paid; a fully-ramped high-bandwidth lane runs
+/// link-bound within this bound, while a non-paying lane stays pinned at the
+/// interval floor. Node-local policy, floored to one interval by the serve loop.
+pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
+/// Default ramp divisor (ADR 003 §Credit window): 2. The credit window is at most
+/// `paid / credit_ramp_divisor`, so the node's unbilled egress on a stream never
+/// exceeds half the revenue the stream has already confirmed. Lower ramps faster;
+/// `0` opens the full [`DEFAULT_CREDIT_MAX`] from the first byte.
+pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
 /// Default group-commit interval in milliseconds when
 /// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
-/// state persistence, #1483): 5 ms.
+/// state persistence): 5 ms.
 ///
 /// The serve loop amortizes the per-voucher fsynced redb commit (~3 ms on local
 /// SSD) across a batch — one fsync for several vouchers, each acknowledged only
 /// *after* the commit is durable, so the replay guard is preserved verbatim. The
-/// batch is gathered by delivering ahead within the [credit
-/// window](DEFAULT_CREDIT_WINDOW_BYTES) and collecting the vouchers that arrive;
-/// this interval bounds how long the loop waits for a straggling batch-mate
-/// before committing what it has, so a client that pauses payment is never
-/// stalled longer than this. It is bounded above by the window: at most
-/// `credit_window / voucher_interval` vouchers can be outstanding, so the batch
-/// never exceeds that regardless of this value.
+/// batch is gathered by delivering ahead within the ramped [credit
+/// window](DEFAULT_CREDIT_MAX) and collecting the vouchers that arrive; this
+/// interval bounds how long the loop waits for a straggling batch-mate before
+/// committing what it has, so a client that pauses payment is never stalled
+/// longer than this. It is bounded above by the window: at most `credit_window /
+/// VOUCHER_INTERVAL_BYTES` vouchers can be outstanding, so the batch never
+/// exceeds that regardless of this value.
 ///
 /// **Sizing constraint.** The interval spends credit-window headroom, not
 /// throughput: to keep the link saturated while acknowledgements lag one commit
 /// interval, size the window so that
-/// `credit_window ≥ throughput × (RTT + commit_interval)`. At the 8 MiB default
-/// window and a 50 ms RTT, a 5–20 ms interval is comfortable. `0` disables the
-/// gather wait (commit each blocking-read batch immediately); a stop-and-wait
-/// window (≤ one interval) ignores it entirely, since only one voucher is ever
-/// outstanding. Node-local policy, not a wire or governance parameter — like the
-/// voucher interval and the credit window it has no on-chain counterpart.
+/// `credit_window ≥ throughput × (RTT + commit_interval)`. At a fully-ramped 64
+/// MiB window and a 50 ms RTT, a 5–20 ms interval is comfortable. `0` disables
+/// the gather wait (commit each blocking-read batch immediately); a
+/// stop-and-wait window (≤ one interval) ignores it entirely, since only one
+/// voucher is ever outstanding. Node-local policy, not a wire or governance
+/// parameter — like the voucher interval and the credit window it has no
+/// on-chain counterpart.
 pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
-/// Default voucher cadence a node advertises in `StreamResponse` when
-/// `payment.voucher_interval_mb` is unset (ADR 003 §Voucher Interval
-/// Negotiation): 4 MiB. Coarser than the protocol's wire-level
-/// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (the "neither peer proposed"
-/// fallback, 1 MiB) because per-channel vouchers serialize on one fsynced redb
-/// commit (~3 ms): a larger interval lifts that per-channel throughput cap
-/// linearly without raising the credit exposure, which is the window, not the
-/// interval. Independent of [`DEFAULT_CREDIT_WINDOW_BYTES`]; both are set from
-/// config and floored so the window is always at least one interval.
-pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 4;
-/// Default node-wide unrecouped-leech budget (#856, ADR 037
-/// `max_unrecouped_leech_bytes`): 256 MiB. Aggregate speculative pull-through
-/// spend above this pauses until the node serves and recoups. Finite by ADR
-/// commitment; operator-tunable and modeled before locking.
-pub const DEFAULT_MAX_UNRECOUPED_LEECH_BYTES: u64 = 256 * 1024 * 1024;
-/// Default per-peer share ratio (#856, ADR 037 `share_ratio`): 400 == 4.0×. A
-/// peer may be pulled for up to 4× the bytes it has been served, plus the
-/// opening `pull_ahead_bytes` window. Bounded by ADR commitment.
-pub const DEFAULT_PULL_SHARE_RATIO_PERCENT: u64 = 400;
 
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.
 /// With the default `retained_files` this bounds the audit log to ~640 MiB
@@ -1532,12 +1499,10 @@ fn resolve_blockchain_into(
 
 /// Resolve cache fields.
 ///
-/// Enforces `max_blob_size_mb < cache_size_mb`: a single blob equal to or
-/// larger than the cache would saturate the store on one fetch and evict
-/// every other entry, making the node a one-shot download target rather
-/// than a useful cache. Equality is rejected along with the greater-than
-/// case because a cache that can hold exactly one blob has the same
-/// failure mode as one that overflows.
+/// Enforces `max_blob_size_mb <= cache_size_mb`: a blob larger than the whole
+/// cache could never be admitted, so a value above the disk budget is a
+/// permanent-reject misconfiguration. Equality is allowed and is the default —
+/// the disk budget is the ceiling, and a node serves any blob it can hold.
 #[cfg(test)]
 fn resolve_cache(
     cli: &crate::cli::run::CacheArgs,
@@ -1569,10 +1534,14 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.cache_size_mb))
         .unwrap_or(DEFAULT_CACHE_SIZE_MB);
 
+    // Unset => the disk budget itself. A node admits any blob its cache can
+    // hold; operators who want a tighter per-blob bound (for example to cap the
+    // RAM the buffered miss tier spends on one pull) set it explicitly below
+    // `cache_size_mb`.
     let max_blob_size_mb = cli
         .max_blob_size_mb
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
-        .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
+        .unwrap_or(cache_size_mb);
 
     // Buyer-side absolute per-MB rate ceiling (#1375); `0` = unlimited (the
     // default). CLI/env override wins over the file, matching every other knob.
@@ -1582,13 +1551,13 @@ fn resolve_cache_into(
         .unwrap_or(0);
 
     bag.check_with(
-        max_blob_size_mb < cache_size_mb,
+        max_blob_size_mb <= cache_size_mb,
         "cache.max_blob_size_mb",
         || {
             format!(
-                "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
-             cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
-             can saturate the cache on one fetch"
+                "cache.max_blob_size_mb ({max_blob_size_mb}) must not exceed \
+             cache.cache_size_mb ({cache_size_mb}); a blob larger than the whole \
+             cache could never be admitted"
             )
         },
     );
@@ -1778,8 +1747,9 @@ fn resolve_cache_into(
     // — folding it into the local EWMA *and* the observation buffer the gossip
     // publisher drains. So a single fat-fingered value would not merely break this
     // node: it would broadcast false `Unreachable` observations about every honest
-    // peer it touches. (Its predecessor, `PullTimeout`, was exonerating, so the
-    // blast radius of a bad value used to stop at the local node.)
+    // peer it touches. Contrast the sibling knob `node_pull_timeout_sec`: a bad value
+    // there trips `PullTimeout`, which is exonerating, so its blast radius stops at the
+    // local node.
     bag.check(
         node_pull_stall_timeout_sec > 0,
         "cache.node_pull_stall_timeout_sec",
@@ -1787,43 +1757,6 @@ fn resolve_cache_into(
          upstream as stalled on the first read, scoring — and gossiping — every \
          honest peer as unreachable)",
     );
-    // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
-    // keep them typed through the cross-field check and `ResolvedCache`
-    // construction below, so a bytes<->percent (or bytes<->bytes) transposition
-    // inside this resolver is a compile error too.
-    let pull_ahead_bytes = file
-        .and_then(|c| c.pull_ahead_bytes)
-        .unwrap_or(decdn_config_types::Bytes::new(DEFAULT_PULL_AHEAD_BYTES));
-    let max_unrecouped_leech_bytes =
-        file.and_then(|c| c.max_unrecouped_leech_bytes)
-            .unwrap_or(decdn_config_types::Bytes::new(
-                DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-            ));
-    let pull_share_ratio_percent =
-        file.and_then(|c| c.pull_share_ratio_percent)
-            .unwrap_or(decdn_config_types::Percent::new(
-                DEFAULT_PULL_SHARE_RATIO_PERCENT,
-            ));
-
-    // A single request's speculative pull-ahead window must fit within the
-    // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
-    // the global counter past the cap before its first voucher clears, so the
-    // budget cannot accommodate even one window and every speculative serve
-    // refuses immediately. `max_unrecouped_leech_bytes == 0` disables the global
-    // cap, so the check only binds when the budget is enabled.
-    bag.check_with(
-        max_unrecouped_leech_bytes.get() == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
-        "cache.pull_ahead_bytes",
-        || {
-            format!(
-                "cache.pull_ahead_bytes ({pull_ahead_bytes}) must not exceed \
-                 cache.max_unrecouped_leech_bytes ({max_unrecouped_leech_bytes}): a single \
-                 request's pull-ahead window cannot be larger than the node-wide \
-                 unrecouped-leech budget"
-            )
-        },
-    );
-
     ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -1849,9 +1782,6 @@ fn resolve_cache_into(
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
-        pull_ahead_bytes,
-        max_unrecouped_leech_bytes,
-        pull_share_ratio_percent,
     }
 }
 
@@ -2164,10 +2094,9 @@ fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
         "bucket name must be 3..=63 chars (got {len})"
     );
     // AWS: "Bucket names must begin and end with a letter or number"
-    // — i.e. no leading/trailing `.` or `-`. The dot rule used to be
-    // the only one here; the hyphen rule was missed in the first
-    // pass. Names like `-foo` or `foo-` would parse but fail
-    // virtual-hosted-style URLs at request time.
+    // — i.e. no leading/trailing `.` or `-`. Both the leading/trailing
+    // dot and hyphen are rejected here. Names like `-foo` or `foo-`
+    // would parse but fail virtual-hosted-style URLs at request time.
     let first = name.bytes().next().unwrap_or(0);
     let last = name.bytes().next_back().unwrap_or(0);
     anyhow::ensure!(
@@ -2497,8 +2426,7 @@ pub fn resolve_payment_into(
     // The clamp only ever raises `rate_per_mb`, so a floor above the wire cap
     // would make the node sign a rate honest clients reject outright (#378).
     // There is no lower guard to write: with `rate_per_mb >= 1` validated above
-    // and a raise-only clamp, the signed rate can never collapse to 0 — an
-    // invariant the removed governance ceiling used to need a check for.
+    // and a raise-only clamp, the signed rate can never collapse to 0.
     bag.check_with(
         delivery_floor <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.delivery_floor",
@@ -2511,37 +2439,23 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Voucher cadence advertised in `StreamResponse` (ADR 003 §Voucher Interval
-    // Negotiation). Default `DEFAULT_VOUCHER_INTERVAL_MB` (4 MB); hardcoded wire
-    // range 1..=1024 (no on-chain counterpart). File-only (no CLI override) — it
-    // is read once at handler construction, not hot-reloadable.
-    let voucher_interval_mb = file
-        .and_then(|p| p.voucher_interval_mb)
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB);
-    // Lower bound is the literal minimum cadence (1 MB), not the default const:
-    // a future change to DEFAULT_VOUCHER_INTERVAL_MB must not narrow the valid
-    // wire range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
-    bag.check_with(
-        (1..=decdn_protocol::MAX_VOUCHER_INTERVAL_MB).contains(&voucher_interval_mb),
-        "payment.voucher_interval_mb",
-        || {
-            format!(
-                "payment.voucher_interval_mb {voucher_interval_mb} out of range \
-                 [1, {}] (ADR 003 §Voucher Interval Negotiation)",
-                decdn_protocol::MAX_VOUCHER_INTERVAL_MB,
-            )
-        },
-    );
-    // Downstream credit window (ADR 003 §Credit window). Default 8 MiB; no upper
-    // bound beyond the runtime deposit guard — a larger window is more unbilled
-    // egress the node fronts, which the operator owns. Floored to one interval by
-    // the serve loop, so no lower bound is enforced here.
-    let credit_window_bytes = file
-        .and_then(|p| p.credit_window_bytes.as_ref())
-        .map_or(DEFAULT_CREDIT_WINDOW_BYTES, |b| b.get());
-    // Group-commit interval (ADR 003 §Off-chain voucher state persistence,
-    // #1483). Default 5 ms; `0` (commit each blocking-read batch immediately) is
-    // a valid setting, so it merges as a first-class value rather than falling
+    // Downstream credit-window ceiling (ADR 003 §Credit window). Default 64 MiB;
+    // no upper bound beyond the runtime deposit guard — a larger ceiling is more
+    // unbilled egress the node fronts once a stream has ramped up, which the
+    // operator owns. Floored to one interval by the serve loop, so no lower
+    // bound is enforced here.
+    let credit_max = file
+        .and_then(|p| p.credit_max.as_ref())
+        .map_or(DEFAULT_CREDIT_MAX, |b| b.get());
+    // Ramp divisor (ADR 003 §Credit window). Default 2; `0` (open the full
+    // ceiling immediately) is a valid setting, so it merges as a first-class
+    // value rather than falling back to the default.
+    let credit_ramp_divisor = file
+        .and_then(|p| p.credit_ramp_divisor)
+        .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
+    // Group-commit interval (ADR 003 §Off-chain voucher state persistence).
+    // Default 5 ms; `0` (commit each blocking-read batch immediately) is a
+    // valid setting, so it merges as a first-class value rather than falling
     // back to the default.
     let voucher_commit_interval_ms = file
         .and_then(|p| p.voucher_commit_interval_ms)
@@ -2549,8 +2463,8 @@ pub fn resolve_payment_into(
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
-        voucher_interval_mb,
-        credit_window_bytes,
+        credit_max,
+        credit_ramp_divisor,
         voucher_commit_interval_ms,
     }
 }
@@ -4344,7 +4258,7 @@ mod tests {
     }
 
     /// A zero stall budget is the most dangerous value in this file (#1134 review).
-    /// `PullStalled` — unlike the `PullTimeout` it replaced — SCORES the peer, and
+    /// `PullStalled` SCORES the peer, and
     /// `record_outcome` writes both the local EWMA and the observation buffer the
     /// gossip publisher drains. So a `0` here would not merely break this node: it
     /// would trip on the first poll of every streaming read and broadcast false
@@ -4504,76 +4418,6 @@ mod tests {
         anyhow::ensure!(
             msg.contains("cache.origin.path") && msg.contains("must not be empty"),
             "error lacked context: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cache_rejects_window_larger_than_leech_budget() -> anyhow::Result<()> {
-        // #856: a per-request pull-ahead window larger than the node-wide
-        // unrecouped-leech budget is rejected — one request could drive the global
-        // counter past the cap before its first voucher clears.
-        let cli = empty_cache_args();
-        let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
-            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(1024 * 1024)),
-            ..Default::default()
-        };
-        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected window-vs-budget rejection"))?;
-        let msg = format!("{err:#}");
-        anyhow::ensure!(
-            msg.contains("cache.pull_ahead_bytes") && msg.contains("max_unrecouped_leech_bytes"),
-            "error lacked context: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cache_allows_large_window_when_global_cap_disabled() -> anyhow::Result<()> {
-        // `max_unrecouped_leech_bytes == 0` disables the global cap, so the
-        // window-vs-budget check does not bind.
-        let cli = empty_cache_args();
-        let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
-            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(0)),
-            ..Default::default()
-        };
-        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
-        anyhow::ensure!(
-            resolved.pull_ahead_bytes == decdn_config_types::Bytes::new(8 * 1024 * 1024),
-            "window not preserved when the global cap is disabled"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cache_byte_percent_knobs_round_trip_from_toml() -> anyhow::Result<()> {
-        // #894: the Bytes/Percent newtypes are `#[serde(transparent)]`, so the
-        // wire form stays a bare integer and wrapping the formerly-`u64` knobs is
-        // non-breaking. Assert a real TOML `[cache]` block deserializes the bare
-        // integers straight into the typed fields — the promise the newtypes make.
-        let file: crate::config::FileConfig = ::toml::from_str(
-            "[cache]\npull_ahead_bytes = 1048576\nmax_unrecouped_leech_bytes = 2097152\npull_share_ratio_percent = 200\n",
-        )?;
-        let cache = file
-            .cache
-            .ok_or_else(|| anyhow::anyhow!("missing [cache] section"))?;
-        anyhow::ensure!(
-            cache.pull_ahead_bytes == Some(decdn_config_types::Bytes::new(1_048_576)),
-            "pull_ahead_bytes did not round-trip: {:?}",
-            cache.pull_ahead_bytes
-        );
-        anyhow::ensure!(
-            cache.max_unrecouped_leech_bytes == Some(decdn_config_types::Bytes::new(2_097_152)),
-            "max_unrecouped_leech_bytes did not round-trip: {:?}",
-            cache.max_unrecouped_leech_bytes
-        );
-        anyhow::ensure!(
-            cache.pull_share_ratio_percent == Some(decdn_config_types::Percent::new(200)),
-            "pull_share_ratio_percent did not round-trip: {:?}",
-            cache.pull_share_ratio_percent
         );
         Ok(())
     }
@@ -4980,9 +4824,8 @@ swap_pool_address = \"0xPool\"
     }
 
     // Origin variant from TOML resolves into a typed `ResolvedOrigin::Http`
-    // that round-trips the parsed URL (#437). Replaces the CLI-vs-TOML
-    // precedence test that lived here before — the origin no longer has a
-    // CLI flag, so precedence is moot, but we still want a smoke test that
+    // that round-trips the parsed URL (#437). The origin has no CLI flag, so
+    // there is no CLI-vs-TOML precedence to test; this is a smoke test that
     // the TOML form makes it through resolution without dropping anything.
     #[test]
     fn resolve_cache_origin_http_from_toml_round_trips() -> anyhow::Result<()> {
@@ -5015,8 +4858,8 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let err = resolve_payment(&cli, Some(&file))
@@ -5063,8 +4906,8 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -5085,14 +4928,14 @@ swap_pool_address = \"0xPool\"
             resolved.rate_per_mb
         );
         anyhow::ensure!(
-            resolved.voucher_interval_mb == DEFAULT_VOUCHER_INTERVAL_MB,
-            "voucher_interval_mb default, got: {}",
-            resolved.voucher_interval_mb
+            resolved.credit_max == DEFAULT_CREDIT_MAX,
+            "credit_max default, got: {}",
+            resolved.credit_max
         );
         anyhow::ensure!(
-            resolved.credit_window_bytes == DEFAULT_CREDIT_WINDOW_BYTES,
-            "credit_window_bytes default, got: {}",
-            resolved.credit_window_bytes
+            resolved.credit_ramp_divisor == DEFAULT_CREDIT_RAMP_DIVISOR,
+            "credit_ramp_divisor default, got: {}",
+            resolved.credit_ramp_divisor
         );
         anyhow::ensure!(
             resolved.voucher_commit_interval_ms == DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
@@ -5110,8 +4953,8 @@ swap_pool_address = \"0xPool\"
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
                 delivery_floor: None,
-                voucher_interval_mb: None,
-                credit_window_bytes: None,
+                credit_max: None,
+                credit_ramp_divisor: None,
                 voucher_commit_interval_ms: set,
             };
             let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -5125,56 +4968,41 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_payment_threads_explicit_voucher_interval() -> anyhow::Result<()> {
-        let file = types::PaymentConfig {
-            rate_per_mb: Some(10),
-            delivery_floor: None,
-            voucher_interval_mb: Some(64),
-            credit_window_bytes: None,
-            voucher_commit_interval_ms: None,
-        };
-        let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
-        anyhow::ensure!(resolved.voucher_interval_mb == 64);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_threads_explicit_credit_window() -> anyhow::Result<()> {
-        let file = types::PaymentConfig {
-            rate_per_mb: Some(10),
-            delivery_floor: None,
-            voucher_interval_mb: None,
-            credit_window_bytes: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
-            voucher_commit_interval_ms: None,
-        };
-        let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
+    fn resolve_payment_defaults_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
+        let resolved = resolve_payment(&empty_payment_args(), None)?;
         anyhow::ensure!(
-            resolved.credit_window_bytes == 32 * 1024 * 1024,
-            "credit_window_bytes threaded, got: {}",
-            resolved.credit_window_bytes
+            resolved.credit_max == DEFAULT_CREDIT_MAX,
+            "got: {}",
+            resolved.credit_max
+        );
+        anyhow::ensure!(
+            resolved.credit_ramp_divisor == DEFAULT_CREDIT_RAMP_DIVISOR,
+            "got: {}",
+            resolved.credit_ramp_divisor
         );
         Ok(())
     }
 
     #[test]
-    fn resolve_payment_rejects_voucher_interval_out_of_range() -> anyhow::Result<()> {
-        for bad in [0u64, decdn_protocol::MAX_VOUCHER_INTERVAL_MB + 1] {
-            let file = types::PaymentConfig {
-                rate_per_mb: Some(10),
-                delivery_floor: None,
-                voucher_interval_mb: Some(bad),
-                credit_window_bytes: None,
-                voucher_commit_interval_ms: None,
-            };
-            let err = resolve_payment(&empty_payment_args(), Some(&file))
-                .err()
-                .ok_or_else(|| anyhow::anyhow!("expected rejection for interval {bad}"))?
-                .to_string();
-            anyhow::ensure!(
-                err.contains("voucher_interval_mb"),
-                "error lacked field context for {bad}: {err}"
-            );
-        }
+    fn resolve_payment_threads_explicit_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(10),
+            delivery_floor: None,
+            credit_max: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
+            credit_ramp_divisor: Some(5),
+            voucher_commit_interval_ms: None,
+        };
+        let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
+        anyhow::ensure!(
+            resolved.credit_max == 32 * 1024 * 1024,
+            "credit_max threaded, got: {}",
+            resolved.credit_max
+        );
+        anyhow::ensure!(
+            resolved.credit_ramp_divisor == 5,
+            "credit_ramp_divisor threaded, got: {}",
+            resolved.credit_ramp_divisor
+        );
         Ok(())
     }
 
@@ -5229,15 +5057,15 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_cache_rejects_max_blob_equal_to_cache_size() -> anyhow::Result<()> {
+    fn resolve_cache_accepts_max_blob_equal_to_cache_size() -> anyhow::Result<()> {
+        // Equality is the default (unset => cache_size_mb) and is allowed:
+        // the disk budget is the admission ceiling.
         let cli = cache_cli(Some(100), Some(100));
-        let err = resolve_cache(&cli, None, Path::new("/tmp"))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for max == cache"))?
-            .to_string();
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            err.contains("max_blob_size_mb") && err.contains("cache_size_mb"),
-            "error lacked context: {err}"
+            resolved.max_blob_size_mb == 100,
+            "max_blob: {}",
+            resolved.max_blob_size_mb
         );
         Ok(())
     }
@@ -5250,7 +5078,7 @@ swap_pool_address = \"0xPool\"
             .ok_or_else(|| anyhow::anyhow!("expected rejection for max > cache"))?
             .to_string();
         anyhow::ensure!(
-            err.contains("strictly less than"),
+            err.contains("must not exceed"),
             "error lacked context: {err}"
         );
         Ok(())
@@ -6993,13 +6821,13 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
-        // Regression guard: if either default changes, the pair must still
-        // satisfy `max_blob < cache_size`. Lives here so a future edit to
-        // the DEFAULT_* constants can't silently reintroduce the #221 bug.
+        // Regression guard: the resolved defaults must satisfy the load-time
+        // `max_blob_size_mb <= cache_size_mb` invariant. The default is
+        // equality (unset => cache_size_mb).
         let cli = cache_cli(None, None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.max_blob_size_mb < resolved.cache_size_mb,
+            resolved.max_blob_size_mb <= resolved.cache_size_mb,
             "defaults violate invariant: max_blob={} cache_size={}",
             resolved.max_blob_size_mb,
             resolved.cache_size_mb
@@ -7336,7 +7164,7 @@ swap_pool_address = \"0xPool\"
     fn run_subcommand_args_are_wired_to_decdn_env_vars() {
         use clap::{Args, CommandFactory, Parser};
 
-        // The user CLI no longer has a `run` subcommand (#421 — the
+        // The user CLI has no `run` subcommand (#421 — the
         // daemon binary `decdn-node` owns it). `RunArgs` itself
         // remains in `decdn-common` because `decdn config validate`
         // flattens it for env-var parity with the daemon. Wrap
@@ -9460,7 +9288,8 @@ swap_pool_address = \"0xPool\"
         let cli = empty_cache_args();
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
-        assert_eq!(resolved.max_blob_size_mb, DEFAULT_MAX_BLOB_SIZE_MB);
+        // Unset `max_blob_size_mb` defaults to the disk budget itself.
+        assert_eq!(resolved.max_blob_size_mb, DEFAULT_CACHE_SIZE_MB);
         Ok(())
     }
 
@@ -9507,8 +9336,8 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
             delivery_floor: None,
-            voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -9522,8 +9351,8 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
             delivery_floor: None,
-            voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;

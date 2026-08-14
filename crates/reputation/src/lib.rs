@@ -6,8 +6,7 @@
 //!   observed delivery (speed, correctness) to a `[0,1]` score fed into the
 //!   local EWMA.
 //!
-//! This crate scores only from direct, first-party delivery outcomes; the
-//! gossip-aggregated network tier has been removed.
+//! This crate scores only from direct, first-party delivery outcomes.
 
 pub mod interaction;
 pub mod local;

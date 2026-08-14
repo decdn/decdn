@@ -832,6 +832,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **config: `cache.max_blob_size_mb` now defaults to `cache.cache_size_mb`
+  instead of a fixed 1 GiB.** The old memory-era default refused a blob a node's
+  disk could easily hold. Unset, the disk budget is now the admission ceiling; a
+  node admits any blob it can store. The knob stays node-configurable for
+  operators who want a tighter per-blob bound (for example to cap the RAM the
+  buffered miss tier spends on one pull). The load-time invariant relaxes from
+  `max_blob_size_mb < cache_size_mb` to `<=` so the default (equality) is legal;
+  a value above `cache_size_mb` is still rejected as a permanent-reject
+  misconfiguration, and `0` still means unlimited.
+
 - **`contracts/script/lib/BuybackVenueLib.sol` is now the single home for buyback
   venue dispatch and burner construction (#1090).** The steady-state FeeRouter
   split, the canonical Permit2 address, the `BUYBACK_VENUE` string dispatch, and

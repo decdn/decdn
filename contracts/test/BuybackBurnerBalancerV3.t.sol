@@ -530,8 +530,8 @@ contract BuybackBurnerBalancerV3Test is Test {
         );
         bb.setSlippageTolerance(SLIPPAGE_CEILING + 1);
 
-        // The pre-#1532 boundary: anything short of 100% used to pass, which
-        // scaled the TWAP floor to 0.01% of fair value — a disabled guard.
+        // A slippage tolerance short of 100% would scale the TWAP floor toward
+        // 0.01% of fair value — a disabled guard — so the ceiling rejects it.
         vm.prank(gov);
         vm.expectRevert(
             abi.encodeWithSelector(GuardedBuybackBurner.SlippageOutOfBounds.selector, 9999, SLIPPAGE_CEILING)
@@ -637,8 +637,8 @@ contract BuybackBurnerBalancerV3Test is Test {
     }
 
     function test_constructor_revertsOnZeroMaxBuyback() public {
-        // `min == max == 0` used to construct cleanly and then revert
-        // `AboveMaxBuyback` on every non-zero call, forever (#1532).
+        // `min == max == 0` would let the burner construct cleanly and then revert
+        // `AboveMaxBuyback` on every non-zero call forever, so the constructor rejects it.
         BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
         cfg.minBuybackAmount_ = 0;
         cfg.maxBuybackAmount_ = 0;

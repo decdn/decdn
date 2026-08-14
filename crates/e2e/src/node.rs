@@ -707,10 +707,10 @@ metrics_bind = "127.0.0.1"
 }
 
 /// Rewrite `payment.rate_per_mb` in a node TOML config, preserving every other
-/// key. Split out of [`NodeFixture::set_rate_per_mb`] so its parse → mutate →
+/// key. Separate from [`NodeFixture::set_rate_per_mb`] so its parse → mutate →
 /// `toml::to_string` round-trip is testable without a live daemon (#1378): the
 /// serializer's `ValueAfterTable` hazard (a scalar written after a sub-table in
-/// `[cache]`) is handled today because each table gets its own buffer, but a
+/// `[cache]`) is handled because each table gets its own buffer, but a
 /// `toml` bump could silently break it — this is the plain-`cargo nextest`
 /// guard, mirroring `render_config_emits_parseable_toml`.
 fn rewrite_rate_per_mb(config: &str, rate: u64) -> anyhow::Result<String> {

@@ -1,5 +1,4 @@
 //! Blob delivery: export the requested range and stream it as paid chunks.
-//! Bodies split from `mod.rs` (#1254).
 
 use std::pin::Pin;
 
@@ -9,7 +8,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::{
     Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, MB_BYTES, Mutex, RecvStream, SendStream, VecDeque,
+    LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES, VecDeque,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -23,9 +22,8 @@ type BaoExportStream = Pin<Box<dyn Stream<Item = CacheResult<Bytes>> + Send>>;
 /// The export yields one item per bao element — a 64-byte proof pair or one
 /// 16 KiB chunk group — which does not line up with [`decdn_protocol::CHUNK_SIZE`]
 /// (1 KiB). This buffers just enough to cut full-size frames, so the serve task
-/// holds O(one export item) rather than O(blob size). It replaces the
-/// `slice::chunks` iterator that used to walk a fully-materialised export buffer,
-/// and reproduces that iterator's two load-bearing properties exactly:
+/// holds O(one export item) rather than O(blob size). It guarantees two
+/// load-bearing properties:
 ///
 /// - **Never an empty frame.** `ChunkData` cannot hold one (#1088), and the
 ///   inactivity deadline on both receive loops rests on "a frame arrived" and
@@ -114,7 +112,7 @@ impl ChunkFramer {
 
 impl ClientHandler {
     /// Stream blob bytes to the paying client behind a credit window (ADR 003
-    /// §Credit window): keep delivering `voucher_interval_mb`-sized batches while
+    /// §Credit window): keep delivering `VOUCHER_INTERVAL_BYTES`-sized batches while
     /// `delivered − paid ≤ credit_window`, collecting cumulative vouchers as they
     /// arrive instead of stalling a full round trip at every interval boundary. A
     /// closing voucher settles the final partial batch. Returns `Ok(())` on a
@@ -139,7 +137,6 @@ impl ClientHandler {
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        interval_mb: u64,
     ) -> anyhow::Result<()> {
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
@@ -154,10 +151,10 @@ impl ClientHandler {
         //
         // The STREAMING export is the load-bearing choice here (#1132). Its
         // whole-blob sibling `export_bao_range` materialises the entire aligned
-        // range before the first frame goes out, so serving a 708 MB blob cost
+        // range before the first frame goes out, so serving a 708 MB blob costs
         // ~708 MB resident per concurrent serve. Streaming bounds this task to one
         // export item plus one wire frame, independent of blob size. Do not
-        // reintroduce the buffered call here.
+        // use the buffered call here.
         //
         // The export snaps to enclosing 16 KiB chunk-group boundaries (a
         // bao proof anchors whole groups); the serve side does NOT trim back to
@@ -176,18 +173,14 @@ impl ClientHandler {
             .await
             .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
 
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
-        // The downstream credit window, floored at one interval so the loop can
-        // always make progress and — for the unconfigured default — collapses to
-        // stop-and-wait. See [`ClientHandler::credit_window`].
-        let window = self.credit_window(interval_bytes);
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         // Group-commit cap (#1483): at most this many vouchers share one fsync.
-        // Bounded by how many intervals fit in the window — the window caps the
-        // in-flight (delivered-but-unpaid) intervals — so at the one-interval
-        // stop-and-wait floor this is 1 and each recoup collects a single voucher,
-        // exactly the pre-batch cadence. `interval_bytes >= 1` (floored in
-        // `credit_window`), so the division never divides by zero.
-        let batch_cap = usize::try_from(window / interval_bytes.max(1))
+        // Bounded by how many intervals fit in the widest window the ramp can
+        // reach (`credit_max`), so the batch size is stable as the window grows
+        // instead of shrinking and growing on every recompute. `interval_bytes >=
+        // 1` (floored in `credit_window`), so the division never divides by zero.
+        let ceiling = self.credit_window(interval_bytes, u64::MAX);
+        let batch_cap = usize::try_from(ceiling / interval_bytes.max(1))
             .unwrap_or(usize::MAX)
             .max(1);
 
@@ -216,27 +209,31 @@ impl ClientHandler {
         // blob makes no pass through the deliver phase and goes straight to
         // `StreamEnd` (#1054). The `?` on `ChunkData::new` is the type carrying the
         // invariant, not a live failure mode; the `?` on `next_frame` IS live —
-        // that is where a mid-export store fault or the truncation refusal surfaces
-        // now that the export streams (#1132).
+        // that is where a mid-export store fault or the truncation refusal surfaces,
+        // because the export streams (#1132).
         let mut chunks = ChunkFramer::new(data, hash);
         let mut next_chunk = chunks.next_frame().await?;
 
         loop {
+            // The ramped window for the payment confirmed so far (ADR 003 §Credit
+            // window). Recomputed each iteration: as `paid` advances in the recoup
+            // phase the window widens, so a paying stream ramps toward `credit_max`
+            // while a non-payer stays pinned at the one-interval floor.
+            let window = self.credit_window(interval_bytes, paid);
+
             // --- deliver phase: stream chunks while the window has room. The
             // window is checked BEFORE each send, so the frontier
             // `delivered − paid` can overshoot by at most the one chunk that
             // crosses the threshold: the credit exposure is "≤ window + one
-            // chunk", exact to within a chunk — the same bound the fused
-            // `window_forward_loop` documents. The check must stay pre-send, not
+            // chunk", exact to within a chunk. The check must stay pre-send, not
             // anticipatory (would-this-chunk-cross): an anticipatory check can
             // stop short of a full interval, and at the one-interval floor
             // (`window == interval`) it would never complete one, starving the
             // recoup phase of a voucher to collect and deadlocking the loop. ---
-            // The pre-fetched frame is `Bytes` (not the `&[u8]` a slice iterator
-            // yielded), so it cannot be copied out of `next_chunk` and left behind
-            // on the window `break` — the window check therefore runs BEFORE the
-            // `take`, keeping the un-sent frame in `next_chunk` for the next pass
-            // and for the `done_delivering` read below.
+            // The pre-fetched frame is owned `Bytes`, so it cannot be copied out of
+            // `next_chunk` and left behind on the window `break` — the window check
+            // therefore runs BEFORE the `take`, keeping the un-sent frame in
+            // `next_chunk` for the next pass and for the `done_delivering` read below.
             while next_chunk.is_some() {
                 if delivered.saturating_sub(paid) >= window {
                     break;
@@ -326,17 +323,14 @@ impl ClientHandler {
             // interval before recouping), so detection latency is window-bounded,
             // not per-MB — the one-interval floor caps it, and even a full window is
             // negligible against the takedown compliance window. Gated on
-            // `collected_any` so it runs only after a committed batch — mirroring
-            // `window_forward_loop`, which nests the equivalent check under its own
-            // `collected_any`. The check sits AFTER a voucher so the bytes already
+            // `collected_any` so it runs only after a committed batch. The check
+            // sits AFTER a voucher so the bytes already
             // on the wire are still paid for — the takedown stops FURTHER delivery,
             // it does not retroactively make the last interval free. Only meaningful
             // while bytes remain to withhold: a takedown landing at the final
             // voucher has nothing left to stop, and terminating there would turn a
             // complete, fully-paid delivery into a reset (no `StreamEnd`) — hence the
-            // `!done` guard. (The fused `window_forward_loop` deliberately omits that
-            // guard: it is acquiring the blob, so a final-voucher takedown must still
-            // abandon the pull to avoid promoting a taken-down blob into cache.)
+            // `!done` guard.
             if collected_any && !done && self.takedown_landed(hash, funder) {
                 self.terminate_for_takedown(send, recv, hash);
                 return Ok(());

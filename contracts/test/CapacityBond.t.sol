@@ -1515,9 +1515,8 @@ contract CapacityBondTest is Test {
     }
 
     /// Slashing an operator with zero active AND zero unbonding bond mints a
-    /// clean zero-amount escrow record. The (now-removed) Genesis-credit slash
-    /// leg used to make a fully-zero slash unreachable; with it gone this is a
-    /// new reachable state, so pin that it stays safe — the offense counter,
+    /// clean zero-amount escrow record. A fully-zero slash is a reachable
+    /// state, so pin that it stays safe — the offense counter,
     /// slash-epoch watermark, and auto-eject still fire, escrow stays flat, and
     /// the unappealed-finalize terminal path no-ops without moving any TOKEN.
     function test_slash_zeroBondOperator_mintsZeroAmountRecordNoOpsAtFinality() public {
@@ -1693,8 +1692,8 @@ contract CapacityBondTest is Test {
     // ----------------------------------------------------------------------
     // Access-control guards on governance setters
     //
-    // None of the setters below were previously covered for role enforcement.
-    // A regression that drops `onlyRole(GOVERNANCE_ROLE)` would otherwise
+    // Role enforcement on the setters below. A regression that drops
+    // `onlyRole(GOVERNANCE_ROLE)` would otherwise
     // pass CI silently, so each setter gets a "reverts when called by a
     // non-governance address" test. The PAUSER_ROLE-gated pause/unpause
     // pair gets the same treatment.
@@ -1886,8 +1885,8 @@ contract CapacityBondTest is Test {
         address opAddr = _readyOperator(opPk);
         bytes32 nodeId = bytes32(uint256(0x7E127));
 
-        // A signature over the legacy `BindNodeId` payload (no termsHash) must
-        // not authorize registration under the new `RegisterNode` typehash.
+        // A signature over the `BindNodeId` payload (no termsHash) must
+        // not authorize registration under the `RegisterNode` typehash.
         bytes memory wrongSig = _signBindNode(opPk, opAddr, nodeId);
         vm.prank(opAddr);
         vm.expectRevert(CapacityBond.InvalidBindingSignature.selector);

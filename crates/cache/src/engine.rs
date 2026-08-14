@@ -1448,7 +1448,7 @@ impl CacheEngine {
     }
 
     /// A live watch of which chunk ranges of `hash` are present, for progressive
-    /// serve-while-filling (#1621 Task 4). Yields the current bitfield's
+    /// serve-while-filling (#1621). Yields the current bitfield's
     /// [`bao_tree::ChunkRanges`] first, then further updates as the blob fills.
     ///
     /// Mirrors [`Self::present_ranges`]'s guards (refuse an evicted/blacklisted
@@ -2143,9 +2143,10 @@ impl CacheEngine {
     /// verified span is imported as a **partial** blob via iroh-blobs
     /// `import_bao_bytes` — no whole-blob origin egress. The node then serves
     /// the range via `export_ranges` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
-    /// Only the actually-pulled bytes (span + outboard) are metered as origin
-    /// egress, tightening the seed-leech caps rather than the whole blob (ADR
-    /// 037 §"Range-scoped origin pulls only tighten the caps").
+    /// Only the actually-pulled bytes leave the origin — the range span the ramped
+    /// credit window paces, plus the small `{H}.obao4` outboard as additional
+    /// origin egress beyond that content window — not the whole blob, tightening
+    /// the node's exposure (ADR 037 §"Origin-tier pull-through").
     ///
     /// Returns [`RangePullOutcome::Served`] when the partial range is present,
     /// or [`RangePullOutcome::Unsupported`] when no origin could range-pull
@@ -2357,8 +2358,9 @@ impl CacheEngine {
             };
 
         // Meter the actually-pulled bytes (span + outboard) as origin egress —
-        // the bytes really did leave an origin. This is what ADR 037 counts
-        // against the seed-leech caps: the pulled side, not the whole blob.
+        // the bytes really did leave an origin. The ramped credit window paces the
+        // content span; the outboard is additional origin egress beyond it. Either
+        // way this is the pulled side, not the whole blob.
         if let Some(m) = &self.inner.metrics {
             let pulled = u64::try_from(data.len())
                 .unwrap_or(u64::MAX)
@@ -2517,7 +2519,7 @@ impl CacheEngine {
     }
 
     /// Stream the header-less bao for `chunk_ranges` of `hash` (a `total_bytes`
-    /// blob) off `reader` into the cache as a B0-tagged **partial**,
+    /// blob) off `reader` into the cache as a **partial**,
     /// O(chunk-group), verifying against the root incrementally. Returns the
     /// drained `reader` (for `BlobSource::finish`). A bounded mpsc
     /// channel feeds a `ChannelRecvStream` that iroh-blobs
@@ -3108,8 +3110,8 @@ impl CacheEngine {
     /// Each item is one export item's serialization — a 64-byte proof pair or one
     /// chunk group's data — so a consumer that writes items straight to the wire
     /// holds O(chunk group) rather than O(blob). This is what the paid serve path
-    /// drives (#1132); a 708 MB blob previously cost ~708 MB resident per
-    /// concurrent serve.
+    /// drives (#1132), so a 708 MB blob costs O(chunk group) resident per
+    /// concurrent serve, not ~708 MB.
     ///
     /// # Truncation is reported mid-stream
     ///
@@ -3120,7 +3122,7 @@ impl CacheEngine {
     /// `Err` **item** rather than as a pre-flight error, and the consumer must
     /// abort the delivery on it. The billing invariant is unchanged: the client
     /// sees a short delivery, rejects it, and never pays the closing voucher — but
-    /// the detection point moved from before the first byte to after the last
+    /// the detection point is after the last byte, not before the first
     /// (#915 review, #1132).
     ///
     /// # Errors
@@ -3231,7 +3233,7 @@ impl CacheEngine {
     /// Collect the outboard `(node, (left, right))` hash pairs iroh-blobs emits for
     /// `chunk_ranges` of `hash`, straight from the store's outboard — NO re-hashing.
     ///
-    /// The decoupled serve leg's shared outboard (#1621 B2 part 2, ADR 038) is fed
+    /// The serve leg's shared outboard (ADR 038) is fed
     /// from these so it can drive a coherent whole-range bao encode while the pull
     /// fills the cache incrementally. Call it for each range as it is admitted (and
     /// for the already-held ranges at serve start): `export_bao` emits every proof
@@ -3542,8 +3544,8 @@ impl CacheEngine {
     }
 
     /// Bump the `origin_fallback` counter and emit a structured log for
-    /// the chain-advance event (#284). Extracted from `pull_through`
-    /// so the hot-path loop body stays small enough for clippy's
+    /// the chain-advance event (#284). Kept out of `pull_through`'s
+    /// hot-path loop body so it stays small enough for clippy's
     /// cognitive-complexity lint, and so the WHY of the
     /// `warn!`-vs-`info!` branch decision lives in one named place
     /// rather than inline with retry control flow.
@@ -3959,8 +3961,8 @@ enum FillMode {
     /// arm already holds it and returns its drain buffer.
     ReturnBytes,
     /// [`CacheEngine::populate`] — the caller drops the payload, so it is never
-    /// read back (#1132). Serving a 708 MB blob used to cost that much again on
-    /// the miss leg for a buffer nobody looked at.
+    /// read back (#1132). Serving a 708 MB blob would otherwise cost that much
+    /// again on the miss leg for a buffer nobody looks at.
     CommitOnly,
 }
 
@@ -4151,7 +4153,7 @@ pub(crate) use crate::origin::BlobTooLargeMarker;
 /// The engine pipes the returned stream directly into
 /// [`iroh_blobs::api::blobs::Blobs::add_stream`], so the I/O bound
 /// becomes the chunk size from the origin (typically a few KiB to a
-/// few MiB depending on the backend) — a 10 GB blob no longer pins
+/// few MiB depending on the backend) — a 10 GB blob never pins
 /// 10 GB of process RSS (issue #271).
 ///
 /// **Why `None`-on-error rather than `Err`:** iroh-blobs'
@@ -5528,11 +5530,11 @@ mod tests {
         Ok(())
     }
 
-    /// The drop-path half of #1517. `InflightGuard::drop` used to swallow the
-    /// `PoisonError` and skip the removal; since `notify_waiters` only wakes
-    /// *current* waiters, the leaked entry made every later request for that
-    /// hash park on a `Notify` that would never fire again — a permanent hang,
-    /// which is the exact failure the guard exists to prevent.
+    /// The drop-path half of #1517. If `InflightGuard::drop` swallowed the
+    /// `PoisonError` and skipped the removal, then — since `notify_waiters`
+    /// only wakes *current* waiters — the leaked entry would make every later
+    /// request for that hash park on a `Notify` that never fires again — a
+    /// permanent hang, which is the exact failure the guard exists to prevent.
     ///
     /// The unpoisoned cancellation case is covered by
     /// [`cancelled_owner_does_not_orphan_inflight_entry`]; this is its poisoned
@@ -7097,7 +7099,7 @@ mod tests {
         );
     }
 
-    // -- Task 9: admit_bao_stream — O(chunk-group) streaming range admit --
+    // -- admit_bao_stream — O(chunk-group) streaming range admit --
 
     #[tokio::test]
     async fn admit_bao_stream_admits_a_partial_range() {
@@ -7406,7 +7408,7 @@ mod tests {
         }
     }
 
-    /// B3 multi-observer coalescing (#1656) composes with operator eviction
+    /// Multi-observer coalescing (#1656) composes with operator eviction
     /// (#279). A coalesced serve-miss fans one upstream pull out to N serve legs;
     /// each serve leg reads the filling partial through its own in-flight
     /// `export_bao_range_stream` handle. This test reduces that to the cache-level
@@ -7414,10 +7416,10 @@ mod tests {
     /// partial, evicted mid-serve, both still finish delivering byte-for-byte
     /// correct bytes even after the GC sweep has logically removed the blob.**
     ///
-    /// The load-bearing assumption B3 deferred (decision 5): reader-pinning is
+    /// The load-bearing assumption: reader-pinning is
     /// UNCHANGED by coalescing — N serve-leg readers survive an evict + GC sweep
     /// exactly as one reader would, because each holds its own live export handle.
-    /// Eviction is a *logical* takedown: it drops the B0 partial tag and blocks
+    /// Eviction is a *logical* takedown: it drops the partial's protecting tag and blocks
     /// NEW serves (`has` reports absent), but it does not tear down readers already
     /// in flight.
     ///

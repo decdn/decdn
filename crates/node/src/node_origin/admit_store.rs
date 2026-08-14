@@ -1,12 +1,12 @@
 //! `NodeAdmitStore` — the node's pull-leg [`decdn_client_pull::IngestStore`]
-//! over [`decdn_cache::CacheEngine::admit_bao_stream`] (#1621 Task 10).
+//! over [`decdn_cache::CacheEngine::admit_bao_stream`] (#1621).
 //!
-//! `drive()`'s gap-driven pull loop (Task 6) needs a store that both answers
+//! `drive()`'s gap-driven pull loop needs a store that both answers
 //! [`decdn_bao_range::RangedStore`] queries (present/missing ranges, read,
-//! finalize) and can ingest a gap's raw bao wire. [`NodeRangedStore`] (Task 4)
+//! finalize) and can ingest a gap's raw bao wire. [`NodeRangedStore`]
 //! already answers the queries over the cache; this type adds the ingest half
 //! by wrapping a `NodeRangedStore` and streaming each gap straight into
-//! [`decdn_cache::CacheEngine::admit_bao_stream`] (Task 9), which admits the
+//! [`decdn_cache::CacheEngine::admit_bao_stream`], which admits the
 //! bytes as a B0-tagged partial without buffering the whole gap in memory.
 //!
 //! This has to live in `node`, not `cache` or `client-pull`: it names both
@@ -94,7 +94,7 @@ impl IngestStore for NodeAdmitStore {
     /// B0-tagged partial.
     ///
     /// `on_progress` is accepted for the trait but unused on this path: the
-    /// node's progress metering happens at the SERVE leg (Task 11), which
+    /// node's progress metering happens at the SERVE leg, which
     /// meters what it forwards to the downstream client — not at this shared
     /// upstream ingest. If `admit_bao_stream` grows a progress hook later, it
     /// plugs in here.

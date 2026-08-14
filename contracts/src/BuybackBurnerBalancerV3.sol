@@ -164,9 +164,9 @@ contract BuybackBurnerBalancerV3 is GuardedBuybackBurner {
     function _swap(uint256 amountIn, uint256 minOut) internal override returns (uint256 tokenOut) {
         usdc.forceApprove(address(permit2), amountIn);
         // `uint160(amountIn)` cannot truncate: `amountIn` is bounded above by the
-        // base-layer `amountIn <= usdc.balanceOf(this)` check (now in the
-        // `BuybackBurner` parent, so aderyn can no longer see the bound across
-        // the contract split and flags the downcast), and 6-dec USDC total
+        // base-layer `amountIn <= usdc.balanceOf(this)` check (in the
+        // `BuybackBurner` parent, so aderyn cannot see the bound across
+        // the contract boundary and flags the downcast), and 6-dec USDC total
         // supply is ~30 orders of magnitude below 2^160.
         // forge-lint: disable-next-line(block-timestamp)
         // aderyn-ignore-next-line(unsafe-casting)

@@ -133,8 +133,8 @@ mod sol_types {
             function getRegisteredNodeCount() external view returns (uint256);
 
             /// How many slashes have ever been minted against `operator`.
-            /// Paired with `operatorSlashIdAt`, this replaces re-scanning the
-            /// `Slashed` log tail from a block floor on every start: walk
+            /// Paired with `operatorSlashIdAt`, this lets a consumer avoid re-scanning
+            /// the `Slashed` log tail from a block floor on every start: walk
             /// backwards from `count - 1` and stop at the first record whose
             /// `appealWindowClose` has already passed.
             function operatorSlashCount(address operator) external view returns (uint256);

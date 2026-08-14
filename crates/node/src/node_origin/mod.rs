@@ -115,16 +115,17 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// Three outcomes are NOT failures and return before that: [`PoolOpenPending`] (the
 /// open outlived our budget and continues in the background), a reserved slot (a
 /// reconcile holds the slot; retry), and anything the detached open task has already
-/// reported ([`OpenReported`]) — which since the #1145 review includes every one of
-/// `run_open`'s legs, store faults and unreclaimable-expired channels included. So the
-/// unlabeled arm below is now genuinely a *residual*: an open/reuse failure raised
+/// reported ([`OpenReported`]) — which includes every one of `run_open`'s legs,
+/// store faults and unreclaimable-expired channels included. So the
+/// unlabeled arm below is genuinely a *residual*: an open/reuse failure raised
 /// outside the open task itself.
 ///
 /// Returns the [`PullMiss`] this failure is (#1560), so a channel open that failed because
 /// of a fault in THIS node is not answered to the client as an absent blob. That matters
 /// more than the buyer-key case #1560 was filed for: the loudest node-wide buyer faults in
-/// this crate all land here, and all used to sign every client a clean `NotFound` — a
-/// poisoned `opens_in_flight` mutex ("this node can no longer open a buyer channel to ANY
+/// this crate all land here, each of which would otherwise sign every client a
+/// clean `NotFound` — a poisoned `opens_in_flight` mutex ("this node can no longer
+/// open a buyer channel to ANY
 /// provider and must be restarted"), an unreadable channel store ("can neither open nor
 /// reuse a channel to any provider until the store recovers"), a store WRITE that leaves a
 /// deposit untracked, a panicked open task, and a wallet that cannot fund a deposit.
@@ -134,9 +135,7 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// That split is not stylistic: [`OpenReported`] means "already logged and metered, do not
 /// restate" — it says nothing about whose fault the failure is — and every leg of the open
 /// task attaches it. So a ladder that tried to classify by [`PoolOpenFailureReason`]
-/// here would never run: the `OpenReported` arm ends the walk first. An earlier cut of this
-/// fix did exactly that and shipped a dead `match` whose doc advertised a classification the
-/// code could not perform.
+/// here would never run: the `OpenReported` arm ends the walk first.
 ///
 /// Consequently the unmarked legs are the deliberate `Clean` ones: a pending open, a
 /// reconcile-held slot, an unreclaimable expired channel, a `ContractRevert` (deterministic
@@ -155,11 +154,10 @@ fn record_pool_open_failure(
     // means this node's chain lane is too slow for `CHANNEL_OPEN_CALLER_BUDGET`, which is a
     // very different diagnosis from a reverting or under-funded open.
     //
-    // NOT `node_pull_timeout_sec`, which this comment used to name (#1145 review). The
-    // channel open has its OWN budget and always did; `DEFAULT_NODE_PULL_TIMEOUT_SEC`'s own
-    // doc says outright that "raising this to give a slow L2 more room does nothing: that is
-    // the channel open." So the comment was sending an operator to a knob its own config
-    // documentation calls inert for this symptom.
+    // NOT `node_pull_timeout_sec`. The channel open has its OWN budget;
+    // `DEFAULT_NODE_PULL_TIMEOUT_SEC`'s own doc says outright that "raising this to
+    // give a slow L2 more room does nothing: that is the channel open." That knob is
+    // inert for this symptom.
     if err.downcast_ref::<PoolOpenPending>().is_some() {
         deps.metrics.node_pull_pool_open_pending();
         debug!(%provider_addr, %err, "node-origin: pool open still in flight; trying the next candidate");
@@ -259,7 +257,7 @@ pub struct NodeOriginConfig {
     /// received, so it trips only on a silent upstream — never on a large blob or
     /// a slow link. Deliberately not a wall clock: bounding the bytes by wall clock
     /// caps the blob size this node can pull through at `pull_timeout × link
-    /// speed`, which is the bug this replaced.
+    /// speed`, which is the bug this avoids.
     pub stall_timeout: Duration,
     /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
     /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
@@ -652,7 +650,7 @@ impl NodeOrigin {
         let ctx = match deps
             .buyer
             // Bounded by its OWN budget, not the per-candidate one (#1143). A wedged
-            // open no longer consumes the whole outer deadline: we stop waiting and try
+            // open does not consume the whole outer deadline: we stop waiting and try
             // candidate #2, while the open keeps running in the background and its
             // channel is reused if it lands. It is deliberately the smaller budget —
             // this stage and the stream open below are sequential, and
@@ -689,10 +687,10 @@ impl NodeOrigin {
         // quiet during the handshake / verified response is cut off at `deadlines.open`,
         // which emits a typed `PullTimeout { after: deadlines.open }`. That is the SOLE
         // per-candidate open bound — the header handshake in `pull_from_candidate` (below)
-        // opens the same way with no outer wrap. We used to add a second, redundant
-        // `tokio::time::timeout(pull_timeout, …)` wrap here (belt-and-braces); it is dropped
-        // (#1147) because both clocks were sourced from `pull_timeout`, so the double-bound
-        // did nothing but risk drift — an open-specific timeout knob could make a candidate
+        // drives its open the same way with no outer wrap. A second
+        // `tokio::time::timeout(pull_timeout, …)` wrap here would be redundant: both clocks
+        // source from `pull_timeout`, so the double-bound would do nothing but risk
+        // drift — an open-specific timeout knob could make a candidate
         // cost up to `pull_timeout + deadlines.open` while `outer_pull_deadline`
         // (`MAX_PROVIDER_ATTEMPTS × (channel open + pull_timeout + stall) + slack`, #859)
         // still budgets a single `pull_timeout`, starving the fallback loop.
@@ -1423,8 +1421,8 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         // applies this inside `find_providers` (`filter_active_stakers`); the hit
         // path bypasses `find_providers`, so re-apply it here. `addr_resolver` is
         // NOT this guard — the address binding survives ejection/unbonding (only
-        // deregistration clears it), which is what let a node ejected inside the
-        // TTL win a paid pull the cold path would deny (#1223 review).
+        // deregistration clears it), which would otherwise let a node ejected inside the
+        // TTL win a paid pull the cold path denies (#1223).
         //
         // NOTE: an origin from a populated `StaticOriginDirectory` (tests) that is
         // not a staker is skipped here and falls through to the cold path, where
@@ -1501,10 +1499,10 @@ struct PullOutcome<T> {
 /// (#1560).
 ///
 /// The only distinction the callers need is whether the failure was OURS, because
-/// that is what decides the answer this node signs to its own client. Every
-/// non-hit used to collapse onto a clean `NotFound`: no providers, all refused,
-/// all stalled, and a LOCAL fault alike. The last of those is a false statement
-/// about the content — the blob may well exist and be perfectly reachable; it is
+/// that is what decides the answer this node signs to its own client. Collapsing
+/// every non-hit onto a clean `NotFound` — no providers, all refused, all stalled,
+/// and a LOCAL fault alike — makes a false statement about the content in the last
+/// case: the blob may well exist and be perfectly reachable; it is
 /// this node that cannot sign a voucher for it — and `StreamError::InternalError`
 /// ("unexpected failure; do not retry this node") exists precisely to keep a
 /// broken node from laundering its own defect into a signed claim about content.
@@ -1516,9 +1514,10 @@ struct PullOutcome<T> {
 /// ONE provider is not node-wide degradation, and it already has its
 /// own remedy (keep the row, suppress the provider).
 ///
-/// `#[must_use]`: a classifier's verdict that is dropped rather than propagated silently
-/// reverts #1560 at that call site, which is exactly how the channel-open leg shipped
-/// laundered in the first cut. Dropping a `PullVerdict` is legitimate at the two
+/// `#[must_use]`: a classifier's verdict dropped rather than propagated silently
+/// reintroduces the #1560 mis-attribution at that call site — this node's own
+/// fault signed to a client as an absent blob. Dropping a `PullVerdict` is
+/// legitimate at the two
 /// mid-stream sites (the answer is already on the wire) and they say so with `let _ =`,
 /// which satisfies this attribute; dropping a `PullMiss` never is.
 #[must_use]
@@ -1761,15 +1760,15 @@ async fn pull_from_candidate(
     // review). Both halves of that matter.
     //
     // A `&mut VoucherProgress` out-param can only be copied back on a RETURN, and
-    // this pull's defining property since #1134 is that it need not return: it runs
+    // this pull's defining property is that it need not return: it runs
     // with `hard_cap: None`, so nothing inside it ends a slow-but-progressing
     // transfer, and everything that does end one is external and DROPS the future —
     // the foreground `outer_pull_deadline`, or the serve future being dropped (client
-    // disconnect, node shutdown). On every one of those paths the copy-back never ran
-    // and the acked watermark died with the frame, while the USDC it recorded had
-    // already left the node. The next pull then re-signed a cumulative watermark the
-    // upstream had already advanced past, the upstream rejected it as a regression,
-    // and the lane was wedged.
+    // disconnect, node shutdown). On every one of those paths the copy-back would never run
+    // and the acked watermark would die with the frame, while the USDC it recorded
+    // has already left the node. The next pull would then re-sign a cumulative
+    // watermark the upstream has already advanced past, the upstream would reject it
+    // as a regression, and the lane would wedge.
     //
     // The settle guard lives on the PULL THREAD, not here (see the `spawn_blocking`
     // block below): `drive` advances the shared lane `PoolLedger` from that thread,
@@ -1793,9 +1792,9 @@ async fn pull_from_candidate(
 
     // Streaming is bounded by INACTIVITY, with no overall wall-clock cap (#1134).
     //
-    // `pull_timeout` used to wrap this whole fetch, which quietly capped the blob
-    // size a node could pull through at roughly `pull_timeout × link speed` — at
-    // the 20 s default, any blob needing more than ~20 s of transfer was
+    // An overall `pull_timeout` around this whole fetch would quietly cap the blob
+    // size a node can pull through at roughly `pull_timeout × link speed` — at
+    // the 20 s default, any blob needing more than ~20 s of transfer would be
     // unfetchable on this path. The stall bound catches the thing a deadline
     // should catch (an upstream that stops delivering) without penalising size or
     // link speed.
@@ -2068,12 +2067,11 @@ async fn pull_from_candidate(
 /// `Debug` is hand-written: `NodeOriginDeps` is not `Debug`-derivable (it is a bag of trait
 /// objects), and the guard is a field of the `Debug`-deriving [`NodeProgressivePull`].
 ///
-/// BOTH pull paths settle through this and only this. The window path used to settle in
-/// its three terminal methods instead (`finish` / `abandon` / `abandon_corrupt`) — which
-/// is the copy-back-on-return pattern this guard exists to replace, and it lost the
-/// watermark for the same reason: the serve loop drives that pull as a future on the iroh
-/// `accept` task, and a node shutdown or a downstream reset DROPS it, so no terminal method
-/// runs (#1145 review).
+/// BOTH pull paths settle through this and only this. Settling in the three terminal
+/// methods instead (`finish` / `abandon` / `abandon_corrupt`) would lose the
+/// watermark: the serve loop drives that pull as a future on the iroh `accept` task,
+/// and a node shutdown or a downstream reset DROPS it, so no terminal method runs
+/// (#1145 review).
 struct SettleOnDrop {
     /// The runtime deps, reached through the shared `OnceLock`. Holding the `Arc`
     /// (not a borrow) lets the guard cross onto a pull thread and outlive the future
@@ -2109,7 +2107,7 @@ impl Drop for SettleOnDrop {
         // and unacked here (ADR 003 persists before it acks). `settlement` adds back the
         // voucher still on the wire, which is what we actually owe (#1122). Settling at
         // `committed` there re-signs a spent cumulative on the next reuse, which the
-        // upstream rejects as a regression — so the old choice stranded lane progress.
+        // upstream rejects as a regression — stranding lane progress.
         let progress =
             VoucherProgress::from_cumulative(self.ledger.settlement(), self.prior_amount);
         persist_buyer_progress(deps, self.provider_addr, self.pool_id, &progress);
@@ -2266,9 +2264,9 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
 /// tested without a live `NodeOriginDeps`, which needs an iroh endpoint. That matters more
 /// than it sounds. The ladder below is an ORDERED chain of `downcast_ref`s whose order is
 /// load-bearing and invisible to the compiler, ending in a catch-all that scores the peer
-/// `Unreachable`. Every mis-attribution this module has shipped was an error falling one
-/// arm further than it should and landing there: an honest `NotFound` refusal (#1144), a
-/// mid-stream `StreamError`, a broken local signer. Making the decision a pure function
+/// `Unreachable`. Every mis-attribution this module is prone to is an error falling one
+/// arm further than it should and landing there: an honest `NotFound` refusal (#1144),
+/// a mid-stream `StreamError`, a broken local signer. Making the decision a pure function
 /// means "which arm does this error land in?" is a question a test can just ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullVerdict {
@@ -2295,11 +2293,11 @@ enum PullVerdict {
     /// shared pool deposit is NOT: it still backs every other lane and is refundable through
     /// the pool's own grace-window close and reclaim.
     ///
-    /// Split from [`Self::OurVoucherRetryable`] because the two want opposite actions and
-    /// collapsing them is what made a drained lane invisible. `UpstreamVoucherRejected`
-    /// carries a `VoucherRejectReason` whose variants prescribe *different* remedies —
-    /// resend, top up, suppress, stop — and the classifier used to discard it with a bare
-    /// `.is_some()`, so every one of them became "skip this candidate, say nothing".
+    /// Split from [`Self::OurVoucherRetryable`] because the two want opposite actions, and
+    /// collapsing them makes a drained lane invisible. `UpstreamVoucherRejected` carries a
+    /// `VoucherRejectReason` whose variants prescribe *different* remedies — resend, top
+    /// up, suppress, stop — so discarding the reason with a bare `.is_some()` would collapse
+    /// every one of them to "skip this candidate, say nothing".
     ///
     /// The pool row is the node's handle on the deposit, and the recovery sweeps enumerate
     /// the store (`load_all`), so it is KEPT rather than deleted. The provider is SUPPRESSED
@@ -2464,8 +2462,8 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // answered honestly ("the blob is only N bytes"), and the offset it refused is one
     // WE computed — a resume frontier that overran the blob (#1530). Before the miss
     // path could resume at all this was unreachable, so it had no arm and fell through
-    // to `Unreachable`, which would gossip an honest peer as dead on the strength of
-    // our own arithmetic. `ResumeOffsetPastEnd`'s own doc says it: "this is a statement
+    // to `Unreachable`, which would mark an honest peer down with a local EWMA hit
+    // (ADR 008 scoring is local-only) on the strength of our own arithmetic. `ResumeOffsetPastEnd`'s own doc says it: "this is a statement
     // about the offset, not about the peer".
     if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
         return PullVerdict::OurLocalFault;
@@ -2482,8 +2480,9 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // Ahead of `UpstreamRefused` and the catch-all, deliberately: a local signing or encode
     // fault surfaces while we are talking to a peer, and every arm below this one blames
     // the peer to some degree. A node with a broken buyer key hits this on EVERY candidate,
-    // so getting the order wrong here does not mis-score one provider — it gossips the
-    // whole candidate list as unreachable on the strength of our own defect.
+    // so getting the order wrong here does not mis-score one provider — it tars the whole
+    // candidate list with a local `Unreachable` EWMA hit (ADR 008 scoring is local-only,
+    // no gossip tier) on the strength of our own defect.
     if err.downcast_ref::<LocalPullFault>().is_some() {
         return PullVerdict::OurLocalFault;
     }
@@ -2491,7 +2490,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         // A `VoucherRejected` arriving as a mid-stream refusal is the SAME event as one
         // arriving in reply to a voucher, and must get the same remedy (#1145 review).
         //
-        // Since #1484 the client's `resolve_voucher_slot` types a `VoucherRejected` into
+        // The client's `resolve_voucher_slot` types a `VoucherRejected` into
         // `UpstreamVoucherRejected` wherever it lands, so this unwrap is a defensive backstop
         // for any `VoucherRejected` that still reaches here inside `UpstreamRefused`: were it
         // left folded into the refusal ladder it would be ruled `OurFault` — score nothing,
@@ -2526,14 +2525,15 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
 /// spends the reputation/suppression/channel remedies accordingly, while the caller
 /// asks "what may we tell our own client?" and folds the verdict into a
 /// [`PullMiss`]. Returning it is what stops the second question being answered by
-/// silence — every non-hit used to look identical to the serve path, so a fault in
-/// this node was signed to a client as a clean `NotFound` about the content.
+/// silence: without it every non-hit looks identical to the serve path, and a fault in
+/// this node is signed to a client as a clean `NotFound` about the content.
 ///
 /// A caller that has already answered on the wire may drop the verdict. Both mid-stream
 /// sites do ([`NodeProgressivePull::finish`] and [`NodeProgressivePull::abandon`]): by then
 /// the `StreamResponse` is signed `ok: true` and sent, so the failure is an abort, not a
 /// refusal code, and there is no answer left to pick. A caller that has NOT yet answered
-/// owes the verdict a [`PullMiss`] — dropping it there is how #1560 shipped.
+/// owes the verdict a [`PullMiss`]; dropping it there signs this node's own fault to a
+/// client as an absent blob (#1560).
 ///
 /// `channel` is the buyer pool the pull was paying from, or `None` for the failures that
 /// happen before there is one to pay from (a pool open that never completed, a local
@@ -2642,12 +2642,12 @@ fn classify_pull_failure(
             );
         }
         // A refusal proves the peer is reachable and answering, so it is not `Unreachable`
-        // on its own — which is what every refusal used to score, tarring a node exactly as
-        // hard for honestly saying it lacks a blob as for being dead (#1144).
+        // on its own; scoring it `Unreachable` would tar a node exactly as hard for honestly
+        // saying it lacks a blob as for being dead (#1144).
         //
         // Exonerating it is not the same as ignoring it, though. Every candidate that got
         // this far answered `has_blob = true` at probe, so a refusal is a peer contradicting
-        // itself, and recording nothing let a peer that advertises everything and serves
+        // itself, and recording nothing would let a peer that advertises everything and serves
         // nothing keep winning the ranker and burn a `MAX_PROVIDER_ATTEMPTS` slot on every
         // miss, forever. The negative cache is the right instrument — scoped to (peer, hash),
         // TTL'd, reputation-neutral — and `RefusalVerdict` decides what the suppression is
@@ -2895,8 +2895,8 @@ mod tests {
         // layer rather than as the error itself — `anyhow!("voucher signing failed")
         // .context(LocalPullFault)` — and it is then wrapped again on the way up. If
         // this downcast ever stopped working, the exoneration arm would silently stop
-        // firing and a node with a broken signer would go back to gossiping
-        // `Unreachable` about every honest provider it tried. That failure is invisible
+        // firing and a node with a broken signer would go back to recording a local
+        // `Unreachable` EWMA hit against every honest provider it tried. That failure is invisible
         // at the call site, so pin it here.
         let local = anyhow::anyhow!("voucher signing failed: bad key")
             .context(LocalPullFault)
@@ -2922,11 +2922,11 @@ mod tests {
         assert!(refused.downcast_ref::<UpstreamVoucherRejected>().is_none());
     }
 
-    /// The #1144 split, asserted on the real predicate `classify_pull_failure`
-    /// consults: a refusal is proof the peer ANSWERED, so only the one code by
-    /// which a peer reports its own degradation may score it. The `NotFound` case
-    /// is the heart of the issue — a healthy-but-empty node used to take an
-    /// `Unreachable` hit (local EWMA; ADR 008 has no gossip tier) for honestly saying
+    /// Asserted on the real predicate `classify_pull_failure` consults: a refusal is
+    /// proof the peer ANSWERED, so only the one code by
+    /// which a peer reports its own degradation may score it. The
+    /// `NotFound` case is the heart of the issue: a healthy-but-empty node must not take
+    /// an `Unreachable` hit (local EWMA; ADR 008 has no gossip tier) for honestly saying
     /// so.
     #[test]
     fn only_internal_error_refusals_are_scored() {
@@ -3174,10 +3174,10 @@ mod tests {
     }
 
     /// A refusal that arrives MID-STREAM carries the same wire code, and therefore the same
-    /// meaning, as one that arrives at the open. It used to be stringified
-    /// (`bail!(\"stream failed: {e:?}\")`), which fell through every downcast to the
-    /// catch-all and scored the peer `Unreachable` — the exact mis-attribution #1144 fixed
-    /// at the open stage, reappearing one stage later.
+    /// meaning, as one that arrives at the open. Stringifying it
+    /// (`bail!(\"stream failed: {e:?}\")`) would fall through every downcast to the
+    /// catch-all and score the peer `Unreachable` — the same mis-attribution #1144
+    /// forecloses at the open stage, one stage later.
     #[test]
     fn a_mid_stream_refusal_is_judged_by_its_wire_code_not_the_catch_all() {
         for (error, want) in [

@@ -115,10 +115,9 @@ pub struct ClientFetchArgs {
     /// spelling of a valid code works. Overrides `identity.region`; when unset
     /// (and no config region), discovery skips the region-first ordering.
     ///
-    /// Rejected at parse time if it is not an accepted code. Previously an
-    /// unrecognized value was accepted and then silently ignored, so a user who
-    /// asked for locality got round-robin selection with no indication their
-    /// flag had been discarded.
+    /// Rejected at parse time if it is not an accepted code, so a request for
+    /// locality never silently degrades to round-robin selection with the flag
+    /// discarded.
     #[arg(long, value_name = "REGION", value_parser = parse_region_flag)]
     pub region: Option<String>,
 
@@ -270,10 +269,9 @@ impl ClientFetchArgs {
     ///
     /// # Why it exists, and why it is not the health signal
     ///
-    /// It used to be the primary (and only) mechanism, at a 30 s default, which made it a
-    /// poor health signal: an overall deadline has to be sized against
-    /// `blob size × link speed`, so it killed legitimate large or slow-but-healthy
-    /// transfers, while a value small enough to catch a dead node quickly could not serve
+    /// It is a poor health signal on its own: an overall deadline has to be sized against
+    /// `blob size × link speed`, so it kills legitimate large or slow-but-healthy
+    /// transfers, while a value small enough to catch a dead node quickly cannot serve
     /// a big blob at all (#1134).
     ///
     /// It cannot simply be removed, though, because inactivity is not liveness: the stall
@@ -282,8 +280,8 @@ impl ClientFetchArgs {
     /// generous — far above any honest transfer under `--max-blob-mb`.
     ///
     /// Returns a `Duration`, not an `Option<Duration>`. `--timeout-ms` has a default and clap
-    /// rejects a zero, so the cap is ALWAYS present on this path; the `Option` this used to
-    /// return was structurally always `Some`, and existed only to shape-match
+    /// rejects a zero, so the cap is ALWAYS present on this path; an `Option` here would be
+    /// structurally always `Some`, and would exist only to shape-match
     /// `PullDeadlines`'s optional cap — misinforming every reader and forcing a pointless
     /// match (#1145 review). A caller that wants the optional form wraps it.
     ///
@@ -345,9 +343,9 @@ impl ClientFetchArgs {
     /// `decdn-client-pull` in the dependency flow and cannot import `PullDeadlines`. The
     /// `2 ×` is that rule specialised to these two call sites, which set the open bound from
     /// `--stall-timeout-ms` as well. If a future `--open-timeout-ms` breaks that assumption,
-    /// this check goes stale — but it can no longer go WRONG, because the constructor
+    /// this check goes stale — but it cannot go WRONG, because the constructor
     /// downstream still refuses to build a `PullDeadlines` whose cap cannot outlast its
-    /// stages. That is the whole reason the invariant was moved onto the type.
+    /// stages. That is why the invariant lives on the type.
     ///
     /// # Errors
     ///
@@ -524,7 +522,7 @@ mod tests {
     /// whole manifest for `bundle pull`. The cap is what makes that impossible, so it
     /// cannot be absent, and it cannot be zero.
     ///
-    /// "Cannot be absent" is now a fact about the TYPE — `hard_cap()` returns a `Duration`,
+    /// "Cannot be absent" is a fact about the TYPE — `hard_cap()` returns a `Duration`,
     /// not an `Option<Duration>` — so the only thing left for a test to pin is that it cannot
     /// be zero, which is clap's job.
     #[test]
@@ -629,9 +627,8 @@ mod tests {
         assert!(TestCli::try_parse_from(["test", "--stall-timeout-ms", "0"]).is_err());
     }
 
-    /// `--max-blob-mb` is a memory ceiling, nothing more. It used to also scale the
-    /// timeout (at an assumed 35 MiB/s), which is precisely the coupling #1134
-    /// removed: a size flag has no business setting a deadline.
+    /// `--max-blob-mb` is a memory ceiling, nothing more. It does not scale the
+    /// timeout: a size flag has no business setting a deadline (#1134).
     #[test]
     fn max_blob_mb_does_not_influence_the_deadlines() {
         let small = parse(&["--max-blob-mb", "1"]);

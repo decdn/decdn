@@ -63,9 +63,8 @@ struct StreamLabels {
 /// `has_blob: false`" — `exhausted` and `stake_lane_reserved` still advertise.
 ///
 /// The three values are not interchangeable — each has a different operator
-/// remedy, which is why they were three separate counters before #1443 and why
-/// the alert in `monitoring/prometheus-alerts.yml` filters on
-/// `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
+/// remedy, which is why the alert in `monitoring/prometheus-alerts.yml` filters
+/// on `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
 /// these encode as `reason="exhausted"` / `"disabled"` / `"stake_lane_reserved"`.
 ///
 /// Not to be confused with [`decdn_cache::ProbeHoldOutcome::Unavailable`],
@@ -139,7 +138,7 @@ struct ProbeHoldUnavailableLabels {
 
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
-/// closures each watcher site would otherwise define (#1251). Since #1316 all
+/// closures each watcher site would otherwise define (#1251). All
 /// six `LogSink` sites route their liveness (`*_tick`) and panic
 /// (`*_task_panicked`) hooks — and their down-family established/backoff edges —
 /// through this helper (blacklist composes it with its readiness-gate closures).
@@ -546,7 +545,7 @@ pub struct DecdnMetrics {
     /// error!/warn! for reconcile). Folding the untracked case in here — rather than
     /// counting it as `buyer_topup_ok` — means an operator alerting on this metric
     /// sees stranded deposits. The refill is best-effort (the channel is simply left
-    /// un-topped, the pre-#1146 behavior), but a sustained rate means reused channels
+    /// un-topped), but a sustained rate means reused channels
     /// are not being refilled and pull-through to busy providers will degrade as
     /// their deposits drain (check the gas wallet / RPC / USDC balance). Operator-
     /// visible name: `decdn_buyer_topup_failure_total`.
@@ -798,8 +797,9 @@ pub struct DecdnMetrics {
     /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
     ///
     /// Not an error — the providers already found are usable and the pull proceeds with them
-    /// — but not nothing either, and it was previously only a `debug!`, invisible at the
-    /// project's default `RUST_LOG=info`. The ceiling exists because discovery's worst case
+    /// — but not nothing either, and a bare `debug!` would be invisible at the
+    /// project's default `RUST_LOG=info`, so it is a counter. The ceiling exists because
+    /// discovery's worst case
     /// has to be FINITE for `PULL_THROUGH_OUTER_SLACK` to budget for it at all; the cost is
     /// that a lookup which needs more rounds silently returns a smaller candidate set.
     ///
@@ -1082,26 +1082,16 @@ pub struct DecdnMetrics {
     pub node_pull_through_errors: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// window-paced serve loop paused the upstream pull because the per-request
-    /// unrecouped frontier (`bytes pulled − bytes paid`) reached the effective
-    /// window — `pull_ahead_bytes`, floored at one voucher interval — and it waited
-    /// for the downstream voucher to clear. A high rate is benign (the window is
+    /// unrecouped frontier (`bytes pulled − bytes paid`) reached the ramped
+    /// credit window (ADR 003 §Credit window, #1669) and it waited for the
+    /// downstream voucher to clear. A high rate is benign (the window is
     /// doing its job pacing speculation); a flat zero under real pull-through
     /// traffic means the window never binds.
     pub node_pull_through_window_paused: Counter,
-    /// `decdn_node_pull_through_leech_budget_paused_total` (#856): speculative
-    /// pull-throughs refused or paused because the node-wide unrecouped-leech
-    /// budget (`max_unrecouped_leech_bytes`) was exhausted. A sustained rate means
-    /// aggregate speculative spend is hitting the operator's circuit breaker.
-    pub node_pull_through_leech_budget_paused: Counter,
-    /// `decdn_node_pull_through_share_ratio_paused_total` (#856): speculative
-    /// pull-throughs refused because a single requesting peer exceeded its
-    /// `share_ratio` ceiling (pulled-vs-served). Isolates concentrated
-    /// single-peer manufactured-demand abuse.
-    pub node_pull_through_share_ratio_paused: Counter,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
-    /// loss is bounded to `pull_ahead_bytes`; a sustained rate flags a leech.
+    /// loss is bounded to the ramped credit window; a sustained rate flags a leech.
     pub node_pull_through_client_abandoned: Counter,
     /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
     /// serve-miss pull ingested upstream bytes that failed bao verification against
@@ -1266,9 +1256,8 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_chain_hash_denied_total`.
     ///
     /// Not to be confused with `serve_stream_rejected_evicted_since_probe`,
-    /// which governance refusals used to land on: that counter now sees only
-    /// evictions with no blacklist entry behind them (corruption recovery, a
-    /// manual `decdn node evict`).
+    /// which sees only evictions with no blacklist entry behind them (corruption
+    /// recovery, a manual `decdn node evict`).
     pub serve_stream_rejected_chain_hash_denied: Counter,
     /// Delivery refused because the channel's funding address is blacklisted as
     /// an origin — local `denied_origins` or the on-chain `ContentBlacklist`
@@ -1391,7 +1380,7 @@ pub struct Metrics {
     /// `get_or_create`, so without this each `reason` would be absent from
     /// `/metrics` until it first fired — an operator's dashboard and alert
     /// would show a gap rather than a zero. Creating them at startup keeps
-    /// the pre-#1443 property that all three series are exported at zero.
+    /// the property that all three series are exported at zero.
     probe_hold_exhausted: Arc<Counter>,
     probe_hold_disabled: Arc<Counter>,
     probe_hold_stake_lane_reserved: Arc<Counter>,
@@ -2119,17 +2108,9 @@ recorders! {
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
     serve_stream_terminated_takedown => serve_stream_terminated_takedown.inc();
 
-    /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
-    /// to wait for the downstream voucher to clear (#856).
+    /// The window-paced serve loop paused the upstream pull at the ramped credit
+    /// window to wait for the downstream voucher to clear (#856, #1669).
     node_pull_through_window_paused => node_pull_through_window_paused.inc();
-
-    /// A speculative pull-through was refused/paused by the node-wide
-    /// unrecouped-leech budget (#856).
-    node_pull_through_leech_budget_paused => node_pull_through_leech_budget_paused.inc();
-
-    /// A speculative pull-through was refused because a peer exceeded its
-    /// `share_ratio` ceiling (#856).
-    node_pull_through_share_ratio_paused => node_pull_through_share_ratio_paused.inc();
 
     /// A window-paced serve was abandoned because the requesting client dropped
     /// or underpaid mid-pull (#856).
@@ -2706,8 +2687,9 @@ mod tests {
         // Pins the pre-materialization in `Metrics::new` (#1443). A `Family`
         // creates each child series lazily on `get_or_create`, so without that
         // step a `reason` would be missing from `/metrics` until it first
-        // fired — a dashboard gap where the three pre-collapse counters showed
-        // a zero, and a silent hole in the `DecdnProbeHoldViolations` alert's
+        // fired — a dashboard gap where the three `reason` series of
+        // `decdn_probe_hold_unavailable_total` read absent instead of zero, and
+        // a silent hole in the `DecdnProbeHoldViolations` alert's
         // input. Also pins the rendered series text (label name, snake_case
         // value encoding, and the `_total` suffix the encoder appends). Note
         // that pinning it *here* does not tie it to the copies in
@@ -2724,7 +2706,9 @@ mod tests {
             );
         }
 
-        // The collapsed counters must not linger under their old names.
+        // None of these three names is a valid export; probe-hold reasons ship
+        // only as `reason` labels on the collapsed counter
+        // `decdn_probe_hold_unavailable_total`.
         for retired in [
             "decdn_probe_hold_violations_total",
             "decdn_probe_holds_disabled_total",
@@ -2959,11 +2943,9 @@ mod tests {
         // querying a series that no longer exists: the page for probe-hold
         // budget pressure then silently never fires again.
         //
-        // Scoped to the one series this collapse renamed — it asserts the
-        // *query line*, which the blanket name gate below cannot. The blanket
-        // "every `decdn_*` in monitoring/ is exported" check that used to be
-        // impossible here (the stale names blocked it) now lives in
-        // `monitoring_selectors_are_exported`, since #1513 repaired them.
+        // Scoped to the one series — it asserts the *query line*, which the blanket
+        // name gate below cannot. The blanket "every `decdn_*` in monitoring/ is
+        // exported" check lives in `monitoring_selectors_are_exported`.
         const SELECTOR: &str = "decdn_probe_hold_unavailable_total{reason=\"exhausted\"";
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -3133,8 +3115,7 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
-            // Best-effort tag-deletion failures. Bumped since #860/#837 but
-            // never pinned here until #1513 — the array is hand-maintained, so
+            // Best-effort tag-deletion failures. The array is hand-maintained, so
             // a new `CacheMetrics` field is covered only if someone adds it.
             "decdn_cache_tag_drop_failures_total",
             // In-flight coalescing mutex poison (#1517). The struct field is
@@ -3771,10 +3752,10 @@ mod tests {
     fn poisoned_down_since_reports_i64_max_not_zero() {
         // The load-bearing invariant of the down-seconds gauges: a poisoned
         // `down_since` must report `i64::MAX`, never `0`, because reporting `0`
-        // would MASK an in-progress outage (#783/#651/#1032). #1266 folded the
-        // three watchers' scrape recompute into one shared
-        // `refresh_watcher_down_seconds` template, so poisoning any single lock
-        // exercises that conservative-alerting fallback for all of them.
+        // would MASK an in-progress outage (#783/#651/#1032). The three watchers'
+        // scrape recompute goes through one shared `refresh_watcher_down_seconds`
+        // template, so poisoning any single lock exercises that conservative-alerting
+        // fallback for all of them.
         let metrics = Arc::new(Metrics::new());
         let for_thread = Arc::clone(&metrics);
         // Poison `slash_watcher_down_since` from a panicking thread holding the

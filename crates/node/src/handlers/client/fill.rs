@@ -1,5 +1,4 @@
 //! Cache-fill tiers for the serve-miss path.
-//! Bodies split from `mod.rs` (#1254).
 
 use super::{
     Address, B256, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneKey,
@@ -81,12 +80,11 @@ impl ClientHandler {
             // the caller can refuse `InternalError` if no further tier fills (#1129),
             // rather than reporting a broken origin as a miss.
             //
-            // NOT necessarily transient, which this arm used to claim outright: since
-            // #1560 the node-origin also surfaces its own buyer-side faults here (a
-            // broken signer, an unusable deadline config, an unreadable channel store) as
-            // `OriginPullError::Permanent`, and those recur for every hash until an
-            // operator acts. Telling an operator to wait for a permanent defect to pass
-            // is worse than saying nothing, so the line names neither lifetime.
+            // This arm names neither lifetime: the node-origin also surfaces its own
+            // buyer-side faults here (a broken signer, an unusable deadline config, an
+            // unreadable channel store) as `OriginPullError::Permanent`, and those recur
+            // for every hash until an operator acts. Telling an operator to wait for a
+            // permanent defect to pass is worse than saying nothing.
             Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a backend fault");
@@ -247,16 +245,6 @@ impl ClientHandler {
         }
     }
 
-    /// Whether a speculative pull may proceed for `peer` under the seed-leech caps
-    /// (#856). Always `true` when no governor is wired. Like
-    /// [`LeechGovernor::poll_admission`](super::LeechGovernor::poll_admission) this is a stateful, advisory poll (it
-    /// touches the peer's LRU entry and does not reserve budget), not a pure read.
-    pub(super) fn leech_admit(&self, peer: &[u8; 32]) -> bool {
-        self.leech_governor
-            .as_ref()
-            .is_none_or(|g| g.poll_admission(peer))
-    }
-
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
     /// it landed in the store in the race; otherwise meters the abandoned pull and
     /// reports the miss.
@@ -288,7 +276,7 @@ impl ClientHandler {
                 // would contaminate `node_pull_through_timeout`, whose whole job is
                 // to separate "slow/wedged upstream" from "broken store", and send
                 // an operator chasing the network while the disk is dying. Same rule
-                // `on_local_populate_timeout` states; the two used to disagree.
+                // `on_local_populate_timeout` states.
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e, "node-to-node pull-through store lookup failed after deadline");
                 faulted = true;

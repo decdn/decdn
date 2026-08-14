@@ -375,21 +375,12 @@ fn build_config(
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
-            pull_ahead_bytes: decdn_cache::Bytes::new(
-                decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-            ),
-            max_unrecouped_leech_bytes: decdn_cache::Bytes::new(
-                decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-            ),
-            pull_share_ratio_percent: decdn_cache::Percent::new(
-                decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
-            ),
         },
         payment: ResolvedPayment {
             rate_per_mb: 10,
             delivery_floor: 0,
-            voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
-            credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+            credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+            credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         },
         observability: ResolvedObservability {

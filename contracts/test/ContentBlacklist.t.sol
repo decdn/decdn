@@ -685,9 +685,9 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.hasRole(blacklist.REGIONAL_BODY_ROLE(), regionalBody));
     }
 
-    /// @notice The core of #1178: `REGIONAL_BODY_ROLE` alone used to let ANY
-    ///         registered body write entries for ANY region. A body's authority
-    ///         is its own jurisdiction.
+    /// @notice `REGIONAL_BODY_ROLE` alone must not let a registered body write
+    ///         entries for another region. A body's authority is its own
+    ///         jurisdiction.
     function test_addHashRegional_bodyCannotWriteAnotherRegion() public {
         vm.prank(regionalBody); // registered for US, not EU
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.NotRegionalBodyFor.selector, REGION_EU, regionalBody));

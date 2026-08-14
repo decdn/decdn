@@ -28,11 +28,8 @@ import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.
 ///         appeal for the same slash (`markAppealOpen` reverts once it is no
 ///         longer `Escrowed`).
 ///
-///         Naming vs. the retired `SafetyReserve` flow: `grantAppeal` ==
-///         operator vindicated (the old `reverseAppeal` — slash undone), and
-///         `upholdAppeal` == slash stands (the old `reverseAppeal`-as-failure
-///         path). The token flows are the inverse of the old USDC-restitution
-///         `ratifyAppeal`; this contract never moves USDC.
+///         `grantAppeal` == operator vindicated (slash undone); `upholdAppeal`
+///         == slash stands. This contract never moves USDC.
 contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, SunsettingPausable {
     using SafeERC20 for IERC20;
 

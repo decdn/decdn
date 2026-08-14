@@ -1,5 +1,4 @@
-//! Per-lane voucher collection / payment loop. Bodies split from `mod.rs`
-//! (#1254). Group-commit batching added in #1483.
+//! Per-lane voucher collection / payment loop with group-commit batching.
 
 use super::{
     Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ClientHandler,
@@ -417,9 +416,6 @@ impl ClientHandler {
             self.record_receipt(hash, s.delta_bytes, client_node_id, s.amount);
             if let Some(acc) = self.region_accountant.as_ref() {
                 acc.record_served(&client_node_id.0, s.delta_bytes).await;
-            }
-            if let Some(gov) = self.leech_governor.as_ref() {
-                gov.record_served(&client_node_id.0, s.delta_bytes);
             }
         }
 

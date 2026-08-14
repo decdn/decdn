@@ -86,8 +86,7 @@ impl SendOutcome {
         }
     }
 
-    /// Whether the transaction may have taken effect on-chain — the exact
-    /// question the old `Option<B256>` out-param answered.
+    /// Whether the transaction may have taken effect on-chain.
     ///
     /// True for a confirmed success, an in-flight broadcast, and a transport
     /// failure whose broadcast is unknown; false for a definitive rejection and a
@@ -360,7 +359,7 @@ mod tests {
 
     /// The tx hash reaches the receipt on every arm that has one, and only
     /// those; `maybe_effected` splits the "may be pending" arms from the
-    /// definitively-nothing arms exactly as the old `Option<B256>` did.
+    /// definitively-nothing arms.
     #[test]
     fn send_outcome_hash_and_effect_are_total() {
         let h = B256::repeat_byte(0x55);

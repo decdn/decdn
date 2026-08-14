@@ -482,11 +482,9 @@ impl<P: Provider + Clone> OriginSink<P> {
 /// The origin watcher's cursor start: seed the live tail at the block the
 /// bootstrap enumeration was taken at, and persist nothing.
 ///
-/// The cursor used to be durable so a restart could resume the historical
-/// `OriginAdded` replay part-way. There is no historical replay left to
-/// resume: every boot re-reads the namespace set outright, which covers the
-/// downtime gap by construction and needs no reorg rewind — a checkpoint written
-/// before a reorg was the only reason one was needed. This matches the
+/// The cursor persists nothing: every boot re-reads the namespace set
+/// outright, which covers the downtime gap by construction and needs no reorg
+/// rewind, so there is no historical `OriginAdded` replay to resume. This matches the
 /// capacity-bond registry, whose set is likewise rebuilt from its enumeration
 /// each boot.
 const fn cursor_start(at: u64) -> CursorStart {
@@ -584,12 +582,10 @@ where
 {
     let mut cache = DirectoryCache::default();
 
-    // 1. Discover the namespace set by reading it. This used to be a windowed
-    //    `OriginAdded` replay from a configured floor — the whole chain
-    //    on a cold store — purely because the key set was not enumerable on
-    //    chain. Membership was always authoritative via `getOrigins`; only
-    //    "which ids exist" had to come from logs. `assignedNamespaces` closes
-    //    that, so there is no historical scan on any boot, warm or cold.
+    // 1. Discover the namespace set by reading it. Membership is authoritative
+    //    via `getOrigins`; the id set comes from `assignedNamespaces`, which
+    //    enumerates "which ids exist" on chain, so there is no historical log
+    //    scan on any boot, warm or cold.
     let snapshot_block = contracts
         .origin
         .provider()
@@ -1381,10 +1377,10 @@ mod tests {
     /// POLICY PIN: the origin watcher seeds the live tail at the block its
     /// bootstrap enumeration was taken at, and persists NOTHING.
     ///
-    /// The durable cursor existed to resume a historical `OriginAdded`
-    /// replay part-way. There is no replay left to resume — every boot re-reads
-    /// the namespace set — so a checkpoint here would be dead weight that could
-    /// only go stale. A regression that reintroduces one fails this.
+    /// There is no historical `OriginAdded` replay to resume — every boot
+    /// re-reads the namespace set — so a persisted checkpoint would be dead
+    /// weight that could only go stale. A regression that reintroduces one
+    /// fails this.
     #[test]
     fn cursor_start_seeds_at_the_snapshot_and_persists_nothing() {
         match cursor_start(4_242) {

@@ -29,11 +29,10 @@ pub const PROBE_HOLD_DURATION: Duration = PROBE_SLASH_WINDOW.saturating_add(PROB
 
 /// Default maximum number of concurrently held (eviction-exempt) blobs (ADR
 /// 005 §Hold budget). Holds are per-blob: many peers probing one hash share a
-/// single slot. The canonical definition now lives in the
+/// single slot. The canonical definition lives in the
 /// `decdn-config-types` leaf crate (#578) so the config default
 /// (`decdn_common::config`) and the cache engine default cannot drift apart;
-/// re-exported here for the existing `crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS`
-/// path.
+/// re-exported here as `crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS`.
 pub use decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 
 /// Outcome of [`crate::CacheEngine::try_probe_hold`], carrying two independent
@@ -42,7 +41,7 @@ pub use decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 /// - **whether to advertise** the blob — [`ProbeHoldOutcome::advertises`];
 /// - **whether a hold was actually placed** — [`ProbeHoldOutcome::hold_placed`].
 ///
-/// Since holds became best-effort these are no longer the same bit:
+/// Holds are best-effort, so these are two independent bits:
 /// [`Self::BudgetExhausted`] advertises *without* holding. Use the two
 /// predicates rather than matching on variants, so the mapping stays in one
 /// place; the variants themselves exist so the probe handler can emit the right
@@ -102,7 +101,7 @@ impl ProbeHoldOutcome {
     /// Whether an eviction hold was actually placed, making the blob
     /// LRU-exempt for [`PROBE_HOLD_DURATION`].
     ///
-    /// Distinct from [`Self::advertises`] since holds became best-effort — only
+    /// Distinct from [`Self::advertises`]: holds are best-effort, and only
     /// [`Self::Held`] consumes a slot.
     #[must_use]
     pub const fn hold_placed(self) -> bool {

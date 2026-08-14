@@ -323,7 +323,7 @@ pub(crate) fn is_self_announce(
 }
 
 /// Insert (or refresh) an already-validated announce into `table` and
-/// emit the matching metric. Pulled out of [`subscriber_task`] so the
+/// emit the matching metric. Separate from [`subscriber_task`] so the
 /// subscriber loop and the contract test exercise the *same* dispatch
 /// code; a future change here (new `InsertOutcome` variant, metric
 /// rename, gauge re-emission on a rejected arm) cannot drift between
@@ -647,8 +647,8 @@ fn ttl_sweeper_task(
 /// Evict TTL-expired entries once and reflect the result in metrics. On a
 /// non-empty sweep, bump the unlabeled `decdn_peer_table_evicted_ttl_total`
 /// counter by the evicted count and refresh the peer-table-size gauge. A
-/// no-op sweep touches neither metric so silence stays meaningful. Split out
-/// of [`ttl_sweeper_task`] so the metric wiring is unit-testable without the
+/// no-op sweep touches neither metric so silence stays meaningful. Separate
+/// from [`ttl_sweeper_task`] so the metric wiring is unit-testable without the
 /// real clock/interval.
 fn sweep_expired(table: &mut PeerTable, now_us: u64, metrics: &dyn GossipMetrics) {
     let evicted = table.evict_expired(now_us);

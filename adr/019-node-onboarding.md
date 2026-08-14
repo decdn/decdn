@@ -272,7 +272,7 @@ Mechanism-specific guidance — particular hash-match databases, reporting endpo
 ### Positive
 
 - Operators have a single, ordered reference for joining the PoC testnet.
-- All startup prerequisites (rate floor, blacklist, registry) are explicitly ordered, eliminating the previously identified silent-failure class.
+- All startup prerequisites (rate floor, blacklist, registry) are explicitly ordered, eliminating a silent-failure class.
 - The acceptance criteria table (Phase 5) provides a machine-checkable health signal for readiness probes and operational monitoring.
 - Re-onboarding (post-ejection) is explicitly covered, preventing nonce confusion.
 - Onboarding records an explicit operator-duty floor, foreclosing the unaware-operator posture without adding any on-chain content gate.

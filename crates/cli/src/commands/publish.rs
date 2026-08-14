@@ -167,9 +167,9 @@ async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> 
 
 /// The outcome of `namespace create`'s single transaction — the five mutually
 /// exclusive states as one value, so text and JSON rendering derive from one
-/// source of truth and can no longer contradict each other (issue #1578). Modeled
+/// source of truth and cannot contradict each other. Modeled
 /// on [`SeatOutcome`]: an illegal combination (a hash on a dry run, a `created`
-/// with no hash) is now unrepresentable rather than merely unreached.
+/// with no hash) is unrepresentable rather than merely unreached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NamespaceStatus {
     /// `--dry-run`: nothing was sent, and no keystore was loaded.
@@ -1047,11 +1047,10 @@ mod tests {
         assert!(s.contains("status=created tx=0x5555"), "{s}");
     }
 
-    /// The bug this refactor closes (issue #1578): under the old struct a
-    /// `dry_run: true` alongside a `tx: Some` printed `status=dry_run tx=…` and
-    /// emitted `"submitted": true` next to `"status": "dry_run"`. The enum makes
-    /// that pair unrepresentable — `DryRun` carries no hash, so `tx()` is `None`
-    /// and text and JSON agree on both fields — which this pins.
+    /// The enum makes an illegal pair unrepresentable: a `dry_run: true`
+    /// alongside a `tx: Some` cannot print `status=dry_run tx=…` or emit
+    /// `"submitted": true` next to `"status": "dry_run"`. `DryRun` carries no hash,
+    /// so `tx()` is `None` and text and JSON agree on both fields — which this pins.
     #[test]
     fn namespace_dry_run_carries_no_tx_and_is_not_submitted() {
         let dry = NamespaceOutcome {
@@ -1830,8 +1829,7 @@ mod tests {
 
     /// The label/hash derivation for every `NamespaceStatus` state, walked once
     /// so the two renderers can never disagree with each other about a state.
-    /// `dry_run` and `failed` are the pair the old `tx`-derived status could not
-    /// tell apart; the enum keeps them distinct and hash-free.
+    /// `dry_run` and `failed` are distinct, hash-free states the enum keeps apart.
     #[test]
     fn namespace_status_labels_and_hashes_match_their_states() {
         let hash = B256::repeat_byte(0x55);

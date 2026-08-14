@@ -39,7 +39,8 @@ use decdn_client_pull::sink::content_paid_frontier;
 
 use super::{
     Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, MB_BYTES, Mutex, Ordering, RecvStream, SendStream, VecDeque,
+    LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES,
+    VecDeque,
 };
 
 impl ClientHandler {
@@ -52,9 +53,9 @@ impl ClientHandler {
     /// in-flight takedown boundary, and client-disconnect handling all read from
     /// the cache: a coherent whole-range bao encoder reads the cache the pull leg
     /// fills. The caller (orchestration) has
-    /// already proven channel ownership, run the pre-flight gates, negotiated
-    /// `interval_mb`, and signed + sent the `StreamResponse`; the pull leg fills
-    /// the store beside this call. Consumes neither stream — the caller does.
+    /// already proven channel ownership, run the pre-flight gates, and signed +
+    /// sent the `StreamResponse`; the pull leg fills the store beside this call.
+    /// Consumes neither stream — the caller does.
     ///
     /// # Money semantics
     ///
@@ -86,7 +87,6 @@ impl ClientHandler {
         lane_key: LaneKey,
         client_node_id: B256,
         rate_per_mb: u64,
-        interval_mb: u64,
         offset: u64,
         len: u64,
         total_bytes: u64,
@@ -101,7 +101,7 @@ impl ClientHandler {
         };
         let offset = offset.min(end);
 
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         // Backpressure bound, floored at one interval so the loop can always make
         // progress (deliver a full interval, then recoup its voucher).
         let window = window.max(interval_bytes);

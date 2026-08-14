@@ -618,7 +618,7 @@ impl ReceiptSink for ChannelReceiptSink {
 /// Synchronous [`ReceiptSink`] that appends inline to a [`ReceiptLog`],
 /// swallowing the write error. Test/loopback support only: lets the unit and
 /// `client_loopback` tests keep a deterministic in-memory [`ReceiptLog`] fake
-/// behind the sink seam the handler now depends on, without standing up the
+/// behind the sink seam the handler depends on, without standing up the
 /// background writer or polling for an async drain. Production never uses it —
 /// the runtime always routes through [`spawn_receipt_writer`] so disk I/O cannot
 /// block paid delivery.
@@ -660,7 +660,7 @@ impl ReceiptSink for DirectReceiptSink {
 /// enqueues through plus the task `JoinHandle` for graceful shutdown.
 ///
 /// Decouples the audit write from the paid-delivery hot path (#803): the
-/// voucher-accept path now only does a non-blocking [`ReceiptSink::record`] (a
+/// voucher-accept path does only a non-blocking [`ReceiptSink::record`] (a
 /// bounded `try_send`) as each voucher is durably accepted, while this task performs the actual
 /// `append` on the blocking pool. A slow or full disk can therefore only fill
 /// the queue (and drop audit records, counted) — it can never delay delivery
@@ -702,8 +702,8 @@ async fn receipt_writer_loop(
         }
     }
     // Tail-drain: flush every receipt already enqueued before exiting so the
-    // audit tail is not lost on shutdown — the guarantee the previously-awaited
-    // inline write upheld (CLAUDE.md / ADR 003). `try_recv` yields `Empty` once
+    // audit tail is not lost on shutdown — the audit-tail guarantee (CLAUDE.md /
+    // ADR 003). `try_recv` yields `Empty` once
     // the buffer is drained (and `Disconnected` if the senders are gone); either
     // ends the drain.
     while let Ok(receipt) = rx.try_recv() {
@@ -812,8 +812,7 @@ mod tests {
     }
 
     /// The writer drains every queued receipt FIFO and stops cleanly once the
-    /// shutdown token is cancelled — the audit-tail-preservation guarantee (#803)
-    /// the previously-awaited inline write upheld.
+    /// shutdown token is cancelled — the audit-tail-preservation guarantee (#803).
     #[tokio::test]
     async fn writer_drains_all_queued_receipts_then_stops_on_cancel() -> anyhow::Result<()> {
         let log = Arc::new(RecordingLog::default());

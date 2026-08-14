@@ -7,18 +7,20 @@
 //! ([`BlobSource`]), the pacing axis ([`Pacer`]), and the funding axis
 //! ([`Funder`]) into a single fetch that pulls exactly the bytes a request needs.
 //!
-//! # How it folds the CLI's `fetch_blob_streaming` loop
+//! # The money-relevant branches
 //!
-//! The pre-#1608 CLI loop (`crates/cli/src/commands/fetch.rs::fetch_blob_streaming`)
-//! was one whole-tail pull with an advancing `byte_offset`. `drive` keeps its
-//! money-relevant branches but re-frames them around gaps:
+//! A whole-tail pull streams one advancing `byte_offset` to the end of the blob;
+//! `drive` instead drives the same money-relevant branches per gap — it draws,
+//! funds, and resumes one missing range at a time. The CLI's `decdn fetch` and
+//! `bundle pull` run `drive` as their fetch core (via `drive_fetch` in
+//! `crates/cli/src/commands/fetch.rs`). The branches are:
 //!
 //! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
 //!   [`crate::ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
 //!   then [`BlobSource::finish`] to drain the pull and recover the acked voucher
 //!   watermark. The store's checkpoints are what make a mid-gap fault re-enter
-//!   with a SMALLER gap, so a resume never re-pulls a checkpointed prefix — the
-//!   loop's own `set_len`/`seek` rewind is gone (the store owns durability now).
+//!   with a SMALLER gap: the store owns durability, so a resume never re-pulls a
+//!   checkpointed prefix.
 //! - **Reactive top-up**: a genuine mid-fetch exhaustion (confirmed against our
 //!   OWN ledger via [`genuine_exhaustion`]) is funded through [`Funder::top_up`],
 //!   then the gap is retried at its PAID frontier — NOT its checkpointed
@@ -29,14 +31,14 @@
 //!   AHEAD of the last PAID byte. Resuming from `missing_ranges` alone would then
 //!   skip billing the delivered-but-unpaid tail (an under-pay). So the per-leg
 //!   resume offset is [`sink::content_paid_frontier`] of the leg's paid wire
-//!   watermark, exactly as the pre-#1608 CLI loop computed it — the tail is
+//!   watermark — the tail is
 //!   re-delivered (`ingest_stream` re-writes it idempotently) and re-billed.
 //! - **Settle-wait**: after a top-up the driver retries the open immediately —
 //!   the pacer sees the healed deposit and draws right away. If the node's chain
 //!   watcher has not yet observed the new deposit, that retry is refused with the
 //!   ambiguous [`crate::resume_may_be_stale`] shape; ONLY THEN does the driver
-//!   sleep and retry, bounded by the settle-wait budget (this mirrors the legacy
-//!   CLI loop, which only backs off on an actual stale-resume refusal).
+//!   sleep and retry, bounded by the settle-wait budget: back-off happens only on an
+//!   actual stale-resume refusal.
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
 //!   [`WatermarkBundle`](decdn_protocol::client::WatermarkBundle) that ADVANCES
 //!   our committed watermark is a healable desync — the driver reseeds the ledger
@@ -44,25 +46,24 @@
 //!   [`PaceDecision`] — the reseed check runs ahead of pacing, the same ordering
 //!   the node's own miss-pull policy uses.
 //!
-//! # What is deliberately NOT here (deferred to A5 / the CLI)
+//! # What `drive` does not do
 //!
-//! - The **stale-foreign-partial restart-from-zero**. The CLI kept an opaque
-//!   `.partial` with no outboard, so an ambiguous `NotFound` could mean "this file
-//!   belongs to another blob" and it rewound to zero. A [`crate::ClientRangedStore`] is
-//!   keyed to `(root, total_bytes)` and only ever holds bao-verified ranges, so
-//!   there is no foreign-partial ambiguity to resolve — resume is always driven by
-//!   the verified present set.
-//! - **Progress reporting, deadlines, and durable watermark persistence** to a
-//!   `BuyerChannelStore`. The acked watermark lives in the [`PoolLedger`] the
-//!   caller owns; persisting it across process restarts, and drawing a progress
-//!   bar, are CLI concerns (A5).
+//! - No **stale-foreign-partial restart-from-zero**. A
+//!   [`crate::ClientRangedStore`] is keyed to `(root, total_bytes)` and only ever
+//!   holds bao-verified ranges, so an ambiguous `NotFound` can never mean "this
+//!   file belongs to another blob": there is no foreign-partial ambiguity to
+//!   resolve, and resume is always driven by the verified present set.
+//! - No **progress reporting, deadlines, or durable watermark persistence** to a
+//!   `BuyerChannelStore` — these are the caller's job. The acked watermark lives
+//!   in the [`PoolLedger`] the caller owns; persisting it across process restarts,
+//!   and drawing a progress bar, are CLI concerns.
 //!
 //! # Store abstraction
 //!
 //! The store is generic over [`crate::source::IngestStore`] (`RangedStore` +
 //! `ingest_stream`), not the concrete `&ClientRangedStore` — [`crate::ClientRangedStore`]
 //! is one implementer (the CLI/client backend, writing `.partial`/`.obao4`); a
-//! node backend (B2) admits to the cache and tees to its downstream client
+//! node backend admits to the cache and tees to its downstream client
 //! through the same seam.
 
 use std::future::Future;
@@ -82,7 +83,7 @@ use crate::{
     UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
 };
 
-/// The injected wait signal for [`PaceDecision::Wait`] (ADR 037, Phase B): the
+/// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
 /// has advanced (so a re-decide has a chance of finding window room); the client
 /// path never needs one, since `BudgetPacer` never returns `Wait`.
@@ -115,7 +116,7 @@ const CHUNK_BYTES: u64 = 1024;
 
 /// Deployment knobs the pure gap/pay core needs from its caller (CLI: #1497's
 /// `MAX_TOPUP_SETTLE_WAITS` / `TOPUP_SETTLE_BACKOFF`; node: its own smaller
-/// budgets). Kept minimal — progress and deadlines stay with the caller (A5).
+/// budgets). Kept minimal — progress and deadlines stay with the caller.
 #[derive(Debug, Clone, Copy)]
 pub struct DriveConfig {
     /// The reactive top-up target passed to the pacer as
@@ -150,9 +151,9 @@ impl DriveConfig {
 /// the total wait (15s), comfortably above the daemon's chain-event poll cadence
 /// yet well under a fetch's overall deadline.
 ///
-/// The single source of truth for both [`drive`]'s settle-wait budget (via
-/// [`DriveConfig::cli`]) and the CLI's legacy `fetch_blob_streaming` /
-/// `bundle_pull` loop, so the two settle-wait policies cannot silently diverge.
+/// The single source of truth for [`drive`]'s settle-wait budget (via
+/// [`DriveConfig::cli`]); the CLI `fetch` command and `bundle_pull` both run
+/// `drive`, so they share one settle-wait policy.
 pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
 /// Backoff between resume-open retries while waiting for the node's chain watcher
 /// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
@@ -308,7 +309,7 @@ where
 // the four-way fault classification each justify a money-relevant decision inline
 // (which watermark heals a desync, when an exhaustion is fundable, why a stall is
 // terminal); splitting them out would separate those from the loop state they act
-// on, exactly as the CLI's `fetch_blob_streaming` keeps them together.
+// on.
 #[allow(clippy::too_many_lines)]
 async fn fill_gap<St, S, P, F>(
     store: &St,
@@ -498,7 +499,7 @@ where
                 settle_waits = 0;
                 exhaustion_confirmed = false;
             }
-            // Honors `up_to_bytes` (#1608 Phase B / driver.rs TODO, resolved):
+            // Honors `up_to_bytes` (#1608):
             // `BudgetPacer` returns the full gap remainder, so clamping to it is a
             // no-op there; a `WindowPacer` returns a tighter bound, and clamping
             // `draw_len`/`aligned` here is what actually enforces the window — the
@@ -546,7 +547,7 @@ where
                             Ok(reader) => {
                                 // Drain to stream end and recover the acked voucher
                                 // watermark. It lives in the ledger the caller owns
-                                // (durable persistence is A5's job); finishing here
+                                // (durable persistence is the caller's job); finishing here
                                 // enforces wire-byte completeness.
                                 source.finish(reader).await.map(|_vp| ())
                             }
@@ -1283,7 +1284,7 @@ mod tests {
     async fn draw_clamps_the_open_to_up_to_bytes() {
         // A single 4-group gap; the pacer authorizes only ONE group's worth. The
         // driver must open exactly GROUP bytes, not the whole 4*GROUP gap — this
-        // is the up_to_bytes clamp the driver.rs:464 TODO used to skip.
+        // is the up_to_bytes clamp.
         let total = 4 * GROUP;
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);

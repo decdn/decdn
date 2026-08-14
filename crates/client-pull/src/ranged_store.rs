@@ -1,13 +1,13 @@
-//! [`ClientRangedStore`]: the client-side [`RangedStore`](decdn_bao_range::RangedStore) backend (#1621
-//! P2 Task 1) — a `.partial` data file plus a `.partial.obao4` outboard and a
+//! [`ClientRangedStore`]: the client-side [`RangedStore`](decdn_bao_range::RangedStore) backend
+//! (#1621) — a `.partial` data file plus a `.partial.obao4` outboard and a
 //! persisted `.partial.ranges` present-range record, built on `bao-tree` /
 //! `decdn-bao-range` only. No `iroh-blobs` dependency: `client-pull` must
 //! stay iroh-blobs-free so the CLI's pull path links no blob store / AWS SDK
 //! (#578).
 //!
 //! Construction plus the query methods (`total_bytes`, `present_ranges`,
-//! `missing_ranges`, `read`, `is_complete`) came from P2 Task 1. `admit` and
-//! `finalize` (P2 Task 2) fill in the write path against the same
+//! `missing_ranges`, `read`, `is_complete`) query the record. `admit` and
+//! `finalize` provide the write path against the same
 //! `data_path` / `present` fields: `admit` verifies an interleaved bao range
 //! against the root with `bao_tree::io::sync::decode_ranges` (a positioned,
 //! sparse write plus outboard accumulation), and `finalize` runs one
@@ -53,7 +53,7 @@ use crate::sink::{StashedFault, classify_decode_error};
 /// record's write-and-rename (the record may under-claim, which is the safe
 /// direction — the missing range is simply re-fetched on the next resume)
 /// and, worse, an `admit` racing a `finalize` promote is undefined. Reads are
-/// safe to interleave. The P3 driver drives one write op per blob at a time.
+/// safe to interleave. The driver drives one write op per blob at a time.
 pub struct ClientRangedStore {
     /// BLAKE3 content root this store verifies against.
     root: [u8; 32],
@@ -466,12 +466,11 @@ impl ClientRangedStore {
     /// Checkpoint cadence for durable present-range persistence. On a mid-gap
     /// fault, content received since the last checkpoint is re-pulled and
     /// **re-paid** on resume — so this bounds the per-fault re-pay window to
-    /// under one 4 MiB checkpoint interval (≈4 default 1 MiB voucher
-    /// intervals, `DEFAULT_VOUCHER_INTERVAL_MB` in `decdn-protocol`), times
-    /// at most `MAX_RESUME_ATTEMPTS`. Checkpointed (durably-recorded) bytes
-    /// are never re-paid. Larger cadence = fewer fsyncs but a wider re-pay
-    /// window on fault; align to the voucher interval to shrink it toward
-    /// the payment granularity.
+    /// under one 4 MiB checkpoint interval (one `VOUCHER_INTERVAL_BYTES` in
+    /// `decdn-protocol`), times at most `MAX_RESUME_ATTEMPTS`. Checkpointed
+    /// (durably-recorded) bytes are never re-paid. Larger cadence = fewer
+    /// fsyncs but a wider re-pay window on fault; align to the voucher
+    /// accounting interval to shrink it toward the payment granularity.
     const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 
     /// Stream the raw bao encoding of `range` (from `reader`) into the store:

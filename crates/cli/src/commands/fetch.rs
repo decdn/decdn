@@ -535,28 +535,23 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
     // reasons onto `NotFound` (which exists so a prober cannot map other
     // clients' balances).
     //
-    // The threshold is an ESTIMATE, not a proof: the node's floor is one credit
-    // window at ITS configuration, which we cannot read. Estimated with the shipped
-    // defaults — 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`) over a 4 MiB
-    // `DEFAULT_VOUCHER_INTERVAL_MB`, so the window is the binding term. An operator
-    // who raised `credit_window_bytes` has a higher floor than this, so the miss
+    // The node's pre-flight reservation is one voucher interval (the ramp floor);
+    // the window only widens as this pool pays, so one interval is the true lower
+    // bound on what it reserves before serving. Estimated with the fixed
+    // `VOUCHER_INTERVAL_BYTES`, since we cannot read the node's config. The miss
     // direction is "we stay silent when we could have spoken" — never a fabricated
-    // shortfall. Phrased as a possibility, and as a lower bound, for that reason.
+    // shortfall — so it is phrased as a possibility and as a lower bound.
     if let Some(quoted_rate) = refused.evidence().map(|resp| resp.body.rate_per_mb) {
         let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
-        let estimate = min_payment(
-            decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
-            quoted_rate,
-        );
+        let estimate = min_payment(decdn_protocol::client::VOUCHER_INTERVAL_BYTES, quoted_rate);
         if quoted_rate > 0 && headroom < estimate {
             causes.push(format!(
                 "this pool's remaining deposit ({headroom}) is below the ~{estimate} the node \
-                 reserves before serving at its quoted rate of {quoted_rate} per MB — and that \
-                 estimate is a LOWER bound, since the node may reserve several times it \
-                 depending on its configured credit window. The fetch path already auto-refills \
-                 below a low-water mark, so reaching this means the configured working deposit \
-                 is itself too small: raise `--working-deposit-micro-usdc` (or \
-                 `blockchain.buyer_working_deposit_micro_usdc`) and retry"
+                 reserves before serving at its quoted rate of {quoted_rate} per MB. The fetch \
+                 path already auto-refills below a low-water mark, so reaching this means the \
+                 configured working deposit is itself too small: raise \
+                 `--working-deposit-micro-usdc` (or `blockchain.buyer_working_deposit_micro_usdc`) \
+                 and retry"
             ));
         }
     }
@@ -1327,7 +1322,7 @@ where
 /// Attach the ADR 005 client identity binding to an already-built
 /// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the buyer key so
 /// the serving node can prove we own the pool and reactively pull a
-/// cache-missed blob from its configured origin. Split out of
+/// cache-missed blob from its configured origin. Separate from
 /// [`build_pool_ctx`] so `decdn bundle pull` — which takes the `open_lock`
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.

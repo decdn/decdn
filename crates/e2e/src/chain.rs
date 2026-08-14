@@ -219,8 +219,8 @@ impl Drop for AnvilGuard {
 /// facts about the already-running anvil process, fixed at [`Self::launch`].
 /// They are exposed as accessors rather than `pub` fields so a caller can't
 /// reassign one and silently desync the fixture from the live process it
-/// describes (the endpoint used to be two `pub` fields, `rpc_url` + `url`, that
-/// had to agree — now one stored form derives both).
+/// describes (the endpoint is one stored form that derives both the RPC URL
+/// and the URL, so they cannot disagree).
 #[derive(Debug)]
 pub struct ChainFixture {
     _anvil: AnvilGuard,
@@ -1395,12 +1395,12 @@ impl ChainFixture {
     }
 
     /// Extract the `SlashJudge.Slashed` `slashId` from a reveal receipt's logs,
-    /// failing loudly on the pathologies the old inline scan hid (#1379):
+    /// failing loudly on the pathologies an inline scan hides:
     ///
     ///  * a `Slashed` log emitted by `SlashJudge` whose body fails to decode is
-    ///    surfaced as the ABI mismatch it is — the old `if let Ok(..)` swallowed
-    ///    the decode error and bailed "emitted no Slashed event", pointing at the
-    ///    contract when the cause was a stale hand-written binding;
+    ///    surfaced as the ABI mismatch it is, rather than swallowed by an
+    ///    `if let Ok(..)` that bails "emitted no Slashed event" and points at the
+    ///    contract when the cause is a stale hand-written binding;
     ///  * when `expected` is supplied, the decoded `offenseType` and
     ///    `evidenceHash` must match, pinning "slashed for the reason we induced"
     ///    inside the fixture instead of leaving it to each journey.

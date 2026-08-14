@@ -121,9 +121,9 @@ const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 /// Apply an explicit client poll interval to a freshly built provider,
 /// overriding alloy's localhost-detected 250 ms default (#1011).
 ///
-/// Despite the config knob's name this no longer touches event watching: since
-/// #1106 the chain watchers tick on `WatcherConfig::poll_interval` and never read
-/// the client interval. The one consumer still reachable from this node is
+/// Despite the config knob's name, this does not touch event watching: the
+/// chain watchers tick on `WatcherConfig::poll_interval` and never read the
+/// client interval. The one consumer still reachable from this node is
 /// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
 /// `heart.rs`), which the node awaits in `payment_settlement` and
 /// `buyer_channel` — so this bounds how fast a node awaiting a mined settlement /
@@ -643,7 +643,7 @@ async fn serve_until_shutdown(
     // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
     // the process exits (tearing those listeners down with it) rather than ever
     // serving un-vetted content. The watcher was spawned earlier in bring-up
-    // (where the router used to be built), so its initial replay runs
+    // so its initial replay runs
     // concurrently and is often already complete by the time control reaches
     // this gate.
     let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
@@ -806,10 +806,10 @@ async fn build_chain_and_handlers(
         ProviderFactory::shared_head(rpc_url.clone()),
         event_poll_interval,
     ));
-    // The watcher shutdown tokens are no longer minted here: since #1236 each
-    // watcher's `spawn` mints its own and returns a `WatcherHandle` that owns it,
-    // so the runtime drives graceful stop through the handle (`handle.shutdown()`
-    // in the sequence below) rather than a token it might forget to cancel.
+    // Each watcher's `spawn` mints its own shutdown token and returns a
+    // `WatcherHandle` that owns it, so the runtime drives graceful stop through the
+    // handle (`handle.shutdown()` in the sequence below) rather than a token it
+    // might forget to cancel.
     //
     // One CapacityBond enumeration + one watcher feeding both registry
     // projections (#1110). The bindings half is built only when pull-through is
@@ -1091,7 +1091,7 @@ async fn build_chain_and_handlers(
         crate::region_accounting::PeerTableResolver::new(Arc::clone(&peer_table)),
     )));
 
-    // Redeem-hint channel (#327), hoisted out of `PoolSettlementService::bootstrap`
+    // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
     // so the handler takes the sender at construction (no post-construction attach)
     // while the service takes the receiver. `redeem_tx` is cloned into the handler
     // deps below and also handed to the service (so `redeem_hint_sender()` keeps
@@ -1130,8 +1130,6 @@ async fn build_chain_and_handlers(
     // preserved exactly.
     let mut pull_through = None;
     let mut pull_through_origin = None;
-    let mut pull_ahead_bytes = None;
-    let mut leech_governor = None;
     if cfg.cache.node_to_node_pull_through_enabled {
         // The outer deadline bounds how long a miss blocks the delivery path before
         // falling back to `NotFound`. It is *derived* from the per-candidate budget
@@ -1151,28 +1149,10 @@ async fn build_chain_and_handlers(
         pull_through = Some(outer_deadline);
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with downstream
-        // delivery (bounded by `pull_ahead_bytes`) instead of the buffered `populate`,
-        // and govern aggregate speculation with the seed-leech caps. The deposit
-        // pre-check and per-request window apply even without the governor; the
-        // governor adds the global budget + the per-peer share ratio.
+        // delivery, paced by the ramped credit window (ADR 003 §Credit window,
+        // #1669) instead of the buffered `populate`.
         if let Some(origin) = &infra.pull_through_origin {
             pull_through_origin = Some(Arc::clone(origin));
-            pull_ahead_bytes = Some(cfg.cache.pull_ahead_bytes);
-            // The resolver already enforces `pull_ahead_bytes <=
-            // max_unrecouped_leech_bytes` (with the `0`-disables carve-out), so this
-            // validated build is belt-and-suspenders — a self-contradicting pairing is
-            // a bring-up error, not a silently-degraded governor.
-            let leech_caps =
-                crate::leech_governor::LeechCaps::new(crate::leech_governor::LeechCapsConfig {
-                    max_unrecouped_leech_bytes: cfg.cache.max_unrecouped_leech_bytes,
-                    initial_allowance_bytes: cfg.cache.pull_ahead_bytes,
-                    share_ratio_percent: cfg.cache.pull_share_ratio_percent,
-                })
-                .context("invalid seed-leech caps: opening window exceeds the global budget")?;
-            leech_governor = Some(Arc::new(crate::leech_governor::LeechGovernor::new(
-                leech_caps,
-                Arc::clone(&infra.node_metrics),
-            )));
         }
     }
 
@@ -1199,7 +1179,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.receipt_sink),
         cfg.payment.rate_per_mb,
         rate_bounds.clone(),
-        cfg.payment.voucher_interval_mb,
         cfg.cache
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
@@ -1228,17 +1207,15 @@ async fn build_chain_and_handlers(
     client_deps.local_populate = local_populate;
     client_deps.pull_through = pull_through;
     client_deps.pull_through_origin = pull_through_origin;
-    client_deps.pull_ahead_bytes = pull_ahead_bytes;
-    // Downstream paid-delivery credit window (ADR 003 §Credit window, #1477).
-    client_deps.credit_window_bytes =
-        Some(decdn_cache::Bytes::new(cfg.payment.credit_window_bytes));
+    // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
+    client_deps.credit_max = cfg.payment.credit_max;
+    client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
     // Group-commit interval (ADR 003 §Off-chain voucher state persistence, #1483):
     // amortize the per-voucher fsync across a batch, acking each only after the
     // durable commit.
     client_deps.voucher_commit_interval = Some(std::time::Duration::from_millis(
         cfg.payment.voucher_commit_interval_ms,
     ));
-    client_deps.leech_governor = leech_governor;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1470,8 +1447,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         crate::channel_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.concrete_channel_store)),
     );
     // The buyer-side PaymentPool bootstrap (whose on-chain round-trips —
-    // notably the one-time USDC `approve` receipt — historically blocked for many
-    // minutes on a stuck tx; now also bounded by `APPROVE_RECEIPT_TIMEOUT`) and
+    // notably the one-time USDC `approve` receipt — can block for many
+    // minutes on a stuck tx, bounded by `APPROVE_RECEIPT_TIMEOUT`) and
     // the node-origin pull-through provisioning it feeds are BOTH deferred to a
     // background task spawned below (#1109), so the metrics/admin listeners and
     // the "node runtime ready" banner come up independent of any chain RPC. The
@@ -1842,8 +1819,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // Buyer-side PaymentPool bootstrap + node-to-node pull-through
     // provisioning (#831), fully backgrounded off the startup critical path
     // (#1109). The USDC `approve` receipt that `bootstrap` awaits could hang for
-    // many minutes on a stuck tx (now capped by `APPROVE_RECEIPT_TIMEOUT`);
-    // running it inline here previously gated the metrics/admin binds and the
+    // many minutes on a stuck tx (capped by `APPROVE_RECEIPT_TIMEOUT`);
+    // running it inline would gate the metrics/admin binds and the
     // "node runtime ready" banner below. The origin shares its `OnceLock` with
     // the clone already in the cache's origin chain, so a later `provision` from
     // this task arms pull-through; reads before it land as clean misses (no
@@ -1874,7 +1851,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        // Miss pulls open small and graduate on proof (#1497 task 6): the
+        // Miss pulls open small and graduate on proof (#1497): the
         // fresh-open deposit is the INITIAL size, not the working target.
         deposit_hint: buyer_initial_deposit,
         // ...and graduate to the working target when a single pull outruns that
@@ -2000,8 +1977,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         }
 
         // Hold the service (and thus its `AbortOnDrop` reclaim/reconcile
-        // sweeps) alive until shutdown, preserving the pre-#1109
-        // process-lifetime binding — reclaim must keep running even when
+        // sweeps) alive until shutdown — reclaim must keep running even when
         // pull-through is off (`node_origin_opt` is `None`).
         let _service = service;
         let _ = buyer_bootstrap_stop_rx.await;
@@ -2009,8 +1985,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 
     // GossipService owns its own shutdown via this token (#805): cancelling
     // it makes the publisher / subscriber / TTL-sweeper loops return at a
-    // clean await boundary, so the runtime no longer reaches in with
-    // `.abort()`. The handles still live outside the `JoinSet` because we
+    // clean await boundary, so the runtime stops them through the token rather
+    // than `.abort()`. The handles still live outside the `JoinSet` because we
     // cancel the token *after* `router.shutdown()` (an `abort_all()` would
     // cancel eagerly), then await them in the drain phase below.
     let gossip_shutdown = CancellationToken::new();
@@ -2357,7 +2333,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     }
     // No origin cursor to flush: the directory re-reads its namespace set from
     // chain on every boot, so there is no scan progress a lost flush could cost.
-    // The blacklist watcher is the same shape now — it re-enumerates the deny-set
+    // The blacklist watcher is the same shape — it re-enumerates the deny-set
     // from chain on every boot and its live tail carries no durable cursor — so
     // there is nothing to flush here either.
     // Admin server shutdown is ordered per `admin_stop_order`:
@@ -2407,9 +2383,8 @@ async fn shutdown<P: Provider + Clone + 'static>(
         tracing::warn!(%err, "router shutdown reported an error");
     }
     gossip_shutdown.cancel();
-    // The three watchers that had no cancel path before #1230, stopped here for
-    // the same reason gossip is: cooperative exit of an infinite loop at its
-    // next await, once nothing depends on it any more.
+    // The three watchers stopped here for the same reason gossip is: cooperative
+    // exit of an infinite loop at its next await, once nothing depends on it any more.
     //
     // *After* `router.shutdown` deliberately, and the capacity-bond one is why:
     // its projection is the cached active-staker set, which gates DHT `Store`
@@ -3731,21 +3706,12 @@ mod tests {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
-                pull_ahead_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-                ),
-                max_unrecouped_leech_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-                ),
-                pull_share_ratio_percent: decdn_cache::Percent::new(
-                    decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
-                ),
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,
                 delivery_floor: 0,
-                voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
-                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
@@ -4169,8 +4135,9 @@ mod tests {
     }
 
     /// A transient (429) preflight is retried with backoff and succeeds once the
-    /// endpoint recovers — the #1108 startup-burst-429 case that used to exit the
-    /// process. Drives `preflight_retry` with a 1ms backoff so the real HTTP path
+    /// endpoint recovers — the #1108 startup-burst-429 case, where a transient 429
+    /// must not exit the process. Drives `preflight_retry` with a 1ms backoff so the
+    /// real HTTP path
     /// to wiremock runs unpaused but the retries stay fast.
     #[tokio::test]
     async fn preflight_retries_transient_then_succeeds() {

@@ -5,9 +5,9 @@
 //! `eth_getLogs`, hands each log to a [`LogSink`], then advances — and, for a
 //! watcher whose [`CursorStart`] owns a [`Checkpoint`], durably records — the
 //! cursor per window. The **first tick's** large range *is* the historical backfill; later
-//! ticks are the live tail. This replaces alloy's `watch_logs`
-//! (`eth_newFilter` + `eth_getFilterChanges`), which the default public
-//! Arbitrum Sepolia RPC and most keyless endpoints reject with `-32601` (#1106).
+//! ticks are the live tail. It uses `eth_getLogs` rather than alloy's
+//! `watch_logs` (`eth_newFilter` + `eth_getFilterChanges`), which the default
+//! public Arbitrum Sepolia RPC and most keyless endpoints reject with `-32601` (#1106).
 //!
 //! Two properties matter for correctness:
 //!
@@ -51,13 +51,10 @@ pub(crate) struct Checkpoint {
 /// persisted forward.
 ///
 /// Persistence rides inside the variants that own a [`Checkpoint`] rather than
-/// on a separate field, so the two dead-field shapes #1238 removed cannot recur:
-/// a watcher that resumes from a checkpoint cannot be configured without one,
-/// and a watcher that re-derives its floor from head cannot declare a margin or
-/// window it never reads. This replaces the fused `CursorPolicy` + the
-/// `WatcherConfig::seed_cursor` override, where a seeded watcher silently
-/// bypassed floor derivation and left its policy's derivation fields inert
-/// (#1227).
+/// on a separate field, so two invalid shapes cannot be constructed: a watcher
+/// that resumes from a checkpoint cannot be configured without one, and a
+/// watcher that re-derives its floor from head cannot declare a margin or window
+/// it never reads.
 /// Where a [`CursorStart::FromCheckpoint`] watcher starts on a first-ever boot,
 /// when no cursor has ever been persisted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1166,10 +1163,9 @@ mod tests {
     /// in flight finishes and persists, and the next one never starts.
     ///
     /// `run_tick`'s cancel check cites "slash's appeal-window span" as a case it
-    /// exists for — but slash's token was inert, so the check never fired for
-    /// one of the two watchers it names, on the longest tick in the system
-    /// (~1037 windows). #1230 gives slash a live token; this pins the behaviour
-    /// that now reaches it.
+    /// exists for. Slash carries a live cancellation token, so that check reaches
+    /// the appeal-window watcher on the longest tick in the system (~1037
+    /// windows); this test pins that it fires there.
     ///
     /// The cancel fires from inside the sink, mid-window-1. Cancelling before
     /// the call instead would only prove that a tick cancelled up front scans

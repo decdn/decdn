@@ -501,7 +501,7 @@ mod tests {
         Ok(())
     }
 
-    // ---- allowance decision (unchanged from the channel path) -------------
+    // ---- allowance decision -------------
 
     #[test]
     fn unlimited_zero_allowance_approves_max() {

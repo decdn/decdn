@@ -7,9 +7,9 @@ use alloy::primitives::U256;
 use crate::node_origin::PullLegTarget;
 
 use super::{
-    Arc, B256, ClientHandler, ClientMessage, FillOutcome, Hash, LaneDeliveryState, LaneKey,
-    MB_BYTES, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest,
-    StreamRequestExt, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, ClientHandler, ClientMessage, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
+    NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamResponseBody,
+    VOUCHER_INTERVAL_BYTES, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 impl ClientHandler {
@@ -17,8 +17,9 @@ impl ClientHandler {
     /// 037): the pull leg fills the cache from upstream for only the missing ranges
     /// while the serve leg streams the filling cache to the paying client, pacing the
     /// upstream spend by the downstream's vouchers so per-request speculative
-    /// exposure is bounded to `pull_ahead_bytes` rather than the whole blob. The
-    /// caller has already proven channel ownership and confirmed `byte_offset == 0`.
+    /// exposure is bounded to the ramped credit window (#1669) rather than the
+    /// whole blob. The caller has already proven channel ownership and confirmed
+    /// `byte_offset == 0`.
     /// This path claims
     /// the fill itself (`CacheEngine::claim_fill`) after signing the response, so
     /// two concurrent same-hash misses share ONE upstream pull (the owner drives
@@ -26,10 +27,9 @@ impl ClientHandler {
     ///
     /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
     /// populate) hit a backend fault for this request (#1129). This path
-    /// is the last tier, so all three of its MISS exits — the leech shed, no
-    /// openable provider, and the open deadline — refuse via
-    /// [`FillOutcome::miss_reason`], reporting `InternalError` when this node is
-    /// degraded rather than merely empty.
+    /// is the last tier, so both of its MISS exits — no openable provider, and the
+    /// open deadline — refuse via [`FillOutcome::miss_reason`], reporting
+    /// `InternalError` when this node is degraded rather than merely empty.
     ///
     /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
     /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
@@ -45,13 +45,6 @@ impl ClientHandler {
     /// buffered twin the same way), and closing it needs a latch the caller owns rather
     /// than one living inside the future.
     ///
-    /// The leech shed is included deliberately. `StreamError::NotFound`'s own doc
-    /// does sanction it ("declines to pull through … seed-leech caps"), so a bare
-    /// `CacheMiss` there is defensible in isolation — but it is the wrong code once
-    /// the local origin has already faulted: the ONLY reason this request reached
-    /// the paid peer path at all is that the node's own origin is down, and the
-    /// operator needs that on the reject metric, not a `cache_miss` tally.
-    ///
     /// The channel-class refusals (`UnknownChannel`, `InsufficientDeposit`) keep
     /// their own reasons: they are client-attributable and would have refused
     /// regardless of origin health, and they collapse to `NotFound` deliberately so
@@ -63,7 +56,6 @@ impl ClientHandler {
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
-        ext: &StreamRequestExt,
         hash: Hash,
         client_node_id: B256,
         lane_key: LaneKey,
@@ -89,42 +81,31 @@ impl ClientHandler {
         // (`pull_authorized` + the serve gate), and threaded in as `lane` /
         // `lane_key` for the downstream voucher collection.
         //
-        // Voucher-interval negotiation (ADR 003), resolved up front so the floor-M
-        // guard, the response signature, and the serve/pull window all price
-        // against the same interval.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-        // The pacing window: at least `pull_ahead_bytes` (the ADR 037 upstream
-        // exposure knob), the downstream `credit_window` (#1477), and one interval
-        // — the exact bound the two-leg serve/pull driver paces against, and what
-        // the floor-M guard reserves.
-        let window = self
-            .pull_ahead_bytes
-            .as_ref()
-            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
-            .max(interval_bytes)
-            .max(self.credit_window(interval_bytes));
+        // The floor-M guard, the response signature, and the serve/pull window
+        // all price against the fixed voucher accounting interval.
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
+        // The pre-flight reservation is the ramp floor — one voucher interval. In-
+        // stream exposure is bounded by the ramped credit window, which the serve
+        // loop and the pull-leg `RampPacer` both enforce (#1669).
+        let credit_floor = self.credit_window(interval_bytes, 0);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
         // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
         // when the pool's on-chain remaining (`getPool.deposit − totalRedeemed`)
-        // minus the refundable floor `M` can no longer cover the reserved window,
+        // minus the refundable floor `M` can no longer cover the reserved floor,
         // so the node never fronts upstream USDC for a pool that cannot cover it.
         // `pool_remaining` is the cached `getPool.remaining` threaded from the
         // serve gate; `None` (no pool-view, unknown pool, or a read fault) fails
         // open — the on-chain `redeem` is the backstop.
         if let Some(remaining) = pool_remaining
-            && !self.pool_remaining_covers_window(remaining, window, rate_per_mb)
+            && !self.pool_remaining_covers_window(remaining, credit_floor, rate_per_mb)
         {
             let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
             self.log_deposit_refusal(
                 B256::from(req.pool_id),
                 hash,
                 headroom,
-                decdn_incentive::min_payment(window, rate_per_mb),
+                decdn_incentive::min_payment(credit_floor, rate_per_mb),
             );
             return self
                 .respond_error(
@@ -133,20 +114,6 @@ impl ClientHandler {
                     ServeRejectReason::InsufficientDeposit,
                     rate_per_mb,
                 )
-                .await;
-        }
-
-        // (2) Seed-leech admission: global unrecouped budget + per-peer share
-        // ratio. `may_pull` bumps its own pause metric on refusal.
-        let peer = client_node_id.0;
-        if !self.leech_admit(&peer) {
-            // A shed under the leech caps is a miss, not a client fault — so it
-            // honors a fault latched by an earlier tier (#1129). See this function's
-            // doc for why the shed is included where the channel-class refusals are
-            // not.
-            let reason = FillOutcome::miss_reason(fault_seen);
-            return self
-                .respond_error(&mut send, req, reason, rate_per_mb)
                 .await;
         }
 
@@ -205,10 +172,10 @@ impl ClientHandler {
                 .await;
         }
 
-        // (5) The signed `StreamResponse` commits to `total_bytes` (now known) and the
-        // `interval_mb` negotiated above. It is deferred to step (7), AFTER the fill is
-        // claimed — so a peeked geometry that raced to `Owner` opens its pull leg (and
-        // can still cleanly refuse) before we promise `ok: true`.
+        // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
+        // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
+        // raced to `Owner` opens its pull leg (and can still cleanly refuse) before we
+        // promise `ok: true`.
 
         // (6) The two decoupled legs (ADR 037). The SERVE
         // leg runs HERE on the accept task — it MUST be `Send` (the iroh
@@ -219,7 +186,7 @@ impl ClientHandler {
         // the captured-outboard the serve leg's coherent encoder reads, and the pull's
         // terminal signal the serve leg races so a pull that cannot fill a gap fails the
         // serve (no hang). `Notify` wakers + atomics are runtime-agnostic. `interval_bytes`
-        // and the pacing `window` were resolved with the floor-M guard above.
+        // and the pacing `credit_floor` were resolved with the floor-M guard above.
 
         // (6a) Atomically claim the fill (ADR 038): under one registry lock,
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
@@ -282,7 +249,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
@@ -320,10 +287,12 @@ impl ClientHandler {
             let engine = self.cache.clone();
             let session = Arc::clone(&serve_session);
             let cancel = serve_session.cancel_token().clone();
-            // Seed-leech cap (ADR 037): enforced in the pull leg's pacer. The served
-            // client is the accounting key.
-            let leech_governor = self.leech_governor.clone();
-            let client_peer = client_node_id.0;
+            // The pull leg's `RampPacer` (#1669): the same ramp the serve loop
+            // computes from its own paid frontier, so the pull never runs further
+            // ahead of the downstream served-paid frontier than the ramped credit
+            // window allows.
+            let credit_ramp_divisor = self.credit_ramp_divisor;
+            let credit_max = self.credit_max;
             let spawned = std::thread::Builder::new()
                 .name("serve-miss-pull".to_string())
                 .spawn(move || {
@@ -338,10 +307,10 @@ impl ClientHandler {
                             hash,
                             pull_offset,
                             pull_len,
-                            window,
+                            credit_ramp_divisor,
+                            credit_floor,
+                            credit_max,
                             Arc::clone(&session),
-                            leech_governor,
-                            client_peer,
                             cancel,
                         )),
                         Err(e) => {
@@ -388,11 +357,10 @@ impl ClientHandler {
                 lane_key,
                 client_node_id,
                 rate_per_mb,
-                interval_mb,
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                window,
+                credit_floor,
             )
             .await;
 
@@ -444,13 +412,10 @@ impl ClientHandler {
     /// saving). Range-aware own-origin de-dup is a deferred follow-up; the registry is
     /// range-aware already, so nothing changes when own-origin gains partial serving.
     ///
-    /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
-    /// populate) hit a backend fault for this request (#1129), so the leech shed
-    /// reports `InternalError` rather than a bare `CacheMiss` when this node is
-    /// degraded. The ADR 011 open-time deny gates are already discharged (a
-    /// denylisted hash is refused before the availability check; this branch is
-    /// entered only behind `pull_authorized`, which refuses a blacklisted funding
-    /// origin). A takedown that lands mid-stream is caught per interval inside
+    /// The ADR 011 open-time deny gates are already discharged (a denylisted hash
+    /// is refused before the availability check; this branch is entered only
+    /// behind `pull_authorized`, which refuses a blacklisted funding origin). A
+    /// takedown that lands mid-stream is caught per interval inside
     /// [`Self::serve_leg`].
     ///
     /// Faults are scored LOCAL (never against a provider — there is none): the serve
@@ -462,14 +427,12 @@ impl ClientHandler {
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
-        ext: &StreamRequestExt,
         hash: Hash,
         client_node_id: B256,
         lane_key: LaneKey,
         lane: &Arc<Mutex<LaneDeliveryState>>,
         total_bytes: u64,
         pool_remaining: Option<U256>,
-        fault_seen: bool,
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
         // Mark that the own-origin serve-miss tier fired for this request, before
@@ -482,41 +445,32 @@ impl ClientHandler {
         // `lane` / `lane_key` are threaded in for the downstream voucher
         // collection.
         //
-        // Voucher-interval negotiation (ADR 003), resolved up front so the floor-M
-        // guard, the response signature, and the serve/pull window price against
-        // the same interval.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-        // The pacing window: at least `pull_ahead_bytes`, the downstream
-        // `credit_window` (#1477), and one interval — the same bound the peer twin
-        // computes, and what the floor-M guard reserves.
-        let window = self
-            .pull_ahead_bytes
-            .as_ref()
-            .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
-            .max(interval_bytes)
-            .max(self.credit_window(interval_bytes));
+        // The floor-M guard, the response signature, and the serve/pull window
+        // price against the fixed voucher accounting interval.
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
+        // The pre-flight reservation is the ramp floor — one voucher interval, the
+        // same bound the peer twin computes. In-stream exposure is bounded by the
+        // ramped credit window, which the serve loop and the pull-leg `RampPacer`
+        // both enforce (#1669).
+        let credit_floor = self.credit_window(interval_bytes, 0);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
         // pool's on-chain remaining minus the refundable floor `M` cannot cover
-        // the reserved window. `pool_remaining` is the cached `getPool.remaining`
+        // the reserved floor. `pool_remaining` is the cached `getPool.remaining`
         // threaded from the serve gate; `None` fails open (on-chain `redeem` is
         // the backstop). The own-origin leg fronts no upstream USDC, but delivery
-        // is billed per voucher, so a pool that cannot cover the window is refused
+        // is billed per voucher, so a pool that cannot cover the floor is refused
         // here for wire-parity with the peer path rather than served for free.
         if let Some(remaining) = pool_remaining
-            && !self.pool_remaining_covers_window(remaining, window, rate_per_mb)
+            && !self.pool_remaining_covers_window(remaining, credit_floor, rate_per_mb)
         {
             let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
             self.log_deposit_refusal(
                 B256::from(req.pool_id),
                 hash,
                 headroom,
-                decdn_incentive::min_payment(window, rate_per_mb),
+                decdn_incentive::min_payment(credit_floor, rate_per_mb),
             );
             return self
                 .respond_error(
@@ -525,17 +479,6 @@ impl ClientHandler {
                     ServeRejectReason::InsufficientDeposit,
                     rate_per_mb,
                 )
-                .await;
-        }
-
-        // (2) Seed-leech admission: global unrecouped budget + per-peer share ratio.
-        // `leech_admit` bumps its own pause metric on refusal. A shed here is a miss,
-        // not a client fault, so it honors an earlier-tier fault (#1129).
-        let peer = client_node_id.0;
-        if !self.leech_admit(&peer) {
-            let reason = FillOutcome::miss_reason(fault_seen);
-            return self
-                .respond_error(&mut send, req, reason, rate_per_mb)
                 .await;
         }
 
@@ -560,7 +503,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
@@ -571,7 +514,7 @@ impl ClientHandler {
         // current-thread runtime, coordinating only through the `Send + Sync`
         // `FillSession` (the shared PAID frontier, the captured outboard, the pull's
         // terminal signal). #1610 — ingest only behind a waiting, paying client.
-        // `interval_bytes` and the pacing `window` were resolved with the floor-M
+        // `interval_bytes` and the pacing `credit_floor` were resolved with the floor-M
         // guard above.
 
         // (5a) Atomically claim the fill (ADR 038): under one registry lock,
@@ -622,8 +565,8 @@ impl ClientHandler {
             let metrics = Arc::clone(&self.metrics);
             let session = Arc::clone(&serve_session);
             let cancel = serve_session.cancel_token().clone();
-            let leech_governor = self.leech_governor.clone();
-            let client_peer = client_node_id.0;
+            let credit_ramp_divisor = self.credit_ramp_divisor;
+            let credit_max = self.credit_max;
             let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
                 decdn_client_pull::Cumulative::default(),
             ));
@@ -647,11 +590,11 @@ impl ClientHandler {
                             hash,
                             pull_offset,
                             pull_len,
-                            window,
+                            credit_ramp_divisor,
+                            credit_floor,
+                            credit_max,
                             total_bytes,
                             Arc::clone(&session),
-                            leech_governor,
-                            client_peer,
                             cancel,
                         )),
                         Err(e) => {
@@ -698,11 +641,10 @@ impl ClientHandler {
                 lane_key,
                 client_node_id,
                 rate_per_mb,
-                interval_mb,
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                window,
+                credit_floor,
             )
             .await;
 

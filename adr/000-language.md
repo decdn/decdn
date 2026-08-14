@@ -28,7 +28,7 @@ Components:
 - `iroh-blobs` with the `fs-store` backend — content-addressed blob storage and verified transfer.
 - `iroh-gossip` — topic-based epidemic broadcast for node discovery and metadata (`NodeAnnounce`).
 
-**iroh versioning policy.** Pin a caret requirement in `Cargo.toml` (e.g. `iroh = "1"`); the committed `Cargo.lock` is the true pin. Current baseline: **iroh 1.0**, iroh-blobs 0.103, iroh-gossip 0.101, iroh-metrics 1.0 (bumped from the 0.98 baseline in #918). Upgrade only on a deliberate `cargo update`: evaluate API compatibility, then record the new baseline here before merging.
+**iroh versioning policy.** Pin a caret requirement in `Cargo.toml` (e.g. `iroh = "1"`); the committed `Cargo.lock` is the true pin. Current baseline: **iroh 1.0**, iroh-blobs 0.103, iroh-gossip 0.101, iroh-metrics 1.0. Upgrade only on a deliberate `cargo update`: evaluate API compatibility, then record the new baseline here before merging.
 
 ## Consequences
 

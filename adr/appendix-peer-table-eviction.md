@@ -94,9 +94,9 @@ Naming follows [appendix-observability.md § Gossip Metrics](appendix-observabil
 |---|---|---|
 | `decdn_gossip_peer_table_size` | gauge | Distinct peers in the local peer table — **existing**, see appendix |
 | `decdn_gossip_announces_rejected_total` | counter, unlabeled | **Existing**, see appendix; [§ No hard size cap (optional safety ceiling)](#no-hard-size-cap-optional-safety-ceiling) specifies when the `table_full` rejection fires (the optional `gossip.max_peer_entries` path). The reason is a log token, not a metrics label |
-| `decdn_peer_table_evicted_ttl_total` | counter, unlabeled | New: entries removed by the TTL sweeper |
-| `decdn_peer_table_evicted_registry_deregistered_total` | counter, unlabeled | New: entries removed in response to a `NodeDeregistered` event ([§ Registry-cache interaction (active eviction)](#registry-cache-interaction-active-eviction)) |
-| `decdn_peer_table_evicted_registry_ejected_total` | counter, unlabeled | New: as above, for `NodeAutoEjected`. Siblings rather than one `reason` label, per the convention settled in #1475 |
+| `decdn_peer_table_evicted_ttl_total` | counter, unlabeled | Entries removed by the TTL sweeper |
+| `decdn_peer_table_evicted_registry_deregistered_total` | counter, unlabeled | Entries removed in response to a `NodeDeregistered` event ([§ Registry-cache interaction (active eviction)](#registry-cache-interaction-active-eviction)) |
+| `decdn_peer_table_evicted_registry_ejected_total` | counter, unlabeled | As above, for `NodeAutoEjected`. Siblings rather than one `reason` label, per the sibling-counter convention |
 
 A sustained non-zero `decdn_gossip_announces_rejected_total` rate correlated with `table_full` rejection logs signals that `gossip.max_peer_entries` is misconfigured or that registry validation is letting through an unexpected number of `node_id`s.
 

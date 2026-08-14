@@ -1,9 +1,9 @@
-//! `FillSession` — the cache-resident fill-coordination primitive the decoupled
+//! `FillSession` — the cache-resident fill-coordination primitive the
 //! serve-miss legs share (ADR 038).
 //!
 //! # Why this exists
 //!
-//! The decoupled serve leg must emit ONE coherent whole-range bao verified stream
+//! The serve leg must emit ONE coherent whole-range bao verified stream
 //! while the pull leg fills the cache incrementally beside it. `bao_tree`'s async
 //! [`encode_ranges_validated`](bao_tree::io::fsm::encode_ranges_validated) is the
 //! right engine — it walks the range pre-order, reading leaf DATA and, for every

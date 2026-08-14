@@ -3,7 +3,7 @@
 > **This is an appendix, not a core protocol ADR.** The payment model itself is
 > chain-agnostic ([ADR 003](003-payments.md#adr-003-payment-model)): the shared
 > payment pool makes opens rare and moves them off the client's fetch path, so
-> fast or cheap opens are no longer a requirement and the chain choice is a cost
+> fast or cheap opens are not a requirement and the chain choice is a cost
 > and neutrality decision rather than a fast-open necessity. The properties this
 > appendix still weighs are a forced-inclusion delay ≤ 24h (so the redemption
 > grace window covers censorship per
@@ -24,7 +24,7 @@ forced-inclusion delay ≤ 24 hours (Arbitrum value), which lower-bounds the red
 window; **[ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)**'s Balancer V3 Router address (canonical: see
 [ADR 018 §"Buyback execution via Balancer V3"](018-liquidity-strategy.md#buyback-execution-via-balancer-v3))
 is labelled the Arbitrum mainnet address. Because pool opens are rare and off the
-fetch path, per-open gas cost is no longer a first-order selection criterion.
+fetch path, per-open gas cost is not a first-order selection criterion.
 
 ## Candidate Chains
 

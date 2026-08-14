@@ -352,7 +352,7 @@ fn all_target(active: bool, declared: U256) -> (Option<u64>, U256) {
 }
 
 /// Turn the requested amount into `(release, retained, declare_to)`, rejecting
-/// anything the contract would revert on. Split out of [`build_plan`] because
+/// anything the contract would revert on. Separate from [`build_plan`] because
 /// this is where the three flags stop agreeing: each picks a different floor,
 /// and `--to-mbps` is the only one that moves the declared tier.
 async fn resolve_release<P: Provider + Clone>(

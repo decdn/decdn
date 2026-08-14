@@ -1,5 +1,4 @@
 //! Small leaf helpers: rate clamping, response signing, wire writes, receipts.
-//! Bodies split from `mod.rs` (#1254).
 
 use super::{
     B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, SendStream, ServeRejectReason,
@@ -19,8 +18,7 @@ impl ClientHandler {
     /// slow or full disk cannot back-pressure delivery (the bug in #803).
     /// Receipts are enqueued in voucher-acceptance order and the single writer
     /// drains them FIFO, preserving the audit ordering and shutdown-tail
-    /// guarantees the previously-awaited inline write relied on (CLAUDE.md /
-    /// ADR 003).
+    /// guarantees CLAUDE.md / ADR 003 require.
     ///
     /// The `voucher_amount` is rendered as a decimal `uint256` from the
     /// big-endian wire amount (the pool voucher's cumulative amount — its sole
@@ -68,7 +66,6 @@ impl ClientHandler {
         &self,
         body: StreamResponseBody,
         error: Option<StreamError>,
-        voucher_interval_mb: Option<u64>,
     ) -> anyhow::Result<StreamResponse> {
         let slash_sig = StreamSlashData::from_response_body(&body)
             .sign(self.eth_signer.as_ref(), &self.slash_domain)
@@ -78,7 +75,6 @@ impl ClientHandler {
         Ok(StreamResponse {
             body,
             error,
-            voucher_interval_mb,
             slash_sig,
         })
     }
@@ -143,7 +139,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, Some(error), None)?;
+        let resp = self.sign_response(body, Some(error))?;
         self.write_message(send, &ClientMessage::StreamResponse(resp))
             .await?;
         let _ = send.finish();

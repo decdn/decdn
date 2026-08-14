@@ -86,8 +86,8 @@ pub async fn store(
 }
 
 /// ADR 013 application error code a receiver closes the stream with when
-/// it does not implement `BatchStore` admission (the pre-#648 deCDN
-/// handler arm). It is the canonical "fall back to per-hash" signal:
+/// it does not implement `BatchStore` admission. It is the canonical "fall
+/// back to per-hash" signal:
 /// `APP_ERR_UNSUPPORTED_MESSAGE` (also defined in the handlers; the codes
 /// are protocol-wide). See [`batch_store_with_fallback`].
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
@@ -140,8 +140,8 @@ enum BatchAttemptOutcome {
 }
 
 /// Classify a [`batch_store`] error for fallback. Only the explicit
-/// `APP_ERR_UNSUPPORTED_MESSAGE` close — the signal a pre-#648 deCDN node
-/// emits for an unimplemented `BatchStore` — is treated as "fall back to
+/// `APP_ERR_UNSUPPORTED_MESSAGE` close — the signal a node without `BatchStore`
+/// support emits for an unimplemented `BatchStore` — is treated as "fall back to
 /// per-hash and cache". Everything else is a hard failure so a transient
 /// blip or a client bug doesn't trigger an `n`-deep per-hash retry storm
 /// against an unreachable or overloaded receiver.
@@ -403,7 +403,7 @@ async fn exchange(
 }
 
 /// Inner-inner: do the bi-stream exchange on an already-connected
-/// [`Connection`]. Split out so a future caller that wants to bundle
+/// [`Connection`]. A separate function so a caller that wants to bundle
 /// multiple DHT requests on one connection (e.g. a republish sweep to
 /// the same target peer) can re-use the connection.
 async fn exchange_on(conn: &Connection, payload: &[u8]) -> anyhow::Result<wire::DhtMessage> {
@@ -517,8 +517,8 @@ mod tests {
 
     #[test]
     fn unsupported_close_triggers_fallback() {
-        // The canonical "I don't speak BatchStore" signal a pre-#648 node
-        // emits — the only outcome that should cache + fall back per-hash.
+        // The canonical "I don't speak BatchStore" signal a node without
+        // `BatchStore` support emits — the only outcome that should cache + fall back per-hash.
         assert_eq!(
             classify_batch_error(Some(APP_ERR_UNSUPPORTED_MESSAGE)),
             BatchAttemptOutcome::Unsupported

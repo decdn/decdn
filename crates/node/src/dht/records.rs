@@ -368,9 +368,8 @@ impl RecordStore {
             // except under heap corruption. The two legitimate
             // "not a record" misses (`?` above) returned already, so a
             // `None` here is never a normal miss — surface it loudly.
-            // This restores the error signal the pre-refactor in-place
-            // refresh branch logged, now at its true source so all
-            // callers (refresh, evictions, gc, scrub) inherit it. The
+            // Surface it at its true source so all
+            // callers (refresh, evictions, gc, scrub) inherit the error signal. The
             // `get(idx)` keeps clippy's anti-panic policy off bare `[idx]`.
             tracing::error!(
                 ?holder,
@@ -840,9 +839,9 @@ mod tests {
     }
 
     /// GC must terminate and self-repair if a `global_lru` key has no
-    /// matching `by_hash` entry (the "heap corruption" case the deleted
-    /// in-place refresh branch used to guard). The front-walk must drop the
-    /// orphan directly rather than spin on a key `remove_entry` can't clear.
+    /// matching `by_hash` entry (the "heap corruption" case). The front-walk
+    /// must drop the orphan directly rather than spin on a key `remove_entry`
+    /// can't clear.
     #[test]
     fn gc_drops_orphan_global_lru_key_without_spinning() {
         let mut cfg = small_cfg();
@@ -863,8 +862,8 @@ mod tests {
     /// `providers_at` scrubs only the expired holders from a hash whose
     /// bucket has a mix of expired and live records: the live holders
     /// survive, the bucket is NOT pruned, and per-publisher counts drop
-    /// only for the expired holders. Guards the scrub rewrite from
-    /// in-place index-walk to collect-then-`remove_entry`.
+    /// only for the expired holders. Guards the collect-then-`remove_entry`
+    /// scrub against regressing to an in-place index-walk.
     #[test]
     fn providers_at_scrubs_only_expired_holders_in_mixed_bucket() {
         let mut cfg = small_cfg();

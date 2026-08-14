@@ -223,7 +223,7 @@ async fn run() -> anyhow::Result<()> {
 // The test above drives the shared `top_up` kernel directly (the auto-refill-at-
 // reuse-time leg, #1103). This one drives the shipped `decdn` binary through a
 // REAL paid pull that outgrows its `initial_deposit` partway through — the
-// reactive leg added in `fetch_blob_streaming` (`crates/cli/src/commands/fetch.rs`)
+// reactive leg in the shared `drive` pull core (`crates/client-pull/src/driver.rs`)
 // — and asserts the fetch still SUCCEEDS, having topped the pool up on-chain
 // toward `working_deposit` rather than surfacing the exhaustion as a terminal
 // error.
@@ -510,38 +510,36 @@ fn topup_fetch_argv_with_deposits(
 //
 // The test above bakes the pool's very FIRST voucher into `InsufficientDeposit`
 // on a fresh pool — no prior accepted voucher exists, so this is the shallowest
-// possible exercise of the reactive branch. This test drives the case that
-// actually motivated the fix: several whole voucher intervals get delivered AND
-// ACCEPTED first, and only the NEXT one exhausts the deposit.
+// possible exercise of the reactive branch. This test drives the deeper case:
+// several whole voucher intervals get delivered AND ACCEPTED first, and only the
+// NEXT one exhausts the deposit.
 //
-// Before the `genuine_exhaustion` fix (client-pull's advancement-based bundle
-// check), this scenario was unreachable end-to-end: once any voucher has been
-// accepted, the node attaches a `WatermarkBundle` to every subsequent
-// watermark-gated rejection it can (`watermark_bundle_for_reject`), including a
-// perfectly ordinary exhaustion — and the old `genuine_exhaustion` treated ANY
-// authenticated bundle as proof of a healable desync, regardless of whether it
-// told the client anything new. That routed real exhaustion into the resync path
-// (which cannot fix a genuinely short deposit) instead of the top-up path, and the
-// fetch failed outright after burning `MAX_RESUME_ATTEMPTS`. The fix distinguishes
-// "bundle reports something AHEAD of what we already hold" (desync — reseed) from
-// "bundle just echoes our own already-committed watermark" (not a desync — the
-// exhaustion is real), by comparing the bundle's cumulative amount against
-// `ledger.committed()`.
+// Reaching the top-up path here depends on `genuine_exhaustion` (client-pull's
+// advancement-based bundle check): once any voucher has been accepted, the node
+// attaches a `WatermarkBundle` to every subsequent watermark-gated rejection it
+// can (`watermark_bundle_for_reject`), including a perfectly ordinary exhaustion.
+// `genuine_exhaustion` distinguishes "bundle reports something AHEAD of what we
+// already hold" (desync — reseed) from "bundle just echoes our own
+// already-committed watermark" (not a desync — the exhaustion is real), by
+// comparing the bundle's cumulative amount against `ledger.committed()`. That
+// keeps real exhaustion on the top-up path instead of the resync path, which
+// cannot fix a genuinely short deposit and would fail the fetch after burning
+// `MAX_RESUME_ATTEMPTS`.
 //
-// This also exercises the OTHER half of the fix: resuming at the CONTENT paid
+// This also exercises the resume offset: the resume lands at the CONTENT paid
 // frontier — `content_paid_frontier(fetch_start_offset, total_bytes,
 // committed.bytes_now - committed.bytes_at_start)` — rather than the raw on-disk
 // length OR the naive `fetch_start + wire_delta`. Vouchers pay for WIRE bytes
 // (bao content plus interleaved proof, ADR 038), so `committed.bytes` is a WIRE
 // watermark; mapping it back through the bao tree lands the resume on the largest
-// content chunk-group boundary provably inside the paid wire. The fix must
+// content chunk-group boundary provably inside the paid wire. The resume must
 // re-fetch and pay for exactly the delivered-but-unpaid tail — no more
-// (double-pay), no less (under-pay). The old `fetch_start + wire_delta` resume
-// treated the wire watermark as a content offset and overshot by the proof
-// overhead, silently skipping ~one proof's worth of delivered content from
-// billing — a sub-1% under-pay that a content-only cost floor cannot see (the
-// paid proof inflates any honest settle above it), which is why the floor below
-// is the whole-blob WIRE cost.
+// (double-pay), no less (under-pay). Treating the wire watermark as a content
+// offset (`fetch_start + wire_delta`) would overshoot by the proof overhead,
+// silently skipping ~one proof's worth of delivered content from billing — a
+// sub-1% under-pay that a content-only cost floor cannot see (the paid proof
+// inflates any honest settle above it), which is why the floor below is the
+// whole-blob WIRE cost.
 
 const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish the blob
 // Must be >= working_deposit / LOW_WATER_DIVISOR (8_000_000 at the current
@@ -555,33 +553,31 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 //
 //   * The node's pre-serve floor-M reserve (`pool_remaining_covers_window`,
 //     #1516) refuses to open a stream unless the pool's remaining minus the
-//     refundable floor `M` (default 1 USDC) covers one reserved CREDIT WINDOW.
-//     The window is 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`, two of the daemon's
-//     UNCONFIGURED default 4 MiB voucher intervals —
-//     `decdn_common::config::DEFAULT_VOUCHER_INTERVAL_MB`, distinct from the
-//     client-side wire fallback of the same name in `decdn_protocol`, which is
-//     1); at `MULTI_RATE_PER_MB` that window costs 8 * 2_000_000 = 16 USDC, so
-//     the initial deposit must clear 16 USDC + M = 17 USDC just to open.
+//     refundable floor `M` (default 1 USDC) covers the reserved CREDIT WINDOW.
+//     The gate prices a cold, unbounded request at `paid = 0` (ADR 003
+//     §Credit window, #1669), which the ramp collapses to its floor — exactly
+//     ONE fixed 4 MiB voucher accounting interval
+//     (`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`); at `MULTI_RATE_PER_MB`
+//     that floor costs 4 * 2_000_000 = 8 USDC, so the initial deposit must clear
+//     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare —
+//     the number is driven by the second bound below, not by this floor.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
 //     voucher still exhausts it mid-stream and the reactive top-up fires.
 //
-// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 16), two whole 4 MiB
+// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 8), two whole 4 MiB
 // intervals are delivered and accepted (cumulative 16 USDC ≤ 18), and the
 // partial third — the blob is just over two intervals — is the one that
 // genuinely exhausts the deposit.
 //
-// The interval is left at the daemon's default deliberately, rather than
-// configured down to something smaller: overriding it requires a daemon
-// RESTART (`voucher_interval_mb` is read once at bring-up), and restarting
-// between the pool's on-chain open and this test's later on-chain `topUp`
-// was observed to make the daemon's settlement watcher stop applying
-// `PoolToppedUp` events to its tracked pool state — the admin API kept
-// reporting the pre-top-up deposit indefinitely, well past any poll interval,
-// causing the resumed voucher to be rejected forever. That looks like a real,
-// separate bug in the watcher/restart interaction, out of scope for this fix;
-// avoiding any daemon restart in this test sidesteps it entirely (mirroring
-// the single-voucher test above, which also never restarts the daemon and
-// reliably sees its own top-up applied).
+// A daemon restart between the pool's on-chain open and this test's later
+// on-chain `topUp` was observed to make the daemon's settlement watcher stop
+// applying `PoolToppedUp` events to its tracked pool state — the admin API
+// kept reporting the pre-top-up deposit indefinitely, well past any poll
+// interval, causing the resumed voucher to be rejected forever. That looks
+// like a real, separate bug in the watcher/restart interaction, out of scope
+// for this fix; avoiding any daemon restart in this test sidesteps it
+// entirely (mirroring the single-voucher test above, which also never
+// restarts the daemon and reliably sees its own top-up applied).
 const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 18_000_000;
 const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
 
@@ -742,7 +738,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // The one exception is the node's serve-path readiness race: right after
     // `openPool` mines, the node can still answer `NotFound` for the brief window
     // before its `getPool` view resolves the new pool (there is no pool-open event
-    // to wait on the way the retired channel model waited on `ChannelOpened`). A
+    // to wait on). A
     // pure readiness `NotFound` delivers no byte and writes no partial, so
     // re-invoking is safe and cannot double-pay; the moment any byte lands we stop
     // retrying, so the reactive top-up branch remains the only thing that can move
@@ -808,9 +804,8 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     //  * `wire_floor` — over the blob's exact bao WIRE bytes (`bao_encoded_size`,
     //    the identical tree walk the serve encoder and the pull's
     //    `expected_wire_bytes` use). A correct fetch pays for every one of these
-    //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: the
-    //    old `fetch_start + wire_delta` resume skipped delivered content and
-    //    settles strictly below it.
+    //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: a
+    //    content-offset resume skips delivered content and settles strictly below it.
     let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)
@@ -890,11 +885,13 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // interval, so exactly two reactive top-ups are needed:
 //
 //   * The node's pre-serve deposit gate (#1518) refuses to serve unless headroom
-//     covers one credit window — `DEFAULT_CREDIT_WINDOW_BYTES` (8 MiB) at the
-//     quoted rate = 16_000_000 µUSDC here. So BOTH the initial deposit and the
-//     working target must be >= that, or the resumed open after a top-up is
-//     refused instead of served. This is what puts a hard floor under the blob
-//     size: two top-ups need a blob costing more than `initial + working`.
+//     covers the reserved credit window. For a cold, unbounded request the ramp
+//     (ADR 003 §Credit window, #1669) prices at `paid = 0`, its floor — one 4 MiB
+//     interval, 4 * 2_000_000 = 8_000_000 µUSDC at the quoted rate. So BOTH the
+//     initial deposit and the working target must clear that floor (plus `M`),
+//     or the resumed open after a top-up is refused instead of served. 16M
+//     clears it with headroom — the number below is driven by the delivery
+//     arithmetic, not by this floor.
 //   * Vouchers accumulate 8_000_000 µUSDC per whole 4 MiB interval. Starting at a
 //     16_000_000 deposit: vouchers 1-2 are accepted (cumulative 8M, then exactly
 //     16M — the gate is `>`, so an exact match still clears), and voucher 3 (24M)
@@ -912,7 +909,9 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // left-boundary proof hashes.
 
 const TWO_TOPUP_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, as above
-// Both must clear the 8 MiB credit window at the rate above (16_000_000 µUSDC).
+// Both must clear the ramp-floor 4 MiB credit window at the rate above
+// (8_000_000 µUSDC) — sized well above that floor for the delivery
+// arithmetic explained above.
 const TWO_TOPUP_INITIAL_MICRO_USDC: u64 = 16_000_000;
 const TWO_TOPUP_WORKING_MICRO_USDC: u64 = 16_000_000;
 /// Just over 20 MiB: costs more than `initial + working` (forcing a SECOND

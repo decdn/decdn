@@ -295,8 +295,8 @@ pub(crate) const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u6
 ///   inner is a [`BlobTooLargeMarker`], so the caller can downcast and
 ///   surface `CacheError::BlobTooLarge` instead of a generic origin
 ///   error.
-/// - Per-chunk `pull_through_bytes` metric bumps for egress-accounting
-///   parity with the streaming path (every byte the origin sent is
+/// - Per-chunk `pull_through_bytes` metric bumps that mirror the streaming
+///   path's egress accounting (every byte the origin sent is
 ///   billed, even on a drain that ultimately fails).
 pub(crate) async fn drain_to_bytes(
     mut stream: OriginByteStream,
