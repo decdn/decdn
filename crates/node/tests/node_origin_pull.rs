@@ -7143,13 +7143,20 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
-    let payload = vec![0xABu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    // Two DISTINCT blobs, same size, served by the same provider A. Gap-driven
+    // `drive()` re-derives `missing_ranges` from the cache store (#1675), so a
+    // second fetch of the SAME blob is already-cached and pulls/pays nothing —
+    // that would starve this test of the second pull the #852 watermark-reuse
+    // invariant needs. Two distinct hashes force both fetches to actually pull,
+    // so both advance the shared channel's watermark.
+    let payload1 = vec![0xABu8; PAYLOAD_LEN];
+    let payload2 = vec![0xCDu8; PAYLOAD_LEN];
+    let hash1 = Hash::new(&payload1);
+    let hash2 = Hash::new(&payload2);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
-    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
-    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    // --- Node A: holds both blobs; serves probe + client over one endpoint. ---
+    let (cache_a, _tmp_a) = cache_with_blobs(&[&payload1, &payload2]).await?;
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
@@ -7200,58 +7207,77 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    for hash in [hash1, hash2] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(a_id).with_ip_addr(addr_a),
+            *hash.as_bytes(),
+            1,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
-    let (providers, addr_map) =
-        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine, recorded) = provisioned_origin(
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, engine) = build_origin_multi_hash(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
-        hash,
-        pool_id,
-        &b_buyer,
+        &[hash1, hash2],
+        buyer,
         &local_rep,
         &b_metrics,
-        providers,
+        &empty_region_accountant(),
+        &[a_dht],
         addr_map,
+        DEFAULT_TEST_PULL_DEADLINES.0,
+        DEFAULT_TEST_PULL_DEADLINES.1,
     )
     .await;
 
-    // First pull: opens the channel, pays nonce 1..2, persists the watermark.
-    let first_fetch = Origin::fetch(&origin, hash, u64::MAX)
+    // First pull (hash1): opens the channel against A, pays nonce 1..2, persists
+    // the watermark.
+    let first_fetch = Origin::fetch(&origin, hash1, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("first fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(first_fetch, OriginFetch::AlreadyAdmitted),
         "first fetch returned NotFound"
     );
-    let first = engine.get(hash).await?;
+    let first = engine.get(hash1).await?;
     anyhow::ensure!(
-        first.as_ref() == payload.as_slice(),
+        first.as_ref() == payload1.as_slice(),
         "first pull bytes mismatch"
     );
 
-    // Second pull: REUSES the channel, resumes from the persisted watermark, and
-    // the upstream accepts the continued nonces — this is the bug's fix.
-    let second_fetch = Origin::fetch(&origin, hash, u64::MAX)
+    // Second pull (hash2, a DISTINCT blob not yet cached): REUSES the same
+    // channel, resumes from the persisted watermark, and the upstream accepts
+    // the continued nonces — this is the bug's fix. Fetching a distinct hash
+    // (rather than re-fetching hash1) is what forces this leg to actually pull:
+    // `drive()` re-derives `missing_ranges` from the cache store, so re-fetching
+    // an already-cached blob would pull and pay nothing (#1675) and leave the
+    // watermark untouched.
+    let second_fetch = Origin::fetch(&origin, hash2, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("second fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(second_fetch, OriginFetch::AlreadyAdmitted),
         "second fetch returned NotFound — stale voucher rejected (the #852 bug)"
     );
-    let second = engine.get(hash).await?;
+    let second = engine.get(hash2).await?;
     anyhow::ensure!(
-        second.as_ref() == payload.as_slice(),
+        second.as_ref() == payload2.as_slice(),
         "second pull bytes mismatch"
     );
 
@@ -12250,9 +12276,13 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(second, OriginFetch::NotFound),
         "fetch #2 must refuse: H lacks hash1 and A cannot be paid"
     );
+    // One logical pull to A opens TWO connections: `pull_from_candidate`'s free
+    // header handshake (to read `total_bytes`) plus the actual pull `drive()`
+    // opens inside it (#1675). Two streams here still means "A WAS pulled once
+    // (the hash1 wedge)", not twice.
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 1,
-        "A must be pulled exactly once (the hash1 wedge), got {}",
+        streams_a.load(Ordering::SeqCst) == 2,
+        "A must be pulled exactly once (handshake + drive, the hash1 wedge), got {}",
         streams_a.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
@@ -12281,10 +12311,11 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(third, OriginFetch::NotFound),
         "fetch #3 must miss: H is offline and A is wedged"
     );
-    // THE property under test, at the wire: A's one stream ever is the hash1
-    // wedge. A second open here is the hit path handing back the dead channel.
+    // THE property under test, at the wire: A's only pull ever is the hash1
+    // wedge (handshake + drive = the 2 streams above). A climb past 2 here is
+    // the hit path handing back the dead channel.
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 1,
+        streams_a.load(Ordering::SeqCst) == 2,
         "the cache hit re-streamed the WEDGED A — `cached_candidates` must filter a wedged \
          provider even when its (peer, hash) pair was never negative-cached, got {}",
         streams_a.load(Ordering::SeqCst)
@@ -12604,9 +12635,13 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         "A must be probed exactly once on the cold path, got {}",
         a_probes.load(Ordering::SeqCst)
     );
+    // One logical pull to A opens TWO connections: `pull_from_candidate`'s free
+    // header handshake (to read `total_bytes`) plus the actual pull `drive()`
+    // opens inside it (#1675). Two streams here still means "A WAS pulled once",
+    // not twice — the assertion pins the connection count, not the pull count.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 1,
-        "A must be pulled exactly once on the cold path, got {}",
+        a_streams.load(Ordering::SeqCst) == 2,
+        "A must be pulled exactly once (handshake + drive) on the cold path, got {}",
         a_streams.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
@@ -12630,8 +12665,11 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         matches!(second, OriginFetch::NotFound),
         "second fetch must miss — the only cached provider was ejected inside the TTL"
     );
+    // Still 2 — the same two connections from fetch #1's single pull. If the hit
+    // path re-served the ejected A, this would climb by another 2 (handshake +
+    // drive), not by 1.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 1,
+        a_streams.load(Ordering::SeqCst) == 2,
         "the hit re-served an EJECTED A — `is_active` must deny it on the hit path, got {} \
          streams",
         a_streams.load(Ordering::SeqCst)
