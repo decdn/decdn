@@ -30,9 +30,7 @@ import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
 ///         the registry for iroh-NodeId ↔ Ethereum-address
 ///         bindings, and is the source of `firstBondedAt` / `slashedAtEpoch`
 ///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
-/// @dev    Renamed from `StakingRegistry` per ADR 026 v2.2 vocabulary. The
-///         bond / unbond / node-registry primitives are unchanged from the
-///         prior contract; this revision adds:
+/// @dev    The bond / unbond / node-registry primitives, plus:
 ///           - `firstBondedAt[op]`  — set on first successful `bond` (ADR 036)
 ///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by the
 ///                                    `settleAppealGranted` escrow hook on a

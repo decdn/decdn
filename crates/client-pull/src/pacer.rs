@@ -8,9 +8,8 @@
 //!
 //! [`BudgetPacer`] is the client policy: it gates on the buyer's OWN deposit
 //! (order-free — it never waits on the counterparty's state) and folds in the
-//! reactive top-up / resume-at-paid-frontier logic that lived inline in the CLI's
-//! `fetch_blob_streaming`. The node's window pacer (ADR 037, Phase B) is a
-//! separate impl handed to the same driver.
+//! reactive top-up / resume-at-paid-frontier logic. The node's window pacer
+//! (ADR 037) is a separate impl handed to the same driver.
 //!
 //! # Where the error classification lives
 //!
@@ -63,7 +62,7 @@ pub struct PaceState {
     pub exhaustion_confirmed: bool,
     /// Content bytes the node's upstream pull leg has drawn so far (the pull-side
     /// frontier). [`BudgetPacer`] never reads this field — it exists for
-    /// [`WindowPacer`] (ADR 037, Phase B), which bounds `pulled_frontier -
+    /// [`WindowPacer`] (ADR 037), which bounds `pulled_frontier -
     /// served_paid_frontier` by its window. On the client path (which always uses
     /// `BudgetPacer`, never `WindowPacer`) this field is inert; callers may set it
     /// to `0` or to the already-computed delivered frontier — either is safe.
@@ -159,7 +158,7 @@ impl Pacer for BudgetPacer {
     }
 }
 
-/// The node's pull-leg pacing policy (ADR 037, Phase B): reuse [`BudgetPacer`]'s
+/// The node's pull-leg pacing policy (ADR 037): reuse [`BudgetPacer`]'s
 /// money logic VERBATIM — a window pacer never overrides a money decision — and,
 /// only on a `Draw`, clamp `up_to_bytes` so the pull never runs more than
 /// `window_bytes` ahead of the downstream serve leg's paid frontier. When the

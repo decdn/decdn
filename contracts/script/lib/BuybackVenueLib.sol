@@ -17,11 +17,10 @@ import { IUniswapV3SwapRouter } from "../../src/interfaces/IUniswapV3SwapRouter.
 ///         bucket; the runbook script prints the calldata for governance to do it): the deploy-time genesis path
 ///         (`BaseProtocolDeploy._activateBuyback`, driven by `DeployProtocol`'s
 ///         env reader) and the post-deploy operator runbook
-///         (`ActivateBuyback.s.sol`). Before this library each carried its own
-///         copy of the steady-state split, the canonical Permit2 address, the
-///         venue-string dispatch, and the per-venue `Config` literal — four
-///         places for the two paths to drift apart and wire different burners
-///         from the same inputs (issue #1090).
+///         (`ActivateBuyback.s.sol`). This library is the single source of the
+///         steady-state split, the canonical Permit2 address, the venue-string
+///         dispatch, and the per-venue `Config` literal, so the two paths cannot
+///         drift apart and wire different burners from the same inputs.
 ///
 /// @dev    Deliberately a `library`, not a `Script` base: it touches no
 ///         cheatcodes, so each caller keeps owning where its inputs come from
@@ -57,7 +56,7 @@ library BuybackVenueLib {
     ///         `ActivateBuyback` builds its wiring straight from `vm.envAddress`,
     ///         which rejects an *unset* var but happily parses an explicit `0x0`.
     ///         A guard on the deploy script alone leaves the runbook path unprotected,
-    ///         which is the two-entry-point drift issue #1090 exists to remove.
+    ///         which is the two-entry-point drift this library removes.
     error WiringIncomplete(string field);
     /// @notice `maxBuybackAmount_` is zero — a burner receiving the buyback
     ///         bucket's share of revenue that cannot spend it, because
@@ -66,7 +65,7 @@ library BuybackVenueLib {
     ///         Reachable from production env as
     ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`, the "0 means
     ///         unlimited" misreading. `GuardedBuybackBurner.BuybackBandDead` is
-    ///         now the authority (#1532); this stays as a pre-broadcast
+    ///         the authority; this is a pre-broadcast
     ///         fail-fast — see `_requireLiveGuardBand`.
     error GuardBandDead();
 
@@ -157,12 +156,11 @@ library BuybackVenueLib {
         _requireLiveGuardBand(guard);
     }
 
-    /// @dev Reject a guard band that can never execute. Redundant since #1532 —
-    ///      `GuardedBuybackBurner`'s constructor now reverts `BuybackBandDead` on
-    ///      `max == 0` itself, and that is the authority. Kept as a fail-fast at
-    ///      the seam both deploy paths share, so a mis-set env var surfaces
-    ///      before the deploy transaction is broadcast rather than as a reverted
-    ///      deployment mid-run.
+    /// @dev Reject a guard band that can never execute. `GuardedBuybackBurner`'s
+    ///      constructor reverts `BuybackBandDead` on `max == 0` and is the
+    ///      authority; this duplicates the check as a fail-fast at the seam both
+    ///      deploy paths share, so a mis-set env var surfaces before the deploy
+    ///      transaction is broadcast rather than as a reverted deployment mid-run.
     function _requireLiveGuardBand(GuardedBuybackBurner.GuardParams memory guard) private pure {
         if (guard.maxBuybackAmount_ == 0) revert GuardBandDead();
     }

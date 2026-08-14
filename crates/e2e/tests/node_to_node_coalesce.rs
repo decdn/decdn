@@ -1,4 +1,4 @@
-//! B3.5 money proof — the NODE-TO-NODE PAID variant of `coalesce_two_clients`.
+//! Money proof — the NODE-TO-NODE PAID variant of `coalesce_two_clients`.
 //!
 //! Two independently-funded `cdn/client/v1` buyers fetch the SAME missing blob
 //! from ONE pull-through node (the SERVER) CONCURRENTLY. The server holds nothing

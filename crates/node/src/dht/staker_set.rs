@@ -24,11 +24,9 @@ use crate::dht::routing::NodeId;
 /// `active_nodes` is exposed for the bootstrap path (seed the routing
 /// table from it) and for operator tooling.
 ///
-/// There is deliberately no change-subscription seam. One existed
-/// (`subscribe_changes`, a `broadcast` of membership transitions) and was
-/// retired in #1231 with zero production consumers — every `send` was
-/// unconditionally a `SendError`. Consumers read the cached set directly;
-/// re-add a subscription only alongside the code that needs it.
+/// There is deliberately no change-subscription seam. Consumers read the
+/// cached set directly; add a subscription only alongside the code that
+/// needs it.
 pub trait StakerSet: Send + Sync + std::fmt::Debug {
     /// Whether `node_id` is in the active-staker set.
     fn is_active(&self, node_id: &NodeId) -> bool;
@@ -59,7 +57,8 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
 /// membership events via the shared `eth_getLogs` poll) — see
 /// `capacity_bond_registry::bootstrap`, #1110. This impl is what tests and
 /// explicit operator-supplied sets use: construct via [`Self::new`] with a known
-/// `HashSet`, or [`Self::empty`]. Same trait, so it stays a drop-in swap.
+/// `HashSet`, or [`Self::empty`]. It implements the same `StakerSet` trait as
+/// the chain-backed impl, so the two are interchangeable.
 #[derive(Debug)]
 pub struct ConfigStakerSet {
     active: HashSet<NodeId>,

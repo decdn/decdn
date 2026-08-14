@@ -4,9 +4,8 @@
 //! Lives in `decdn-incentive` (per `appendix-poc-production-seams.md`
 //! §Seam 1) because the keystore surface is shared between nodes (slash
 //! signing, on-chain settlement) and clients (voucher signing per ADR 003
-//! §EIP-712 Voucher Signature). The eventual `KeyStore` trait covering
-//! `load_node_key` + `load_eth_key` + `sign_voucher` lands with #319 — for
-//! now the surface is free functions.
+//! §EIP-712 Voucher Signature). The surface is free functions `load_node_key`,
+//! `load_eth_key`, and `sign_voucher`.
 //!
 //! Same security model as [`decdn_common::identity`] — the keystore file is
 //! encrypted at rest, but we still enforce `0o600` on the file and `0o700`

@@ -6,12 +6,12 @@ import { FixedPointMathLib } from "solady/utils/FixedPointMathLib.sol";
 /// @title BondMath
 /// @notice Pure arithmetic for the capacity bond: tier-based slash reduction
 ///         (`reduceAtTier`) and the ADR 026 § Capacity-bond curve evaluation
-///         (`bondRequired`). Extracted from `CapacityBond` so the defensive
+///         (`bondRequired`). Separate from `CapacityBond` so the defensive
 ///         over-100%-tier clip and the active-then-unbonding ordering can be
 ///         unit-tested directly (without deploying a near-EIP-170-ceiling test
 ///         harness of the full `CapacityBond`). `CapacityBond._reduceBondAtTier`
 ///         reads the operator's balances, calls `reduceAtTier`, and writes the
-///         results back — behaviorally equivalent to the prior inlined form.
+///         results back.
 /// @dev    `bondRequired` is `public` (not `internal`): it compiles into this
 ///         library's own deployed bytecode and is reached from `CapacityBond`
 ///         via a linked DELEGATECALL, keeping the fixed-point `pow` math out of

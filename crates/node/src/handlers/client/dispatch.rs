@@ -1,5 +1,5 @@
 //! Connection accept loop + per-stream dispatch state machine.
-//! Bodies split from `mod.rs` (#1254); see there for the struct + shared types.
+//! See `mod.rs` for the struct + shared types.
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
@@ -774,11 +774,10 @@ impl ClientHandler {
         // The lane is keyed by `(pool_id, bound_signer, this operator)`; a
         // request with no verified binding cannot name a lane, and a bound client
         // whose signer has no lane for this pool resolves to `None`. Both are
-        // refused pre-serve as an unknown lane, subsuming the old owner-mismatch
-        // gate: a binding that does not match the lane's signer simply resolves
-        // to no lane. The mid-stream reason cannot ride in the initial
-        // `StreamResponse`, so use the delivery-side `NotFound` here (avoids
-        // leaking lane existence).
+        // refused pre-serve as an unknown lane: a binding that does not match the
+        // lane's signer resolves to no lane. The mid-stream reason cannot ride in
+        // the initial `StreamResponse`, so use the delivery-side `NotFound` here
+        // (avoids leaking lane existence).
         let Some(lane_key) = lane_key else {
             tracing::warn!("stream request with no verified binding; refusing pre-serve");
             return self

@@ -250,7 +250,7 @@ fn refill_decision(
     refill_amount(deposit, committed, target, low_water)
 }
 
-/// The deposit a FRESH open escrows (#1497 task 6): "open small, graduate on
+/// The deposit a FRESH open escrows (#1497): "open small, graduate on
 /// proof". `max(deposit_hint, initial_deposit)` — deliberately the small
 /// `initial_deposit`, not the larger `working_deposit` [`refill_decision`]
 /// graduates a proven pool toward. `deposit_hint` still lets a caller ask for
@@ -326,7 +326,7 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     voucher_domain: Eip712Domain,
     token: Address,
     owner: Address,
-    /// The small deposit a fresh `openPool` escrows (#1497 task 6): "open small,
+    /// The small deposit a fresh `openPool` escrows (#1497): "open small,
     /// graduate on proof". Consumed by [`open_deposit`].
     initial_deposit: U256,
     /// The larger graduation target a reused pool's low-water refill tops up
@@ -351,7 +351,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// `initial_deposit` is the small deposit a fresh open escrows;
     /// `working_deposit` is the larger target a reused pool's low-water refill
-    /// graduates it toward (#1497 task 6).
+    /// graduates it toward (#1497).
     ///
     /// # Errors
     ///

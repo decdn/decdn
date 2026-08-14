@@ -36,21 +36,19 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// `discover → probe → rank` overhead: work that runs under the outer deadline but does not
 /// scale with the attempt count.
 ///
-/// **Derived, not chosen** (#1145 review). This used to be a flat 10 s described as "a
-/// tunable judgement value… small relative to one per-candidate budget", and it was smaller
-/// than the thing it was named for:
+/// **Derived, not chosen** (#1145 review). A flat constant would be smaller than the thing
+/// it is named for:
 ///
 /// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 500 ms; but
 /// - discovery is `find_providers`, whose rounds are each bounded by
 ///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose round count is capped by
 ///   [`MAX_LOOKUP_ROUNDS`] (4).
 ///
-/// At those defaults, four discovery rounds plus the probe phase can cost 32.5 s against
-/// the old 10 s budget. The outer deadline was therefore short of what the fetch could
-/// actually spend, and the `tokio::time::timeout` around
-/// `discover → probe → rank → pull` could fire while candidate #3 was still in its stall
-/// window — the #859 fallback starvation this whole formula exists to prevent, reachable at
-/// the defaults.
+/// At those defaults, four discovery rounds plus the probe phase can cost 32.5 s. A flat
+/// budget short of that leaves the outer deadline short of what the fetch can actually spend,
+/// so the `tokio::time::timeout` around `discover → probe → rank → pull` can fire while
+/// candidate #3 is still in its stall window — the #859 fallback starvation this formula
+/// exists to prevent, reachable at the defaults.
 ///
 /// The fix is in two halves, and both are necessary: [`MAX_LOOKUP_ROUNDS`] makes discovery's
 /// worst case finite, and this makes it a TERM. An unbounded cost cannot be budgeted for by
@@ -61,7 +59,7 @@ pub const PULL_THROUGH_OUTER_SLACK: Duration =
 /// How long a pull is willing to WAIT on a buyer-channel open before giving up on
 /// that candidate — not how long the open itself is allowed to take (#1143).
 ///
-/// Since #1143 the `openChannel` runs in a detached task that owns the tx, so a
+/// The `openChannel` runs in a detached task that owns the tx, so a
 /// caller that stops waiting costs nothing: the open continues, the channel lands,
 /// and the next pull to that provider reuses it. What the caller buys by waiting is
 /// only the chance to use the channel on *this* pull. That makes a short budget the
@@ -81,7 +79,7 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
 /// fallback loop to actually reach candidates #2..N when candidate #1 *stalls*,
 /// this outer deadline must strictly exceed the sum of all per-candidate costs —
-/// otherwise both clocks (sourced from the same config value before #859) expire
+/// otherwise both clocks expire
 /// together and the outer timeout cancels the whole fetch at the instant candidate
 /// #1's own timeout fires, killing the fallback.
 ///
@@ -99,14 +97,13 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// and that is what this must budget `MAX_PROVIDER_ATTEMPTS` of, plus
 /// [`PULL_THROUGH_OUTER_SLACK`] of one-time discovery overhead.
 ///
-/// Every stage has to be a term here, and each one was learned the same way. Budgeting
-/// only `per_candidate` let a cold cache against a slow L2 burn the whole deadline on
-/// candidates #1 and #2 and never dial #3. Adding the channel open but not the stall
-/// window left the same hole for a peer that goes silent mid-stream instead of failing
-/// to open — and made it *worse*, because `stall` is operator-tunable: at
-/// `node_pull_stall_timeout_sec = 120` a single silent candidate outlasts the whole
-/// two-term deadline on its own. Taking `stall` as an argument is what keeps the two
-/// from drifting apart again.
+/// Every stage has to be a term here. Budgeting only `per_candidate` would let a cold
+/// cache against a slow L2 burn the whole deadline on candidates #1 and #2 and never
+/// dial #3. Covering the channel open but not the stall window would leave the same hole
+/// for a peer that goes silent mid-stream instead of failing to open — and a worse one,
+/// because `stall` is operator-tunable: at `node_pull_stall_timeout_sec = 120` a single
+/// silent candidate outlasts a two-term deadline on its own. Taking `stall` as an
+/// argument keeps this deadline in step with `node_pull_stall_timeout_sec`.
 ///
 /// # What this deadline does not bound
 ///
@@ -119,11 +116,10 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// That is correct: it is succeeding, and falling through mid-stream would restart the
 /// download from zero against another peer, throwing away the bytes already paid for.
 /// On expiry the foreground request gives up with a clean miss and nothing continues in
-/// the background — #1610 removed the detached warm, so a pull only ever runs while a
+/// the background — there is no detached warm, so a pull only ever runs while a
 /// client is waiting, and the blob is re-acquired on the next real client request.
 ///
-/// So this bounds how long a **client** waits; there is no longer any acquisition that
-/// outlives that wait.
+/// So this bounds how long a **client** waits; no acquisition outlives that wait.
 #[must_use]
 pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
@@ -493,9 +489,9 @@ mod tests {
     // There is deliberately NO unit test here asserting that the slack covers the
     // `discover → probe → rank` overhead it is named for (#1145 review).
     //
-    // There was one, and it could not fail. `PULL_THROUGH_OUTER_SLACK` is now DEFINED as
+    // `PULL_THROUGH_OUTER_SLACK` is DEFINED as
     // `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so a test that recomputes
-    // that expression and asserts the slack is at least as big is asserting `A >= A`. It
+    // that expression and asserts the slack is at least as big asserts `A >= A`. It
     // would pass with any value of any of the three constants — which is precisely the sin
     // its own doc comment accused its predecessor of ("proves only that the slack is
     // whatever the slack is"), restated one level up. Deriving the constant is what MAKES it

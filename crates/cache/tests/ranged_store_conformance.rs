@@ -1,7 +1,7 @@
 //! Runs the shared `decdn-bao-range` conformance suite against
 //! [`decdn_cache::NodeRangedStore`] — the node-side `RangedStore` backend
-//! over the iroh-blobs cache. First real exercise of that suite (Task 2)
-//! against a concrete backend (Task 4 of #1621).
+//! over the iroh-blobs cache. Exercises that suite against a concrete
+//! backend (#1621).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

@@ -1095,10 +1095,9 @@ async fn pull_through_succeeds_above_one_mib_payload() -> anyhow::Result<()> {
     // 2 MiB payload exercises the streaming pull-through across multiple
     // origin chunks — `tokio_util::io::ReaderStream` emits 4 KiB-sized
     // chunks by default, so 2 MiB → ~512 chunks through `add_stream`'s
-    // bidi protocol. Used to exercise the explicit `spawn_blocking`
-    // BLAKE3 path before #271; that double-hash is now handled inside
-    // iroh-blobs' `add_stream` so this test is now a regression check
-    // that multi-chunk streaming completes through the engine.
+    // bidi protocol. This is a regression check that multi-chunk
+    // streaming completes through the engine — iroh-blobs' `add_stream`
+    // handles the BLAKE3 hashing internally (#271).
     let payload = vec![0x7Fu8; 2 * 1024 * 1024];
     let hash = Hash::new(&payload);
 
@@ -1502,8 +1501,8 @@ async fn serve_encoded(encoding: &'static str, body: Vec<u8>, canonical_hash: Ha
 /// how the encoded bytes arrived (gzip, zstd, identity), so the bomb
 /// surfaces as a generic `CacheError::OriginError` whose message
 /// names the cap. Operator-debug fidelity: still actionable; the
-/// previously-typed `DecompressionFailed` variant now reaches the
-/// chain only when the decoder itself fails (truncated / empty body
+/// `DecompressionFailed` variant reaches the chain only when the
+/// decoder itself fails (truncated / empty body
 /// — see the dedicated tests below).
 #[tokio::test]
 async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
@@ -4912,9 +4911,9 @@ async fn populate_fills_via_the_streaming_commit_path() -> anyhow::Result<()> {
 /// small enough to take (`should_buffer` routes anything at or under
 /// `buffered_max_bytes`, 4 MiB by default; a `None` hint streams regardless).
 ///
-/// That arm changed with `FillMode`: it used to hand its drain buffer back
-/// regardless of what the caller asked for. This pins only that the fill still
-/// works — it CANNOT distinguish the two behaviours, because `pull_through_fill`
+/// The buffered arm's return shape depends on `FillMode`. This pins only that
+/// the fill still works — it CANNOT distinguish the two behaviours, because
+/// `pull_through_fill`
 /// drops the payload either way and `PullThroughOutcome` is private to the crate.
 /// The correspondence itself is pinned by
 /// `engine::tests::fill_mode_determines_the_return_shape_in_both_directions`,

@@ -2,11 +2,10 @@
 //!
 //! [`ChainStakerSet`] (membership: `NodeId → active?`) and
 //! [`ChainNodeAddressDirectory`] (bindings: `NodeId → operator address`) are both
-//! derived from the same `CapacityBond` contract. They used to bootstrap and
-//! watch it independently: two paginated `getRegisteredNodes` reads at boot, and
-//! two `eth_getLogs` poll loops thereafter, filtering the same address — with
-//! node-address's two topics a strict *subset* of staker-set's five. This module
-//! runs one enumeration and one loop, demuxing to both projections.
+//! derived from the same `CapacityBond` contract. This module runs one
+//! enumeration and one `eth_getLogs` loop over the shared `CapacityBond`
+//! address, demuxing to both projections; node-address's two topics are a
+//! strict *subset* of staker-set's five.
 //!
 //! # What actually differs between them
 //!
@@ -27,14 +26,12 @@
 //!
 //! # Fatality
 //!
-//! Staker-set bootstrap is fatal; node-address bootstrap was non-fatal
-//! (pull-through is opportunistic). Sharing the read *eliminates* rather than
-//! violates that asymmetry: `getRegisteredNodes` failure was already fatal,
-//! because the unconditional staker-set bootstrap ran first and propagated it —
-//! the node-address bootstrap was never reached. With the read shared, the
-//! bindings projection has **no RPC of its own**: it is derived from page data
-//! already in hand and cannot fail independently. So no node that boots today
-//! loses pull-through, and none that boots today starts failing.
+//! The single `getRegisteredNodes` bootstrap is fatal: staker-set requires it,
+//! and its failure propagates. The bindings projection (pull-through is
+//! opportunistic, so it would otherwise be non-fatal) has **no RPC of its own**:
+//! it is derived from page data already in hand and cannot fail independently. A
+//! node either boots with both projections or fails at the one shared read, so
+//! pull-through is never lost on its own.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -136,9 +133,9 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
         // Bounded explicitly: `WatcherConfig::rpc_call_timeout` covers only the
         // loop's own `get_logs`, so a sink's follow-up read stays unbounded unless
         // it wraps itself (the `blacklist_watcher::scope_check` precedent). That
-        // matters more now than it did per-watcher: one stalled `nodeIdOf` used to
-        // wedge just the staker-set loop, but this loop also feeds the bindings
-        // projection. A timeout surfaces as `Err`, which `on_operator_change`
+        // matters here because this single loop feeds both the staker-set and the
+        // bindings projection: one stalled `nodeIdOf` would wedge both.
+        // A timeout surfaces as `Err`, which `on_operator_change`
         // already counts and skips without tripping the stream backoff.
         let resolved = timed(None, "nodeIdOf", self.registry.nodeIdOf(operator).call()).await?;
         let node_id = resolved.nodeId.0;
@@ -478,15 +475,7 @@ where
     )
     // `staker_set_watcher_*` is the shared `capacity-bond` loop's health, and it
     // covers the bindings projection too — one loop feeds both, so there is one
-    // thing to report. A parallel `node_address_watcher_*` family used to be
-    // fired alongside these and was retired in #1231: since #1226 collapsed the
-    // two loops into one it was a perfectly-correlated shadow, reporting the same
-    // outage twice. It was kept at the time on the grounds that retiring it would
-    // break existing dashboards and alerts — no dashboard, alert, ADR, or runbook
-    // in this repo ever referenced it — and that a gauge frozen at `0` forever is
-    // an alert that can never fire. That second argument was the stronger one,
-    // and it cut the other way: the family was gated on the bindings projection
-    // existing, so a pull-through-off node reported exactly that frozen `0`.
+    // thing to report.
     .on_established(metric_hook(
         &metrics,
         Metrics::staker_set_watcher_cycle_established,
@@ -796,10 +785,7 @@ mod tests {
 
     /// The staker-set family tracks the one shared loop. It is unconditional:
     /// this loop feeds the bindings projection too, so its health is the same
-    /// health whether or not pull-through is on. (Before #1231 a second,
-    /// perfectly-correlated `node_address_watcher_*` family was fired alongside
-    /// it, gated on the projection existing — which is what made the gate, and
-    /// a second test for the gated-off case, necessary.)
+    /// health whether or not pull-through is on.
     ///
     /// The third call is what gives the `established` leg coverage.
     /// `backoff_started` is edge-triggered on `down_since` being unset, so the

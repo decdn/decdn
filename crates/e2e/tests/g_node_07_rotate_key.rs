@@ -529,8 +529,8 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
     // invocation, before anything is submitted.
     //
     // This is the whole point of validating the flag ahead of the phase
-    // branches: the guard used to sit past the early returns, so passing the
-    // node's own keystore was accepted silently here and only refused at the
+    // branches: with the guard past the early returns, passing the
+    // node's own keystore is accepted silently here and only refused at the
     // re-onboarding call — two weeks, a 14-day window and four transactions
     // later, with the tier already cleared and nothing gained. Asserting the
     // operator is still registered afterwards is what pins "refused *before*

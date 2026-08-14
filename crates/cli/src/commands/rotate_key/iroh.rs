@@ -205,12 +205,13 @@ pub(crate) async fn run(
 
 /// Verify the receipt actually moved the binding, then install the key.
 ///
-/// Extracted from `run` because both of its failure arms share one obligation
+/// Separate from `run` because both of its failure arms share one obligation
 /// that is easy to get wrong: the transaction has **mined**, so the key must be
 /// preserved rather than dropped, and the receipt must be written before the
-/// error propagates. Keeping them in one place is what stops the two arms from
-/// drifting apart — which is exactly how the commit arm ended up as the only
-/// post-send path that destroyed the key.
+/// error propagates. Keeping them in one place holds both arms to that shared
+/// obligation, so no post-send path destroys the key. The commit arm is where
+/// this bites hardest: `confirm_bound` has just proved the chain names this key,
+/// so parking it rather than dropping it is what keeps recovery a `mv`.
 ///
 /// # Errors
 ///
@@ -251,8 +252,8 @@ fn gate_and_install(
         Err(err) => {
             // `confirm_bound` just PROVED `nodeIdToAddress[new_node_id] ==
             // operator`, so this is the one post-send path where the chain
-            // definitely names this key — and it used to be the only one that
-            // destroyed it. Park it: recovery becomes a `mv` instead of a second
+            // definitely names this key. Park it rather than destroy it: recovery
+            // becomes a `mv` instead of a second
             // `bindNodeId` and another binding nonce. That matters most in
             // `install_staged`'s worst branch, which can leave `node.secret`
             // MISSING — where `--bind-existing` would refuse for want of a key
@@ -1134,7 +1135,7 @@ mod tests {
     /// alone write into it — the bug the FS side effect was: `stage_node_key`
     /// eagerly creates the directory via `ensure_data_dir` even though its
     /// temp file is removed on drop, so a preview against a data dir that
-    /// does not exist yet used to leave it behind anyway.
+    /// does not exist yet would otherwise leave it behind anyway.
     #[test]
     fn dry_run_acquire_creates_no_data_dir() {
         let tmp = tempfile::tempdir().expect("make a scratch dir");

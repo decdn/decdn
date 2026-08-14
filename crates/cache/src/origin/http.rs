@@ -179,7 +179,7 @@ impl HttpOrigin {
 ///   resets and is worth retrying. Tradeoff is bounded by `max_retries`.
 /// - `is_decode()` — character-set / chunked-transfer parse failure.
 ///   With reqwest auto-decompression disabled (see `HttpOrigin::new`)
-///   this no longer fires for gzip/zstd; the remaining triggers are
+///   this does not fire for gzip/zstd; the remaining triggers are
 ///   protocol-level and retrying *may* mask a deterministic bug, but
 ///   the `max_retries` ceiling bounds the cost.
 ///

@@ -284,7 +284,7 @@ fn encode_verified_range_rejects_wrong_length_outboard() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// End-to-end store path (#823 Phase 2c): the verified encoding the helper
+/// End-to-end store path (#823): the verified encoding the helper
 /// produces imports into `iroh-blobs` as a partial blob via `import_bao_bytes`,
 /// and `export_ranges` reads the **originally requested** (narrower) sub-range
 /// back from the widened import — no whole-blob present.

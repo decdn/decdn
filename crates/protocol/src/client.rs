@@ -126,21 +126,20 @@ impl ClientMessage {
     /// `Ok(())`.
     ///
     /// [`ChunkData`] is dispatched here for TOTALITY over the enum, and for nothing more
-    /// (#1145 review). Two things this doc used to claim are false, and both would mislead
-    /// the next reader into relying on a check that is not here:
+    /// (#1145 review). Two facts about this method are easy to misread, and either mistake
+    /// leads the next reader to rely on a check that is not here:
     ///
-    /// - *"this is the seam a receive loop is told to call"* — no receive loop calls it.
-    ///   `read_client_message` decodes and returns; only `StreamResponse::validate` runs on
-    ///   the receive path, explicitly, via `verify_response`.
-    /// - *"a `ChunkData` arm that returned `Ok(())` would hand every future receive path the
-    ///   empty-frame spin bug back"* — the arm cannot fail. Once the field went private
-    ///   behind `#[serde(try_from)]`, `ChunkData::validate` became total; its own doc says
-    ///   so ("always `Ok` for a frame that exists").
+    /// - No receive loop calls this. `read_client_message` decodes and returns; only
+    ///   `StreamResponse::validate` runs on the receive path, explicitly, via
+    ///   `verify_response`. This aggregate is a convenience, not a load-bearing seam.
+    /// - The `ChunkData` arm cannot fail. Its field is private behind `#[serde(try_from)]`,
+    ///   which makes `ChunkData::validate` total — its own doc says so ("always `Ok` for a
+    ///   frame that exists").
     ///
     /// The empty-frame floor #1088 needs is enforced by the DECODE GATE, not by this
     /// dispatch: an empty frame cannot be constructed *or* deserialized, so no receive loop
-    /// has to remember anything. That is the whole point of having made it structural — and
-    /// the reason this aggregate is a convenience, not a load-bearing seam.
+    /// has to remember anything. That is what makes the floor structural rather than a
+    /// convention.
     ///
     /// # Errors
     ///
@@ -523,22 +522,23 @@ impl StreamResponse {
 /// check, so it cannot be *decoded* either. A receive loop therefore holds a valid frame
 /// by having one at all, and a serve path cannot emit an empty frame even by accident.
 ///
-/// It was not always so, and the reason it is now is worth keeping. The floor used to be
-/// an advisory `validate()` that two receive loops remembered to call and neither emitter
-/// called at all; the serve side was correct only *incidentally*, and differently on each
-/// path:
+/// The invariant lives on the type, not in a convention, because a convention here is
+/// silently skippable. Were the floor an advisory `validate()`, it would ride on every
+/// receive loop remembering to call it and every emitter avoiding an empty frame — and
+/// the serve side avoids one only *incidentally*, differently on each path:
 ///
 /// - The **buffered** path chunks its payload with `slice::chunks`, which yields no
 ///   items for an empty slice. So even the empty blob (whose bao encoding is zero
 ///   bytes — see `decdn_bao_range::align_range`) goes straight to
 ///   [`ClientMessage::StreamEnd`] rather than sending an empty frame first (#1054).
 /// - The **window-paced** path (#856) forwards upstream frames verbatim and does no
-///   re-chunking, so it *inherited* the guarantee rather than establishing it.
+///   re-chunking, so it inherits the guarantee rather than establishing it.
 ///
 /// Both facts are true, both are about unrelated code, and either could change without
 /// anyone noticing which invariant they had just removed — while the reputation system
-/// silently depends on it, since a false `PullStalled` gossips an honest peer as
-/// unreachable. That is a lot of weight for a convention. Now the type carries it.
+/// depends on it, since a false `PullStalled` gossips an honest peer as unreachable. That
+/// is too much weight for a convention, so the type carries the floor instead: the field
+/// is private and both doors reject an empty payload, so it cannot be skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ChunkDataWire")]
 pub struct ChunkData {
@@ -1452,12 +1452,11 @@ mod tests {
         // not a REPRESENTABLE one: rejecting it is the decoder's job, not a receive
         // loop's obligation to remember.
         //
-        // This test used to assert the opposite — that an empty frame decodes cleanly and
-        // only a later `validate()` call refuses it — and that assertion is exactly how
-        // the hole hid: it reads as a considered separation of decode from validation,
-        // while what it actually pinned was that a receive loop which forgot to call
-        // `validate()` would spin on empty frames forever. Two of the three loops
-        // remembered; neither emitter did.
+        // Decode-time rejection is what closes the hole. If an empty frame decoded cleanly
+        // and only a later `validate()` call refused it, a receive loop that forgot to call
+        // `validate()` would spin on empty frames forever — each empty frame advances neither
+        // the cumulative byte count nor the stall deadline, so nothing ever breaks the loop.
+        // Making the decoder refuse the frame lifts that standing obligation off every loop.
         //
         // So: forge the bytes an adversary would send (a length-prefix of 0, which no
         // constructor will produce) and require the decoder to refuse them.
@@ -1502,7 +1501,7 @@ mod tests {
     #[test]
     fn chunk_data_validate_agrees_with_the_constructor() -> Result<(), MessageValidationError> {
         // `validate` survives only as the arm `ClientMessage::validate` dispatches to, so
-        // the aggregate validator stays total over the enum. It can no longer FAIL — a
+        // the aggregate validator stays total over the enum. It cannot FAIL — a
         // `ChunkData` that exists came through `new` or the decode gate — and that is the
         // assertion worth making: if this ever returns `Err`, some construction path has
         // gone around the constructor.
@@ -1724,7 +1723,7 @@ mod tests {
             Err(MessageValidationError::InvalidVoucherSigLen { len: 0 })
         );
         // The aggregate seam dispatches to `ChunkData::validate` rather than waving the
-        // variant through (#1088). It can no longer catch an empty frame — none can be
+        // variant through (#1088). It cannot catch an empty frame — none can be
         // built to hand it — but the arm must stay, so the validator remains total over
         // the enum and a future payload invariant on this variant is not silently skipped.
         assert_eq!(

@@ -1447,11 +1447,11 @@ mod served_paid_wait_tests {
         }
     }
 
-    /// THE #1673 race: the serve leg advances the frontier and fires
+    /// The #1673 race: the serve leg advances the frontier and fires
     /// `notify_waiters()` in the gap between the pacer reading `observed` and the
     /// pull parking. The notify wakes nobody (no waiter registered, no permit
-    /// stored). The fixed `wait` must re-read the frontier after arming and return
-    /// at once — the old edge-triggered wait wedged here forever.
+    /// stored). `wait` must re-read the frontier after arming and return at once;
+    /// an edge-triggered wait wedges here forever.
     #[tokio::test]
     async fn a_racing_advance_before_the_park_is_not_lost() {
         let advanced = Arc::new(Notify::new());

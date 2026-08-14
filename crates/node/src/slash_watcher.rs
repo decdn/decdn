@@ -84,8 +84,8 @@ pub struct DetectedSlash {
     pub block_number: Option<u64>,
     /// **Effective** appeal-window close the contract enforces: the record's base
     /// `appealWindowClose` plus the global `pausedTotal` snapshot, so protocol-pause
-    /// extensions are reflected. Always `Some` now the deadline comes off the
-    /// record rather than a best-effort block read.
+    /// extensions are reflected. Always `Some` because the deadline comes off the
+    /// record, not a best-effort block read.
     pub appeal_window_close: Option<u64>,
 }
 

@@ -131,7 +131,7 @@ pub struct BlockchainArgs {
 
 /// Cache storage configuration.
 ///
-/// As of #437, origin selection (HTTP / filesystem / S3-compatible)
+/// Origin selection (HTTP / filesystem / S3-compatible)
 /// lives only in the config-file `[cache.origin]` table — there are no
 /// CLI flags for it. The S3 backend has many fields (bucket, region,
 /// endpoint, credentials) that don't fit cleanly on a command line, and

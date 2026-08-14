@@ -1,5 +1,4 @@
-//! Per-lane voucher collection / payment loop. Bodies split from `mod.rs`
-//! (#1254). Group-commit batching added in #1483.
+//! Per-lane voucher collection / payment loop with group-commit batching.
 
 use super::{
     Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ClientHandler,

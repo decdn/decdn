@@ -13,10 +13,10 @@ pub mod buyer_channel;
 pub mod buyer_ledgers;
 pub mod chain_events;
 pub mod channel_store;
-/// The `cdn/client/v1` paid-pull requester now lives in the shared
-/// `decdn-client-pull` crate (reused by the CLI's client fetch / bundle pull).
-/// Re-exported under the original module path so node call sites and the
-/// integration tests keep their `client_requester::…` paths.
+/// The `cdn/client/v1` paid-pull requester lives in the shared
+/// `decdn-client-pull` crate (reused by the CLI's client fetch / bundle pull),
+/// re-exported here as `client_requester` so node call sites and the
+/// integration tests use `client_requester::…` paths.
 pub use decdn_client_pull as client_requester;
 pub mod announce_gate;
 pub mod commands;

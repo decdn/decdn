@@ -97,9 +97,7 @@ const LABEL: &str = "ChainStakerSet active set";
 /// Internal to `dht`, and it lives here rather than in `staker_set` because
 /// `ConfigStakerSet` has no use for it: the only producer
 /// (`capacity_bond_registry`) and the only consumer (`apply_change`, below) are
-/// both on the chain-backed path. It was briefly public, as the payload of a
-/// `StakerSet::subscribe_changes` broadcast that nothing ever subscribed to
-/// (#1231).
+/// both on the chain-backed path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StakerChange {
     /// `node_id` joined the active set (was absent, now present).
@@ -157,8 +155,7 @@ impl StakerSet for ChainStakerSet {
 /// `#[must_use]`) — every production call site does, since an idempotent no-op
 /// is a routine outcome rather than an error. In production the mutation-gated
 /// gauge is the observable signal; the bool is what the idempotence tests below
-/// assert on, having previously watched a `broadcast` emission that was retired
-/// in #1231.
+/// assert on.
 pub(super) fn apply_change(
     active: &RwLock<HashSet<NodeId>>,
     metrics: &Arc<Metrics>,

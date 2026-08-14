@@ -377,8 +377,8 @@ mod tests {
 
     use super::*;
 
-    // Distinct valid 20-byte addresses standing in for the pre-#1140 placeholder
-    // strings ("0xFLAG"/"0xCONFIG"/…). `resolve*` now parse their address fields,
+    // Distinct valid 20-byte addresses standing in for the placeholder
+    // strings ("0xFLAG"/"0xCONFIG"/…). `resolve*` parse their address fields,
     // so the fixtures must be real addresses; the mnemonic last byte maps back to
     // the old placeholder. Inputs use `ADDR.to_string()` (round-trips through
     // `parse`), expectations compare the `Address` directly.

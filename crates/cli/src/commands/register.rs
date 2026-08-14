@@ -1,20 +1,20 @@
-//! `decdn node register` — on-chain node registration (ADR 019 § Step 2.3).
+//! `decdn node register` — on-chain node registration (ADR 019).
 //!
 //! Unlike the other `node` subcommands (which talk to a running node's
-//! loopback admin RPC), this performs Phase 2 Step 2.3 of operator
-//! onboarding: it loads the local iroh node key and Ethereum keystore,
+//! loopback admin RPC), this performs the on-chain operator-registration
+//! step of onboarding: it loads the local iroh node key and Ethereum keystore,
 //! reads the operator's on-chain nonces, builds the EIP-712
 //! `bindingSignature` and the ed25519 ownership signature locally, and
 //! submits `CapacityBond.registerNode`.
 //!
-//! Phase 2.1/2.2 (`approve` + `bond` + `declareMbps`) are a precondition:
+//! Bonding (`approve` + `bond` + `declareMbps`) is a precondition:
 //! the contract reverts `BondBelowMinimum` / `BondBelowCurve` if the bond
 //! is not already posted (run `decdn node bond` first). `--dry-run` builds
 //! and prints everything (it still reads the chain for the nonces the
 //! signatures depend on) but does not submit.
 //!
 //! The signing + submit path is factored into `submit_registration` so
-//! `decdn setup` (#933) can drive Step 2.3 with the same already-loaded
+//! `decdn setup` (#933) can drive registration with the same already-loaded
 //! signer + provider it used for bonding, decrypting the keystore once.
 
 use std::io;
@@ -101,7 +101,7 @@ pub(crate) struct RegisterOutcome {
 }
 
 /// Build the binding + ownership signatures and submit `registerNode`
-/// (ADR 019 § Step 2.3) against an already-built `provider` and `signer`.
+/// (ADR 019) against an already-built `provider` and `signer`.
 /// `dry_run` reads the chain for the nonces the signatures depend on but does
 /// not submit. Shared by `run` and `decdn setup` so the keystore is decrypted
 /// once across bond + register.

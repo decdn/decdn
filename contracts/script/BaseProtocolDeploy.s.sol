@@ -453,7 +453,7 @@ abstract contract BaseProtocolDeploy is Script {
         if (act.activate) _assertBuybackActivated(cfg, act, d);
     }
 
-    /// @dev The all-off activation the legacy single-arg entry point uses.
+    /// @dev The all-off activation the single-arg entry point uses.
     function _noBuybackActivation() internal pure returns (BuybackActivation memory act) {
         // Every field defaults to zero; `activate == false` short-circuits the path.
         return act;

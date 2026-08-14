@@ -1,9 +1,10 @@
 //! `BackendSource` — the node's UNPAID [`decdn_client_pull::BlobSource`] over its
-//! own configured origin (fs/http/s3), for Flow A own-origin serve-miss (FA.1b).
+//! own configured origin (fs/http/s3), for the own-origin serve-miss.
 //!
 //! The peer serve-miss path pulls a cold blob from another node over a paid
-//! `cdn/client/v1` channel ([`decdn_client_pull::PeerSource`]). Flow A is the
-//! LOCAL twin: the bytes are already reachable through this node's own origin, so
+//! `cdn/client/v1` channel ([`decdn_client_pull::PeerSource`]). The own-origin
+//! serve-miss flow is the LOCAL twin: the bytes are already reachable through this
+//! node's own origin, so
 //! there is no counterparty, no channel, and no payment — but the driver, sink,
 //! and serve leg are reused verbatim. This source is what lets that happen: it
 //! produces the header-less interleaved bao wire for one [`AlignedRange`] straight
@@ -47,7 +48,7 @@ use decdn_client_pull::source::SourceFuture;
 use decdn_client_pull::{BlobSource, PoolLedger, UpstreamPullHeader, VoucherProgress};
 use iroh_io::AsyncStreamReader;
 
-/// The node's unpaid own-origin [`BlobSource`] for Flow A.
+/// The node's unpaid [`BlobSource`] for the own-origin serve-miss flow.
 ///
 /// One `BackendSource` serves one gap-driven fetch of the blob `root` (a
 /// `total_bytes`-byte blob) out of `engine`'s configured origins. `self_pay` is a

@@ -20,8 +20,8 @@ decdn-bao-range = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }
 iroh-metrics = { workspace = true }
-# `AsyncStreamReader` bound for `CacheEngine::admit_bao_stream` (Task 9,
-# #1621 B2): the upstream reader driving a range admit, kept independent of
+# `AsyncStreamReader` bound for `CacheEngine::admit_bao_stream`: the upstream
+# reader driving a range admit, kept independent of
 # any client-pull type so `cache` stays leaf w.r.t. `client-pull` (#578).
 iroh-io = { workspace = true }
 # bao verified-range codec for origin range-pull verification (#823): turn a
@@ -64,8 +64,8 @@ aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 
 [dev-dependencies]
-# Shared RangedStore conformance suite (#1621 Task 2), run here for the first
-# time against a concrete backend (NodeRangedStore, Task 4).
+# Shared RangedStore conformance suite, run against a concrete backend
+# (NodeRangedStore).
 decdn-bao-range = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

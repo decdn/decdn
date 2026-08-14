@@ -49,13 +49,12 @@ pub enum AnnounceGate<S> {
     /// clock skew.
     ///
     /// **`#[cfg(test)]`: this variant does not exist in a production build.**
-    /// It previously relied on a doc comment plus a unit test on
-    /// `announce_staked_gate` to stay out of the runtime — but nothing stopped a
-    /// future edit passing `Disabled` straight to
-    /// [`crate::GossipService::spawn`], which would reopen the hole #1170 closed
-    /// with every existing test still green (`announce_staked_gate` would keep
-    /// returning `Enforce`; it would just have no callers). Gating the variant
-    /// moves that invariant from prose to the compiler.
+    /// Gating the variant to `#[cfg(test)]` keeps it out of the runtime by the
+    /// compiler. A doc comment plus a unit test on `announce_staked_gate` would
+    /// not stop a future edit from passing `Disabled` straight to
+    /// [`crate::GossipService::spawn`] and reopening the hole #1170 closed —
+    /// every existing test would stay green (`announce_staked_gate` would keep
+    /// returning `Enforce`; it would just have no callers).
     #[cfg(test)]
     Disabled,
 }

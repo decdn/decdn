@@ -426,7 +426,7 @@ mod tests {
 
     // Issue #378: the wire boundary MUST reject `rate_per_mb` above
     // MAX_RATE_PER_MB so a malicious peer cannot feed an overflow-inducing
-    // value into the client selection score. The hook now lives on the
+    // value into the client selection score. The hook lives on the
     // signed body field.
     #[test]
     fn probe_response_body_decode_rejects_rate_above_max() -> Result<(), postcard::Error> {

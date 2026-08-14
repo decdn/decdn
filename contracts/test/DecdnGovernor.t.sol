@@ -352,8 +352,8 @@ contract DecdnGovernorTest is Test {
 
     /// @notice #847 boundary — the slash window's lower edge is inclusive. A
     ///         slash at exactly `windowStart` zeroes the vote; one epoch earlier
-    ///         does not. Pins the `>=` bound that the `endEpoch` shift perturbs
-    ///         (only the upper `== endEpoch` edge was previously asserted).
+    ///         does not. Pins the `>=` lower-edge bound as well as the upper
+    ///         `== endEpoch` edge.
     function test_getVotes_slashAtWindowStartBoundary() public {
         vm.warp(BASE + 2);
         bond.setFirstBondedAt(operator, uint64(BASE - 365 days));

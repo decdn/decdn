@@ -148,8 +148,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         carry a DMCA/DSA-defensible provenance record. Kept out of
     ///         `HashEntry` to preserve that struct's static ABI shape (see its
     ///         doc). Public auto-getter `hashReason(region, hash)`; cleared on
-    ///         `removeHash*`. Set to `""` for legacy entries added before this
-    ///         field existed.
+    ///         `removeHash*`. Set to `""` when an entry carries no reason.
     mapping(bytes32 region => mapping(bytes32 hash => string)) public hashReason;
 
     /// @notice Operator-level blacklist (ADR 011 § Decision — operator-level
@@ -645,8 +644,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @dev    This is the only readable source for the origin deny-set. Unlike
     ///         the hash set, it is outside the `getBlacklistVersion()` mechanism
     ///         (ADR 011 § Polling — `OriginBlacklistUpdated` carries no version),
-    ///         so a consumer has no counter to detect a missed update against and
-    ///         previously had nothing to reconcile a dropped event with.
+    ///         so a consumer has no counter to detect a missed update against, and
+    ///         reconciles a dropped `OriginBlacklistUpdated` event against this full
+    ///         enumeration.
     function blacklistedAddresses(uint256 offset, uint256 limit) external view returns (address[] memory page) {
         uint256 len = _blacklistedAddrs.length();
         if (offset >= len) return new address[](0);
