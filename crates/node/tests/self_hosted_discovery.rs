@@ -625,7 +625,7 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
     let domain = test_slash_domain();
     let handler = Arc::new(ProbeHandler::new(
         server_id,
-        Arc::new(AtomicU64::new(rate_per_mb)),
+        rate_per_mb,
         Arc::clone(&metrics),
         limiter,
         permissive_probe_rate_limiter(&metrics),

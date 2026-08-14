@@ -45,7 +45,6 @@ pub async fn run(
     );
 
     let reload_state = std::sync::Arc::new(runtime::RuntimeReloadState::new(
-        run_args.payment.clone(),
         run_args.observability.clone(),
         &resolved,
         log_level_setter,

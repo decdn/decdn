@@ -20,7 +20,6 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -135,7 +134,7 @@ async fn spawn_probe_server(
     let domain = test_slash_domain();
     let handler = Arc::new(ProbeHandler::new(
         id,
-        Arc::new(AtomicU64::new(RATE_PER_MB)),
+        RATE_PER_MB,
         Arc::clone(metrics),
         permissive_limiter(metrics),
         permissive_probe_rate_limiter(metrics),

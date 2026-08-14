@@ -1,7 +1,6 @@
 //! Hot-reload of mutable configuration fields on SIGHUP.
 //!
 //! Reloadable fields (applied in place; no restart required):
-//!   - `payment.rate_per_mb`
 //!   - `observability.log_level`
 //!   - `cache.pinned_hashes`
 //!   - all of `security.*` — the live `ConnectionLimiter` swaps its
@@ -60,16 +59,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dispatch::ConnectionLimiter;
 use anyhow::Context;
 use decdn_common::cli::common::LogLevel;
-use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
+use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
-    ConfigErrorBag, FileConfig, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
-    load_file_config, parse_pinned_hashes, resolve_observability_into, resolve_payment_into,
-    resolve_security_into,
+    ConfigErrorBag, FileConfig, ResolvedObservability, ResolvedSecurity, load_file_config,
+    parse_pinned_hashes, resolve_observability_into, resolve_security_into,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -83,7 +80,6 @@ use decdn_common::config::{
 /// first reload commits one.
 #[derive(Debug, Clone, Copy)]
 pub struct ReloadSnapshot {
-    pub rate_per_mb: u64,
     pub log_level: Option<decdn_common::cli::common::LogLevel>,
 }
 
@@ -205,75 +201,6 @@ fn drain_or_log<T>(slot: &std::sync::Mutex<Option<T>>, section: &'static str) ->
             let _ = poisoned.into_inner().take();
             None
         }
-    }
-}
-
-// ----- payment ------------------------------------------------------------
-
-/// Reloadable `[payment]` section. Owns the shared `Arc<AtomicU64>`
-/// behind `payment.rate_per_mb` so the probe handler reads the current
-/// value without a lock.
-struct PaymentSection {
-    cli: PaymentArgs,
-    rate_per_mb: Arc<AtomicU64>,
-    /// Last applied rate, retained across reloads for the per-section
-    /// `prev_rate_per_mb` field on the success line.
-    buf: std::sync::Mutex<Option<ResolvedPayment>>,
-    /// `delivery_floor` as seeded into the live handlers at startup. Only
-    /// `rate_per_mb` is hot-reloadable. Since #1172 the live delivery floor is
-    /// sourced from on-chain `getRateBounds()` and tracked by the
-    /// `RateBoundsUpdated` watcher, so the config `delivery_floor` is only a
-    /// pre-chain seed — a reload that changes it is accepted by
-    /// `resolve_payment` but has no effect on the live clamp (the chain value
-    /// is authoritative). Retained here so the swap can warn instead of
-    /// silently ignoring the change.
-    applied_floor: u64,
-}
-
-impl ReloadableSection for PaymentSection {
-    fn name(&self) -> &'static str {
-        "payment"
-    }
-    fn clear_buffer(&self) {
-        if let Ok(mut g) = self.buf.lock() {
-            *g = None;
-        }
-    }
-    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
-        let resolved = resolve_payment_into(&self.cli, file.payment.as_ref(), bag);
-        if let Ok(mut g) = self.buf.lock() {
-            *g = Some(resolved);
-        }
-    }
-    fn infallible_swap(&self) {
-        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
-            return;
-        };
-        let prev = self
-            .rate_per_mb
-            .swap(resolved.rate_per_mb, Ordering::Relaxed);
-        // Since #1172 the live delivery floor comes from on-chain
-        // `getRateBounds()` (seeded at startup, kept current by the
-        // `RateBoundsUpdated` watcher); the config value is only the pre-chain
-        // seed. A reload that changes it has no effect on the live clamp —
-        // governance owns it on-chain. Surface that rather than silently
-        // ignoring the change.
-        if resolved.delivery_floor != self.applied_floor {
-            tracing::warn!(
-                section = self.name(),
-                applied_delivery_floor = self.applied_floor,
-                new_delivery_floor = resolved.delivery_floor,
-                "payment.delivery_floor change ignored; the live delivery floor \
-                 is governed on-chain via getRateBounds() (#1172), not this \
-                 config seed"
-            );
-        }
-        tracing::info!(
-            section = self.name(),
-            rate_per_mb = resolved.rate_per_mb,
-            prev_rate_per_mb = prev,
-            "config reload section applied"
-        );
     }
 }
 
@@ -633,18 +560,16 @@ impl ReloadableSection for SecuritySection {
 /// new struct, `Arc` it once at construction, and append to the
 /// `sections` vec — no central touch of `RuntimeReloadState::reload`.
 pub struct RuntimeReloadState {
-    payment: Arc<PaymentSection>,
     log_level: Arc<LogLevelSection>,
     pinned: Arc<PinnedHashesSection>,
     security: Arc<SecuritySection>,
     content: Arc<ContentSection>,
-    /// Iteration order for the three-phase reload. Matches the order
-    /// the previous monolithic body used (`payment`, `log_level`,
-    /// `pinned_hashes`, `security`) so the user-visible commit ordering
-    /// across sections doesn't shift behind the refactor. `content` is
-    /// appended after them — it is new, so no prior ordering to preserve,
-    /// and it commits last because it has no `attach_*` dependency that
-    /// could make an earlier position matter.
+    /// Iteration order for the three-phase reload: `log_level`,
+    /// `pinned_hashes`, `security`, then `content`. The order matters for
+    /// reproducibility (operator-visible tracing event order) and for the
+    /// rollback-boundary contract documented on the trait — moving
+    /// `log_level` earlier or later would change which pre-`log_level`
+    /// commits survive a setter failure.
     sections: Vec<Arc<dyn ReloadableSection>>,
     /// Serialises concurrent reloads. A SIGHUP racing an `admin_v1_reload`
     /// (both call [`Self::reload`]) waits here so the two-phase commit of
@@ -658,10 +583,6 @@ pub struct RuntimeReloadState {
 impl std::fmt::Debug for RuntimeReloadState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeReloadState")
-            .field(
-                "rate_per_mb",
-                &self.payment.rate_per_mb.load(Ordering::Relaxed),
-            )
             .field("current_log_level", &self.log_level.current)
             .finish_non_exhaustive()
     }
@@ -679,17 +600,10 @@ impl RuntimeReloadState {
     /// reload to apply unconditionally is simpler and more correct than
     /// trying to reflect the env-filter directive back into a `LogLevel`.
     pub fn new(
-        payment_cli: PaymentArgs,
         observability_cli: ObservabilityArgs,
         initial: &decdn_common::config::ResolvedConfig,
         log_level_setter: LogLevelSetter,
     ) -> Self {
-        let payment = Arc::new(PaymentSection {
-            cli: payment_cli,
-            rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
-            buf: std::sync::Mutex::new(None),
-            applied_floor: initial.payment.delivery_floor,
-        });
         let log_level = Arc::new(LogLevelSection {
             cli: observability_cli,
             setter: log_level_setter,
@@ -711,22 +625,19 @@ impl RuntimeReloadState {
             engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
         });
-        // Registration order is the same as the old monolithic body's
-        // commit order: payment, log_level, pinned_hashes, security.
-        // The order matters for reproducibility (operator-visible
-        // tracing event order) and for the rollback-boundary contract
-        // documented on the trait — moving log_level later or earlier
-        // would change which pre-log_level commits survive a setter
-        // failure.
+        // Registration order sets the commit order: log_level,
+        // pinned_hashes, security, content. The order matters for
+        // reproducibility (operator-visible tracing event order) and for
+        // the rollback-boundary contract documented on the trait — moving
+        // log_level later or earlier would change which pre-log_level
+        // commits survive a setter failure.
         let sections: Vec<Arc<dyn ReloadableSection>> = vec![
-            Arc::clone(&payment) as _,
             Arc::clone(&log_level) as _,
             Arc::clone(&pinned) as _,
             Arc::clone(&security) as _,
             Arc::clone(&content) as _,
         ];
         Self {
-            payment,
             log_level,
             pinned,
             security,
@@ -780,13 +691,6 @@ impl RuntimeReloadState {
         }
     }
 
-    /// Shared atomic backing `payment.rate_per_mb`. Cloned into the probe
-    /// handler at startup; subsequent reloads `store()` into this without
-    /// rebuilding the handler.
-    pub fn rate_per_mb(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.payment.rate_per_mb)
-    }
-
     /// Build a state for tests outside `runtime::reload::tests` that need
     /// to drive `reload()` end-to-end (e.g. `admin::tests` exercising
     /// `admin_v1_reload`). Centralised here rather than duplicated per
@@ -800,7 +704,6 @@ impl RuntimeReloadState {
     // would obscure which fields the reload path reads, not clarify it.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn for_test_with_setter(
-        rate_per_mb: u64,
         level: decdn_common::cli::common::LogLevel,
         log_level_setter: LogLevelSetter,
     ) -> Self {
@@ -880,8 +783,9 @@ impl RuntimeReloadState {
                     decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
                 ),
             },
+            // Placeholder rate — `payment.*` is restart-required.
             payment: ResolvedPayment {
-                rate_per_mb,
+                rate_per_mb: 1,
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
                 credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
@@ -916,10 +820,6 @@ impl RuntimeReloadState {
             content: decdn_common::config::ResolvedContent::default(),
         };
         Self::new(
-            decdn_common::cli::run::PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             decdn_common::cli::run::ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -934,7 +834,7 @@ impl RuntimeReloadState {
     }
 
     /// Snapshot the post-reload values an operator wants to confirm: the
-    /// current `rate_per_mb` and the most recently applied log level.
+    /// most recently applied log level.
     ///
     /// `log_level` is `None` until the first successful reload — the
     /// startup `EnvFilter` may have been built from `RUST_LOG` rather
@@ -945,14 +845,11 @@ impl RuntimeReloadState {
     ///
     /// A poisoned `current_log_level` mutex collapses to `None` rather
     /// than propagating: the caller is `admin_v1_reload`, which has
-    /// already received an `Ok(())` from `reload()` (so the rate value
-    /// is authoritative); the snapshot is best-effort metadata.
+    /// already received an `Ok(())` from `reload()`; the snapshot is
+    /// best-effort metadata.
     pub fn current(&self) -> ReloadSnapshot {
         let log_level = self.log_level.current.lock().ok().and_then(|guard| *guard);
-        ReloadSnapshot {
-            rate_per_mb: self.payment.rate_per_mb.load(Ordering::Relaxed),
-            log_level,
-        }
+        ReloadSnapshot { log_level }
     }
 
     /// Re-read the config file at `path` and apply changes to reloadable
@@ -1106,14 +1003,13 @@ fn warn_ignored(field: &'static str) {
 }
 
 /// Emit a "requires restart" notice for each non-reloadable field the
-/// operator can't hot-apply. Fully non-reloadable sections warn whenever
-/// they are *present*; the partially-reloadable sections (`cache`,
-/// `observability`, `payment`) warn only when they set a field *outside*
-/// their reloadable subset, so the common `cache.pinned_hashes`-only,
-/// `observability.log_level`-only, or `payment.rate_per_mb`-only reload
-/// stays quiet. `security` is fully reloadable and never warns.
-/// Best-effort operator guidance, not a correctness gate — this does not
-/// diff against the previous file, so a present-but-unchanged
+/// operator can't hot-apply. Fully non-reloadable sections (including
+/// `payment`) warn whenever they are *present*; the partially-reloadable
+/// sections (`cache`, `observability`) warn only when they set a field
+/// *outside* their reloadable subset, so the common `cache.pinned_hashes`-only
+/// or `observability.log_level`-only reload stays quiet. `security` is fully
+/// reloadable and never warns. Best-effort operator guidance, not a correctness
+/// gate — this does not diff against the previous file, so a present-but-unchanged
 /// non-reloadable field still warns on every reload.
 fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
     if file.identity.is_some() {
@@ -1132,17 +1028,16 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
     {
         warn_ignored("cache.* (cache_dir, sizes, origin, decompress, max_probe_holds)");
     }
-    if file
-        .payment
-        .as_ref()
-        .is_some_and(payment_has_restart_required_field)
-    {
-        // Only `voucher_interval_mb` lands here: `rate_per_mb` reloads, and
-        // `delivery_floor` gets a *change-based* notice from
-        // `PaymentSection::infallible_swap` (which holds the applied floor to
-        // diff against). `voucher_interval_mb` has no such applied value to
-        // diff, so the presence-based notice is its only home.
-        warn_ignored("payment.* (voucher_interval_mb)");
+    if file.payment.is_some() {
+        // The whole `[payment]` section is restart-required. `rate_per_mb` is
+        // the served price — an economic commitment on the wire — so it takes
+        // effect only at startup; reprice by draining and restarting.
+        // `delivery_floor` is governed on-chain via `getRateBounds()`; the
+        // other serve knobs are read once at handler construction.
+        warn_ignored(
+            "payment.* (rate_per_mb, delivery_floor, voucher_interval_mb, \
+             credit_window_bytes, voucher_commit_interval_ms)",
+        );
     }
     if file.gossip.is_some() {
         warn_ignored("gossip.* (announce_interval, peer_ttl, subscribe_global)");
@@ -1272,33 +1167,6 @@ const fn observability_has_restart_required_field(
         || admin_port.is_some()
         || otlp_endpoint.is_some()
         || region_accounting_interval_sec.is_some()
-}
-
-/// Whether the file's `[payment]` section sets a field whose restart notice
-/// belongs here. `rate_per_mb` reloads and `delivery_floor` is warned
-/// change-based in [`PaymentSection::infallible_swap`], so the read-once serve
-/// knobs — `voucher_interval_mb`, `credit_window_bytes`, and
-/// `voucher_commit_interval_ms`, each read into the client handler at bring-up
-/// with no applied value to diff — are the ones that trip this gate.
-/// Exhaustively destructured for the same compile-time-classification reason as
-/// [`cache_has_restart_required_field`].
-const fn payment_has_restart_required_field(
-    p: &decdn_common::config::types::PaymentConfig,
-) -> bool {
-    let decdn_common::config::types::PaymentConfig {
-        rate_per_mb: _,    // hot-reloadable
-        delivery_floor: _, // warned change-based in PaymentSection::infallible_swap
-        voucher_interval_mb,
-        // Read once at handler construction (like `voucher_interval_mb`); a change
-        // needs a restart to take effect (ADR 003 §Credit window).
-        credit_window_bytes,
-        // Read once at handler construction (#1483 group commit); a change needs a
-        // restart to take effect (ADR 003 §Off-chain voucher state persistence).
-        voucher_commit_interval_ms,
-    } = p;
-    voucher_interval_mb.is_some()
-        || credit_window_bytes.is_some()
-        || voucher_commit_interval_ms.is_some()
 }
 
 #[cfg(test)]
@@ -1442,8 +1310,12 @@ mod tests {
         path
     }
 
+    /// A reload whose file also changes the restart-required
+    /// `payment.rate_per_mb` still applies the reloadable sections (here
+    /// `log_level`) and succeeds. The restart-required *notice* is covered by
+    /// the SIGHUP integration test in `crates/node/tests/sighup_signal.rs`.
     #[tokio::test]
-    async fn reload_applies_rate_and_log_level() {
+    async fn reload_applies_log_level_and_ignores_rate_change() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
@@ -1453,10 +1325,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1468,11 +1336,9 @@ mod tests {
             &initial,
             setter,
         );
-        let shared_rate = state.rate_per_mb();
 
         state.reload(&path).await.unwrap();
 
-        assert_eq!(shared_rate.load(Ordering::Relaxed), 99);
         assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Debug));
     }
 
@@ -1491,10 +1357,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1514,7 +1376,6 @@ mod tests {
         *captured.lock().unwrap() = None;
         // Second reload sees the cached level and skips the setter.
         state.reload(&path).await.unwrap();
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 5);
         assert!(captured.lock().unwrap().is_none());
     }
 
@@ -1538,10 +1399,6 @@ mod tests {
         let initial = seed_resolved(1, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1558,31 +1415,21 @@ mod tests {
         assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Info));
     }
 
-    /// Fail-stop guarantee: when the setter errors, `rate_per_mb` must
-    /// not move. The "previous values retained on error" contract
-    /// requires the atomic store to be the last commit step. Inject a
-    /// setter that always returns an error and assert the rate doesn't
-    /// move.
+    /// Fail-stop guarantee: when the setter errors, the reload surfaces the
+    /// error rather than partially applying. Inject a setter that always
+    /// returns an error and assert the reload fails.
     #[tokio::test]
-    async fn reload_keeps_rate_when_log_level_setter_fails() {
+    async fn reload_errors_when_log_level_setter_fails() {
         let dir = tempfile::tempdir().unwrap();
-        // File asks for rate=88 and a log level that differs from the
-        // cached value (None, i.e. force-apply path) so the setter is
-        // actually called and gets the chance to fail.
-        let path = write_config(
-            dir.path(),
-            "[payment]\nrate_per_mb = 88\n\n[observability]\nlog_level = \"debug\"\n",
-        );
+        // Log level differs from the cached value (None, i.e. force-apply
+        // path) so the setter is actually called and gets the chance to fail.
+        let path = write_config(dir.path(), "[observability]\nlog_level = \"debug\"\n");
 
         let failing_setter: LogLevelSetter =
             Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
 
         let initial = seed_resolved(42, LogLevel::Info);
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1597,27 +1444,19 @@ mod tests {
 
         let err = state.reload(&path).await.unwrap_err();
         assert!(format!("{err:#}").contains("simulated tracing-reload failure"));
-        // The atomic must NOT have been swapped — that's the whole point
-        // of putting the store after the fallible work.
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
     }
 
     /// Transactional contract for the *log-level* mutex: a poisoned
-    /// `current_log_level` must surface as an error from the reload
-    /// function *before* the rate atomic is swapped, so the previous
-    /// rate is retained.
+    /// `current_log_level` must surface as an error from the reload function
+    /// rather than committing a partial reload.
     #[tokio::test]
-    async fn reload_keeps_rate_when_log_level_mutex_poisoned() {
+    async fn reload_errors_when_log_level_mutex_poisoned() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), "[payment]\nrate_per_mb = 77\n");
+        let path = write_config(dir.path(), "[observability]\nlog_level = \"debug\"\n");
 
         let initial = seed_resolved(33, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1645,29 +1484,20 @@ mod tests {
 
         let err = st.reload(&path).await.unwrap_err();
         assert!(format!("{err:#}").contains("log-level mutex poisoned"));
-        // Rate atomic must not have moved.
-        assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 33);
     }
 
     /// The `reload_lock` only serialises concurrent reloads; it guards no
     /// data, so a poisoned lock (a prior panic-mid-reload) must not wedge
     /// future reloads. A reload after poisoning still recovers the guard
-    /// and applies the file — the setter fires and the rate atomic moves.
+    /// and applies the file — the setter fires.
     #[tokio::test]
     async fn reload_recovers_from_poisoned_reload_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            dir.path(),
-            "[payment]\nrate_per_mb = 99\n\n[observability]\nlog_level = \"debug\"\n",
-        );
+        let path = write_config(dir.path(), "[observability]\nlog_level = \"debug\"\n");
 
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1692,7 +1522,6 @@ mod tests {
 
         // Reload still succeeds — the poisoned lock is recovered in place.
         st.reload(&path).await.expect("reload recovers from poison");
-        assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 99);
         assert_eq!(captured.lock().unwrap().as_ref(), Some(&LogLevel::Debug));
     }
 
@@ -1717,10 +1546,6 @@ mod tests {
         let initial = seed_resolved(11, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1740,21 +1565,19 @@ mod tests {
         state.reload(&path).await.unwrap();
         state.reload(&path).await.unwrap();
         assert!(captured.lock().unwrap().is_none());
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 11);
     }
 
+    /// `payment.*` is restart-required, so the reload path leaves it unparsed:
+    /// even a `rate_per_mb = 0` (which the startup resolver rejects) reloads
+    /// cleanly. Startup validation catches the invalid value.
     #[tokio::test]
-    async fn reload_rejects_invalid_rate_and_keeps_previous() {
+    async fn reload_ignores_invalid_rate_since_payment_is_restart_required() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), "[payment]\nrate_per_mb = 0\n");
 
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1767,10 +1590,10 @@ mod tests {
             setter,
         );
 
-        let err = state.reload(&path).await.unwrap_err();
-        assert!(format!("{err:#}").contains("rate_per_mb"));
-        // Previous value retained on rejection.
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+        state
+            .reload(&path)
+            .await
+            .expect("a restart-required payment field must not fail the reload");
     }
 
     #[tokio::test]
@@ -1781,10 +1604,6 @@ mod tests {
         let initial = seed_resolved(7, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1798,44 +1617,12 @@ mod tests {
         );
         let err = state.reload(&missing).await.unwrap_err();
         assert!(format!("{err:#}").contains("failed to read config file"));
-        // No changes applied.
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 7);
-    }
-
-    #[tokio::test]
-    async fn reload_preserves_cli_override() {
-        // CLI sets rate_per_mb=50; file says 99; resolution must keep 50.
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(dir.path(), "[payment]\nrate_per_mb = 99\n");
-
-        let initial = seed_resolved(50, LogLevel::Info);
-        let (setter, _captured) = recording_setter();
-        let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: Some(50),
-                delivery_floor: None,
-            },
-            ObservabilityArgs {
-                log_level: None,
-                log_format: None,
-                metrics_port: None,
-                metrics_bind: None,
-                admin_port: None,
-                otlp_endpoint: None,
-            },
-            &initial,
-            setter,
-        );
-
-        state.reload(&path).await.unwrap();
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 50);
     }
 
     /// A malformed TOML body must reject the reload before any commit
-    /// side-effect runs: the setter is never called and the rate atomic
-    /// stays at its previous value. Without this test the transactional
-    /// guarantees only get exercised on the *resolution* failure paths,
-    /// not on the parse failure path.
+    /// side-effect runs: the setter is never called. Without this test the
+    /// transactional guarantees only get exercised on the *resolution*
+    /// failure paths, not on the parse failure path.
     #[tokio::test]
     async fn reload_returns_error_on_malformed_toml() {
         let dir = tempfile::tempdir().unwrap();
@@ -1847,10 +1634,6 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -1868,7 +1651,6 @@ mod tests {
         // the call failed.
         assert!(!format!("{err:#}").is_empty());
 
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
         assert!(captured.lock().unwrap().is_none());
     }
 
@@ -1876,10 +1658,6 @@ mod tests {
 
     fn denylist_state(initial: &decdn_common::config::ResolvedConfig) -> RuntimeReloadState {
         RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2044,10 +1822,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2085,10 +1859,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2133,10 +1903,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2170,10 +1936,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2204,7 +1966,7 @@ mod tests {
     }
 
     /// Direct test for the poison-recovery branch in `attach_cache`.
-    /// `reload_keeps_rate_when_log_level_mutex_poisoned` poisons the
+    /// `reload_errors_when_log_level_mutex_poisoned` poisons the
     /// log-level slot, but never the cache slot itself. This locks in the
     /// recovery path that commit `a148c02` introduced — silently
     /// no-op'ing on a poisoned cache mutex would turn every subsequent
@@ -2214,10 +1976,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = Arc::new(RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2292,10 +2050,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2336,10 +2090,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2374,10 +2124,6 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2393,10 +2139,8 @@ mod tests {
 
         let err = state.reload(&path).await.unwrap_err();
         assert!(format!("{err:#}").contains("per_source_rate_per_sec"));
-        // Payment rate must NOT have moved despite being valid in the
-        // file — "previous values retained on error" applies to the
-        // whole reload.
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+        // "Previous values retained on error" applies to the whole reload:
+        // the log-level setter must not have run when security rejected.
         assert!(
             captured.lock().unwrap().is_none(),
             "log-level setter must not have run when security rejected"
@@ -2411,9 +2155,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
-            "[payment]\n\
-             rate_per_mb = 0\n\
-             [cache]\n\
+            "[cache]\n\
              pinned_hashes = [\"notahash\"]\n\
              [security]\n\
              per_source_rate_per_sec = -1.0\n",
@@ -2422,10 +2164,6 @@ mod tests {
         let initial = seed_resolved(42, LogLevel::Info);
         let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2440,16 +2178,14 @@ mod tests {
 
         let err = state.reload(&path).await.unwrap_err();
         let msg = format!("{err:#}");
-        // Aggregated envelope from `ConfigErrorBag::into_result`.
+        // Aggregated envelope from `ConfigErrorBag::into_result`. `[payment]`
+        // is restart-required and never resolved on reload, so it cannot
+        // contribute a problem here — the two reloadable sections do.
         assert!(
-            msg.contains("configuration has 3 problem(s)"),
-            "expected 3-problem envelope, got: {msg}"
+            msg.contains("configuration has 2 problem(s)"),
+            "expected 2-problem envelope, got: {msg}"
         );
         // Every offending field is named in the same error.
-        assert!(
-            msg.contains("payment.rate_per_mb"),
-            "missing payment field: {msg}"
-        );
         assert!(
             msg.contains("cache.pinned_hashes"),
             "missing pinned-hashes field: {msg}"
@@ -2459,60 +2195,11 @@ mod tests {
             "missing security field: {msg}"
         );
 
-        // All-or-nothing: every section's previous value is retained.
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
+        // All-or-nothing: the log-level setter must not have run.
         assert!(
             captured.lock().unwrap().is_none(),
             "log-level setter must not have run when any section rejected"
         );
-    }
-
-    /// Two problems inside one section must both surface — guards
-    /// against `*_into` workers short-circuiting on the first push.
-    #[tokio::test]
-    async fn reload_aggregates_two_problems_in_one_section() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            dir.path(),
-            "[payment]\n\
-             rate_per_mb = 0\n\
-             voucher_interval_mb = 0\n",
-        );
-
-        let initial = seed_resolved(42, LogLevel::Info);
-        let (setter, _captured) = recording_setter();
-        let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
-            ObservabilityArgs {
-                log_level: None,
-                log_format: None,
-                metrics_port: None,
-                metrics_bind: None,
-                admin_port: None,
-                otlp_endpoint: None,
-            },
-            &initial,
-            setter,
-        );
-
-        let err = state.reload(&path).await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("configuration has 2 problem(s)"),
-            "expected 2-problem envelope, got: {msg}"
-        );
-        assert!(
-            msg.contains("payment.rate_per_mb"),
-            "missing rate_per_mb: {msg}"
-        );
-        assert!(
-            msg.contains("payment.voucher_interval_mb"),
-            "missing voucher_interval_mb: {msg}"
-        );
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
     }
 
     /// Setter-failure case extended with security: the log-level setter
@@ -2531,10 +2218,6 @@ mod tests {
             Box::new(|_| Err(anyhow::anyhow!("simulated tracing-reload failure")));
         let initial = seed_resolved(10, LogLevel::Info);
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2575,10 +2258,6 @@ mod tests {
         let initial = seed_resolved(10, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = Arc::new(RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2615,23 +2294,19 @@ mod tests {
 
     /// A non-reloadable section present in the file only earns a
     /// "requires restart" notice — it must not gate the reload. A file
-    /// carrying `[network]` (restart-only) alongside a `[payment]` rate
-    /// change still applies the reloadable field.
+    /// carrying `[network]` (restart-only) alongside a reloadable
+    /// `log_level` change still applies the reloadable field.
     #[tokio::test]
     async fn reload_applies_despite_restart_only_section_present() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(
             dir.path(),
-            "[payment]\nrate_per_mb = 77\n\n[network]\nbind_port = 4433\n",
+            "[observability]\nlog_level = \"debug\"\n\n[network]\nbind_port = 4433\n",
         );
 
         let initial = seed_resolved(42, LogLevel::Info);
-        let (setter, _captured) = recording_setter();
+        let (setter, captured) = recording_setter();
         let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
             ObservabilityArgs {
                 log_level: None,
                 log_format: None,
@@ -2645,7 +2320,7 @@ mod tests {
         );
 
         state.reload(&path).await.expect("reload applies");
-        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 77);
+        assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Debug));
     }
 
     /// The `[cache]` restart notice is gated on a *non-reloadable* field
@@ -2691,36 +2366,5 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         assert!(observability_has_restart_required_field(&with_metrics));
-    }
-
-    /// The `[payment]` restart notice is gated on `voucher_interval_mb`
-    /// only: `rate_per_mb` reloads and the delivery bounds are warned
-    /// change-based in `PaymentSection::infallible_swap`, so neither trips
-    /// this gate; `voucher_interval_mb` must.
-    #[test]
-    fn payment_notice_gate_covers_only_voucher_interval() {
-        use decdn_common::config::types::PaymentConfig;
-
-        // Reloadable field only -> no notice here.
-        let rate_only = PaymentConfig {
-            rate_per_mb: Some(100),
-            ..PaymentConfig::default()
-        };
-        assert!(!payment_has_restart_required_field(&rate_only));
-        // Delivery bounds are warned change-based elsewhere -> not here.
-        let bounds_only = PaymentConfig {
-            delivery_floor: Some(1),
-            ..PaymentConfig::default()
-        };
-        assert!(!payment_has_restart_required_field(&bounds_only));
-        assert!(!payment_has_restart_required_field(
-            &PaymentConfig::default()
-        ));
-        // The one field with no other home -> notice.
-        let voucher = PaymentConfig {
-            voucher_interval_mb: Some(8),
-            ..PaymentConfig::default()
-        };
-        assert!(payment_has_restart_required_field(&voucher));
     }
 }

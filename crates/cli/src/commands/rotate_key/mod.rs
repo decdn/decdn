@@ -25,9 +25,9 @@
 //! state to pick its phase instead of trusting a flag about what already ran.
 //!
 //! Neither path restarts the daemon. The iroh key is not hot-reloadable
-//! (`crates/node/src/runtime/reload.rs` covers `payment.rate_per_mb`,
-//! `observability.log_level`, `cache.pinned_hashes`, and `security.*` — nothing
-//! that rebuilds the iroh endpoint), and a command that must keep working with
+//! (`crates/node/src/runtime/reload.rs` covers `observability.log_level`,
+//! `cache.pinned_hashes`, and `security.*` — nothing that rebuilds the iroh
+//! endpoint), and a command that must keep working with
 //! the daemon *down* cannot depend on its admin RPC. Drain, stop, rotate,
 //! restart stays the operator's sequence; the command names the steps it did
 //! not take.

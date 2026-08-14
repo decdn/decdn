@@ -2,9 +2,9 @@
 //! Bodies split from `mod.rs` (#1254).
 
 use super::{
-    B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, Ordering, SendStream,
-    ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
-    StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message, write_frame,
+    B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, SendStream, ServeRejectReason,
+    StreamError, StreamRequest, StreamResponse, StreamResponseBody, StreamSlashData, U256,
+    VoucherRejectReason, WatermarkBundle, encode_message, write_frame,
 };
 
 impl ClientHandler {
@@ -49,7 +49,7 @@ impl ClientHandler {
     /// `rate_bounds_clamp_events` on any clamp (ADR 005 §Rate bounds — the same
     /// clamp-and-warn the probe handler applies before signing a `ProbeResponse`).
     pub(super) fn clamped_rate(&self) -> u64 {
-        let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
+        let raw_rate = self.rate_per_mb;
         let (rate_per_mb, floor) = self.rate_bounds.raise_to_floor(raw_rate);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();

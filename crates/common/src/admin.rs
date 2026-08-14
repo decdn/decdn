@@ -247,10 +247,6 @@ pub struct AnnounceResponse {
 /// the RPC response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReloadResponse {
-    /// `payment.rate_per_mb` after the reload. Atomic-loaded *after*
-    /// `RuntimeReloadState::reload` returns `Ok`, so the reported value
-    /// is the one any new probe handler request will see.
-    pub rate_per_mb: u64,
     /// `observability.log_level` after the reload, lowercase
     /// (`"trace"` / `"debug"` / `"info"` / `"warn"` / `"error"`) — same
     /// spelling the resolver and config file accept. `"unknown"` only
@@ -655,7 +651,7 @@ pub trait AdminRpc {
     /// - [`RELOAD_ERROR_CODE`] when the reload itself fails — previous
     ///   values are retained, matching the SIGHUP behaviour.
     /// - On success: [`ReloadResponse`] carrying the post-reload
-    ///   `rate_per_mb` and `log_level`.
+    ///   `log_level`.
     #[method(name = "reload")]
     async fn reload(&self) -> RpcResult<ReloadResponse>;
 

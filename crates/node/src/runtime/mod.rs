@@ -913,7 +913,7 @@ async fn build_chain_and_handlers(
 
     let probe_handler = Arc::new(ProbeHandler::new(
         infra.secret_key.public(),
-        reload_state.rate_per_mb(),
+        cfg.payment.rate_per_mb,
         Arc::clone(&infra.node_metrics),
         Arc::clone(&infra.limiter),
         Arc::clone(&probe_rate_limiter),
@@ -1197,7 +1197,7 @@ async fn build_chain_and_handlers(
         bind_domain.clone(),
         Arc::clone(&infra.channel_state_store),
         Arc::clone(&infra.receipt_sink),
-        reload_state.rate_per_mb(),
+        cfg.payment.rate_per_mb,
         rate_bounds.clone(),
         cfg.payment.voucher_interval_mb,
         cfg.cache

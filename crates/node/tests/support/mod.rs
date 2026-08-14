@@ -16,7 +16,6 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::signers::local::PrivateKeySigner;
@@ -374,7 +373,7 @@ fn client_handler_deps(
         domains.binding.clone(),
         store,
         receipt_sink,
-        Arc::new(AtomicU64::new(rate)),
+        rate,
         decdn_node::rate_bounds::RateBounds::new(0),
         1, // voucher_interval_mb
         max_blob_size_bytes,

@@ -10,9 +10,11 @@
 //!
 //! One node, one offense — **rate manipulation** — induced through real operator
 //! surfaces. The node answers a probe for a held blob at its configured rate; the
-//! operator raises `payment.rate_per_mb` and hot-reloads it (no restart — the
-//! field is in the reloadable set); the node's next signed `StreamResponse` for
-//! the same hash *delivers* (`ok: true`) at the higher rate inside the 30s window.
+//! operator raises `payment.rate_per_mb` and restarts the daemon to apply it (the
+//! rate is restart-required); the node's next signed `StreamResponse` for the same
+//! hash *delivers* (`ok: true`) at the higher rate inside the 30s window. The
+//! restart is fast relative to that window, so the probe (before) and stream
+//! (after) both land inside it.
 //! Those two daemon-signed messages are the `submitRateChallenge` pair. A signed
 //! refusal (`ok: false`) is deliberately not usable: rate manipulation requires a
 //! delivery, so only a real `ok: true` response at the raised rate is evidence.
@@ -168,14 +170,11 @@ async fn run() -> anyhow::Result<()> {
         "the node must not claim a blob it was never given"
     );
 
-    // The switch: rewrite the operator's own config rate and hot-reload it. No
-    // restart, no reconnect — the serve path reads the rate through the atomic the
-    // reload swaps.
-    let reloaded = node.set_rate_per_mb(SWITCHED_RATE_PER_MB).await?;
-    anyhow::ensure!(
-        reloaded == SWITCHED_RATE_PER_MB,
-        "daemon reported rate {reloaded} after reload, expected {SWITCHED_RATE_PER_MB}"
-    );
+    // The switch: rewrite the operator's config rate and restart the daemon to
+    // apply it (the served rate is restart-required). The client reconnects on the
+    // next request. The raised rate is verified where it becomes evidence — the
+    // signed `rate_per_mb` inside the `StreamResponse` captured below.
+    node.set_rate_per_mb(SWITCHED_RATE_PER_MB).await?;
 
     // The real signed DELIVERY at the raised rate, for the same hash, inside the
     // window. `ok: true` is what makes this rate-manipulation evidence: the node
