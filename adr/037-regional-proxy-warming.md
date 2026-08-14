@@ -138,7 +138,7 @@ The window-paced handler introduces no wire-format change: its `StreamRequest` /
 - The first client to warm a locale for a given blob pays a latency premium (one extra hop plus the cold upstream pull's start-up latency) relative to going direct. The premium is bounded by `proxy_warming.max_wait_ms` and the fallback path.
 - A warmed node may hold `H` only partially under range-access patterns and never publish a whole-blob STORE, so such copies are discoverable only via RTT routing, not via the normal FIND_VALUE path. Range-addressed discovery is deferred.
 - The per-peer RTT map and background latency sweep are new always-on client state and traffic. The sweep is bounded by the existing probe rate budget, but it is a real cost a warming-capable client pays continuously, and a client that never runs long enough to populate the map never warms anything (it falls back to direct delivery).
-- Speculative pull-through that is throttled by the global budget or per-peer ratio leaves some warming opportunities unserved during recovery windows; this is the intended trade against operator loss.
+- Speculative pull-through that the pre-flight deposit guard refuses, because the requesting pool cannot cover even the ramp floor, leaves that warming opportunity unserved; this is the intended trade against operator loss.
 
 ### Risks
 
