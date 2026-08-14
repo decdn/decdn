@@ -4610,26 +4610,27 @@ fn spawn_a_paid_then_silent_server(
 }
 
 /// A pull that is CANCELLED mid-stream must still persist the voucher watermark the
-/// upstream already acked (#1145 review).
+/// upstream already acked (#1145 review, #852).
 ///
-/// Cancellation is not an exotic path here — it is the designed behaviour, and #1134
-/// is what made it reachable. The buffered pull now carries `hard_cap: None`, so
-/// nothing INSIDE it ends a slow-but-progressing transfer. Everything that does end
-/// one is external, and every one of them DROPS the future rather than returning
-/// through it: the foreground `outer_pull_deadline`, or the serve future being
-/// dropped (client disconnect, node shutdown).
+/// Cancellation is not an exotic path here — it is the designed behaviour. The pull
+/// carries `hard_cap: None`, so nothing INSIDE it ends a slow-but-progressing
+/// transfer. Everything that does end one is external, and every one of them DROPS
+/// the `fetch` future rather than returning through it: the foreground
+/// `outer_pull_deadline`, or the serve future being dropped (client disconnect, node
+/// shutdown). Dropping the future cancels the pull's `CancellationToken`, which the
+/// off-thread `drive` selects on and stops.
 ///
-/// `VoucherProgress` promises that its copy-back "runs on every return path … so the
-/// latest acked totals survive a mid-stream failure". A drop is not a return path.
-/// The money is spent the instant the upstream acks, but the watermark lived in the
-/// cancelled frame and died with it — so the next pull re-signs a stale nonce, the
-/// upstream rejects `StaleNonce`, and `OurVoucherRejected` skips the candidate
-/// without a word, for the whole 90-day life of the channel.
+/// The money is spent the instant the upstream acks, so the watermark must outlive the
+/// dropped future. It does: the [`SettleOnDrop`] guard rides the PULL THREAD (not the
+/// `fetch` future), so it persists the final acked watermark AFTER the cancelled
+/// `drive` fully stops. Lose that — settle nothing, or settle a stale value from the
+/// racing outer future — and the next pull re-signs a spent nonce, the upstream rejects
+/// `StaleNonce`, and the channel wedges for the whole life of the lane.
 ///
-/// The cancellation here is a short `timeout` that drops the fetch — standing in for
-/// the three real droppers — against a stall budget long enough that `PullStalled`
-/// cannot be what ends it. The bytes were paid for either way; the only question the
-/// test asks is whether we wrote that down.
+/// The cancellation here is a `timeout` that drops the fetch — standing in for the real
+/// droppers — against a stall budget long enough that `PullStalled` cannot be what ends
+/// it. The bytes were paid for either way; the test asks only whether we wrote that
+/// down, and wrote it exactly once at the acked watermark.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Result<()> {
@@ -4712,11 +4713,37 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // The upstream acked one 1 MiB voucher before going quiet: nonce 1, 1 MiB of
     // bytes, `ceil(1 MiB × RATE / 1 MiB)` = RATE in amount. That is real USDC, and it
     // must be on the buyer's books even though the pull that spent it never returned.
+    //
+    // The persist happens on the PULL THREAD, not on the dropped `fetch` future:
+    // dropping the future cancels the token, and the pull thread then stops `drive`,
+    // yields `ABANDON_DRAIN` so the abandoned upstream connection drains, and only then
+    // drops its `SettleOnDrop` guard. So the watermark lands a beat AFTER the
+    // cancellation, not synchronously with it — poll for it rather than reading once.
+    // (Were the settle still on the outer future, or missing, this poll would time out:
+    // that is the wedge this test guards.)
+    let want = vec![(a_eth.address(), U256::from(MB_BYTES), U256::from(RATE))];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while progress_log(&recorded)? != want {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "a cancelled pull must persist the watermark the upstream already acked, \
+             from the pull thread — otherwise the next reuse re-signs a stale nonce and \
+             the channel wedges until it expires. Got {:?}",
+            progress_log(&recorded)?
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And it settles EXACTLY once, at that acked watermark: the pull thread stopped the
+    // instant it was cancelled (#1610), so it never advances the ledger past the acked
+    // interval and never persists a second, higher (or regressed) watermark that a later
+    // reuse would collide with. Give a stopped pull room to misbehave, then re-check the
+    // log is still the single acked entry.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     anyhow::ensure!(
-        progress_log(&recorded)? == vec![(a_eth.address(), U256::from(MB_BYTES), U256::from(RATE))],
-        "a cancelled pull must persist the watermark the upstream already acked — \
-         otherwise the next reuse re-signs a stale nonce and the channel wedges until \
-         it expires. Got {:?}",
+        progress_log(&recorded)? == want,
+        "a cancelled pull must settle once at the acked watermark and not keep \
+         advancing after cancel; got {:?}",
         progress_log(&recorded)?
     );
 

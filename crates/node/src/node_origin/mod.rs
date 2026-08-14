@@ -54,6 +54,7 @@ pub(crate) use admit_store::NodeAdmitStore;
 )]
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
+use pull_leg::ABANDON_DRAIN;
 #[allow(
     unused_imports,
     reason = "wired by the own-origin serve-miss orchestration"
@@ -76,6 +77,7 @@ use decdn_client_pull::driver::DriveConfig;
 use decdn_client_pull::{BudgetPacer, PeerSource, drive};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use decdn_reputation::{LocalReputation, Outcome};
@@ -478,7 +480,7 @@ impl NodeOrigin {
     /// `drive` is non-`Send`, which the iroh `ProtocolHandler::accept` bound forbids
     /// on the serve task), so it cannot borrow `&self`. It captures this `Arc` and
     /// reads the deps via `get()` on the pull thread — the same handle
-    /// `SettleOnDrop::Shared` already carries across a drop.
+    /// [`SettleOnDrop`] already carries across a drop.
     pub(crate) fn deps_arc(&self) -> Arc<OnceLock<NodeOriginDeps>> {
         Arc::clone(&self.deps)
     }
@@ -758,7 +760,7 @@ impl NodeOrigin {
                     node_id: candidate.node_id,
                     hash_bytes,
                     settle: SettleOnDrop {
-                        deps: SettleDeps::Shared(Arc::clone(&self.deps)),
+                        deps: Arc::clone(&self.deps),
                         provider_addr,
                         pool_id: ctx.pool_id,
                         prior_amount: ctx.prior_amount,
@@ -848,7 +850,7 @@ pub struct NodeProgressivePull {
     /// future on the iroh `accept` task (it borrows `&self`, so it cannot be `tokio::spawn`ed);
     /// a node shutdown or a downstream connection reset drops that future outright, and no
     /// terminal method runs (#1145 review).
-    settle: SettleOnDrop<'static>,
+    settle: SettleOnDrop,
     /// Keeps the outbound stream gauge raised through every terminal/drop path.
     stream_guard: StreamGuard,
 }
@@ -1077,7 +1079,7 @@ impl Origin for NodeOrigin {
                 deps.metrics.probe_cache_hit();
                 deps.metrics.node_pull_attempt();
                 attempt_metered = true;
-                let outcome = try_pull(deps, &cached, hash_bytes, budget).await;
+                let outcome = try_pull(&deps_lock, deps, &cached, hash_bytes, budget).await;
                 match outcome.payload {
                     Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
                     Err(failed) => miss = miss.or(failed),
@@ -1131,7 +1133,10 @@ impl Origin for NodeOrigin {
             }
             // Writes the probe cache at its tail.
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-            match try_pull(deps, &ranked, hash_bytes, budget).await.payload {
+            match try_pull(&deps_lock, deps, &ranked, hash_bytes, budget)
+                .await
+                .payload
+            {
                 Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
                 Err(failed) => miss_answer(miss.or(failed)),
             }
@@ -1615,6 +1620,7 @@ impl PullMiss {
 /// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
 /// than the constant itself — see [`PullOutcome`].
 async fn try_pull(
+    deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
     ranked: &[Candidate],
     hash_bytes: [u8; 32],
@@ -1624,7 +1630,7 @@ async fn try_pull(
     let mut miss = PullMiss::Clean;
     for candidate in ranked.iter().take(budget) {
         attempts += 1;
-        match pull_from_candidate(deps, candidate, hash_bytes).await {
+        match pull_from_candidate(deps_lock, deps, candidate, hash_bytes).await {
             Ok(()) => {
                 return PullOutcome {
                     payload: Ok(()),
@@ -1703,6 +1709,7 @@ fn lane_ledger(
 // it would scatter a single linear flow across helpers.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn pull_from_candidate(
+    deps_lock: &Arc<OnceLock<NodeOriginDeps>>,
     deps: &NodeOriginDeps,
     candidate: &Candidate,
     hash_bytes: [u8; 32],
@@ -1750,7 +1757,8 @@ async fn pull_from_candidate(
     };
     let started = Instant::now();
     // The ledger is CALLER-owned, and the watermark is settled from it by a `Drop`
-    // guard rather than after the await (#1145 review). Both halves of that matter.
+    // guard ([`SettleOnDrop`]) rather than by a copy-back after the await (#1145
+    // review). Both halves of that matter.
     //
     // A `&mut VoucherProgress` out-param can only be copied back on a RETURN, and
     // this pull's defining property since #1134 is that it need not return: it runs
@@ -1758,17 +1766,22 @@ async fn pull_from_candidate(
     // transfer, and everything that does end one is external and DROPS the future —
     // the foreground `outer_pull_deadline`, or the serve future being dropped (client
     // disconnect, node shutdown). On every one of those paths the copy-back never ran
-    // and the acked watermark died with
-    // the frame, while the USDC it recorded had already left the node. The next pull
-    // then re-signed a cumulative watermark the upstream had already advanced past,
-    // the upstream rejected it as a regression, and the lane was wedged.
+    // and the acked watermark died with the frame, while the USDC it recorded had
+    // already left the node. The next pull then re-signed a cumulative watermark the
+    // upstream had already advanced past, the upstream rejected it as a regression,
+    // and the lane was wedged.
     //
-    // `Drop` is the one thing that runs on both paths, so the persist lives there and
-    // nowhere else — one path, no second copy to forget. It reads
-    // `PoolLedger::settlement` (a sync mirror) because a `Drop` cannot await.
+    // The settle guard lives on the PULL THREAD, not here (see the `spawn_blocking`
+    // block below): `drive` advances the shared lane `PoolLedger` from that thread,
+    // and a cooperative cancel drops the `drive` future there, so the guard must
+    // persist the FINAL watermark AFTER the drive has fully stopped advancing it.
+    // Settling from this outer future instead would race the still-running thread and
+    // persist a STALE cumulative, wedging the lane exactly as the copy-back did. So
+    // nothing pre-`drive` on this outer future settles: the channel-open, bind, and
+    // free header handshake below issue no voucher.
     // As on the window path: a zero budget is our own misconfiguration, metered as ours.
-    // Checked BEFORE the ledger and the guard, so a pull that cannot legally run never
-    // reaches the wire and has nothing to settle.
+    // Checked BEFORE the ledger, so a pull that cannot legally run never reaches the
+    // wire and has nothing to settle.
     let deadlines = match deps.config.deadlines() {
         Ok(deadlines) => deadlines,
         Err(err) => {
@@ -1777,13 +1790,6 @@ async fn pull_from_candidate(
         }
     };
     let ledger = lane_ledger(deps, provider_addr, &ctx);
-    let settle = SettleOnDrop {
-        deps: SettleDeps::Borrowed(deps),
-        provider_addr,
-        pool_id: ctx.pool_id,
-        prior_amount: ctx.prior_amount,
-        ledger: Arc::clone(&ledger),
-    };
 
     // Streaming is bounded by INACTIVITY, with no overall wall-clock cap (#1134).
     //
@@ -1825,7 +1831,7 @@ async fn pull_from_candidate(
     {
         Ok(pair) => pair,
         Err(err) => {
-            drop(settle);
+            // No bytes pulled, no voucher paid — nothing to settle.
             let verdict =
                 classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(ctx.pool_id), &err);
             return Err(PullMiss::for_verdict(verdict));
@@ -1836,14 +1842,35 @@ async fn pull_from_candidate(
 
     // Run `drive()` on a dedicated blocking-pool thread with its own current-thread
     // runtime, exactly as the window-paced serve-miss pull leg does
-    // (`handlers::client::window`). `drive`'s future is non-`Send` categorically —
-    // `IngestStore::ingest_stream` is a return-position-impl-trait-in-trait with no
-    // `Send` bound, for any `R: BaoRangeReader` (see
-    // `decdn_client_pull::source::IngestStore`'s docs) — which `Origin::fetch`'s
-    // `+ Send` trait bound forbids inline. Every axis is therefore captured OWNED:
-    // no `FillSession` (no serve leg reads beside a populate) and no window/leech
-    // pacer (this tier has no downstream paid frontier to pace against — it pulls
-    // the whole blob, as the buffered loop did).
+    // (`node_origin::pull_leg::run_pull_leg`). `drive`'s future is non-`Send`
+    // categorically — `IngestStore::ingest_stream` is a
+    // return-position-impl-trait-in-trait with no `Send` bound, for any
+    // `R: BaoRangeReader` (see `decdn_client_pull::source::IngestStore`'s docs) — which
+    // `Origin::fetch`'s `+ Send` trait bound forbids inline. Every axis is therefore
+    // captured OWNED: no `FillSession` (no serve leg reads beside a populate) and no
+    // window/leech pacer (this tier has no downstream paid frontier to pace against, so
+    // it pulls the whole blob under a plain [`BudgetPacer`]).
+    //
+    // Cancellation + settle + drain mirror `run_pull_leg`, and each half is
+    // load-bearing:
+    //
+    // - CANCELLATION. `spawn_blocking` tasks are never aborted when their `JoinHandle`
+    //   is dropped, so a bare thread would keep pulling and PAYING vouchers for a blob
+    //   nobody awaits once the `fetch` future is dropped (`outer_pull_deadline` expiry,
+    //   client disconnect, node shutdown — #1610). The outer future holds a
+    //   `cancel.drop_guard()`, so dropping it cancels the token; the pull thread runs
+    //   `drive` under a `select!` against `cancel.cancelled()` and stops.
+    // - ON-THREAD SETTLE. `drive` advances the shared lane `PoolLedger` from the pull
+    //   thread, so the [`SettleOnDrop`] guard lives THERE, holding the shared deps
+    //   `Arc`, and persists the FINAL watermark (#852) only after `drive` has fully
+    //   stopped advancing it. Settling from the outer future would race the still-running
+    //   thread and persist a STALE cumulative, wedging the lane.
+    // - ABANDON DRAIN. A cancelled or errored `drive` returns without a graceful
+    //   cooperative close, stranding the upstream iroh connection whose QUIC driver
+    //   lives on this pull-thread runtime; dropping the runtime with no drain hangs the
+    //   node's `Endpoint::close()`. Yield [`ABANDON_DRAIN`] on those paths so the
+    //   connection flushes its CONNECTION_CLOSE first. The clean `Ok` path closes
+    //   inside `drive` and skips the drain.
     let hash = Hash::from(hash_bytes);
     let endpoint = deps.endpoint.clone();
     let slash_domain = deps.slash_domain.clone();
@@ -1851,19 +1878,40 @@ async fn pull_from_candidate(
     let buyer = Arc::clone(&deps.buyer);
     let metrics = Arc::clone(&deps.metrics);
     let ledger_for_drive = Arc::clone(&ledger);
+    let deps_for_thread = Arc::clone(deps_lock);
     let max_blob_size_bytes = deps.config.max_blob_size_bytes;
     let drive_config = DriveConfig {
         working_deposit: deps.config.working_deposit,
         max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
         settle_backoff: SETTLE_POLL_STEP,
     };
+    // The outer `fetch`-side future owns the drop guard: dropping this future (deadline
+    // expiry / disconnect / shutdown) cancels the token, which the pull thread selects
+    // on to stop the drive.
+    let cancel = CancellationToken::new();
+    let cancel_for_thread = cancel.clone();
+    let _cancel_guard = cancel.drop_guard();
     let join = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         Ok::<_, std::io::Error>(rt.block_on(async move {
             let store = NodeAdmitStore::new(engine, hash, total_bytes, None);
+            // Capture the lane seed before `ctx` moves behind the mutex, so the
+            // on-thread settle can tell whether this stream advanced the watermark.
+            let pool_id = ctx.pool_id;
+            let prior_amount = ctx.prior_amount;
             let ctx = Arc::new(std::sync::Mutex::new(ctx));
+            // #852: persist the buyer watermark on EVERY exit — clean completion, a
+            // terminal drive error, or a cooperative cancel — from THIS pull thread,
+            // AFTER the `drive` below has fully stopped advancing the shared ledger.
+            let _settle = SettleOnDrop {
+                deps: Arc::clone(&deps_for_thread),
+                provider_addr,
+                pool_id,
+                prior_amount,
+                ledger: Arc::clone(&ledger_for_drive),
+            };
             let source = PeerSource::new(
                 &endpoint,
                 EndpointAddr::new(pk),
@@ -1888,58 +1936,67 @@ async fn pull_from_candidate(
             // — no truncate, no rewind buffer. `drive` finalizes the store when the
             // whole blob is present, so the caller holds no whole-blob buffer of its
             // own on success.
-            let result = drive(
-                &store,
-                &source,
-                &pacer,
-                &funder,
-                &ctx,
-                &ledger_for_drive,
-                hash_bytes,
-                0,
-                total_bytes,
-                &drive_config,
-                None,
-                None,
-                None,
-            )
-            .await;
-            let pool_id = ctx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pool_id;
-            (result, pool_id)
+            let cancelled;
+            let result = tokio::select! {
+                biased;
+                r = drive(
+                    &store,
+                    &source,
+                    &pacer,
+                    &funder,
+                    &ctx,
+                    &ledger_for_drive,
+                    hash_bytes,
+                    0,
+                    total_bytes,
+                    &drive_config,
+                    None,
+                    None,
+                    None,
+                ) => {
+                    cancelled = false;
+                    r
+                }
+                () = cancel_for_thread.cancelled() => {
+                    cancelled = true;
+                    Ok(())
+                }
+            };
+            // Drain a stranded upstream connection on the cancel/`Err` paths only, so
+            // `Endpoint::close()` cannot hang on the runtime this thread is about to
+            // drop. The `_settle` guard drops AFTER this, persisting the final
+            // watermark.
+            if cancelled || result.is_err() {
+                tokio::time::sleep(ABANDON_DRAIN).await;
+            }
+            (result, pool_id, cancelled)
         }))
     })
     .await;
-    // Capture the delivery duration BEFORE the guard settles: `record_progress` does
-    // a blocking fsync'd store write, and folding it into `elapsed` would inflate the
-    // delivery-speed reputation signal for a reason unrelated to the network pull.
     let elapsed = started.elapsed();
-    drop(settle);
-    // Three failure shapes collapse to one classification path: the blocking task
-    // itself panicked (`JoinError`), its dedicated runtime failed to build (`io::Error`
-    // — starvation/resource exhaustion, not a peer fault), or `drive` itself errored.
-    // None of the first two says anything about the PROVIDER, but they are still OUR
-    // fault and must not launder into a clean miss (#1560) — `classify_pull_failure`
-    // has no typed arm for either, so they fall through its catch-all `Unreachable`/
-    // `Refused` classification onto `PullMiss::Clean`, same as any other transport
-    // fault; a truly node-wide resource exhaustion is expected to repeat across every
-    // candidate and surface some other way (metrics, logs) rather than through this
-    // per-pull classifier.
-    let (result, pool_id) = match join {
-        Ok(Ok((result, pool_id))) => (result, pool_id),
-        Ok(Err(err)) => (
-            Err(anyhow::Error::new(err).context("node-origin: pull-thread runtime build failed")),
-            B256::ZERO,
-        ),
-        Err(join_err) => (
-            Err(anyhow::anyhow!(
-                "node-origin: pull thread panicked or was cancelled: {join_err}"
-            )),
-            B256::ZERO,
-        ),
+    // A genuine cooperative cancel (the `fetch` future was dropped) is neither a clean
+    // delivery nor a fault: do not score or classify it. The two THREAD-LEVEL failure
+    // shapes — the blocking task panicked (`JoinError`) or its dedicated runtime failed
+    // to build (`io::Error`, resource exhaustion) — say nothing about the PROVIDER, but
+    // they are OUR fault and must not launder into a clean miss (#1560), so they map to
+    // [`PullMiss::LocalFault`] directly rather than falling through the transport-fault
+    // classifier onto `PullMiss::Clean`.
+    let (result, pool_id, cancelled) = match join {
+        Ok(Ok(triple)) => triple,
+        Ok(Err(err)) => {
+            warn!(%err, "node-origin: pull-thread runtime build failed; local fault");
+            return Err(PullMiss::LocalFault);
+        }
+        Err(join_err) => {
+            warn!(%join_err, "node-origin: pull thread panicked; local fault");
+            return Err(PullMiss::LocalFault);
+        }
     };
+    if cancelled {
+        // The pull was abandoned mid-transfer; the on-thread settle already persisted
+        // the watermark. Nothing to score.
+        return Err(PullMiss::Clean);
+    }
     match result {
         Ok(()) => {
             // Content delivered by this provider for a from-zero whole-blob pull is
@@ -1968,27 +2025,6 @@ async fn pull_from_candidate(
     }
 }
 
-/// How a [`SettleOnDrop`] reaches the deps it settles against.
-///
-/// The two pull paths hold them differently — the buffered one borrows for the length of a
-/// single call, the window one carries the runtime's `Arc` across a pull it hands to the
-/// serve loop — and the guard must work on BOTH, because both can be dropped mid-pull.
-enum SettleDeps<'a> {
-    Borrowed(&'a NodeOriginDeps),
-    Shared(Arc<OnceLock<NodeOriginDeps>>),
-}
-
-impl SettleDeps<'_> {
-    /// `None` only if the node was never provisioned — in which case there is no store to
-    /// persist to and nothing to settle.
-    fn get(&self) -> Option<&NodeOriginDeps> {
-        match self {
-            Self::Borrowed(deps) => Some(deps),
-            Self::Shared(deps) => deps.get(),
-        }
-    }
-}
-
 /// Settles what a pull paid — on EVERY way out of it, including a drop.
 ///
 /// This is a `Drop` guard rather than a pair of calls after the await because the
@@ -2013,8 +2049,13 @@ impl SettleDeps<'_> {
 /// watermark for the same reason: the serve loop drives that pull as a future on the iroh
 /// `accept` task, and a node shutdown or a downstream reset DROPS it, so no terminal method
 /// runs (#1145 review).
-struct SettleOnDrop<'a> {
-    deps: SettleDeps<'a>,
+struct SettleOnDrop {
+    /// The runtime deps, reached through the shared `OnceLock`. Holding the `Arc`
+    /// (not a borrow) lets the guard cross onto a pull thread and outlive the future
+    /// that spawned it — both pull paths drop it off their original stack.
+    /// `get()` is `None` only if the node was never provisioned, in which case there
+    /// is no store to persist to and nothing to settle.
+    deps: Arc<OnceLock<NodeOriginDeps>>,
     provider_addr: Address,
     pool_id: B256,
     /// The lane's cumulative amount the pull started from, so a `Drop` can tell
@@ -2023,7 +2064,7 @@ struct SettleOnDrop<'a> {
     ledger: Arc<PoolLedger>,
 }
 
-impl std::fmt::Debug for SettleOnDrop<'_> {
+impl std::fmt::Debug for SettleOnDrop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SettleOnDrop")
             .field("provider_addr", &self.provider_addr)
@@ -2032,7 +2073,7 @@ impl std::fmt::Debug for SettleOnDrop<'_> {
     }
 }
 
-impl Drop for SettleOnDrop<'_> {
+impl Drop for SettleOnDrop {
     fn drop(&mut self) {
         let Some(deps) = self.deps.get() else {
             return;
