@@ -4415,11 +4415,14 @@ fn spawn_a_paid_then_silent_server(
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Result<()> {
-    // Advertise 1.5 MiB but serve only the first 1 MiB, so the buyer is left waiting
-    // for a remainder that never comes — with one interval already bought and acked.
-    let payload = vec![0x7Du8; PAYLOAD_LEN];
+    // Advertise two voucher intervals but serve only the first one, so the buyer is
+    // left waiting for a remainder that never comes — with one interval already
+    // bought and acked.
+    let payload_len =
+        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(2)).unwrap_or(usize::MAX);
+    let payload = vec![0x7Du8; payload_len];
     let hash = Hash::new(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+    let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let a_sk = fresh_key();
     let a_id = a_sk.public();
@@ -7621,9 +7624,14 @@ async fn spawn_node_a(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
-    let payload = vec![0xCDu8; PAYLOAD_LEN];
+    // 1.5x the pacing window (which floors at `VOUCHER_INTERVAL_BYTES`, ADR 003
+    // §Credit window), so the pull crosses exactly one window boundary and pauses
+    // once, with a real remainder left to resume.
+    let payload_len =
+        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload = vec![0xCDu8; payload_len];
     let hash = Hash::new(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+    let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
     let ab_channel_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -7681,8 +7689,8 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         "leaf received {} of {total_bytes} bytes",
         outcome.received
     );
-    // The headline #856 behavior: PAYLOAD_LEN (1.5 MiB) exceeds the default
-    // ~1 MiB window, so the pull MUST have paused at the window frontier and
+    // The headline #856 behavior: the payload (1.5x the pacing window) exceeds the
+    // default window, so the pull MUST have paused at the window frontier and
     // resumed as the leaf's vouchers cleared. Assert the pause actually fired —
     // a regression that broke the resume could still pass the full-delivery
     // checks above (the blob would simply never arrive), so pin the pause
@@ -7697,24 +7705,38 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         "B must promote the teed blob on a complete delivery"
     );
     // B's buyer channel to A advanced under the DECOUPLED window-paced cadence
-    // (#1621 B2 part 2), which differs from the fused path's single-open shape:
-    //
-    //   * nonce 3 (not 2). The pull leg opens the blob in MORE THAN ONE span: the
-    //     ~1 MiB window pause at the frontier forces a SECOND upstream open (the
-    //     `node_pull_through_window_paused_total >= 1` assertion above proves the
-    //     pause fired), so the buyer signs one extra voucher — one per open.
-    //   * 1_579_008 WIRE bytes (not the single-span `bao_encoded_size(all)` of
-    //     1_578_944). Under ADR 038 the node-to-node payment meters WIRE (the bao
-    //     stream: content + interleaved proof). Re-opening at the span boundary
-    //     re-emits that boundary's bao parent once, adding exactly 64 redundant
-    //     proof bytes: 1_578_944 + 64 = 1_579_008.
-    //   * amount 17. Voucher amounts round up PER interval delta, not once over the
-    //     cumulative total (protocol-mandated), so the sum of per-interval ceilings
-    //     is 17 — one more than a single cumulative ceiling. B pays A for exactly
-    //     the wire A delivered.
+    // (#1621 B2 part 2), which differs from the fused path's single-open shape: the
+    // pull leg opens the blob in more than one span, because the window pause at
+    // the frontier (proven above) forces a second upstream open, each with its OWN
+    // voucher accounting starting fresh at that open (#856) rather than continuing
+    // the cumulative total. The wire total re-emits the span boundary's bao parent
+    // once more than a single-span encoding would (ADR 038 meters WIRE: content +
+    // interleaved proof), and each leg's own wire is chunked and ceiling-rounded
+    // independently, so the two legs' summed payment is more than a single
+    // cumulative ceiling over the whole wire would be.
+    let leg1_wire =
+        u64::try_from(honest_bao_wire_range(&payload, 0, VOUCHER_INTERVAL_BYTES)?.len())
+            .unwrap_or(u64::MAX);
+    let leg2_wire =
+        u64::try_from(honest_bao_wire_range(&payload, VOUCHER_INTERVAL_BYTES, 0)?.len())
+            .unwrap_or(u64::MAX);
+    let expected_wire = leg1_wire.saturating_add(leg2_wire);
+    let per_leg_amount = |wire: u64| -> U256 {
+        let mut amount = U256::ZERO;
+        let mut remaining = wire;
+        while remaining > 0 {
+            let chunk = remaining.min(VOUCHER_INTERVAL_BYTES);
+            amount += min_payment(chunk, RATE);
+            remaining -= chunk;
+        }
+        amount
+    };
+    let expected_amount = per_leg_amount(leg1_wire) + per_leg_amount(leg2_wire);
     anyhow::ensure!(
-        progress_log(&recorded)? == vec![(a_eth.address(), U256::from(1_579_008), U256::from(17))],
-        "expected B's upstream watermark at the full blob, got {:?}",
+        progress_log(&recorded)?
+            == vec![(a_eth.address(), U256::from(expected_wire), expected_amount)],
+        "expected B's upstream watermark at the full blob ({expected_wire} wire bytes, \
+         {expected_amount} paid), got {:?}",
         progress_log(&recorded)?
     );
 
@@ -8685,8 +8707,17 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
     // peer is over its allowance with nothing collectable — the exact stall shape.
     // The whole interaction must resolve well within the deadline (a regression
     // that reintroduces the spin hangs here), B must not cache the partial blob,
-    // and the share-ratio pause must have fired exactly once.
-    let payload = vec![0x5Au8; PAYLOAD_LEN];
+    // and the share-ratio pause must have fired exactly once. The payload exceeds
+    // the pacing window (which floors at `VOUCHER_INTERVAL_BYTES`, ADR 003 §Credit
+    // window) by a small margin — just enough that a SECOND pacer iteration is
+    // required to reach the rest of the blob (the re-check the stalled leech
+    // allowance must deny; a payload that fits inside the first window never
+    // reaches a second iteration at all) — while keeping the transfer small so
+    // this stays a fast-refusal test, not a bulk-transfer one.
+    let payload_len =
+        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_add(decdn_cache::CHUNK_GROUP_BYTES * 4))
+            .unwrap_or(usize::MAX);
+    let payload = vec![0x5Au8; payload_len];
     let hash = Hash::new(&payload);
 
     let ab_channel_id = B256::repeat_byte(0xA4);
@@ -8730,7 +8761,7 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
     let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
     let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
     let resolved = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(20),
         leaf_paced_pull(
             &leaf_ep,
             b_target,
@@ -8757,7 +8788,7 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
         .last()
         .map_or(0, |(_, bytes, _)| u64::try_from(*bytes).unwrap_or(u64::MAX));
     anyhow::ensure!(
-        upstream_bytes < PAYLOAD_LEN as u64,
+        upstream_bytes < payload_len as u64,
         "a leech-stalled serve must not pull the whole blob ({upstream_bytes} bytes)"
     );
     // The share-ratio cap denied the speculative pull (the loop re-checks before
@@ -8884,7 +8915,7 @@ async fn serve_wire_paced(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    let interval_bytes = MB_BYTES;
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
     let mut unvouchered: u64 = 0;
     for chunk in wire.chunks(CHUNK_SIZE) {
         if !gap.is_zero() {
@@ -9081,13 +9112,16 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
     // early (bounded spend), not promote, fire `upstream_verify_failed`, and score
     // A `Corruption`.
     //
-    // Construction: the HONEST whole-blob bao wire for a 1.5 MiB payload
-    // (multi-interval, so one voucher exchange completes before the corruption),
-    // with a single byte flipped ~1.1 MiB in — every group before it verifies,
-    // the containing group fails.
-    let payload = vec![0xB7u8; PAYLOAD_LEN];
+    // Construction: the HONEST whole-blob bao wire for a payload 1.5x one voucher
+    // accounting interval (so one voucher exchange completes before the
+    // corruption), with a single byte flipped just past that first interval —
+    // every group before it verifies, the containing group fails, and a real
+    // remainder of wire stays undelivered behind it.
+    let payload_len =
+        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload = vec![0xB7u8; payload_len];
     let hash = Hash::new(&payload);
-    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+    let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
     let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
         &payload,
         decdn_cache::range_pull::IROH_BLOCK_SIZE,
@@ -9105,7 +9139,8 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         .get(8..)
         .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
         .to_vec();
-    let corrupt_at = 1_150_000usize;
+    let corrupt_at =
+        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_add(400_000)).unwrap_or(usize::MAX);
     let byte = wire
         .get_mut(corrupt_at)
         .ok_or_else(|| anyhow::anyhow!("corruption offset outside the wire"))?;
@@ -9289,8 +9324,12 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     // #856: a leaf that underpays a mid-window voucher must be cleanly rejected
     // (VoucherOutcome::Rejected), B must abandon the partial fill (nothing cached),
     // its upstream spend stays bounded to ~one window, and the client-abandoned
-    // counter fires.
-    let payload = vec![0x7Cu8; PAYLOAD_LEN];
+    // counter fires. The payload exceeds one voucher accounting interval
+    // (`VOUCHER_INTERVAL_BYTES`), so the leaf actually reaches an interval boundary
+    // to underpay rather than draining the whole blob first.
+    let payload_len =
+        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload = vec![0x7Cu8; payload_len];
     let hash = Hash::new(&payload);
 
     let ab_channel_id = B256::repeat_byte(0xA7);
@@ -9349,11 +9388,14 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     let upstream_bytes: u64 = progress_log(&recorded)?
         .last()
         .map_or(0, |(_, bytes, _)| u64::try_from(*bytes).unwrap_or(u64::MAX));
-    let one_window = decdn_common::config::DEFAULT_PULL_AHEAD_BYTES;
+    // The pacing window floors at `VOUCHER_INTERVAL_BYTES` (ADR 003 §Credit
+    // window), which exceeds the `DEFAULT_PULL_AHEAD_BYTES` knob, so it — not the
+    // raw pull-ahead default — is the effective window this spend is bounded to.
+    let one_window = VOUCHER_INTERVAL_BYTES;
     // The window bounds CONTENT bytes, but the upstream watermark meters WIRE bytes
     // (bao content + interleaved proof, ADR 038), so one window of content costs one
-    // window + its proof overhead (~4 KiB on a 1 MiB window) plus up to a group of
-    // boundary overshoot. One chunk group of slack covers both.
+    // window + its proof overhead plus up to a group of boundary overshoot. One
+    // chunk group of slack covers both.
     anyhow::ensure!(
         upstream_bytes <= one_window + decdn_cache::CHUNK_GROUP_BYTES,
         "B's upstream spend ({upstream_bytes}) must stay bounded to ~one window ({one_window})"
@@ -12412,6 +12454,35 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
 /// not a suffix of the offset-0 one. That is precisely why a resumed leg's wire cost
 /// cannot be derived by subtracting from the whole-blob cost, and why
 /// `content_paid_frontier` re-anchors per leg.
+/// [`honest_bao_wire_from`], bounded to `byte_len` bytes from `byte_offset`
+/// (`byte_len == 0` means "to the end", matching [`decdn_cache::range_pull::align_range`]).
+/// Used to derive a single window-paced LEG's own wire encoding, independent of the
+/// other leg's — each leg's voucher accounting resets at its own open (#856).
+fn honest_bao_wire_range(payload: &[u8], byte_offset: u64, byte_len: u64) -> Result<Vec<u8>> {
+    let hash = Hash::new(payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+        payload,
+        decdn_cache::range_pull::IROH_BLOCK_SIZE,
+    );
+    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total_bytes)?;
+    let start = usize::try_from(aligned.fetch_start()).unwrap_or(usize::MAX);
+    let end = usize::try_from(aligned.fetch_end()).unwrap_or(usize::MAX);
+    let window = payload
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("aligned window {start}..{end} outside the payload"))?;
+    let combined = decdn_cache::range_pull::encode_verified_range(
+        *hash.as_bytes(),
+        &aligned,
+        window,
+        bytes::Bytes::from(ob.data),
+    )?;
+    Ok(combined
+        .get(8..)
+        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
+        .to_vec())
+}
+
 fn honest_bao_wire_from(payload: &[u8], byte_offset: u64) -> Result<Vec<u8>> {
     let hash = Hash::new(payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -12632,7 +12703,7 @@ async fn serve_with_deposit_ceiling(
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
         unvouchered = unvouchered.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        if unvouchered >= MB_BYTES {
+        if unvouchered >= VOUCHER_INTERVAL_BYTES {
             if !settle_voucher(&mut send, &mut recv, deposit).await? {
                 // Refused: hold the connection so the buyer reads the rejection frame
                 // rather than a transport reset (which would score as unreachable).

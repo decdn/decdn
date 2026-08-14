@@ -282,10 +282,11 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default window-paced pull-through pipeline window (#856, ADR 037
-/// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
-/// most this many bytes ahead of the requesting client's cleared payment, so an
-/// abandoned request costs at most this window of upstream spend, not the whole
-/// blob.
+/// `pull_ahead_bytes`): 1 MiB. This is under the 4 MiB voucher interval, and the
+/// serve loop floors the effective window at one interval, so this default paces
+/// at 4 MiB. The serving node pulls at most the effective window ahead of the
+/// requesting client's cleared payment, so an abandoned request costs at most
+/// that window of upstream spend, not the whole blob.
 pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
 /// Default downstream paid-delivery credit window (ADR 003 §Credit window): 8
 /// MiB. The serve loop keeps streaming while `delivered − paid ≤ credit_window`,

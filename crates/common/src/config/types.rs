@@ -547,8 +547,8 @@ pub struct CacheConfig {
     pub node_pull_stall_timeout_sec: Option<u64>,
     /// Window-paced pull-through per-request pipeline window in bytes (#856, ADR
     /// 037 `pull_ahead_bytes`). Absent =>
-    /// [`crate::config::DEFAULT_PULL_AHEAD_BYTES`] (1 MiB ≈ one voucher
-    /// interval). The serving node pulls at most this many bytes ahead of what
+    /// [`crate::config::DEFAULT_PULL_AHEAD_BYTES`] (1 MiB, under the 4 MiB
+    /// voucher interval). The serving node pulls at most this many bytes ahead of what
     /// the requesting client has paid for, so the loss on an abandoned request
     /// is bounded to this window rather than the whole blob. Larger keeps the
     /// upstream pull more pipelined (higher throughput) at a larger per-request
