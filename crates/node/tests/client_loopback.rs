@@ -57,7 +57,8 @@ use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
-    ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VoucherRejectReason,
+    ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VOUCHER_INTERVAL_BYTES,
+    VoucherRejectReason,
 };
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
@@ -1663,6 +1664,131 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
     anyhow::ensure!(
         metric_line_present(&fx.metrics.encode()?, "decdn_client_idle_close_total 1"),
         "the post-concurrency idle reap must be metered exactly once"
+    );
+
+    client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
+/// ADR 005 §Payment lanes and concurrent streams: two same-lane streams share
+/// ONE aggregate byte counter and ONE cumulative-voucher watermark. Two
+/// deliveries run on one `(pool_id, signer, provider)` lane — each blob is under
+/// a single voucher interval, so neither stream crosses the 4 MiB
+/// `VOUCHER_INTERVAL_BYTES` boundary alone, but their combined wire bytes do — so
+/// the SHARED lane counter is what carries the crossing. Both serve legs sit
+/// parked at their closing voucher on the one lane, then settle in the REVERSE of
+/// their open order. The node reconstructs each voucher's cumulative
+/// `bytes_delivered` from the shared counter plus that stream's own delivered
+/// delta, so the final persisted watermark is the exact aggregate no matter which
+/// stream is paid first (#1689).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_same_lane_streams_aggregate_across_the_voucher_interval() -> anyhow::Result<()>
+{
+    // Each blob is under one voucher interval, so a single stream yields just one
+    // (closing) voucher; their sum clears the interval, so only the shared lane
+    // counter crosses the boundary — the aggregate-accounting path under test.
+    let payload_a = vec![0x71u8; 3 * 1024 * 1024];
+    let payload_b = vec![0x82u8; 2 * 1024 * 1024];
+    // A generous idle window: the test settles promptly and asserts nothing about
+    // the idle reaper, so the clock must never fire while streams are parked.
+    let idle = Duration::from_secs(30);
+    let fx = idle_fixture_with_two_blobs(&payload_a, &payload_b, idle).await?;
+    let blob_a = fx.blob(0)?;
+    let blob_b = fx.blob(1)?;
+
+    // The preconditions the test's meaning rests on: each stream stays under one
+    // interval (so neither crosses the boundary on its own), yet their aggregate
+    // clears it (so the shared counter must).
+    anyhow::ensure!(
+        blob_a.wire_bytes < VOUCHER_INTERVAL_BYTES && blob_b.wire_bytes < VOUCHER_INTERVAL_BYTES,
+        "each blob must stay under one voucher interval: a={}, b={}, interval={}",
+        blob_a.wire_bytes,
+        blob_b.wire_bytes,
+        VOUCHER_INTERVAL_BYTES,
+    );
+    let aggregate_wire = blob_a
+        .wire_bytes
+        .checked_add(blob_b.wire_bytes)
+        .ok_or_else(|| anyhow::anyhow!("aggregate wire-byte overflow"))?;
+    anyhow::ensure!(
+        aggregate_wire > VOUCHER_INTERVAL_BYTES,
+        "the two streams must aggregate past one interval: {aggregate_wire} <= {VOUCHER_INTERVAL_BYTES}",
+    );
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+
+    // Both streams open on the one connection and fully deliver: every chunk of
+    // both blobs is on the wire (each blob sits inside the one-interval credit
+    // window) before either voucher is paid, so the two serve legs are
+    // simultaneously parked at their closing-voucher exchange on the shared lane.
+    let stalled_a = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_a.hash.as_bytes(),
+        blob_a.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+    let stalled_b = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_b.hash.as_bytes(),
+        blob_b.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+
+    // Out-of-order settlement: pay stream B (opened SECOND) first, then A. The
+    // cumulative watermark is threaded in PAYMENT order, not open order — the node
+    // steps the shared counter by each stream's own delivered delta, so B's
+    // voucher reconstructs to `wire_b` and A's to `wire_b + wire_a`.
+    let (_b_completed_at, after_b) = stalled_b
+        .pay_and_finish(&fx.client_signer, VoucherTotals::default())
+        .await?;
+    anyhow::ensure!(
+        after_b.wire_bytes == blob_b.wire_bytes,
+        "after paying B first the cumulative wire bytes must be exactly B's: {} vs {}",
+        after_b.wire_bytes,
+        blob_b.wire_bytes,
+    );
+
+    // A's cumulative voucher is where the shared counter crosses the 4 MiB
+    // boundary (from `wire_b` to `wire_b + wire_a`).
+    let (_a_completed_at, after_a) = stalled_a.pay_and_finish(&fx.client_signer, after_b).await?;
+    anyhow::ensure!(
+        after_a.wire_bytes == aggregate_wire,
+        "the final cumulative wire bytes must be the exact aggregate: {} vs {aggregate_wire}",
+        after_a.wire_bytes,
+    );
+
+    // The lane persisted ONE shared watermark — the exact aggregate of both
+    // streams (monotone, never double-counted) — and its cumulative amount is what
+    // the two vouchers paid.
+    let persisted = fx.store.load_all()?;
+    anyhow::ensure!(
+        persisted.len() == 1,
+        "the two streams share one lane, but {} were persisted",
+        persisted.len(),
+    );
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(aggregate_wire),
+        "shared lane watermark: {} (expected the {aggregate_wire}-byte aggregate)",
+        only.last_bytes_delivered(),
+    );
+    anyhow::ensure!(
+        only.last_amount() == after_a.amount,
+        "cumulative amount: {} (expected {})",
+        only.last_amount(),
+        after_a.amount,
     );
 
     client_ep.close().await;
