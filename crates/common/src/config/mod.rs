@@ -285,17 +285,17 @@ pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 /// abandoned request costs at most this window of upstream spend, not the whole
 /// blob.
 pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
-/// Default downstream paid-delivery credit window (ADR 003 §Credit window): 8
-/// MiB. The serve loop keeps streaming while `delivered − paid ≤ credit_window`,
-/// so paid delivery pipelines behind this bound instead of stalling a full round
-/// trip at every voucher interval. At the 4 MiB default interval this is two
-/// intervals of headroom, which keeps ~150 MiB/s reachable at a 50 ms RTT (a
-/// stop-and-wait 1 MiB interval caps at ~19 MiB/s there). It is the node's whole
-/// credit exposure — unbilled egress already on the wire — and is strictly
-/// cheaper than the speculative USDC the node already fronts on an upstream pull
-/// ([`DEFAULT_PULL_AHEAD_BYTES`]); the client's exposure stays zero because
-/// vouchers are cumulative over bytes already delivered.
-pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// Default downstream credit-window ceiling (ADR 003 §Credit window): 64 MiB. A
+/// stream's window ramps from one voucher interval toward this cap in proportion
+/// to what the stream has already paid; a fully-ramped high-bandwidth lane runs
+/// link-bound within this bound, while a non-paying lane stays pinned at the
+/// interval floor. Node-local policy, floored to one interval by the serve loop.
+pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
+/// Default ramp divisor (ADR 003 §Credit window): 2. The credit window is at most
+/// `paid / credit_ramp_divisor`, so the node's unbilled egress on a stream never
+/// exceeds half the revenue the stream has already confirmed. Lower ramps faster;
+/// `0` opens the full [`DEFAULT_CREDIT_MAX`] from the first byte.
+pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
 /// Default group-commit interval in milliseconds when
 /// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
 /// state persistence, #1483): 5 ms.
@@ -303,23 +303,24 @@ pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 /// The serve loop amortizes the per-voucher fsynced redb commit (~3 ms on local
 /// SSD) across a batch — one fsync for several vouchers, each acknowledged only
 /// *after* the commit is durable, so the replay guard is preserved verbatim. The
-/// batch is gathered by delivering ahead within the [credit
-/// window](DEFAULT_CREDIT_WINDOW_BYTES) and collecting the vouchers that arrive;
-/// this interval bounds how long the loop waits for a straggling batch-mate
-/// before committing what it has, so a client that pauses payment is never
-/// stalled longer than this. It is bounded above by the window: at most
-/// `credit_window / voucher_interval` vouchers can be outstanding, so the batch
-/// never exceeds that regardless of this value.
+/// batch is gathered by delivering ahead within the ramped [credit
+/// window](DEFAULT_CREDIT_MAX) and collecting the vouchers that arrive; this
+/// interval bounds how long the loop waits for a straggling batch-mate before
+/// committing what it has, so a client that pauses payment is never stalled
+/// longer than this. It is bounded above by the window: at most `credit_window /
+/// voucher_interval` vouchers can be outstanding, so the batch never exceeds
+/// that regardless of this value.
 ///
 /// **Sizing constraint.** The interval spends credit-window headroom, not
 /// throughput: to keep the link saturated while acknowledgements lag one commit
 /// interval, size the window so that
-/// `credit_window ≥ throughput × (RTT + commit_interval)`. At the 8 MiB default
-/// window and a 50 ms RTT, a 5–20 ms interval is comfortable. `0` disables the
-/// gather wait (commit each blocking-read batch immediately); a stop-and-wait
-/// window (≤ one interval) ignores it entirely, since only one voucher is ever
-/// outstanding. Node-local policy, not a wire or governance parameter — like the
-/// voucher interval and the credit window it has no on-chain counterpart.
+/// `credit_window ≥ throughput × (RTT + commit_interval)`. At a fully-ramped 64
+/// MiB window and a 50 ms RTT, a 5–20 ms interval is comfortable. `0` disables
+/// the gather wait (commit each blocking-read batch immediately); a
+/// stop-and-wait window (≤ one interval) ignores it entirely, since only one
+/// voucher is ever outstanding. Node-local policy, not a wire or governance
+/// parameter — like the voucher interval and the credit window it has no
+/// on-chain counterpart.
 pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
 /// Default voucher cadence a node advertises in `StreamResponse` when
 /// `payment.voucher_interval_mb` is unset (ADR 003 §Voucher Interval
@@ -328,8 +329,8 @@ pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
 /// fallback, 1 MiB) because per-channel vouchers serialize on one fsynced redb
 /// commit (~3 ms): a larger interval lifts that per-channel throughput cap
 /// linearly without raising the credit exposure, which is the window, not the
-/// interval. Independent of [`DEFAULT_CREDIT_WINDOW_BYTES`]; both are set from
-/// config and floored so the window is always at least one interval.
+/// interval. Independent of [`DEFAULT_CREDIT_MAX`]; both are set from config
+/// and floored so the window is always at least one interval.
 pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 4;
 /// Default node-wide unrecouped-leech budget (#856, ADR 037
 /// `max_unrecouped_leech_bytes`): 256 MiB. Aggregate speculative pull-through
@@ -2524,13 +2525,20 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Downstream credit window (ADR 003 §Credit window). Default 8 MiB; no upper
-    // bound beyond the runtime deposit guard — a larger window is more unbilled
-    // egress the node fronts, which the operator owns. Floored to one interval by
-    // the serve loop, so no lower bound is enforced here.
-    let credit_window_bytes = file
-        .and_then(|p| p.credit_window_bytes.as_ref())
-        .map_or(DEFAULT_CREDIT_WINDOW_BYTES, |b| b.get());
+    // Downstream credit-window ceiling (ADR 003 §Credit window). Default 64 MiB;
+    // no upper bound beyond the runtime deposit guard — a larger ceiling is more
+    // unbilled egress the node fronts once a stream has ramped up, which the
+    // operator owns. Floored to one interval by the serve loop, so no lower
+    // bound is enforced here.
+    let credit_max = file
+        .and_then(|p| p.credit_max.as_ref())
+        .map_or(DEFAULT_CREDIT_MAX, |b| b.get());
+    // Ramp divisor (ADR 003 §Credit window). Default 2; `0` (open the full
+    // ceiling immediately) is a valid setting, so it merges as a first-class
+    // value rather than falling back to the default.
+    let credit_ramp_divisor = file
+        .and_then(|p| p.credit_ramp_divisor)
+        .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
     // Group-commit interval (ADR 003 §Off-chain voucher state persistence,
     // #1483). Default 5 ms; `0` (commit each blocking-read batch immediately) is
     // a valid setting, so it merges as a first-class value rather than falling
@@ -2542,7 +2550,8 @@ pub fn resolve_payment_into(
         rate_per_mb,
         delivery_floor,
         voucher_interval_mb,
-        credit_window_bytes,
+        credit_max,
+        credit_ramp_divisor,
         voucher_commit_interval_ms,
     }
 }
@@ -5007,7 +5016,8 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(0),
             delivery_floor: None,
             voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let err = resolve_payment(&cli, Some(&file))
@@ -5055,7 +5065,8 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(0),
             delivery_floor: None,
             voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -5081,9 +5092,14 @@ swap_pool_address = \"0xPool\"
             resolved.voucher_interval_mb
         );
         anyhow::ensure!(
-            resolved.credit_window_bytes == DEFAULT_CREDIT_WINDOW_BYTES,
-            "credit_window_bytes default, got: {}",
-            resolved.credit_window_bytes
+            resolved.credit_max == DEFAULT_CREDIT_MAX,
+            "credit_max default, got: {}",
+            resolved.credit_max
+        );
+        anyhow::ensure!(
+            resolved.credit_ramp_divisor == DEFAULT_CREDIT_RAMP_DIVISOR,
+            "credit_ramp_divisor default, got: {}",
+            resolved.credit_ramp_divisor
         );
         anyhow::ensure!(
             resolved.voucher_commit_interval_ms == DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
@@ -5102,7 +5118,8 @@ swap_pool_address = \"0xPool\"
                 rate_per_mb: Some(10),
                 delivery_floor: None,
                 voucher_interval_mb: None,
-                credit_window_bytes: None,
+                credit_max: None,
+                credit_ramp_divisor: None,
                 voucher_commit_interval_ms: set,
             };
             let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -5121,7 +5138,8 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(10),
             delivery_floor: None,
             voucher_interval_mb: Some(64),
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -5130,19 +5148,41 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_payment_threads_explicit_credit_window() -> anyhow::Result<()> {
+    fn resolve_payment_defaults_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
+        let resolved = resolve_payment(&empty_payment_args(), None)?;
+        anyhow::ensure!(
+            resolved.credit_max == DEFAULT_CREDIT_MAX,
+            "got: {}",
+            resolved.credit_max
+        );
+        anyhow::ensure!(
+            resolved.credit_ramp_divisor == DEFAULT_CREDIT_RAMP_DIVISOR,
+            "got: {}",
+            resolved.credit_ramp_divisor
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_threads_explicit_credit_max_and_ramp_divisor() -> anyhow::Result<()> {
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
             delivery_floor: None,
             voucher_interval_mb: None,
-            credit_window_bytes: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
+            credit_max: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
+            credit_ramp_divisor: Some(5),
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
         anyhow::ensure!(
-            resolved.credit_window_bytes == 32 * 1024 * 1024,
-            "credit_window_bytes threaded, got: {}",
-            resolved.credit_window_bytes
+            resolved.credit_max == 32 * 1024 * 1024,
+            "credit_max threaded, got: {}",
+            resolved.credit_max
+        );
+        anyhow::ensure!(
+            resolved.credit_ramp_divisor == 5,
+            "credit_ramp_divisor threaded, got: {}",
+            resolved.credit_ramp_divisor
         );
         Ok(())
     }
@@ -5154,7 +5194,8 @@ swap_pool_address = \"0xPool\"
                 rate_per_mb: Some(10),
                 delivery_floor: None,
                 voucher_interval_mb: Some(bad),
-                credit_window_bytes: None,
+                credit_max: None,
+                credit_ramp_divisor: None,
                 voucher_commit_interval_ms: None,
             };
             let err = resolve_payment(&empty_payment_args(), Some(&file))
@@ -9500,7 +9541,8 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(1),
             delivery_floor: None,
             voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -9515,7 +9557,8 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(50),
             delivery_floor: None,
             voucher_interval_mb: None,
-            credit_window_bytes: None,
+            credit_max: None,
+            credit_ramp_divisor: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;

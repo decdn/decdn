@@ -549,17 +549,26 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 // tops it up to the working deposit before the stream even opens — pre-empting
 // the REACTIVE (mid-stream) top-up this test means to exercise.
 //
+// STALE (#1669): the sizing below assumes the pre-ramp flat credit window —
+// the node's pre-serve gate now prices at `paid = 0`, which the ramp collapses
+// to the one-interval floor (not a fixed multi-interval window) unless
+// `credit_ramp_divisor = 0` is configured. The daemon config this suite starts
+// (`crates/e2e/src/node.rs`) does not set `credit_max` / `credit_ramp_divisor`,
+// so it now runs the ramped default. The byte/USDC arithmetic here has not
+// been re-derived against that; treat it as historical reasoning that may no
+// longer bind, not as a current guarantee.
+//
 // Sized against two competing bounds of the shared-pool serve path:
 //
 //   * The node's pre-serve floor-M reserve (`pool_remaining_covers_window`,
 //     #1516) refuses to open a stream unless the pool's remaining minus the
 //     refundable floor `M` (default 1 USDC) covers one reserved CREDIT WINDOW.
-//     The window is 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`, two of the daemon's
-//     UNCONFIGURED default 4 MiB voucher intervals —
-//     `decdn_common::config::DEFAULT_VOUCHER_INTERVAL_MB`, distinct from the
-//     client-side wire fallback of the same name in `decdn_protocol`, which is
-//     1); at `MULTI_RATE_PER_MB` that window costs 8 * 2_000_000 = 16 USDC, so
-//     the initial deposit must clear 16 USDC + M = 17 USDC just to open.
+//     The window is 8 MiB (two of the daemon's UNCONFIGURED default 4 MiB
+//     voucher intervals — `decdn_common::config::DEFAULT_VOUCHER_INTERVAL_MB`,
+//     distinct from the client-side wire fallback of the same name in
+//     `decdn_protocol`, which is 1); at `MULTI_RATE_PER_MB` that window costs
+//     8 * 2_000_000 = 16 USDC, so the initial deposit must clear
+//     16 USDC + M = 17 USDC just to open.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
 //     voucher still exhausts it mid-stream and the reactive top-up fires.
 //
@@ -883,12 +892,17 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // verified on-disk prefix, `set_len` zero-extending the partial, and the whole-file
 // hash check failing a fetch that was already paid for.
 //
+// STALE (#1669): see the equivalent note above the multi-interval test's
+// sizing comment — this arithmetic assumes the pre-ramp flat credit window and
+// has not been re-derived against the ramped default this suite now runs
+// under.
+//
 // Sizing, at `TWO_TOPUP_RATE_PER_MB` and the daemon's default 4 MiB voucher
 // interval, so exactly two reactive top-ups are needed:
 //
 //   * The node's pre-serve deposit gate (#1518) refuses to serve unless headroom
-//     covers one credit window — `DEFAULT_CREDIT_WINDOW_BYTES` (8 MiB) at the
-//     quoted rate = 16_000_000 µUSDC here. So BOTH the initial deposit and the
+//     covers one credit window — 8 MiB at the quoted rate = 16_000_000 µUSDC
+//     here. So BOTH the initial deposit and the
 //     working target must be >= that, or the resumed open after a top-up is
 //     refused instead of served. This is what puts a hard floor under the blob
 //     size: two top-ups need a blob costing more than `initial + working`.

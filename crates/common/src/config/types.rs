@@ -778,18 +778,24 @@ pub struct PaymentConfig {
     /// not governance-owned: no contract holds a cadence parameter (ADR 003
     /// §Voucher Interval Negotiation).
     pub voucher_interval_mb: Option<u64>,
-    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
-    /// how far past the client's cleared payment the node keeps streaming before
-    /// it must collect a voucher, so paid delivery pipelines instead of stalling a
-    /// round trip at every interval boundary. Bounds the node's credit exposure
-    /// (unbilled egress already on the wire) to exactly this; the client's exposure
-    /// stays zero (vouchers are cumulative over delivered bytes). Absent =>
-    /// [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB). Floored at one
-    /// voucher interval; a value at or below one interval reproduces the
-    /// pre-credit-window stop-and-wait cadence. Like [`Self::voucher_interval_mb`]
-    /// it is node-local config, not a governance-owned parameter — no contract
-    /// holds a delivery-cadence value (ADR 003 §Voucher Interval Negotiation).
-    pub credit_window_bytes: Option<decdn_config_types::Bytes>,
+    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window). The
+    /// per-stream window ramps toward this cap as the stream pays, bounding the
+    /// node's credit exposure (unbilled egress already on the wire) to
+    /// `paid / credit_ramp_divisor`; the client's exposure stays zero (vouchers
+    /// are cumulative over delivered bytes). Absent =>
+    /// [`crate::config::DEFAULT_CREDIT_MAX`] (64 MiB). Floored at one voucher
+    /// interval; a value at or below one interval reproduces the
+    /// pre-ramp stop-and-wait cadence. Like [`Self::voucher_interval_mb`] it is
+    /// node-local config, not a governance-owned parameter — no contract holds a
+    /// delivery-cadence value (ADR 003 §Voucher Interval Negotiation).
+    pub credit_max: Option<decdn_config_types::Bytes>,
+    /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
+    /// `paid / credit_ramp_divisor`, floored at one voucher interval and capped at
+    /// [`Self::credit_max`]. Absent => [`crate::config::DEFAULT_CREDIT_RAMP_DIVISOR`]
+    /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
+    /// behavior. Like [`Self::voucher_interval_mb`] it is node-local config, not a
+    /// governance-owned parameter.
+    pub credit_ramp_divisor: Option<u64>,
     /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
     /// persistence, #1483): how long the serve loop waits to gather more
     /// vouchers into one fsynced commit before committing what it has, so a
@@ -797,10 +803,10 @@ pub struct PaymentConfig {
     /// acknowledged only after the commit is durable, so the replay guard is
     /// unchanged. Absent => [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]
     /// (5 ms). `0` commits each blocking-read batch immediately. Composes with
-    /// [`Self::credit_window_bytes`] via `credit_window ≥ throughput × (RTT +
+    /// [`Self::credit_max`] via `credit_window ≥ throughput × (RTT +
     /// commit_interval)`; bounded above by the window (at most
     /// `credit_window / voucher_interval` vouchers are ever outstanding). Like
-    /// [`Self::voucher_interval_mb`] and [`Self::credit_window_bytes`] it is
+    /// [`Self::voucher_interval_mb`] and [`Self::credit_max`] it is
     /// node-local, not a governance-owned parameter.
     pub voucher_commit_interval_ms: Option<u64>,
 }

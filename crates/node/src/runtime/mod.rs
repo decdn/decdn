@@ -1229,9 +1229,9 @@ async fn build_chain_and_handlers(
     client_deps.pull_through = pull_through;
     client_deps.pull_through_origin = pull_through_origin;
     client_deps.pull_ahead_bytes = pull_ahead_bytes;
-    // Downstream paid-delivery credit window (ADR 003 §Credit window, #1477).
-    client_deps.credit_window_bytes =
-        Some(decdn_cache::Bytes::new(cfg.payment.credit_window_bytes));
+    // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
+    client_deps.credit_max = cfg.payment.credit_max;
+    client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
     // Group-commit interval (ADR 003 §Off-chain voucher state persistence, #1483):
     // amortize the per-voucher fsync across a batch, acking each only after the
     // durable commit.
@@ -3741,7 +3741,8 @@ mod tests {
                 rate_per_mb: 10,
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
-                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },

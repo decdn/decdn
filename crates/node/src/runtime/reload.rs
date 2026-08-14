@@ -788,7 +788,8 @@ impl RuntimeReloadState {
                 rate_per_mb: 1,
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
-                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
@@ -1036,7 +1037,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // other serve knobs are read once at handler construction.
         warn_ignored(
             "payment.* (rate_per_mb, delivery_floor, voucher_interval_mb, \
-             credit_window_bytes, voucher_commit_interval_ms)",
+             credit_max, credit_ramp_divisor, voucher_commit_interval_ms)",
         );
     }
     if file.gossip.is_some() {
@@ -1271,7 +1272,8 @@ mod tests {
                 rate_per_mb: rate,
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
-                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },

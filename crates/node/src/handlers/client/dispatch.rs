@@ -395,38 +395,38 @@ impl ClientHandler {
                 //
                 // For an UNBOUNDED request (`byte_len == 0`: whole blob, or a tail
                 // from an offset) the billed size genuinely is unknowable pre-fill,
-                // so the window stands. Be clear about the residual that leaves,
-                // because it is not small: at stock config the window is 8 MiB
-                // (`DEFAULT_CREDIT_WINDOW_BYTES`, over a 4 MiB
-                // `DEFAULT_VOUCHER_INTERVAL_MB`), so a cold 100 KiB whole-blob
-                // fetch is priced at 8 MiB while the same blob served warm is
-                // priced at 100 KiB. A channel funded for the blob but not for a
-                // window is refused cold and served warm. Closing that needs the
-                // origin size probe to run before the floor, which is a larger
-                // change than this one.
+                // so the window stands. Be clear about the residual that leaves:
+                // this guard prices at `paid = 0`, i.e. the ramp floor — one
+                // voucher interval (`DEFAULT_VOUCHER_INTERVAL_MB`, 4 MiB by
+                // default) — not the fully-ramped `credit_max` ceiling (64 MiB),
+                // since a cold request has confirmed no payment yet. A channel
+                // funded for the blob but not for a floor interval is refused
+                // cold and served warm. Closing that needs the origin size probe
+                // to run before the floor, which is a larger change than this one.
                 //
                 // `window.rs` keeps its own guard. The honest relationship is
                 // narrower than "two separate guards": at default settings its
                 // `else` arm resolves to `max(pull_ahead, interval, credit_window)`
-                // = the credit window = this same floor, so it is redundant
+                // = the credit window floor = this same floor, so it is redundant
                 // there. (Not because `DEFAULT_PULL_AHEAD_BYTES` equals one
                 // interval — it is 1 MiB against a 4 MiB default interval. The
                 // `.max(credit_window(..))` term is what makes them coincide.) It
                 // diverges once either `max_blob_size_bytes` is finite (it then
                 // reserves the whole-blob cost) or `pull_ahead_bytes` is raised
-                // above the window — nothing validates that pair against each
+                // above the floor — nothing validates that pair against each
                 // other. Neither direction is guaranteed stricter: a 1 MiB blob cap
-                // under an 8 MiB window makes it WEAKER than this floor. It is also
-                // the tier that fronts UPSTREAM spend. Do not delete it on the
-                // strength of this floor alone.
+                // under a wider `pull_ahead_bytes` makes it WEAKER than this floor.
+                // It is also the tier that fronts UPSTREAM spend. Do not delete it
+                // on the strength of this floor alone.
                 //
                 // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
                 // front any fill when the pool's on-chain **remaining**
                 // (`getPool.deposit − getPool.totalRedeemed`) minus the refundable
-                // floor `M` cannot cover the reserved credit window: see
+                // floor `M` cannot cover the reserved credit-window floor: see
                 // [`ClientHandler::pool_remaining_covers_window`], the pure policy
-                // this site calls. `reserved` is one credit window, capped by the
-                // request's own aligned span when it bounds itself.
+                // this site calls. `reserved` is one interval (the ramp floor at
+                // `paid = 0`), capped by the request's own aligned span when it
+                // bounds itself.
                 //
                 // `remaining` comes from the cached `getPool` view resolved above;
                 // a `None` view fails open (the on-chain `redeem` is the backstop).
@@ -436,7 +436,7 @@ impl ClientHandler {
                     && let Some(status) = pool_status
                 {
                     let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-                    let window = self.credit_window(interval_bytes);
+                    let window = self.credit_window(interval_bytes, 0);
                     let reserved = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
@@ -806,24 +806,25 @@ impl ClientHandler {
 
         // Pre-flight floor-M gate — the direct-serve twin of the pull-through
         // guard in `window.rs` (keep the two in step). Without it the node signs
-        // `ok: true` and streams a full credit window before the first voucher's
+        // `ok: true` and streams a full interval before the first voucher's
         // pool-solvency check can fire, so a pool that cannot cover even that
-        // first window gets it free on every request (#1516).
+        // first interval gets it free on every request (#1516).
         //
         // In the shared-payment-pool model the quantity is the pool's on-chain
         // **remaining** (`getPool.deposit − getPool.totalRedeemed`) minus the
         // refundable floor `M`, checked against the credit-window cost via
         // [`ClientHandler::pool_remaining_covers_window`]. `guard_bytes` is the
-        // chunk-group-aligned span (what `export_bao_range_stream` bills),
-        // capped by the credit window.
+        // chunk-group-aligned span (what `export_bao_range_stream` bills), capped
+        // by the credit-window floor at `paid = 0` — the ramp has not started yet
+        // on a fresh request.
         //
         // `remaining` comes from the cached `getPool` view resolved above. When it
         // is `Some`, refuse `InsufficientDeposit` if the pool's remaining minus the
-        // refundable floor `M` can no longer cover the reserved credit window; a
-        // `None` view fails open (see the gate's construction above).
+        // refundable floor `M` can no longer cover the reserved credit-window
+        // floor; a `None` view fails open (see the gate's construction above).
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
         let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
-            .min(self.credit_window(interval_bytes));
+            .min(self.credit_window(interval_bytes, 0));
         if let Some(status) = pool_status
             && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
         {

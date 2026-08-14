@@ -382,15 +382,20 @@ pub struct ClientHandlerDeps {
     pub local_populate: Option<Duration>,
     pub pull_through_origin: Option<Arc<NodeOrigin>>,
     pub pull_ahead_bytes: Option<Bytes>,
-    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
-    /// how far past cleared payment the serve loop keeps streaming before it must
-    /// collect a voucher. `None` (the default, and in tests) reads as one voucher
-    /// interval — stop-and-wait, the pre-credit-window cadence. The runtime sets
-    /// it from `payment.credit_window_bytes`. Independent of `pull_ahead_bytes`
-    /// (which bounds the *upstream* speculative spend on a cache-miss pull): this
-    /// bounds the *downstream* unbilled-egress exposure. Both are floored at one
-    /// interval so the serve loop can always make progress.
-    pub credit_window_bytes: Option<Bytes>,
+    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window): the
+    /// per-stream window ramps toward this cap as the stream pays. Defaults to
+    /// `DEFAULT_CREDIT_MAX` (64 MiB); the runtime sets it from
+    /// `payment.credit_max`. Independent of `pull_ahead_bytes` (which bounds the
+    /// *upstream* speculative spend on a cache-miss pull): this bounds the
+    /// *downstream* unbilled-egress exposure. Both are floored at one interval so
+    /// the serve loop can always make progress.
+    pub credit_max: u64,
+    /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
+    /// `paid / credit_ramp_divisor`, floored at one interval and capped at
+    /// `credit_max`. Defaults to `DEFAULT_CREDIT_RAMP_DIVISOR` (2); the runtime
+    /// sets it from `payment.credit_ramp_divisor`. `0` opens the full ceiling
+    /// immediately.
+    pub credit_ramp_divisor: u64,
     /// Group-commit interval (ADR 003 §Off-chain voucher state persistence,
     /// #1483): how long the serve loop waits to gather more vouchers into one
     /// fsynced commit before committing what it has. `None` (the default, and in
@@ -461,7 +466,8 @@ impl ClientHandlerDeps {
             local_populate: None,
             pull_through_origin: None,
             pull_ahead_bytes: None,
-            credit_window_bytes: None,
+            credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+            credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval: None,
             leech_governor: None,
             idle_timeout: None,
@@ -571,13 +577,17 @@ pub struct ClientHandler {
     /// `pull_through_origin`. The window-paced loop pulls at most this many bytes
     /// ahead of cleared downstream payment.
     pull_ahead_bytes: Option<Bytes>,
-    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window),
-    /// set at construction via [`ClientHandlerDeps`]. The serve loop keeps
-    /// streaming while `delivered − paid ≤ credit_window`, collecting cumulative
-    /// vouchers as they arrive instead of stalling a full round trip at every
-    /// interval. `None` reads as one voucher interval (stop-and-wait). Read
-    /// through [`Self::credit_window`], which applies the one-interval floor.
-    credit_window_bytes: Option<Bytes>,
+    /// Downstream credit-window ceiling in bytes (ADR 003 §Credit window), set at
+    /// construction via [`ClientHandlerDeps`]. The serve loop keeps streaming
+    /// while `delivered − paid ≤ credit_window`, collecting cumulative vouchers as
+    /// they arrive instead of stalling a full round trip at every interval. Read
+    /// through [`Self::credit_window`], which ramps from one interval toward this
+    /// ceiling as `paid` grows.
+    credit_max: u64,
+    /// Ramp divisor for the credit window (ADR 003 §Credit window), set at
+    /// construction via [`ClientHandlerDeps`]. Read through
+    /// [`Self::credit_window`].
+    credit_ramp_divisor: u64,
     /// Group-commit interval (ADR 003 §Off-chain voucher state persistence,
     /// #1483), set at construction via [`ClientHandlerDeps`]. The serve loop
     /// waits at most this long to gather additional vouchers into one fsynced
@@ -694,7 +704,8 @@ impl ClientHandler {
             local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,
             pull_ahead_bytes: deps.pull_ahead_bytes,
-            credit_window_bytes: deps.credit_window_bytes,
+            credit_max: deps.credit_max,
+            credit_ramp_divisor: deps.credit_ramp_divisor,
             voucher_commit_interval: deps.voucher_commit_interval,
             leech_governor: deps.leech_governor,
             content_deny: deps.content_deny,
@@ -973,22 +984,20 @@ impl ClientHandler {
     }
 
     /// The effective downstream credit window in bytes for a stream whose
-    /// negotiated voucher interval is `interval_bytes` (ADR 003 §Credit window).
-    ///
-    /// The serve loop keeps `delivered − paid` within this bound before it must
-    /// collect a voucher, so it is exactly the node's bounded credit exposure:
-    /// unbilled egress already on the wire, capped here and nowhere else. Floored
-    /// at one interval so the loop can always make progress (deliver a full
-    /// interval, then recoup it) — a configured window below one interval, or the
-    /// unconfigured `None`, both collapse to the interval, which reproduces the
-    /// pre-credit-window stop-and-wait cadence exactly. The floor is also what
-    /// rules out a deadlock: whenever the window blocks further delivery, at least
-    /// one full interval is unpaid, so there is always a voucher to collect.
-    pub(super) fn credit_window(&self, interval_bytes: u64) -> u64 {
-        self.credit_window_bytes
-            .as_ref()
-            .map_or(0, |b| b.get())
-            .max(interval_bytes)
+    /// negotiated voucher interval is `interval_bytes` and whose cumulative
+    /// confirmed payment is `paid` (ADR 003 §Credit window). The window ramps
+    /// from one interval toward `credit_max` as `paid` grows, so the serve
+    /// loop's bounded credit exposure — `delivered − paid` — is at most
+    /// `paid / credit_ramp_divisor`. Floored at one interval so the loop always
+    /// makes progress; a `credit_ramp_divisor` of `0` opens the full ceiling
+    /// immediately.
+    pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
+        decdn_incentive::ramped_credit_window(
+            self.credit_ramp_divisor,
+            interval_bytes,
+            self.credit_max,
+            paid,
+        )
     }
 
     /// The refundable floor-`M` serving guard (shared-payment-pool model): the

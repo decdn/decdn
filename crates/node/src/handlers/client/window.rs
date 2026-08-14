@@ -106,7 +106,7 @@ impl ClientHandler {
             .as_ref()
             .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
             .max(interval_bytes)
-            .max(self.credit_window(interval_bytes));
+            .max(self.credit_window(interval_bytes, 0));
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
         // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
@@ -498,7 +498,7 @@ impl ClientHandler {
             .as_ref()
             .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
             .max(interval_bytes)
-            .max(self.credit_window(interval_bytes));
+            .max(self.credit_window(interval_bytes, 0));
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the

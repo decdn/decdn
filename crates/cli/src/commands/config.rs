@@ -682,7 +682,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rate_per_mb = 10
 # delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
 # voucher_interval_mb = 1                  # voucher cadence advertised on cdn/client/v1 (ADR 003); range 1..=MAX_VOUCHER_INTERVAL_MB
-# credit_window_bytes = 8388608            # downstream credit window in bytes (ADR 003 §Credit window); how far past cleared payment the node streams before collecting a voucher; default 8 MiB; floored at one voucher interval
+# credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one voucher interval
+# credit_ramp_divisor = 2                  # ramp divisor (ADR 003 §Credit window); window is paid/credit_ramp_divisor, capped at credit_max; 0 opens the full ceiling immediately
 # voucher_commit_interval_ms = 5           # group-commit interval for durable voucher persistence (ADR 003, #1483); 0 commits each batch immediately; default 5ms
 
 [observability]
@@ -1001,14 +1002,16 @@ mod tests {
             rate_per_mb,
             delivery_floor,
             voucher_interval_mb,
-            credit_window_bytes,
+            credit_max,
+            credit_ramp_divisor,
             voucher_commit_interval_ms,
         } = &config::types::PaymentConfig::default();
         let payment = [
             ("rate_per_mb =", rate_per_mb.is_none()),
             ("delivery_floor =", delivery_floor.is_none()),
             ("voucher_interval_mb =", voucher_interval_mb.is_none()),
-            ("credit_window_bytes =", credit_window_bytes.is_none()),
+            ("credit_max =", credit_max.is_none()),
+            ("credit_ramp_divisor =", credit_ramp_divisor.is_none()),
             (
                 "voucher_commit_interval_ms =",
                 voucher_commit_interval_ms.is_none(),

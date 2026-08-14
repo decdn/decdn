@@ -432,18 +432,17 @@ pub struct ResolvedPayment {
     /// [`crate::config::DEFAULT_VOUCHER_INTERVAL_MB`], range
     /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`].
     pub voucher_interval_mb: u64,
-    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
-    /// how far past cleared payment the serve loop streams before collecting a
-    /// voucher. Default [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB);
-    /// floored at one voucher interval by the serve loop, so a value at or below
-    /// one interval is stop-and-wait.
-    pub credit_window_bytes: u64,
+    /// Credit-window ceiling in bytes (ADR 003 §Credit window). See
+    /// [`crate::config::DEFAULT_CREDIT_MAX`].
+    pub credit_max: u64,
+    /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.
+    pub credit_ramp_divisor: u64,
     /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
     /// persistence, #1483): how long the serve loop waits to batch more vouchers
     /// into one fsynced commit before committing what it has. Default
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 ms); `0` commits
-    /// each blocking-read batch immediately. Bounded above by
-    /// [`Self::credit_window_bytes`].
+    /// each blocking-read batch immediately. Bounded above by the ramped window
+    /// (see [`Self::credit_max`]).
     pub voucher_commit_interval_ms: u64,
 }
 
