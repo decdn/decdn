@@ -82,20 +82,6 @@ impl NodeFunder {
             metrics,
         }
     }
-
-    /// The pool's current spendable headroom: `deposit - committed`. Locks the
-    /// context only to copy `deposit` out and reads the committed watermark off the
-    /// shared ledger — neither guard is held across an `.await`.
-    fn current_spendable(&self) -> U256 {
-        let deposit = {
-            let guard = self
-                .ctx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.deposit
-        };
-        deposit.saturating_sub(self.ledger.committed().amount)
-    }
 }
 
 #[async_trait]
@@ -106,13 +92,22 @@ impl Funder for NodeFunder {
 
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
         Box::pin(async move {
+            // Read the raw deposit once; derive spendable locally so the target
+            // computation and the headroom classification share one baseline.
+            let current_deposit = {
+                let guard = self
+                    .ctx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.deposit
+            };
+            let current_spendable = current_deposit.saturating_sub(self.ledger.committed().amount);
             // `top_up_pool` targets spendable, so raise the target by exactly
             // `additional` above the current spendable — that is what adds
             // `additional` to the deposit (a `topUp` never touches committed spend).
-            let current = self.current_spendable();
-            let spendable_target = current.saturating_add(additional);
+            let spendable_target = current_spendable.saturating_add(additional);
             match self.opener.top_up_pool(spendable_target).await {
-                Ok(new_deposit) if new_deposit > current => {
+                Ok(new_deposit) if new_deposit > current_deposit => {
                     self.metrics.node_pull_reactive_topup();
                     Ok(DepositOutcome::Added(new_deposit))
                 }
@@ -353,6 +348,43 @@ mod tests {
         assert!(
             text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
             "expected a failing top-up to bump the refused counter: {text}"
+        );
+    }
+
+    /// Regression for the raw-deposit-vs-spendable baseline bug: with `committed`
+    /// nonzero, `top_up_pool`'s no-op path returns the deposit UNCHANGED (a
+    /// concurrent proactive refill already grabbed the slot). Classifying against
+    /// the spendable baseline (`deposit - committed`) would wrongly read the
+    /// unchanged raw deposit as `> current_spendable` and count it as a success;
+    /// classifying against the raw deposit — the fix — correctly calls it refused.
+    #[tokio::test]
+    async fn top_up_no_headroom_landing_with_committed_spend_is_refused() {
+        let deposit = U256::from(1_000u64);
+        let committed = U256::from(600u64);
+        // The no-op path: `top_up_pool` returns the pre-call raw deposit unchanged.
+        let opener = Arc::new(MockOpener::new(Ok(deposit)));
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let f = NodeFunder::new(
+            opener,
+            test_ctx(deposit),
+            test_ledger(committed),
+            Arc::clone(&metrics),
+        );
+
+        let outcome = f
+            .top_up(U256::from(250u64))
+            .await
+            .expect("top-up should succeed (a no-op landing is not an error)");
+
+        assert_eq!(outcome, DepositOutcome::Added(deposit));
+        let text = metrics.encode().expect("metrics should encode");
+        assert!(
+            text.contains("decdn_node_pull_reactive_topup_refused_total 1"),
+            "expected a no-headroom landing to bump the refused counter: {text}"
+        );
+        assert!(
+            !text.contains("decdn_node_pull_reactive_topup_total 1"),
+            "expected a no-headroom landing NOT to bump the success counter: {text}"
         );
     }
 }
