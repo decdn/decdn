@@ -4,12 +4,13 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, Hash, LaneKey, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT,
-    RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError,
-    StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message, reset_stream,
-    verify_binding,
+    FillOutcome, FirstMessage, Hash, LaneKey, LaneSlot, Mutex, OwnedSemaphorePermit,
+    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
+    StreamReadError, StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
+use std::sync::atomic::Ordering;
 
 impl ClientHandler {
     /// Accept the connection-level rate-limit permit, then serve each inbound
@@ -293,6 +294,59 @@ impl ClientHandler {
             Some(key) => self.lanes.lock().await.get(&key).cloned(),
             None => None,
         };
+
+        // Per-lane concurrent-stream admission cap (#1697). Runs ONCE here, before
+        // any serve-path branch, so every delivered stream — cache hit, backend-origin
+        // miss, window pull-through miss, or buffered miss — is counted. Each same-lane
+        // stream ALREADY in flight reserves one credit-window floor of pool headroom on
+        // top of this stream's own per-path floor gate, so a lane cannot put more unpaid
+        // downstream egress in flight than its refundable-floor headroom covers.
+        //
+        // A stream's window is FIXED at admission; this never re-divides a live stream's
+        // share — it gates NEW admissions only. `n_active == 0` (the single-stream case)
+        // applies NO surcharge, so a lone stream is admitted exactly as before the cap;
+        // its own per-path floor gate is the only solvency check it faces.
+        //
+        // Checked-and-incremented under the lane lock so two simultaneous opens
+        // serialize and neither admits into the same last slot (TOCTOU → N+1). Only
+        // capability-bearing streams reach here with `known_lane` set — intake registers
+        // the lane from this request's own capability above, so concurrent first-streams
+        // on a fresh lane share one counter. `LaneSlot`'s drop releases the slot on every
+        // exit (success, `?`, disconnect, panic).
+        let mut lane_slot: Option<LaneSlot> = None;
+        if let (Some(lane), Some(status)) = (known_lane.as_ref(), pool_status) {
+            let floor = self.credit_window(VOUCHER_INTERVAL_BYTES, 0);
+            let guard = lane.lock().await;
+            let active = guard.active_streams.clone();
+            let n_active = active.load(Ordering::Relaxed);
+            let reserved = floor.saturating_mul(u64::from(n_active).saturating_add(1));
+            if n_active > 0
+                && !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb)
+            {
+                drop(guard);
+                let headroom = status
+                    .remaining
+                    .saturating_sub(self.pool_min_remaining_deposit);
+                self.log_deposit_refusal(
+                    B256::from(req.pool_id),
+                    hash,
+                    headroom,
+                    decdn_incentive::min_payment(reserved, rate_per_mb),
+                );
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::LaneAtCapacity,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
+            active.fetch_add(1, Ordering::Relaxed);
+            drop(guard);
+            lane_slot = Some(LaneSlot::new(active));
+        }
+        let _lane_slot = lane_slot;
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.

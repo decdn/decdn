@@ -8595,6 +8595,176 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     Ok(())
 }
 
+/// The hoisted per-lane admission cap (#1697) covers the window pull-through MISS
+/// path, not only the cache-hit path: a same-lane stream already in flight makes a
+/// concurrent same-lane MISS refuse with the collapsed `NotFound` wire code before
+/// it ever opens a second upstream pull.
+///
+/// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
+/// reused as the leaf channel) and same signer, dialed over two independent
+/// connections, mirroring two concurrent client streams on one payment lane.
+/// `remaining = 50` covers `min_payment(floor, RATE)` (40, `floor` = one
+/// `VOUCHER_INTERVAL_BYTES`) — enough for the first stream's own pre-flight
+/// floor-M guard inside `serve_via_window_pull_through` — but not
+/// `min_payment(2 * floor, RATE)` (80), the reserve the hoisted gate charges once
+/// a second same-lane stream sees `n_active == 1`. This is the same one-floor
+/// headroom tuning as `second_same_lane_stream_refused_when_budget_covers_one` in
+/// `client_loopback.rs`, extended to a request that MISSES locally and fills via
+/// the window-paced pull-through provider instead of a cache hit.
+///
+/// Determinism: leaf 1 is admitted and its lane slot incremented by the hoisted
+/// gate — which runs before B ever dials upstream — strictly before A's gated
+/// server observes the upstream `StreamRequest`. Waiting on `received` therefore
+/// guarantees leaf 1's slot is held before leaf 2 opens, so leaf 2 deterministically
+/// sees `n_active == 1` and is refused pre-serve (it never reaches A at all).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
+    use alloy::signers::SignerSync;
+
+    let payload = vec![0xC7u8; 4096];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA9);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
+        spawn_gated_node_a(&payload).await?;
+
+    // One lane: one leaf channel, one signer, shared by both concurrent opens.
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x8A);
+    // Tuned to admit exactly one floor's worth of reserved credit-window headroom
+    // (see the doc comment above for the arithmetic).
+    let remaining = U256::from(50u64);
+    let (handler_b, b_target, ep_b, _recorded, cache_b, _b_metrics, _local_rep, b_operator) =
+        build_node_b_with_leaves(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            &[(
+                leaf_channel_id,
+                leaf_eth.address(),
+                leaf_eth.address(),
+                remaining,
+            )],
+            0,
+            64,
+            None,
+            DEFAULT_TEST_PULL_DEADLINES,
+        )
+        .await?;
+    let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
+
+    // Leaf 1: opens the lane's only slot. Spawn it, then wait for A to observe
+    // the upstream request — proof the hoisted gate already admitted and
+    // incremented before this point.
+    let leaf1_sk = fresh_key();
+    let leaf1_node_id = B256::from(*leaf1_sk.public().as_bytes());
+    let (leaf1_ep, _) = local_endpoint(leaf1_sk, vec![]).await?;
+    let leaf1_target = b_target.clone();
+    let leaf1_eth = Arc::clone(&leaf_eth);
+    let leaf1_task = tokio::spawn(async move {
+        leaf_paced_pull(
+            &leaf1_ep,
+            leaf1_target,
+            leaf1_node_id,
+            &leaf1_eth,
+            b_operator,
+            leaf_channel_id,
+            hash,
+            RATE,
+            None,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), received.notified())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "gated upstream A never signaled `received` — leaf 1 likely never \
+                 reached the pull-through path"
+            )
+        })?;
+
+    // Leaf 2: same lane, concurrent with leaf 1 still in flight. Drive the
+    // request by hand (rather than `leaf_paced_pull`, which bails on a refusal)
+    // so the refusal itself — the collapsed `NotFound` wire code — is asserted.
+    let leaf2_sk = fresh_key();
+    let leaf2_node_id = B256::from(*leaf2_sk.public().as_bytes());
+    let (leaf2_ep, _) = local_endpoint(leaf2_sk, vec![]).await?;
+    let conn2 = leaf2_ep
+        .connect(b_target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf2 connect: {e}"))?;
+    let (mut send2, mut recv2) = conn2
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf2 open_bi: {e}"))?;
+    let binding_hash = binding_signing_hash(leaf2_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: leaf_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: leaf_channel_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x9002,
+    };
+    let payload2 =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame(&mut send2, &payload2)
+        .await
+        .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
+    let frame2 = read_frame(&mut recv2)
+        .await
+        .map_err(|e| anyhow::anyhow!("read resp: {e}"))?;
+    let (msg2, _) = decode_message::<ClientMessage>(&frame2)
+        .map_err(|e| anyhow::anyhow!("decode resp: {e}"))?;
+    let ClientMessage::StreamResponse(resp2) = msg2 else {
+        anyhow::bail!("leaf2: expected StreamResponse, got {msg2:?}");
+    };
+    anyhow::ensure!(
+        !resp2.body.ok,
+        "concurrent same-lane MISS must be refused while budget covers only one floor"
+    );
+    anyhow::ensure!(
+        matches!(resp2.error, Some(StreamError::NotFound)),
+        "expected the collapsed NotFound wire code for LaneAtCapacity, got {:?}",
+        resp2.error
+    );
+    conn2.close(0u32.into(), b"refused");
+
+    // Release A: leaf 1, the lane's admitted stream, completes and settles —
+    // proving the cap released neither wedged the lane nor blocked the admitted
+    // stream.
+    release.notify_one();
+    let out1 = leaf1_task.await??;
+    anyhow::ensure!(out1.completed, "leaf 1 delivery did not complete");
+    anyhow::ensure!(out1.hash_ok, "leaf 1 received bytes failed the hash check");
+    anyhow::ensure!(
+        cache_b.has(hash).await?,
+        "leaf 1's fill must promote the blob"
+    );
+
+    leaf2_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
 /// A resumed cache-miss request (`byte_offset > 0`) must NOT engage the fused
 /// window path: the incremental whole-blob BLAKE3 is only valid from offset 0,
 /// so the handler gates the fused serve on `req.byte_offset == 0` and falls a

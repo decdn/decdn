@@ -446,6 +446,7 @@ enum CommitOutcome {
 #[allow(clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
 
     use alloy::primitives::{Address, U256};
     use decdn_incentive::store::{PoolStateStore, StoreError};
@@ -510,6 +511,7 @@ mod tests {
         let lane = Arc::new(Mutex::new(LaneDeliveryState {
             state: seed,
             bytes_delivered_cumulative: U256::ZERO,
+            active_streams: Arc::new(AtomicU32::new(0)),
         }));
         handler
             .lanes
@@ -606,6 +608,7 @@ mod tests {
         let lane = Arc::new(Mutex::new(LaneDeliveryState {
             state: seed,
             bytes_delivered_cumulative: U256::ZERO,
+            active_streams: Arc::new(AtomicU32::new(0)),
         }));
         handler
             .lanes

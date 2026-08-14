@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -124,6 +124,41 @@ struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes delivered as of the last accepted voucher.
     bytes_delivered_cumulative: U256,
+    /// Count of same-lane streams currently admitted and delivering. The serve-path
+    /// admission gate charges each already-active stream one credit-window floor of
+    /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
+    /// as an `Arc` so the guard releases lock-free without re-taking the lane mutex.
+    active_streams: Arc<AtomicU32>,
+}
+
+/// RAII slot for one admitted same-lane stream. Created under the lane lock after
+/// the admission gate increments [`LaneDeliveryState::active_streams`]; its `Drop`
+/// decrements the same counter on every serve exit — success, error, `?`-return,
+/// client disconnect, panic — so a finished stream always frees its slot. A leaked
+/// slot would make the lane refuse new streams forever, so the count is owned by
+/// this guard, never decremented by hand.
+struct LaneSlot {
+    counter: Arc<AtomicU32>,
+}
+
+impl LaneSlot {
+    const fn new(counter: Arc<AtomicU32>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for LaneSlot {
+    fn drop(&mut self) {
+        // Saturating decrement. A slot exists only paired with a prior increment,
+        // so the counter is never 0 here today; the saturating floor keeps a future
+        // unpaired slot from underflowing `u32::MAX` and wedging the lane (every
+        // admission then refused) rather than failing safe.
+        let _ = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
 }
 
 /// Whether an insufficient-deposit `warn!` is due: `interval` has elapsed since
@@ -157,6 +192,12 @@ enum ServeRejectReason {
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
+    /// The lane already has enough concurrent same-lane streams in flight that
+    /// admitting one more would put more unpaid egress in flight than the pool's
+    /// refundable-floor headroom covers. Distinct from [`Self::InsufficientDeposit`]
+    /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire,
+    /// see [`Self::wire_error`].
+    LaneAtCapacity,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
     HashDenied,
@@ -181,27 +222,28 @@ impl ServeRejectReason {
     ///
     /// The requester side of this mapping is `decdn_client_pull::UpstreamRefused`,
     /// which recovers the wire code — and ONLY the wire code — from a refusal
-    /// (#1144). So the `NotFound` collapse is what a requester sees for all seven
+    /// (#1144). So the `NotFound` collapse is what a requester sees for all six
     /// reasons below, and the reputation consequences it draws must hold for the
     /// weakest of them. They do: it scores `NotFound` as no fault at all, and only
     /// `InternalError` as a degraded peer.
     const fn wire_error(self) -> StreamError {
         match self {
-            // `InsufficientDeposit` collapses to `NotFound` alongside the other
-            // miss reasons (#856): it must be wire-indistinguishable so a probing
-            // client cannot map out other pools' remaining balances; the
-            // distinction survives only in the per-reason metric.
-            // `RangeNotSatisfiable` collapses to `NotFound` alongside the other
-            // "won't serve this" reasons: an out-of-bounds bounded range is a
-            // client error, but signalling it as `NotFound` (rather than
-            // `InternalError`) keeps it reputation-benign — a requester scores
-            // `InternalError` as a degraded peer (#1144), and a client's own
-            // malformed range must not penalise the node for it. The distinction
-            // survives in the per-reason metric.
+            // `InsufficientDeposit` and `LaneAtCapacity` both collapse to `NotFound`
+            // alongside the other miss reasons (#856): they must be
+            // wire-indistinguishable so a probing client cannot map out a pool's
+            // remaining balances or lane concurrency state; the distinction survives
+            // only in the per-reason metric. `RangeNotSatisfiable` collapses to
+            // `NotFound` alongside the other "won't serve this" reasons: an
+            // out-of-bounds bounded range is a client error, but signalling it as
+            // `NotFound` (rather than `InternalError`) keeps it reputation-benign —
+            // a requester scores `InternalError` as a degraded peer (#1144), and a
+            // client's own malformed range must not penalise the node for it. The
+            // distinction survives in the per-reason metric.
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
+            | Self::LaneAtCapacity
             | Self::RangeNotSatisfiable => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
@@ -645,6 +687,7 @@ impl ClientHandler {
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
                     bytes_delivered_cumulative: bytes,
+                    active_streams: Arc::new(AtomicU32::new(0)),
                 })),
             );
         }
@@ -840,6 +883,7 @@ impl ClientHandler {
             Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
+                active_streams: Arc::new(AtomicU32::new(0)),
             }))
         });
         self.refresh_lane_metrics().await;
@@ -1434,6 +1478,7 @@ mod tests {
                     None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
+                active_streams: Arc::new(AtomicU32::new(0)),
             })),
         );
         handler.refresh_lane_metrics().await;
@@ -1835,6 +1880,33 @@ mod tests {
         assert!(
             handler.lanes.lock().await.contains_key(&lane_key),
             "a correct-owner capability registers its lane so vouchers can be served"
+        );
+    }
+
+    #[test]
+    fn lane_at_capacity_collapses_to_not_found() {
+        // A capacity refusal must be wire-indistinguishable from any other
+        // miss/deposit refusal so a probing client cannot detect a lane's
+        // concurrency state or map pool balances.
+        assert_eq!(
+            ServeRejectReason::LaneAtCapacity.wire_error(),
+            StreamError::NotFound
+        );
+    }
+
+    #[test]
+    fn lane_slot_decrements_counter_on_drop() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = Arc::new(AtomicU32::new(0));
+        counter.fetch_add(1, Ordering::Relaxed); // caller increments under lock
+        {
+            let _slot = LaneSlot::new(counter.clone());
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "slot must release on drop"
         );
     }
 }
