@@ -187,10 +187,9 @@ in current schema terms:
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
   and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
 
-A client does not configure the voucher cadence: it sends no `voucher_interval_mb` and follows the
-cadence the seller advertises on `cdn/client/v1`
-([ADR 003 § Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), which is
-why a client leaves the `[payment]` section unset.
+A client does not configure the payment cadence: `chunk_bytes` is a protocol constant
+([ADR 003 § Chunk Cadence](003-payments.md#chunk-cadence)), so there is nothing to send and nothing
+to negotiate, which is why a client leaves the `[payment]` section unset.
 
 The Ed25519 node key and the `peers.json` cache have no config keys of their own: both live inside
 the resolved data dir (see the tree above), so they move with `--data-dir` / `[identity] data_dir`.
