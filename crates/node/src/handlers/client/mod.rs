@@ -951,14 +951,15 @@ impl ClientHandler {
         }
     }
 
-    /// The effective downstream credit window in bytes for a stream whose
-    /// negotiated voucher interval is `interval_bytes` and whose cumulative
-    /// confirmed payment is `paid` (ADR 003 §Credit window). The window ramps
-    /// from one interval toward `credit_max` as `paid` grows, so the serve
-    /// loop's bounded credit exposure — `delivered − paid` — is at most
-    /// `paid / credit_ramp_divisor`. Floored at one interval so the loop always
-    /// makes progress; a `credit_ramp_divisor` of `0` opens the full ceiling
-    /// immediately.
+    /// The effective downstream credit window in bytes for a stream whose voucher
+    /// interval is `interval_bytes` and whose cumulative confirmed payment is
+    /// `paid` (ADR 003 §Credit window). The window ramps from one interval toward
+    /// `credit_max` as `paid` grows, so the serve loop's bounded credit exposure —
+    /// `delivered − paid` — is exactly the window: `paid / credit_ramp_divisor`
+    /// once that clears the one-interval floor, the floor itself below that point
+    /// (including at `paid == 0`), and the full `credit_max` when
+    /// `credit_ramp_divisor` is `0`. Floored at one interval so the loop always
+    /// makes progress.
     pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
         decdn_incentive::ramped_credit_window(
             self.credit_ramp_divisor,

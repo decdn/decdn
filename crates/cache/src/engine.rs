@@ -2143,9 +2143,10 @@ impl CacheEngine {
     /// verified span is imported as a **partial** blob via iroh-blobs
     /// `import_bao_bytes` — no whole-blob origin egress. The node then serves
     /// the range via `export_ranges` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
-    /// Only the actually-pulled bytes (span + outboard) count against the
-    /// ramped credit window, tightening it rather than the whole blob (ADR
-    /// 037 §"Origin-tier pull-through").
+    /// Only the actually-pulled bytes leave the origin — the range span the ramped
+    /// credit window paces, plus the small `{H}.obao4` outboard as additional
+    /// origin egress beyond that content window — not the whole blob, tightening
+    /// the node's exposure (ADR 037 §"Origin-tier pull-through").
     ///
     /// Returns [`RangePullOutcome::Served`] when the partial range is present,
     /// or [`RangePullOutcome::Unsupported`] when no origin could range-pull
@@ -2357,8 +2358,9 @@ impl CacheEngine {
             };
 
         // Meter the actually-pulled bytes (span + outboard) as origin egress —
-        // the bytes really did leave an origin. This is what ADR 037's ramped
-        // credit window counts against: the pulled side, not the whole blob.
+        // the bytes really did leave an origin. The ramped credit window paces the
+        // content span; the outboard is additional origin egress beyond it. Either
+        // way this is the pulled side, not the whole blob.
         if let Some(m) = &self.inner.metrics {
             let pulled = u64::try_from(data.len())
                 .unwrap_or(u64::MAX)

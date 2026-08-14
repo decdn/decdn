@@ -216,8 +216,10 @@ impl Pacer for WindowPacer {
 /// compose [`WindowPacer`] over a window that itself ramps with the downstream
 /// served-paid frontier, so on the fused serve-miss path the upstream pull never
 /// runs further ahead of cleared client payment than the ramped credit window
-/// allows. A non-paying client's request therefore fronts at most one interval of
-/// speculative upstream spend; the window widens only as the client pays.
+/// allows. With a nonzero divisor a non-paying client's request therefore fronts
+/// at most one interval (the floor) of speculative upstream spend, and the window
+/// widens only as the client pays; a divisor of `0` opens the full `credit_max`
+/// from the first byte, the same instant-ceiling behavior as the downstream window.
 #[derive(Debug, Clone, Copy)]
 pub struct RampPacer {
     pub divisor: u64,

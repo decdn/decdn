@@ -6,8 +6,10 @@
 /// deliver a full interval and recoup it, and capped at `credit_max`. A `divisor`
 /// of `0` opens the full `credit_max` from the first byte. The window is a pure
 /// function of this stream's own `paid` bytes, so a non-paying stream stays pinned
-/// at the floor and a paying stream ramps to the ceiling; the node's unbilled
-/// exposure is therefore at most `paid / divisor`.
+/// at the floor and a paying stream ramps to the ceiling. The node's unbilled
+/// exposure is exactly the returned window: `paid / divisor` once that clears the
+/// `floor`, the `floor` itself below that point (including at `paid == 0`), and the
+/// full `credit_max` when `divisor` is `0`.
 #[must_use]
 pub fn ramped_credit_window(divisor: u64, floor: u64, credit_max: u64, paid: u64) -> u64 {
     let ceiling = credit_max.max(floor);
