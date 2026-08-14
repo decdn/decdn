@@ -87,8 +87,6 @@ Even the worst case (1024 MB at ceiling rate) exposes $1.024 — small against t
 
 Voucher interval negotiation carries the whole per-voucher-overhead question for large blobs. A node does not also cap blob size: it admits any blob its disk budget holds ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)), because paid ingest streams to disk and the exposure a large blob creates is disk, which eviction already bounds.
 
-The payment-side exposure is bounded by the interval and the reserve, not by blob size. A node stops serving a pool at the refundable floor `M` ([Pool solvency and the refundable floor `M`](#pool-solvency-and-the-refundable-floor-m)), so a large blob cannot draw a pool past what `M` protects — the transfer stops at the floor mid-blob, like any other.
-
 ### Credit Window
 
 This section is the **delivery** credit window — unbilled egress already on the wire. It is distinct from the refundable floor `M` a node reserves against a pool's on-chain drain ([Pool solvency and the refundable floor `M`](#pool-solvency-and-the-refundable-floor-m)). This one bounds bytes delivered ahead of the next voucher; `M` bounds how far a pool may be drawn down before nodes stop serving it.
