@@ -510,7 +510,12 @@ async fn provisioned_origin(
     metrics: &Arc<Metrics>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-) -> (NodeOrigin, CacheEngine, Arc<Mutex<Vec<ProgressEntry>>>) {
+) -> (
+    NodeOrigin,
+    CacheEngine,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    tempfile::TempDir,
+) {
     provisioned_origin_with_accountant(
         ep_b,
         b_dht,
@@ -540,7 +545,12 @@ async fn provisioned_origin_with_accountant(
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-) -> (NodeOrigin, CacheEngine, Arc<Mutex<Vec<ProgressEntry>>>) {
+) -> (
+    NodeOrigin,
+    CacheEngine,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    tempfile::TempDir,
+) {
     provisioned_origin_with_deadlines(
         ep_b,
         b_dht,
@@ -590,7 +600,12 @@ async fn provisioned_origin_with_deadlines(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     (pull_timeout, stall_timeout): (Duration, Duration),
-) -> (NodeOrigin, CacheEngine, Arc<Mutex<Vec<ProgressEntry>>>) {
+) -> (
+    NodeOrigin,
+    CacheEngine,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    tempfile::TempDir,
+) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id,
@@ -600,7 +615,7 @@ async fn provisioned_origin_with_deadlines(
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, engine_tmp) = build_origin_with_timeout(
         ep_b,
         b_dht,
         hash,
@@ -615,7 +630,7 @@ async fn provisioned_origin_with_deadlines(
         0,
     )
     .await;
-    (origin, engine, recorded)
+    (origin, engine, recorded, engine_tmp)
 }
 
 /// Like [`provisioned_origin`], but the buyer enforces a `max_blob_size_bytes`
@@ -633,7 +648,7 @@ async fn provisioned_origin_with_ceiling(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     max_blob_size_bytes: u64,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id,
@@ -674,7 +689,7 @@ async fn build_origin(
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_timeout(
         ep_b,
         b_dht,
@@ -709,7 +724,7 @@ async fn build_origin_with_timeout(
     pull_timeout: Duration,
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_negative_cache(
         ep_b,
         b_dht,
@@ -752,7 +767,7 @@ async fn build_origin_with_negative_cache(
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_probe_caches(
         ep_b,
         b_dht,
@@ -810,7 +825,7 @@ async fn build_origin_with_probe_caches(
     // but the reactive-top-up tests passes — DISABLES the leg, so a fixture whose
     // channel runs dry still fails the way its test asserts.
     working_deposit: U256,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     // Providers are active stakers, matching production (a probe-cache HIT
     // re-checks `is_active`, so an empty set would make every cached provider
     // un-servable on a hit). `find_providers` still returns empty for them — no
@@ -820,7 +835,7 @@ async fn build_origin_with_probe_caches(
     let mut dir = HashMap::new();
     dir.insert(directory_namespace, providers);
 
-    let engine = throwaway_engine()
+    let (engine, engine_tmp) = throwaway_engine()
         .await
         .expect("throwaway engine for the node-origin fixture");
     let origin = NodeOrigin::new();
@@ -861,7 +876,7 @@ async fn build_origin_with_probe_caches(
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         engine: engine.clone(),
     });
-    (origin, engine)
+    (origin, engine, engine_tmp)
 }
 
 /// [`build_origin_with_timeout`] with a DETERMINISTIC ranked order, by pre-seeding
@@ -901,7 +916,7 @@ async fn build_origin_seeded_ranking(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let probe_cache = PositiveProbeCache::new();
     probe_cache.insert(
         ContentHash::from_bytes(*hash.as_bytes()),
@@ -955,12 +970,12 @@ async fn build_origin_multi_hash(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-) -> (NodeOrigin, CacheEngine) {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let mut dir = HashMap::new();
     for _h in hashes {
         dir.insert(U256::ZERO, providers.to_vec());
     }
-    let engine = throwaway_engine()
+    let (engine, engine_tmp) = throwaway_engine()
         .await
         .expect("throwaway engine for the node-origin fixture");
     let origin = NodeOrigin::new();
@@ -1006,7 +1021,7 @@ async fn build_origin_multi_hash(
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         engine: engine.clone(),
     });
-    (origin, engine)
+    (origin, engine, engine_tmp)
 }
 
 /// Convenience: a single-provider directory entry + its resolver binding.
@@ -1061,14 +1076,13 @@ fn counter_value(metrics: &Arc<Metrics>, name: &str) -> Result<u64> {
 /// admits each gap via `admit_bao_stream`, so every fixture that provisions an
 /// origin needs one, whether or not the fixture reads its contents back.
 ///
-/// The backing directory is leaked (`TempDir::keep`) rather than returned
-/// alongside the engine: the builders below thread the returned `CacheEngine`
-/// back to the caller instead, and the engine handle stays valid without its
-/// `TempDir` guard — a `CacheEngine` is an actor handle over the open store,
-/// not a borrow of the directory.
-async fn throwaway_engine() -> Result<CacheEngine> {
-    let dir = tempfile::tempdir()?.keep();
-    Ok(CacheEngine::open(&dir, vec![], 16).await?)
+/// Returns the `TempDir` guard alongside the engine: the builders below thread it
+/// through to their own caller, which binds it for the life of the test so its drop
+/// reclaims the backing directory.
+async fn throwaway_engine() -> Result<(CacheEngine, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let engine = CacheEngine::open(dir.path(), vec![], 16).await?;
+    Ok((engine, dir))
 }
 
 /// Build a cache pre-seeded with every payload in `payloads`: a one-shard
@@ -1225,7 +1239,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine, _recorded) = provisioned_origin(
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -1348,7 +1362,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([(*a_id.as_bytes(), "DE".to_string())]),
     ))));
-    let (origin, engine, recorded) = provisioned_origin_with_accountant(
+    let (origin, engine, recorded, _engine_tmp) = provisioned_origin_with_accountant(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2421,7 +2435,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     // a loaded runner's live-probe jitter could otherwise float A ahead of the staller,
     // deliver from A first, and leave the staller untried (no timeout, flake). See
     // `build_origin_seeded_ranking`.
-    let (origin, engine) = build_origin_seeded_ranking(
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2666,7 +2680,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     // real value — it is a term of the outer deadline.
     let stall_budget = Duration::from_secs(20);
     let per_candidate = Duration::from_secs(2);
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2921,7 +2935,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     // is a multiplicative term in the ranker, so a loaded runner's probe jitter could
     // otherwise float A ahead of a staller and leave it untried (only one timeout, flake).
     // See `build_origin_seeded_ranking`.
-    let (origin, _engine) = build_origin_seeded_ranking(
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3019,7 +3033,7 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     let b_id = fresh_key().public();
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
-    let (origin, _engine, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3092,7 +3106,7 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     // Provider discovered, but addr_map is EMPTY → unresolvable.
-    let (origin, _engine, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3139,7 +3153,7 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
         DhtNodeId::from_bytes(*a_id.as_bytes()),
         Address::repeat_byte(0x44),
     );
-    let (origin, _engine, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3210,7 +3224,7 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _engine, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3300,7 +3314,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _engine, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3405,7 +3419,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3564,7 +3578,7 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_seeded_ranking(
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3717,7 +3731,7 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
 
         let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
         let b_metrics = Arc::new(Metrics::new());
-        let (origin, _engine) = build_origin_seeded_ranking(
+        let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
             &ep_b,
             DhtNodeId::from_bytes(*b_id.as_bytes()),
             hash,
@@ -3829,7 +3843,7 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_seeded_ranking(
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3918,7 +3932,7 @@ async fn window_open_still_reports_an_honest_refusal_as_a_clean_miss() -> Result
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _engine, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -4079,7 +4093,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_seeded_ranking(
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -4164,7 +4178,7 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _engine, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -4683,7 +4697,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5065,7 +5079,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5163,7 +5177,7 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5286,7 +5300,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5409,7 +5423,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5538,7 +5552,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5656,7 +5670,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5769,7 +5783,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     }) as Arc<dyn PoolOpener>;
     let mut addr_map = HashMap::new();
     addr_map.insert(a_dht, a_eth.address());
-    let (origin, _engine) = build_origin_multi_hash(
+    let (origin, _engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
         b_dht,
         &[hash1, hash2],
@@ -5894,7 +5908,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6113,7 +6127,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6243,7 +6257,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6445,7 +6459,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6598,7 +6612,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_negative_cache(
+    let (origin, _engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6743,7 +6757,7 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6839,7 +6853,7 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _engine, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6960,7 +6974,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _engine) = provisioned_origin_with_ceiling(
+    let (origin, _engine, _engine_tmp) = provisioned_origin_with_ceiling(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -7093,7 +7107,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
     // `0` ceiling => unlimited blob size, so the blob gate cannot fire; the origin's
     // NodeOriginConfig.max_rate_per_mb defaults to 0, so only the probe-relative
     // bound applies — exactly what we are exercising.
-    let (origin, _engine) = provisioned_origin_with_ceiling(
+    let (origin, _engine, _engine_tmp) = provisioned_origin_with_ceiling(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -7231,7 +7245,7 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_multi_hash(
+    let (origin, engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         &[hash1, hash2],
@@ -7393,7 +7407,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin(
+    let (origin, engine, _engine_tmp) = build_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -7743,7 +7757,7 @@ async fn build_node_b_with_leaves(
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) = one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth_addr);
-    let (origin, _engine, recorded) = provisioned_origin_with_deadlines(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin_with_deadlines(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10089,7 +10103,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
 
-    let engine = throwaway_engine().await?;
+    let (engine, _engine_tmp) = throwaway_engine().await?;
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
@@ -10284,7 +10298,7 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine, _recorded) = provisioned_origin(
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10426,7 +10440,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     // A 300ms positive-cache TTL: short enough that a real sleep past it is not a
     // test-suite hazard, unlike the production 15s (anchored on `Instant`, so
     // `tokio::time::pause` cannot fast-forward it).
-    let (origin, engine) = build_origin_with_probe_caches(
+    let (origin, engine, _engine_tmp) = build_origin_with_probe_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10581,7 +10595,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     // Directory keyed ONLY under namespace NS (no `NO_NAMESPACE` entry).
-    let (origin, _engine) = build_origin_with_probe_caches(
+    let (origin, _engine, _engine_tmp) = build_origin_with_probe_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10754,7 +10768,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10938,7 +10952,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11212,7 +11226,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11371,7 +11385,7 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine, _recorded) = provisioned_origin(
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11539,7 +11553,7 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11820,7 +11834,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -12007,7 +12021,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, _engine) = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -12224,7 +12238,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let (origin, engine) = build_origin_multi_hash(
+    let (origin, engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         &[hash1, hash2],
@@ -12580,7 +12594,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     // `StaticOriginDirectory`, which cannot be mutated mid-test). A default 15s
     // positive-cache TTL keeps the fetch #1 entry live through the ejection and
     // fetch #2, so only the `is_active` re-check can drop it.
-    let engine = throwaway_engine().await?;
+    let (engine, _engine_tmp) = throwaway_engine().await?;
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
@@ -13048,6 +13062,9 @@ struct TopUpFixture {
     /// The engine the origin streams pulled bytes into — a test reads them back with
     /// `engine.get(hash)` after a fetch reports `AlreadyAdmitted`.
     engine: CacheEngine,
+    /// The engine's backing directory. Held for the fixture's lifetime so its drop does
+    /// not reclaim the store out from under an in-flight or still-inspected engine.
+    _engine_tmp: tempfile::TempDir,
     opener: Arc<FundingOpener>,
     metrics: Arc<Metrics>,
     local_rep: Arc<LocalReputation>,
@@ -13171,7 +13188,7 @@ async fn top_up_fixture_multi_rep(
     });
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, engine) = build_origin_with_probe_caches(
+    let (origin, engine, engine_tmp) = build_origin_with_probe_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -13194,6 +13211,7 @@ async fn top_up_fixture_multi_rep(
     Ok(TopUpFixture {
         origin,
         engine,
+        _engine_tmp: engine_tmp,
         opener,
         metrics,
         local_rep,
