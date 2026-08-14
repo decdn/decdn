@@ -545,32 +545,6 @@ pub struct CacheConfig {
     /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
     /// here is ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
     pub node_pull_stall_timeout_sec: Option<u64>,
-    /// Window-paced pull-through per-request pipeline window in bytes (#856, ADR
-    /// 037 `pull_ahead_bytes`). Absent =>
-    /// [`crate::config::DEFAULT_PULL_AHEAD_BYTES`] (1 MiB ≈ one voucher
-    /// interval). The serving node pulls at most this many bytes ahead of what
-    /// the requesting client has paid for, so the loss on an abandoned request
-    /// is bounded to this window rather than the whole blob. Larger keeps the
-    /// upstream pull more pipelined (higher throughput) at a larger per-request
-    /// speculative exposure. The serve loop floors the effective window at one
-    /// voucher interval so it can always make progress, so a value below one
-    /// interval (including `0`) collapses to one-interval pacing, not one chunk.
-    pub pull_ahead_bytes: Option<decdn_config_types::Bytes>,
-    /// Node-wide circuit breaker on aggregate speculative pull-through spend, in
-    /// bytes (#856, ADR 037 `max_unrecouped_leech_bytes`). Absent =>
-    /// [`crate::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES`]. When the rolling
-    /// `Σ(bytes pulled for misses) − Σ(bytes served)` reaches this, speculative
-    /// pull-through pauses and resumes as the node serves and recoups. Bounds
-    /// distributed manufactured-demand abuse in aggregate. `0` disables the
-    /// global cap (the per-request window and per-peer ratio still apply).
-    pub max_unrecouped_leech_bytes: Option<decdn_config_types::Bytes>,
-    /// Per-peer speculative-pull ceiling as a percentage of bytes served to that
-    /// peer (#856, ADR 037 `share_ratio`); `100` == 1.0×. Absent =>
-    /// [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`]. The node will not
-    /// pull more than this ratio of what it has served a peer, plus an opening
-    /// allowance of `pull_ahead_bytes`, bounding concentrated single-peer abuse.
-    /// `0` pins a peer to only the opening window.
-    pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

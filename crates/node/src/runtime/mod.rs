@@ -1130,8 +1130,6 @@ async fn build_chain_and_handlers(
     // preserved exactly.
     let mut pull_through = None;
     let mut pull_through_origin = None;
-    let mut pull_ahead_bytes = None;
-    let mut leech_governor = None;
     if cfg.cache.node_to_node_pull_through_enabled {
         // The outer deadline bounds how long a miss blocks the delivery path before
         // falling back to `NotFound`. It is *derived* from the per-candidate budget
@@ -1151,28 +1149,10 @@ async fn build_chain_and_handlers(
         pull_through = Some(outer_deadline);
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with downstream
-        // delivery (bounded by `pull_ahead_bytes`) instead of the buffered `populate`,
-        // and govern aggregate speculation with the seed-leech caps. The deposit
-        // pre-check and per-request window apply even without the governor; the
-        // governor adds the global budget + the per-peer share ratio.
+        // delivery, paced by the ramped credit window (ADR 003 §Credit window,
+        // #1669) instead of the buffered `populate`.
         if let Some(origin) = &infra.pull_through_origin {
             pull_through_origin = Some(Arc::clone(origin));
-            pull_ahead_bytes = Some(cfg.cache.pull_ahead_bytes);
-            // The resolver already enforces `pull_ahead_bytes <=
-            // max_unrecouped_leech_bytes` (with the `0`-disables carve-out), so this
-            // validated build is belt-and-suspenders — a self-contradicting pairing is
-            // a bring-up error, not a silently-degraded governor.
-            let leech_caps =
-                crate::leech_governor::LeechCaps::new(crate::leech_governor::LeechCapsConfig {
-                    max_unrecouped_leech_bytes: cfg.cache.max_unrecouped_leech_bytes,
-                    initial_allowance_bytes: cfg.cache.pull_ahead_bytes,
-                    share_ratio_percent: cfg.cache.pull_share_ratio_percent,
-                })
-                .context("invalid seed-leech caps: opening window exceeds the global budget")?;
-            leech_governor = Some(Arc::new(crate::leech_governor::LeechGovernor::new(
-                leech_caps,
-                Arc::clone(&infra.node_metrics),
-            )));
         }
     }
 
@@ -1228,7 +1208,6 @@ async fn build_chain_and_handlers(
     client_deps.local_populate = local_populate;
     client_deps.pull_through = pull_through;
     client_deps.pull_through_origin = pull_through_origin;
-    client_deps.pull_ahead_bytes = pull_ahead_bytes;
     // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
     client_deps.credit_max = cfg.payment.credit_max;
     client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
@@ -1238,7 +1217,6 @@ async fn build_chain_and_handlers(
     client_deps.voucher_commit_interval = Some(std::time::Duration::from_millis(
         cfg.payment.voucher_commit_interval_ms,
     ));
-    client_deps.leech_governor = leech_governor;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -3727,15 +3705,6 @@ mod tests {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
-                pull_ahead_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
-                ),
-                max_unrecouped_leech_bytes: decdn_cache::Bytes::new(
-                    decdn_common::config::DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-                ),
-                pull_share_ratio_percent: decdn_cache::Percent::new(
-                    decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
-                ),
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,

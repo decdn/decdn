@@ -1082,26 +1082,16 @@ pub struct DecdnMetrics {
     pub node_pull_through_errors: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// window-paced serve loop paused the upstream pull because the per-request
-    /// unrecouped frontier (`bytes pulled − bytes paid`) reached the effective
-    /// window — `pull_ahead_bytes`, floored at one voucher interval — and it waited
-    /// for the downstream voucher to clear. A high rate is benign (the window is
+    /// unrecouped frontier (`bytes pulled − bytes paid`) reached the ramped
+    /// credit window (ADR 003 §Credit window, #1669) and it waited for the
+    /// downstream voucher to clear. A high rate is benign (the window is
     /// doing its job pacing speculation); a flat zero under real pull-through
     /// traffic means the window never binds.
     pub node_pull_through_window_paused: Counter,
-    /// `decdn_node_pull_through_leech_budget_paused_total` (#856): speculative
-    /// pull-throughs refused or paused because the node-wide unrecouped-leech
-    /// budget (`max_unrecouped_leech_bytes`) was exhausted. A sustained rate means
-    /// aggregate speculative spend is hitting the operator's circuit breaker.
-    pub node_pull_through_leech_budget_paused: Counter,
-    /// `decdn_node_pull_through_share_ratio_paused_total` (#856): speculative
-    /// pull-throughs refused because a single requesting peer exceeded its
-    /// `share_ratio` ceiling (pulled-vs-served). Isolates concentrated
-    /// single-peer manufactured-demand abuse.
-    pub node_pull_through_share_ratio_paused: Counter,
     /// `decdn_node_pull_through_client_abandoned_total` (#856): window-paced
     /// serves the requesting client dropped or underpaid mid-pull, so the node
     /// aborted the upstream pull and abandoned the partial fill. The per-request
-    /// loss is bounded to `pull_ahead_bytes`; a sustained rate flags a leech.
+    /// loss is bounded to the ramped credit window; a sustained rate flags a leech.
     pub node_pull_through_client_abandoned: Counter,
     /// `decdn_node_pull_through_upstream_verify_failed_total` (#856/#915): a
     /// serve-miss pull ingested upstream bytes that failed bao verification against
@@ -2118,17 +2108,9 @@ recorders! {
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
     serve_stream_terminated_takedown => serve_stream_terminated_takedown.inc();
 
-    /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
-    /// to wait for the downstream voucher to clear (#856).
+    /// The window-paced serve loop paused the upstream pull at the ramped credit
+    /// window to wait for the downstream voucher to clear (#856, #1669).
     node_pull_through_window_paused => node_pull_through_window_paused.inc();
-
-    /// A speculative pull-through was refused/paused by the node-wide
-    /// unrecouped-leech budget (#856).
-    node_pull_through_leech_budget_paused => node_pull_through_leech_budget_paused.inc();
-
-    /// A speculative pull-through was refused because a peer exceeded its
-    /// `share_ratio` ceiling (#856).
-    node_pull_through_share_ratio_paused => node_pull_through_share_ratio_paused.inc();
 
     /// A window-paced serve was abandoned because the requesting client dropped
     /// or underpaid mid-pull (#856).

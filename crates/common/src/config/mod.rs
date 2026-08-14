@@ -279,12 +279,6 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// a total miss: 167.5 s at defaults.
 pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
-/// Default window-paced pull-through pipeline window (#856, ADR 037
-/// `pull_ahead_bytes`): 1 MiB ≈ one voucher interval. The serving node pulls at
-/// most this many bytes ahead of the requesting client's cleared payment, so an
-/// abandoned request costs at most this window of upstream spend, not the whole
-/// blob.
-pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
 /// Default downstream credit-window ceiling (ADR 003 §Credit window): 64 MiB. A
 /// stream's window ramps from one voucher interval toward this cap in proportion
 /// to what the stream has already paid; a fully-ramped high-bandwidth lane runs
@@ -332,15 +326,6 @@ pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
 /// interval. Independent of [`DEFAULT_CREDIT_MAX`]; both are set from config
 /// and floored so the window is always at least one interval.
 pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 4;
-/// Default node-wide unrecouped-leech budget (#856, ADR 037
-/// `max_unrecouped_leech_bytes`): 256 MiB. Aggregate speculative pull-through
-/// spend above this pauses until the node serves and recoups. Finite by ADR
-/// commitment; operator-tunable and modeled before locking.
-pub const DEFAULT_MAX_UNRECOUPED_LEECH_BYTES: u64 = 256 * 1024 * 1024;
-/// Default per-peer share ratio (#856, ADR 037 `share_ratio`): 400 == 4.0×. A
-/// peer may be pulled for up to 4× the bytes it has been served, plus the
-/// opening `pull_ahead_bytes` window. Bounded by ADR commitment.
-pub const DEFAULT_PULL_SHARE_RATIO_PERCENT: u64 = 400;
 
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.
 /// With the default `retained_files` this bounds the audit log to ~640 MiB
@@ -1782,43 +1767,6 @@ fn resolve_cache_into(
          upstream as stalled on the first read, scoring — and gossiping — every \
          honest peer as unreachable)",
     );
-    // Resolve the seed-leech knobs to their typed `Bytes` / `Percent` form and
-    // keep them typed through the cross-field check and `ResolvedCache`
-    // construction below, so a bytes<->percent (or bytes<->bytes) transposition
-    // inside this resolver is a compile error too.
-    let pull_ahead_bytes = file
-        .and_then(|c| c.pull_ahead_bytes)
-        .unwrap_or(decdn_config_types::Bytes::new(DEFAULT_PULL_AHEAD_BYTES));
-    let max_unrecouped_leech_bytes =
-        file.and_then(|c| c.max_unrecouped_leech_bytes)
-            .unwrap_or(decdn_config_types::Bytes::new(
-                DEFAULT_MAX_UNRECOUPED_LEECH_BYTES,
-            ));
-    let pull_share_ratio_percent =
-        file.and_then(|c| c.pull_share_ratio_percent)
-            .unwrap_or(decdn_config_types::Percent::new(
-                DEFAULT_PULL_SHARE_RATIO_PERCENT,
-            ));
-
-    // A single request's speculative pull-ahead window must fit within the
-    // node-wide unrecouped-leech budget (#856). Otherwise one request can drive
-    // the global counter past the cap before its first voucher clears, so the
-    // budget cannot accommodate even one window and every speculative serve
-    // refuses immediately. `max_unrecouped_leech_bytes == 0` disables the global
-    // cap, so the check only binds when the budget is enabled.
-    bag.check_with(
-        max_unrecouped_leech_bytes.get() == 0 || pull_ahead_bytes <= max_unrecouped_leech_bytes,
-        "cache.pull_ahead_bytes",
-        || {
-            format!(
-                "cache.pull_ahead_bytes ({pull_ahead_bytes}) must not exceed \
-                 cache.max_unrecouped_leech_bytes ({max_unrecouped_leech_bytes}): a single \
-                 request's pull-ahead window cannot be larger than the node-wide \
-                 unrecouped-leech budget"
-            )
-        },
-    );
-
     ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -1844,9 +1792,6 @@ fn resolve_cache_into(
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
-        pull_ahead_bytes,
-        max_unrecouped_leech_bytes,
-        pull_share_ratio_percent,
     }
 }
 
@@ -4505,76 +4450,6 @@ mod tests {
         anyhow::ensure!(
             msg.contains("cache.origin.path") && msg.contains("must not be empty"),
             "error lacked context: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cache_rejects_window_larger_than_leech_budget() -> anyhow::Result<()> {
-        // #856: a per-request pull-ahead window larger than the node-wide
-        // unrecouped-leech budget is rejected — one request could drive the global
-        // counter past the cap before its first voucher clears.
-        let cli = empty_cache_args();
-        let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
-            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(1024 * 1024)),
-            ..Default::default()
-        };
-        let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected window-vs-budget rejection"))?;
-        let msg = format!("{err:#}");
-        anyhow::ensure!(
-            msg.contains("cache.pull_ahead_bytes") && msg.contains("max_unrecouped_leech_bytes"),
-            "error lacked context: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cache_allows_large_window_when_global_cap_disabled() -> anyhow::Result<()> {
-        // `max_unrecouped_leech_bytes == 0` disables the global cap, so the
-        // window-vs-budget check does not bind.
-        let cli = empty_cache_args();
-        let toml = types::CacheConfig {
-            pull_ahead_bytes: Some(decdn_config_types::Bytes::new(8 * 1024 * 1024)),
-            max_unrecouped_leech_bytes: Some(decdn_config_types::Bytes::new(0)),
-            ..Default::default()
-        };
-        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
-        anyhow::ensure!(
-            resolved.pull_ahead_bytes == decdn_config_types::Bytes::new(8 * 1024 * 1024),
-            "window not preserved when the global cap is disabled"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cache_byte_percent_knobs_round_trip_from_toml() -> anyhow::Result<()> {
-        // #894: the Bytes/Percent newtypes are `#[serde(transparent)]`, so the
-        // wire form stays a bare integer and wrapping the underlying `u64` knobs
-        // in the newtypes is non-breaking. Assert a real TOML `[cache]` block deserializes the bare
-        // integers straight into the typed fields — the promise the newtypes make.
-        let file: crate::config::FileConfig = ::toml::from_str(
-            "[cache]\npull_ahead_bytes = 1048576\nmax_unrecouped_leech_bytes = 2097152\npull_share_ratio_percent = 200\n",
-        )?;
-        let cache = file
-            .cache
-            .ok_or_else(|| anyhow::anyhow!("missing [cache] section"))?;
-        anyhow::ensure!(
-            cache.pull_ahead_bytes == Some(decdn_config_types::Bytes::new(1_048_576)),
-            "pull_ahead_bytes did not round-trip: {:?}",
-            cache.pull_ahead_bytes
-        );
-        anyhow::ensure!(
-            cache.max_unrecouped_leech_bytes == Some(decdn_config_types::Bytes::new(2_097_152)),
-            "max_unrecouped_leech_bytes did not round-trip: {:?}",
-            cache.max_unrecouped_leech_bytes
-        );
-        anyhow::ensure!(
-            cache.pull_share_ratio_percent == Some(decdn_config_types::Percent::new(200)),
-            "pull_share_ratio_percent did not round-trip: {:?}",
-            cache.pull_share_ratio_percent
         );
         Ok(())
     }

@@ -6511,10 +6511,7 @@ async fn spawn_local_and_window_server(
         16,
         |deps| {
             deps.local_populate = Some(Duration::from_secs(20));
-            deps.set_window_pull_through(
-                Arc::new(decdn_node::node_origin::NodeOrigin::new()),
-                decdn_cache::Bytes::new(64 * 1024),
-            );
+            deps.pull_through_origin = Some(Arc::new(decdn_node::node_origin::NodeOrigin::new()));
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -6802,10 +6799,8 @@ async fn spawn_fault_server(
             FaultTiers::LocalOnly => deps.local_populate = Some(Duration::from_secs(20)),
             FaultTiers::LocalAndWindow => {
                 deps.local_populate = Some(Duration::from_secs(20));
-                deps.set_window_pull_through(
-                    Arc::new(decdn_node::node_origin::NodeOrigin::new()),
-                    decdn_cache::Bytes::new(64 * 1024),
-                );
+                deps.pull_through_origin =
+                    Some(Arc::new(decdn_node::node_origin::NodeOrigin::new()));
             }
             FaultTiers::Buffered => deps.pull_through = Some(Duration::from_secs(20)),
         },

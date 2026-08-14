@@ -245,16 +245,6 @@ impl ClientHandler {
         }
     }
 
-    /// Whether a speculative pull may proceed for `peer` under the seed-leech caps
-    /// (#856). Always `true` when no governor is wired. Like
-    /// [`LeechGovernor::poll_admission`](super::LeechGovernor::poll_admission) this is a stateful, advisory poll (it
-    /// touches the peer's LRU entry and does not reserve budget), not a pure read.
-    pub(super) fn leech_admit(&self, peer: &[u8; 32]) -> bool {
-        self.leech_governor
-            .as_ref()
-            .is_none_or(|g| g.poll_admission(peer))
-    }
-
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
     /// it landed in the store in the race; otherwise meters the abandoned pull and
     /// reports the miss.

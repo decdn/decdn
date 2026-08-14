@@ -404,20 +404,12 @@ impl ClientHandler {
                 // cold and served warm. Closing that needs the origin size probe
                 // to run before the floor, which is a larger change than this one.
                 //
-                // `window.rs` keeps its own guard. The honest relationship is
-                // narrower than "two separate guards": at default settings its
-                // `else` arm resolves to `max(pull_ahead, interval, credit_window)`
-                // = the credit window floor = this same floor, so it is redundant
-                // there. (Not because `DEFAULT_PULL_AHEAD_BYTES` equals one
-                // interval — it is 1 MiB against a 4 MiB default interval. The
-                // `.max(credit_window(..))` term is what makes them coincide.) It
-                // diverges once either `max_blob_size_bytes` is finite (it then
-                // reserves the whole-blob cost) or `pull_ahead_bytes` is raised
-                // above the floor — nothing validates that pair against each
-                // other. Neither direction is guaranteed stricter: a 1 MiB blob cap
-                // under a wider `pull_ahead_bytes` makes it WEAKER than this floor.
-                // It is also the tier that fronts UPSTREAM spend. Do not delete it
-                // on the strength of this floor alone.
+                // `window.rs` keeps its own guard. Its window is exactly
+                // `self.credit_window(interval_bytes, 0)` — the same ramp-floor
+                // computation this site uses — so the two guards are redundant at
+                // this floor. It is also the tier that fronts UPSTREAM spend (the
+                // pull leg's `RampPacer`, #1669, paces against the SAME ramp as it
+                // pays). Do not delete it on the strength of this floor alone.
                 //
                 // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
                 // front any fill when the pool's on-chain **remaining**
@@ -534,7 +526,6 @@ impl ClientHandler {
                                             ln,
                                             total,
                                             pool_status.map(|s| s.remaining),
-                                            fault_seen,
                                             rate_per_mb,
                                         ))
                                         .await;
@@ -608,7 +599,8 @@ impl ClientHandler {
                 // upstream cost before any downstream voucher), it runs the pull
                 // leg (fill the cache from upstream) beside the serve leg (stream
                 // the filling cache to the paying client), so the per-request
-                // speculative exposure is bounded to `pull_ahead_bytes`.
+                // speculative exposure is bounded to the ramped credit window
+                // (#1669).
                 //
                 // It requires `byte_offset == 0 && byte_len == 0` (a whole-blob
                 // request). This is a conservative constraint on the ROUTING, not a
