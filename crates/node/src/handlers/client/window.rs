@@ -93,25 +93,25 @@ impl ClientHandler {
         // The pre-flight reservation is the ramp floor — one voucher interval. In-
         // stream exposure is bounded by the ramped credit window, which the serve
         // loop and the pull-leg `RampPacer` both enforce (#1669).
-        let window = self.credit_window(interval_bytes, 0);
+        let credit_floor = self.credit_window(interval_bytes, 0);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
         // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
         // when the pool's on-chain remaining (`getPool.deposit − totalRedeemed`)
-        // minus the refundable floor `M` can no longer cover the reserved window,
+        // minus the refundable floor `M` can no longer cover the reserved floor,
         // so the node never fronts upstream USDC for a pool that cannot cover it.
         // `pool_remaining` is the cached `getPool.remaining` threaded from the
         // serve gate; `None` (no pool-view, unknown pool, or a read fault) fails
         // open — the on-chain `redeem` is the backstop.
         if let Some(remaining) = pool_remaining
-            && !self.pool_remaining_covers_window(remaining, window, rate_per_mb)
+            && !self.pool_remaining_covers_window(remaining, credit_floor, rate_per_mb)
         {
             let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
             self.log_deposit_refusal(
                 B256::from(req.pool_id),
                 hash,
                 headroom,
-                decdn_incentive::min_payment(window, rate_per_mb),
+                decdn_incentive::min_payment(credit_floor, rate_per_mb),
             );
             return self
                 .respond_error(
@@ -192,7 +192,7 @@ impl ClientHandler {
         // the captured-outboard the serve leg's coherent encoder reads, and the pull's
         // terminal signal the serve leg races so a pull that cannot fill a gap fails the
         // serve (no hang). `Notify` wakers + atomics are runtime-agnostic. `interval_bytes`
-        // and the pacing `window` were resolved with the floor-M guard above.
+        // and the pacing `credit_floor` were resolved with the floor-M guard above.
 
         // (6a) Atomically claim the fill (ADR 038): under one registry lock,
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
@@ -314,7 +314,7 @@ impl ClientHandler {
                             pull_offset,
                             pull_len,
                             credit_ramp_divisor,
-                            window,
+                            credit_floor,
                             credit_max,
                             Arc::clone(&session),
                             cancel,
@@ -367,7 +367,7 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                window,
+                credit_floor,
             )
             .await;
 
@@ -465,25 +465,25 @@ impl ClientHandler {
         // same bound the peer twin computes. In-stream exposure is bounded by the
         // ramped credit window, which the serve loop and the pull-leg `RampPacer`
         // both enforce (#1669).
-        let window = self.credit_window(interval_bytes, 0);
+        let credit_floor = self.credit_window(interval_bytes, 0);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
         // pool's on-chain remaining minus the refundable floor `M` cannot cover
-        // the reserved window. `pool_remaining` is the cached `getPool.remaining`
+        // the reserved floor. `pool_remaining` is the cached `getPool.remaining`
         // threaded from the serve gate; `None` fails open (on-chain `redeem` is
         // the backstop). The own-origin leg fronts no upstream USDC, but delivery
-        // is billed per voucher, so a pool that cannot cover the window is refused
+        // is billed per voucher, so a pool that cannot cover the floor is refused
         // here for wire-parity with the peer path rather than served for free.
         if let Some(remaining) = pool_remaining
-            && !self.pool_remaining_covers_window(remaining, window, rate_per_mb)
+            && !self.pool_remaining_covers_window(remaining, credit_floor, rate_per_mb)
         {
             let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
             self.log_deposit_refusal(
                 B256::from(req.pool_id),
                 hash,
                 headroom,
-                decdn_incentive::min_payment(window, rate_per_mb),
+                decdn_incentive::min_payment(credit_floor, rate_per_mb),
             );
             return self
                 .respond_error(
@@ -527,7 +527,7 @@ impl ClientHandler {
         // current-thread runtime, coordinating only through the `Send + Sync`
         // `FillSession` (the shared PAID frontier, the captured outboard, the pull's
         // terminal signal). #1610 — ingest only behind a waiting, paying client.
-        // `interval_bytes` and the pacing `window` were resolved with the floor-M
+        // `interval_bytes` and the pacing `credit_floor` were resolved with the floor-M
         // guard above.
 
         // (5a) Atomically claim the fill (ADR 038): under one registry lock,
@@ -604,7 +604,7 @@ impl ClientHandler {
                             pull_offset,
                             pull_len,
                             credit_ramp_divisor,
-                            window,
+                            credit_floor,
                             credit_max,
                             total_bytes,
                             Arc::clone(&session),
@@ -658,7 +658,7 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                window,
+                credit_floor,
             )
             .await;
 
