@@ -20,21 +20,27 @@ new content cannot be admitted.
 
 **Detect:**
 
-- `df -h $cache_dir` against the configured `cache.cache_dir` — this is the
-  authoritative signal today.
-- No dedicated cache-capacity metric is exported yet (the cache crate has
-  no metrics; `cache.cache_size_mb` is parsed but the engine does not
-  enforce it). Track host-level disk usage until cache instrumentation
-  lands.
+- `df -h $cache_dir` against the configured `cache.cache_dir` — the
+  host-level ground truth.
+- In-node, `decdn_cache_bytes` (current on-disk footprint) against
+  `decdn_cache_size_limit_bytes` (the configured `cache.cache_size_mb`
+  ceiling) shows headroom, and `decdn_cache_gc_bytes_reclaimed_total` shows
+  eviction keeping up. A footprint pinned at the ceiling with reclaim flat
+  means eviction is starved — confirm `cache.gc_interval_sec` is non-zero.
 - Existing alert `DecdnHighStreamErrorRate` will fire downstream once
   origin writes start to fail, but it is not capacity-specific.
 
 **Remediate:**
 
 1. Prune the cache directory manually, **or** move `cache.cache_dir` to a
-   larger volume, **or** provision more disk on the host. Raising
-   `cache.cache_size_mb` is a no-op today: the engine accepts only
-   `max_blob_size_mb` as input and performs no eviction.
+   larger volume, **or** provision more disk on the host. `cache.cache_size_mb`
+   is enforced by the eviction driver (#1173) — to make the node hold less,
+   **lower** it; raising it lets the cache grow and worsens disk pressure.
+   Enforcement is indirect: the driver releases LRU blobs and the iroh-blobs GC
+   sweep (`cache.gc_interval_sec`, default 300s) reclaims the disk, so a write
+   burst can overshoot the ceiling until a sweep catches up — and with
+   `cache.gc_interval_sec = 0` nothing is reclaimed and the ceiling is
+   unenforceable (the node warns at startup).
 2. If you moved `cache.cache_dir`, restart the node to pick up the new
    value. SIGHUP reload for live re-tune lands with
    [#236](https://github.com/decdn/decdn/issues/236); until then, restart
