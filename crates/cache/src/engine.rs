@@ -3655,6 +3655,21 @@ impl CacheEngine {
         let fetch = origin.fetch(hash, max_blob_bytes).await?;
         let (stream, size_hint) = match fetch {
             crate::origin::OriginFetch::NotFound => return Ok(PullThroughOutcome::NotFound),
+            crate::origin::OriginFetch::AlreadyAdmitted => {
+                // The origin admitted + verified the blob into the store itself
+                // (node-to-node pull, #1682). Skip the drain / import_and_verify_stream
+                // and reuse the same post-commit tail the streamed path runs.
+                return match mode {
+                    FillMode::CommitOnly => Ok(PullThroughOutcome::Committed),
+                    FillMode::ReturnBytes => match self.read_local(hash).await {
+                        Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
+                        Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
+                        Err(other) => Ok(PullThroughOutcome::Store(anyhow::Error::msg(format!(
+                            "read_local returned unexpected variant after AlreadyAdmitted: {other}"
+                        )))),
+                    },
+                };
+            }
             crate::origin::OriginFetch::Found { stream, size_hint } => (stream, size_hint),
         };
 
@@ -7120,6 +7135,125 @@ mod tests {
             0,
             "a rejected import must not tag a partial"
         );
+    }
+
+    /// An origin that admits the blob into the store itself (as the ported
+    /// `NodeOrigin` does) and returns `AlreadyAdmitted`; the engine must then
+    /// serve it from the store without re-ingesting.
+    ///
+    /// The origin needs a handle to the same `CacheEngine` it is registered
+    /// on to call `admit_bao_stream`, but `CacheEngine::open` needs the
+    /// origin list up front — so the handle is late-bound through a
+    /// `OnceLock` set right after `open` returns, mirroring how the node
+    /// wires its own origin against the engine it is constructed for.
+    #[tokio::test]
+    async fn already_admitted_short_circuits_and_serves_from_store() -> anyhow::Result<()> {
+        /// Header-less bao wire reader for [`CacheEngine::admit_bao_stream`]
+        /// in [`already_admitted_short_circuits_and_serves_from_store`].
+        struct AdmitReader(bytes::Bytes);
+        impl iroh_io::AsyncStreamReader for AdmitReader {
+            async fn read_bytes(&mut self, len: usize) -> std::io::Result<bytes::Bytes> {
+                Ok(self.0.split_to(self.0.len().min(len)))
+            }
+            async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+                if self.0.len() < L {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short",
+                    ));
+                }
+                let g = self.0.split_to(L);
+                let mut out = [0u8; L];
+                out.copy_from_slice(&g);
+                Ok(out)
+            }
+        }
+
+        /// An origin whose `fetch` admits the blob into its own engine (via
+        /// a late-bound handle — see the test doc comment) and returns
+        /// `AlreadyAdmitted`, exactly as the ported `NodeOrigin` will.
+        #[derive(Debug)]
+        struct AdmittingOrigin {
+            engine: std::sync::Arc<std::sync::OnceLock<CacheEngine>>,
+            hash: Hash,
+            total: u64,
+            wire: bytes::Bytes,
+            ranges: bao_tree::ChunkRanges,
+        }
+
+        impl Origin for AdmittingOrigin {
+            fn kind(&self) -> OriginKind {
+                OriginKind::Peer
+            }
+
+            fn fetch(
+                &self,
+                hash: Hash,
+                _max_bytes: u64,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    if hash != self.hash {
+                        return Ok(OriginFetch::NotFound);
+                    }
+                    let engine = self
+                        .engine
+                        .get()
+                        .expect("engine set by the caller right after open");
+                    engine
+                        .admit_bao_stream(
+                            self.hash,
+                            self.ranges.clone(),
+                            self.total,
+                            AdmitReader(self.wire.clone()),
+                            None,
+                        )
+                        .await
+                        .map_err(|e| crate::OriginPullError::Permanent(anyhow::Error::from(e)))?;
+                    Ok(OriginFetch::AlreadyAdmitted)
+                })
+            }
+        }
+
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 5 * group + 321;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let (hash, ranges, wire) = bao_for(root, &plaintext, outboard, 0, total, total);
+        assert!(
+            wire.len() > 8,
+            "bao_for output must carry the 8-byte header"
+        );
+        let wire = wire.slice(8..);
+
+        let engine_cell = std::sync::Arc::new(std::sync::OnceLock::<CacheEngine>::new());
+        let origin = std::sync::Arc::new(AdmittingOrigin {
+            engine: engine_cell.clone(),
+            hash,
+            total,
+            wire,
+            ranges: ranges.clone(),
+        }) as Arc<dyn Origin>;
+
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), vec![origin], 16).await?;
+        engine_cell
+            .set(engine.clone())
+            .map_err(|_| anyhow::anyhow!("engine cell already set"))?;
+
+        // populate (CommitOnly) → blob present without re-ingest.
+        engine.populate(hash).await?;
+        anyhow::ensure!(
+            engine.has(hash).await?,
+            "blob must be present after AlreadyAdmitted populate"
+        );
+        // get (ReturnBytes) → bytes read back from the store equal the content.
+        let got = engine.get(hash).await?;
+        anyhow::ensure!(
+            got.as_ref() == plaintext.as_slice(),
+            "served bytes must equal the blob"
+        );
+        Ok(())
     }
 
     #[tokio::test]

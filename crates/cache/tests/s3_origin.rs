@@ -120,6 +120,9 @@ async fn fetch_no_such_key_maps_to_not_found() -> anyhow::Result<()> {
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
         OriginFetch::Found { .. } => anyhow::bail!("expected NotFound on NoSuchKey"),
+        OriginFetch::AlreadyAdmitted => {
+            anyhow::bail!("S3Origin never admits directly; expected NotFound on NoSuchKey")
+        }
     }
 }
 
@@ -144,6 +147,9 @@ async fn fetch_bare_http_404_maps_to_not_found() -> anyhow::Result<()> {
     match origin.fetch(hash, 16 * 1024 * 1024).await? {
         OriginFetch::NotFound => Ok(()),
         OriginFetch::Found { .. } => anyhow::bail!("expected NotFound on HTTP 404"),
+        OriginFetch::AlreadyAdmitted => {
+            anyhow::bail!("S3Origin never admits directly; expected NotFound on HTTP 404")
+        }
     }
 }
 
@@ -179,6 +185,9 @@ async fn fetch_404_with_no_such_bucket_is_permanent_not_not_found() -> anyhow::R
              instead of the real config error. fix in classify_get_object_error."
         ),
         Ok(OriginFetch::Found { .. }) => anyhow::bail!("expected error, got Found"),
+        Ok(OriginFetch::AlreadyAdmitted) => {
+            anyhow::bail!("S3Origin never admits directly; expected error, got AlreadyAdmitted")
+        }
         Err(err) => {
             anyhow::ensure!(
                 matches!(err, OriginPullError::Permanent(_)),

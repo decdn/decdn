@@ -131,6 +131,12 @@ pub enum OriginFetch {
     },
     /// The origin reported the object does not exist (e.g. HTTP 404).
     NotFound,
+    /// The origin streamed this blob into the store itself, verifying each chunk
+    /// group against the rooted hash via [`crate::CacheEngine::admit_bao_stream`], and it
+    /// is present. The engine does not re-ingest: it reads the committed blob back
+    /// for a `ReturnBytes` caller and reports `Committed` for a fill. The
+    /// node-to-node pull uses this so a whole blob never lands in RAM.
+    AlreadyAdmitted,
 }
 
 impl std::fmt::Debug for OriginFetch {
@@ -141,6 +147,7 @@ impl std::fmt::Debug for OriginFetch {
                 .field("size_hint", size_hint)
                 .finish_non_exhaustive(),
             Self::NotFound => f.write_str("NotFound"),
+            Self::AlreadyAdmitted => f.write_str("AlreadyAdmitted"),
         }
     }
 }
@@ -161,11 +168,13 @@ impl OriginFetch {
         }
     }
 
-    /// Drain the stream into a single [`Bytes`]. Returns `Ok(None)`
-    /// for `NotFound`, `Ok(Some(bytes))` for `Found`. Used by tests
-    /// and other helpers that need the full payload as a contiguous
-    /// buffer; the cache pull-through path goes through `add_stream`
-    /// directly and never collects.
+    /// Drain the stream into a single [`Bytes`]. Returns `Ok(None)` for
+    /// `NotFound` or `AlreadyAdmitted` (neither carries a stream to drain —
+    /// a direct-admit origin's caller reads the blob back from the store
+    /// instead), `Ok(Some(bytes))` for `Found`. Used by tests and other
+    /// helpers that need the full payload as a contiguous buffer; the cache
+    /// pull-through path goes through `add_stream` directly and never
+    /// collects.
     ///
     /// The initial allocation is capped at 1 MiB regardless of
     /// `size_hint` so a hostile origin advertising a multi-TiB
@@ -187,7 +196,7 @@ impl OriginFetch {
         use bytes::BytesMut;
         use futures_util::StreamExt;
         match self {
-            Self::NotFound => Ok(None),
+            Self::NotFound | Self::AlreadyAdmitted => Ok(None),
             Self::Found {
                 mut stream,
                 size_hint,

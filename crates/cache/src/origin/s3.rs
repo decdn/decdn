@@ -789,7 +789,13 @@ impl Origin for S3Origin {
                 // read — degrade rather than error (whole-blob pull surfaces
                 // the real `NotFound`).
                 Err(e) => match classify_get_object_error(e, &log_target)? {
-                    OriginFetch::NotFound | OriginFetch::Found { .. } => {
+                    // `classify_get_object_error` only ever produces
+                    // `NotFound` for an `Err` input; `Found` and
+                    // `AlreadyAdmitted` are present only to satisfy
+                    // exhaustiveness.
+                    OriginFetch::NotFound
+                    | OriginFetch::Found { .. }
+                    | OriginFetch::AlreadyAdmitted => {
                         return Ok(OriginRangeFetch::Unsupported);
                     }
                 },
@@ -850,9 +856,11 @@ impl Origin for S3Origin {
                     // that doesn't publish `{H}.obao4`.
                     OriginFetch::NotFound => return Ok(OutboardFetch::NotFound),
                     // `classify_get_object_error` never actually produces
-                    // this arm for an `Err` input; only present to satisfy
+                    // these arms for an `Err` input; only present to satisfy
                     // exhaustiveness (mirrors `get_object_bounded`).
-                    OriginFetch::Found { .. } => return Ok(OutboardFetch::Unsupported),
+                    OriginFetch::Found { .. } | OriginFetch::AlreadyAdmitted => {
+                        return Ok(OutboardFetch::Unsupported);
+                    }
                 },
             };
             if let Some(len) = resp.content_length()
@@ -929,8 +937,14 @@ impl S3Origin {
             Ok(r) => r,
             Err(e) => match classify_get_object_error(e, &log_target)? {
                 // Missing outboard → degrade (the expected path for origins
-                // that don't publish `{H}.obao4`).
-                OriginFetch::NotFound | OriginFetch::Found { .. } => return Ok(None),
+                // that don't publish `{H}.obao4`). `Found` and
+                // `AlreadyAdmitted` never occur here; present only to
+                // satisfy exhaustiveness.
+                OriginFetch::NotFound
+                | OriginFetch::Found { .. }
+                | OriginFetch::AlreadyAdmitted => {
+                    return Ok(None);
+                }
             },
         };
         if let Some(len) = resp.content_length()
