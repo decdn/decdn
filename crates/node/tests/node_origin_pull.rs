@@ -12912,7 +12912,7 @@ async fn serve_with_deposit_ceiling(
     // Serve the RESUME leg (`byte_offset > 0`) slowly, AFTER the response is on the
     // wire so the delay lands in the chunk stream (`pull_to_sink`), not the open. The
     // paid-wait accounting must count this as the upstream serving bytes, not as our
-    // funding wait: it is the exact time `PulledBlob::paid_wait` must NOT absorb
+    // funding wait — it must not be charged against the delivery-speed elapsed clock
     // (#1602). Zero for every test but the delivery-speed regression.
     if req.byte_offset > 0 && !resume_delay.is_zero() {
         tokio::time::sleep(resume_delay).await;
@@ -13611,9 +13611,9 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 ///
 /// Concurrency makes the interleaving nondeterministic, so this cannot pin WHICH
 /// pull exhausts first — but with the clamp both orderings succeed, and without it
-/// the overshoot ordering corrupts, which is what a regression run trips on. The
-/// deterministic pin of the clamp itself is
-/// `resume::tests::a_concurrent_pulls_vouchers_cannot_push_the_frontier_past_decoded_bytes`.
+/// the overshoot ordering corrupts, which is what a regression run trips on. This is
+/// the deterministic pin of the `delivered_frontier` clamp in
+/// `decdn_client_pull::driver::drive`.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Result<()> {
     let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 3 + 777;
@@ -13680,11 +13680,13 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
 
 /// The reactive top-up is bounded at ONE per pull, over the wire (#1600 review).
 ///
-/// The pure policy is pinned by `resume::tests::reactive_topups_are_bounded`; this
-/// pins the WIRING — the `topups += 1` the loop performs after a landed top-up.
-/// Removing that increment is currently invisible to every other test, because the
-/// funding double is idempotent against its target (a second call at the same
-/// target adds nothing, so `fund` reports no headroom and the loop stops anyway).
+/// The pure policy — refusing once `topups_used == max_topups` — is pinned in
+/// `decdn_client_pull::pacer`'s own unit tests; this pins the WIRING — the
+/// `topups_used` increment [`decdn_client_pull::driver::drive`] performs after a
+/// landed top-up. Removing that increment is currently invisible to every other
+/// test, because the funding double is idempotent against its target (a second call
+/// at the same target adds nothing, so the funder reports no headroom and the loop
+/// stops anyway).
 /// Here the working deposit is deliberately still too small for the blob, so a loop
 /// that did not count would keep funding-and-failing rather than ending after one.
 #[tokio::test(flavor = "multi_thread")]

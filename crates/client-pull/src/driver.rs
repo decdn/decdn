@@ -41,7 +41,8 @@
 //!   [`WatermarkBundle`](decdn_protocol::client::WatermarkBundle) that ADVANCES
 //!   our committed watermark is a healable desync — the driver reseeds the ledger
 //!   ([`PoolLedger::reseed`]) and retries. This is driver-owned, NOT a
-//!   [`PaceDecision`], exactly as `node_origin::resume::decide` orders it.
+//!   [`PaceDecision`] — the reseed check runs ahead of pacing, the same ordering
+//!   the node's own miss-pull policy uses.
 //!
 //! # What is deliberately NOT here (deferred to A5 / the CLI)
 //!
@@ -398,9 +399,8 @@ where
         // gap `Done` (or trips the `paid_frontier >= gap_end` spin-guard in the Draw
         // arm) before the bytes are in the store, so `drive` returns `Ok` with the
         // blob incomplete and never finalizes it: success for a blob that is not
-        // there. Clamping to `delivered_frontier` restores the
-        // `.min(resume_offset(decoded_len))` guard the pre-drive resume loop held
-        // (`resume.rs::resume_frontier`). On a solo pull and the whole client path
+        // there. Clamping to `delivered_frontier` is the same guard against that
+        // overshoot every resumable pull needs. On a solo pull and the whole client path
         // delivery runs AHEAD of payment (ADR 003's credit window), so
         // `delivered_frontier >= paid_frontier` and the clamp is a NO-OP — resume
         // still starts at the true paid frontier and the delivered-but-unpaid tail is

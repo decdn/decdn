@@ -58,7 +58,7 @@ use tracing::debug;
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
-use super::resume::{SETTLE_POLL_STEP, settle_wait_budget};
+use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::{
     NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleOnDrop, bind_upstream_ctx,
     cached_candidates, classify_pull_failure, discover, lane_ledger, now_micros, probe_and_rank,

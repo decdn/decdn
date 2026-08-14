@@ -4,7 +4,7 @@
 //! fetch's budget state ([`PaceState`]), may the driver draw the next paid
 //! segment, must it top up, wait, stop, or refuse? It is a total function of the
 //! snapshot — **no I/O, no async** — so the policy is unit-testable in isolation,
-//! exactly like the node's `node_origin::resume::decide`.
+//! independent of any network or chain fixture.
 //!
 //! [`BudgetPacer`] is the client policy: it gates on the buyer's OWN deposit
 //! (order-free — it never waits on the counterparty's state) and folds in the

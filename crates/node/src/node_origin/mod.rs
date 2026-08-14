@@ -45,7 +45,6 @@ mod admit_store;
 mod backend_source;
 mod funder;
 mod pull_leg;
-mod resume;
 
 pub(crate) use admit_store::NodeAdmitStore;
 #[allow(
@@ -54,13 +53,13 @@ pub(crate) use admit_store::NodeAdmitStore;
 )]
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
+use funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use pull_leg::ABANDON_DRAIN;
 #[allow(
     unused_imports,
     reason = "wired by the own-origin serve-miss orchestration"
 )]
 pub(crate) use pull_leg::{PullLegTarget, run_local_pull_leg, run_pull_leg};
-use resume::{SETTLE_POLL_STEP, settle_wait_budget};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -290,7 +289,7 @@ pub struct NodeOriginConfig {
     ///
     /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
     /// network runs the same default cadence and this is the only local reading of
-    /// it we have. See `resume::settle_wait_budget`.
+    /// it we have. See `funder::settle_wait_budget`.
     pub event_poll_interval: Duration,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
