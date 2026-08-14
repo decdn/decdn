@@ -1358,6 +1358,34 @@ impl StalledDelivery {
         }
         Ok((Instant::now(), settled))
     }
+
+    /// Sign and send a voucher carrying an explicit cumulative
+    /// `(bytes_delivered, amount)`, then read and return the node's next message.
+    /// Unlike [`Self::pay_and_finish`] this hands the caller an arbitrary
+    /// watermark, so a test can inject a malformed or out-of-order voucher and
+    /// assert how the node rejects it.
+    async fn send_cumulative_voucher(
+        &mut self,
+        signer: &PrivateKeySigner,
+        bytes_delivered: u64,
+        amount: U256,
+    ) -> anyhow::Result<ClientMessage> {
+        let voucher = Voucher {
+            pool_id: pool_id(),
+            signer: signer.address(),
+            provider: operator_addr(),
+            amount,
+            bytes_delivered: U256::from(bytes_delivered),
+        }
+        .sign(signer, &payment_domain())
+        .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+        write_client_msg(
+            &mut self.send,
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+        )
+        .await?;
+        read_client_msg(&mut self.recv).await
+    }
 }
 
 /// Assert `err` is the handler's graceful app-layer idle close: `APP_ERR_NO_ERROR`
@@ -1812,6 +1840,108 @@ async fn concurrent_same_lane_streams_aggregate_across_the_voucher_interval() ->
         only.last_amount(),
         after_a.amount,
     );
+
+    client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
+/// The current limitation that motivates the self-describing-voucher follow-up:
+/// a SKIP-AHEAD voucher — one whose cumulative `bytes_delivered` assumes another
+/// same-lane stream's bytes are already settled, sent before that stream is paid
+/// — is rejected. The node reconstructs a voucher's cumulative bytes from the
+/// shared lane counter plus THIS stream's delivered delta (see
+/// `voucher.rs::verify_voucher`), so a voucher signed over a larger cumulative
+/// than the node has delivered on the lane recovers a different address than it
+/// was signed under and comes back as `VoucherRejected { WrongSigner }` (the
+/// signature is well-formed — it just no longer recovers the lane's pinned
+/// signer against the reconstructed watermark). This is why a client with
+/// concurrent same-lane streams must serialize its voucher signing rather than
+/// pay out of order. Enabling concurrent (skip-ahead) settlement is a deliberate
+/// protocol change that must flip this test — with the accompanying footguns in
+/// view (per-hash receipts, `paid ≤ delivered` clamp, rate re-derivation,
+/// single-signer, coalescing frontier guards).
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_ahead_voucher_on_a_concurrent_lane_is_rejected() -> anyhow::Result<()> {
+    // Both blobs sit under one voucher interval, so each stream has a single
+    // closing voucher; their sizes differ so a skip-ahead cumulative cannot
+    // coincidentally match the reconstructed per-stream value.
+    let payload_a = vec![0x71u8; 512 * 1024];
+    let payload_b = vec![0x82u8; 384 * 1024];
+    let idle = Duration::from_secs(30);
+    let fx = idle_fixture_with_two_blobs(&payload_a, &payload_b, idle).await?;
+    let blob_a = fx.blob(0)?;
+    let blob_b = fx.blob(1)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+
+    // Both streams deliver fully and park at their closing voucher; nothing is
+    // paid yet, so the shared lane counter is still 0. Stream A is left parked
+    // (never paid) for the whole test — its bytes are exactly what B's skip-ahead
+    // voucher wrongly assumes are already on the lane.
+    let _stalled_a = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_a.hash.as_bytes(),
+        blob_a.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+    let mut stalled_b = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_b.hash.as_bytes(),
+        blob_b.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+
+    // On stream B, pay a voucher that SKIPS AHEAD: its cumulative bytes/amount
+    // assume A's bytes are already on the lane. But A has not been paid, so the
+    // node reconstructs B's cumulative as `0 + wire_b`, not `wire_a + wire_b`, and
+    // the signature — made over the larger total — recovers a different address
+    // than the lane's pinned signer.
+    let skip_ahead_bytes = blob_a
+        .wire_bytes
+        .checked_add(blob_b.wire_bytes)
+        .ok_or_else(|| anyhow::anyhow!("skip-ahead wire-byte overflow"))?;
+    let skip_ahead_amount = min_payment(blob_a.wire_bytes, RATE_PER_MB)
+        .checked_add(min_payment(blob_b.wire_bytes, RATE_PER_MB))
+        .ok_or_else(|| anyhow::anyhow!("skip-ahead amount overflow"))?;
+
+    let reply = stalled_b
+        .send_cumulative_voucher(&fx.client_signer, skip_ahead_bytes, skip_ahead_amount)
+        .await?;
+    match reply {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+            ..
+        }) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::WrongSigner,
+                "a skip-ahead voucher must be rejected as WrongSigner, got {reason:?}"
+            );
+        }
+        other => anyhow::bail!(
+            "expected VoucherRejected {{ WrongSigner }} for a skip-ahead voucher, got {other:?}"
+        ),
+    }
+
+    // The rejected voucher never advanced the lane: the persisted watermark stays
+    // at the seed (zero).
+    let persisted = fx.store.load_all()?;
+    if let Some(only) = persisted.first() {
+        anyhow::ensure!(
+            only.last_bytes_delivered() == U256::ZERO,
+            "a rejected skip-ahead voucher must not advance the lane watermark, got {}",
+            only.last_bytes_delivered(),
+        );
+    }
 
     client_ep.close().await;
     fx.server_ep.close().await;
