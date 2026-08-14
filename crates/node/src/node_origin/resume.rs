@@ -302,6 +302,7 @@ fn is_cap_exhausted(err: &anyhow::Error) -> bool {
 
 /// Who we are pulling from. Bundled because the four identifiers travel together
 /// through every stage of the loop and none of them changes across a resume.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PullTarget<'a> {
     /// The candidate's iroh identity, for dialling and for scoring.
@@ -341,6 +342,7 @@ struct LegAnchor {
 }
 
 /// A completed resumable pull: the blob, and the wall clock spent NOT pulling it.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 pub(super) struct PulledBlob {
     /// The decoded content, verified per chunk group as it landed.
     pub bytes: Vec<u8>,
@@ -368,6 +370,7 @@ pub(super) struct PulledBlob {
 /// only a RESUMABLE pull can produce, [`ResumeOffsetPastEnd`] (#1530), for which
 /// `pull_verdict` gained an arm classifying it as our own fault rather than the
 /// peer's.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 pub(super) async fn pull_blob(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
@@ -501,6 +504,7 @@ impl LoopState {
 /// # Errors
 ///
 /// The open's or the stream's error, typed for the classifier.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 async fn stream_leg(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
@@ -565,6 +569,7 @@ async fn stream_leg(
 ///
 /// Split out so the caller reads as a loop rather than as an argument list: the only
 /// thing that varies between legs is the offset.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 async fn open_leg(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,
@@ -612,6 +617,7 @@ async fn open_leg(
 /// resumed leg actually has more headroom than the one that just exhausted — the
 /// only question the loop needs answered, since retrying without it would exhaust at
 /// the same offset.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 async fn fund(
     deps: &NodeOriginDeps,
     provider_addr: Address,
@@ -658,6 +664,7 @@ async fn fund(
 /// Fund the exhausted channel and move the resume offset to this leg's paid
 /// frontier. `false` when no headroom was added, in which case retrying at the same
 /// offset would exhaust identically and the caller must end the pull.
+#[allow(dead_code, reason = "removed in the resume-loop deletion task")]
 async fn top_up_and_reanchor(
     deps: &NodeOriginDeps,
     target: PullTarget<'_>,

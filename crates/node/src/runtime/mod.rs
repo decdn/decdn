@@ -1901,6 +1901,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let region_accountant_c = Arc::clone(&ch.region_accountant);
     let node_metrics_for_buyer = Arc::clone(&infra.node_metrics);
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
+    let node_origin_engine = infra.cache.clone();
     let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
     let payment_pool_addr_for_buyer = ch.payment_pool_addr;
     tasks.spawn(async move {
@@ -1984,6 +1985,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     wedged_providers: Arc::new(std::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
+                    engine: node_origin_engine.clone(),
                 });
                 tracing::info!(
                     "node-to-node cache-miss pull-through provisioned and enabled (#831)"

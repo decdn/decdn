@@ -12,23 +12,23 @@
 //!    with the origin-directory fallback),
 //! 2. probes each candidate for rate + RTT and ranks them by the combined
 //!    local+network reputation score ([`crate::selection::rank_candidates`]),
-//! 3. opens (or reuses) a buyer payment channel to the best candidate and pulls
-//!    progressively (`resume::pull_blob`, #1530 — resumable, so a channel that
-//!    runs dry mid-blob is topped up and the pull continues at the paid frontier),
-//!    falling back through up to [`crate::selection::MAX_PROVIDER_ATTEMPTS`]
-//!    providers,
+//! 3. opens (or reuses) a buyer payment channel to the best candidate and streams
+//!    the whole blob straight into the local cache via the gap-driven
+//!    [`decdn_client_pull::drive`] loop (#1682 — resumable, so a channel that
+//!    runs dry mid-blob is topped up and the pull continues at the paid frontier;
+//!    no whole-blob buffer is ever held in RAM), falling back through up to
+//!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
 //! 4. records the per-provider [`Outcome`] into the local reputation score and
 //!    the observation buffer, so the gossip publisher emits reports about the
 //!    upstreams this node pulled from (ADR 008 §Local Score / §Gossip Protocol).
 //!
-//! The cache engine verifies the returned bytes against the content hash and
-//! ingests them, and the pull's incremental decoder verifies every chunk group of
-//! the bao verified-stream against the content root as it lands (ADR 038, via
-//! `pull_to_sink`), so a dishonest provider
-//! is detected (and scored [`Outcome::Corruption`]) rather than surfaced to the
-//! caller. On the window path the corruption detector is the cache TEE's
-//! verifying decoder; its verdict reaches the scorer via
-//! [`NodeProgressivePull::finish`]'s [`TeeVerdict`] / `abandon_corrupt` (#915).
+//! Every chunk group of the bao verified-stream is verified against the content
+//! root as it lands and admitted straight into the cache (ADR 038, via
+//! `admit_bao_stream`), so a dishonest provider is detected (and scored
+//! [`Outcome::Corruption`]) rather than surfaced to the caller. On the window
+//! path the corruption detector is the cache TEE's verifying decoder; its
+//! verdict reaches the scorer via [`NodeProgressivePull::finish`]'s
+//! [`TeeVerdict`] / `abandon_corrupt` (#915).
 //!
 //! # Deferred initialisation
 //!
@@ -47,20 +47,19 @@ mod funder;
 mod pull_leg;
 mod resume;
 
-#[allow(unused_imports, reason = "wired by the serve-miss pull driver")]
 pub(crate) use admit_store::NodeAdmitStore;
 #[allow(
     unused_imports,
     reason = "wired by the own-origin serve-miss orchestration"
 )]
 pub(crate) use backend_source::BackendSource;
-#[allow(unused_imports, reason = "wired by the serve-miss pull driver")]
 pub(crate) use funder::NodeFunder;
 #[allow(
     unused_imports,
     reason = "wired by the own-origin serve-miss orchestration"
 )]
 pub(crate) use pull_leg::{PullLegTarget, run_local_pull_leg, run_pull_leg};
+use resume::{SETTLE_POLL_STEP, settle_wait_budget};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -73,6 +72,8 @@ use alloy::primitives::{Address, B256, U256};
 use bytes::Bytes;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
+use decdn_client_pull::driver::DriveConfig;
+use decdn_client_pull::{BudgetPacer, PeerSource, drive};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tracing::{debug, warn};
@@ -80,6 +81,7 @@ use tracing::{debug, warn};
 use decdn_reputation::{LocalReputation, Outcome};
 
 use decdn_incentive::PoolOpenFailureReason;
+use decdn_protocol::client::NO_NAMESPACE;
 
 use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
@@ -398,6 +400,10 @@ pub struct NodeOriginDeps {
     /// wedged provider for ALL hashes, not just the one that wedged it. In-memory: on
     /// restart the first miss re-wedges and re-suppresses within one pull.
     pub wedged_providers: Arc<Mutex<HashMap<DhtNodeId, u64>>>,
+    /// The cache engine this origin admits into. Set at `provision`, after the
+    /// engine exists. The node-to-node pull streams straight into it via
+    /// `admit_bao_stream`, so a whole blob never lands in RAM (#1682).
+    pub engine: decdn_cache::CacheEngine,
 }
 
 impl std::fmt::Debug for NodeOriginDeps {
@@ -680,8 +686,8 @@ impl NodeOrigin {
         // (→ `open_stream`, #1134): a candidate that accepts the connection and then goes
         // quiet during the handshake / verified response is cut off at `deadlines.open`,
         // which emits a typed `PullTimeout { after: deadlines.open }`. That is the SOLE
-        // per-candidate open bound — the buffered path (`resume::pull_blob`, below) drives
-        // each of its opens the same way with no outer wrap. We used to add a second, redundant
+        // per-candidate open bound — the header handshake in `pull_from_candidate` (below)
+        // opens the same way with no outer wrap. We used to add a second, redundant
         // `tokio::time::timeout(pull_timeout, …)` wrap here (belt-and-braces); it is dropped
         // (#1147) because both clocks were sourced from `pull_timeout`, so the double-bound
         // did nothing but risk drift — an open-specific timeout knob could make a candidate
@@ -803,9 +809,9 @@ pub enum TeeVerdict {
 ///
 /// # No reactive top-up here, deliberately (#1530)
 ///
-/// The buffered miss pull resumes across a mid-pull deposit top-up
-/// (`resume::pull_blob`); this path does not, and the asymmetry is structural
-/// rather than an oversight.
+/// The populate-path miss pull resumes across a mid-pull deposit top-up
+/// (`pull_from_candidate`'s gap-driven `drive` loop); this path does not, and the
+/// asymmetry is structural rather than an oversight.
 ///
 /// The downstream client already holds a signed `StreamResponse { ok: true }` and is
 /// being fed a single continuous stream. Re-opening upstream at `byte_offset > 0`
@@ -1073,7 +1079,7 @@ impl Origin for NodeOrigin {
                 attempt_metered = true;
                 let outcome = try_pull(deps, &cached, hash_bytes, budget).await;
                 match outcome.payload {
-                    Ok(bytes) => return Ok(OriginFetch::found_one_shot(bytes)),
+                    Ok(()) => return Ok(OriginFetch::AlreadyAdmitted),
                     Err(failed) => miss = miss.or(failed),
                 }
                 budget = budget.saturating_sub(outcome.attempts);
@@ -1126,7 +1132,7 @@ impl Origin for NodeOrigin {
             // Writes the probe cache at its tail.
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
             match try_pull(deps, &ranked, hash_bytes, budget).await.payload {
-                Ok(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
+                Ok(()) => Ok(OriginFetch::AlreadyAdmitted),
                 Err(failed) => miss_answer(miss.or(failed)),
             }
         })
@@ -1613,15 +1619,15 @@ async fn try_pull(
     ranked: &[Candidate],
     hash_bytes: [u8; 32],
     budget: usize,
-) -> PullOutcome<Bytes> {
+) -> PullOutcome<()> {
     let mut attempts = 0;
     let mut miss = PullMiss::Clean;
     for candidate in ranked.iter().take(budget) {
         attempts += 1;
         match pull_from_candidate(deps, candidate, hash_bytes).await {
-            Ok(bytes) => {
+            Ok(()) => {
                 return PullOutcome {
-                    payload: Ok(bytes),
+                    payload: Ok(()),
                     attempts,
                 };
             }
@@ -1685,10 +1691,12 @@ fn lane_ledger(
 }
 
 /// Attempt a single paid pull from one candidate: resolve its operator address,
-/// open/reuse a buyer channel, run the resumable pull (`resume::pull_blob`), and
-/// record the reputation outcome. Returns the bytes on success, otherwise the
-/// [`PullMiss`] this failure is (try the next candidate either way — a local fault
-/// latches, it does not abort the walk, #1560).
+/// open/reuse a buyer channel, and stream the whole blob into `deps.engine` via
+/// the gap-driven [`drive`] loop, recording the reputation outcome. On success
+/// the blob is admitted and durable in the store — no whole-blob buffer is ever
+/// held in RAM (#1682). Returns the [`PullMiss`] this failure is on a miss (try
+/// the next candidate either way — a local fault latches, it does not abort the
+/// walk, #1560).
 // Sequential resolve → open → fetch → classify pipeline; the tracing macros and
 // the success/failure classification inflate the cognitive-complexity + line
 // metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
@@ -1698,7 +1706,7 @@ async fn pull_from_candidate(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
     hash_bytes: [u8; 32],
-) -> Result<Bytes, PullMiss> {
+) -> Result<(), PullMiss> {
     let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
         return Err(PullMiss::Clean);
     };
@@ -1731,7 +1739,7 @@ async fn pull_from_candidate(
         }
     };
     // #1117: bind the request so the upstream can chain a reactive pull.
-    let mut ctx = match bind_upstream_ctx(deps, ctx) {
+    let ctx = match bind_upstream_ctx(deps, ctx) {
         Ok(ctx) => ctx,
         Err(err) => {
             // As on the window path: our signing fault, metered as ours, peer unscored.
@@ -1792,65 +1800,169 @@ async fn pull_from_candidate(
     // continues (#1610 removed the detached warm). So "no hard cap here" does not mean
     // "a client can wait forever".
     let _stream_guard = deps.metrics.outbound_stream_guard();
-    // `ctx` is `&mut` from here on: a landed reactive top-up raises `ctx.deposit`, and
-    // the resumed leg's headroom arithmetic — which decides whether the NEXT rejection
-    // is genuine exhaustion or an upstream lying — reads it (#1530).
-    let result = resume::pull_blob(
-        deps,
-        resume::PullTarget {
-            pk,
-            provider_addr,
-            candidate,
-            hash_bytes,
-        },
-        &mut ctx,
-        &ledger,
+
+    // Header handshake: a free whole-tail open to read the committed `total_bytes`,
+    // then abort — no bytes pulled, no voucher. `NO_NAMESPACE`, as this hash-only
+    // populate path carries no served-client namespace.
+    let rate_ceiling = effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb);
+    let (header, probe) = match open_progressive_upstream(
+        &deps.endpoint,
+        EndpointAddr::new(pk),
+        &ctx,
+        Arc::clone(&ledger),
+        &deps.slash_domain,
+        provider_addr,
+        hash_bytes,
+        NO_NAMESPACE,
+        0,
+        now_micros(),
+        deps.config.max_blob_size_bytes,
+        rate_ceiling,
         deadlines,
+        0,
     )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            drop(settle);
+            let verdict =
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(ctx.pool_id), &err);
+            return Err(PullMiss::for_verdict(verdict));
+        }
+    };
+    let total_bytes = header.total_bytes;
+    let _ = probe.abort();
+
+    // Run `drive()` on a dedicated blocking-pool thread with its own current-thread
+    // runtime, exactly as the window-paced serve-miss pull leg does
+    // (`handlers::client::window`). `drive`'s future is non-`Send` categorically —
+    // `IngestStore::ingest_stream` is a return-position-impl-trait-in-trait with no
+    // `Send` bound, for any `R: BaoRangeReader` (see
+    // `decdn_client_pull::source::IngestStore`'s docs) — which `Origin::fetch`'s
+    // `+ Send` trait bound forbids inline. Every axis is therefore captured OWNED:
+    // no `FillSession` (no serve leg reads beside a populate) and no window/leech
+    // pacer (this tier has no downstream paid frontier to pace against — it pulls
+    // the whole blob, as the buffered loop did).
+    let hash = Hash::from(hash_bytes);
+    let endpoint = deps.endpoint.clone();
+    let slash_domain = deps.slash_domain.clone();
+    let engine = deps.engine.clone();
+    let buyer = Arc::clone(&deps.buyer);
+    let metrics = Arc::clone(&deps.metrics);
+    let ledger_for_drive = Arc::clone(&ledger);
+    let max_blob_size_bytes = deps.config.max_blob_size_bytes;
+    let drive_config = DriveConfig {
+        working_deposit: deps.config.working_deposit,
+        max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
+        settle_backoff: SETTLE_POLL_STEP,
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok::<_, std::io::Error>(rt.block_on(async move {
+            let store = NodeAdmitStore::new(engine, hash, total_bytes, None);
+            let ctx = Arc::new(std::sync::Mutex::new(ctx));
+            let source = PeerSource::new(
+                &endpoint,
+                EndpointAddr::new(pk),
+                Arc::clone(&ctx),
+                Arc::clone(&ledger_for_drive),
+                &slash_domain,
+                provider_addr,
+                NO_NAMESPACE,
+                max_blob_size_bytes,
+                rate_ceiling,
+                deadlines,
+            );
+            let pacer = BudgetPacer::new();
+            let funder = NodeFunder::new(
+                buyer,
+                Arc::clone(&ctx),
+                Arc::clone(&ledger_for_drive),
+                metrics,
+            );
+            // Whole blob: offset 0, len `total_bytes`. `drive` derives missing ranges
+            // from the ranged store, so a mid-pull top-up resumes by re-deriving gaps
+            // — no truncate, no rewind buffer. `drive` finalizes the store when the
+            // whole blob is present, so the caller holds no whole-blob buffer of its
+            // own on success.
+            let result = drive(
+                &store,
+                &source,
+                &pacer,
+                &funder,
+                &ctx,
+                &ledger_for_drive,
+                hash_bytes,
+                0,
+                total_bytes,
+                &drive_config,
+                None,
+                None,
+                None,
+            )
+            .await;
+            let pool_id = ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pool_id;
+            (result, pool_id)
+        }))
+    })
     .await;
     // Capture the delivery duration BEFORE the guard settles: `record_progress` does
     // a blocking fsync'd store write, and folding it into `elapsed` would inflate the
     // delivery-speed reputation signal for a reason unrelated to the network pull.
     let elapsed = started.elapsed();
     drop(settle);
+    // Three failure shapes collapse to one classification path: the blocking task
+    // itself panicked (`JoinError`), its dedicated runtime failed to build (`io::Error`
+    // — starvation/resource exhaustion, not a peer fault), or `drive` itself errored.
+    // None of the first two says anything about the PROVIDER, but they are still OUR
+    // fault and must not launder into a clean miss (#1560) — `classify_pull_failure`
+    // has no typed arm for either, so they fall through its catch-all `Unreachable`/
+    // `Refused` classification onto `PullMiss::Clean`, same as any other transport
+    // fault; a truly node-wide resource exhaustion is expected to repeat across every
+    // candidate and surface some other way (metrics, logs) rather than through this
+    // per-pull classifier.
+    let (result, pool_id) = match join {
+        Ok(Ok((result, pool_id))) => (result, pool_id),
+        Ok(Err(err)) => (
+            Err(anyhow::Error::new(err).context("node-origin: pull-thread runtime build failed")),
+            B256::ZERO,
+        ),
+        Err(join_err) => (
+            Err(anyhow::anyhow!(
+                "node-origin: pull thread panicked or was cancelled: {join_err}"
+            )),
+            B256::ZERO,
+        ),
+    };
     match result {
-        Ok(resume::PulledBlob { bytes, paid_wait }) => {
-            // The same exclusion, for the same reason, applied to the other two things
-            // that are not the upstream serving bytes: the settle sleep and the `topUp`
-            // receipt. Both are OUR funding, and charging a peer's delivery-speed score
-            // for the time we spent on a chain would defame it for helping us (#1530).
-            let elapsed = elapsed.saturating_sub(paid_wait);
-            let bytes = Bytes::from(bytes);
+        Ok(()) => {
+            // Content delivered by this provider for a from-zero whole-blob pull is
+            // `total_bytes`. `paid_wait` is not subtracted here, matching the
+            // gap-driven `run_pull_leg` path (settle waits are rare and the driver
+            // bounds them).
             record_outcome(
                 deps,
                 pk,
                 &Outcome::Delivered {
-                    bytes: bytes.len() as u64,
+                    bytes: total_bytes,
                     elapsed,
                 },
             );
             // Inbound counterpart of the serve path's `record_served` (#858).
-            // `bytes` is the DECODED content buffer (`pull_to_sink` writes only
-            // verified plaintext, dropping the bao proof and the pre-`byte_offset`
-            // bytes, ADR 038), so `bytes.len()` is CONTENT bytes — and it counts each
-            // byte ONCE across a resumed pull, because the sink is truncated back to
-            // the resume offset before the next leg appends. Slightly under the WIRE
-            // bytes the
-            // voucher watermark advanced in (the proof overhead the buyer paid).
-            // Region accounting attributes the delivered content, which is the
-            // right unit for a locality signal. Note this tracks *delivered*
-            // bytes, not *spent*: a partially-paid failed pull (the `Err` arm)
-            // still persists its voucher watermark above (#852) but is
-            // intentionally not region-counted, so `bytes_in` diverges from
-            // on-chain spend on failed pulls by design.
             deps.region_accountant
-                .record_pulled(&candidate.node_id, bytes.len() as u64)
+                .record_pulled(&candidate.node_id, total_bytes)
                 .await;
-            Ok(bytes)
+            Ok(())
         }
         Err(err) => {
             let verdict =
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(ctx.pool_id), &err);
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), &err);
             Err(PullMiss::for_verdict(verdict))
         }
     }
@@ -2238,11 +2350,12 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
 /// `CapExceeded`/`AmountRegression`/`BytesRegression`, and it does not need to.
-/// `resume::pull_blob` (this node's own cache-miss buyer leg) already retries a resumable
-/// rejection in its own loop before it can ever surface here: it reseeds the pool's ledger
-/// and reopens the pull, transparently, and this classifier sees only the FINAL outcome. The
-/// loop also answers a genuine `CapExceeded` with an on-chain top-up rather than a terminal
-/// error. So by the time `pull_verdict` downcasts an error to `UpstreamVoucherRejected` and
+/// The gap-driven `decdn_client_pull::drive` loop (this node's own cache-miss buyer leg)
+/// already retries a resumable rejection in its own loop before it can ever surface here: it
+/// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees
+/// only the FINAL outcome. The loop also answers a genuine `CapExceeded` with an on-chain
+/// top-up (via [`NodeFunder`]) rather than a terminal error. So by the time `pull_verdict`
+/// downcasts an error to `UpstreamVoucherRejected` and
 /// reaches this function, the rejection is genuinely terminal: either the reason was never
 /// gated, it carried no bundle, the bundle failed shape validation, or the bounded resume
 /// attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
