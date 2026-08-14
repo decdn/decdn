@@ -26,8 +26,8 @@ a ceiling. A non-paying stream stays pinned at the floor.
 
 ```
 window(paid) =
-    if credit_ramp_speed == 0 { max(floor, credit_max) }         // instant
-    else { (paid / credit_ramp_speed).clamp(floor, max(floor, credit_max)) }
+    if credit_ramp_divisor == 0 { max(floor, credit_max) }         // instant
+    else { (paid / credit_ramp_divisor).clamp(floor, max(floor, credit_max)) }
 ```
 
 - `floor` = one voucher interval. This keeps the ADR 003 invariant that a stream can always
@@ -35,10 +35,10 @@ window(paid) =
   ramp. Without a floor of at least one interval the ramp's own feedback loop never turns
   over.
 - `credit_max` = window ceiling, node config, default `64 * 1024 * 1024` (64 MiB).
-- `credit_ramp_speed` = the paid-bytes-per-window divisor, node config, default `2`.
+- `credit_ramp_divisor` = the paid-bytes-per-window divisor, node config, default `2`.
   Lower is faster; `0` is instant full `credit_max`.
 
-At `credit_ramp_speed = 2` the window is always at most half of what the stream has already
+At `credit_ramp_divisor = 2` the window is always at most half of what the stream has already
 paid. A lane that has paid 128 MiB gets the full 64 MiB window; a lane that has paid nothing
 sits at the floor.
 
@@ -49,20 +49,20 @@ bytes. Payments are linear in bytes. Tying the window linearly to cumulative pai
 the node's credit exposure a fixed fraction of confirmed revenue:
 
 ```
-exposure = delivered − paid ≤ window ≤ paid / credit_ramp_speed
+exposure = delivered − paid ≤ window ≤ paid / credit_ramp_divisor
 ```
 
-So the node has always collected at least `credit_ramp_speed ×` its current exposure. With
-`credit_ramp_speed = 2` an attacker must pay for two bytes to extract one byte of free-ride;
+So the node has always collected at least `credit_ramp_divisor ×` its current exposure. With
+`credit_ramp_divisor = 2` an attacker must pay for two bytes to extract one byte of free-ride;
 the node nets positive on every stream, including a pure pay-a-little-then-abandon attack.
 The window is a pure function of this stream's `paid` counter, which resets on every new
 stream — no stored client history, no graduation table.
 
 ### Node-wide exposure bound
 
-Each stream's exposure is at most `paid / credit_ramp_speed`, and `paid` can never exceed the
+Each stream's exposure is at most `paid / credit_ramp_divisor`, and `paid` can never exceed the
 requesting pool's deposit (a voucher cannot claim more than the pool holds). So the node's
-aggregate speculative exposure is bounded by `Σ pool deposits / credit_ramp_speed` — a
+aggregate speculative exposure is bounded by `Σ pool deposits / credit_ramp_divisor` — a
 real-capital bound, tighter than a byte counter and un-gameable by a flood of unfunded pools.
 This bound plus the pre-flight deposit guard replace the ADR 037 `max_unrecouped_leech_bytes`
 node-wide circuit breaker and the per-peer `share_ratio` outright.
@@ -80,8 +80,8 @@ Add:
 
 - `credit_max: Option<Bytes>` → `ResolvedPayment.credit_max: u64`, default
   `DEFAULT_CREDIT_MAX = 64 * 1024 * 1024`.
-- `credit_ramp_speed: Option<u64>` → `ResolvedPayment.credit_ramp_speed: u64`, default
-  `DEFAULT_CREDIT_RAMP_SPEED = 2`. `0` means instant.
+- `credit_ramp_divisor: Option<u64>` → `ResolvedPayment.credit_ramp_divisor: u64`, default
+  `DEFAULT_CREDIT_RAMP_DIVISOR = 2`. `0` means instant.
 
 `[cache]` section — delete outright:
 
@@ -93,14 +93,41 @@ Add:
 
 ## Node changes
 
+### Shared ramp formula (`crates/incentive/src/`)
+
+The exact same `window(paid)` function is used by the downstream serve loop (node) **and** the
+upstream pull-leg pacer (client-pull). One definition, no drift. It lives in `decdn-incentive`
+— the only leaf both `node` and `client-pull` already depend on:
+
+```rust
+/// Ramped delivery credit window (ADR 003 §Credit window): the unbilled egress a
+/// node fronts on a stream grows in proportion to what the stream has already paid,
+/// floored at one voucher interval and capped at `credit_max`. `divisor == 0` means
+/// the window is the full `credit_max` from the first byte.
+#[must_use]
+pub fn ramped_credit_window(divisor: u64, floor: u64, credit_max: u64, paid: u64) -> u64 {
+    let ceiling = credit_max.max(floor);
+    if divisor == 0 {
+        return ceiling;
+    }
+    (paid / divisor).clamp(floor, ceiling)
+}
+```
+
 ### Ramp accessor (`crates/node/src/handlers/client/mod.rs`)
 
 Replace the flat `credit_window(interval_bytes) -> u64` accessor (currently
-`credit_window_bytes.max(interval_bytes)`) with a ramp-aware pair:
+`credit_window_bytes.max(interval_bytes)`) with a ramp-aware one that delegates to the shared
+formula, using the handler's `credit_max` and `credit_ramp_divisor` fields (from deps → runtime
+config) and `floor = interval_bytes`:
 
-- `credit_floor(interval_bytes) -> u64` = `interval_bytes` (one voucher interval).
-- `credit_window(interval_bytes, paid) -> u64` = the `window(paid)` formula above, using the
-  handler's `credit_max` and `credit_ramp_speed` fields (from deps → runtime config).
+```rust
+pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
+    decdn_incentive::ramped_credit_window(
+        self.credit_ramp_divisor, interval_bytes, self.credit_max, paid,
+    )
+}
+```
 
 Pre-flight callers that have no `paid` yet pass `paid = 0`, which yields the floor.
 
@@ -128,16 +155,45 @@ against the floor (one interval), i.e. `credit_window(interval_bytes, 0)`:
 
 The floor-vs-ceiling residuals documented in ADR 037 §Implementation status shrink: with the
 ramp, the pre-flight reservation is one interval, and in-stream exposure is bounded by the
-ramped window, which never exceeds `paid / credit_ramp_speed`.
+ramped window, which never exceeds `paid / credit_ramp_divisor`.
 
 ### Upstream pull-leg pacer (`crates/node/src/node_origin/pull_leg.rs`)
 
 `LeechPacer::decide` currently gates the upstream draw on `pull_ahead_bytes` plus
-`governor.poll_admission` / `record_pulled`. Rework it to pace the upstream frontier on the
-**ramped downstream window**: on the fused serve-miss path the pull may run ahead of cleared
-downstream payment only as far as the current `window(paid)` allows, matching the downstream
-pause. Remove the `LeechGovernor` parameter and all `record_pulled` / `poll_admission` calls;
-remove `record_served` on the voucher path.
+`governor.poll_admission` / `record_pulled`, wrapping a `WindowPacer` with a **fixed**
+`window_bytes`. On the fused serve-miss path the pull must not run further ahead of cleared
+downstream payment than the *ramped* window allows — otherwise a non-paying client's request
+would still front up to `credit_max` of speculative upstream USDC while the downstream serve
+sits pinned at the floor.
+
+Replace `LeechPacer` with a ramp-aware pacer in `crates/client-pull/src/pacer.rs` that computes
+the window from the live `served_paid_frontier` each decision, so upstream pull and downstream
+serve ramp in lockstep:
+
+```rust
+pub struct RampPacer {
+    pub divisor: u64,
+    pub floor: u64,
+    pub credit_max: u64,
+}
+impl Pacer for RampPacer {
+    fn decide(&self, s: &PaceState) -> PaceDecision {
+        let window = decdn_incentive::ramped_credit_window(
+            self.divisor, self.floor, self.credit_max, s.served_paid_frontier,
+        );
+        WindowPacer::new(window).decide(s)
+    }
+}
+```
+
+`WindowPacer` (the fixed-window pacer) stays as the primitive `RampPacer` composes over; its
+existing tests are unchanged. Delete `LeechPacer`, its `governor` field, and every
+`record_pulled` / `poll_admission` call at the two `run_pull_leg` construction sites
+(`pull_leg.rs:605, 889`) and the test constructions (`pull_leg.rs:1072, 1103`). Thread
+`(credit_ramp_divisor, floor = interval_bytes, credit_max)` into `run_pull_leg` in place of the
+single `window: u64` it takes today (a `pub fn` signature change — re-run the anvil-e2e compile
+gate: `cargo test --no-run -p decdn-e2e --features anvil-e2e`). Remove `record_served` on the
+voucher path (`crates/node/src/handlers/client/voucher.rs:418-421`).
 
 ### Delete `LeechGovernor`
 
@@ -163,7 +219,7 @@ floor (one interval) pre-flight, so the estimate switches to one voucher interva
 - Remove the `credit_window_bytes` template comment and dump lines (~685, 1004, 1011).
 - Remove the three `[cache]` seed-leech knob template comments and dump lines (~272-275,
   677-679, 938-996).
-- Add `credit_max` and `credit_ramp_speed` template comments and dump lines under `[payment]`.
+- Add `credit_max` and `credit_ramp_divisor` template comments and dump lines under `[payment]`.
 
 ## ADR changes
 
@@ -174,11 +230,11 @@ issue or PR references, each line stands alone read cold.
 
 Rewrite from a fixed window to a ramped window:
 
-- The window is `min(credit_max, max(floor, paid / credit_ramp_speed))`; a stream starts at
+- The window is `min(credit_max, max(floor, paid / credit_ramp_divisor))`; a stream starts at
   one voucher interval and grows in proportion to its own confirmed payment, up to
   `credit_max`.
 - State the exposure invariant: the node's unbilled egress on a stream is at most
-  `paid / credit_ramp_speed`, so a stream never fronts more than a fixed fraction of the
+  `paid / credit_ramp_divisor`, so a stream never fronts more than a fixed fraction of the
   revenue it has already confirmed.
 - Keep the floor-at-one-interval, node-local-policy, durability, and takedown-latency
   paragraphs, updated so the "window" they refer to is the ramped window (takedown latency is
@@ -193,7 +249,7 @@ Rewrite from a fixed window to a ramped window:
 - Rewrite §Implementation status: the fused serve-miss path is paced by the ramped credit
   window (ADR 003); the pre-flight deposit guard refuses a cache-miss pull whose pool cannot
   cover the floor, and node-wide speculative exposure is bounded by `Σ pool deposits /
-  credit_ramp_speed`. Remove `LeechGovernor`, `pull_ahead_bytes`, `share_ratio`,
+  credit_ramp_divisor`. Remove `LeechGovernor`, `pull_ahead_bytes`, `share_ratio`,
   `max_unrecouped_leech_bytes` references.
 - Update the threat-model and acceptance-criteria items that named the caps to name the ramp
   and the deposit bound instead.
@@ -201,14 +257,14 @@ Rewrite from a fixed window to a ramped window:
 ## Tests
 
 - `crates/common/src/config/mod.rs` — replace `credit_window_bytes` resolution tests with
-  `credit_max` / `credit_ramp_speed` defaults + explicit-override round-trips; drop the
+  `credit_max` / `credit_ramp_divisor` defaults + explicit-override round-trips; drop the
   seed-leech-cap resolution and cross-field-validation tests; fix struct-literal fixtures.
 - `crates/node/tests/client_loopback.rs` — replace the flat-window behavioral tests with ramp
   tests:
   - a non-paying stream is served exactly the floor (one interval) ahead of zero payment and
     then pauses (pinned at floor),
-  - paying advances `paid` and grows the window to `paid / credit_ramp_speed`,
-  - `credit_ramp_speed = 0` serves the full `credit_max` immediately,
+  - paying advances `paid` and grows the window to `paid / credit_ramp_divisor`,
+  - `credit_ramp_divisor = 0` serves the full `credit_max` immediately,
   - the deposit gate covers the floor, not the ceiling.
 - Delete `LeechGovernor` unit tests (`crates/node/src/leech_governor.rs`) and the pull-leg
   tests that assert seed-leech-cap pausing (`crates/node/tests/node_origin_pull.rs`,
