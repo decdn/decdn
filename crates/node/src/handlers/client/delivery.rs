@@ -9,7 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::{
     Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, MB_BYTES, Mutex, RecvStream, SendStream, VecDeque,
+    LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES, VecDeque,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -114,7 +114,7 @@ impl ChunkFramer {
 
 impl ClientHandler {
     /// Stream blob bytes to the paying client behind a credit window (ADR 003
-    /// §Credit window): keep delivering `voucher_interval_mb`-sized batches while
+    /// §Credit window): keep delivering `VOUCHER_INTERVAL_BYTES`-sized batches while
     /// `delivered − paid ≤ credit_window`, collecting cumulative vouchers as they
     /// arrive instead of stalling a full round trip at every interval boundary. A
     /// closing voucher settles the final partial batch. Returns `Ok(())` on a
@@ -139,7 +139,6 @@ impl ClientHandler {
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        interval_mb: u64,
     ) -> anyhow::Result<()> {
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
@@ -176,7 +175,7 @@ impl ClientHandler {
             .await
             .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
 
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         // The downstream credit window, floored at one interval so the loop can
         // always make progress and — for the unconfigured default — collapses to
         // stop-and-wait. See [`ClientHandler::credit_window`].

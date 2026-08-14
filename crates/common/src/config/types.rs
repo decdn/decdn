@@ -768,16 +768,6 @@ pub struct PaymentConfig {
     /// refuses startup outright), so treat the on-chain value as authoritative.
     /// Absent => `0`.
     pub delivery_floor: Option<u64>,
-    /// Voucher cadence the node advertises in `StreamResponse` for
-    /// `cdn/client/v1` delivery (ADR 003 §Voucher Interval Negotiation): the
-    /// node pauses delivery once outstanding unvouchered bytes exceed
-    /// `voucher_interval_mb * 1_048_576`. Absent =>
-    /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (1 MB). Range
-    /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`] — unlike
-    /// [`Self::delivery_floor`], that bound is hardcoded in the wire schema,
-    /// not governance-owned: no contract holds a cadence parameter (ADR 003
-    /// §Voucher Interval Negotiation).
-    pub voucher_interval_mb: Option<u64>,
     /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
     /// how far past the client's cleared payment the node keeps streaming before
     /// it must collect a voucher, so paid delivery pipelines instead of stalling a
@@ -785,23 +775,23 @@ pub struct PaymentConfig {
     /// (unbilled egress already on the wire) to exactly this; the client's exposure
     /// stays zero (vouchers are cumulative over delivered bytes). Absent =>
     /// [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB). Floored at one
-    /// voucher interval; a value at or below one interval reproduces the
-    /// pre-credit-window stop-and-wait cadence. Like [`Self::voucher_interval_mb`]
-    /// it is node-local config, not a governance-owned parameter — no contract
-    /// holds a delivery-cadence value (ADR 003 §Voucher Interval Negotiation).
+    /// voucher accounting interval ([`decdn_protocol::VOUCHER_INTERVAL_BYTES`]);
+    /// a value at or below one interval reproduces stop-and-wait delivery. It
+    /// is node-local config, not a governance-owned parameter — no contract
+    /// holds a delivery-window value.
     pub credit_window_bytes: Option<decdn_config_types::Bytes>,
     /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
-    /// persistence, #1483): how long the serve loop waits to gather more
-    /// vouchers into one fsynced commit before committing what it has, so a
-    /// single durable write amortizes across a batch. Each voucher is still
+    /// persistence): how long the serve loop waits to gather more vouchers
+    /// into one fsynced commit before committing what it has, so a single
+    /// durable write amortizes across a batch. Each voucher is still
     /// acknowledged only after the commit is durable, so the replay guard is
     /// unchanged. Absent => [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]
     /// (5 ms). `0` commits each blocking-read batch immediately. Composes with
     /// [`Self::credit_window_bytes`] via `credit_window ≥ throughput × (RTT +
     /// commit_interval)`; bounded above by the window (at most
-    /// `credit_window / voucher_interval` vouchers are ever outstanding). Like
-    /// [`Self::voucher_interval_mb`] and [`Self::credit_window_bytes`] it is
-    /// node-local, not a governance-owned parameter.
+    /// `credit_window / VOUCHER_INTERVAL_BYTES` vouchers are ever outstanding).
+    /// Like [`Self::credit_window_bytes`] it is node-local, not a
+    /// governance-owned parameter.
     pub voucher_commit_interval_ms: Option<u64>,
 }
 

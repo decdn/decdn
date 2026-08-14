@@ -35,7 +35,7 @@ use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolOpenFailureReason,
     PoolStateStore, ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain,
-    binding_signing_hash, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    binding_signing_hash, min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::client_requester::probe::probe_once;
@@ -56,8 +56,9 @@ use decdn_protocol::client::{
 };
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, ContentHash, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES,
-    ProbeMessage, decode_message, encode_message, encode_stream_request, read_frame, write_frame,
+    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, ContentHash, MB_BYTES, ProbeMessage,
+    VOUCHER_INTERVAL_BYTES, decode_message, encode_message, encode_stream_request, read_frame,
+    write_frame,
 };
 use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
@@ -1428,7 +1429,6 @@ async fn serve_wrong_bytes(
     let resp = StreamResponse {
         body,
         error: None,
-        voucher_interval_mb: Some(1),
         slash_sig,
     };
     write_frame(
@@ -1566,7 +1566,6 @@ async fn serve_gated_correct_bytes(
         let resp = StreamResponse {
             body,
             error: None,
-            voucher_interval_mb: Some(1),
             slash_sig,
         };
         if req.byte_offset == 0 && req.byte_len == 0 {
@@ -1773,7 +1772,6 @@ async fn serve_then_reject_voucher(
     let resp = StreamResponse {
         body,
         error: None,
-        voucher_interval_mb: Some(1),
         slash_sig,
     };
     write_frame(
@@ -1866,7 +1864,6 @@ async fn serve_then_error_on_voucher(
     let resp = StreamResponse {
         body,
         error: None,
-        voucher_interval_mb: Some(1),
         slash_sig,
     };
     write_frame(
@@ -4039,7 +4036,6 @@ fn signed_response(
     Ok(StreamResponse {
         body,
         error,
-        voucher_interval_mb: Some(1),
         slash_sig,
     })
 }
@@ -4190,7 +4186,7 @@ fn spawn_an_empty_chunk_server(
 /// stops delivering while we wait. That is what `Unreachable` means, and the
 /// inactivity deadline is the only thing that catches it.
 ///
-/// `prefix_chunks` frames are sent (under the 1 MiB voucher interval, so no
+/// `prefix_chunks` frames are sent (under the voucher accounting interval, so no
 /// voucher round trip intrudes) against a much larger advertised `total_bytes`,
 /// so the receive loop is left genuinely waiting for more.
 async fn serve_then_go_silent(
@@ -4294,7 +4290,7 @@ fn spawn_a_mid_stream_silent_server(
 /// voucher the buyer presents for it — and only THEN goes silent (#1145 review).
 ///
 /// The distinction from [`serve_then_go_silent`] is the whole point. That one stays
-/// deliberately UNDER the 1 MiB voucher interval, so no voucher round trip intrudes:
+/// deliberately UNDER the voucher accounting interval, so no voucher round trip intrudes:
 /// nothing is ever paid, and there is no watermark to lose. Here the upstream has
 /// committed and acked a voucher before it stops — ADR 003 has the node commit
 /// BEFORE it acks — so from the ack onward the payment is real and irreversible.
@@ -4321,14 +4317,15 @@ async fn serve_a_paid_interval_then_go_silent(
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
-    // Exactly one voucher interval: `signed_response` advertises
-    // `voucher_interval_mb: Some(1)`, and CHUNK_SIZE divides 1 MiB evenly, so this
-    // lands the buyer's unvouchered counter precisely on the interval boundary and
-    // it must present a voucher before it will take another byte.
+    // Exactly one voucher interval: CHUNK_SIZE divides VOUCHER_INTERVAL_BYTES
+    // evenly, so this lands the buyer's unvouchered counter precisely on the
+    // interval boundary and it must present a voucher before it will take
+    // another byte.
     // Honest bao bytes, for the reason `serve_then_go_silent` records: the buyer
     // verifies each chunk group as it decodes, so filler would end the pull as
     // corruption long before the voucher round trip this fixture is built around.
-    let interval_chunks = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) / CHUNK_SIZE;
+    let interval_chunks =
+        usize::try_from(VOUCHER_INTERVAL_BYTES).unwrap_or(usize::MAX) / CHUNK_SIZE;
     for frame in wire_frames(&wire, interval_chunks)? {
         write_frame(&mut send, &frame)
             .await
@@ -4493,11 +4490,18 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
          silent-but-paid upstream) when the cancellation dropped it"
     );
 
-    // The upstream acked one 1 MiB voucher before going quiet: nonce 1, 1 MiB of
-    // bytes, `ceil(1 MiB × RATE / 1 MiB)` = RATE in amount. That is real USDC, and it
-    // must be on the buyer's books even though the pull that spent it never returned.
+    // The upstream acked one voucher interval before going quiet: nonce 1,
+    // VOUCHER_INTERVAL_BYTES of bytes, `ceil(VOUCHER_INTERVAL_BYTES × RATE / 1 MiB)`
+    // in amount. That is real USDC, and it must be on the buyer's books even though
+    // the pull that spent it never returned.
+    let interval_amount = min_payment(VOUCHER_INTERVAL_BYTES, RATE);
     anyhow::ensure!(
-        progress_log(&recorded)? == vec![(a_eth.address(), U256::from(MB_BYTES), U256::from(RATE))],
+        progress_log(&recorded)?
+            == vec![(
+                a_eth.address(),
+                U256::from(VOUCHER_INTERVAL_BYTES),
+                interval_amount
+            )],
         "a cancelled pull must persist the watermark the upstream already acked — \
          otherwise the next reuse re-signs a stale nonce and the channel wedges until \
          it expires. Got {:?}",
@@ -4543,7 +4547,7 @@ async fn serve_then_error_mid_stream(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    // Two real frames, well under the 1 MiB voucher interval, so no voucher round trip
+    // Two real frames, well under the voucher accounting interval, so no voucher round trip
     // intrudes and the loop is unambiguously mid-delivery when the error lands. Real bao
     // bytes, not filler: the buyer verifies each chunk group as it decodes, so filler
     // would end the pull as CORRUPTION before the mid-stream error this test is about
@@ -5001,7 +5005,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
     // Three 1 KiB frames: real progress (so this is unambiguously a MID-stream
-    // stall, not an open-stage one), but far under the 1 MiB voucher interval, so
+    // stall, not an open-stage one), but far under the voucher accounting interval, so
     // no voucher round trip intrudes on the silence that follows.
     let task_a = spawn_a_mid_stream_silent_server(
         ep_a.clone(),
@@ -7234,7 +7238,6 @@ async fn leaf_paced_pull(
     let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
     let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
     let ext = StreamRequestExt {
-        voucher_interval_mb: None,
         binding: Some(ClientBinding {
             ethereum_address: leaf_eth.address().into(),
             binding_signature,
@@ -7267,10 +7270,7 @@ async fn leaf_paced_pull(
     // count the same forwarded wire bytes into `interval_bytes`.
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(total, &bao_tree::ChunkRanges::all());
-    let interval_bytes = resp
-        .voucher_interval_mb
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
-        .saturating_mul(MB_BYTES);
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -8414,7 +8414,6 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
     let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
     let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
     let ext = StreamRequestExt {
-        voucher_interval_mb: None,
         binding: Some(ClientBinding {
             ethereum_address: leaf_eth.address().into(),
             binding_signature,
@@ -8592,7 +8591,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     // on-chain `remaining` (here the stub pool-view reports the seeded deposit)
     // minus the refundable floor `M` can no longer cover the reserved credit
     // window is refused (signed `NotFound`) BEFORE any upstream pull — no USDC
-    // fronted. The reserved window is one MiB at `RATE`, so `min_payment` is 10;
+    // fronted. The reserved window is one voucher accounting interval at `RATE`;
     // a remaining of 5 cannot cover it and the pull-through is refused at the
     // pre-spend gate.
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
@@ -8823,7 +8822,7 @@ async fn read_voucher(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
 /// Like [`serve_wrong_bytes`], but serves `wire` (a bao verified-stream,
 /// possibly corrupted mid-way) with the REAL per-interval voucher pacing:
 /// `total_bytes` (the CONTENT size) is advertised separately from the wire
-/// length, and a voucher is read + acked at every 1 MiB interval boundary of
+/// length, and a voucher is read + acked at every voucher interval boundary of
 /// wire bytes, matching the buyer's cadence — so a multi-interval serve never
 /// deadlocks on an unacked mid-stream voucher. When the buyer aborts (e.g. its
 /// tee rejects a corrupt group, #915), the next write/read here errors and the
@@ -8877,7 +8876,6 @@ async fn serve_wire_paced(
     let resp = StreamResponse {
         body,
         error: None,
-        voucher_interval_mb: Some(1),
         slash_sig,
     };
     write_frame(
@@ -9102,7 +9100,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         bytes::Bytes::from(ob.data),
     )?;
     // Strip the 8-byte LE size header (the wire is header-less) and corrupt one
-    // byte past the first 1 MiB voucher interval.
+    // byte past the first voucher interval.
     let mut wire = combined
         .get(8..)
         .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
@@ -9220,7 +9218,6 @@ async fn leaf_underpays_first_voucher(
         leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec()
     };
     let ext = StreamRequestExt {
-        voucher_interval_mb: None,
         binding: Some(ClientBinding {
             ethereum_address: leaf_eth.address().into(),
             binding_signature,
@@ -9247,10 +9244,7 @@ async fn leaf_underpays_first_voucher(
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     };
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
-    let interval_bytes = resp
-        .voucher_interval_mb
-        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB)
-        .saturating_mul(MB_BYTES);
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
 
     // Read chunks until the first interval boundary, then underpay it.
     let mut cumulative: u64 = 0;
@@ -9492,8 +9486,9 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x6F);
     // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
-    // deposit guard (ceiling = min_payment(1 MiB, RATE) = 10 µUSDC) passes against
-    // the funded leaf, so we exercise step (4), not the step (1) deposit guard.
+    // deposit guard (ceiling = min_payment(one voucher interval, RATE)) passes
+    // against the funded leaf, so we exercise step (4), not the step (1) deposit
+    // guard.
     let max_blob_size_bytes = 1024 * 1024;
     let (
         handler_b,

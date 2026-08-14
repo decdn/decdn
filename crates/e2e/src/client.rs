@@ -857,7 +857,6 @@ impl PoolSession {
     /// what `client-pull` attaches to a `stream_fetch` request.
     fn request_ext(&self) -> StreamRequestExt {
         StreamRequestExt {
-            voucher_interval_mb: None,
             binding: self.ctx.client_binding.clone(),
             capability: self.ctx.capability.as_ref().map(signed_to_wire_capability),
         }

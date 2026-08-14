@@ -537,8 +537,8 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
     //
     // The threshold is an ESTIMATE, not a proof: the node's floor is one credit
     // window at ITS configuration, which we cannot read. Estimated with the shipped
-    // defaults — 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`) over a 4 MiB
-    // `DEFAULT_VOUCHER_INTERVAL_MB`, so the window is the binding term. An operator
+    // default — 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`) over the fixed 4 MiB
+    // `VOUCHER_INTERVAL_BYTES`, so the window is the binding term. An operator
     // who raised `credit_window_bytes` has a higher floor than this, so the miss
     // direction is "we stay silent when we could have spoken" — never a fabricated
     // shortfall. Phrased as a possibility, and as a lower bound, for that reason.

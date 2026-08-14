@@ -375,7 +375,6 @@ fn client_handler_deps(
         receipt_sink,
         rate,
         decdn_node::rate_bounds::RateBounds::new(0),
-        1, // voucher_interval_mb
         max_blob_size_bytes,
         max_concurrent_streams,
         // Empty by default; a test needing a populated deny-set overwrites the

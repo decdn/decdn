@@ -389,7 +389,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         payment: ResolvedPayment {
             rate_per_mb: 10,
             delivery_floor: 0,
-            voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
             voucher_commit_interval_ms: decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
         },

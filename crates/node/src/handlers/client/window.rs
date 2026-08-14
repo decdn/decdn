@@ -7,9 +7,9 @@ use alloy::primitives::U256;
 use crate::node_origin::PullLegTarget;
 
 use super::{
-    Arc, B256, ClientHandler, ClientMessage, FillOutcome, Hash, LaneDeliveryState, LaneKey,
-    MB_BYTES, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest,
-    StreamRequestExt, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, ClientHandler, ClientMessage, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
+    NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamResponseBody,
+    VOUCHER_INTERVAL_BYTES, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 impl ClientHandler {
@@ -63,7 +63,6 @@ impl ClientHandler {
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
-        ext: &StreamRequestExt,
         hash: Hash,
         client_node_id: B256,
         lane_key: LaneKey,
@@ -89,14 +88,9 @@ impl ClientHandler {
         // (`pull_authorized` + the serve gate), and threaded in as `lane` /
         // `lane_key` for the downstream voucher collection.
         //
-        // Voucher-interval negotiation (ADR 003), resolved up front so the floor-M
-        // guard, the response signature, and the serve/pull window all price
-        // against the same interval.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // The floor-M guard, the response signature, and the serve/pull window
+        // all price against the fixed voucher accounting interval.
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         // The pacing window: at least `pull_ahead_bytes` (the ADR 037 upstream
         // exposure knob), the downstream `credit_window` (#1477), and one interval
         // — the exact bound the two-leg serve/pull driver paces against, and what
@@ -205,10 +199,10 @@ impl ClientHandler {
                 .await;
         }
 
-        // (5) The signed `StreamResponse` commits to `total_bytes` (now known) and the
-        // `interval_mb` negotiated above. It is deferred to step (7), AFTER the fill is
-        // claimed — so a peeked geometry that raced to `Owner` opens its pull leg (and
-        // can still cleanly refuse) before we promise `ok: true`.
+        // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
+        // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
+        // raced to `Owner` opens its pull leg (and can still cleanly refuse) before we
+        // promise `ok: true`.
 
         // (6) The two decoupled legs (ADR 037). The SERVE
         // leg runs HERE on the accept task — it MUST be `Send` (the iroh
@@ -282,7 +276,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
@@ -388,7 +382,6 @@ impl ClientHandler {
                 lane_key,
                 client_node_id,
                 rate_per_mb,
-                interval_mb,
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
@@ -462,7 +455,6 @@ impl ClientHandler {
         mut send: SendStream,
         mut recv: RecvStream,
         req: &StreamRequest,
-        ext: &StreamRequestExt,
         hash: Hash,
         client_node_id: B256,
         lane_key: LaneKey,
@@ -482,14 +474,9 @@ impl ClientHandler {
         // `lane` / `lane_key` are threaded in for the downstream voucher
         // collection.
         //
-        // Voucher-interval negotiation (ADR 003), resolved up front so the floor-M
-        // guard, the response signature, and the serve/pull window price against
-        // the same interval.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
-        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        // The floor-M guard, the response signature, and the serve/pull window
+        // price against the fixed voucher accounting interval.
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
         // The pacing window: at least `pull_ahead_bytes`, the downstream
         // `credit_window` (#1477), and one interval — the same bound the peer twin
         // computes, and what the floor-M guard reserves.
@@ -560,7 +547,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        let resp = self.sign_response(body, None)?;
         self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
             .await?;
 
@@ -698,7 +685,6 @@ impl ClientHandler {
                 lane_key,
                 client_node_id,
                 rate_per_mb,
-                interval_mb,
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,

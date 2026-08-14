@@ -68,7 +68,6 @@ impl ClientHandler {
         &self,
         body: StreamResponseBody,
         error: Option<StreamError>,
-        voucher_interval_mb: Option<u64>,
     ) -> anyhow::Result<StreamResponse> {
         let slash_sig = StreamSlashData::from_response_body(&body)
             .sign(self.eth_signer.as_ref(), &self.slash_domain)
@@ -78,7 +77,6 @@ impl ClientHandler {
         Ok(StreamResponse {
             body,
             error,
-            voucher_interval_mb,
             slash_sig,
         })
     }
@@ -143,7 +141,7 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, Some(error), None)?;
+        let resp = self.sign_response(body, Some(error))?;
         self.write_message(send, &ClientMessage::StreamResponse(resp))
             .await?;
         let _ = send.finish();
