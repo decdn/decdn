@@ -109,8 +109,10 @@ Pre-flight callers that have no `paid` yet pass `paid = 0`, which yields the flo
 Today `window` is computed once (`let window = self.credit_window(interval_bytes)`) before the
 loop. Change it to recompute from the live `paid` counter each loop iteration, so the pre-send
 pause `delivered − paid < window` uses the current ramped window. The group-commit `batch_cap`
-(intervals per window) is sized against `credit_max` (the ceiling) so the fsync-batching cap is
-stable across the ramp.
+(intervals per window) keeps its simplest form: computed once against `credit_max` (the
+ceiling), stable across the ramp. The group-commit / fsync batching refactor is out of scope
+here (#1672); this change touches `batch_cap` only enough to keep it compiling and correct
+against the new ceiling.
 
 ### Reservation / deposit guards
 
@@ -224,6 +226,8 @@ Rewrite from a fixed window to a ramped window:
   collapses the interval to chunk granularity and the floor becomes chunk-sized for free.
 - PayWord hash-chain vouchers (#1670).
 - Sub-MB / byte-granularity voucher confirmation.
+- Group-commit / fsync batching refactor (#1672); `batch_cap` here changes only enough to stay
+  correct against `credit_max`.
 
 ## Verification
 
