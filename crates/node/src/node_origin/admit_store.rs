@@ -28,7 +28,6 @@ use decdn_client_pull::{BaoRangeReader, IngestStore};
 /// admit path captures each admitted range's proof nodes into the serve leg's shared
 /// outboard (#1621 B3, ADR 038) so the serve leg can drive a coherent whole-range
 /// encode while the pull fills incrementally — the node just threads the session in.
-#[allow(dead_code, reason = "wired by Task 11's driver construction")]
 pub(crate) struct NodeAdmitStore {
     inner: NodeRangedStore,
     /// Serve-leg fill session. `None` when no serve leg reads beside this pull (e.g.
@@ -37,7 +36,6 @@ pub(crate) struct NodeAdmitStore {
     session: Option<Arc<FillSession>>,
 }
 
-#[allow(dead_code, reason = "wired by Task 11's driver construction")]
 impl NodeAdmitStore {
     /// Wrap `engine`'s view of `hash` (a `total_bytes`-byte blob) as the node's
     /// pull-leg store. When `session` is wired, the cache's admit path captures each
@@ -106,6 +104,15 @@ impl IngestStore for NodeAdmitStore {
     /// `reader` passes straight through — the drained reader `admit_bao_stream`
     /// returns is handed back as-is, preserving its `StashedFault` for the
     /// caller's [`decdn_client_pull::BlobSource::finish`].
+    ///
+    /// On the admit ERROR path this recovers the reader's parked typed peer
+    /// fault. `admit_bao_stream` hands the reader back on both arms; when it
+    /// errors, the reason the stream stopped is almost always a peer fault the
+    /// pull reader parked mid-fill (`PullStalled`/`PullTimeout`/`UpstreamRefused`/
+    /// `UpstreamVoucherRejected`/buyer-side `LocalPullFault`) — the cache decoder
+    /// only sees the resulting truncation as a generic `CacheError`. Surfacing
+    /// the parked fault verbatim keeps `pull_verdict` fault classification,
+    /// reputation, channel remedies, and reactive top-up (`CapExceeded`) working.
     fn ingest_stream<'a, R>(
         &'a self,
         range: &'a AlignedRange,
@@ -120,7 +127,7 @@ impl IngestStore for NodeAdmitStore {
             // [`FillSession`] is wired, captures its outboard proof nodes into it
             // cache-side (no-op when no serve leg reads beside this pull).
             // Front-to-back admits union to the whole tree.
-            let drained = self
+            match self
                 .inner
                 .engine()
                 .admit_bao_stream(
@@ -131,8 +138,39 @@ impl IngestStore for NodeAdmitStore {
                     self.session.as_ref(),
                 )
                 .await
-                .map_err(anyhow::Error::from)?;
-            Ok(drained)
+            {
+                Ok(mut reader) => {
+                    // A parked fault can outlive a fully-decoded byte stream: a
+                    // voucher rejected at the closing interval (buyer-side
+                    // `LocalPullFault`/`UpstreamVoucherRejected`) parks the fault
+                    // AFTER every requested byte already landed, so admit sees a
+                    // clean EOF and returns `Ok`. Mirror the client store's `Done`
+                    // arm — surface the parked fault over the apparent success.
+                    if let Some(fault) = reader.take_fault() {
+                        return Err(fault);
+                    }
+                    Ok(reader)
+                }
+                Err((mut reader, cache_err)) => {
+                    // The parked typed peer fault is the real reason the stream
+                    // stopped; it beats the generic truncation the cache decoder
+                    // sees, so it wins.
+                    if let Some(fault) = reader.take_fault() {
+                        return Err(fault);
+                    }
+                    // No parked fault means the bytes themselves failed to verify
+                    // (a dishonest upstream). Surface the typed corruption sentinel
+                    // `pull_verdict` / `is_bao_corruption` understand.
+                    if matches!(
+                        cache_err,
+                        decdn_cache::CacheError::VerifyFailed { .. }
+                            | decdn_cache::CacheError::HashMismatch { .. }
+                    ) {
+                        return Err(anyhow::Error::new(decdn_client_pull::HashMismatch));
+                    }
+                    Err(anyhow::Error::from(cache_err))
+                }
+            }
         })
     }
 }

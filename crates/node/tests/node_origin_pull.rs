@@ -495,10 +495,11 @@ fn empty_region_accountant() -> Arc<RegionAccountant> {
 /// real reputation/metrics handles. Tests vary `providers`/`addr_map` to drive
 /// the discovery / resolution / probe / pull branches.
 ///
-/// Returns the origin plus the [`StubOpener`]'s `recorded` log so a test can
-/// assert what voucher progress was persisted (#852).
+/// Returns the origin, its `CacheEngine` (so a test can read pulled bytes back
+/// from the store after `AlreadyAdmitted`), and the [`StubOpener`]'s `recorded`
+/// log so a test can assert what voucher progress was persisted (#852).
 #[allow(clippy::too_many_arguments)]
-fn provisioned_origin(
+async fn provisioned_origin(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -508,7 +509,12 @@ fn provisioned_origin(
     metrics: &Arc<Metrics>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
+) -> (
+    NodeOrigin,
+    CacheEngine,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    tempfile::TempDir,
+) {
     provisioned_origin_with_accountant(
         ep_b,
         b_dht,
@@ -521,12 +527,13 @@ fn provisioned_origin(
         providers,
         addr_map,
     )
+    .await
 }
 
 /// Like [`provisioned_origin`], but with a caller-supplied region accountant so a
 /// test can assert that a delivered pull feeds `bytes_in` (#858).
 #[allow(clippy::too_many_arguments)]
-fn provisioned_origin_with_accountant(
+async fn provisioned_origin_with_accountant(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -537,7 +544,12 @@ fn provisioned_origin_with_accountant(
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
+) -> (
+    NodeOrigin,
+    CacheEngine,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    tempfile::TempDir,
+) {
     provisioned_origin_with_deadlines(
         ep_b,
         b_dht,
@@ -551,6 +563,7 @@ fn provisioned_origin_with_accountant(
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES,
     )
+    .await
 }
 
 /// The `(pull_timeout, stall_timeout)` every test that does not care about the deadline gate
@@ -574,7 +587,7 @@ const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
 /// never reaches the wire under a zero budget; a live probe still may, if the caller wired
 /// one.
 #[allow(clippy::too_many_arguments)]
-fn provisioned_origin_with_deadlines(
+async fn provisioned_origin_with_deadlines(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -586,7 +599,12 @@ fn provisioned_origin_with_deadlines(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     (pull_timeout, stall_timeout): (Duration, Duration),
-) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
+) -> (
+    NodeOrigin,
+    CacheEngine,
+    Arc<Mutex<Vec<ProgressEntry>>>,
+    tempfile::TempDir,
+) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id,
@@ -596,7 +614,7 @@ fn provisioned_origin_with_deadlines(
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, engine, engine_tmp) = build_origin_with_timeout(
         ep_b,
         b_dht,
         hash,
@@ -609,15 +627,16 @@ fn provisioned_origin_with_deadlines(
         pull_timeout,
         stall_timeout,
         0,
-    );
-    (origin, recorded)
+    )
+    .await;
+    (origin, engine, recorded, engine_tmp)
 }
 
 /// Like [`provisioned_origin`], but the buyer enforces a `max_blob_size_bytes`
 /// ceiling — drives the production `pull_from_candidate` path against the
 /// buyer-side gate (#840).
 #[allow(clippy::too_many_arguments)]
-fn provisioned_origin_with_ceiling(
+async fn provisioned_origin_with_ceiling(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -628,7 +647,7 @@ fn provisioned_origin_with_ceiling(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     max_blob_size_bytes: u64,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id,
@@ -652,13 +671,14 @@ fn provisioned_origin_with_ceiling(
         Duration::from_secs(20),
         max_blob_size_bytes,
     )
+    .await
 }
 
 /// Provision a `NodeOrigin` with stubbed discovery/resolver/reputation around a
 /// caller-supplied buyer `PoolOpener`, so a test can inject any opener
 /// (recording, failing, …) without re-wiring the deps.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-fn build_origin(
+async fn build_origin(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -668,7 +688,7 @@ fn build_origin(
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_timeout(
         ep_b,
         b_dht,
@@ -683,13 +703,14 @@ fn build_origin(
         DEFAULT_TEST_PULL_DEADLINES.1,
         0,
     )
+    .await
 }
 
 /// [`build_origin`] with an explicit per-candidate `pull_timeout`, so a test can
 /// drive a *short* deadline and exercise the stall-then-fallthrough path (#859)
 /// without a 20-second wait.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-fn build_origin_with_timeout(
+async fn build_origin_with_timeout(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -702,7 +723,7 @@ fn build_origin_with_timeout(
     pull_timeout: Duration,
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_negative_cache(
         ep_b,
         b_dht,
@@ -718,6 +739,7 @@ fn build_origin_with_timeout(
         max_blob_size_bytes,
         NegativeProbeCache::new(),
     )
+    .await
 }
 
 /// [`build_origin_with_timeout`] with the negative cache injected, so a test can pick its
@@ -730,7 +752,7 @@ fn build_origin_with_timeout(
 /// a test wants: the two arms then have visibly different lifetimes in opposite directions,
 /// and no single implementation can satisfy both assertions by accident.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-fn build_origin_with_negative_cache(
+async fn build_origin_with_negative_cache(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -744,7 +766,7 @@ fn build_origin_with_negative_cache(
     stall_timeout: Duration,
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     build_origin_with_probe_caches(
         ep_b,
         b_dht,
@@ -766,6 +788,7 @@ fn build_origin_with_negative_cache(
         // Reactive mid-pull top-up off; only the #1530 tests turn it on.
         U256::ZERO,
     )
+    .await
 }
 
 /// [`build_origin_with_timeout`] with BOTH probe caches injected, so a test can pick each
@@ -776,7 +799,7 @@ fn build_origin_with_negative_cache(
 /// separately is also what makes their INTERACTION observable: a positive entry that
 /// outlives a negative one is how a peer becomes selectable again without a re-probe.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-fn build_origin_with_probe_caches(
+async fn build_origin_with_probe_caches(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     _hash: Hash,
@@ -801,7 +824,7 @@ fn build_origin_with_probe_caches(
     // but the reactive-top-up tests passes — DISABLES the leg, so a fixture whose
     // channel runs dry still fails the way its test asserts.
     working_deposit: U256,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     // Providers are active stakers, matching production (a probe-cache HIT
     // re-checks `is_active`, so an empty set would make every cached provider
     // un-servable on a hit). `find_providers` still returns empty for them — no
@@ -811,6 +834,9 @@ fn build_origin_with_probe_caches(
     let mut dir = HashMap::new();
     dir.insert(directory_namespace, providers);
 
+    let (engine, engine_tmp) = throwaway_engine()
+        .await
+        .expect("throwaway engine for the node-origin fixture");
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
@@ -847,8 +873,9 @@ fn build_origin_with_probe_caches(
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        engine: engine.clone(),
     });
-    origin
+    (origin, engine, engine_tmp)
 }
 
 /// [`build_origin_with_timeout`] with a DETERMINISTIC ranked order, by pre-seeding
@@ -876,7 +903,7 @@ fn build_origin_with_probe_caches(
 /// RTT are what feed the score. The slice order is only the provider set (also used to
 /// build the active staker set the cached path re-checks); the rank is recomputed.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-fn build_origin_seeded_ranking(
+async fn build_origin_seeded_ranking(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hash: Hash,
@@ -888,7 +915,7 @@ fn build_origin_seeded_ranking(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let probe_cache = PositiveProbeCache::new();
     probe_cache.insert(
         ContentHash::from_bytes(*hash.as_bytes()),
@@ -923,13 +950,14 @@ fn build_origin_seeded_ranking(
         // Reactive mid-pull top-up off; only the #1530 tests turn it on.
         U256::ZERO,
     )
+    .await
 }
 
 /// Build a `NodeOrigin` whose directory maps SEVERAL hashes to the same provider set, so a
 /// test can pull two different blobs from one provider through one shared `deps` — and thus
 /// one shared `wedged_providers` map (#1145 review). `max_blob_size_bytes` is 0 (no ceiling).
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
-fn build_origin_multi_hash(
+async fn build_origin_multi_hash(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
     hashes: &[Hash],
@@ -941,11 +969,14 @@ fn build_origin_multi_hash(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-) -> NodeOrigin {
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let mut dir = HashMap::new();
     for _h in hashes {
         dir.insert(U256::ZERO, providers.to_vec());
     }
+    let (engine, engine_tmp) = throwaway_engine()
+        .await
+        .expect("throwaway engine for the node-origin fixture");
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
@@ -987,8 +1018,9 @@ fn build_origin_multi_hash(
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        engine: engine.clone(),
     });
-    origin
+    (origin, engine, engine_tmp)
 }
 
 /// Convenience: a single-provider directory entry + its resolver binding.
@@ -1036,6 +1068,20 @@ fn counter_value(metrics: &Arc<Metrics>, name: &str) -> Result<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(0);
     Ok(val)
+}
+
+/// A fresh, empty destination cache for a `NodeOrigin`'s node-to-node pull to
+/// stream into (#1682): `NodeOriginDeps.engine` is where `pull_from_candidate`
+/// admits each gap via `admit_bao_stream`, so every fixture that provisions an
+/// origin needs one, whether or not the fixture reads its contents back.
+///
+/// Returns the `TempDir` guard alongside the engine: the builders below thread it
+/// through to their own caller, which binds it for the life of the test so its drop
+/// reclaims the backing directory.
+async fn throwaway_engine() -> Result<(CacheEngine, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let engine = CacheEngine::open(dir.path(), vec![], 16).await?;
+    Ok((engine, dir))
 }
 
 /// Build a cache pre-seeded with every payload in `payloads`: a one-shard
@@ -1192,7 +1238,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -1202,7 +1248,8 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     // Discover → probe → open (with binding) → A reactively pulls its own origin
     // → serve. A held nothing in-store, so a successful pull is proof of the
@@ -1210,9 +1257,11 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("node-origin chained fetch failed: {e}"))?;
-    let bytes = fetched.collect_to_bytes().await?.ok_or_else(|| {
-        anyhow::anyhow!("node-origin returned NotFound; the chained reactive pull did not fire")
-    })?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "node-origin did not admit the blob; the chained reactive pull did not fire"
+    );
+    let bytes = engine.get(hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "chained-pull bytes mismatch"
@@ -1312,7 +1361,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
         HashMap::from([(*a_id.as_bytes(), "DE".to_string())]),
     ))));
-    let (origin, recorded) = provisioned_origin_with_accountant(
+    let (origin, engine, recorded, _engine_tmp) = provisioned_origin_with_accountant(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -1323,16 +1372,18 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         &region_accountant,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     // --- The orchestration: discover → probe → rank → open → pull. ------------
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
-    let bytes = fetched
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("node-origin returned NotFound; expected the blob"))?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "node-origin did not admit the blob; expected the pull to deliver it"
+    );
+    let bytes = engine.get(hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -1376,6 +1427,173 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         "expected DE bytes_in == {total_bytes}, got {:?}",
         region_accountant.snapshot()
     );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// A large node-to-node populate lands the blob complete and durable, driven
+/// through the streaming pull (no whole-blob RAM buffer). #1682.
+///
+/// Twin of [`node_origin_pull_fills_and_records_reputation`], but driven through
+/// `CacheEngine::populate` rather than a bare `Origin::fetch` call, and over a
+/// blob several chunk groups past the old 4 MiB buffered threshold — the point
+/// of the port is only exercised once the pull spans more than one gap-driven
+/// range.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn large_blob_populates_via_streaming_pull() -> Result<()> {
+    const LARGE_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+    let mut payload = vec![0u8; LARGE_PAYLOAD_LEN];
+    let mut x: u32 = 0x9e37_79b9;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(LARGE_PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let pool_id = B256::repeat_byte(0xA2);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin, whose own cache is
+    // the destination the streaming pull admits into. -------------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+
+    // Deferred-initialisation pattern (see `node_origin` module docs): the
+    // `NodeOrigin` is built empty, placed in node B's own cache's origin chain,
+    // then provisioned with that SAME cache as `NodeOriginDeps.engine` — the
+    // streaming pull admits straight into it.
+    let origin = NodeOrigin::new();
+    let cache_dir_b = tempfile::tempdir()?;
+    let engine_b = CacheEngine::open(
+        cache_dir_b.path(),
+        vec![Arc::new(origin.clone()) as Arc<dyn Origin>],
+        16,
+    )
+    .await?;
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let mut dir = HashMap::new();
+    dir.insert(U256::ZERO, providers.clone());
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
+            *b_id.as_bytes(),
+        )))),
+        staker_set: Arc::new(ConfigStakerSet::new(providers.into_iter().collect()))
+            as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
+        slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
+        local_rep: Arc::clone(&local_rep),
+        negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
+        metrics: Arc::clone(&b_metrics),
+        region_accountant: empty_region_accountant(),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(20),
+            max_blob_size_bytes: 0,
+            max_rate_per_mb: 0,
+            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
+            working_deposit: U256::ZERO,
+            event_poll_interval: Duration::from_millis(50),
+            lookup: decdn_node::dht::LookupConfig::default(),
+            own_region: None,
+        },
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        engine: engine_b.clone(),
+    });
+
+    // --- Populate node B's cache: discover → probe → rank → open → stream. ----
+    engine_b.populate(hash).await?;
+
+    anyhow::ensure!(
+        engine_b.has(hash).await?,
+        "blob must be present after populate"
+    );
+    let got = engine_b.get(hash).await?;
+    anyhow::ensure!(got.len() as u64 == total_bytes, "full blob length");
+    anyhow::ensure!(got.as_ref() == payload.as_slice(), "content matches");
 
     ep_b.close().await;
     ep_a.close().await;
@@ -2212,7 +2430,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     // a loaded runner's live-probe jitter could otherwise float A ahead of the staller,
     // deliver from A first, and leave the staller untried (no timeout, flake). See
     // `build_origin_seeded_ranking`.
-    let origin = build_origin_seeded_ranking(
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2231,16 +2449,18 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         // `StreamResponse`), so it must be the 1 s open budget above that abandons
         // the candidate, not the streaming inactivity bound (#1134).
         Duration::from_secs(20),
-    );
+    )
+    .await;
 
     // The orchestration must abandon the staller and deliver from A.
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
-    let bytes = fetched
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected the blob from the honest fallback candidate"))?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "expected the blob from the honest fallback candidate"
+    );
+    let bytes = engine.get(hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -2455,7 +2675,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     // real value — it is a term of the outer deadline.
     let stall_budget = Duration::from_secs(20);
     let per_candidate = Duration::from_secs(2);
-    let origin = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2468,7 +2688,8 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         per_candidate,
         stall_budget,
         0,
-    );
+    )
+    .await;
 
     // The loop must abandon BOTH wedged candidates on their own budgets and still
     // deliver from A — inside the outer deadline the runtime would really give it,
@@ -2486,10 +2707,11 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     .await
     .map_err(|_| anyhow::anyhow!("fetch never returned: the wedged opens starved the loop"))?
     .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
-    let bytes = fetched
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected the blob from the honest fallback candidate"))?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "expected the blob from the honest fallback candidate"
+    );
+    let bytes = engine.get(hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -2708,7 +2930,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     // is a multiplicative term in the ranker, so a loaded runner's probe jitter could
     // otherwise float A ahead of a staller and leave it untried (only one timeout, flake).
     // See `build_origin_seeded_ranking`.
-    let origin = build_origin_seeded_ranking(
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2720,7 +2942,8 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         addr_map,
         per_candidate,
         Duration::from_secs(20),
-    );
+    )
+    .await;
 
     // The open loop must abandon BOTH stallers on their own budgets and open A.
     let opened = tokio::time::timeout(
@@ -2805,7 +3028,7 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     let b_id = fresh_key().public();
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
-    let (origin, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2815,7 +3038,8 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
         &b_metrics,
         Vec::new(),
         HashMap::new(),
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -2877,7 +3101,7 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     // Provider discovered, but addr_map is EMPTY → unresolvable.
-    let (origin, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2887,7 +3111,8 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
         &b_metrics,
         vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
         HashMap::new(),
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -2923,7 +3148,7 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
         DhtNodeId::from_bytes(*a_id.as_bytes()),
         Address::repeat_byte(0x44),
     );
-    let (origin, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2933,7 +3158,8 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
         &b_metrics,
         vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
         addr_map,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -2993,7 +3219,7 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, recorded) = provisioned_origin(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3003,7 +3229,8 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -3082,7 +3309,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3092,7 +3319,8 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -3186,7 +3414,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3199,7 +3427,8 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // What a failed pull ANSWERS with is itself reason-dependent (#1560), and the
     // split is the fix: `BadSignature`/`WrongSigner` mean the upstream could not
@@ -3344,7 +3573,7 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_seeded_ranking(
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3357,7 +3586,8 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
         Duration::from_secs(20),
         // The fault: no stall budget means no pull may legally run.
         Duration::ZERO,
-    );
+    )
+    .await;
 
     let miss = tokio::time::timeout(
         Duration::from_secs(10),
@@ -3496,7 +3726,7 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
 
         let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
         let b_metrics = Arc::new(Metrics::new());
-        let origin = build_origin_seeded_ranking(
+        let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
             &ep_b,
             DhtNodeId::from_bytes(*b_id.as_bytes()),
             hash,
@@ -3508,7 +3738,8 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
             addr_map,
             DEFAULT_TEST_PULL_DEADLINES.0,
             DEFAULT_TEST_PULL_DEADLINES.1,
-        );
+        )
+        .await;
 
         let miss = tokio::time::timeout(
             Duration::from_secs(10),
@@ -3607,7 +3838,7 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_seeded_ranking(
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3619,7 +3850,8 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
         addr_map,
         Duration::from_secs(20),
         Duration::ZERO,
-    );
+    )
+    .await;
 
     let err = tokio::time::timeout(
         Duration::from_secs(10),
@@ -3695,7 +3927,7 @@ async fn window_open_still_reports_an_honest_refusal_as_a_clean_miss() -> Result
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3705,7 +3937,8 @@ async fn window_open_still_reports_an_honest_refusal_as_a_clean_miss() -> Result
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     let miss = tokio::time::timeout(
         Duration::from_secs(20),
@@ -3855,7 +4088,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_seeded_ranking(
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3867,7 +4100,8 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         Duration::from_secs(20),
@@ -3876,13 +4110,11 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     .await
     .map_err(|_| anyhow::anyhow!("fetch never returned"))?
     .map_err(|e| anyhow::anyhow!("a walk that reached an honest candidate must deliver: {e}"))?;
-    let delivered = got
-        .collect_to_bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("drain the delivered stream: {e}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("the honest fallback held the blob; the walk must not miss")
-        })?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "the honest fallback held the blob; the walk must not miss"
+    );
+    let delivered = engine.get(hash).await?;
     anyhow::ensure!(
         delivered.as_ref() == payload.as_slice(),
         "the fallback candidate's bytes must be the ones returned"
@@ -3941,7 +4173,7 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -3951,7 +4183,8 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -4390,26 +4623,27 @@ fn spawn_a_paid_then_silent_server(
 }
 
 /// A pull that is CANCELLED mid-stream must still persist the voucher watermark the
-/// upstream already acked (#1145 review).
+/// upstream already acked (#1145 review, #852).
 ///
-/// Cancellation is not an exotic path here — it is the designed behaviour, and #1134
-/// is what made it reachable. The buffered pull now carries `hard_cap: None`, so
-/// nothing INSIDE it ends a slow-but-progressing transfer. Everything that does end
-/// one is external, and every one of them DROPS the future rather than returning
-/// through it: the foreground `outer_pull_deadline`, or the serve future being
-/// dropped (client disconnect, node shutdown).
+/// Cancellation is not an exotic path here — it is the designed behaviour. The pull
+/// carries `hard_cap: None`, so nothing INSIDE it ends a slow-but-progressing
+/// transfer. Everything that does end one is external, and every one of them DROPS
+/// the `fetch` future rather than returning through it: the foreground
+/// `outer_pull_deadline`, or the serve future being dropped (client disconnect, node
+/// shutdown). Dropping the future cancels the pull's `CancellationToken`, which the
+/// off-thread `drive` selects on and stops.
 ///
-/// `VoucherProgress` promises that its copy-back "runs on every return path … so the
-/// latest acked totals survive a mid-stream failure". A drop is not a return path.
-/// The money is spent the instant the upstream acks, but the watermark lived in the
-/// cancelled frame and died with it — so the next pull re-signs a stale nonce, the
-/// upstream rejects `StaleNonce`, and `OurVoucherRejected` skips the candidate
-/// without a word, for the whole 90-day life of the channel.
+/// The money is spent the instant the upstream acks, so the watermark must outlive the
+/// dropped future. It does: the [`SettleOnDrop`] guard rides the PULL THREAD (not the
+/// `fetch` future), so it persists the final acked watermark AFTER the cancelled
+/// `drive` fully stops. Lose that — settle nothing, or settle a stale value from the
+/// racing outer future — and the next pull re-signs a spent nonce, the upstream rejects
+/// `StaleNonce`, and the channel wedges for the whole life of the lane.
 ///
-/// The cancellation here is a short `timeout` that drops the fetch — standing in for
-/// the three real droppers — against a stall budget long enough that `PullStalled`
-/// cannot be what ends it. The bytes were paid for either way; the only question the
-/// test asks is whether we wrote that down.
+/// The cancellation here is a `timeout` that drops the fetch — standing in for the real
+/// droppers — against a stall budget long enough that `PullStalled` cannot be what ends
+/// it. The bytes were paid for either way; the test asks only whether we wrote that
+/// down, and wrote it exactly once at the acked watermark.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Result<()> {
@@ -4461,7 +4695,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -4476,7 +4710,8 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         // deadline provably is NOT what ends this pull. The drop is.
         Duration::from_mins(2),
         0,
-    );
+    )
+    .await;
 
     // Cancel it: `timeout` drops the fetch future exactly as the foreground
     // `outer_pull_deadline` and node shutdown do.
@@ -4495,17 +4730,42 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // VOUCHER_INTERVAL_BYTES of bytes, `ceil(VOUCHER_INTERVAL_BYTES × RATE / 1 MiB)`
     // in amount. That is real USDC, and it must be on the buyer's books even though
     // the pull that spent it never returned.
+    //
+    // The persist happens on the PULL THREAD, not on the dropped `fetch` future:
+    // dropping the future cancels the token, and the pull thread then stops `drive`,
+    // yields `ABANDON_DRAIN` so the abandoned upstream connection drains, and only then
+    // drops its `SettleOnDrop` guard. So the watermark lands a beat AFTER the
+    // cancellation, not synchronously with it — poll for it rather than reading once.
+    // (Were the settle still on the outer future, or missing, this poll would time out:
+    // that is the wedge this test guards.)
     let interval_amount = min_payment(VOUCHER_INTERVAL_BYTES, RATE);
+    let want = vec![(
+        a_eth.address(),
+        U256::from(VOUCHER_INTERVAL_BYTES),
+        interval_amount,
+    )];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while progress_log(&recorded)? != want {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "a cancelled pull must persist the watermark the upstream already acked, \
+             from the pull thread — otherwise the next reuse re-signs a stale nonce and \
+             the channel wedges until it expires. Got {:?}",
+            progress_log(&recorded)?
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And it settles EXACTLY once, at that acked watermark: the pull thread stopped the
+    // instant it was cancelled (#1610), so it never advances the ledger past the acked
+    // interval and never persists a second, higher (or regressed) watermark that a later
+    // reuse would collide with. Give a stopped pull room to misbehave, then re-check the
+    // log is still the single acked entry.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     anyhow::ensure!(
-        progress_log(&recorded)?
-            == vec![(
-                a_eth.address(),
-                U256::from(VOUCHER_INTERVAL_BYTES),
-                interval_amount
-            )],
-        "a cancelled pull must persist the watermark the upstream already acked — \
-         otherwise the next reuse re-signs a stale nonce and the channel wedges until \
-         it expires. Got {:?}",
+        progress_log(&recorded)? == want,
+        "a cancelled pull must settle once at the acked watermark and not keep \
+         advancing after cancel; got {:?}",
         progress_log(&recorded)?
     );
 
@@ -4823,7 +5083,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -4836,7 +5096,8 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         Duration::from_secs(10),
         EMPTY_CHUNK_STALL_BUDGET,
         0,
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         EMPTY_CHUNK_ASSERT_WINDOW,
@@ -4920,7 +5181,7 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -4933,7 +5194,8 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         Duration::from_secs(10),
         EMPTY_CHUNK_STALL_BUDGET,
         0,
-    );
+    )
+    .await;
 
     // The OPEN is honest (a valid signed response), so this must succeed — the
     // hostility is entirely in the frames that follow.
@@ -5042,7 +5304,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5059,7 +5321,8 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         Duration::from_secs(20),
         Duration::from_secs(2),
         0,
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         Duration::from_secs(30),
@@ -5164,7 +5427,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5179,7 +5442,8 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         Duration::from_secs(20),
         Duration::from_secs(2),
         0,
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         Duration::from_secs(30),
@@ -5292,7 +5556,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5308,7 +5572,8 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         Duration::from_secs(30),
@@ -5409,7 +5674,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5423,7 +5688,8 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         Duration::from_secs(30),
@@ -5521,7 +5787,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     }) as Arc<dyn PoolOpener>;
     let mut addr_map = HashMap::new();
     addr_map.insert(a_dht, a_eth.address());
-    let origin = build_origin_multi_hash(
+    let (origin, _engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
         b_dht,
         &[hash1, hash2],
@@ -5533,7 +5799,8 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-    );
+    )
+    .await;
 
     // Pull 1 (hash1): A wedges its channel. One wedge event.
     let got1 = tokio::time::timeout(
@@ -5645,7 +5912,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5659,7 +5926,8 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     let got = tokio::time::timeout(
         Duration::from_secs(30),
@@ -5863,7 +6131,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let origin = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -5876,7 +6144,8 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         per_candidate,
         stall_budget,
         0,
-    );
+    )
+    .await;
 
     // The REAL production deadline, derived exactly as the runtime derives it. This is the
     // whole point: an assertion against a generously hand-picked number would pass with a
@@ -5894,17 +6163,16 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     })?
     .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
 
-    let bytes = fetched
-        .collect_to_bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("collect: {e}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the loop gave up before reaching the healthy candidate #3 — two silent \
-                 candidates consumed a budget the outer deadline had not allowed for"
-            )
-        })?;
-    anyhow::ensure!(bytes == payload, "wrong bytes from candidate #3");
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "the loop gave up before reaching the healthy candidate #3 — two silent \
+         candidates consumed a budget the outer deadline had not allowed for"
+    );
+    let bytes = engine.get(hash).await?;
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "wrong bytes from candidate #3"
+    );
 
     // Both silent candidates were classified as stalls (not as our own deadline firing),
     // which is what proves they were abandoned on the STALL bound — the stage whose budget
@@ -5993,7 +6261,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6008,18 +6276,19 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         // silent, so the inactivity bound must never fire.
         Duration::from_secs(5),
         0,
-    );
+    )
+    .await;
 
     let started = std::time::Instant::now();
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("a slow-but-healthy pull must complete, got: {e}"))?;
-    let bytes = fetched.collect_to_bytes().await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "a slow-but-healthy pull returned NotFound: the transfer was killed by a \
-             whole-blob deadline it should no longer have (#1134)"
-        )
-    })?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "a slow-but-healthy pull returned NotFound: the transfer was killed by a \
+         whole-blob deadline it should no longer have (#1134)"
+    );
+    let bytes = engine.get(hash).await?;
     let elapsed = started.elapsed();
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
@@ -6194,7 +6463,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6207,16 +6476,18 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // N refuses; the loop falls through to A, which delivers.
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("node-origin fetch failed: {e}"))?;
-    let bytes = fetched
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected the blob from the candidate that holds it"))?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "expected the blob from the candidate that holds it"
+    );
+    let bytes = engine.get(hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -6253,10 +6524,8 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("second node-origin fetch failed: {e}"))?;
     anyhow::ensure!(
-        refetched
-            .collect_to_bytes()
-            .await?
-            .is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(refetched, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "the second fetch must still deliver the blob from A"
     );
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
@@ -6347,7 +6616,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_negative_cache(
+    let (origin, _engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6361,7 +6630,8 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         Duration::from_secs(20),
         0,
         NegativeProbeCache::with_capacity_and_ttl(16, TINY_CACHE_TTL),
-    );
+    )
+    .await;
 
     // Pull #1: refused, and the refusal records a suppression whose TTL is the thing under
     // test.
@@ -6491,7 +6761,7 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6504,14 +6774,16 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
-    anyhow::ensure!(got.is_none(), "a refused pull must not surface bytes");
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a refused pull must not surface bytes"
+    );
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
     let count = counter_value(&b_metrics, "probe_post_eviction_failures_total")?;
 
@@ -6585,7 +6857,7 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, _engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6595,7 +6867,8 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -6705,7 +6978,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let origin = provisioned_origin_with_ceiling(
+    let (origin, _engine, _engine_tmp) = provisioned_origin_with_ceiling(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6716,7 +6989,8 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         providers,
         addr_map,
         ceiling,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -6837,7 +7111,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
     // `0` ceiling => unlimited blob size, so the blob gate cannot fire; the origin's
     // NodeOriginConfig.max_rate_per_mb defaults to 0, so only the probe-relative
     // bound applies — exactly what we are exercising.
-    let origin = provisioned_origin_with_ceiling(
+    let (origin, _engine, _engine_tmp) = provisioned_origin_with_ceiling(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6848,7 +7122,8 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         providers,
         addr_map,
         0,
-    );
+    )
+    .await;
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
         .await
@@ -6886,13 +7161,20 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
-    let payload = vec![0xABu8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
+    // Two DISTINCT blobs, same size, served by the same provider A. Gap-driven
+    // `drive()` re-derives `missing_ranges` from the cache store (#1675), so a
+    // second fetch of the SAME blob is already-cached and pulls/pays nothing —
+    // that would starve this test of the second pull the #852 watermark-reuse
+    // invariant needs. Two distinct hashes force both fetches to actually pull,
+    // so both advance the shared channel's watermark.
+    let payload1 = vec![0xABu8; PAYLOAD_LEN];
+    let payload2 = vec![0xCDu8; PAYLOAD_LEN];
+    let hash1 = Hash::new(&payload1);
+    let hash2 = Hash::new(&payload2);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    // --- Node A: holds the blob; serves probe + client over one endpoint. -----
-    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
-    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    // --- Node A: holds both blobs; serves probe + client over one endpoint. ---
+    let (cache_a, _tmp_a) = cache_with_blobs(&[&payload1, &payload2]).await?;
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
@@ -6943,57 +7225,77 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
-    let _ = probe_once(
-        &ep_b,
-        EndpointAddr::new(a_id).with_ip_addr(addr_a),
-        *hash.as_bytes(),
-        1,
-        Duration::from_secs(10),
-    )
-    .await?;
+    for hash in [hash1, hash2] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(a_id).with_ip_addr(addr_a),
+            *hash.as_bytes(),
+            1,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
-    let (providers, addr_map) =
-        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, recorded) = provisioned_origin(
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
-        hash,
-        pool_id,
-        &b_buyer,
+        &[hash1, hash2],
+        buyer,
         &local_rep,
         &b_metrics,
-        providers,
+        &empty_region_accountant(),
+        &[a_dht],
         addr_map,
-    );
+        DEFAULT_TEST_PULL_DEADLINES.0,
+        DEFAULT_TEST_PULL_DEADLINES.1,
+    )
+    .await;
 
-    // First pull: opens the channel, pays nonce 1..2, persists the watermark.
-    let first = Origin::fetch(&origin, hash, u64::MAX)
+    // First pull (hash1): opens the channel against A, pays nonce 1..2, persists
+    // the watermark.
+    let first_fetch = Origin::fetch(&origin, hash1, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch failed: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("first fetch returned NotFound"))?;
+        .map_err(|e| anyhow::anyhow!("first fetch failed: {e}"))?;
     anyhow::ensure!(
-        first.as_ref() == payload.as_slice(),
+        matches!(first_fetch, OriginFetch::AlreadyAdmitted),
+        "first fetch returned NotFound"
+    );
+    let first = engine.get(hash1).await?;
+    anyhow::ensure!(
+        first.as_ref() == payload1.as_slice(),
         "first pull bytes mismatch"
     );
 
-    // Second pull: REUSES the channel, resumes from the persisted watermark, and
-    // the upstream accepts the continued nonces — this is the bug's fix.
-    let second = Origin::fetch(&origin, hash, u64::MAX)
+    // Second pull (hash2, a DISTINCT blob not yet cached): REUSES the same
+    // channel, resumes from the persisted watermark, and the upstream accepts
+    // the continued nonces — this is the bug's fix. Fetching a distinct hash
+    // (rather than re-fetching hash1) is what forces this leg to actually pull:
+    // `drive()` re-derives `missing_ranges` from the cache store, so re-fetching
+    // an already-cached blob would pull and pay nothing (#1675) and leave the
+    // watermark untouched.
+    let second_fetch = Origin::fetch(&origin, hash2, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch failed: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "second fetch returned NotFound — stale voucher rejected (the #852 bug)"
-            )
-        })?;
+        .map_err(|e| anyhow::anyhow!("second fetch failed: {e}"))?;
     anyhow::ensure!(
-        second.as_ref() == payload.as_slice(),
+        matches!(second_fetch, OriginFetch::AlreadyAdmitted),
+        "second fetch returned NotFound — stale voucher rejected (the #852 bug)"
+    );
+    let second = engine.get(hash2).await?;
+    anyhow::ensure!(
+        second.as_ref() == payload2.as_slice(),
         "second pull bytes mismatch"
     );
 
@@ -7109,7 +7411,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin(
+    let (origin, engine, _engine_tmp) = build_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -7119,16 +7421,19 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         &empty_region_accountant(),
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     // The pull delivers the verified bytes even though persisting the watermark
     // failed — the persist error must not discard already-paid-for content.
-    let bytes = Origin::fetch(&origin, hash, u64::MAX)
+    let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("fetch failed: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("persist failure must not turn the pull into NotFound"))?;
+        .map_err(|e| anyhow::anyhow!("fetch failed: {e}"))?;
+    anyhow::ensure!(
+        matches!(fetched, OriginFetch::AlreadyAdmitted),
+        "persist failure must not turn the pull into NotFound"
+    );
+    let bytes = engine.get(hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "delivered bytes mismatch"
@@ -7444,7 +7749,7 @@ async fn build_node_b_with_leaves(
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) = one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth_addr);
-    let (origin, recorded) = provisioned_origin_with_deadlines(
+    let (origin, _engine, recorded, _engine_tmp) = provisioned_origin_with_deadlines(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -7456,7 +7761,8 @@ async fn build_node_b_with_leaves(
         providers,
         addr_map,
         node_pull_deadlines,
-    );
+    )
+    .await;
 
     // B's empty cache (the tee fills it) and the leaf's channel in B's store.
     let cache_tmp = tempfile::tempdir()?;
@@ -9383,6 +9689,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
 
+    let (engine, _engine_tmp) = throwaway_engine().await?;
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
@@ -9424,6 +9731,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        engine: engine.clone(),
     });
 
     // The two misses race, exactly as two cache misses for different blobs do.
@@ -9431,26 +9739,20 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         Origin::fetch(&origin, hash, u64::MAX),
         Origin::fetch(&origin, hash2, u64::MAX),
     );
-    let got1 = first
-        .map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the first concurrent pull returned NOTHING — its voucher collided with the \
-                 other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
-            )
-        })?;
-    let got2 = second
-        .map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the second concurrent pull returned NOTHING — its voucher collided with the \
-                 other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
-            )
-        })?;
+    let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
+    anyhow::ensure!(
+        matches!(first, OriginFetch::AlreadyAdmitted),
+        "the first concurrent pull returned NOTHING — its voucher collided with the \
+         other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+    );
+    let got1 = engine.get(hash).await?;
+    let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
+    anyhow::ensure!(
+        matches!(second, OriginFetch::AlreadyAdmitted),
+        "the second concurrent pull returned NOTHING — its voucher collided with the \
+         other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+    );
+    let got2 = engine.get(hash2).await?;
     anyhow::ensure!(got1.as_ref() == payload.as_slice(), "blob 1 bytes mismatch");
     anyhow::ensure!(
         got2.as_ref() == payload2.as_slice(),
@@ -9582,7 +9884,7 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -9592,15 +9894,15 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(first, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob"
     );
     anyhow::ensure!(probes.load(Ordering::SeqCst) == 1, "first fetch must probe");
@@ -9608,11 +9910,10 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
 
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(second, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "second fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -9725,7 +10026,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     // A 300ms positive-cache TTL: short enough that a real sleep past it is not a
     // test-suite hazard, unlike the production 15s (anchored on `Instant`, so
     // `tokio::time::pause` cannot fast-forward it).
-    let origin = build_origin_with_probe_caches(
+    let (origin, engine, _engine_tmp) = build_origin_with_probe_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -9744,15 +10045,15 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         U256::ZERO,
         // Reactive mid-pull top-up off; only the #1530 tests turn it on.
         U256::ZERO,
-    );
+    )
+    .await;
 
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(first, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob"
     );
     anyhow::ensure!(probes.load(Ordering::SeqCst) == 1, "first fetch must probe");
@@ -9763,11 +10064,10 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
 
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(second, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "second fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -9881,7 +10181,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     // Directory keyed ONLY under namespace NS (no `NO_NAMESPACE` entry).
-    let origin = build_origin_with_probe_caches(
+    let (origin, _engine, _engine_tmp) = build_origin_with_probe_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -9899,7 +10199,8 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         U256::from(NS),
         // Reactive mid-pull top-up off; only the #1530 tests turn it on.
         U256::ZERO,
-    );
+    )
+    .await;
 
     // Negative control FIRST (before any pull warms the hash-keyed probe cache):
     // a `NO_NAMESPACE` pull finds no directory origin and no cached candidate, so
@@ -10053,7 +10354,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10066,18 +10367,17 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // Fetch #1: cold path. Discovers, probes, and ranks all three; the whole
     // MAX_PROVIDER_ATTEMPTS budget is spent refusing, and the ranked list is
     // cached at `probe_and_rank`'s tail regardless of the miss.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_none(),
+        matches!(first, OriginFetch::NotFound),
         "all three providers refuse; the first fetch must miss"
     );
     anyhow::ensure!(
@@ -10093,11 +10393,9 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     // and must not re-probe anyone.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_none(),
+        matches!(second, OriginFetch::NotFound),
         "the cached candidates all refuse again; the second fetch must miss too"
     );
     anyhow::ensure!(
@@ -10119,11 +10417,9 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     // a fresh lookup that re-probes all three at the wire.
     let third = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("third fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("third fetch: {e}"))?;
     anyhow::ensure!(
-        third.is_none(),
+        matches!(third, OriginFetch::NotFound),
         "all three providers still refuse; the third fetch must miss too"
     );
     anyhow::ensure!(
@@ -10242,7 +10538,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let origin = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10255,18 +10551,17 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // Fetch #1: cold path (cache empty). H is undiscoverable, so only N is
     // probed and cached — a SINGLE cached candidate, fewer than
     // `MAX_PROVIDER_ATTEMPTS`. N refuses, so the fetch is a clean miss.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_none(),
+        matches!(first, OriginFetch::NotFound),
         "H is unreachable and N refuses; the first fetch must miss"
     );
     anyhow::ensure!(
@@ -10357,11 +10652,10 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     // H, ranks H first (cheaper rate), and delivers via H without retrying N.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(second, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "the second fetch must deliver the blob via the cold fallthrough"
     );
     anyhow::ensure!(
@@ -10518,7 +10812,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10531,7 +10825,8 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // Fetch #1: cold path. N is tried first (cheaper rate), refuses NotFound
     // (negative-cached for `REFUSAL_SUPPRESSION_TTL`), and the loop falls
@@ -10539,11 +10834,10 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     // pair is cached at `probe_and_rank`'s tail.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(first, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob from A"
     );
     anyhow::ensure!(
@@ -10564,11 +10858,10 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     // and re-refuse: exactly the positive cache undoing the negative one.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(second, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "second fetch must still deliver the blob from A"
     );
     anyhow::ensure!(
@@ -10678,7 +10971,7 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let (origin, _recorded) = provisioned_origin(
+    let (origin, engine, _recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10688,17 +10981,17 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         &b_metrics,
         providers,
         addr_map,
-    );
+    )
+    .await;
 
     // The buffered fetch: cold path. Probes A once and writes the probe cache at
     // `probe_and_rank`'s tail.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("buffered fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("buffered fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(first, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "the buffered fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -10846,7 +11139,7 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -10859,18 +11152,17 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // The buffered fetch: cold path (cache empty). H is undiscoverable, so only N
     // is probed and cached — a SINGLE cached candidate, fewer than
     // `MAX_PROVIDER_ATTEMPTS`. N refuses, so the fetch is a clean miss.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("buffered fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("buffered fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_none(),
+        matches!(first, OriginFetch::NotFound),
         "H is unreachable and N refuses; the buffered fetch must miss"
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
@@ -11128,7 +11420,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11141,7 +11433,8 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // Call #1: cold path (cache empty). Discovers, probes, and ranks all three;
     // the whole budget is spent opening-and-refused, and the ranked list is cached
@@ -11314,7 +11607,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_with_timeout(
+    let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -11327,17 +11620,19 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         Duration::from_secs(20),
         Duration::from_secs(20),
         0,
-    );
+    )
+    .await;
 
     // Fetch #1: cold path. N is probed, ranked, cached — and its refusal
     // negative-caches (N, hash) for the full TTL, stranding the fresh positive
     // entry with no usable provider.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
-    anyhow::ensure!(first.is_none(), "N refuses; the first fetch must miss");
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(first, OriginFetch::NotFound),
+        "N refuses; the first fetch must miss"
+    );
     anyhow::ensure!(
         probes_n.load(Ordering::SeqCst) == 1,
         "expected N probed exactly once, got {}",
@@ -11357,11 +11652,9 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     // drops the suppressed N before it can be re-probed or re-streamed.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_none(),
+        matches!(second, OriginFetch::NotFound),
         "N is still suppressed; the second fetch must miss"
     );
     // THE property under test. A regressed `Some(vec![])` would meter this fetch
@@ -11531,7 +11824,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         recorded: Arc::new(Mutex::new(Vec::new())),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let origin = build_origin_multi_hash(
+    let (origin, engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         &[hash1, hash2],
@@ -11547,18 +11840,18 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         // these. The pulls that matter complete in milliseconds.
         Duration::from_secs(3),
         Duration::from_secs(3),
-    );
+    )
+    .await;
 
     // Fetch #1 (hash2): cold path. Both are probed and cached in the hash2 entry;
     // H (cheaper) ranks first and delivers, so A is never pulled — no negative
     // entry, no wedge, just a live cached candidate.
     let first = Origin::fetch(&origin, hash2, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_some_and(|b| b.as_ref() == payload2.as_slice()),
+        matches!(first, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash2).await?.as_ref() == payload2.as_slice(),
         "fetch #1 must deliver hash2 from H"
     );
     anyhow::ensure!(
@@ -11583,9 +11876,13 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(second, OriginFetch::NotFound),
         "fetch #2 must refuse: H lacks hash1 and A cannot be paid"
     );
+    // One logical pull to A opens TWO connections: `pull_from_candidate`'s free
+    // header handshake (to read `total_bytes`) plus the actual pull `drive()`
+    // opens inside it (#1675). Two streams here still means "A WAS pulled once
+    // (the hash1 wedge)", not twice.
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 1,
-        "A must be pulled exactly once (the hash1 wedge), got {}",
+        streams_a.load(Ordering::SeqCst) == 2,
+        "A must be pulled exactly once (handshake + drive, the hash1 wedge), got {}",
         streams_a.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
@@ -11614,10 +11911,11 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(third, OriginFetch::NotFound),
         "fetch #3 must miss: H is offline and A is wedged"
     );
-    // THE property under test, at the wire: A's one stream ever is the hash1
-    // wedge. A second open here is the hit path handing back the dead channel.
+    // THE property under test, at the wire: A's only pull ever is the hash1
+    // wedge (handshake + drive = the 2 streams above). A climb past 2 here is
+    // the hit path handing back the dead channel.
     anyhow::ensure!(
-        streams_a.load(Ordering::SeqCst) == 1,
+        streams_a.load(Ordering::SeqCst) == 2,
         "the cache hit re-streamed the WEDGED A — `cached_candidates` must filter a wedged \
          provider even when its (peer, hash) pair was never negative-cached, got {}",
         streams_a.load(Ordering::SeqCst)
@@ -11882,6 +12180,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     // `StaticOriginDirectory`, which cannot be mutated mid-test). A default 15s
     // positive-cache TTL keeps the fetch #1 entry live through the ejection and
     // fetch #2, so only the `is_active` re-check can drop it.
+    let (engine, _engine_tmp) = throwaway_engine().await?;
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
@@ -11918,17 +12217,17 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        engine: engine.clone(),
     });
 
     // Fetch #1: cold path. `find_providers` is empty (no routing entries), so the
     // directory fallback returns [A]; A is probed once, cached, and delivers.
     let first = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
-        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        matches!(first, OriginFetch::AlreadyAdmitted)
+            && engine.get(hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob from A"
     );
     anyhow::ensure!(
@@ -11936,9 +12235,13 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         "A must be probed exactly once on the cold path, got {}",
         a_probes.load(Ordering::SeqCst)
     );
+    // One logical pull to A opens TWO connections: `pull_from_candidate`'s free
+    // header handshake (to read `total_bytes`) plus the actual pull `drive()`
+    // opens inside it (#1675). Two streams here still means "A WAS pulled once",
+    // not twice — the assertion pins the connection count, not the pull count.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 1,
-        "A must be pulled exactly once on the cold path, got {}",
+        a_streams.load(Ordering::SeqCst) == 2,
+        "A must be pulled exactly once (handshake + drive) on the cold path, got {}",
         a_streams.load(Ordering::SeqCst)
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
@@ -11957,15 +12260,16 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     // so the fetch is a clean NotFound. Crucially, A is never re-contacted.
     let second = Origin::fetch(&origin, hash, u64::MAX)
         .await
-        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
-        .collect_to_bytes()
-        .await?;
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
-        second.is_none(),
+        matches!(second, OriginFetch::NotFound),
         "second fetch must miss — the only cached provider was ejected inside the TTL"
     );
+    // Still 2 — the same two connections from fetch #1's single pull. If the hit
+    // path re-served the ejected A, this would climb by another 2 (handshake +
+    // drive), not by 1.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 1,
+        a_streams.load(Ordering::SeqCst) == 2,
         "the hit re-served an EJECTED A — `is_active` must deny it on the hit path, got {} \
          streams",
         a_streams.load(Ordering::SeqCst)
@@ -12237,7 +12541,7 @@ async fn serve_with_deposit_ceiling(
     // Serve the RESUME leg (`byte_offset > 0`) slowly, AFTER the response is on the
     // wire so the delay lands in the chunk stream (`pull_to_sink`), not the open. The
     // paid-wait accounting must count this as the upstream serving bytes, not as our
-    // funding wait: it is the exact time `PulledBlob::paid_wait` must NOT absorb
+    // funding wait — it must not be charged against the delivery-speed elapsed clock
     // (#1602). Zero for every test but the delivery-speed regression.
     if req.byte_offset > 0 && !resume_delay.is_zero() {
         tokio::time::sleep(resume_delay).await;
@@ -12370,6 +12674,12 @@ fn spawn_deposit_capped_server(
 /// it paid.
 struct TopUpFixture {
     origin: NodeOrigin,
+    /// The engine the origin streams pulled bytes into — a test reads them back with
+    /// `engine.get(hash)` after a fetch reports `AlreadyAdmitted`.
+    engine: CacheEngine,
+    /// The engine's backing directory. Held for the fixture's lifetime so its drop does
+    /// not reclaim the store out from under an in-flight or still-inspected engine.
+    _engine_tmp: tempfile::TempDir,
     opener: Arc<FundingOpener>,
     metrics: Arc<Metrics>,
     local_rep: Arc<LocalReputation>,
@@ -12493,7 +12803,7 @@ async fn top_up_fixture_multi_rep(
     });
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let origin = build_origin_with_probe_caches(
+    let (origin, engine, engine_tmp) = build_origin_with_probe_caches(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -12510,10 +12820,13 @@ async fn top_up_fixture_multi_rep(
         PositiveProbeCache::new(),
         U256::ZERO,
         U256::from(setup.working_micro_usdc),
-    );
+    )
+    .await;
 
     Ok(TopUpFixture {
         origin,
+        engine,
+        _engine_tmp: engine_tmp,
         opener,
         metrics,
         local_rep,
@@ -12572,10 +12885,11 @@ async fn a_pull_larger_than_the_initial_deposit_tops_up_once_and_completes() -> 
     .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
 
-    let bytes = got
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("a topped-up pull must deliver the blob, not NotFound"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "a topped-up pull must deliver the blob, not NotFound"
+    );
+    let bytes = fixture.engine.get(Hash::new(payload.as_ref())).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "the resumed pull delivered {} bytes, expected {}",
@@ -12675,10 +12989,11 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
     .await
     .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
-    let bytes = got
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("a topped-up pull must deliver the blob, not NotFound"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "a topped-up pull must deliver the blob, not NotFound"
+    );
+    let bytes = fixture.engine.get(Hash::new(payload.as_ref())).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "the resumed pull delivered {} bytes, expected {}",
@@ -12749,7 +13064,7 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
     .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
     anyhow::ensure!(
-        got.collect_to_bytes().await?.is_some(),
+        matches!(got, OriginFetch::AlreadyAdmitted),
         "the pull must have completed for its spend to mean anything"
     );
 
@@ -12929,12 +13244,15 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 ///
 /// Concurrency makes the interleaving nondeterministic, so this cannot pin WHICH
 /// pull exhausts first — but with the clamp both orderings succeed, and without it
-/// the overshoot ordering corrupts, which is what a regression run trips on. The
-/// deterministic pin of the clamp itself is
-/// `resume::tests::a_concurrent_pulls_vouchers_cannot_push_the_frontier_past_decoded_bytes`.
+/// the overshoot ordering corrupts, which is what a regression run trips on. This is
+/// the deterministic pin of the `delivered_frontier` clamp in
+/// `decdn_client_pull::driver::drive`.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Result<()> {
-    let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 3 + 777;
+    // Four voucher intervals (`VOUCHER_INTERVAL_BYTES` is 4 MiB) of content per blob:
+    // large enough that each stream's ramped credit window (floored at one interval)
+    // cannot front the whole payload on credit, so real vouchers come due mid-pull.
+    let len = usize::try_from(VOUCHER_INTERVAL_BYTES).unwrap_or(usize::MAX) * 4 + 777;
     let payload_a: Arc<Vec<u8>> = Arc::new(
         (0..len)
             .map(|i| u8::try_from(i % 249).unwrap_or(0))
@@ -12949,12 +13267,15 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
     let hash_b = Hash::new(payload_b.as_ref());
     anyhow::ensure!(hash_a != hash_b, "fixtures must be distinct blobs");
 
-    // Roughly four wire intervals per blob at RATE, so the combined spend of two
-    // concurrent pulls exhausts an initial deposit sized for four — mid-blob, with
-    // real delivered-and-paid bytes on BOTH streams behind the rejection.
+    // The initial deposit funds roughly six wire intervals — enough for real
+    // progress on both streams, but well short of the combined ~eight intervals the
+    // two 4-interval blobs cost together, so the combined spend of the two
+    // concurrent pulls exhausts it mid-blob, with real delivered-and-paid bytes on
+    // BOTH streams behind the rejection. The working deposit is large enough for
+    // both to finish afterward.
     let fixture = top_up_fixture_multi(
         vec![Arc::clone(&payload_a), Arc::clone(&payload_b)],
-        TopUpSetup::honest(4 * RATE, 400 * RATE, true),
+        TopUpSetup::honest(6 * RATE, 400 * RATE, true),
     )
     .await?;
 
@@ -12967,16 +13288,18 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
     .await
     .map_err(|_| anyhow::anyhow!("concurrent top-up pulls never finished"))?;
 
-    let bytes_a = got_a
-        .map_err(|e| anyhow::anyhow!("fetch A: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("pull A must deliver, not NotFound"))?;
-    let bytes_b = got_b
-        .map_err(|e| anyhow::anyhow!("fetch B: {e}"))?
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("pull B must deliver, not NotFound"))?;
+    let got_a = got_a.map_err(|e| anyhow::anyhow!("fetch A: {e}"))?;
+    anyhow::ensure!(
+        matches!(got_a, OriginFetch::AlreadyAdmitted),
+        "pull A must deliver, not NotFound"
+    );
+    let bytes_a = fixture.engine.get(hash_a).await?;
+    let got_b = got_b.map_err(|e| anyhow::anyhow!("fetch B: {e}"))?;
+    anyhow::ensure!(
+        matches!(got_b, OriginFetch::AlreadyAdmitted),
+        "pull B must deliver, not NotFound"
+    );
+    let bytes_b = fixture.engine.get(hash_b).await?;
     // EXACT bytes, which is the whole point: an overshot frontier assembles a blob
     // with a gap where the truncate could not rewind, and the engine's hash check
     // turns that into a NotFound (caught above) — never silently wrong bytes.
@@ -12996,11 +13319,13 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
 
 /// The reactive top-up is bounded at ONE per pull, over the wire (#1600 review).
 ///
-/// The pure policy is pinned by `resume::tests::reactive_topups_are_bounded`; this
-/// pins the WIRING — the `topups += 1` the loop performs after a landed top-up.
-/// Removing that increment is currently invisible to every other test, because the
-/// funding double is idempotent against its target (a second call at the same
-/// target adds nothing, so `fund` reports no headroom and the loop stops anyway).
+/// The pure policy — refusing once `topups_used == max_topups` — is pinned in
+/// `decdn_client_pull::pacer`'s own unit tests; this pins the WIRING — the
+/// `topups_used` increment [`decdn_client_pull::driver::drive`] performs after a
+/// landed top-up. Removing that increment is currently invisible to every other
+/// test, because the funding double is idempotent against its target (a second call
+/// at the same target adds nothing, so the funder reports no headroom and the loop
+/// stops anyway).
 /// Here the working deposit is deliberately still too small for the blob, so a loop
 /// that did not count would keep funding-and-failing rather than ending after one.
 #[tokio::test(flavor = "multi_thread")]
