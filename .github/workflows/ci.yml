@@ -182,7 +182,7 @@ jobs:
           shared-key: public-api
           # Restore-only except on `main`; only `main` writes it (see clippy job).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.9
+      - uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-nextest
       - run: cargo nextest run -p decdn-protocol --features public-api-test
@@ -388,7 +388,7 @@ jobs:
           # job). This is the largest partition (~1.2 GiB instrumented target),
           # so gating its save is what most relieves the saturated cache store.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.9
+      - uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -662,7 +662,7 @@ jobs:
         with:
           shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.9
+      - uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-nextest
       # Hoist the cold contract compile out of the tests (#1620). Both anvil
@@ -754,7 +754,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.9
+      - uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-nextest
       # Hoist the cold contract compile out of the fixtures (#1620). Each
