@@ -371,18 +371,6 @@ impl std::fmt::Display for HashMismatch {
 
 impl std::error::Error for HashMismatch {}
 
-/// Typed sentinel for a server that claimed a `total_bytes` above the buyer's
-/// `max_blob_size_bytes` ceiling (#840). Returned (not a bare string) so the
-/// pull orchestrator can `downcast_ref` and classify it as a buyer-side policy
-/// rejection — distinct from a hash mismatch or an unreachable peer — rather
-/// than mis-attributing it to the provider's reputation. `Display` carries
-/// `BlobTooLarge` so logs and the existing requester tests can match on it.
-#[derive(Debug)]
-pub struct BlobTooLargeClaim {
-    pub claimed: u64,
-    pub ceiling: u64,
-}
-
 /// The requested `byte_offset` is at or past the blob's end, so no resume can be
 /// served from it (#1120).
 ///
@@ -415,18 +403,6 @@ impl std::fmt::Display for ResumeOffsetPastEnd {
 }
 
 impl std::error::Error for ResumeOffsetPastEnd {}
-
-impl std::fmt::Display for BlobTooLargeClaim {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "server claimed {} bytes, exceeding max_blob_size {} bytes (BlobTooLarge)",
-            self.claimed, self.ceiling
-        )
-    }
-}
-
-impl std::error::Error for BlobTooLargeClaim {}
 
 /// Typed sentinel for a server that signed an open-stage `StreamResponse`
 /// (`ok == true`) quoting a per-MB `rate_per_mb` above the buyer's effective
@@ -1173,11 +1149,10 @@ pub async fn stream_fetch(
         // the overall cap and the stall bound is harmless. Production paths take
         // `PullDeadlines` directly and split the two.
         PullDeadlines::whole_transfer(timeout),
-        // No buyer-side blob-size or rate ceiling on this test/loopback helper. The
-        // production pull path does not go through here — it calls
-        // `stream_fetch_tracked` directly (`node_origin::pull_from_candidate`)
-        // with its configured `max_blob_size_bytes` / `max_rate_per_mb`.
-        0,
+        // No buyer-side rate ceiling on this test/loopback helper. The production
+        // pull path does not go through here — it calls `stream_fetch_tracked`
+        // directly (`node_origin::pull_from_candidate`) with its configured
+        // `max_rate_per_mb`.
         0,
         &mut VoucherProgress::default(),
     )
@@ -1209,7 +1184,6 @@ pub async fn stream_fetch_tracked(
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
@@ -1224,7 +1198,6 @@ pub async fn stream_fetch_tracked(
         byte_offset,
         timestamp_us,
         deadlines,
-        max_blob_size_bytes,
         max_rate_per_mb,
         progress,
         None,
@@ -1262,7 +1235,6 @@ pub async fn stream_fetch_tracked_with_progress(
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     progress: &mut VoucherProgress,
     on_progress: Option<&ProgressCallback>,
@@ -1286,7 +1258,6 @@ pub async fn stream_fetch_tracked_with_progress(
             namespace_id,
             byte_offset,
             timestamp_us,
-            max_blob_size_bytes,
             max_rate_per_mb,
             deadlines.open,
             deadlines.stall,
@@ -1358,7 +1329,6 @@ pub async fn stream_fetch_shared(
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
 ) -> anyhow::Result<Bytes> {
     with_hard_cap(
@@ -1375,7 +1345,6 @@ pub async fn stream_fetch_shared(
             decdn_protocol::client::NO_NAMESPACE,
             byte_offset,
             timestamp_us,
-            max_blob_size_bytes,
             max_rate_per_mb,
             deadlines.open,
             deadlines.stall,
@@ -1579,7 +1548,6 @@ async fn fetch_inner(
     namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     open: Duration,
     stall: Duration,
@@ -1597,7 +1565,6 @@ async fn fetch_inner(
             namespace_id,
             byte_offset,
             timestamp_us,
-            max_blob_size_bytes,
             max_rate_per_mb,
             open,
             stall,
@@ -1807,7 +1774,6 @@ async fn fetch_inner_once(
     namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     open: Duration,
     stall: Duration,
@@ -1844,20 +1810,15 @@ async fn fetch_inner_once(
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
     }
-    // Reject an oversized server-claimed `total_bytes` before allocating or
-    // entering the receive loop — `total_bytes` is server-controlled and
-    // `StreamResponse::validate()` does not bound it, so the in-loop
-    // `cumulative > expected` guard alone would let one inflated promise drive
-    // us toward OOM. Mirrors the serving-side `BlobTooLarge` gate
-    // (handlers/client.rs); `0` = unlimited (#840). Typed sentinel so the pull
-    // orchestrator classifies it as a buyer-side policy rejection, not provider
-    // misbehavior.
-    if max_blob_size_bytes > 0 && resp.body.total_bytes > max_blob_size_bytes {
-        return Err(anyhow::Error::new(BlobTooLargeClaim {
-            claimed: resp.body.total_bytes,
-            ceiling: max_blob_size_bytes,
-        }));
-    }
+    // No blob-size ceiling here (#1678). `total_bytes` is server-controlled, but
+    // a size ceiling is a *local resource* policy and this requester has no
+    // resource to protect: every caller streams the body somewhere bounded — the
+    // node into `admit_bao_stream` at O(chunk-group), the buffered miss tier
+    // under its own `buffered_max_bytes` cap. Whoever owns the memory or the
+    // disk enforces its own bound; duplicating one here only meant a node could
+    // not fetch a blob its disk could hold. The in-loop `cumulative > expected`
+    // guard still stops an inflated promise from over-delivering.
+    //
     // Reject an over-ceiling rate before paying a single voucher (#1375). `resp`
     // is `ok == true` and already verified against `expected_signer`, so it is
     // the operator's own signed quote — carry it into the error as replayable
@@ -2284,8 +2245,10 @@ impl std::fmt::Debug for UpstreamPull {
 /// `total_bytes` is known up front), and return its header plus a live
 /// [`UpstreamPull`] to drive. The same response-validation rules as
 /// `stream_fetch` apply — zero-rate rejection, `slash_sig` recovery, echoed
-/// field checks, the [`BlobTooLargeClaim`] ceiling, and the
+/// field checks, the [`RateAboveCeiling`] quote bound, and the
 /// `total_bytes >= byte_offset` floor — all enforced BEFORE the first chunk.
+/// There is no blob-size ceiling here (#1678): the requester streams into a
+/// caller-owned sink, so bounding the size is the sink owner's job.
 ///
 /// # Errors
 ///
@@ -2317,7 +2280,6 @@ pub async fn open_progressive_pull(
     namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
@@ -2355,15 +2317,10 @@ pub async fn open_progressive_pull(
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
     }
-    // Same buyer-side ceiling as `fetch_inner`: reject an inflated `total_bytes`
-    // before forwarding/allocating anything (#840). Typed sentinel so the pull
-    // orchestrator classifies it as a buyer policy rejection, not provider fault.
-    if max_blob_size_bytes > 0 && resp.body.total_bytes > max_blob_size_bytes {
-        return Err(anyhow::Error::new(BlobTooLargeClaim {
-            claimed: resp.body.total_bytes,
-            ceiling: max_blob_size_bytes,
-        }));
-    }
+    // No blob-size ceiling here either — see `fetch_inner` (#1678). This leg
+    // forwards into a caller-supplied sink rather than a buffer, so there is
+    // even less to protect: the sink's own bound is the real one.
+    //
     // Same buyer-side rate ceiling as `fetch_inner` (#1375): refuse an over-ceiling
     // quote before the first paid interval, carrying the signed quote out as
     // rate-manipulation evidence. `0` = unbounded.

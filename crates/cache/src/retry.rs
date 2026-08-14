@@ -27,7 +27,7 @@
 //!   reclaims the bytes at `cache.gc_interval_sec` cadence) and the
 //!   error is classified, restarting the loop from the headers phase.
 //!   Memory stays bounded; disk amplification is
-//!   `(1 + max_retries) * max_blob_bytes` worst case until GC.
+//!   `(1 + max_retries) * disk_budget_bytes` worst case until GC.
 //!
 //! ## Coalescing interaction and the retry-amplification bound (#1615)
 //!
@@ -376,7 +376,7 @@ pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
     let inner = match inner.downcast::<BlobTooLargeMarker>() {
         Ok(marker) => {
             return OriginPullError::Permanent(anyhow::anyhow!(
-                "origin body exceeded max_blob_bytes={}",
+                "origin body exceeded disk_budget_bytes={}",
                 marker.max_bytes
             ));
         }

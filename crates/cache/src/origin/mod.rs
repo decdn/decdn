@@ -32,7 +32,7 @@ use crate::error::OriginPullError;
 
 /// Marker error packed into the `io::Error` that the cache's
 /// stream wrappers write to the engine's side channel when an
-/// origin delivers more than `max_blob_bytes`. The engine
+/// origin delivers more than `disk_budget_bytes`. The engine
 /// downcasts via `io::Error::get_ref` to surface
 /// `CacheError::BlobTooLarge` (matching the pre-streaming typed
 /// variant) instead of generic `OriginError`. Adapter-internal
@@ -49,7 +49,7 @@ impl std::fmt::Display for BlobTooLargeMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "origin stream exceeded max_blob_bytes={} mid-flight",
+            "origin stream exceeded disk_budget_bytes={} mid-flight",
             self.max_bytes
         )
     }
@@ -87,7 +87,7 @@ impl std::error::Error for BlobTooLargeMarker {}
 ///   (iroh-blobs GC reclaims the bytes at `cache.gc_interval_sec`
 ///   cadence, #518) and the retry loop restarts from the headers
 ///   phase. Worst-case orphaned bytes per fetch are
-///   `(1 + max_retries) * max_blob_bytes` until GC.
+///   `(1 + max_retries) * disk_budget_bytes` until GC.
 ///
 /// Typed `Permanent` markers short-circuit retry regardless of which
 /// path applies: the internal `BlobTooLargeMarker` surfaces as

@@ -924,7 +924,6 @@ where
         deps.namespace_id,
         0,
         micros_now(),
-        deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
         0,
@@ -933,6 +932,19 @@ where
     .map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
     let total_bytes = header.total_bytes;
     drop(first_pull);
+    // `--max-blob-mb` is enforced HERE rather than inside the requester (#1678).
+    // The requester dropped its ceiling because it has no resource of its own to
+    // protect — every caller streams the body somewhere bounded. This caller's
+    // bounded somewhere is the user's disk, and only the CLI knows what the user
+    // asked to spend of it. Checked on the header, before a byte is written or a
+    // voucher signed: `first_pull` is dropped above having paid nothing.
+    if total_bytes > deps.max_blob_bytes {
+        anyhow::bail!(
+            "provider claims {total_bytes} bytes, over the --max-blob-mb ceiling of {} bytes; \
+             raise --max-blob-mb to fetch it",
+            deps.max_blob_bytes
+        );
+    }
 
     // The store sits beside `output`, keyed by the output's own file name, so its
     // promoted final path IS `output` (no post-finalize rename) and its `.partial`
@@ -966,7 +978,6 @@ where
         deps.slash_dom,
         provider,
         deps.namespace_id,
-        deps.max_blob_bytes,
         deps.max_rate_per_mb,
         deps.deadlines,
     );

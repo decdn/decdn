@@ -225,8 +225,9 @@ fn validate_fails_when_config_flag_points_at_missing_file() -> anyhow::Result<()
     Ok(())
 }
 
-// Three independent problems across three sections: missing rpc_url,
-// max_blob_size_mb >= cache_size_mb, and rate_per_mb = 0.
+// Three independent problems across three sections: missing rpc_url, a zero
+// cache_size_mb (#1678 — the disk budget is also the admission ceiling, so `0`
+// refuses every blob rather than disabling the cap), and rate_per_mb = 0.
 const MULTI_ERROR: &str = r#"
 [blockchain]
 payment_pool_address = "0x0000000000000000000000000000000000000001"
@@ -234,8 +235,7 @@ capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
 
 [cache]
-cache_size_mb = 100
-max_blob_size_mb = 500
+cache_size_mb = 0
 
 [payment]
 rate_per_mb = 0
@@ -260,7 +260,7 @@ fn validate_emits_all_problems_at_once() -> anyhow::Result<()> {
     for needle in [
         "rpc_url",
         "content_blacklist_address",
-        "max_blob_size_mb",
+        "cache.cache_size_mb",
         "rate_per_mb",
     ] {
         anyhow::ensure!(
@@ -354,7 +354,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         cache: ResolvedCache {
             cache_dir: PathBuf::from("/var/lib/decdn/cache"),
             cache_size_mb: 10_240,
-            max_blob_size_mb: 1_024,
             max_rate_per_mb: 0,
             origins: Vec::new(),
             pinned_hashes: decdn_cache::PinnedHashes::empty(),

@@ -72,7 +72,7 @@ struct Inner {
     /// together in `open_full`); an empty `origins` yields an empty
     /// `breakers` and the `NoOrigin` short-circuit never reaches them.
     breakers: Vec<OriginBreaker>,
-    max_blob_bytes: u64,
+    disk_budget_bytes: u64,
     /// Per-hash last-access timestamps for LRU eviction ordering.
     access_times: Mutex<HashMap<Hash, Instant>>,
     /// In-flight pull-through requests. When a pull is in progress for a hash,
@@ -814,18 +814,25 @@ pub enum RangePullOutcome {
 }
 
 impl CacheEngine {
-    /// Open or create the store at `cache_dir`. `max_blob_mb` caps the size
-    /// of any single blob pulled from the origin. Oversize payloads typically
-    /// surface as [`CacheError::OriginError`] (the HTTP origin trips the cap
-    /// mid-stream before the engine sees the bytes), or as
+    /// Open or create the store at `cache_dir`. `cache_size_mb` is this node's
+    /// **disk budget**, and doubles as the ceiling on any single blob pulled
+    /// from an origin: a blob that cannot fit the whole cache can never be
+    /// admitted, so refusing it up front is strictly better than writing it and
+    /// letting eviction thrash (#1678).
+    ///
+    /// The cap binds on the origin pull-through path specifically, because that
+    /// is the one ingest path where no signed `total_bytes` precedes the bytes —
+    /// an origin backend can lie about, or simply omit, its length. Oversize
+    /// payloads typically surface as [`CacheError::OriginError`] (the HTTP
+    /// origin trips the cap mid-stream before the engine sees the bytes), or as
     /// [`CacheError::BlobTooLarge`] when a custom `Origin` impl returns bytes
     /// that exceed the cap without self-enforcement.
     pub async fn open(
         cache_dir: &Path,
         origins: Vec<Arc<dyn Origin>>,
-        max_blob_mb: u64,
+        cache_size_mb: u64,
     ) -> CacheResult<Self> {
-        Self::open_with_pinned(cache_dir, origins, max_blob_mb, PinnedHashes::empty()).await
+        Self::open_with_pinned(cache_dir, origins, cache_size_mb, PinnedHashes::empty()).await
     }
 
     /// Open the cache with an initial pinning set. The set is held in an
@@ -840,13 +847,13 @@ impl CacheEngine {
     pub async fn open_with_pinned(
         cache_dir: &Path,
         origins: Vec<Arc<dyn Origin>>,
-        max_blob_mb: u64,
+        cache_size_mb: u64,
         pinned: PinnedHashes,
     ) -> CacheResult<Self> {
         Self::open_full(
             cache_dir,
             origins,
-            max_blob_mb,
+            cache_size_mb,
             pinned,
             RetryPolicy::default(),
             CircuitBreakerPolicy::default(),
@@ -878,7 +885,7 @@ impl CacheEngine {
     pub async fn open_full(
         cache_dir: &Path,
         origins: Vec<Arc<dyn Origin>>,
-        max_blob_mb: u64,
+        cache_size_mb: u64,
         pinned: PinnedHashes,
         retry_policy: RetryPolicy,
         circuit_breaker: CircuitBreakerPolicy,
@@ -888,7 +895,7 @@ impl CacheEngine {
         Self::open_full_with_clock(
             cache_dir,
             origins,
-            max_blob_mb,
+            cache_size_mb,
             pinned,
             retry_policy,
             circuit_breaker,
@@ -908,7 +915,7 @@ impl CacheEngine {
     pub async fn open_full_with_clock(
         cache_dir: &Path,
         origins: Vec<Arc<dyn Origin>>,
-        max_blob_mb: u64,
+        cache_size_mb: u64,
         pinned: PinnedHashes,
         retry_policy: RetryPolicy,
         circuit_breaker: CircuitBreakerPolicy,
@@ -982,10 +989,10 @@ impl CacheEngine {
             let _ = strong.set(store.clone());
         }
 
-        // Saturate-on-overflow: an operator setting `max_blob_mb = u64::MAX`
-        // as a de-facto "unlimited" value should still yield a usable byte cap
-        // rather than overflow-wrap to zero.
-        let max_blob_bytes = max_blob_mb.saturating_mul(1024 * 1024);
+        // Saturate rather than wrap on an absurd `cache_size_mb`. There is no
+        // "unlimited" sentinel here — `0` means a 0-byte budget that refuses
+        // every blob, which is why config resolution rejects it (#1678).
+        let disk_budget_bytes = cache_size_mb.saturating_mul(1024 * 1024);
 
         let evicted_log_path = cache_dir.join("evicted.log");
         let evicted = load_evicted_log(&evicted_log_path)?;
@@ -1004,7 +1011,7 @@ impl CacheEngine {
                 store,
                 origins,
                 breakers,
-                max_blob_bytes,
+                disk_budget_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
                 inflight_poison_logged: AtomicBool::new(false),
@@ -1046,6 +1053,15 @@ impl CacheEngine {
     #[must_use]
     pub fn in_flight_total(&self, hash: Hash) -> Option<u64> {
         self.inner.fill_registry.in_flight_total(hash)
+    }
+
+    /// Σ `total_bytes` over every live fill — the inbound content this node is
+    /// committed to landing on disk (#1678). See
+    /// [`FillRegistry::total_in_flight_bytes`] for why it over-estimates on
+    /// purpose, and call it on the eviction-sweep cadence, not per request.
+    #[must_use]
+    pub fn total_in_flight_bytes(&self) -> u64 {
+        self.inner.fill_registry.total_in_flight_bytes()
     }
 
     /// Atomically claim a serve-miss of `[offset, offset+len)` (`len == 0` = to end)
@@ -3331,7 +3347,7 @@ impl CacheEngine {
         if let Some(m) = &self.inner.metrics {
             m.origin_fetches.inc();
         }
-        let max_blob_bytes = self.inner.max_blob_bytes;
+        let disk_budget_bytes = self.inner.disk_budget_bytes;
         let policy = self.inner.retry_policy;
 
         // Fallback chain walk (#284). Each origin gets its own retry
@@ -3385,7 +3401,7 @@ impl CacheEngine {
                     self.pull_through_attempt(
                         Arc::clone(&origin),
                         hash,
-                        max_blob_bytes,
+                        disk_budget_bytes,
                         policy,
                         mode,
                     )
@@ -3430,7 +3446,7 @@ impl CacheEngine {
                 Ok(PullThroughOutcome::BlobTooLarge) => {
                     return Err(CacheError::BlobTooLarge {
                         hash,
-                        limit_bytes: max_blob_bytes,
+                        limit_bytes: disk_budget_bytes,
                     });
                 }
                 Ok(PullThroughOutcome::HashMismatch { actual }) => {
@@ -3644,7 +3660,7 @@ impl CacheEngine {
         &self,
         origin: Arc<dyn Origin>,
         hash: Hash,
-        max_blob_bytes: u64,
+        disk_budget_bytes: u64,
         policy: RetryPolicy,
         mode: FillMode,
     ) -> Result<PullThroughOutcome, OriginPullError> {
@@ -3652,7 +3668,7 @@ impl CacheEngine {
         // (`pull_through`'s fallback-chain loop, #284) so this method
         // is agnostic to chain position and works identically for the
         // singular-origin (chain length 1) and multi-origin paths.
-        let fetch = origin.fetch(hash, max_blob_bytes).await?;
+        let fetch = origin.fetch(hash, disk_budget_bytes).await?;
         let (stream, size_hint) = match fetch {
             crate::origin::OriginFetch::NotFound => return Ok(PullThroughOutcome::NotFound),
             crate::origin::OriginFetch::Found { stream, size_hint } => (stream, size_hint),
@@ -3664,13 +3680,13 @@ impl CacheEngine {
         // is a deterministic operator-visible cap breach; surface as
         // `BlobTooLarge` directly without burning retry budget.
         if let Some(advertised) = size_hint
-            && advertised > max_blob_bytes
+            && advertised > disk_budget_bytes
         {
             return Ok(PullThroughOutcome::BlobTooLarge);
         }
 
         if should_buffer(size_hint, policy.buffered_max_bytes) {
-            let drain_cap = policy.buffered_max_bytes.min(max_blob_bytes);
+            let drain_cap = policy.buffered_max_bytes.min(disk_budget_bytes);
             let bytes = match drain_to_bytes(stream, drain_cap, self.inner.metrics.as_ref()).await {
                 Ok(b) => b,
                 // Cap-breach: surface as `BlobTooLarge` directly (typed
@@ -3693,7 +3709,7 @@ impl CacheEngine {
         // payload as `Bytes`, so re-read it from the local store (one mmap'd read
         // with `fs-store`, no extra origin egress).
         match self
-            .import_and_verify_stream(hash, stream, max_blob_bytes)
+            .import_and_verify_stream(hash, stream, disk_budget_bytes)
             .await?
         {
             // The fill-only caller (`populate` / `populate_local`) drops the bytes,
@@ -3732,7 +3748,7 @@ impl CacheEngine {
     /// It does NOT broadcast the insert or read the bytes back; the caller owns
     /// those (the pull-through re-reads for its `Bytes` return).
     ///
-    /// `count_and_cap_stream` enforces `max_blob_bytes` and bumps the
+    /// `count_and_cap_stream` enforces `disk_budget_bytes` and bumps the
     /// origin-egress metric per chunk, so the pulled bytes are metered as the
     /// upstream egress they genuinely are (those bytes left an origin) without
     /// touching the `get`-caller hit/returned counters.
@@ -3740,7 +3756,7 @@ impl CacheEngine {
         &self,
         hash: Hash,
         stream: S,
-        max_blob_bytes: u64,
+        disk_budget_bytes: u64,
     ) -> Result<StreamCommitOutcome, OriginPullError>
     where
         S: futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
@@ -3754,7 +3770,7 @@ impl CacheEngine {
         let captured_err: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
         let counted = count_and_cap_stream(
             stream,
-            max_blob_bytes,
+            disk_budget_bytes,
             self.inner.metrics.clone(),
             captured_err.clone(),
         );

@@ -147,7 +147,7 @@ fn should_warn_now(now_ms: u64, last_warn_ms: u64, interval: Duration) -> bool {
 /// `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all ship as `NotFound` on
 /// the wire (to avoid leaking channel existence), but are distinct here so an
 /// operator can, e.g., isolate an unknown-channel abuse campaign.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeRejectReason {
     EvictedSinceProbe,
     CacheMiss,
@@ -293,9 +293,86 @@ enum FillOutcome {
     /// node is broken" would steer clients off a perfectly healthy node forever
     /// over one oversized blob.
     HardFault,
+    /// The blob does not fit this node's disk budget (`cache.cache_size_mb`), so
+    /// the engine's admission cap refused it (#1678).
+    ///
+    /// Split out from [`Self::CleanMiss`] because the honest wire answer differs.
+    /// A miss says "ask me again later"; this says "never ask me for this blob" —
+    /// no eviction can make a blob fit that does not fit the whole cache, so it
+    /// is durable for this (node, blob) in a way a miss is not. It maps to
+    /// [`ServeRejectReason::BlobTooLarge`], which ADR 005 §Retry behavior defines
+    /// as exactly "do not retry this node, a different node may accept it".
+    ///
+    /// Not a [`Self::HardFault`]: the node is healthy and its answer is correct.
+    TooLarge,
 }
 
 impl FillOutcome {
+    /// Classify a failed fill. Pure — no logging, no metrics — so "which arm
+    /// does this error land in?" is a question a test can just ask, the same
+    /// reasoning `node_origin::pull_verdict` is built on. Every mis-attribution
+    /// this path has shipped was an error landing one arm further than it should.
+    ///
+    /// The four-way split is load-bearing and each boundary has cost a bug:
+    ///
+    /// - **Clean miss** (`NotFound` / `NoOrigin`): nobody had it. Not evidence of
+    ///   anything; the terminal answer is left to the other tiers.
+    /// - **Hard fault** (`OriginError` / `Store`): this node is degraded, not
+    ///   empty — the caller must refuse `InternalError` rather than sign a
+    ///   `NotFound` claiming the blob does not exist (#1129). Deliberately narrow:
+    ///   only these two. NOT necessarily transient, either — since #1560 the
+    ///   node-origin surfaces permanent buyer-side faults (broken signer, unusable
+    ///   deadline config, unreadable channel store) through this same arm.
+    /// - **Too large** (`BlobTooLarge`, #1678): does not fit this node's disk
+    ///   budget. Deterministic like the arm below, but it earns its own outcome
+    ///   because the client can act on it — it means "never ask me for this blob",
+    ///   where a miss means "maybe later".
+    /// - **Everything else** (`HashMismatch`, `VerifyFailed`,
+    ///   `EvictionLimitExceeded`): deterministic for this hash, but not evidence
+    ///   the node is broken. `InternalError` here would steer clients off a
+    ///   healthy node permanently over one bad blob.
+    pub(super) const fn for_cache_error(err: &CacheError) -> Self {
+        match err {
+            CacheError::OriginError { .. } | CacheError::Store(_) => Self::HardFault,
+            CacheError::BlobTooLarge { .. } => Self::TooLarge,
+            // `NotFound` / `NoOrigin` (a genuine miss) and the deterministic
+            // remainder (`HashMismatch`, `VerifyFailed`, `EvictionLimitExceeded`)
+            // share this arm because they owe the client the same answer, not
+            // because they are the same thing. Keeping them textually separate
+            // would be clearer but is exactly the `match_same_arms` clippy denies;
+            // the distinction that survives is the one that matters — the
+            // deterministic set is metered and logged at `warn`
+            // ([`Self::is_metered_failure`]), a real miss is not.
+            _ => Self::CleanMiss,
+        }
+    }
+
+    /// Whether a failed fill is worth the operator's attention: bump the
+    /// pull-through error counter and log at `warn` rather than `debug`.
+    ///
+    /// Keyed on the ERROR, not on [`Self::for_cache_error`]'s outcome, and that
+    /// is the whole point. A `HashMismatch` and a plain `NotFound` both answer
+    /// the client with a miss, but only one of them means something is wrong;
+    /// deriving this from the outcome would collapse the deterministic set into
+    /// the ordinary-miss silence and quietly stop metering corrupt blobs.
+    pub(super) const fn is_reportable_fill_error(err: &CacheError) -> bool {
+        !matches!(
+            err,
+            CacheError::NotFound { .. } | CacheError::NoOrigin { .. }
+        )
+    }
+
+    /// The log line's tail, naming what happened. `CleanMiss` covers both a
+    /// genuine miss and the deterministic-but-client-benign set, so the phrasing
+    /// stays neutral — the error itself is on the same line for diagnosis.
+    pub(super) const fn fill_failure_note(self) -> &'static str {
+        match self {
+            Self::Filled | Self::CleanMiss => "could not fill",
+            Self::HardFault => "hit a backend fault",
+            Self::TooLarge => "blob exceeds this node's disk budget",
+        }
+    }
+
     /// The reject reason a *terminal* miss carries, given whether any tier
     /// attempted for this request hit a hard fault. Falling THROUGH to a further
     /// tier after a fault is legitimate (a different source may still serve) — so
@@ -307,6 +384,20 @@ impl FillOutcome {
             ServeRejectReason::InternalError
         } else {
             ServeRejectReason::CacheMiss
+        }
+    }
+
+    /// The reject reason for a terminal non-fill, given this tier's outcome and
+    /// whether an earlier tier faulted.
+    ///
+    /// [`Self::TooLarge`] wins over `fault_seen`: an earlier tier's fault does
+    /// not change the fact that this blob cannot fit here, and `InternalError`
+    /// would tell the client to route off a node that is answering correctly.
+    /// Everything else defers to [`Self::miss_reason`].
+    const fn terminal_reason(self, fault_seen: bool) -> ServeRejectReason {
+        match self {
+            Self::TooLarge => ServeRejectReason::BlobTooLarge,
+            _ => Self::miss_reason(fault_seen),
         }
     }
 
@@ -359,7 +450,6 @@ pub struct ClientHandlerDeps {
     /// replacing the by-value config stand-in.
     pub rate_bounds: crate::rate_bounds::RateBounds,
     pub voucher_interval_mb: u64,
-    pub max_blob_size_bytes: u64,
     pub max_concurrent_streams: usize,
     /// Live content deny-set (ADR 011): the operator's local denylist unioned
     /// with the on-chain origin blacklist. NOT an `Option`, unlike the wiring
@@ -404,7 +494,6 @@ impl std::fmt::Debug for ClientHandlerDeps {
         f.debug_struct("ClientHandlerDeps")
             .field("node_id", &self.node_id)
             .field("voucher_interval_mb", &self.voucher_interval_mb)
-            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_concurrent_streams", &self.max_concurrent_streams)
             .finish_non_exhaustive()
     }
@@ -427,7 +516,6 @@ impl ClientHandlerDeps {
         rate_per_mb: Arc<AtomicU64>,
         rate_bounds: crate::rate_bounds::RateBounds,
         voucher_interval_mb: u64,
-        max_blob_size_bytes: u64,
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
         pool_min_remaining_deposit: U256,
@@ -449,7 +537,6 @@ impl ClientHandlerDeps {
             rate_per_mb,
             rate_bounds,
             voucher_interval_mb,
-            max_blob_size_bytes,
             max_concurrent_streams,
             content_deny,
             redeem_hint: None,
@@ -601,7 +688,6 @@ pub struct ClientHandler {
     rate_per_mb: Arc<AtomicU64>,
     rate_bounds: crate::rate_bounds::RateBounds,
     voucher_interval_mb: u64,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     /// Throttle state for the insufficient-deposit refusal log (#1520): the
     /// millisecond timestamp of the last emitted `warn!`, and how many refusals
@@ -629,7 +715,6 @@ impl std::fmt::Debug for ClientHandler {
         f.debug_struct("ClientHandler")
             .field("node_id", &self.node_id)
             .field("voucher_interval_mb", &self.voucher_interval_mb)
-            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_concurrent_streams", &self.max_concurrent_streams)
             .finish_non_exhaustive()
     }
@@ -697,7 +782,6 @@ impl ClientHandler {
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
             voucher_interval_mb: deps.voucher_interval_mb,
-            max_blob_size_bytes: deps.max_blob_size_bytes,
             max_concurrent_streams: deps.max_concurrent_streams,
             deposit_refusal_last_warn_ms: AtomicU64::new(0),
             deposit_refusal_suppressed: AtomicU64::new(0),
@@ -1327,7 +1411,6 @@ pub(super) async fn handler_over_store(
         Arc::new(AtomicU64::new(1)),
         crate::rate_bounds::RateBounds::new(0),
         1,
-        0,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
         U256::ZERO,
@@ -1340,6 +1423,76 @@ pub(super) async fn handler_over_store(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ---- fill-error classification (#1678) ----
+
+    fn hash_for_test() -> decdn_cache::Hash {
+        decdn_cache::Hash::new(b"fill-classification")
+    }
+
+    #[test]
+    fn a_blob_over_the_disk_budget_classifies_as_too_large() {
+        let err = CacheError::BlobTooLarge {
+            hash: hash_for_test(),
+            limit_bytes: 1024,
+        };
+        assert_eq!(FillOutcome::for_cache_error(&err), FillOutcome::TooLarge);
+        assert_eq!(
+            FillOutcome::TooLarge.terminal_reason(false),
+            ServeRejectReason::BlobTooLarge,
+            "the client must be told not to ask this node for this blob again"
+        );
+    }
+
+    #[test]
+    fn too_large_outranks_an_earlier_tiers_fault() {
+        // An earlier tier faulting does not change the fact that this blob
+        // cannot fit here, and `InternalError` would route the client off a node
+        // that is answering correctly.
+        assert_eq!(
+            FillOutcome::TooLarge.terminal_reason(true),
+            ServeRejectReason::BlobTooLarge
+        );
+    }
+
+    #[test]
+    fn a_backend_fault_is_a_hard_fault_and_a_miss_is_not() {
+        assert_eq!(
+            FillOutcome::for_cache_error(&CacheError::Store(anyhow::anyhow!("disk gone"))),
+            FillOutcome::HardFault
+        );
+        assert_eq!(
+            FillOutcome::for_cache_error(&CacheError::NotFound {
+                hash: hash_for_test()
+            }),
+            FillOutcome::CleanMiss
+        );
+    }
+
+    /// Metering keys on the ERROR, not on the outcome. A `VerifyFailed` answers
+    /// the client with a miss but still means a peer served corrupt bytes, so it
+    /// must stay metered — deriving this from `FillOutcome::CleanMiss` would
+    /// silently fold it into ordinary-miss silence.
+    #[test]
+    fn a_deterministic_error_is_reported_even_though_it_answers_as_a_miss() {
+        let corrupt = CacheError::VerifyFailed {
+            expected: hash_for_test(),
+        };
+        assert_eq!(
+            FillOutcome::for_cache_error(&corrupt),
+            FillOutcome::CleanMiss
+        );
+        assert!(
+            FillOutcome::is_reportable_fill_error(&corrupt),
+            "a corrupt blob must still bump the counter and log at warn"
+        );
+        assert!(
+            !FillOutcome::is_reportable_fill_error(&CacheError::NotFound {
+                hash: hash_for_test()
+            }),
+            "an ordinary miss must not: it would drown the signal"
+        );
+    }
 
     /// Build the smallest `ClientHandler` for the handler-layer tests below,
     /// seeding the floor-`M` minimum-remaining-deposit at zero.
@@ -1383,7 +1536,6 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             crate::rate_bounds::RateBounds::new(0),
             1,
-            0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             pool_min_remaining_deposit,
@@ -1773,7 +1925,6 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             crate::rate_bounds::RateBounds::new(0),
             1,
-            0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             U256::ZERO,

@@ -291,10 +291,9 @@ pub struct BlockchainConfig {
 pub struct CacheConfig {
     /// Blob cache directory.
     pub cache_dir: Option<PathBuf>,
-    /// Maximum cache size in megabytes.
+    /// Maximum cache size in megabytes — this node's disk budget, and since
+    /// #1678 the only ceiling on a single blob. Must be non-zero.
     pub cache_size_mb: Option<u64>,
-    /// Maximum single blob size in megabytes.
-    pub max_blob_size_mb: Option<u64>,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
     /// per-MB units as the wire `StreamResponse.rate_per_mb`. Absent / `0` =
     /// unlimited. Bounds what this node, as a BUYER on a cache-miss pull, will
@@ -367,10 +366,10 @@ pub struct CacheConfig {
     ///   in-flight fetch) but leave no on-disk garbage.
     /// - **Abort + restart** applies above the threshold or when
     ///   `size_hint` is unknown. Each failed attempt strands up to
-    ///   `max_blob_size_mb` of partial-import bytes until iroh-blobs
+    ///   `cache_size_mb` of partial-import bytes until iroh-blobs
     ///   GC reclaims them at `cache.gc_interval_sec` cadence.
     ///   Worst-case disk amplification per fetch is
-    ///   `(1 + max_retries) * max_blob_size_mb`.
+    ///   `(1 + max_retries) * cache_size_mb`.
     ///
     /// `decdn_config_types::RetryPolicy` carries `#[serde(default)]` so
     /// partial sections (e.g. just `max_retries = 5`) get the rest of

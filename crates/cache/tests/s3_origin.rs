@@ -710,7 +710,7 @@ async fn cache_engine_rejects_s3_body_larger_than_max_blob_bytes() -> anyhow::Re
     let engine = CacheEngine::open_full(
         tmp.path(),
         vec![origin as Arc<dyn Origin>],
-        1, // max_blob_size_mb = 1 MiB
+        1, // cache_size_mb = 1 MiB disk budget
         decdn_cache::PinnedHashes::empty(),
         RetryPolicy::disabled(),
         decdn_cache::CircuitBreakerPolicy::default(),
@@ -844,7 +844,7 @@ async fn cache_engine_s3_rejects_decompression_bomb() -> anyhow::Result<()> {
     let engine = CacheEngine::open(
         tmp.path(),
         vec![origin as Arc<dyn Origin>],
-        1, // max_blob_size_mb = 1 MiB
+        1, // cache_size_mb = 1 MiB disk budget
     )
     .await?;
 

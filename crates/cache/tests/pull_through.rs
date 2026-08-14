@@ -558,7 +558,7 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
     let engine = CacheEngine::open_full(
         tmp.path(),
         vec![origin as Arc<dyn Origin>],
-        1, // max_blob_size_mb = 1 MiB; payload is 2 MiB
+        1, // cache_size_mb = 1 MiB disk budget; payload is 2 MiB
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
         decdn_cache::CircuitBreakerPolicy::default(),
@@ -743,10 +743,18 @@ impl Origin for OversizedOrigin {
 
 #[tokio::test]
 async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Result<()> {
-    // Origin ignores the max_bytes advisory and returns 2 MiB. Cap at 1 MiB.
-    // This proves the engine's post-receive size check is load-bearing
-    // defense in depth — a regression dropping that check would be caught
-    // by this test even if the HTTP origin's streaming cap is fine.
+    // Origin ignores the max_bytes advisory and returns 2 MiB against a 1 MiB
+    // disk budget. This proves the engine's post-receive size check is
+    // load-bearing defense in depth — a regression dropping that check would be
+    // caught here even if the HTTP origin's streaming cap is fine.
+    //
+    // Since #1678 this is the ONLY blob-size ceiling left, and its limit is
+    // `cache.cache_size_mb`. It survives the removal of the serve-side and
+    // buyer-side gates because it guards a different thing: an origin backend
+    // signs no size ahead of its bytes and can simply lie, where a paid provider
+    // commits to `total_bytes` up front and streams to disk. This is admission —
+    // delivery of an already-resident blob is never size-gated
+    // (`a_large_resident_blob_is_served_without_a_size_gate`, node suite).
     let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
     let hash = Hash::new(&payload);
     let origin = Arc::new(OversizedOrigin { payload });
@@ -3861,7 +3869,7 @@ async fn fallback_does_not_advance_on_hash_mismatch() -> anyhow::Result<()> {
 #[tokio::test]
 async fn fallback_does_not_advance_on_blob_too_large() -> anyhow::Result<()> {
     // Operator-set cap breach: surfacing this lets operators tune
-    // `max_blob_size_mb` or evict the offender, rather than silently
+    // `cache_size_mb` or evict the offender, rather than silently
     // letting a chain mirror serve under the same cap.
     let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
     let hash = Hash::new(&payload);

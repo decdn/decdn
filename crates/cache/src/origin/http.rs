@@ -23,9 +23,10 @@ use super::{
 use crate::error::{OriginError, OriginPullError};
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
-/// duration is intentionally *not* bounded because `max_blob_size_mb` can be
-/// as large as 10 GB and no single total-request timeout fits both small and
-/// large blobs. Instead, we pair this with phase-level timeouts below.
+/// duration is intentionally *not* bounded because `cache_size_mb` — the disk
+/// budget that now bounds a single blob — can be tens of GB, and no single
+/// total-request timeout fits both small and large blobs. Instead, we pair this
+/// with phase-level timeouts below.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ceiling on how long the origin may take to respond with headers after
@@ -365,7 +366,7 @@ impl Origin for HttpOrigin {
             // `BlobTooLarge` (#804). Hand `None` for compressed bodies so
             // they always take the streaming path, where
             // `count_and_cap_stream` checks the running decoded total
-            // against the correct `max_blob_bytes`. The pre-stream
+            // against the correct `disk_budget_bytes`. The pre-stream
             // `advertised_len > max_bytes` short-circuit above still runs
             // first (compressed-len > max_bytes already implies
             // decoded-len > max_bytes under sane ratios). For identity

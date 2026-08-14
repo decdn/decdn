@@ -451,7 +451,6 @@ impl NodeOrigin {
             namespace_bytes,
             0,
             now_micros(),
-            deps.config.max_blob_size_bytes,
             rate_ceiling,
             deadlines,
             0,
@@ -595,7 +594,6 @@ pub(crate) async fn run_pull_leg(
         &deps.slash_domain,
         provider_addr,
         namespace_id,
-        deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
     );

@@ -58,6 +58,44 @@ impl ClientHandler {
         self.lanes.lock().await.contains_key(&lane_key)
     }
 
+    /// Map a failed fill to its [`FillOutcome`], and log/meter it. Shared by
+    /// both fill tiers: `tier` names which one for the log line, and is the only
+    /// thing that differs between them — the classification itself must NOT,
+    /// since the client-visible consequence of each error is a property of the
+    /// error, not of which tier hit it.
+    ///
+    /// The four-way split is load-bearing and each boundary has cost a bug:
+    ///
+    /// - **Clean miss** (`NotFound` / `NoOrigin`): nobody had it. Not evidence of
+    ///   anything; leave the terminal answer to the other tiers.
+    /// - **Hard fault** (`OriginError` / `Store`): this node is degraded, not
+    ///   empty — the caller must refuse `InternalError` rather than sign a
+    ///   `NotFound` that claims the blob does not exist (#1129). Deliberately
+    ///   narrow: only these two. Note it is NOT necessarily transient — since
+    ///   #1560 the node-origin also surfaces permanent buyer-side faults (broken
+    ///   signer, unusable deadline config, unreadable channel store) as
+    ///   `OriginPullError::Permanent` through this arm, and those recur for every
+    ///   hash until an operator acts. So the log line names neither lifetime.
+    /// - **Too large** (`BlobTooLarge`, #1678): the blob does not fit this node's
+    ///   disk budget. Deterministic like the arm below, but it earns its own
+    ///   outcome because the client can act on it — `BlobTooLarge` means "never
+    ///   ask me for this blob", where a miss means "maybe later".
+    /// - **Everything else** (`HashMismatch`, `VerifyFailed`,
+    ///   `EvictionLimitExceeded`): deterministic for this hash but not evidence
+    ///   the node is broken. Reporting `InternalError` would steer clients off a
+    ///   healthy node permanently over one bad blob. Metered, then treated as a
+    ///   plain miss.
+    fn classify_fill_error(&self, hash: Hash, err: &CacheError, tier: &str) -> FillOutcome {
+        let outcome = FillOutcome::for_cache_error(err);
+        if FillOutcome::is_reportable_fill_error(err) {
+            self.metrics.node_pull_through_error();
+            tracing::warn!(%hash, error = %err, "{tier}: {}", outcome.fill_failure_note());
+        } else {
+            tracing::debug!(%hash, error = %err, "{tier}: {}", outcome.fill_failure_note());
+        }
+        outcome
+    }
+
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
     /// cache engine's `NodeOrigin` (last in the origin chain) does the discovery
     /// → probe → ranked paid pull → populate; here we trigger it via
@@ -71,41 +109,7 @@ impl ClientHandler {
     pub(super) async fn try_pull_through(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate(hash)).await {
             Ok(Ok(())) => FillOutcome::Filled,
-            // A clean miss — no origin/provider had it — is the normal
-            // unfillable case (`NotFound`/`NoOrigin`); log at debug and move on.
-            Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
-                tracing::debug!(%hash, error = %e, "node-to-node pull-through found no source");
-                FillOutcome::CleanMiss
-            }
-            // A backend fault — the node is degraded, not empty. Report it as a fault so
-            // the caller can refuse `InternalError` if no further tier fills (#1129),
-            // rather than reporting a broken origin as a miss.
-            //
-            // NOT necessarily transient, which this arm used to claim outright: since
-            // #1560 the node-origin also surfaces its own buyer-side faults here (a
-            // broken signer, an unusable deadline config, an unreadable channel store) as
-            // `OriginPullError::Permanent`, and those recur for every hash until an
-            // operator acts. Telling an operator to wait for a permanent defect to pass
-            // is worse than saying nothing, so the line names neither lifetime.
-            Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a backend fault");
-                FillOutcome::HardFault
-            }
-            // Everything else (`BlobTooLarge`, `HashMismatch`, `VerifyFailed`,
-            // `EvictionLimitExceeded`) is DETERMINISTIC: it will recur on every
-            // request for this hash, so it is not evidence the node is degraded.
-            // Reporting it as `InternalError` ("do not retry this node") would
-            // steer clients off a healthy node permanently over one bad blob — and
-            // for `BlobTooLarge` it would also contradict the size gate, which
-            // refuses the very same condition with the dedicated `BlobTooLarge`
-            // code when the blob happens to be in the store. Meter it (the operator
-            // still needs to see it) but let it fall through as a plain miss.
-            Ok(Err(e)) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a permanent cache-engine error");
-                FillOutcome::CleanMiss
-            }
+            Ok(Err(e)) => self.classify_fill_error(hash, &e, "node-to-node pull-through"),
             Err(_) => self.on_pull_through_timeout(hash, timeout).await,
         }
     }
@@ -125,25 +129,7 @@ impl ClientHandler {
     pub(super) async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
             Ok(Ok(())) => FillOutcome::Filled,
-            Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
-                tracing::debug!(%hash, error = %e, "reactive local-origin pull-through found no source");
-                FillOutcome::CleanMiss
-            }
-            // Transient — the operator's own origin is down. See
-            // [`Self::try_pull_through`] for why the split is exactly these two
-            // variants and not a catch-all.
-            Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a transient backend fault");
-                FillOutcome::HardFault
-            }
-            // Deterministic (`BlobTooLarge` / `HashMismatch` / `VerifyFailed`):
-            // recurs every request, so it is not evidence this node is degraded.
-            Ok(Err(e)) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "reactive local-origin pull-through hit a permanent cache-engine error");
-                FillOutcome::CleanMiss
-            }
+            Ok(Err(e)) => self.classify_fill_error(hash, &e, "reactive local-origin pull-through"),
             Err(_) => self.on_local_populate_timeout(hash, timeout).await,
         }
     }

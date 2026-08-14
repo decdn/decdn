@@ -42,13 +42,14 @@ pub enum CacheError {
         expected: Hash,
     },
 
-    /// The origin returned a blob larger than the configured
-    /// `max_blob_size_mb`.
-    #[error("blob {hash} exceeds max_blob_size of {limit_bytes} bytes")]
+    /// The origin returned a blob larger than this node's disk budget
+    /// (`cache.cache_size_mb`). Deterministic for this blob on this node: no
+    /// eviction can make a blob fit that does not fit the whole cache (#1678).
+    #[error("blob {hash} exceeds the {limit_bytes} byte disk budget")]
     BlobTooLarge {
         /// The hash that was requested.
         hash: Hash,
-        /// The configured ceiling, in bytes.
+        /// The disk budget, in bytes.
         limit_bytes: u64,
     },
 

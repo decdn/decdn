@@ -412,13 +412,12 @@ impl ClientHandler {
                 // there. (Not because `DEFAULT_PULL_AHEAD_BYTES` equals one
                 // interval — it is 1 MiB against a 4 MiB default interval. The
                 // `.max(credit_window(..))` term is what makes them coincide.) It
-                // diverges once either `max_blob_size_bytes` is finite (it then
-                // reserves the whole-blob cost) or `pull_ahead_bytes` is raised
-                // above the window — nothing validates that pair against each
-                // other. Neither direction is guaranteed stricter: a 1 MiB blob cap
-                // under an 8 MiB window makes it WEAKER than this floor. It is also
-                // the tier that fronts UPSTREAM spend. Do not delete it on the
-                // strength of this floor alone.
+                // diverges once `pull_ahead_bytes` is raised above the window —
+                // nothing validates that pair against each other. (It used to
+                // diverge on a second axis too, reserving the whole-blob cost
+                // when a blob-size cap was configured; #1678 removed the cap, so
+                // that arm is gone.) It is still the tier that fronts UPSTREAM
+                // spend. Do not delete it on the strength of this floor alone.
                 //
                 // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
                 // front any fill when the pool's on-chain **remaining**
@@ -668,7 +667,7 @@ impl ClientHandler {
                         _ => FillOutcome::CleanMiss,
                     };
                     if !buffered.is_filled() {
-                        let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
+                        let reason = buffered.terminal_reason(fault_seen || buffered.is_fault());
                         return self
                             .respond_error(&mut send, &req, reason, rate_per_mb)
                             .await;
@@ -732,16 +731,12 @@ impl ClientHandler {
             };
             total_bytes
         };
-        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::BlobTooLarge,
-                    rate_per_mb,
-                )
-                .await;
-        }
+        // No size gate here (#1678). The blob is RESIDENT — `has` said so and
+        // `inspect` just sized it — so it already occupies the disk a ceiling
+        // would be protecting. Refusing to serve bytes we are holding was the
+        // whole bug: it burned the storage cost and then declined the revenue.
+        // The disk decision belongs at ADMISSION (the engine's `cache_size_mb`
+        // cap on the origin pull path), not at delivery.
 
         // Bounded-range bounds check (ADR 005 §Bounded byte ranges). Reject an
         // out-of-bounds range with a `StreamError` *before* signing the success

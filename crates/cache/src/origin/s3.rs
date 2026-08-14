@@ -719,7 +719,7 @@ impl Origin for S3Origin {
             // in-bounds blob as `BlobTooLarge` (#804). Hand `None` so the
             // body always takes the streaming path, where
             // `count_and_cap_stream` checks the running decoded total
-            // against the correct `max_blob_bytes`. The pre-stream
+            // against the correct `disk_budget_bytes`. The pre-stream
             // `advertised_size > max_bytes` short-circuit above still runs
             // first, so a compressed body advertising > `max_bytes` is
             // rejected early (compression ratios < 1 make that a sound

@@ -31,13 +31,6 @@ pub use types::FileConfig;
 const DEFAULT_BIND_PORT: u16 = 4433;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
-/// Default maximum single blob size in megabytes (1 GB).
-///
-/// Deliberately well below `DEFAULT_CACHE_SIZE_MB` so a single oversized
-/// blob can't saturate the entire cache and evict all other content in
-/// one fetch. The `max_blob_size_mb < cache_size_mb` invariant is enforced
-/// at config load (see `resolve_cache_into`).
-const DEFAULT_MAX_BLOB_SIZE_MB: u64 = 1_024;
 /// Default rate per MB in USDC base units ($0.00001/MB).
 const DEFAULT_RATE_PER_MB: u64 = 10;
 /// Default Prometheus metrics port. Exposed publicly so `decdn node top`
@@ -169,10 +162,10 @@ const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
 /// minutes balances the hostile-origin amplification window against the
 /// per-sweep cost of walking the blob list. The window matters because
-/// a single failed pull-through orphans up to `max_blob_size_mb`
+/// a single failed pull-through orphans up to `cache_size_mb`
 /// (one upload-per-request bound, not multiplied by the interval), but
 /// a stream of failed requests inside one interval compounds: total
-/// leak before reclaim is bounded by `requests_in_window * max_blob_size_mb`.
+/// leak before reclaim is bounded by `requests_in_window * cache_size_mb`.
 /// Tuning the interval down shrinks that window. Operators on lean disks
 /// can tune lower; setting to `0` disables the periodic sweep entirely.
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
@@ -1532,12 +1525,10 @@ fn resolve_blockchain_into(
 
 /// Resolve cache fields.
 ///
-/// Enforces `max_blob_size_mb < cache_size_mb`: a single blob equal to or
-/// larger than the cache would saturate the store on one fetch and evict
-/// every other entry, making the node a one-shot download target rather
-/// than a useful cache. Equality is rejected along with the greater-than
-/// case because a cache that can hold exactly one blob has the same
-/// failure mode as one that overflows.
+/// Enforces `cache_size_mb > 0`. Since #1678 that budget is also the
+/// admission ceiling on a single blob, and the engine's cap has no
+/// "unlimited" sentinel — a zero budget refuses every blob rather than
+/// disabling the check, which is the opposite of what `0` reads as.
 #[cfg(test)]
 fn resolve_cache(
     cli: &crate::cli::run::CacheArgs,
@@ -1569,11 +1560,6 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.cache_size_mb))
         .unwrap_or(DEFAULT_CACHE_SIZE_MB);
 
-    let max_blob_size_mb = cli
-        .max_blob_size_mb
-        .or_else(|| file.and_then(|c| c.max_blob_size_mb))
-        .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
-
     // Buyer-side absolute per-MB rate ceiling (#1375); `0` = unlimited (the
     // default). CLI/env override wins over the file, matching every other knob.
     let max_rate_per_mb = cli
@@ -1581,17 +1567,17 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.max_rate_per_mb))
         .unwrap_or(0);
 
-    bag.check_with(
-        max_blob_size_mb < cache_size_mb,
-        "cache.max_blob_size_mb",
-        || {
-            format!(
-                "cache.max_blob_size_mb ({max_blob_size_mb}) must be strictly less than \
-             cache.cache_size_mb ({cache_size_mb}); otherwise a single oversized blob \
-             can saturate the cache on one fetch"
-            )
-        },
-    );
+    // `cache_size_mb` became load-bearing when #1678 deleted `max_blob_size_mb`:
+    // it is now the disk budget AND the admission ceiling on a single blob. The
+    // engine derives its cap by multiplying it out, and there is no "unlimited"
+    // sentinel on that path — a `0` budget is a 0-byte cap that refuses every
+    // blob with `BlobTooLarge`. An operator reaching for `0` means "no limit", so
+    // failing at load with that spelled out is the only safe reading.
+    bag.check_with(cache_size_mb > 0, "cache.cache_size_mb", || {
+        "cache.cache_size_mb must be at least 1: it is this node's disk budget, and a \
+         zero budget refuses every blob (BlobTooLarge) rather than disabling the cap"
+            .to_string()
+    });
 
     let origins = resolve_origins_into(file, bag);
 
@@ -1827,7 +1813,6 @@ fn resolve_cache_into(
     ResolvedCache {
         cache_dir,
         cache_size_mb,
-        max_blob_size_mb,
         max_rate_per_mb,
         origins,
         pinned_hashes,
@@ -4041,7 +4026,6 @@ mod tests {
             cache: Some(types::CacheConfig {
                 cache_dir: Some(PathBuf::from(r"C:\data\${HOME}\cache")),
                 cache_size_mb: None,
-                max_blob_size_mb: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -4081,7 +4065,6 @@ mod tests {
             cache: Some(types::CacheConfig {
                 cache_dir: Some(PathBuf::from("~/decdn-cache")),
                 cache_size_mb: None,
-                max_blob_size_mb: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -4118,7 +4101,6 @@ mod tests {
             cache: Some(types::CacheConfig {
                 cache_dir: Some(PathBuf::from("~")),
                 cache_size_mb: None,
-                max_blob_size_mb: None,
                 ..Default::default()
             }),
             ..Default::default()
@@ -4209,7 +4191,6 @@ mod tests {
                 c.cache = Some(types::CacheConfig {
                     cache_dir: Some(PathBuf::from(v)),
                     cache_size_mb: None,
-                    max_blob_size_mb: None,
                     ..Default::default()
                 });
             }),
@@ -5214,14 +5195,10 @@ swap_pool_address = \"0xPool\"
         Ok(())
     }
 
-    fn cache_cli(
-        cache_size_mb: Option<u64>,
-        max_blob_size_mb: Option<u64>,
-    ) -> crate::cli::run::CacheArgs {
+    fn cache_cli(cache_size_mb: Option<u64>) -> crate::cli::run::CacheArgs {
         crate::cli::run::CacheArgs {
             cache_dir: None,
             cache_size_mb,
-            max_blob_size_mb,
             max_rate_per_mb: None,
             max_probe_holds: None,
             stake_lane_reserved_holds: None,
@@ -5229,46 +5206,34 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_cache_rejects_max_blob_equal_to_cache_size() -> anyhow::Result<()> {
-        let cli = cache_cli(Some(100), Some(100));
+    fn resolve_cache_rejects_a_zero_disk_budget() -> anyhow::Result<()> {
+        // `0` reads as "no limit" to an operator, but since #1678 the engine
+        // multiplies this budget out into its admission cap and has no unlimited
+        // sentinel — a 0-byte cap refuses EVERY blob. Rejecting at load is the
+        // only reading that cannot silently brick a node.
+        let cli = cache_cli(Some(0));
         let err = resolve_cache(&cli, None, Path::new("/tmp"))
             .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for max == cache"))?
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for a zero cache_size_mb"))?
             .to_string();
         anyhow::ensure!(
-            err.contains("max_blob_size_mb") && err.contains("cache_size_mb"),
-            "error lacked context: {err}"
+            err.contains("cache.cache_size_mb"),
+            "the error must name the field an operator has to fix: {err}"
         );
         Ok(())
     }
 
     #[test]
-    fn resolve_cache_rejects_max_blob_greater_than_cache_size() -> anyhow::Result<()> {
-        let cli = cache_cli(Some(100), Some(200));
-        let err = resolve_cache(&cli, None, Path::new("/tmp"))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for max > cache"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("strictly less than"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_cache_accepts_max_blob_below_cache_size() -> anyhow::Result<()> {
-        let cli = cache_cli(Some(1024), Some(512));
+    fn resolve_cache_accepts_a_budget_smaller_than_the_old_blob_default() -> anyhow::Result<()> {
+        // 512 MiB is under the retired 1 GiB `max_blob_size_mb` default, a pair
+        // the deleted `max_blob_size_mb < cache_size_mb` invariant would have
+        // rejected outright. It is now simply a small node (#1678).
+        let cli = cache_cli(Some(512));
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.cache_size_mb == 1024,
+            resolved.cache_size_mb == 512,
             "cache_size: {}",
             resolved.cache_size_mb
-        );
-        anyhow::ensure!(
-            resolved.max_blob_size_mb == 512,
-            "max_blob: {}",
-            resolved.max_blob_size_mb
         );
         Ok(())
     }
@@ -5444,7 +5409,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn pinned_and_denied_hash_collision_is_rejected() -> anyhow::Result<()> {
         let shared = "cd".repeat(32);
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let cache_file = types::CacheConfig {
             pinned_hashes: Some(vec![shared.clone(), "ab".repeat(32)]),
             ..types::CacheConfig::default()
@@ -5474,7 +5439,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn disjoint_pinned_and_denied_hashes_are_accepted() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let cache_file = types::CacheConfig {
             pinned_hashes: Some(vec!["ab".repeat(32)]),
             ..types::CacheConfig::default()
@@ -5516,7 +5481,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_no_origin_and_pinned_empty_by_default() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
             resolved.origins.is_empty(),
@@ -5529,7 +5494,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_cache_user_agent_defaults_to_workspace_constant() -> anyhow::Result<()> {
         // Absent => DEFAULT_USER_AGENT (#435).
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
             resolved.user_agent == decdn_config_types::DEFAULT_USER_AGENT,
@@ -5541,7 +5506,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_user_agent_from_file_overrides_default() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             user_agent: Some("MyCdn/1.0 (+ops@example.com)".to_string()),
             ..types::CacheConfig::default()
@@ -5566,7 +5531,7 @@ swap_pool_address = \"0xPool\"
         // The shim `resolve_cache` returns `Err` and drops the partial
         // value, so the test drives `resolve_cache_into` directly to
         // observe the field.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             user_agent: Some("evil\r\nX-Inject: 1".to_string()),
             ..types::CacheConfig::default()
@@ -5588,7 +5553,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_cache_gc_interval_defaults_when_absent() -> anyhow::Result<()> {
         // Absent => DEFAULT_GC_INTERVAL_SEC (#518).
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
             resolved.gc_interval_sec == DEFAULT_GC_INTERVAL_SEC,
@@ -5601,7 +5566,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_gc_interval_from_file_overrides_default() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             gc_interval_sec: Some(42),
             ..types::CacheConfig::default()
@@ -5618,7 +5583,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_cache_fs_rescan_interval_defaults_when_absent() -> anyhow::Result<()> {
         // Absent => DEFAULT_FS_RESCAN_INTERVAL_SEC (#1130).
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
             resolved.fs_rescan_interval_sec == DEFAULT_FS_RESCAN_INTERVAL_SEC,
@@ -5631,7 +5596,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_fs_rescan_interval_from_file_overrides_default() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             fs_rescan_interval_sec: Some(30),
             ..types::CacheConfig::default()
@@ -5651,7 +5616,7 @@ swap_pool_address = \"0xPool\"
         // clamp/floor should turn it back on. A regression that
         // saturated to a minimum would silently re-enable GC for
         // operators who explicitly opted out.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             gc_interval_sec: Some(0),
             ..types::CacheConfig::default()
@@ -5669,7 +5634,7 @@ swap_pool_address = \"0xPool\"
     fn resolve_cache_stake_lane_reserved_holds_defaults_to_zero() -> anyhow::Result<()> {
         // Absent everywhere => reservation off (#757). The default MUST be 0
         // so a node that never opted in behaves exactly as pre-#757.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
             resolved.stake_lane_reserved_holds == DEFAULT_STAKE_LANE_RESERVED_HOLDS,
@@ -5685,7 +5650,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_stake_lane_reserved_holds_from_file() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             stake_lane_reserved_holds: Some(8),
             ..types::CacheConfig::default()
@@ -5705,7 +5670,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::CacheArgs {
             cache_dir: None,
             cache_size_mb: None,
-            max_blob_size_mb: None,
             max_rate_per_mb: None,
             max_probe_holds: None,
             stake_lane_reserved_holds: Some(3),
@@ -5725,7 +5689,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_rejects_empty_user_agent() {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             user_agent: Some(String::new()),
             ..types::CacheConfig::default()
@@ -5748,7 +5712,7 @@ swap_pool_address = \"0xPool\"
     /// the operator which config field is to blame.
     #[test]
     fn resolve_cache_rejects_user_agent_with_control_bytes() {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         for bad in [
             "evil\r\nX-Inject: 1",
             "has\nlf",
@@ -5784,7 +5748,7 @@ swap_pool_address = \"0xPool\"
     /// real-world UAs occasionally; make sure the validator doesn't over-reject.
     #[test]
     fn resolve_cache_accepts_user_agent_with_tab() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             user_agent: Some("MyCdn/1.0\t(ops@example.com)".to_string()),
             ..types::CacheConfig::default()
@@ -5800,7 +5764,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_http_decompress_strict_via_file() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin: Some(types::OriginConfig::Http {
                 url: "https://origin.example/".to_string(),
@@ -5823,7 +5787,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_s3_decompress_strict_via_file() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(types::S3OriginConfig {
             decompress: Some(decdn_config_types::DecompressMode::Strict),
             ..s3_cfg("decdn-blobs")
@@ -5843,7 +5807,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_s3_decompress_defaults_to_auto() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(s3_cfg("decdn-blobs"));
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         match resolved.origins.into_iter().next() {
@@ -5860,7 +5824,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_http_decompress_defaults_to_auto() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin: Some(types::OriginConfig::Http {
                 url: "https://origin.example/".to_string(),
@@ -5913,7 +5877,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_origin_s3_happy_path() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(types::S3OriginConfig {
             bucket: "decdn-blobs".to_string(),
             region: "us-east-1".to_string(),
@@ -5946,7 +5910,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_s3_origin_prefix_trailing_slash_already_present_unchanged() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let mut s3 = s3_cfg("decdn-blobs");
         s3.prefix = Some("foo/bar/".to_string());
         let resolved = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))?;
@@ -5961,7 +5925,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_s3_origin_empty_prefix_stays_empty() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let mut s3 = s3_cfg("decdn-blobs");
         s3.prefix = Some(String::new());
         let resolved = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))?;
@@ -5976,7 +5940,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_s3_origin_path_style_none_collapses_to_false() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(
             &cli,
             Some(&cache_with_s3(s3_cfg("decdn-blobs"))),
@@ -5997,7 +5961,7 @@ swap_pool_address = \"0xPool\"
     /// Helper: assert that a TOML-form S3 config rejects with an
     /// error whose chained message contains every required fragment.
     fn assert_s3_rejects(s3: types::S3OriginConfig, fragments: &[&str]) -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let err = resolve_cache(&cli, Some(&cache_with_s3(s3)), Path::new("/tmp"))
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected rejection"))?;
@@ -6019,7 +5983,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn validate_bucket_accepts_min_length_three() -> anyhow::Result<()> {
         // Boundary: exactly 3 chars must pass.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let _ = resolve_cache(&cli, Some(&cache_with_s3(s3_cfg("abc"))), Path::new("/tmp"))?;
         Ok(())
     }
@@ -6033,7 +5997,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn validate_bucket_accepts_max_length_sixty_three() -> anyhow::Result<()> {
         let name: String = std::iter::repeat_n('a', 63).collect();
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let _ = resolve_cache(&cli, Some(&cache_with_s3(s3_cfg(&name))), Path::new("/tmp"))?;
         Ok(())
     }
@@ -6285,7 +6249,7 @@ swap_pool_address = \"0xPool\"
     // `S3Credentials::Static` into resolved form.
     #[test]
     fn resolve_cache_origin_s3_static_credentials_round_trip() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(types::S3OriginConfig {
             bucket: "decdn-blobs".to_string(),
             region: "us-east-1".to_string(),
@@ -6330,7 +6294,7 @@ swap_pool_address = \"0xPool\"
     // `ResolvedS3Credentials::DefaultChain { profile: None }`.
     #[test]
     fn resolve_cache_origin_s3_default_chain_no_profile() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(types::S3OriginConfig {
             bucket: "decdn-blobs".to_string(),
             region: "us-east-1".to_string(),
@@ -6368,7 +6332,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_cache_origin_s3_default_chain_empty_profile_collapses_to_none() -> anyhow::Result<()>
     {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(types::S3OriginConfig {
             bucket: "decdn-blobs".to_string(),
             region: "us-east-1".to_string(),
@@ -6405,7 +6369,7 @@ swap_pool_address = \"0xPool\"
     // `DefaultChain` placeholder where one wasn't requested.
     #[test]
     fn resolve_cache_origin_s3_no_credentials_resolves_to_none() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = cache_with_s3(s3_cfg("decdn-blobs"));
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         match resolved.origins.into_iter().next() {
@@ -6676,7 +6640,7 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_cache_pinned_hashes_propagate_through_file() -> anyhow::Result<()> {
         let h = make_hex_hash(5);
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             pinned_hashes: Some(vec![h.clone()]),
             ..types::CacheConfig::default()
@@ -6692,7 +6656,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_cache_invalid_pinned_hash_fails_resolution() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             pinned_hashes: Some(vec!["not-a-hash".to_string()]),
             ..types::CacheConfig::default()
@@ -6713,7 +6677,7 @@ swap_pool_address = \"0xPool\"
         // Absent `cache.origin_retry` section => defaults from
         // RetryPolicy::default(). Pin the contract here so a future
         // default change has to update this test deliberately.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         let p = resolved.origin_retry;
         anyhow::ensure!(p.max_retries == 3, "default max_retries");
@@ -6728,7 +6692,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin_retry: Some(decdn_config_types::RetryPolicy {
                 max_retries: 7,
@@ -6771,7 +6735,7 @@ swap_pool_address = \"0xPool\"
     fn resolve_origin_retry_max_retries_zero_is_valid() -> anyhow::Result<()> {
         // `0` opts out and is the documented disable knob; resolution
         // must not reject it.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin_retry: Some(decdn_config_types::RetryPolicy {
                 max_retries: 0,
@@ -6786,7 +6750,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_origin_retry_rejects_initial_above_max() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin_retry: Some(decdn_config_types::RetryPolicy {
                 initial_backoff_ms: 2_000,
@@ -6808,7 +6772,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_origin_retry_rejects_jitter_out_of_range() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
             let file = types::CacheConfig {
                 origin_retry: Some(decdn_config_types::RetryPolicy {
@@ -6834,7 +6798,7 @@ swap_pool_address = \"0xPool\"
         // #519 hard ceiling: buffered_max_bytes > 64 MiB is almost
         // certainly an operator typo. The streaming abort+restart
         // path covers any blob size without raising this knob.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin_retry: Some(decdn_config_types::RetryPolicy {
                 buffered_max_bytes: MAX_BUFFERED_MAX_BYTES + 1,
@@ -6864,7 +6828,7 @@ swap_pool_address = \"0xPool\"
         // Boundary: exactly the ceiling is allowed; only > ceiling is
         // rejected. Pins the inclusive-bound semantics so a future
         // edit can't accidentally flip the inequality.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin_retry: Some(decdn_config_types::RetryPolicy {
                 buffered_max_bytes: MAX_BUFFERED_MAX_BYTES,
@@ -6882,7 +6846,7 @@ swap_pool_address = \"0xPool\"
         // `0` disables the buffer path entirely (operator opt-out;
         // documented in `RetryPolicy::buffered_max_bytes`). Must
         // resolve cleanly.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             origin_retry: Some(decdn_config_types::RetryPolicy {
                 buffered_max_bytes: 0,
@@ -6900,7 +6864,7 @@ swap_pool_address = \"0xPool\"
         // Absent `cache.circuit_breaker` => defaults from
         // CircuitBreakerPolicy::default() (#963). Pin the contract so a
         // default change is a deliberate, test-visible edit.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         let p = resolved.circuit_breaker;
         anyhow::ensure!(p.enabled, "breaker on by default");
@@ -6912,7 +6876,7 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_circuit_breaker_parses_full_section() -> anyhow::Result<()> {
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy {
                 enabled: true,
@@ -6954,7 +6918,7 @@ swap_pool_address = \"0xPool\"
         // A disabled breaker (enabled = false) never reaches HALF-OPEN,
         // so half_open_max_calls = 0 must resolve cleanly — an operator
         // opting out shouldn't have to supply a half-open value.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy::disabled()),
             ..types::CacheConfig::default()
@@ -6970,7 +6934,7 @@ swap_pool_address = \"0xPool\"
         // An ACTIVE breaker with half_open_max_calls = 0 could never
         // probe for recovery and would stay open forever — reject it at
         // config-load time with a contextualized error.
-        let cli = cache_cli(None, None);
+        let cli = cache_cli(None);
         let file = types::CacheConfig {
             circuit_breaker: Some(decdn_config_types::CircuitBreakerPolicy {
                 enabled: true,
@@ -6992,16 +6956,16 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_cache_defaults_satisfy_invariant() -> anyhow::Result<()> {
-        // Regression guard: if either default changes, the pair must still
-        // satisfy `max_blob < cache_size`. Lives here so a future edit to
-        // the DEFAULT_* constants can't silently reintroduce the #221 bug.
-        let cli = cache_cli(None, None);
+    fn resolve_cache_defaults_satisfy_the_disk_budget_floor() -> anyhow::Result<()> {
+        // Regression guard, retargeted by #1678: the pair invariant it used to
+        // check (`max_blob < cache_size`) is gone with the knob, but the default
+        // still has to clear the floor that replaced it — a `DEFAULT_CACHE_SIZE_MB`
+        // edited to `0` would refuse every blob on a default config.
+        let cli = cache_cli(None);
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         anyhow::ensure!(
-            resolved.max_blob_size_mb < resolved.cache_size_mb,
-            "defaults violate invariant: max_blob={} cache_size={}",
-            resolved.max_blob_size_mb,
+            resolved.cache_size_mb > 0,
+            "the default disk budget must be non-zero; got {}",
             resolved.cache_size_mb
         );
         Ok(())
@@ -7384,7 +7348,6 @@ swap_pool_address = \"0xPool\"
             ("chain_id", "DECDN_CHAIN_ID"),
             ("cache_dir", "DECDN_CACHE_DIR"),
             ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
-            ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
             ("max_rate_per_mb", "DECDN_MAX_RATE_PER_MB"),
             ("max_probe_holds", "DECDN_MAX_PROBE_HOLDS"),
             (
@@ -7715,7 +7678,6 @@ swap_pool_address = \"0xPool\"
         crate::cli::run::CacheArgs {
             cache_dir: None,
             cache_size_mb: None,
-            max_blob_size_mb: None,
             max_rate_per_mb: None,
             max_probe_holds: None,
             stake_lane_reserved_holds: None,
@@ -9408,7 +9370,6 @@ swap_pool_address = \"0xPool\"
         let file = types::CacheConfig {
             cache_dir: Some(PathBuf::from("/from/file")),
             cache_size_mb: None,
-            max_blob_size_mb: None,
             ..Default::default()
         };
         let resolved = common::test_support::with_home_override(Some(&home), || {
@@ -9438,7 +9399,6 @@ swap_pool_address = \"0xPool\"
         let file = types::CacheConfig {
             cache_dir: Some(PathBuf::from("/from/file")),
             cache_size_mb: None,
-            max_blob_size_mb: None,
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/data-dir"))?;
@@ -9460,7 +9420,6 @@ swap_pool_address = \"0xPool\"
         let cli = empty_cache_args();
         let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
-        assert_eq!(resolved.max_blob_size_mb, DEFAULT_MAX_BLOB_SIZE_MB);
         Ok(())
     }
 
@@ -9468,16 +9427,13 @@ swap_pool_address = \"0xPool\"
     fn resolve_cache_cli_size_overrides_file_size() -> anyhow::Result<()> {
         let mut cli = empty_cache_args();
         cli.cache_size_mb = Some(2_048);
-        cli.max_blob_size_mb = Some(256);
         let file = types::CacheConfig {
             cache_dir: None,
             cache_size_mb: Some(99_999),
-            max_blob_size_mb: Some(50_000),
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, 2_048);
-        assert_eq!(resolved.max_blob_size_mb, 256);
         Ok(())
     }
 
@@ -9487,12 +9443,10 @@ swap_pool_address = \"0xPool\"
         let file = types::CacheConfig {
             cache_dir: None,
             cache_size_mb: Some(2_048),
-            max_blob_size_mb: Some(256),
             ..Default::default()
         };
         let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
         assert_eq!(resolved.cache_size_mb, 2_048);
-        assert_eq!(resolved.max_blob_size_mb, 256);
         Ok(())
     }
 
@@ -9849,7 +9803,7 @@ denied_hashes = ["{shared}"]
     #[test]
     fn resolve_config_aggregates_all_problems_in_one_pass() -> anyhow::Result<()> {
         // Four independent problems across three sections (bad region,
-        // missing rpc_url, max_blob >= cache, rate_per_mb = 0) must all
+        // missing rpc_url, a zero cache_size_mb, rate_per_mb = 0) must all
         // surface in a single error so the operator fixes them in one
         // edit cycle.
         let body = r#"
@@ -9862,8 +9816,7 @@ capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [cache]
-cache_size_mb = 100
-max_blob_size_mb = 500
+cache_size_mb = 0
 
 [payment]
 rate_per_mb = 0
@@ -9882,7 +9835,7 @@ rate_per_mb = 0
         for needle in [
             "identity.region",
             "rpc_url",
-            "max_blob_size_mb",
+            "cache.cache_size_mb",
             "rate_per_mb",
         ] {
             assert!(

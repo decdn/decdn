@@ -353,7 +353,6 @@ fn build_config(
         cache: ResolvedCache {
             cache_dir,
             cache_size_mb: 1024,
-            max_blob_size_mb: 128,
             max_rate_per_mb: 0,
             origins: Vec::new(),
             pinned_hashes: decdn_cache::PinnedHashes::empty(),

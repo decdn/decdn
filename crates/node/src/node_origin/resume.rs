@@ -41,6 +41,21 @@
 //! is still a strict improvement on what it replaces: the buffered requester held
 //! the bao wire form in a `BytesMut` AND the decoded content in a `Vec`, so peak
 //! memory drops from roughly 2x the blob to 1x.
+//!
+//! # …which makes this the one tier bounded by MEMORY (#1678)
+//!
+//! 1x the blob is still O(blob). Every other ingest path streams to disk at
+//! O(chunk-group) through `admit_bao_stream`, so #1678 could delete
+//! `max_blob_size_mb` and let the disk budget be the only ceiling. This tier
+//! cannot: its ceiling has to be an amount of RAM.
+//!
+//! So it carries its own bound — [`BufferedTierTooLarge`] against
+//! `cache.origin_retry.buffered_max_bytes` (4 MiB default), the knob that
+//! already means "bytes this node will hold in memory for one origin fetch".
+//! A blob over it is not unservable here; it simply has to arrive through the
+//! streaming window tier instead. Porting this loop onto
+//! `BlobSource`/`NodeAdmitStore` would remove the bound along with the buffer,
+//! and is tracked separately.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,7 +84,7 @@ use crate::selection::Candidate;
 /// Deliberately **1**, where the CLI's [`MAX_TOPUP_ATTEMPTS`] is 3. The node tops
 /// up from the initial deposit straight to the working deposit — 0.5 USDC to 10
 /// USDC under the shipped defaults, a 20x jump — so one top-up covers any blob
-/// inside `cache.max_blob_size_mb` at any sane rate. Needing a second means the
+/// inside `cache.origin_retry.buffered_max_bytes` at any sane rate. Needing a second means the
 /// upstream's quoted rate is wrong for the working deposit, which is a pricing
 /// problem no amount of funding fixes; each extra attempt costs a transaction plus
 /// a settle wait, both of which land on a client that is waiting.
@@ -451,10 +466,15 @@ struct LoopState {
     /// The verified content decoded so far. Truncated back to the resume offset at
     /// the start of each leg, so no byte is ever appended twice.
     ///
-    /// Deliberately NOT `with_capacity(total_bytes)`: `max_blob_size_bytes == 0` is
-    /// the "unlimited" sentinel, so a hostile upstream could claim `u64::MAX` and we
-    /// would abort on the allocation before the size gate ever ran. Growing costs a
-    /// few reallocs on a path already bounded by the network.
+    /// Deliberately NOT `with_capacity(total_bytes)`: `total_bytes` is
+    /// upstream-controlled, so pre-allocating on it lets a hostile peer pick this
+    /// node's allocation size. Growing costs a few reallocs on a path already
+    /// bounded by the network.
+    ///
+    /// This buffer is why the tier needs [`BufferedTierTooLarge`]: it is the last
+    /// ingest path holding a whole blob in RAM, so its bound is memory
+    /// (`cache.origin_retry.buffered_max_bytes`) rather than the disk budget
+    /// every other path answers to (#1678).
     buf: Vec<u8>,
     /// Content offset the next leg starts at.
     byte_offset: u64,
@@ -561,6 +581,39 @@ async fn stream_leg(
     .map(|_| ())
 }
 
+/// The upstream's signed `total_bytes` is more than this node will hold in
+/// memory for one buffered pull (`cache.origin_retry.buffered_max_bytes`).
+///
+/// Typed rather than a bare string so [`super::pull_verdict`] can classify it as
+/// a **buyer-side policy** refusal — this node's RAM budget, not provider
+/// misbehavior. A peer that serves this blob happily to a node with a larger
+/// buffer (or over the streaming window tier) is behaving correctly, so it must
+/// not be scored for our refusal.
+///
+/// This is the one bound that is a *memory* quantity rather than the disk budget
+/// (#1678): [`LoopState::buf`] holds the whole blob, so this tier — and only
+/// this tier — has to refuse what it cannot hold in RAM.
+#[derive(Debug)]
+pub(super) struct BufferedTierTooLarge {
+    /// What the upstream signed for.
+    pub claimed: u64,
+    /// `cache.origin_retry.buffered_max_bytes`.
+    pub ceiling: u64,
+}
+
+impl std::fmt::Display for BufferedTierTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upstream claimed {} bytes, over the {} byte buffered-tier memory \
+             ceiling (cache.origin_retry.buffered_max_bytes)",
+            self.claimed, self.ceiling
+        )
+    }
+}
+
+impl std::error::Error for BufferedTierTooLarge {}
+
 /// Open one leg at `byte_offset`.
 ///
 /// Split out so the caller reads as a loop rather than as an argument list: the only
@@ -593,7 +646,6 @@ async fn open_leg(
         NO_NAMESPACE,
         byte_offset,
         now_micros(),
-        deps.config.max_blob_size_bytes,
         // Refuse a stream quote above the lower of the candidate's probe rate and the
         // configured absolute ceiling, before paying (#1375). `candidate.rate_per_mb >= 1`
         // always (`ProbeResponse::validate` rejects a zero rate and `probe_candidate`
@@ -606,6 +658,30 @@ async fn open_leg(
         0,
     )
     .await
+    .and_then(|(header, pull)| {
+        // Memory gate, applied to the SIGNED `total_bytes` before the caller
+        // touches its buffer (#1678). This tier accumulates the whole blob into
+        // `LoopState.buf`, so an upstream that claims a huge size drives us
+        // toward OOM; `total_bytes` is upstream-controlled and
+        // `StreamResponse::validate()` does not bound it.
+        //
+        // Checked on EVERY leg, not just the first: a resumed leg re-opens
+        // against a freshly signed header, and nothing forces the second
+        // upstream to have quoted the same size as the first.
+        //
+        // `0` disables the buffered tier entirely, matching what
+        // `buffered_max_bytes = 0` already means for the origin retry path (all
+        // fetches route around the buffer). Refusing everything here is the
+        // correct reading of that: this tier IS the buffer.
+        let ceiling = deps.config.buffered_tier_max_bytes;
+        if header.total_bytes > ceiling {
+            return Err(anyhow::Error::new(BufferedTierTooLarge {
+                claimed: header.total_bytes,
+                ceiling,
+            }));
+        }
+        Ok((header, pull))
+    })
 }
 
 /// Raise the channel toward `want` and update `ctx.deposit`. Returns whether the

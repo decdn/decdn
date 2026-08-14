@@ -19,8 +19,8 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_client_pull::buyer_pool::open_pool;
 use decdn_client_pull::{
-    BlobTooLargeClaim, HashMismatch, PoolContext, PullDeadlines, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
+    HashMismatch, PoolContext, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, sign_client_binding, stream_fetch_tracked,
 };
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
@@ -254,7 +254,6 @@ impl ClientFixture {
                 // the `ZeroBudget` arm is unreachable here — propagate rather than unwrap.
                 PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
                 0,
-                0,
                 &mut progress,
             )
             .await
@@ -400,7 +399,6 @@ impl ClientFixture {
             byte_offset,
             TIMESTAMP_US,
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
-            0,
             0,
             &mut progress,
         )
@@ -750,7 +748,6 @@ impl ClientFixture {
             timestamp_us,
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
             0,
-            0,
             &mut VoucherProgress::default(),
         )
         .await
@@ -890,8 +887,8 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// errors, `PullTimeout`, and `PullStalled` reach the closing `true` by
 /// fallthrough.
 ///
-/// Everything else is terminal: a corrupt delivery (`HashMismatch`), a buyer-side
-/// size-cap rejection (`BlobTooLargeClaim`), any other mid-stream voucher
+/// Everything else is terminal: a corrupt delivery (`HashMismatch`), any
+/// mid-stream voucher
 /// rejection (`UpstreamVoucherRejected` — e.g. an `AmountRegression` left by
 /// one-sided ack loss, deposit exhaustion, or a `CapExceeded`), or a refusal by
 /// which the node reports itself degraded / the blob over its own ceiling.
@@ -902,9 +899,7 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// every one of them — including a hard `InternalError` — was retried to the
 /// deadline.
 fn is_retryable(err: &anyhow::Error) -> bool {
-    if err.downcast_ref::<HashMismatch>().is_some()
-        || err.downcast_ref::<BlobTooLargeClaim>().is_some()
-    {
+    if err.downcast_ref::<HashMismatch>().is_some() {
         return false;
     }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {

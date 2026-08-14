@@ -1173,10 +1173,38 @@ pub struct DecdnMetrics {
     /// `InternalError`, not a signed absence. Visible name:
     /// `decdn_serve_stream_rejected_internal_error_total`.
     pub serve_stream_rejected_internal_error: Counter,
-    /// `serve_stream` requests refused because the blob exceeds the configured
-    /// `max_blob_size_bytes`. Visible name:
+    /// `serve_stream` requests refused because the blob does not fit this node's
+    /// disk budget (`cache.cache_size_mb`), reported by the cache engine's
+    /// admission cap on the origin pull path (#1678). Visible name:
     /// `decdn_serve_stream_rejected_blob_too_large_total`.
+    ///
+    /// Since #1678 this can no longer fire for a blob the node already HOLDS —
+    /// a resident blob is always servable. It means "I could not take this in",
+    /// never "I have it but will not send it".
     pub serve_stream_rejected_blob_too_large: Counter,
+    // ---- Fill-size distribution (#1678) ----
+    //
+    // A bucket ladder rather than a histogram: `iroh_metrics::Histogram` has no
+    // `Default`, and `#[derive(MetricsGroup)]` constructs every field through
+    // `Default::default()`. Five counters answer the only question this needs to
+    // answer — are the blobs this node warms big enough to matter against
+    // `cache_size_mb`? — without fighting the framework for quantiles nobody
+    // asked for. Bucket bounds are inclusive upper bounds; each fill increments
+    // exactly one.
+    /// Fills whose signed `total_bytes` is ≤ 1 MiB.
+    /// Visible name: `decdn_node_fill_size_le_1mib_total`.
+    pub node_fill_size_le_1mib: Counter,
+    /// Fills of 1 MiB–16 MiB. Visible name: `decdn_node_fill_size_le_16mib_total`.
+    pub node_fill_size_le_16mib: Counter,
+    /// Fills of 16 MiB–256 MiB. Visible name: `decdn_node_fill_size_le_256mib_total`.
+    pub node_fill_size_le_256mib: Counter,
+    /// Fills of 256 MiB–1 GiB. Visible name: `decdn_node_fill_size_le_1gib_total`.
+    pub node_fill_size_le_1gib: Counter,
+    /// Fills over 1 GiB — the range the removed 1 GiB `max_blob_size_mb` default
+    /// used to refuse outright. A non-zero value here is the direct evidence that
+    /// #1678 changed what this node can serve.
+    /// Visible name: `decdn_node_fill_size_gt_1gib_total`.
+    pub node_fill_size_gt_1gib: Counter,
     /// `serve_stream` requests refused on an unknown / never-opened lane
     /// (#848). Wire-indistinguishable from `cache_miss`/`owner_mismatch` (all
     /// signed as `NotFound` to avoid leaking lane existence), so this
@@ -1198,8 +1226,10 @@ pub struct DecdnMetrics {
     /// 1. the cache-miss **floor** (#1519) — one credit window, applied above
     ///    every fill tier so none of them fronts origin egress or upstream USDC
     ///    for a channel that cannot pay for a single interval;
-    /// 2. the **window** tier's speculative ceiling (#856) — the whole-blob cost
-    ///    when `max_blob_size_bytes` is finite, else the window cost;
+    /// 2. the **window** tier's speculative ceiling (#856) — the window cost
+    ///    (`max(pull_ahead_bytes, one interval, one credit window)`). It was
+    ///    once the whole-blob cost when a blob-size cap was configured; there is
+    ///    no such cap since #1678, so only the window arm remains;
     /// 3. the **direct-serve** ceiling (#1516) —
     ///    `min(credit window, chunk-group-aligned request span)`.
     ///
@@ -1580,6 +1610,27 @@ impl Metrics {
             ProbeHoldUnavailableReason::StakeLaneReserved => {
                 self.probe_hold_stake_lane_reserved.inc()
             }
+        };
+    }
+
+    /// Record the signed `total_bytes` of one fill into the size-bucket ladder
+    /// (#1678). Hand-written rather than a `recorders!` entry because that macro
+    /// maps one recorder to one field expression, and this dispatches across
+    /// five.
+    ///
+    /// Called once per fill at the point `total_bytes` first becomes known and
+    /// trusted — the peeked-or-handshaked total on the serve-miss path. Not
+    /// called per chunk or per observer: the question is the distribution of
+    /// blob SIZES this node warms, so a coalesced fill that N clients attach to
+    /// is one observation, not N.
+    pub fn record_fill_size(&self, total_bytes: u64) {
+        const MIB: u64 = 1024 * 1024;
+        match total_bytes {
+            0..=MIB => self.decdn.node_fill_size_le_1mib.inc(),
+            _ if total_bytes <= 16 * MIB => self.decdn.node_fill_size_le_16mib.inc(),
+            _ if total_bytes <= 256 * MIB => self.decdn.node_fill_size_le_256mib.inc(),
+            _ if total_bytes <= 1024 * MIB => self.decdn.node_fill_size_le_1gib.inc(),
+            _ => self.decdn.node_fill_size_gt_1gib.inc(),
         };
     }
 
@@ -2069,8 +2120,8 @@ recorders! {
     /// surfaced as `InternalError` (#876).
     serve_stream_rejected_internal_error => serve_stream_rejected_internal_error.inc();
 
-    /// Record a `serve_stream` request refused because the blob exceeds
-    /// `max_blob_size_bytes` (#876).
+    /// Record a `serve_stream` request refused because the blob does not fit
+    /// this node's disk budget (#876, #1678).
     serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 
     /// Record a `serve_stream` request refused on an unknown lane (#876).

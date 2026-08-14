@@ -1200,9 +1200,6 @@ async fn build_chain_and_handlers(
         reload_state.rate_per_mb(),
         rate_bounds.clone(),
         cfg.payment.voucher_interval_mb,
-        cfg.cache
-            .max_blob_size_mb
-            .saturating_mul(decdn_protocol::MB_BYTES),
         MAX_CLIENT_STREAMS,
         Arc::clone(&content_denylist),
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
@@ -1869,10 +1866,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
         stall_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec),
-        max_blob_size_bytes: cfg
-            .cache
-            .max_blob_size_mb
-            .saturating_mul(decdn_protocol::MB_BYTES),
+        // The buffered miss tier's MEMORY bound, not a blob-size cap (#1678):
+        // `resume::pull_blob` holds the whole blob in RAM, so it answers to the
+        // same knob that bounds every other in-memory origin fetch.
+        buffered_tier_max_bytes: cfg.cache.origin_retry.buffered_max_bytes,
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
         // Miss pulls open small and graduate on proof (#1497 task 6): the
         // fresh-open deposit is the INITIAL size, not the working target.
@@ -2994,7 +2991,7 @@ async fn build_cache(
     let engine = CacheEngine::open_full(
         &cfg.cache.cache_dir,
         origins,
-        cfg.cache.max_blob_size_mb,
+        cfg.cache.cache_size_mb,
         cfg.cache.pinned_hashes.clone(),
         cfg.cache.origin_retry,
         cfg.cache.circuit_breaker,
@@ -3705,7 +3702,6 @@ mod tests {
             cache: decdn_common::config::ResolvedCache {
                 cache_dir,
                 cache_size_mb: 1024,
-                max_blob_size_mb: 128,
                 max_rate_per_mb: 0,
                 origins,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),

@@ -231,11 +231,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  cache_size_mb:            {}",
         resolved.cache.cache_size_mb
     )?;
-    writeln!(
-        w,
-        "  max_blob_size_mb:         {}",
-        resolved.cache.max_blob_size_mb
-    )?;
     match resolved.cache.max_rate_per_mb {
         0 => writeln!(w, "  max_rate_per_mb:          unlimited (buyer)")?,
         n => writeln!(w, "  max_rate_per_mb:          {n} (buyer ceiling)")?,
@@ -614,8 +609,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [cache]
 # cache_dir = "~/.decdn/cache"
-# cache_size_mb = 10240
-# max_blob_size_mb = 1024
+# cache_size_mb = 10240                    # disk budget, and the only ceiling on a single blob (#1678); must be non-zero
 # max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_floor clamp, which raises this node's own quote
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
@@ -912,7 +906,6 @@ mod tests {
         let config::types::CacheConfig {
             cache_dir,
             cache_size_mb,
-            max_blob_size_mb,
             max_rate_per_mb,
             origin,
             origins,
@@ -942,7 +935,6 @@ mod tests {
         let cache = [
             ("cache_dir =", cache_dir.is_none()),
             ("cache_size_mb =", cache_size_mb.is_none()),
-            ("max_blob_size_mb =", max_blob_size_mb.is_none()),
             ("max_rate_per_mb =", max_rate_per_mb.is_none()),
             ("[cache.origin]", origin.is_none()),
             ("[[cache.origins]]", origins.is_none()),

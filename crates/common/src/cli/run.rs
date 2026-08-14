@@ -148,11 +148,6 @@ pub struct CacheArgs {
     #[arg(long, value_name = "MB", env = "DECDN_CACHE_SIZE_MB")]
     pub cache_size_mb: Option<u64>,
 
-    /// Maximum single blob size in megabytes [default: 1024]. Must be
-    /// strictly less than `cache_size_mb`.
-    #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
-    pub max_blob_size_mb: Option<u64>,
-
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid cache-miss pulls, in USDC
     /// base units (same units as `--rate-per-mb`) [default: 0 = unlimited]. This
     /// node refuses a provider quote above the lower of this and the rate the

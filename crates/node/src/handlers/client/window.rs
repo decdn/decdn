@@ -196,14 +196,16 @@ impl ClientHandler {
             }
         };
 
-        // (4) Size gate on the claimed total (peeked or upstream-handshaked).
-        // (`open_pull_leg` already refuses an oversized header via its
-        // `max_blob_size_bytes`; this is a belt-and-braces wire-reason check.)
-        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            return self
-                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
-                .await;
-        }
+        // (4) No size gate on the claimed total (#1678). This tier streams the
+        // upstream body into `admit_bao_stream` at O(chunk-group) memory, so a
+        // large `total_bytes` costs disk, not RAM — and the disk it costs is
+        // bounded by the eviction driver against `cache.cache_size_mb`. A blob
+        // this node's disk can hold is a blob this node should warm.
+        //
+        // What replaced the gate is measurement: record the size instead of
+        // refusing it, so an operator can see the distribution the removed cap
+        // used to truncate.
+        self.metrics.record_fill_size(total_bytes);
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known) and the
         // `interval_mb` negotiated above. It is deferred to step (7), AFTER the fill is
@@ -539,14 +541,12 @@ impl ClientHandler {
                 .await;
         }
 
-        // (3) Size gate on the origin-claimed total (belt-and-braces: dispatch's
-        // `origin_size` probe already produced `total_bytes`; refuse an oversized
-        // blob with the wire-parity reason before signing anything).
-        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
-            return self
-                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
-                .await;
-        }
+        // (3) No size gate on the origin-claimed total (#1678) — the own-origin
+        // twin of the peer tier above, and streaming for the same reason. The
+        // engine's `cache_size_mb` cap still binds on the origin pull itself,
+        // which is where an unsigned-length backend can actually lie to us.
+        // Measured, not gated, exactly as on the peer twin.
+        self.metrics.record_fill_size(total_bytes);
 
         // (4) Sign + send the response up front — it commits to `total_bytes`,
         // which the caller already read from the origin size probe, and to the

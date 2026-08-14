@@ -85,7 +85,9 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 
 Even the worst case (1024 MB at ceiling rate) exposes $1.024 — small against the reserve `M` a node keeps against a pool (see [Pool solvency and the refundable floor `M`](#pool-solvency-and-the-refundable-floor-m)).
 
-Voucher interval negotiation is complemented by per-node `max_blob_size` limits ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)): while interval negotiation reduces per-voucher overhead for large blobs, `max_blob_size` allows nodes to refuse blobs that would create unacceptable resource pressure (cache exhaustion, extended origin pulls) regardless of voucher cadence.
+Voucher interval negotiation carries the whole per-voucher-overhead question for large blobs. A node does not also cap blob size: it admits any blob its disk budget holds ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)), because paid ingest streams to disk and the exposure a large blob creates is disk, which eviction already bounds.
+
+The payment-side exposure is bounded by the interval and the reserve, not by blob size. A node stops serving a pool at the refundable floor `M` ([Pool solvency and the refundable floor `M`](#pool-solvency-and-the-refundable-floor-m)), so a large blob cannot draw a pool past what `M` protects — the transfer stops at the floor mid-blob, like any other.
 
 ### Credit Window
 

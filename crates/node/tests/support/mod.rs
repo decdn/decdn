@@ -249,7 +249,7 @@ impl ReceiptLog for BlockingReceiptLog {
 }
 
 /// Build a [`ClientHandler`] over `cache`/`store` with explicit domains and the
-/// `max_blob_size_bytes` (`0` == unlimited) / `max_concurrent_streams` knobs.
+/// `max_concurrent_streams` knob.
 /// Uses a throwaway in-memory receipt log; tests asserting receipt contents use
 /// [`build_handler_full_with_receipts`].
 #[allow(clippy::too_many_arguments)]
@@ -262,7 +262,6 @@ pub fn build_handler_full(
     store: Arc<dyn PoolStateStore>,
     rate: u64,
     domains: &HandlerDomains,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
     build_handler_full_with_receipts(
@@ -275,7 +274,6 @@ pub fn build_handler_full(
         Arc::new(VecReceiptLog::default()),
         rate,
         domains,
-        max_blob_size_bytes,
         max_concurrent_streams,
     )
 }
@@ -293,7 +291,6 @@ pub fn build_handler_full_with_receipts(
     receipt_log: Arc<dyn ReceiptLog>,
     rate: u64,
     domains: &HandlerDomains,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
     // The handler enqueues through a `ReceiptSink`; wrap the test's synchronous
@@ -309,7 +306,6 @@ pub fn build_handler_full_with_receipts(
         Arc::new(DirectReceiptSink::new(receipt_log)),
         rate,
         domains,
-        max_blob_size_bytes,
         max_concurrent_streams,
     )
 }
@@ -329,7 +325,6 @@ pub fn build_handler_full_with_sink(
     receipt_sink: Arc<dyn ReceiptSink>,
     rate: u64,
     domains: &HandlerDomains,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
     Ok(Arc::new(ClientHandler::new(client_handler_deps(
@@ -342,7 +337,6 @@ pub fn build_handler_full_with_sink(
         receipt_sink,
         rate,
         domains,
-        max_blob_size_bytes,
         max_concurrent_streams,
     ))?))
 }
@@ -360,7 +354,6 @@ fn client_handler_deps(
     receipt_sink: Arc<dyn ReceiptSink>,
     rate: u64,
     domains: &HandlerDomains,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> ClientHandlerDeps {
     ClientHandlerDeps::new(
@@ -377,7 +370,6 @@ fn client_handler_deps(
         Arc::new(AtomicU64::new(rate)),
         decdn_node::rate_bounds::RateBounds::new(0),
         1, // voucher_interval_mb
-        max_blob_size_bytes,
         max_concurrent_streams,
         // Empty by default; a test needing a populated deny-set overwrites the
         // `content_deny` field via the `configure` closure of `build_handler_with`.
@@ -404,7 +396,6 @@ pub fn build_handler_full_configured(
     store: Arc<dyn PoolStateStore>,
     rate: u64,
     domains: &HandlerDomains,
-    max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     configure: impl FnOnce(&mut ClientHandlerDeps),
 ) -> anyhow::Result<Arc<ClientHandler>> {
@@ -418,7 +409,6 @@ pub fn build_handler_full_configured(
         Arc::new(DirectReceiptSink::new(Arc::new(VecReceiptLog::default()))),
         rate,
         domains,
-        max_blob_size_bytes,
         max_concurrent_streams,
     );
     configure(&mut deps);

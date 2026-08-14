@@ -85,11 +85,10 @@ use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
-    BlobTooLargeClaim, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger,
-    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamPull,
-    UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    effective_rate_ceiling, open_progressive_pull as open_progressive_upstream,
-    sign_client_binding,
+    Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger, PullDeadlines, PullStalled,
+    PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamPull, UpstreamPullHeader,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    open_progressive_pull as open_progressive_upstream, sign_client_binding,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -257,10 +256,21 @@ pub struct NodeOriginConfig {
     /// caps the blob size this node can pull through at `pull_timeout × link
     /// speed`, which is the bug this replaced.
     pub stall_timeout: Duration,
-    /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
-    /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
-    /// `total_bytes` claim before buffering (#840).
-    pub max_blob_size_bytes: u64,
+    /// Memory ceiling for the **buffered** miss tier (`resume::pull_blob`), from
+    /// `cache.origin_retry.buffered_max_bytes`. `0` = the buffered tier is
+    /// disabled outright.
+    ///
+    /// This tier is the one ingest path that still holds a whole blob in RAM
+    /// (`LoopState.buf`), so unlike every other path its bound is a *memory*
+    /// quantity, not the disk budget (#1678). Sizing it off `cache_size_mb`
+    /// would be a category error: a 10 GiB disk budget is not 10 GiB of RSS to
+    /// spend on one pull. Blobs above it fall to the streaming window tier.
+    ///
+    /// Reusing the retry knob is deliberate — `buffered_max_bytes` already means
+    /// "how many bytes this node will hold in memory for one origin fetch", is
+    /// already validated against a 64 MiB hard ceiling, and the buffered tier is
+    /// exactly that operation with a peer in place of the backend.
+    pub buffered_tier_max_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
     /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the
     /// probe-relative bound (the rate the chosen candidate advertised) so the node
@@ -723,7 +733,6 @@ impl NodeOrigin {
             namespace_id.to_be_bytes(),
             0,
             now_micros(),
-            deps.config.max_blob_size_bytes,
             // Refuse a stream quote above the lower of the candidate's probe rate
             // and the configured absolute ceiling, before paying (#1375).
             // `candidate.rate_per_mb >= 1` always: `ProbeResponse::validate`
@@ -2094,7 +2103,13 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
 /// means "which arm does this error land in?" is a question a test can just ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullVerdict {
-    /// The blob is over OUR configured ceiling (#840) — it may be fine for other nodes.
+    /// The blob is over OUR configured ceiling — it may be fine for other nodes.
+    ///
+    /// Since #1678 the ceiling this reports is the **buffered miss tier's memory
+    /// bound** (`cache.origin_retry.buffered_max_bytes`), not a blob-size cap:
+    /// the node refuses to hold a blob that big in RAM for one pull. The blob is
+    /// still servable here over the streaming window tier, and a peer that
+    /// offered it did nothing wrong (#840).
     OversizeClaim,
     /// The provider quoted a per-MB rate above the buyer's effective ceiling — the lower
     /// of its own probe rate and our configured absolute cap (#1375). We refused before
@@ -2275,7 +2290,7 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
 
 /// The ordered sentinel ladder. Pure: no metrics, no reputation, no I/O.
 fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
-    if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
+    if err.downcast_ref::<resume::BufferedTierTooLarge>().is_some() {
         return PullVerdict::OversizeClaim;
     }
     if err.downcast_ref::<RateAboveCeiling>().is_some() {
@@ -2382,11 +2397,12 @@ fn classify_pull_failure(
 
     let verdict = pull_verdict(err);
     match verdict {
-        // OUR ceiling, not the provider's fault — it may legitimately serve larger blobs to
-        // nodes configured with a higher `max_blob_size`. Metered, not scored (#840).
+        // OUR memory ceiling, not the provider's fault — it may legitimately serve larger
+        // blobs to nodes with a bigger buffer, and this node can still take the same blob
+        // over the streaming window tier. Metered, not scored (#840, #1678).
         PullVerdict::OversizeClaim => {
             deps.metrics.node_pull_too_large();
-            debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
+            debug!(%provider_addr, %err, "node-origin: blob over the buffered-tier memory ceiling; refused before buffering");
         }
         // The provider quoted above our effective rate ceiling (#1375). We refused before
         // paying; the signed over-quote is retained ON the `RateAboveCeiling` error for a

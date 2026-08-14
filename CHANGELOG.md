@@ -28,6 +28,47 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Config-breaking: `cache.max_blob_size_mb` is removed; blob admission is now a
+  disk decision against `cache.cache_size_mb` (#1678).** The knob existed to bound
+  RAM back when the warm/buyer leg buffered a whole blob. Since the range-aware
+  `admit` path (#1607/#1608) that leg streams to disk at `O(chunk-group)`, so the
+  cap only stopped a node from holding a blob its disk could easily fit — a node
+  with 2 TB of disk refused a 2 GB blob because of a 1 GiB default sized for
+  memory. Removing it lets a node serve any blob its cache budget holds.
+  - **The CLI flag `--max-blob-size-mb` and env `DECDN_MAX_BLOB_SIZE_MB` are
+    gone**, as is the `max_blob_size_mb < cache_size_mb` startup invariant. A
+    config file still setting the key fails to load (`deny_unknown_fields`).
+  - **`cache.cache_size_mb = 0` is now rejected at startup.** It became
+    load-bearing: it is the disk budget *and* the admission ceiling, and the
+    engine's cap has no "unlimited" sentinel, so a zero budget would refuse every
+    blob rather than disable the check — the opposite of what `0` reads as.
+  - **`StreamError::BlobTooLarge` survives with a new meaning:** "does not fit my
+    disk budget", not "over my configured blob cap". It is now an *admission*
+    answer only — a node that already holds a blob always serves it, however
+    large. The old serve-side gate refused resident blobs, which burned the
+    storage cost and then declined the revenue for it.
+  - **The buffered node-to-node miss tier keeps a ceiling, in memory rather than
+    disk.** `resume::pull_blob` is the one ingest path still holding a whole blob
+    in RAM, so it is bounded by `cache.origin_retry.buffered_max_bytes` (4 MiB
+    default). Above that it refuses and the blob arrives over the streaming
+    window tier instead — a live behaviour change for large blobs on that tier.
+    Porting it onto the streaming `BlobSource` path is tracked separately.
+  - Buyer-side: `BlobTooLargeClaim` and the requester's size ceiling are gone —
+    the requester has no resource of its own to protect, since every caller
+    streams into a bounded sink. `decdn fetch --max-blob-mb` is unaffected and
+    now enforced in the CLI, which is the layer that owns the user's disk.
+
+- **New cache observability for admission pressure (#1678).**
+  `decdn_cache_fill_in_flight_bytes` (inbound content committed but not yet
+  written), `decdn_cache_pending_reclaim_bytes` (released but not yet reclaimed —
+  the reclaim-lag signal), `decdn_cache_evicting` (hysteresis latch), and a
+  `decdn_node_fill_size_*` bucket ladder over fill sizes. There is deliberately
+  no up-front admission reservation: eviction remains the sole enforcer, and
+  these metrics exist to show whether fill bursts outrun reclaim badly enough to
+  need one. Making the GC sweep run on demand at the high-water crossing —
+  which would close the lag directly — stays blocked on iroh-blobs keeping
+  `gc_run_once` private ([#520](https://github.com/decdn/decdn/issues/520)).
+
 - **Container image renamed to `decdn-node`, and now published to Docker Hub as
   well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
   the same image is published as `decdn/decdn-node` on Docker Hub. The image

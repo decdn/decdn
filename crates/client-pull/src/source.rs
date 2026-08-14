@@ -209,7 +209,6 @@ pub struct PeerSource<'a> {
     slash_domain: &'a Eip712Domain,
     expected_signer: Address,
     namespace_id: [u8; 32],
-    max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
 }
@@ -222,7 +221,6 @@ impl std::fmt::Debug for PeerSource<'_> {
             .field("target", &self.target)
             .field("expected_signer", &self.expected_signer)
             .field("namespace_id", &self.namespace_id)
-            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
             .field("max_rate_per_mb", &self.max_rate_per_mb)
             .field("deadlines", &self.deadlines)
             .finish_non_exhaustive()
@@ -231,8 +229,8 @@ impl std::fmt::Debug for PeerSource<'_> {
 
 impl<'a> PeerSource<'a> {
     /// Build a source for one gap-driven fetch against `target`, paid out of
-    /// `ledger` over `ctx`'s channel. `namespace_id`, `max_blob_size_bytes`,
-    /// `max_rate_per_mb`, and `deadlines` are the same buyer-side policy knobs
+    /// `ledger` over `ctx`'s channel. `namespace_id`, `max_rate_per_mb`, and
+    /// `deadlines` are the same buyer-side policy knobs
     /// [`crate::open_progressive_pull`] takes directly — see its docs.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -244,7 +242,6 @@ impl<'a> PeerSource<'a> {
         slash_domain: &'a Eip712Domain,
         expected_signer: Address,
         namespace_id: [u8; 32],
-        max_blob_size_bytes: u64,
         max_rate_per_mb: u64,
         deadlines: PullDeadlines,
     ) -> Self {
@@ -256,7 +253,6 @@ impl<'a> PeerSource<'a> {
             slash_domain,
             expected_signer,
             namespace_id,
-            max_blob_size_bytes,
             max_rate_per_mb,
             deadlines,
         }
@@ -293,7 +289,6 @@ impl BlobSource for PeerSource<'_> {
                 self.namespace_id,
                 range.fetch_start(),
                 micros_now(),
-                self.max_blob_size_bytes,
                 self.max_rate_per_mb,
                 self.deadlines,
                 range.fetch_len(),

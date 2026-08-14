@@ -168,10 +168,10 @@ pub struct ResolvedBlockchain {
 pub struct ResolvedCache {
     /// Blob cache directory.
     pub cache_dir: PathBuf,
-    /// Maximum cache size in megabytes.
+    /// Maximum cache size in megabytes — this node's disk budget, and since
+    /// #1678 the only ceiling on a single blob. Guaranteed non-zero by
+    /// `resolve_cache`.
     pub cache_size_mb: u64,
-    /// Maximum single blob size in megabytes.
-    pub max_blob_size_mb: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
     /// per-MB units as the wire `StreamResponse.rate_per_mb`; `0` = unlimited
     /// (the default). Distinct from the seller-side `delivery_floor` clamp, which

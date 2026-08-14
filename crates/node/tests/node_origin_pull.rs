@@ -559,6 +559,17 @@ fn provisioned_origin_with_accountant(
 const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
     (Duration::from_secs(20), Duration::from_secs(20));
 
+/// The buffered-tier memory ceiling every test that is not ABOUT that ceiling
+/// runs with: 64 MiB, the same hard cap config resolution allows for
+/// `cache.origin_retry.buffered_max_bytes`, and far above any fixture payload.
+///
+/// Deliberately not `0`. Before #1678 this slot held `max_blob_size_bytes`,
+/// where `0` was the "unlimited" sentinel — so fixtures passed `0` to mean "no
+/// ceiling". The buffered tier's bound is a memory budget with no such sentinel:
+/// `0` is a zero-byte buffer that refuses every blob. Reusing the old spelling
+/// would silently turn every one of these fixtures into a refusal test.
+const DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Like [`provisioned_origin_with_accountant`], but the caller picks the node-origin
 /// deadline budgets.
 ///
@@ -609,14 +620,18 @@ fn provisioned_origin_with_deadlines(
         addr_map,
         pull_timeout,
         stall_timeout,
-        0,
+        // Permissive buffered-tier memory ceiling: `0` no longer means
+        // "unlimited" (#1678), it means a 0-byte buffer that refuses every
+        // blob. Fixtures that are not ABOUT the ceiling want it out of the way.
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
     (origin, recorded)
 }
 
-/// Like [`provisioned_origin`], but the buyer enforces a `max_blob_size_bytes`
-/// ceiling — drives the production `pull_from_candidate` path against the
-/// buyer-side gate (#840).
+/// Like [`provisioned_origin`], but the buyer enforces a
+/// `buffered_tier_max_bytes` MEMORY ceiling — drives the production
+/// `pull_from_candidate` path against the buffered tier's own bound (#840,
+/// #1678).
 #[allow(clippy::too_many_arguments)]
 fn provisioned_origin_with_ceiling(
     ep_b: &iroh::Endpoint,
@@ -628,7 +643,7 @@ fn provisioned_origin_with_ceiling(
     metrics: &Arc<Metrics>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
-    max_blob_size_bytes: u64,
+    buffered_tier_max_bytes: u64,
 ) -> NodeOrigin {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
@@ -651,7 +666,7 @@ fn provisioned_origin_with_ceiling(
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        max_blob_size_bytes,
+        buffered_tier_max_bytes,
     )
 }
 
@@ -682,7 +697,7 @@ fn build_origin(
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES.0,
         DEFAULT_TEST_PULL_DEADLINES.1,
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     )
 }
 
@@ -702,7 +717,7 @@ fn build_origin_with_timeout(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-    max_blob_size_bytes: u64,
+    buffered_tier_max_bytes: u64,
 ) -> NodeOrigin {
     build_origin_with_negative_cache(
         ep_b,
@@ -716,7 +731,7 @@ fn build_origin_with_timeout(
         addr_map,
         pull_timeout,
         stall_timeout,
-        max_blob_size_bytes,
+        buffered_tier_max_bytes,
         NegativeProbeCache::new(),
     )
 }
@@ -743,7 +758,7 @@ fn build_origin_with_negative_cache(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-    max_blob_size_bytes: u64,
+    buffered_tier_max_bytes: u64,
     negative_cache: NegativeProbeCache,
 ) -> NodeOrigin {
     build_origin_with_probe_caches(
@@ -758,7 +773,7 @@ fn build_origin_with_negative_cache(
         addr_map,
         pull_timeout,
         stall_timeout,
-        max_blob_size_bytes,
+        buffered_tier_max_bytes,
         negative_cache,
         PositiveProbeCache::new(),
         // Buffered/generic path: the directory is keyed under `NO_NAMESPACE`,
@@ -789,7 +804,7 @@ fn build_origin_with_probe_caches(
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
     stall_timeout: Duration,
-    max_blob_size_bytes: u64,
+    buffered_tier_max_bytes: u64,
     negative_cache: NegativeProbeCache,
     probe_cache: PositiveProbeCache,
     // Namespace the directory keys the provider set under. Buffered/generic callers
@@ -833,7 +848,7 @@ fn build_origin_with_probe_caches(
             probe_fanout: 5,
             pull_timeout,
             stall_timeout,
-            max_blob_size_bytes,
+            buffered_tier_max_bytes,
             max_rate_per_mb: 0,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             working_deposit,
@@ -917,7 +932,7 @@ fn build_origin_seeded_ranking(
         addr_map,
         pull_timeout,
         stall_timeout,
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
         NegativeProbeCache::new(),
         probe_cache,
         U256::ZERO,
@@ -928,7 +943,8 @@ fn build_origin_seeded_ranking(
 
 /// Build a `NodeOrigin` whose directory maps SEVERAL hashes to the same provider set, so a
 /// test can pull two different blobs from one provider through one shared `deps` — and thus
-/// one shared `wedged_providers` map (#1145 review). `max_blob_size_bytes` is 0 (no ceiling).
+/// one shared `wedged_providers` map (#1145 review). The buffered-tier memory
+/// ceiling is left permissive.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
 fn build_origin_multi_hash(
     ep_b: &iroh::Endpoint,
@@ -973,7 +989,7 @@ fn build_origin_multi_hash(
             probe_fanout: 5,
             pull_timeout,
             stall_timeout,
-            max_blob_size_bytes: 0,
+            buffered_tier_max_bytes: DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
             max_rate_per_mb: 0,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -1161,7 +1177,6 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
         |deps| deps.local_populate = Some(Duration::from_secs(20)),
     )?;
@@ -1274,7 +1289,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -2139,7 +2153,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -2362,7 +2375,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -2472,7 +2484,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         addr_map,
         per_candidate,
         stall_budget,
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // The loop must abandon BOTH wedged candidates on their own budgets and still
@@ -2618,7 +2630,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -3203,7 +3214,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // What a failed pull ANSWERS with is itself reason-dependent (#1560), and the
@@ -3815,7 +3826,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -4477,7 +4487,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         // A stall budget far longer than the cancellation below, so the inactivity
         // deadline provably is NOT what ends this pull. The drop is.
         Duration::from_mins(2),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // Cancel it: `timeout` drops the fetch future exactly as the foreground
@@ -4830,7 +4840,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         addr_map,
         Duration::from_secs(10),
         EMPTY_CHUNK_STALL_BUDGET,
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = tokio::time::timeout(
@@ -4927,7 +4937,7 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         addr_map,
         Duration::from_secs(10),
         EMPTY_CHUNK_STALL_BUDGET,
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // The OPEN is honest (a valid signed response), so this must succeed — the
@@ -5053,7 +5063,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         // inactivity deadline can be what ends this pull.
         Duration::from_secs(20),
         Duration::from_secs(2),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = tokio::time::timeout(
@@ -5099,7 +5109,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
 /// blob size, because the serve path writes the `StreamResponse` and only then materialises
 /// the whole bao wire encoding (`export_bao_range`) before it can emit chunk #1.
 ///
-/// So a 1 GiB blob — the default `max_blob_size_mb` — read off a cold disk, or served by a
+/// So a 1 GiB blob — over the retired `max_blob_size_mb` default — read off a cold disk, or served by a
 /// node already streaming to several peers, could blow the 20 s default stall budget doing
 /// exactly what it was asked. The requester then scored it `Unreachable`: a local EWMA hit
 /// against an honest server, for the crime of being big.
@@ -5173,7 +5183,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         // does answer, promptly and correctly. Only the first-chunk wait can be what fires.
         Duration::from_secs(20),
         Duration::from_secs(2),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = tokio::time::timeout(
@@ -5302,7 +5312,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         // `PullTimeout` arm instead.
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = tokio::time::timeout(
@@ -5417,7 +5427,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         // Generous budgets: the refusal must end this pull, not a deadline.
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = tokio::time::timeout(
@@ -5653,7 +5663,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         // Generous, as above: the rejection must be what ends this pull, not a deadline.
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = tokio::time::timeout(
@@ -5810,7 +5820,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -5870,7 +5879,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         addr_map,
         per_candidate,
         stall_budget,
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // The REAL production deadline, derived exactly as the runtime derives it. This is the
@@ -6002,7 +6011,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         // Comfortably above the 600 ms inter-frame gap: this upstream is slow, not
         // silent, so the inactivity bound must never fire.
         Duration::from_secs(5),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let started = std::time::Instant::now();
@@ -6104,7 +6113,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         store_n as Arc<dyn PoolStateStore>,
         STALL_RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_n, addr_n) =
@@ -6145,7 +6153,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6201,7 +6208,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // N refuses; the loop falls through to A, which delivers.
@@ -6354,7 +6361,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
         NegativeProbeCache::with_capacity_and_ttl(16, TINY_CACHE_TTL),
     );
 
@@ -6498,7 +6505,7 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     let got = Origin::fetch(&origin, hash, u64::MAX)
@@ -6615,22 +6622,34 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     Ok(())
 }
 
-/// #840 over the real orchestration: an honest upstream holds and would serve a
-/// blob larger than B's `max_blob_size` ceiling. The buyer must reject the
-/// oversized `total_bytes` claim before buffering — the fetch is a clean
-/// `NotFound`, the `node_pull_too_large` counter moves, and (crucially) the
-/// provider is NOT scored: a buyer-side ceiling is OUR policy, not the provider's
-/// fault, so no observation is emitted and its local score stays neutral.
+/// The OOM regression guard for the buffered miss tier (#840, retargeted by
+/// #1678). An honest upstream holds and would serve a blob larger than what B
+/// will hold in RAM for one buffered pull.
 ///
-/// This exercises `pull_from_candidate` passing `deps.config.max_blob_size_bytes`
-/// (the loopback test calls `stream_fetch_tracked` directly and bypasses it).
+/// **Why this test cannot be deleted along with the other size gates.**
+/// `resume::pull_blob` accumulates the whole blob into `LoopState.buf`, so it is
+/// the one ingest path where an upstream-signed `total_bytes` translates
+/// directly into this node's RSS. Every other path streams to disk at
+/// O(chunk-group) and correctly lost its ceiling; if this one loses its bound
+/// too, a peer claiming a huge `total_bytes` walks the node into an allocation
+/// it cannot survive. The bound moved from `max_blob_size_mb` (a disk-shaped
+/// number) to `cache.origin_retry.buffered_max_bytes` (a memory-shaped one), and
+/// this test moved with it.
+///
+/// The refusal must stay reputation-neutral: the fetch is a clean `NotFound`,
+/// `node_pull_too_large` moves, and the provider is NOT scored — our RAM budget
+/// is our policy, and the same peer serves this blob correctly to a node with a
+/// bigger buffer, or to this node over the streaming window tier.
+///
+/// Exercises `pull_from_candidate` → `open_leg`'s header check (the loopback
+/// tests call `stream_fetch_tracked` directly and bypass it).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()> {
     let payload = vec![0xABu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
-    // Buyer ceiling well below the 1.5 MiB blob → the gate fires.
+    // Buffered-tier memory ceiling below the 1.5 MiB blob → the gate fires.
     let ceiling: u64 = 1_048_576;
     anyhow::ensure!(total_bytes > ceiling, "fixture must exceed the ceiling");
 
@@ -6669,7 +6688,6 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0, // server ceiling unlimited — it would happily serve the full blob.
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6683,7 +6701,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         RATE,
     );
 
-    // --- Node B: dial-only endpoint with a sub-blob ceiling. ------------------
+    // --- Node B: dial-only endpoint with a sub-blob memory ceiling. -----------
     let b_sk = fresh_key();
     let b_id = b_sk.public();
     let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
@@ -6797,7 +6815,6 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0, // server blob ceiling unlimited — isolate the RATE gate.
         16,
     )?;
     let (ep_a, addr_a) =
@@ -6920,7 +6937,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -7067,7 +7083,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -7351,7 +7366,6 @@ async fn build_node_b(
     leaf_channel_id: B256,
     leaf_eth_addr: Address,
     leaf_deposit: U256,
-    max_blob_size_bytes: u64,
     leech_caps: Option<LeechCaps>,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
@@ -7372,7 +7386,6 @@ async fn build_node_b(
         ab_channel_id,
         b_buyer,
         &[(leaf_channel_id, leaf_eth_addr, leaf_eth_addr, leaf_deposit)],
-        max_blob_size_bytes,
         64,
         leech_caps,
         None,
@@ -7386,12 +7399,12 @@ async fn build_node_b(
 /// node B (each leaf needs its own channel to avoid sharing voucher state). The
 /// single-leaf [`build_node_b`] is a thin wrapper over this.
 ///
-/// `engine_max_blob_mb` caps B's cache-engine store (`CacheEngine::open`'s
-/// `max_blob_mb`). It is independent of the handler's `max_blob_size_bytes`
-/// (which gates the *serve*): setting the engine cap below the blob size while
-/// leaving the handler cap permissive lets a test force `tee.finish()` to reject
-/// the promote on an otherwise-successful delivery (#896). Most callers pass the
-/// default `64`.
+/// `engine_cache_size_mb` is B's cache-engine DISK BUDGET (`CacheEngine::open`'s
+/// `cache_size_mb`), which since #1678 is also the admission ceiling on a single
+/// blob. Setting it below the blob size lets a test force `tee.finish()` to
+/// reject the promote on an otherwise-successful delivery (#896). Most callers
+/// pass the default `64`. There is no longer a separate handler-side serve
+/// ceiling to hold permissive against it — the serve gates are gone.
 ///
 /// Each leaf is `(pool_id, funder, voucher_signer, deposit)`. The two address
 /// legs are distinct on purpose: an on-chain `openChannel` may pin a delegate
@@ -7414,8 +7427,7 @@ async fn build_node_b_with_leaves(
     ab_channel_id: B256,
     b_buyer: &Arc<PrivateKeySigner>,
     leaves: &[(B256, Address, Address, U256)],
-    max_blob_size_bytes: u64,
-    engine_max_blob_mb: u64,
+    engine_cache_size_mb: u64,
     // Seed-leech caps to enable the governor on node B; the governor is built
     // over B's own `Metrics` (so leech counters land where tests assert them) and
     // returned so a test can pre-exhaust it before serving (#1254).
@@ -7468,7 +7480,7 @@ async fn build_node_b_with_leaves(
     // B's empty cache (the tee fills it) and the leaf's channel in B's store.
     let cache_tmp = tempfile::tempdir()?;
     let cache_b =
-        decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], engine_max_blob_mb).await?;
+        decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], engine_cache_size_mb).await?;
     let cache_handle = cache_b.clone();
     // Leak the tempdir guard for the test's lifetime (kept alive by the returned
     // engine's open store anyway).
@@ -7523,7 +7535,6 @@ async fn build_node_b_with_leaves(
         store_b as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        max_blob_size_bytes,
         16,
         |deps| {
             // Window-paced pull-through: the deadline accommodates the full
@@ -7603,7 +7614,6 @@ async fn spawn_node_a(
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -7652,7 +7662,6 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -7786,7 +7795,6 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
             leaf_delegate.address(),
             U256::from(DEPOSIT_MICRO_USDC),
         )],
-        0,
         64,
         None,
         Some(Arc::clone(&deny)),
@@ -7902,7 +7910,6 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
         )],
-        0,
         64,
         None,
         None,
@@ -8017,7 +8024,6 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
         )],
-        0,
         64,
         None,
         None,
@@ -8105,7 +8111,6 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -8223,7 +8228,6 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
                 U256::from(DEPOSIT_MICRO_USDC),
             ),
         ],
-        0,
         64,
         None,
         None,
@@ -8390,7 +8394,6 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -8514,7 +8517,6 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -8605,7 +8607,6 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x3F);
-    let max_blob_size_bytes = 64 * 1024 * 1024;
     let (
         handler_b,
         b_target,
@@ -8626,7 +8627,6 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(5u64),
-        max_blob_size_bytes,
         None,
     )
     .await?;
@@ -8717,7 +8717,6 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         Some(LeechCaps::new_unchecked(LeechCapsConfig {
             max_unrecouped_leech_bytes: Bytes::new(0),
             initial_allowance_bytes: Bytes::new(CHUNK_SIZE as u64),
@@ -9013,7 +9012,6 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -9139,7 +9137,6 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -9326,7 +9323,6 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         None,
     )
     .await?;
@@ -9410,7 +9406,6 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         // `new_unchecked`: a tiny global budget below the opening window, so the
         // global circuit breaker binds on the first admission (the scenario under
         // test). `LeechCaps::new` rejects this pairing by design.
@@ -9472,120 +9467,6 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Result<()> {
-    // #856 step (4): the fused serve opens the upstream pull, reads `total_bytes`
-    // from the signed header, and — if it exceeds this node's `max_blob_size_bytes`
-    // — signs `BlobTooLarge` (wire `NotFound`), abandons BOTH the upstream pull and
-    // the cache tee, and forwards nothing. The regression this guards: a dropped
-    // size gate would fuse-serve an over-ceiling blob; a forgotten `tee.abandon()`
-    // on this arm would strand the in-flight tee claim for the hash. We assert the
-    // refusal, the `blob_too_large` metric, that no voucher was paid upstream
-    // (channel opened, zero bytes pulled), and that nothing was cached.
-    let payload = vec![0xB1u8; PAYLOAD_LEN];
-    let hash = Hash::new(&payload);
-
-    let ab_channel_id = B256::repeat_byte(0xA6);
-    let b_buyer = Arc::new(PrivateKeySigner::random());
-    let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
-
-    let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x6F);
-    // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
-    // deposit guard (ceiling = min_payment(1 MiB, RATE) = 10 µUSDC) passes against
-    // the funded leaf, so we exercise step (4), not the step (1) deposit guard.
-    let max_blob_size_bytes = 1024 * 1024;
-    let (
-        handler_b,
-        b_target,
-        ep_b,
-        recorded,
-        cache_b,
-        b_metrics,
-        _local_rep,
-        _leech_gov,
-        b_operator,
-    ) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        max_blob_size_bytes,
-        None,
-    )
-    .await?;
-    let task_b = spawn_server(ep_b.clone(), handler_b);
-
-    let leaf_sk = fresh_key();
-    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
-    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
-    let refused = leaf_paced_pull(
-        &leaf_ep,
-        b_target.clone(),
-        leaf_node_id,
-        &leaf_eth,
-        b_operator,
-        leaf_channel_id,
-        hash,
-        RATE,
-        None,
-    )
-    .await
-    .is_err();
-    anyhow::ensure!(
-        refused,
-        "an upstream blob over the size ceiling must be refused (signed NotFound), not fused-served"
-    );
-    anyhow::ensure!(
-        progress_log(&recorded)?.is_empty(),
-        "the size gate must abort before any voucher is paid upstream, got {:?}",
-        progress_log(&recorded)?
-    );
-    anyhow::ensure!(
-        !cache_b.has(hash).await?,
-        "an oversized-upstream refusal must not promote the blob into B's cache"
-    );
-    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
-    // The tee claim was released on the abort arm: a second request for the SAME
-    // hash is not wedged on a stranded in-flight entry — it reaches the size gate
-    // again and is refused identically (a leaked tee would instead hang/coalesce).
-    let retry_sk = fresh_key();
-    let retry_node_id = B256::from(*retry_sk.public().as_bytes());
-    let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
-    let refused_again = leaf_paced_pull(
-        &retry_ep,
-        b_target,
-        retry_node_id,
-        &leaf_eth,
-        b_operator,
-        leaf_channel_id,
-        hash,
-        RATE,
-        None,
-    )
-    .await
-    .is_err();
-    anyhow::ensure!(
-        refused_again,
-        "a repeat request for the same hash must be refused again, not wedged on a stranded tee claim"
-    );
-    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 2)?;
-
-    retry_ep.close().await;
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.await?;
-    task_b.await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
     // #856 step (2): the per-peer share ratio can deny a speculative pull at
     // *admission*, before any upstream byte is pulled — distinct from the
@@ -9624,7 +9505,6 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
         leaf_channel_id,
         leaf_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
-        0,
         // No opening allowance, no share-ratio growth, global budget off: the peer is
         // immediately over its (zero) ceiling at the first admission poll. These caps
         // satisfy `LeechCaps::new` (a `0` global budget disables the window≤budget
@@ -9751,7 +9631,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -9822,7 +9701,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
             stall_timeout: Duration::from_secs(20),
-            max_blob_size_bytes: 0,
+            buffered_tier_max_bytes: DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
             max_rate_per_mb: 0,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
@@ -9959,7 +9838,6 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -10090,7 +9968,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -10150,7 +10027,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
         NegativeProbeCache::new(),
         PositiveProbeCache::with_capacity_and_ttl(16, Duration::from_millis(300)),
         // Buffered `Origin::fetch` path — directory keyed under `NO_NAMESPACE`.
@@ -10250,7 +10127,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -10306,7 +10182,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
         NegativeProbeCache::new(),
         PositiveProbeCache::new(),
         U256::from(NS),
@@ -10478,7 +10354,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // Fetch #1: cold path. Discovers, probes, and ranks all three; the whole
@@ -10667,7 +10543,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // Fetch #1: cold path (cache empty). H is undiscoverable, so only N is
@@ -10735,7 +10611,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         store_h as Arc<dyn PoolStateStore>,
         h_rate,
         &domains,
-        0,
         16,
     )?;
     let (ep_h, addr_h) =
@@ -10881,7 +10756,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -10943,7 +10817,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // Fetch #1: cold path. N is tried first (cheaper rate), refuses NotFound
@@ -11055,7 +10929,6 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -11271,7 +11144,7 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // The buffered fetch: cold path (cache empty). H is undiscoverable, so only N
@@ -11322,7 +11195,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         store_h as Arc<dyn PoolStateStore>,
         h_rate,
         &domains,
-        0,
         16,
     )?;
     let (ep_h, addr_h) =
@@ -11553,7 +11425,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // Call #1: cold path (cache empty). Discovers, probes, and ranks all three;
@@ -11739,7 +11611,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         addr_map,
         Duration::from_secs(20),
         Duration::from_secs(20),
-        0,
+        DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
     );
 
     // Fetch #1: cold path. N is probed, ranked, cached — and its refusal
@@ -11893,7 +11765,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         store_h as Arc<dyn PoolStateStore>,
         h_rate,
         &domains,
-        0,
         16,
     )?;
     let (ep_h, addr_h) =
@@ -12232,7 +12103,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         store_a as Arc<dyn PoolStateStore>,
         RATE,
         &domains,
-        0,
         16,
     )?;
     let (ep_a, addr_a) =
@@ -12316,7 +12186,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
             stall_timeout: Duration::from_secs(20),
-            max_blob_size_bytes: 0,
+            buffered_tier_max_bytes: DEFAULT_TEST_BUFFERED_TIER_MAX_BYTES,
             max_rate_per_mb: 0,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull

@@ -853,7 +853,7 @@ mod tests {
             "wrapper error lost typed BlobTooLargeMarker inner: {err}"
         );
         anyhow::ensure!(
-            err.to_string().contains("max_blob_bytes=1024"),
+            err.to_string().contains("disk_budget_bytes=1024"),
             "wrapper Display lost cap-value wording: {err}"
         );
         Ok(())
