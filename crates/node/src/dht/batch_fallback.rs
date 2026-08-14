@@ -4,7 +4,7 @@
 //! `BatchStore` is a pure optimization with a per-hash `Store` fallback.
 //! A publisher detects that a receiver does not support batching when the
 //! receiver closes the `BatchStore` stream with `APP_ERR_UNSUPPORTED_MESSAGE`
-//! (`0x01`) — the signal a pre-#648 deCDN node emits for the unimplemented
+//! (`0x01`) — the signal a node without `BatchStore` support emits for the unimplemented
 //! variant. On that close the publisher MUST fall back to per-hash `Store`
 //! for that receiver, and SHOULD cache the negative result for a bounded
 //! duration so it doesn't pay the drop-and-fallback round-trip on every

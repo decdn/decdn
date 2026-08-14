@@ -223,7 +223,7 @@ async fn run() -> anyhow::Result<()> {
 // The test above drives the shared `top_up` kernel directly (the auto-refill-at-
 // reuse-time leg, #1103). This one drives the shipped `decdn` binary through a
 // REAL paid pull that outgrows its `initial_deposit` partway through — the
-// reactive leg added in `fetch_blob_streaming` (`crates/cli/src/commands/fetch.rs`)
+// reactive leg in the shared `drive` pull core (`crates/client-pull/src/driver.rs`)
 // — and asserts the fetch still SUCCEEDS, having topped the pool up on-chain
 // toward `working_deposit` rather than surfacing the exhaustion as a terminal
 // error.
@@ -510,38 +510,36 @@ fn topup_fetch_argv_with_deposits(
 //
 // The test above bakes the pool's very FIRST voucher into `InsufficientDeposit`
 // on a fresh pool — no prior accepted voucher exists, so this is the shallowest
-// possible exercise of the reactive branch. This test drives the case that
-// actually motivated the fix: several whole voucher intervals get delivered AND
-// ACCEPTED first, and only the NEXT one exhausts the deposit.
+// possible exercise of the reactive branch. This test drives the deeper case:
+// several whole voucher intervals get delivered AND ACCEPTED first, and only the
+// NEXT one exhausts the deposit.
 //
-// Before the `genuine_exhaustion` fix (client-pull's advancement-based bundle
-// check), this scenario was unreachable end-to-end: once any voucher has been
-// accepted, the node attaches a `WatermarkBundle` to every subsequent
-// watermark-gated rejection it can (`watermark_bundle_for_reject`), including a
-// perfectly ordinary exhaustion — and the old `genuine_exhaustion` treated ANY
-// authenticated bundle as proof of a healable desync, regardless of whether it
-// told the client anything new. That routed real exhaustion into the resync path
-// (which cannot fix a genuinely short deposit) instead of the top-up path, and the
-// fetch failed outright after burning `MAX_RESUME_ATTEMPTS`. The fix distinguishes
-// "bundle reports something AHEAD of what we already hold" (desync — reseed) from
-// "bundle just echoes our own already-committed watermark" (not a desync — the
-// exhaustion is real), by comparing the bundle's cumulative amount against
-// `ledger.committed()`.
+// Reaching the top-up path here depends on `genuine_exhaustion` (client-pull's
+// advancement-based bundle check): once any voucher has been accepted, the node
+// attaches a `WatermarkBundle` to every subsequent watermark-gated rejection it
+// can (`watermark_bundle_for_reject`), including a perfectly ordinary exhaustion.
+// `genuine_exhaustion` distinguishes "bundle reports something AHEAD of what we
+// already hold" (desync — reseed) from "bundle just echoes our own
+// already-committed watermark" (not a desync — the exhaustion is real), by
+// comparing the bundle's cumulative amount against `ledger.committed()`. That
+// keeps real exhaustion on the top-up path instead of the resync path, which
+// cannot fix a genuinely short deposit and would fail the fetch after burning
+// `MAX_RESUME_ATTEMPTS`.
 //
-// This also exercises the OTHER half of the fix: resuming at the CONTENT paid
+// This also exercises the resume offset: the resume lands at the CONTENT paid
 // frontier — `content_paid_frontier(fetch_start_offset, total_bytes,
 // committed.bytes_now - committed.bytes_at_start)` — rather than the raw on-disk
 // length OR the naive `fetch_start + wire_delta`. Vouchers pay for WIRE bytes
 // (bao content plus interleaved proof, ADR 038), so `committed.bytes` is a WIRE
 // watermark; mapping it back through the bao tree lands the resume on the largest
-// content chunk-group boundary provably inside the paid wire. The fix must
+// content chunk-group boundary provably inside the paid wire. The resume must
 // re-fetch and pay for exactly the delivered-but-unpaid tail — no more
-// (double-pay), no less (under-pay). The old `fetch_start + wire_delta` resume
-// treated the wire watermark as a content offset and overshot by the proof
-// overhead, silently skipping ~one proof's worth of delivered content from
-// billing — a sub-1% under-pay that a content-only cost floor cannot see (the
-// paid proof inflates any honest settle above it), which is why the floor below
-// is the whole-blob WIRE cost.
+// (double-pay), no less (under-pay). Treating the wire watermark as a content
+// offset (`fetch_start + wire_delta`) would overshoot by the proof overhead,
+// silently skipping ~one proof's worth of delivered content from billing — a
+// sub-1% under-pay that a content-only cost floor cannot see (the paid proof
+// inflates any honest settle above it), which is why the floor below is the
+// whole-blob WIRE cost.
 
 const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish the blob
 // Must be >= working_deposit / LOW_WATER_DIVISOR (8_000_000 at the current
@@ -742,7 +740,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // The one exception is the node's serve-path readiness race: right after
     // `openPool` mines, the node can still answer `NotFound` for the brief window
     // before its `getPool` view resolves the new pool (there is no pool-open event
-    // to wait on the way the retired channel model waited on `ChannelOpened`). A
+    // to wait on). A
     // pure readiness `NotFound` delivers no byte and writes no partial, so
     // re-invoking is safe and cannot double-pay; the moment any byte lands we stop
     // retrying, so the reactive top-up branch remains the only thing that can move
@@ -808,9 +806,8 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     //  * `wire_floor` — over the blob's exact bao WIRE bytes (`bao_encoded_size`,
     //    the identical tree walk the serve encoder and the pull's
     //    `expected_wire_bytes` use). A correct fetch pays for every one of these
-    //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: the
-    //    old `fetch_start + wire_delta` resume skipped delivered content and
-    //    settles strictly below it.
+    //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: a
+    //    content-offset resume skips delivered content and settles strictly below it.
     let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)

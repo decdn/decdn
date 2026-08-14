@@ -1327,7 +1327,7 @@ where
 /// Attach the ADR 005 client identity binding to an already-built
 /// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the buyer key so
 /// the serving node can prove we own the pool and reactively pull a
-/// cache-missed blob from its configured origin. Split out of
+/// cache-missed blob from its configured origin. Separate from
 /// [`build_pool_ctx`] so `decdn bundle pull` — which takes the `open_lock`
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.

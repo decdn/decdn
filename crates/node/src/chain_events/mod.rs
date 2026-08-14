@@ -2,19 +2,14 @@
 //!
 //! Every watcher drives its log source through `resumable_watcher::run`, a
 //! single `eth_getLogs` polling loop that unifies historical backfill and the
-//! live tail into one resumable, cursor-persisting loop (#1092). It replaced the
-//! per-watcher `watch_logs` (`eth_newFilter` + `eth_getFilterChanges`) streams,
-//! which the default public Arbitrum Sepolia RPC and most keyless endpoints
-//! reject with `-32601` (#1106). No `watch_logs`/`eth_newFilter` call remains on
-//! the node's hot path.
+//! live tail into one resumable, cursor-persisting loop (#1092). The node makes
+//! no `watch_logs`/`eth_newFilter` call: the default public Arbitrum Sepolia RPC
+//! and most keyless endpoints reject those with `-32601` (#1106).
 //!
 //! # Watchers scan to head, deliberately
 //!
 //! Every watcher's scan upper bound is the head block itself. There is no
-//! confirmation lag and no knob for one: a `WatcherConfig::confirmations` field
-//! existed, documented a `head - confirmations` bound, and was passed `0` by all
-//! six watchers — so it never lagged anything, while its doc claimed otherwise
-//! (#1227).
+//! confirmation lag and no knob for one.
 //!
 //! Two distinct things can go wrong at the unstable tip, and re-scan idempotency
 //! covers only one of them:

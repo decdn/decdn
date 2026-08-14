@@ -281,7 +281,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     /// @notice Set the per-operator vote cap in bps. Must be called through
     ///         the timelock (the governor's executor is itself). The new
     ///         value is checkpointed at `clock()`; in-flight proposals whose
-    ///         snapshot timepoint is earlier read the prior value (I4 fix).
+    ///         snapshot timepoint is earlier read the prior value.
     function setVoteCapBps(uint256 newValue) external onlyGovernance {
         if (newValue < VOTE_CAP_BPS_FLOOR || newValue > VOTE_CAP_BPS_CEILING) {
             revert ParamOutOfBounds({ value: newValue, floor: VOTE_CAP_BPS_FLOOR, ceiling: VOTE_CAP_BPS_CEILING });

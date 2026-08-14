@@ -528,7 +528,7 @@ pub struct CacheConfig {
     /// It does NOT bound the streaming stage (#1134) — that is
     /// [`Self::node_pull_stall_timeout_sec`]. A wall clock over the bytes would
     /// cap the blob size a node can pull through at roughly
-    /// `this × link speed`, which is what it used to do.
+    /// `this × link speed`.
     pub node_pull_timeout_sec: Option<u64>,
     /// Inactivity timeout in seconds for the STREAMING stage of an upstream pull
     /// (#1134). Absent => [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`]
@@ -761,7 +761,7 @@ pub struct PaymentConfig {
     /// Pre-chain **seed** for the lower bound the node clamps `rate_per_mb` to
     /// before signing a `ProbeResponse` (ADR 005 §Rate bounds validation).
     ///
-    /// Since #1172 this no longer governs the live clamp: the node reads
+    /// This does not govern the live clamp: the node reads
     /// `PaymentPool.getRateBounds()` at startup and overwrites this value
     /// before it serves anything, then tracks `RateBoundsUpdated`. Setting it
     /// only affects the window before that read completes (and a failed read

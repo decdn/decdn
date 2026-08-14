@@ -232,9 +232,9 @@ impl ServeRejectReason {
 /// Separates a genuine absence from a transient backend fault, which a bare
 /// `bool` cannot. The cache engine already draws this distinction (it
 /// deliberately prefers `OriginError` over `NotFound` when an origin faulted);
-/// the handler used to throw it away, collapsing both to "not filled" and
-/// refusing with `CacheMiss` — wire [`StreamError::NotFound`] — even when the
-/// real cause was the operator's own S3/fs origin being down.
+/// preserving it here keeps the handler from collapsing both to "not filled" and
+/// refusing with `CacheMiss` — wire [`StreamError::NotFound`] — when the
+/// real cause is the operator's own S3/fs origin being down.
 ///
 /// Why the reason code matters, stated precisely (the wire codes' own docs in
 /// `decdn_protocol::client` are the authority here):
@@ -1604,11 +1604,10 @@ mod tests {
     /// wire code. They stay distinct *reasons* only so the operator's own
     /// metrics can tell them apart, which no client can read.
     ///
-    /// The failure this pins is not hypothetical — it shipped. Governance
-    /// entries used to reach the serve path only as cache evictions and answered
-    /// `EvictedSinceProbe`, which made `HashBlacklisted` a unique fingerprint for
-    /// "this operator privately denied it": exactly the map of an operator's
-    /// legal exposure the ADR forecloses.
+    /// Without this, governance entries reaching the serve path only as cache
+    /// evictions would answer `EvictedSinceProbe`, making `HashBlacklisted` a unique
+    /// fingerprint for "this operator privately denied it": exactly the map of an
+    /// operator's legal exposure the ADR forecloses.
     #[test]
     fn local_and_governance_hash_denials_share_one_wire_code() {
         assert_eq!(

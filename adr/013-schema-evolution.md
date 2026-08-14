@@ -380,7 +380,7 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 ### Positive
 
-- Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md#adr-005-wire-protocol) as a standard, repeatable mechanism — no longer a one-time workaround
+- Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md#adr-005-wire-protocol) as a standard, repeatable mechanism rather than a one-time workaround
 - Length-prefixed framing enables forward-compatible deserialization: receivers skip unknown trailing bytes without connection failure
 - Protocol enums give explicit, type-safe message discrimination on every ALPN instead of ad-hoc discriminator bytes
 - The three-tier model provides a clear decision framework for every future protocol change

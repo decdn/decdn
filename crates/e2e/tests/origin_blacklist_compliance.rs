@@ -8,8 +8,7 @@
 //! channel is funded by that address — with the `OriginBlacklisted` wire reason,
 //! not a bare channel/connect failure. Un-blacklisting re-opens the gate.
 //!
-//! Two further legs guard the parts of that path with the WEAKEST primitives,
-//! and both were previously untested:
+//! Two further legs guard the parts of that path with the WEAKEST primitives:
 //!
 //! - **The operator list.** `addOperator` writes `isOperatorBlacklisted` and
 //!   emits `OperatorBlacklisted` — it never touches `_isOriginBlacklisted` or

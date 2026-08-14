@@ -361,12 +361,12 @@ pub(super) struct PulledBlob {
 ///
 /// # Errors
 ///
-/// The last attempt's error, typed exactly as the buffered path used to return it
-/// so [`super::classify_pull_failure`] still sees `PullStalled` / `PullTimeout` /
+/// The last attempt's error, typed so [`super::classify_pull_failure`] sees
+/// `PullStalled` / `PullTimeout` /
 /// `UpstreamRefused` / `UpstreamVoucherRejected` / `HashMismatch` /
 /// `LocalPullFault` / `BlobTooLargeClaim` / `RateAboveCeiling` — plus the one shape
 /// only a RESUMABLE pull can produce, [`ResumeOffsetPastEnd`] (#1530), for which
-/// `pull_verdict` gained an arm classifying it as our own fault rather than the
+/// `pull_verdict` has an arm classifying it as our own fault rather than the
 /// peer's.
 pub(super) async fn pull_blob(
     deps: &NodeOriginDeps,
@@ -928,8 +928,7 @@ mod tests {
 
     /// An uncorroborated `CapExceeded` is REFUSED, distinctly from an
     /// ordinary terminal failure, so the caller can meter the peer's behaviour
-    /// (#1600 review — this case previously collapsed into `Terminal` and its
-    /// counter could never fire).
+    /// Collapsing it into `Terminal` would leave its counter unable to fire.
     #[test]
     fn a_bogus_exhaustion_claim_is_refused_distinctly() {
         let ctx = ctx_with_deposit(U256::from(1_000_000u64));

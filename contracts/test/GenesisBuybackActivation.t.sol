@@ -277,10 +277,9 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
-    /// @notice Venue-scoped sub-structs plus this guard replace the old flat
-    ///         `BuybackActivation` (issue #1090). Wiring a Balancer field under
-    ///         `venue == UNISWAP` used to be silently dropped — the caller could
-    ///         believe it had pointed at a Balancer pool and ship a Uniswap burner.
+    /// @notice Venue-scoped sub-structs plus this guard reject a Balancer field
+    ///         wired under `venue == UNISWAP`, so a caller cannot believe it
+    ///         pointed at a Balancer pool and ship a Uniswap burner.
     function test_revertsWhenBalancerFieldsSetUnderUniswapVenue() public {
         BuybackActivation memory act = _uniswapActivation(address(0xdead));
         act.bal.wiring.vault = address(0xBA1);

@@ -1,7 +1,7 @@
-//! `decdn setup` — guided node onboarding wizard (ADR 019 Phases 1–2, #933).
+//! `decdn setup` — guided node onboarding wizard (ADR 019, #933).
 //!
 //! Thin orchestration over the existing primitives — `key-gen`, `node bond`,
-//! `node register` — with the Phase 1 pre-flight checks that catch the
+//! `node register` — with the pre-flight checks that catch the
 //! mis-ordered-step / under-funded-wallet failure class ADR 019 § Context
 //! calls out *before* any transaction is submitted, plus a final on-chain
 //! readiness summary. It introduces **no new on-chain logic**: every contract
@@ -30,13 +30,13 @@ use decdn_incentive::{Erc20, price_impact_bps, swap_top_up, swap_venue};
 
 use crate::commands::{bond, chain_ctx, key_gen, register, terms};
 
-/// ADR 019 Phase 1 step 2 (Synchronize clock): the local clock should be within
+/// Clock synchronization (ADR 019): the local clock should be within
 /// 10 s of UTC before onboarding. Gossip messages are silently rejected by
 /// peers once skew reaches 60 s (ADR 001 § Clock synchronization), so this 10 s
 /// onboarding ceiling leaves margin.
 const CLOCK_SKEW_LIMIT_SECS: i64 = 10;
 
-/// Conservative upper bound on the total gas for the Phase 2 transactions
+/// Conservative upper bound on the total gas for the on-chain onboarding transactions
 /// (`approve` + `bond` + `declareMbps` + `registerNode`). Used only to size
 /// the native-gas pre-flight check, so an over-estimate is the safe direction.
 const PREFLIGHT_GAS_UNITS: u64 = 600_000;
@@ -137,7 +137,7 @@ impl Preflight {
         self.token_balance >= self.shortfall
     }
 
-    /// Native-gas balance covers the estimated Phase 2 gas cost.
+    /// Native-gas balance covers the estimated on-chain onboarding gas cost.
     fn native_ok(&self) -> bool {
         self.native_balance >= self.gas_needed
     }
@@ -185,7 +185,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let json = args.chain.common.json;
     let dry_run = args.chain.common.dry_run;
 
-    // ---- Phase 1: keys (idempotent — generate only on a clean slate). ----
+    // ---- Keys (idempotent — generate only on a clean slate). ----
     let key_path = identity::key_path(&resolved.data_dir);
     let default_keystore = eth_identity::keystore_path(&resolved.data_dir);
     let mut keys_generated = false;
@@ -229,7 +229,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     })?;
     let local_node_id = B256::from_slice(node_secret.public().as_bytes());
 
-    // ---- Phase 1: pre-flight reads (read-only; abort before any tx). ----
+    // ---- Pre-flight reads (read-only; abort before any tx). ----
     if !json {
         println!("pre-flight checks:");
     }
@@ -317,8 +317,8 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         U256::from(PREFLIGHT_GAS_UNITS + prepared_swap.swap_gas_units()) * U256::from(gas_price);
     pf.gas_needed = gas_needed;
 
-    // TOKEN mode keeps the original TOKEN-balance pre-flight; USDC mode replaced
-    // it with the `usdc_balance` (or, on a failed quote, `swap`) check above.
+    // TOKEN mode uses the TOKEN-balance pre-flight; USDC mode uses the
+    // `usdc_balance` (or, on a failed quote, `swap`) check above.
     if matches!(prepared_swap, SwapPrep::None) {
         check_line(
             json,
@@ -501,7 +501,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let mut bond_done = false;
 
     let live: anyhow::Result<Readiness> = async {
-        // ---- Phase 2.1/2.2: bond (idempotent stake-to-tier). ----
+        // ---- Bond (idempotent stake-to-tier). ----
         if !json {
             println!("bond:");
         }
@@ -523,7 +523,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             bond_reported = true;
         }
 
-        // ---- Phase 2.3: register (skipped only when *this* key is already
+        // ---- Register (skipped only when *this* key is already
         //      bound; `terms_hash` is `Some` iff a fresh registration is due). ----
         if let Some(terms_hash) = terms_hash {
             if !json {
@@ -555,7 +555,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             );
         }
 
-        // ---- Phase 5: readiness summary (read back on-chain state). ----
+        // ---- Readiness summary (read back on-chain state). ----
         read_readiness(&bond_contract, operator).await
     }
     .await;
@@ -1212,7 +1212,7 @@ async fn prepare_usdc_swap<P: Provider + Clone + 'static>(
     }))
 }
 
-/// Print the Phase-5 readiness summary (human mode). The on-chain subset
+/// Print the readiness summary (human mode). The on-chain subset
 /// reachable without a running daemon — registry-active, bond, declared tier,
 /// node id — plus the region/multiaddrs as submitted.
 fn emit_readiness(json: bool, r: &Readiness, region: &str, multiaddrs: usize) {
@@ -1280,9 +1280,8 @@ fn build_summary(
             "bond_tx": tx_hex(bond_outcome.bond),
             "declare_tx": tx_hex(bond_outcome.declare),
         },
-        // `skipped` alone used to conflate three states once the partial path
-        // could emit this object: not due, not reached, and attempted-and-failed
-        // (#1355 review). `due` disambiguates — `skipped: true, due: true` is a
+        // `skipped` alone cannot distinguish three states: not due, not reached,
+        // and attempted-and-failed. `due` disambiguates — `skipped: true, due: true` is a
         // registration that was owed and did not complete — and `tx` carries the
         // hash when one was broadcast without a readable receipt, which is the
         // case where the operator most needs it.

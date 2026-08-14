@@ -1,7 +1,7 @@
 //! Behavior tests for [`decdn_cache::ServeStore`] over [`NodeRangedStore`]
-//! (#1621 Task 5, B1 of the node serve-miss driver).
+//! (#1621).
 //!
-//! Three cases, matching the Task 4 primitives:
+//! Three cases, matching the `ServeStore` primitives:
 //! - `encode_range` round-trips to the ADR-038 header-less wire bao.
 //! - `observe` is a LIVE watch: it reflects a range admitted after the watch
 //!   opened, not just the snapshot at open time.

@@ -1,8 +1,8 @@
 //! [`NodeRangedStore`]: the node-side [`RangedStore`] backend over the
-//! iroh-blobs cache (#1621 Task 4).
+//! iroh-blobs cache (#1621).
 //!
-//! A thin, per-blob adapter over [`CacheEngine`]'s already-shipped
-//! present/missing/admit/export API — behavior-preserving, no new storage
+//! A thin, per-blob adapter over [`CacheEngine`]'s
+//! present/missing/admit/export API, adding no new storage
 //! logic. `finalize` relies on the node's own auto-promotion: once every
 //! chunk of a blob is present the store already reports it complete, so
 //! finalize is just that check, erroring [`RangedStoreError::Incomplete`]
@@ -171,7 +171,7 @@ mod tests {
     use crate::engine::CacheEngine;
     use iroh_blobs::Hash;
 
-    /// The `hash`/`engine` accessors (#1621 Task 10) round-trip the values
+    /// The `hash`/`engine` accessors round-trip the values
     /// `new` was constructed with — the node-crate `NodeAdmitStore` wrapper
     /// reaches `admit_bao_stream` through these rather than duplicating the
     /// `(engine, hash, total_bytes)` triple.

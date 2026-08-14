@@ -223,14 +223,10 @@ impl std::fmt::Debug for DhtStatusHandles {
 /// `wait_admin` (issue #604) is a per-drain configuration bit:
 /// [`fire`](Self::fire) takes it as a parameter. **First writer wins**
 /// — once a fire has established the value, subsequent fires return
-/// that same value rather than overwriting. This collapses two prior
-/// races into one well-defined outcome:
-///
-/// 1. A handler that called `set_wait_admin` after `fire` (no longer
-///    possible — the API has no such method).
-/// 2. Two concurrent drain RPCs whose `wait_admin` values disagreed
-///    (the earlier one's response now correctly reports the effective
-///    value the runtime will see).
+/// that same value rather than overwriting. This gives two concurrent
+/// drain RPCs one well-defined outcome: the effective `wait_admin`
+/// value the runtime will see is the first one written, and every
+/// response reports that same value.
 ///
 /// Cross-thread visibility comes from the `Notify::notify_one →
 /// Notify::notified()` happens-before edge: the runtime's
@@ -610,7 +606,7 @@ impl AdminRpcServer for AdminRpcImpl {
         let req = req.unwrap_or_default();
         // Atomic fire-with-wait_admin: returns the *effective* value
         // the runtime will see. First writer wins, so a concurrent
-        // drain race can no longer produce a response that lies about
+        // drain race cannot produce a response that lies about
         // what the runtime will do (issue #604 review). The CLI reads
         // this ack to refuse polling against any server that didn't
         // honor `wait_admin` — older binary, future regression, or a

@@ -1,13 +1,14 @@
 //! [`ServeStore`]: node-only extension of [`RangedStore`] for progressive
-//! serve-while-filling (#1621 Task 4, B1 of the node serve-miss driver).
+//! serve-while-filling (#1621).
 //!
 //! `ServeStore` extends `bao_range::RangedStore` but is defined here, in
 //! `cache`, rather than in the `bao-range` leaf crate: its two methods speak
 //! iroh-blobs / `futures_util::Stream` types directly (a live present-ranges
 //! watch and a re-encoded wire-bao stream), and `bao-range` stays free of an
-//! iroh-blobs dependency (ADR 038). No routing calls this yet — the future
-//! node serve-miss driver (B2) adopts it; its value today is the typed seam
-//! plus the tests in Task 5.
+//! iroh-blobs dependency (ADR 038). The node serve-miss serve path
+//! (`crates/node/src/handlers/client/serve_encoder.rs`) consumes it, observing
+//! the store's present ranges as the blob fills; `ServeStore` is the typed seam
+//! that keeps those iroh-blobs types out of `bao-range`.
 
 use bytes::Bytes;
 use decdn_bao_range::{RangedFuture, RangedStore, RangedStoreError};

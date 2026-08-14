@@ -128,8 +128,7 @@ pub(crate) fn spot_in_from_sqrt(
     }
     // `sqrt_price_x96 < 2^160`, so the square is `< 2^320` and fits `U512`.
     // `saturating_mul` keeps this total (no overflow panic) even for the
-    // unreachable type-max inputs, mirroring the old fully-saturating path —
-    // this is an advisory-only spot estimate.
+    // unreachable type-max inputs — this is an advisory-only spot estimate.
     let sqrt = U512::from(sqrt_price_x96);
     let price_x192 = sqrt.saturating_mul(sqrt);
     if price_x192.is_zero() {
@@ -424,10 +423,10 @@ mod tests {
     }
 
     /// A realistic ~10 Gbps-tier bond quantity (`795_000` TOKEN, 18 decimals).
-    /// The old `saturating_mul` path overflowed `U256` here and returned a
-    /// fabricated value (`U256::MAX / price` on the token0 side, or
-    /// `U256::MAX >> 192` on the token1 side); the `U512` path returns the
-    /// mathematically correct spot. Both token-ordering branches are covered.
+    /// A `U256` square would overflow here and return a fabricated value
+    /// (`U256::MAX / price` on the token0 side, or `U256::MAX >> 192` on the
+    /// token1 side); the `U512` path returns the mathematically correct spot.
+    /// Both token-ordering branches are covered.
     fn ten_gbps_bond() -> U256 {
         // 795_000 * 10^18.
         U256::from(795_000u64) * U256::from(10u64).pow(U256::from(18u64))
@@ -444,7 +443,7 @@ mod tests {
         assert_eq!(got, expected, "token0 spot must be amount_out / price");
         assert_ne!(got, U256::MAX, "must not saturate to U256::MAX");
         // Sanity: the correct answer is ~1.9875e23, far below U256::MAX and far
-        // above the fabricated ~2^62 the old saturating path produced.
+        // above the fabricated ~2^62 a saturating `U256` square would produce.
         assert!(got > U256::from(10u64).pow(U256::from(23u64)));
     }
 
@@ -458,11 +457,11 @@ mod tests {
         let got = spot_in_from_sqrt(sqrt_price_2x, amount_out, false);
         assert_eq!(got, expected, "token1 spot must be amount_out * price");
         assert_ne!(got, U256::MAX, "must not saturate to U256::MAX");
-        // Correct answer ~3.18e24; the old saturating path produced ~2^64.
+        // Correct answer ~3.18e24; a saturating `U256` square would produce ~2^64.
         assert!(got > U256::from(10u64).pow(U256::from(24u64)));
     }
 
-    // Issue-1 cleanup coverage note (#991, reassessed under #1347). Running the
+    // Cleanup coverage note. Running the
     // allowance reset on every path rests on two properties, now covered
     // separately:
     //

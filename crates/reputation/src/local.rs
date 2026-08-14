@@ -92,7 +92,7 @@ pub enum Outcome {
     /// signal
     /// ([ADR 030 §Soft mitigation](../../../adr/030-node-region-self-attestation.md)).
     /// Scored as a fully negative sample (like [`Outcome::Unreachable`]); it is a
-    /// local-only observation and is never folded into a gossiped report.
+    /// local-only observation.
     RegionLatencyMismatch,
 }
 

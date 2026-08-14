@@ -37,9 +37,8 @@ struct SlashRecord {
 ///         escrow-on-slash, ADR 036 § Slashing zero-out): the unappealed
 ///         distribution, the appeal-open transition, and the upheld / granted
 ///         settle paths, plus the multi-slash watermark recompute.
-/// @dev    Extracted from `CapacityBond` to keep that contract under the
-///         EIP-170 runtime-size ceiling (issue #770 — the capacity-bond curve
-///         enforcement consumed the remaining headroom). The entrypoints are
+/// @dev    Separate from `CapacityBond` to keep that contract under the
+///         EIP-170 runtime-size ceiling. The entrypoints are
 ///         `public`, so they compile into this library's own deployed bytecode
 ///         and are reached from `CapacityBond` via a linked DELEGATECALL —
 ///         executing in `CapacityBond`'s storage context, so the `storage`

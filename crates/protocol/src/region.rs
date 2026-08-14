@@ -348,7 +348,8 @@ mod tests {
     /// actually reads untrusted data — the peer cache, whose region strings come
     /// from an on-chain `regionHint` any operator can set to arbitrary bytes,
     /// and whose decode error reaches the user through `CacheRead::Unusable`.
-    /// It used to use `Unexpected::Str(&raw)`, which echoed.
+    /// The deserializer must not surface the raw input (e.g. via
+    /// `Unexpected::Str(&raw)`), which would echo it.
     #[test]
     fn construction_errors_do_not_echo_the_input() {
         let from_str = "U\n/evil".parse::<Region>().expect_err("must reject");
@@ -369,7 +370,7 @@ mod tests {
     }
 
     /// Round-trips as the plain 2-character string, so persisted forms stay
-    /// readable and stay compatible with the `String` this replaced.
+    /// readable.
     #[test]
     fn serializes_as_a_plain_string() {
         let region = Region::parse("DE").expect("DE is assigned");

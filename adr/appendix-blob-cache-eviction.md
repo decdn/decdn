@@ -40,9 +40,9 @@ Hashes in the operator-pinned set (`pinned: ArcSwap<HashSet<Hash>>` at `crates/c
 
 `CacheEngine::evict(hash)` is the DMCA / corruption-recovery path. It writes the hash into the in-memory `evicted: Mutex<HashSet<Hash>>`. It appends the hash to `<cache_dir>/evicted.log` with `fsync`, so the eviction survives a process restart. `CacheEngine::has` and `CacheEngine::get` short-circuit to "not present" for any evicted hash, so serving stops immediately.
 
-Disk reclaim is best-effort. It follows on the next GC sweep **when periodic GC is enabled (`cache.gc_interval_sec > 0`) and the tag deletion succeeds**. `Blobs::delete` is `pub(crate)` in iroh-blobs (GC-only), but **tag deletion is public**. So `evict` deletes the blob's protecting named tag(s). Without that, GC can never reclaim a tagged blob and the evicted bytes leak forever (#860). A tag-delete failure does not fail the takedown, because serving is already blocked. It leaves the bytes GC-protected, surfaced via `decdn_cache_tag_drop_failures_total`. Reclaim is therefore not unconditional for DMCA/compliance expectations.
+Disk reclaim is best-effort. It follows on the next GC sweep **when periodic GC is enabled (`cache.gc_interval_sec > 0`) and the tag deletion succeeds**. `Blobs::delete` is `pub(crate)` in iroh-blobs (GC-only), but **tag deletion is public**. So `evict` deletes the blob's protecting named tag(s). Without that, GC can never reclaim a tagged blob and the evicted bytes leak forever. A tag-delete failure does not fail the takedown, because serving is already blocked. It leaves the bytes GC-protected, surfaced via `decdn_cache_tag_drop_failures_total`. Reclaim is therefore not unconditional for DMCA/compliance expectations.
 
-Wrong-hash bytes from a failed pull-through are handled separately and are **not** logically evicted. Under content-addressing, those bytes are valid content for their own hash. So the node makes them GC-eligible (drop the temp tag on the streaming path / delete the named tag on the drain path). It does not blacklist them in `evicted.log`, which would durably censor a legitimate hash (#853, #837).
+Wrong-hash bytes from a failed pull-through are handled separately and are **not** logically evicted. Under content-addressing, those bytes are valid content for their own hash. So the node makes them GC-eligible (drop the temp tag on the streaming path / delete the named tag on the drain path). It does not blacklist them in `evicted.log`, which would durably censor a legitimate hash.
 
 The two layers compose cleanly. LRU eviction is *ephemeral cache pressure*: a victim selected by the driver loop. Operator eviction is a *durable operator directive*: a hash hidden permanently. LRU eviction does not append to `evicted.log`. Operator eviction does not consult `last_accessed`. Pinning protects against LRU but loses to operator evict — DMCA always wins.
 
@@ -64,10 +64,10 @@ Naming follows [appendix-observability.md § Cache Metrics](appendix-observabili
 |---|---|---|
 | `decdn_cache_bytes` | gauge | **Existing**, see appendix; current on-disk cache footprint. Pairs with `decdn_cache_size_limit_bytes` for a saturation ratio. |
 | `decdn_cache_evictions_total` | counter, unlabeled | **Existing**, see appendix; entries removed by LRU pressure (driver loop). Description tightened per the intro above. |
-| `decdn_cache_size_limit_bytes` | gauge | New: configured `cache.cache_size_mb × 1 048 576`. Paired with `decdn_cache_bytes` for a saturation ratio. |
-| `decdn_cache_evicted_operator_total` | counter, unlabeled | New: hashes removed via `decdn node evict`. Distinct from `decdn_cache_evictions_total`. |
-| `decdn_cache_pinned_count` | gauge | New: size of the operator-pinned set. |
-| `decdn_cache_tag_drop_failures_total` | counter, unlabeled | New: best-effort named-tag deletions that failed, on the `evict()` (#860) and drain-path hash-mismatch (#837) paths. Serving is unaffected; a sustained nonzero rate means disk reclaim is stuck (an `evict()` failure is a DMCA/compliance concern, the drain path a hostile-origin disk leak). Not auto-retried. |
+| `decdn_cache_size_limit_bytes` | gauge | Configured `cache.cache_size_mb × 1 048 576`. Paired with `decdn_cache_bytes` for a saturation ratio. |
+| `decdn_cache_evicted_operator_total` | counter, unlabeled | Hashes removed via `decdn node evict`. Distinct from `decdn_cache_evictions_total`. |
+| `decdn_cache_pinned_count` | gauge | Size of the operator-pinned set. |
+| `decdn_cache_tag_drop_failures_total` | counter, unlabeled | Best-effort named-tag deletions that failed, on the `evict()` and drain-path hash-mismatch paths. Serving is unaffected; a sustained nonzero rate means disk reclaim is stuck (an `evict()` failure is a DMCA/compliance concern, the drain path a hostile-origin disk leak). Not auto-retried. |
 
 [ADR 005](005-protocol.md#adr-005-wire-protocol) owns the `decdn_probe_hold_*` metrics ([appendix § Slash-Safety Metrics (all Mandatory)](appendix-observability.md#slash-safety-metrics-all-mandatory)); this appendix does not redefine them. A sustained non-zero `decdn_probe_hold_unavailable_total{reason="exhausted"}` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer. The operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
 
@@ -106,9 +106,9 @@ The driver enforces the `cache.cache_size_mb` ceiling, not the cache write path.
 
 | Metric | Type | Description |
 |---|---|---|
-| `decdn_cache_evictions_sweeps_total` | counter, label `outcome={evicted, starved, idle}` | New: one increment per driver tick. `evicted` if ≥1 candidate was removed; `starved` if pressure persisted but `eviction_candidates()` returned empty; `idle` if the high-water condition was not met. |
-| `decdn_cache_evictions_starved_total` | counter, unlabeled | New: convenience counter equivalent to `decdn_cache_evictions_sweeps_total{outcome="starved"}` for alerting (avoids label-filtering at scrape time). Emitted alongside the labeled metric. |
-| `decdn_cache_evictions_bytes_total` | counter, unlabeled | New: cumulative bytes freed by the driver via LRU eviction. Pairs with `decdn_cache_evictions_total` (count-based) so dashboards show both "how many" and "how much" without computing byte/entry products from cache-size estimates. |
+| `decdn_cache_evictions_sweeps_total` | counter, label `outcome={evicted, starved, idle}` | One increment per driver tick. `evicted` if ≥1 candidate was removed; `starved` if pressure persisted but `eviction_candidates()` returned empty; `idle` if the high-water condition was not met. |
+| `decdn_cache_evictions_starved_total` | counter, unlabeled | Convenience counter equivalent to `decdn_cache_evictions_sweeps_total{outcome="starved"}` for alerting (avoids label-filtering at scrape time). Emitted alongside the labeled metric. |
+| `decdn_cache_evictions_bytes_total` | counter, unlabeled | Cumulative bytes freed by the driver via LRU eviction. Pairs with `decdn_cache_evictions_total` (count-based) so dashboards show both "how many" and "how much" without computing byte/entry products from cache-size estimates. |
 
 ## Consequences
 

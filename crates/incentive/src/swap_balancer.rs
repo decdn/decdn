@@ -457,7 +457,7 @@ mod tests {
         assert!(args.user_data.is_empty());
     }
 
-    // Issue-1 cleanup coverage note (#991, reassessed under #1347). Once Leg 1's
+    // Cleanup coverage note. Once Leg 1's
     // USDC→Permit2 approval stands, both legs' resets run on every subsequent
     // path — success, a failed Leg-2 Permit2→Router approve (the between-legs
     // path the human reviewer flagged), or a reverted/failed swap. Two

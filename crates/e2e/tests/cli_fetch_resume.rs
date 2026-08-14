@@ -33,8 +33,8 @@
 //!    without it the test would pass on an implementation that silently
 //!    re-downloaded everything.
 //! 3. **Corrupt checkpoint.** Seeded with a valid checkpoint whose `.partial` data
-//!    is then flipped a byte — the record still claims the group present. In the
-//!    new model `finalize`'s whole-blob `valid_ranges` sweep is the guarantee: a
+//!    is then flipped a byte — the record still claims the group present.
+//!    `finalize`'s whole-blob `valid_ranges` sweep is the guarantee: a
 //!    corrupt group can never be silently promoted. The first run pulls the
 //!    missing suffix, the sweep catches the bad group, shrinks the present set to
 //!    exclude it, and returns `Incomplete` — so the run FAILS and writes no
@@ -304,7 +304,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- Journey 3: a corrupt checkpoint is caught by the finalize sweep ----
     //
     // Seed a valid checkpoint, then flip a byte in its `.partial` data while the
-    // `.ranges` record still claims the group present. In the new model the client
+    // `.ranges` record still claims the group present. The client
     // trusts the record for what to SKIP, so the corrupt group is never re-pulled
     // on its own — only `finalize`'s whole-blob `valid_ranges` sweep can catch it.
     //
@@ -342,7 +342,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Second run: the sweep already dropped the bad group from the record, so the
     // resume re-pulls exactly it and promotes the correct blob — the self-heal the
-    // new model guarantees without ever emitting a wrong output.
+    // client guarantees without ever emitting a wrong output.
     run_fetch_until_ready(client_dir.path(), &args).await?;
     let got = std::fs::read(&out).context("read output after corruption recovery")?;
     anyhow::ensure!(
@@ -397,14 +397,14 @@ async fn run() -> anyhow::Result<()> {
     // ---- Journey 5: a COMPLETE checkpoint for an exact-multiple-of-16-KiB blob --
     //
     // Seed a COMPLETE checkpoint (record claims the whole blob) whose total size is
-    // an exact multiple of the chunk-group size. In the new model the store is
+    // an exact multiple of the chunk-group size. The store is
     // simply complete: `drive` computes an EMPTY `missing_ranges`, opens NOTHING,
     // and `finalize` promotes the already-complete `.partial` in place. The
-    // aligned-size trap the old `resume_offset(len)` snap-DOWN hit — reading a
+    // aligned-size trap of an offset-derived resume — reading a
     // complete partial as `byte_offset == total_bytes`, drawing a `NotFound`, and
     // re-paying from zero — cannot arise: presence is record-driven, not
     // offset-derived. A ragged final group (journeys 1-4) exercises the same free
-    // finish; this pins it for the exact-multiple size that used to re-pay.
+    // finish; this pins it for the exact-multiple size an offset-derived resume would re-pay.
     //
     // A complete checkpoint with no `--output` is exactly the on-disk state a crash
     // between the last checkpoint and the atomic promote leaves behind.

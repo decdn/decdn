@@ -88,10 +88,10 @@ pub struct LeechCaps {
 
 /// Named parameters for [`LeechCaps::new`] / [`LeechCaps::new_unchecked`] (#894).
 ///
-/// A struct rather than three positional arguments: the two byte quantities
-/// (`max_unrecouped_leech_bytes`, `initial_allowance_bytes`) can no longer be
-/// transposed at a call site without a compile error, and the distinct [`Bytes`]
-/// / [`Percent`] types stop a bytes↔percent swap besides.
+/// A struct, not three positional arguments, so the two byte quantities
+/// (`max_unrecouped_leech_bytes`, `initial_allowance_bytes`) cannot be
+/// transposed at a call site, and the distinct [`Bytes`] / [`Percent`] types
+/// stop a bytes↔percent swap besides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeechCapsConfig {
     /// Node-wide circuit breaker on aggregate speculative spend. `0` disables.

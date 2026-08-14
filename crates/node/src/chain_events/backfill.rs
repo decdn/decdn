@@ -5,12 +5,10 @@
 //! (rather than in any one watcher) so a new consumer picks up the shared span
 //! instead of forking a fresh one (#1092).
 //!
-//! Scope shrank with #1504: the genesis-replay consumers (the origin directory's
-//! seating-event scan and its `REPLAY_WINDOW_BLOCKS` span, the blacklist
-//! and buyer-reconcile scans) are gone — those watchers enumerate their state
-//! from a contract view at a pinned block instead. What remains is the live-tail
-//! windowing every watcher shares, plus the durable-cursor rewind that only the
-//! settlement watcher resumes from.
+//! This provides the live-tail windowing every watcher shares, plus the
+//! durable-cursor rewind that only the settlement watcher resumes from. The
+//! genesis-replay watchers (origin directory, blacklist, buyer-reconcile)
+//! enumerate their state from a contract view at a pinned block and use neither.
 
 /// How many blocks the persisted scan checkpoint is rewound before the
 /// resume backfill (#751), absorbing a shallow reorg between the last scanned
@@ -24,13 +22,11 @@
 /// `HeadMinusWindow` start re-derives its floor from head on every boot, so
 /// there is nothing to rewind.
 ///
-/// One live consumer after #1504: the settlement watcher
-/// ([`crate::payment_settlement`], #751), through
-/// [`super::resumable_watcher::CursorStart::FromCheckpoint`]'s `reorg_margin`.
-/// The origin directory used to be the second, rewinding a persisted
-/// `CheckpointKey::Origin` cursor before re-enumerating; it now seeds its tail at
-/// the enumeration block and persists nothing, so there is no cursor to rewind
-/// and a reorg below that block is corrected by the next boot's enumeration.
+/// One live consumer: the settlement watcher ([`crate::payment_settlement`], #751),
+/// through [`super::resumable_watcher::CursorStart::FromCheckpoint`]'s `reorg_margin`.
+/// The origin directory seeds its tail at the enumeration block and persists
+/// nothing, so it has no cursor to rewind; a reorg below that block is corrected
+/// by the next boot's enumeration.
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
 /// Maximum block span scanned per `eth_getLogs` during the resume backfill

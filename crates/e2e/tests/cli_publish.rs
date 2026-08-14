@@ -241,7 +241,7 @@ async fn partial_seat_reports_what_landed<P: alloy::providers::Provider>(
 
 /// The self-serve half of the journey: a vetted publisher seats an origin and
 /// unseats it again, each in one transaction with no governance step in
-/// between. Split out of [`run`] to keep either function readable.
+/// between. Separate from [`run`] to keep either function readable.
 async fn seat_then_unseat<P: alloy::providers::Provider>(
     node: &NodeFixture,
     assignment: &OriginAssignment::OriginAssignmentInstance<P>,

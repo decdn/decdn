@@ -63,7 +63,7 @@ CLI shape:
 ### Why JSON-RPC, not REST-style routes?
 
 - The surface dispatches named operations, not resource state. Actions like `drain` or `configReload` are neither `GET` nor `PUT` on a resource; REST's verb/URI model adds friction without benefit.
-- jsonrpsee's `#[rpc(server, client)]` macro makes the Rust trait the single source of truth: server impl and client bindings generate together, so the two sides cannot drift on method name, params, or return shape. The old hyper route table needed separately maintained `handle(&req)` branches and reqwest JSON parsing.
+- jsonrpsee's `#[rpc(server, client)]` macro makes the Rust trait the single source of truth: server impl and client bindings generate together, so the two sides cannot drift on method name, params, or return shape. A hand-written hyper route table would need separately maintained `handle(&req)` branches and reqwest JSON parsing.
 - Cleaner error modeling: JSON-RPC carries errors in a structured `{ code, message, data }` object on a `200`; route-based HTTP conflates transport `404` (missing route) with application `404` (peer not found) unless the server is careful.
 - Modest cost: jsonrpsee is a larger dependency than a hand-rolled hyper service, but as the surface accretes methods the per-method cost is one trait method vs. one handler plus a routing entry.
 

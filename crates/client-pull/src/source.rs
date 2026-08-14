@@ -8,7 +8,7 @@
 //! raw bao encoding of one [`decdn_bao_range::AlignedRange`] and yields the wire
 //! bytes on demand; the STORE's ingest decoder (rooted at the blob hash `H`)
 //! verifies each chunk group exactly once, exactly as `sink::decode_to_sink` does
-//! today. This keeps a source — `PeerSource` (paid `cdn/client/v1`, A2) or a
+//! today. This keeps a source — `PeerSource` (paid `cdn/client/v1`) or a
 //! future `BackendSource` (origin re-encode) — free of bao logic, and matches the
 //! "admit verifies once" contract of [`decdn_bao_range::RangedStore`].
 //!
@@ -179,11 +179,11 @@ fn micros_now() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-/// The paid `BlobSource` (#1608 Phase A, A2): wraps
+/// The paid `BlobSource` (#1608): wraps
 /// [`crate::open_progressive_pull`] behind [`BlobSource`], scoping every
 /// [`open`](BlobSource::open) to exactly the requested [`AlignedRange`] via the
-/// `byte_len`-bounded pull (the wire `StreamRequest` already carried the field;
-/// only the OPEN-side plumbing was whole-tail before this).
+/// `byte_len`-bounded pull: the wire `StreamRequest` carries the field and the
+/// OPEN-side plumbing scopes each pull to the requested range.
 ///
 /// One `PeerSource` serves one gap-driven fetch against one upstream peer — it
 /// holds the pull context (`endpoint`, `target`, `ctx`, `ledger`, …) but not a
@@ -309,7 +309,7 @@ impl BlobSource for PeerSource<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Test doubles: a scripted BlobSource + a fake Funder for the A4 driver tests.
+// Test doubles: a scripted BlobSource + a fake Funder for the driver tests.
 // Feature-gated so a production caller cannot name them, but compiled outside
 // `cfg(test)` under `test-util`, so they must stay anti-panic clean.
 // ---------------------------------------------------------------------------
@@ -672,7 +672,7 @@ mod tests {
 
     /// `PeerSource` implements `BlobSource` — checked at compile time rather than
     /// exercised end-to-end, since a real run needs a live `Endpoint`/connection.
-    /// A4's driver tests exercise the trait's behavior against `ScriptedSource`;
+    /// The driver tests exercise the trait's behavior against `ScriptedSource`;
     /// the loopback pull tests in `lib.rs`/`sink.rs` (`open_progressive_pull`,
     /// `decode_to_sink`, the `byte_len` plumbing above) cover `PeerSource`'s own
     /// building blocks. `'static` is just a concrete lifetime to instantiate the

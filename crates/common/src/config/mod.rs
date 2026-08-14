@@ -68,10 +68,8 @@ const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
 /// unchanged from before #1011; it also overrides alloy's 250 ms localhost
 /// default, which the receipt heartbeat would otherwise use against a dev anvil.
 const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
-/// Minimum chain-event poll interval. The floor is unchanged from #1011; its
-/// reason is not. The long-lived `eth_newFilter` streams it was originally sized
-/// against are gone — #1106 replaced them with `eth_getLogs` polling, so no
-/// `eth_getFilterChanges` is issued anywhere on the node. At 250 ms the node's
+/// Minimum chain-event poll interval. The node polls chain events with
+/// `eth_getLogs` and issues no `eth_getFilterChanges` anywhere. At 250 ms the node's
 /// ~6 watcher loops would each scan `[cursor, head]` four times a second against
 /// one endpoint, tripping provider rate limits and burning paid quota just as the
 /// original flood did. The same floor bounds the receipt-heartbeat consumer.
@@ -1778,8 +1776,9 @@ fn resolve_cache_into(
     // — folding it into the local EWMA *and* the observation buffer the gossip
     // publisher drains. So a single fat-fingered value would not merely break this
     // node: it would broadcast false `Unreachable` observations about every honest
-    // peer it touches. (Its predecessor, `PullTimeout`, was exonerating, so the
-    // blast radius of a bad value used to stop at the local node.)
+    // peer it touches. Contrast the sibling knob `node_pull_timeout_sec`: a bad value
+    // there trips `PullTimeout`, which is exonerating, so its blast radius stops at the
+    // local node.
     bag.check(
         node_pull_stall_timeout_sec > 0,
         "cache.node_pull_stall_timeout_sec",
@@ -2164,10 +2163,9 @@ fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
         "bucket name must be 3..=63 chars (got {len})"
     );
     // AWS: "Bucket names must begin and end with a letter or number"
-    // — i.e. no leading/trailing `.` or `-`. The dot rule used to be
-    // the only one here; the hyphen rule was missed in the first
-    // pass. Names like `-foo` or `foo-` would parse but fail
-    // virtual-hosted-style URLs at request time.
+    // — i.e. no leading/trailing `.` or `-`. Both the leading/trailing
+    // dot and hyphen are rejected here. Names like `-foo` or `foo-`
+    // would parse but fail virtual-hosted-style URLs at request time.
     let first = name.bytes().next().unwrap_or(0);
     let last = name.bytes().next_back().unwrap_or(0);
     anyhow::ensure!(
@@ -2497,8 +2495,7 @@ pub fn resolve_payment_into(
     // The clamp only ever raises `rate_per_mb`, so a floor above the wire cap
     // would make the node sign a rate honest clients reject outright (#378).
     // There is no lower guard to write: with `rate_per_mb >= 1` validated above
-    // and a raise-only clamp, the signed rate can never collapse to 0 — an
-    // invariant the removed governance ceiling used to need a check for.
+    // and a raise-only clamp, the signed rate can never collapse to 0.
     bag.check_with(
         delivery_floor <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.delivery_floor",
@@ -4344,7 +4341,7 @@ mod tests {
     }
 
     /// A zero stall budget is the most dangerous value in this file (#1134 review).
-    /// `PullStalled` — unlike the `PullTimeout` it replaced — SCORES the peer, and
+    /// `PullStalled` SCORES the peer, and
     /// `record_outcome` writes both the local EWMA and the observation buffer the
     /// gossip publisher drains. So a `0` here would not merely break this node: it
     /// would trip on the first poll of every streaming read and broadcast false
@@ -4551,8 +4548,8 @@ mod tests {
     #[test]
     fn cache_byte_percent_knobs_round_trip_from_toml() -> anyhow::Result<()> {
         // #894: the Bytes/Percent newtypes are `#[serde(transparent)]`, so the
-        // wire form stays a bare integer and wrapping the formerly-`u64` knobs is
-        // non-breaking. Assert a real TOML `[cache]` block deserializes the bare
+        // wire form stays a bare integer and wrapping the underlying `u64` knobs
+        // in the newtypes is non-breaking. Assert a real TOML `[cache]` block deserializes the bare
         // integers straight into the typed fields — the promise the newtypes make.
         let file: crate::config::FileConfig = ::toml::from_str(
             "[cache]\npull_ahead_bytes = 1048576\nmax_unrecouped_leech_bytes = 2097152\npull_share_ratio_percent = 200\n",
@@ -4980,9 +4977,8 @@ swap_pool_address = \"0xPool\"
     }
 
     // Origin variant from TOML resolves into a typed `ResolvedOrigin::Http`
-    // that round-trips the parsed URL (#437). Replaces the CLI-vs-TOML
-    // precedence test that lived here before — the origin no longer has a
-    // CLI flag, so precedence is moot, but we still want a smoke test that
+    // that round-trips the parsed URL (#437). The origin has no CLI flag, so
+    // there is no CLI-vs-TOML precedence to test; this is a smoke test that
     // the TOML form makes it through resolution without dropping anything.
     #[test]
     fn resolve_cache_origin_http_from_toml_round_trips() -> anyhow::Result<()> {
@@ -7336,7 +7332,7 @@ swap_pool_address = \"0xPool\"
     fn run_subcommand_args_are_wired_to_decdn_env_vars() {
         use clap::{Args, CommandFactory, Parser};
 
-        // The user CLI no longer has a `run` subcommand (#421 — the
+        // The user CLI has no `run` subcommand (#421 — the
         // daemon binary `decdn-node` owns it). `RunArgs` itself
         // remains in `decdn-common` because `decdn config validate`
         // flattens it for env-var parity with the daemon. Wrap

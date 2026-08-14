@@ -1,7 +1,7 @@
 //! Integration test for [`decdn_cache::CacheEngine::admit_bao`] — the thin
 //! wrapper over `import_bao_bytes` that lets a caller admit an
 //! already-verified interleaved bao encoding without reaching into the
-//! private store handle (Task 3, #1621).
+//! private store handle (#1621).
 
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};

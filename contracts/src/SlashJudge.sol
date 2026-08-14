@@ -36,8 +36,8 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         this side (constructor + `setMaxEvidenceAge`). The mirror check on
 ///         `CapacityBond.setUnbondingPeriod` is enforced via CapacityBond's
 ///         `slashJudge` reference (wired post-deploy through
-///         `CapacityBond.setSlashJudge`), so the paired invariant is now closed
-///         on both contracts (#778).
+///         `CapacityBond.setSlashJudge`), so the paired invariant is closed
+///         on both contracts.
 contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPausable, EIP712 {
     using SafeERC20 for IERC20;
 
@@ -454,7 +454,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///      and no regional leg rescues it); the regional legs fold their
     ///      before-response check into a boolean.
     /// @dev The comparison anchor is `effectiveAt`, not `addedAt` (ADR 011
-    ///      § Compliance Window, #1169). Slashing on `addedAt` punished a node
+    ///      § Compliance Window). Slashing on `addedAt` would punish a node
     ///      for a delivery served inside the grace period it is explicitly
     ///      granted — with a 10-minute default poll interval, for content it had
     ///      no way to know was prohibited.

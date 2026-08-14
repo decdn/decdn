@@ -311,7 +311,7 @@ contract SlashJudgeTest is Test {
     /// @dev A signed refusal (`ok:false`) is inert as rate evidence even when it
     ///      quotes a higher rate than the probe — you cannot overcharge on a
     ///      delivery you declined. This is what lets a node sign `ok:false`
-    ///      freely (the retired phantom offense used to weaponize exactly this).
+    ///      freely.
     function test_rate_revertsWhenStreamNotOk() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
         SlashJudge.StreamMsg memory s = _stream(false, 25, streamTs); // ok=false, 25 > 10

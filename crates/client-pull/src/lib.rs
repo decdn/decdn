@@ -50,7 +50,7 @@ pub mod pacer;
 pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
-/// Client-side [`decdn_bao_range::RangedStore`] backend (#1621 P2): a
+/// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
 pub mod ranged_store;
 pub mod rtt_map;
@@ -883,14 +883,14 @@ impl std::error::Error for PullStalled {}
 /// PRIMARY way a dead node is detected — so the catch-all must stay as it is.
 ///
 /// The exception was this class. A node whose own signer is broken cannot pay
-/// anybody, and would previously walk the candidate list tarring every honest
+/// anybody, and would walk the candidate list tarring every honest
 /// provider it met with an `Unreachable` — a local EWMA hit; ADR 008 scoring is
 /// local-only — on the strength of its own fault. Attach this marker at a
 /// local-fault site and the classifier exonerates the peer and warns about us instead.
 ///
-/// # It now also decides what a CLIENT is told (#1560)
+/// # It also decides what a CLIENT is told (#1560)
 ///
-/// Reputation is no longer the only consequence. A second consumer — the node crate's
+/// Reputation is not the only consequence. A second consumer — the node crate's
 /// `record_channel_open_failure` — reads this marker to choose between answering a
 /// downstream client `StreamError::NotFound` ("we could not obtain this blob") and
 /// `InternalError` ("unexpected failure; do not retry this node"). That path involves no
@@ -918,7 +918,7 @@ impl std::error::Error for LocalPullFault {}
 /// The bounds on a pull, each matched to the stage it governs (#1134).
 ///
 /// The two are not interchangeable, and conflating them is the bug this type
-/// exists to prevent. A single whole-transfer deadline — what this replaced — is
+/// exists to prevent. A single whole-transfer deadline is
 /// mostly useless as a health signal: it has to be sized against `blob size ×
 /// link speed`, so it kills legitimate large or slow-but-healthy transfers while
 /// a value small enough to catch a dead peer quickly cannot serve a big blob at
@@ -954,10 +954,10 @@ impl std::error::Error for LocalPullFault {}
 /// pull then looks fully configured while its peer-health signal is dead.
 ///
 /// [`Self::capped`] is fallible and the fields are private BECAUSE of that (#1145 review).
-/// The invariant was previously enforced nowhere on this type: the fields were `pub`, both
-/// production call sites built it with a struct literal, and the check lived in the CLI's
-/// `ClientFetchArgs::validate` as a hardcoded `timeout > 2 × stall` — correct only because
-/// those two call sites happened to set `open` from the same knob as `stall`. Adding an
+/// The invariant belongs on this type: with `pub` fields, callers build it with a struct
+/// literal and the only check is a hardcoded `timeout > 2 × stall` in the CLI's
+/// `ClientFetchArgs::validate`, correct only because those call sites set `open` from the same
+/// knob as `stall`. Adding an
 /// `--open-timeout-ms` flag would have made it silently wrong, in the direction that reopens
 /// the hole. The invariant belongs to the type that has the three values.
 #[derive(Debug, Clone, Copy)]
@@ -1017,10 +1017,9 @@ impl PullDeadlines {
     ///
     /// [`DeadlineError::ZeroBudget`] for a zero `open` or `stall`.
     ///
-    /// This constructor used to be infallible, on the reasoning that "a zero `open` or
-    /// `stall` is still nonsense, but it is a bound that fires too EAGERLY — loud, and
-    /// immediately obvious — rather than one that silently never fires". That is exactly
-    /// backwards, and this same PR says so 800 lines away in `config`: a zero stall "trips
+    /// A zero `open` or `stall` must fail here, not pass. One might argue it is a bound that
+    /// fires too EAGERLY — loud, immediately obvious — rather than one that silently never
+    /// fires. That is exactly backwards: `config` says so, a zero stall "trips
     /// `PullStalled` on the first poll of every streaming read … it would broadcast false
     /// `Unreachable` observations about every honest peer it touches."
     ///
@@ -1086,7 +1085,7 @@ impl PullDeadlines {
         self.hard_cap
     }
 
-    /// The legacy single-deadline shape: one budget serving as the open bound, the
+    /// The single-deadline shape: one budget serving as the open bound, the
     /// stall bound, AND the overall cap. **Test-only — do not reach for this in
     /// production.** That conflation is exactly what #1134 set out to remove, and the
     /// name reads far more like a legitimate policy choice than it is.
@@ -1168,7 +1167,7 @@ pub async fn stream_fetch(
         decdn_protocol::client::NO_NAMESPACE,
         byte_offset,
         timestamp_us,
-        // The legacy single-deadline shape (#1134): this helper's callers are
+        // The single-deadline shape (#1134): this helper's callers are
         // loopback tests moving tiny blobs, for which one budget serving as both
         // the overall cap and the stall bound is harmless. Production paths take
         // `PullDeadlines` directly and split the two.
@@ -1527,10 +1526,9 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// field on the wire), not a position within THIS blob's byte range. A
 /// channel can fund many blobs; jumping the wire offset ahead to the
 /// channel's cumulative would, for every caller that requested
-/// `byte_offset == 0` (previously the CLI's buffered `fetch_blob` /
-/// bundle-pull path; both CLI commands now stream through
-/// `open_progressive_pull` instead, so only `stream_fetch`'s test-only
-/// callers still reach this wrapper at that offset), silently return a
+/// `byte_offset == 0` (only `stream_fetch`'s test-only callers reach this
+/// wrapper at that offset; the CLI's `fetch_blob` and bundle-pull commands
+/// stream through `open_progressive_pull`), silently return a
 /// TRUNCATED tail instead of the full blob the caller is relying on getting
 /// back. The bytes already streamed in the failed attempt were never decoded
 /// (the error path never reaches `decode_verified_range`), so there is
@@ -1554,9 +1552,8 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// the FINAL outcome (success, or the original terminal error once
 /// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't eligible).
 ///
-/// The daemon's node-to-node cache-miss buyer leg USED to be one of those callers
-/// (via [`stream_fetch_shared`], always at `byte_offset == 0`). Since #1530 it does
-/// not: it drives its own resume loop over [`open_progressive_pull`] in
+/// The daemon's node-to-node cache-miss buyer leg does not use this wrapper: it
+/// drives its own resume loop over [`open_progressive_pull`] in
 /// `decdn-node`'s `node_origin/resume.rs`, which reseeds on the same contract and
 /// additionally answers a genuine `CapExceeded` with an on-chain top-up —
 /// the thing a from-zero buffered retry could never do without re-paying for the
@@ -1567,7 +1564,7 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// A bundle-less rejection, a non-gated reason, or a bundle that fails
 /// [`WatermarkBundle::validate`] (malformed `last_signature` length) is
 /// never treated as resumable and is returned to the caller unchanged on
-/// the first attempt, exactly as before this feature existed.
+/// the first attempt.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_inner(
     endpoint: &Endpoint,
@@ -2019,7 +2016,7 @@ async fn receive_and_pay(
             // from "dead peer" when the honest case is unbounded in blob size.
             //
             // But be precise about what this does and does not fix (#1145 review). It fixes
-            // the ATTRIBUTION: an honest server with a slow first byte is no longer gossiped
+            // the ATTRIBUTION: an honest server with a slow first byte is not gossiped
             // as unreachable. It does NOT make that blob fetchable. The pull still fails —
             // a blob whose server-side materialisation exceeds the stall window is
             // unfetchable on this path. The real repair is on the SERVE side:
@@ -2466,7 +2463,7 @@ impl UpstreamPull {
     /// unexpected message, a [`UpstreamVoucherRejected`] / transport error while paying, or —
     /// on the inactivity clock — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
     /// the stall budget elapses before the first byte (`cumulative == 0`). An empty or
-    /// over-`CHUNK_SIZE` `ChunkData` is no longer raised here: it is rejected at decode by
+    /// over-`CHUNK_SIZE` `ChunkData` is not raised here: it is rejected at decode by
     /// `ChunkData`'s `serde(try_from)` (#1088), so it surfaces out of `read_client_message`.
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
@@ -2551,7 +2548,7 @@ impl UpstreamPull {
     /// Finalize a completed pull: drain to `StreamEnd` if needed, enforce
     /// wire-byte completeness (the full promised bao wire size was received),
     /// close the connection cleanly, and return the final acked watermark to
-    /// persist. Per ADR 038 this no longer re-hashes the whole blob — bao
+    /// persist. Per ADR 038 this does not re-hash the whole blob — bao
     /// verification is delegated to the tee's verifying decoder (cached copy) and
     /// the downstream client's own decoder.
     ///
@@ -2586,7 +2583,7 @@ impl UpstreamPull {
         }
         // Completeness for every fetch (full and resumed): bao verification is
         // delegated to the tee's verifying decoder (cached copy) and the
-        // downstream client's own decoder, so `finish` no longer re-hashes the
+        // downstream client's own decoder, so `finish` does not re-hash the
         // whole blob. A
         // truncated stream (fewer wire bytes than promised) can't be decoded, so
         // require the full promised wire size as the completeness signal.
@@ -2621,14 +2618,11 @@ impl Drop for UpstreamPull {
     /// its richer reason and this is a no-op when one of them ran; it only takes
     /// effect on a dropped-without-finalize path.
     ///
-    /// It closes the connection and nothing else, and that is now sufficient. It used to
-    /// note that "the acked watermark cannot be recovered from `drop` (it can't be
-    /// returned), so this bounds only the connection leak, not the #852 watermark loss" —
-    /// which was true while the watermark lived in a field of this struct. It does not:
-    /// the watermark lives in the channel's [`PoolLedger`], which OUTLIVES the pull (it
-    /// is shared with the other pulls on the channel). A dropped pull's caller reads it
-    /// with [`PoolLedger::settlement`] and persists it — `node_origin` does exactly that
-    /// from its own `Drop` guard (#1145 review).
+    /// It closes the connection and nothing else, and that is sufficient: the acked
+    /// watermark lives in the channel's [`PoolLedger`], which OUTLIVES the pull (it
+    /// is shared with the other pulls on the channel), not in a field of this struct. A
+    /// dropped pull's caller reads it with [`PoolLedger::settlement`] and persists it —
+    /// `node_origin` does exactly that from its own `Drop` guard (#1145 review).
     fn drop(&mut self) {
         self.conn.close(0u32.into(), b"upstream-pull-dropped");
     }
@@ -2642,7 +2636,7 @@ impl Drop for UpstreamPull {
 /// compute → sign → send critical section across every concurrent stream drawing
 /// on the lane — so vouchers reach the node in strict cumulative order — and
 /// releases its issuance lock the instant the send returns. Parallel range
-/// streams to one provider no longer serialize their payments behind each other's
+/// streams to one provider do not serialize their payments behind each other's
 /// round trips, because there is no round trip: only a rejection comes back, and
 /// it arrives as its own mid-stream `StreamError`.
 ///
@@ -2886,7 +2880,7 @@ mod tests {
     /// quoted wire cost — not just be accepted and ignored. This is the
     /// construction-level proof that `open_progressive_pull`'s `byte_len`
     /// threads all the way to the wire-byte bound `PeerSource`'s callers price
-    /// vouchers from (#1608 A2): a middle-gap request must quote strictly less
+    /// vouchers from (#1608): a middle-gap request must quote strictly less
     /// than the whole tail, and must match `align_range`'s own `wire_len` for the
     /// identical bounded span so the two can never drift.
     #[test]

@@ -367,8 +367,8 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
 ) -> anyhow::Result<Phase> {
     // Validate `--new-keystore` HERE, before the early returns below, not only
     // once the bond is exited. The phases that return first — deregister,
-    // request, waiting, withdraw — never read the flag, so a same-address
-    // keystore used to be accepted silently at the very start and only refused
+    // request, waiting, withdraw — never read the flag, so without this check a
+    // same-address keystore is accepted silently at the very start and only refused
     // at the re-onboarding call: two weeks, a 14-day window, and four
     // transactions later, with the tier already cleared and nothing gained.
     // Refusing on the first invocation is the entire point of the guard.

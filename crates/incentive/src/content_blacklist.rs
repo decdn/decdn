@@ -87,9 +87,8 @@ mod sol_types {
             /// True while `origin` is denied at the origin level, honouring
             /// emergency auto-expiry (a raw mapping read would not).
             ///
-            /// Re-added now that the deny-set is enumerable: this was previously
-            /// dropped as dead surface because the only use for it — a
-            /// per-address boot reconcile — had nothing to iterate over.
+            /// The per-address boot reconcile relies on this predicate, which is usable
+            /// because the deny-set is enumerable and has something to iterate over.
             ///
             /// This alone is NOT the address-liveness predicate: it reads only
             /// `_isOriginBlacklisted` and returns `false` for an OPERATOR-only
@@ -210,13 +209,10 @@ mod sol_types {
             /// consumer cannot use the version counter to detect that it missed
             /// one.
             ///
-            /// That used to make this event tail the whole guarantee — the set
-            /// was not enumerable, so a durable projection resumed from a
-            /// persisted cursor was the only way to hold it, and losing that
-            /// projection meant coming up with an empty deny-set. It is now
-            /// enumerable via [`blacklistedAddresses`], so this event is a
-            /// low-latency signal to re-read rather than the source of truth, and
-            /// the boot reconcile it lacked is finally possible.
+            /// The set is enumerable via [`blacklistedAddresses`], so a consumer holds
+            /// the deny-set by enumeration and treats this event as a low-latency signal
+            /// to re-read rather than the source of truth; the boot reconcile draws on
+            /// the same enumeration.
             event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
 
             /// Governance blacklisted an OPERATOR address (`addOperator`), which

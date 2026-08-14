@@ -16,10 +16,8 @@
 //!
 //! That is a file-ownership difference, not a logic difference, so both
 //! stores supply only their own `Database` and delegate the actual work to
-//! [`BuyerPoolTable`]. Before #1246 each store carried its own copy of this
-//! code, and the byte-compatibility contract between them was asserted only
-//! by a doc comment; now it is the same code, and `tests::encode_is_byte_stable`
-//! pins the bytes.
+//! [`BuyerPoolTable`]. Both stores share this code, so their on-disk format is
+//! byte-identical by construction, and `tests::encode_is_byte_stable` pins the bytes.
 //!
 //! The operations here never assume they own the file or that the buyer
 //! table is the only table in it — that is what makes the node's
@@ -175,8 +173,8 @@ impl StoredBuyerPoolState {
     }
 }
 
-/// Encode one buyer record. The single home for what used to be scattered
-/// inlined copies across two crates.
+/// Encode one buyer record. The single encoder shared by every crate that
+/// persists a buyer pool.
 fn encode_record(state: &BuyerPoolState) -> Result<Vec<u8>, StoreError> {
     postcard::to_allocvec(&StoredBuyerPoolState::from(state))
         .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))

@@ -100,10 +100,9 @@ impl AnnounceOriginDenySet {
 /// Note what this does *not* buy: it is not what keeps the runtime from failing
 /// open. Exporting this type would create no un-gated path — anything an
 /// external caller could build with it is the same wrapping
-/// [`announce_staked_gate`] already returns. The genuinely un-gated seam was
-/// `AnnounceGate::Disabled`, which narrowing this struct did not touch — that is
-/// now closed separately by making the variant `#[cfg(test)]` in `decdn-gossip`,
-/// i.e. absent from production builds.
+/// [`announce_staked_gate`] already returns. The one un-gated seam,
+/// `AnnounceGate::Disabled`, is `#[cfg(test)]` in `decdn-gossip` — absent from
+/// production builds — so it is closed independently of this struct.
 #[derive(Debug)]
 pub(crate) struct NodeStakedNodeSet {
     staker_set: Arc<dyn StakerSet>,
@@ -229,11 +228,9 @@ mod tests {
     /// refactor silently disabling rule 2 (the #1170 hole), which `run()` alone
     /// would only surface under the anvil e2e (#1222).
     ///
-    /// The other half of that guarantee — "never the fail-open variant" — used
-    /// to be a `let ... else { panic!() }` here. It is no longer assertable, and
-    /// that is the improvement: `AnnounceGate::Disabled` is `#[cfg(test)]` in
-    /// `decdn-gossip`, so from this crate the pattern is irrefutable and the
-    /// invariant is the compiler's rather than this test's.
+    /// The other half of that guarantee — "never the fail-open variant" — is the
+    /// compiler's, not this test's: `AnnounceGate::Disabled` is `#[cfg(test)]` in
+    /// `decdn-gossip`, so from this crate the pattern is irrefutable.
     #[test]
     fn announce_staked_gate_admits_against_the_live_set() {
         let member = pk();

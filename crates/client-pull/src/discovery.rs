@@ -675,8 +675,7 @@ pub const RTT_REUSE_TOLERANCE: f64 = 1.5;
 /// candidates are returned unreordered.
 ///
 /// Both sides are [`Region`]s, so this is a plain equality: the trim +
-/// case-fold that used to run on every comparison moved into the parse
-/// boundary (#1348).
+/// case-fold runs at the parse boundary, not on every comparison (#1348).
 #[must_use]
 pub fn select_candidates(
     mut candidates: Vec<NodeCandidate>,
@@ -830,7 +829,7 @@ mod tests {
         );
     }
 
-    /// The filter now keys on the on-chain `isActive` (the `active[]` column of
+    /// The filter keys on the on-chain `isActive` (the `active[]` column of
     /// `getRegisteredNodes`), NOT the raw `NodeInfo.active` registration flag. A
     /// node mid-unbonding is still `NodeInfo.active == true` but `isActive ==
     /// false`, and the client must drop it up front rather than defer to probing.
@@ -907,10 +906,10 @@ mod tests {
         assert_eq!(out[2].eth_address, Address::repeat_byte(1));
     }
 
-    /// The normalization now lives in the type, so ` us ` and `US` are the same
+    /// The normalization lives in the type, so ` us ` and `US` are the same
     /// VALUE, not merely two things a comparison happens to fold together. This
-    /// is what makes the derived `Eq` on `NodeCandidate` correct — before
-    /// #1348 the same node under two spellings compared unequal, so any future
+    /// is what makes the derived `Eq` on `NodeCandidate` correct: without it the
+    /// same node under two spellings would compare unequal, so any
     /// `dedup`/`contains`/`retain` over candidates would silently fail to
     /// dedupe.
     #[test]
