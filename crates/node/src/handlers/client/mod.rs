@@ -2,9 +2,11 @@
 //!
 //! Serves the revenue path: a payer opens one bidirectional QUIC stream per
 //! blob, the node answers with a signed [`StreamResponse`], then streams
-//! [`ChunkData`] in `VOUCHER_INTERVAL_BYTES`-sized batches, pausing at each
-//! batch boundary to collect a cumulative payment `Voucher` before continuing,
-//! and finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
+//! [`ChunkData`], collecting a cumulative payment `Voucher` at each
+//! `VOUCHER_INTERVAL_BYTES` boundary and pausing only when the unpaid balance
+//! (`delivered − paid`) reaches the credit window — so delivery pipelines
+//! several intervals ahead of payment rather than stopping at each one — and
+//! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
 //! initial response (`ok: false` + [`StreamError`]); a mid-stream voucher
 //! rejection is sent as a [`ClientMessage::StreamError`] and the stream is
 //! closed **cleanly** (no QUIC reset) so the client can read the reason.
