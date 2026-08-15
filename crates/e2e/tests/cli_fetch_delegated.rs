@@ -256,19 +256,19 @@ async fn run() -> anyhow::Result<()> {
         let auth =
             e2e_assert::read_authorization(chain.admin(), payment_pool, pool_id, delegate_addr)
                 .await?;
-        Ok((auth.cap > U256::ZERO).then_some(auth))
+        Ok((auth.cap > 0).then_some(auth))
     })
     .await?
     .context("delegate signer was never registered on-chain (getAuthorization.cap stayed zero)")?;
     anyhow::ensure!(
-        auth.cap == grant.spending_cap,
+        U256::from(auth.cap) == grant.spending_cap,
         "registered cap {} must equal the delegated capability's FINITE cap {}",
         auth.cap,
         grant.spending_cap
     );
     anyhow::ensure!(
-        auth.cap != U256::MAX,
-        "the registered cap must be the finite delegated cap, not the self-owned U256::MAX sentinel"
+        auth.cap != u64::MAX,
+        "the registered cap must be the finite delegated cap, not the self-owned u64::MAX sentinel"
     );
     anyhow::ensure!(
         auth.expiry == grant.expiry,
@@ -277,7 +277,7 @@ async fn run() -> anyhow::Result<()> {
         grant.expiry
     );
     anyhow::ensure!(
-        auth.spent > U256::ZERO && auth.spent <= auth.cap,
+        auth.spent > 0 && auth.spent <= auth.cap,
         "the delegate's spent-so-far ({}) must be positive and within the cap ({})",
         auth.spent,
         auth.cap
@@ -294,7 +294,7 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
     anyhow::ensure!(
-        lane.amount > U256::ZERO && lane.bytesDelivered > U256::ZERO,
+        lane.amount > 0 && lane.bytesDelivered > 0,
         "the delegate's lane must have advanced (amount={}, bytesDelivered={})",
         lane.amount,
         lane.bytesDelivered
@@ -311,7 +311,9 @@ async fn run() -> anyhow::Result<()> {
         .context("get PoolRedeemed logs")?;
     let names_delegate = logs.iter().any(|log| {
         PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data).is_ok_and(|e| {
-            e.poolId == pool_id && e.signer == delegate_addr && e.provider == operator
+            e.poolId == pool_id
+                && e.provider == operator
+                && e.lanes.iter().any(|lane| lane.signer == delegate_addr)
         })
     });
     anyhow::ensure!(
@@ -325,7 +327,7 @@ async fn run() -> anyhow::Result<()> {
     let owner_auth =
         e2e_assert::read_authorization(chain.admin(), payment_pool, pool_id, owner_addr).await?;
     anyhow::ensure!(
-        owner_auth.cap == U256::ZERO && owner_auth.spent == U256::ZERO,
+        owner_auth.cap == 0 && owner_auth.spent == 0,
         "the owner must never be registered as a signer (cap={}, spent={})",
         owner_auth.cap,
         owner_auth.spent
@@ -334,7 +336,7 @@ async fn run() -> anyhow::Result<()> {
         e2e_assert::read_watermark(chain.admin(), payment_pool, pool_id, owner_addr, operator)
             .await?;
     anyhow::ensure!(
-        owner_lane.amount == U256::ZERO && owner_lane.bytesDelivered == U256::ZERO,
+        owner_lane.amount == 0 && owner_lane.bytesDelivered == 0,
         "the owner must hold no voucher lane on its own pool (amount={}, bytesDelivered={})",
         owner_lane.amount,
         owner_lane.bytesDelivered

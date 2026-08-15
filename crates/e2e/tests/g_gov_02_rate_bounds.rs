@@ -322,10 +322,10 @@ async fn run() -> anyhow::Result<()> {
         settled_amount_and_bytes(&chain, paid.pool_id, client.address(), node.operator_addr())
             .await?;
     assert!(
-        billed_bytes >= U256::from(2 * MIB),
+        u128::from(billed_bytes) >= 2 * MIB as u128,
         "the settled voucher must cover the whole blob, got {billed_bytes} billed bytes"
     );
-    let implied_rate = amount * U256::from(BYTES_PER_MB) / billed_bytes;
+    let implied_rate = U256::from(amount) * U256::from(BYTES_PER_MB) / U256::from(billed_bytes);
     assert!(
         (U256::from(NEW_FLOOR)..=U256::from(NEW_FLOOR + 1)).contains(&implied_rate),
         "the blob must be sold at the ratified floor ({NEW_FLOOR}/MB): settled {amount} \
@@ -705,7 +705,7 @@ async fn settled_amount_and_bytes(
     pool_id: B256,
     signer: Address,
     provider: Address,
-) -> anyhow::Result<(U256, U256)> {
+) -> anyhow::Result<(u64, u64)> {
     let lane = decdn_e2e::assert::read_watermark(
         chain.admin(),
         chain.addrs().payment_pool,

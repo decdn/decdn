@@ -5,10 +5,12 @@ import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol"
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { SunsettingPausable } from "./SunsettingPausable.sol";
 import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import { IFeeRouterSettlement } from "./interfaces/IFeeRouterSettlement.sol";
 import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
@@ -37,6 +39,7 @@ import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
 ///         no signatures).
 contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP712 {
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
 
     // -----------------------------------------------------------------
     // Roles
@@ -131,25 +134,35 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @notice Per-owner monotonic pool counter used in `poolId` derivation.
     mapping(address owner => uint256) public ownerPoolNonce;
 
+    /// @dev Two slots. `owner + status + disputeDeadline` is 29 bytes, and
+    ///      the two USDC counters are 16 more. Every USDC field on this
+    ///      contract is `uint64` — 1.845e19 base units is ~$18.4 trillion at
+    ///      USDC's 6 decimals, some four hundred times the token's entire
+    ///      supply — so the width bounds nothing a real pool can reach while
+    ///      keeping each struct inside one slot.
     struct Pool {
         address owner;
-        uint64 openedAt;
         Status status;
-        address token;
         uint64 disputeDeadline;
-        uint256 deposit;
-        uint256 totalRedeemed;
+        uint64 deposit;
+        uint64 totalRedeemed;
     }
 
+    /// @dev One slot (192 of 256 bits). `spent <= cap` by construction, so
+    ///      the accumulator cannot outgrow the width the cap was accepted at.
     struct Authorization {
-        uint256 cap;
+        uint64 cap;
         uint64 expiry;
-        uint256 spent;
+        uint64 spent;
     }
 
+    /// @dev One slot (128 of 256 bits). Both fields are watermarks that only
+    ///      ever advance toward a presented `uint64` cumulative, so neither
+    ///      can exceed the width a voucher can carry. `bytesDelivered` tops
+    ///      out at 18.4 exabytes on a single lane.
     struct Lane {
-        uint256 amount;
-        uint256 bytesDelivered;
+        uint64 amount;
+        uint64 bytesDelivered;
     }
 
     mapping(bytes32 poolId => Pool) internal pools;
@@ -168,20 +181,32 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     event PoolOpened(bytes32 indexed poolId, address indexed owner, uint256 deposit);
     event PoolToppedUp(bytes32 indexed poolId, uint256 additionalDeposit, uint256 newDeposit);
 
-    /// @notice A node cashed a voucher against its lane. `paid` is the USDC
-    ///         routed to `FeeRouter` this call, `bytesPaid` the paid-proportional
-    ///         served bytes stamped into the operator's epoch, and
-    ///         `newPaidCumulative` the lane's cumulative paid amount after the
-    ///         advance. A node follows this event (filtered on its own
-    ///         `provider`) as the single write path for the paid side.
-    event PoolRedeemed(
-        bytes32 indexed poolId,
-        address indexed signer,
-        address indexed provider,
-        uint256 paid,
-        uint256 bytesPaid,
-        uint256 newPaidCumulative
-    );
+    /// @notice One lane's outcome inside a `PoolRedeemed`.
+    ///         `newPaidCumulative` is the lane's cumulative paid amount after
+    ///         the advance — the value a node writes to its paid watermark,
+    ///         cumulative rather than a delta so the stream is idempotent and
+    ///         survives a gap. `bytesPaid` is the paid-proportional served
+    ///         byte count, carried for per-lane accounting; nothing normative
+    ///         reads it, since governance vote weight comes from
+    ///         `FeeRouter.bytesPerEpoch`.
+    struct LaneSettled {
+        address signer;
+        uint64 newPaidCumulative;
+        uint64 bytesPaid;
+    }
+
+    /// @notice A node cashed vouchers against one pool. Emitted once per pool
+    ///         group with an entry per lane that actually paid, rather than
+    ///         once per lane: the log base and its topics are then paid once
+    ///         for the group instead of once for every lane, which is what
+    ///         keeps a lane cheap enough to redeem at a small balance.
+    ///         A node follows this event, filtered on its own `provider`, as
+    ///         the single write path for the paid side.
+    /// @dev    The amount paid per lane is deliberately absent: a node writes
+    ///         `newPaidCumulative` rather than summing deltas, so a delta is
+    ///         never read and would only be a word of log data per lane. The
+    ///         per-call USDC total is on `FeeRouter.Settled`.
+    event PoolRedeemed(bytes32 indexed poolId, address indexed provider, LaneSettled[] lanes);
 
     /// @notice The owner started the grace-window close on `poolId`.
     ///         `redeem` stays callable until `disputeDeadline`.
@@ -207,8 +232,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error ZeroAmount();
     error PoolNotOpen();
     error NotPoolOwner();
-    error NothingToRedeem();
-    error NotProvider();
     error InvalidVoucherSignature();
     error InvalidCapabilitySignature();
     error RateFloorViolation(uint256 amount, uint256 bytesDelivered, uint256 deliveryFloor);
@@ -272,7 +295,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///         `poolId = keccak256(owner, ownerPoolNonce[owner])`. Names no
     ///         provider and no signer — a pool is bound to no payee at open.
     // slither-disable-next-line reentrancy-no-eth
-    function openPool(uint256 deposit) external nonReentrant whenNotPaused returns (bytes32 poolId) {
+    function openPool(uint64 deposit) external nonReentrant whenNotPaused returns (bytes32 poolId) {
         if (deposit == 0) revert ZeroAmount();
 
         uint256 nonce = ownerPoolNonce[msg.sender];
@@ -281,9 +304,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
         Pool storage p = pools[poolId];
         p.owner = msg.sender;
-        p.openedAt = uint64(block.timestamp);
         p.status = Status.Open;
-        p.token = address(usdc);
 
         // Credit the balance actually received, not the requested amount, so
         // a fee-on-transfer USDC proxy cannot over-state this pool's share of
@@ -299,7 +320,10 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // nothing), not a dangerous balance equality.
         // slither-disable-next-line incorrect-equality
         if (received == 0) revert ZeroAmount();
-        p.deposit = received;
+        // `received <= deposit` for a well-behaved or fee-on-transfer token,
+        // but a token that credits more than it was asked for must not silently
+        // truncate the pool's deposit.
+        p.deposit = received.toUint64();
 
         emit PoolOpened(poolId, msg.sender, received);
     }
@@ -307,7 +331,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @notice Owner-only: add funds to an open pool.
     /// @dev `whenNotPaused`: pause refuses new inflows during an incident.
     // slither-disable-next-line reentrancy-no-eth
-    function topUp(bytes32 poolId, uint256 additionalDeposit) external nonReentrant whenNotPaused {
+    function topUp(bytes32 poolId, uint64 additionalDeposit) external nonReentrant whenNotPaused {
         Pool storage p = pools[poolId];
         if (p.status != Status.Open) revert PoolNotOpen();
         if (msg.sender != p.owner) revert NotPoolOwner();
@@ -326,7 +350,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // equality.
         // slither-disable-next-line incorrect-equality
         if (received == 0) revert ZeroAmount();
-        p.deposit += received;
+        p.deposit += received.toUint64();
 
         emit PoolToppedUp(poolId, received, p.deposit);
     }
@@ -362,7 +386,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.disputeDeadline) revert GraceWindowActive();
 
-        uint256 ownerRefund = p.deposit - p.totalRedeemed;
+        uint64 ownerRefund = p.deposit - p.totalRedeemed;
         p.status = Status.Closed;
 
         if (ownerRefund != 0) usdc.safeTransfer(p.owner, ownerRefund);
@@ -374,87 +398,140 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     // Redemption
     // -----------------------------------------------------------------
 
-    /// @notice Pay a node against a monotone cumulative voucher while the pool
-    ///         is `Open` or inside the grace window (ADR 003 § `redeem`
-    ///         behavior). The payee (`provider == msg.sender`) presents the
-    ///         highest voucher it holds; redemption pays the increment over the
-    ///         lane watermark, bounded by the signer's remaining cap and the
-    ///         pool's remaining deposit, then routes the paid USDC through
-    ///         `FeeRouter.routeSettlement` in the same transaction.
-    /// @param  voucherSig The signer's EIP-712 `Voucher` signature over
-    ///         `{poolId, signer, provider, cumulative, bytesDelivered}`.
-    /// @param  capability On a signer's first redemption, the ABI-encoded tuple
-    ///         `(uint256 spendingCap, uint64 expiry, bytes ownerSig)` carrying
-    ///         the owner's EIP-712 `Capability` signature and the limits it
-    ///         authorizes; empty bytes for every later redemption of an
-    ///         already-registered signer.
-    // slither-disable-next-line reentrancy-no-eth
-    function redeem(
-        bytes32 poolId,
-        address signer,
-        address provider,
-        uint256 cumulative,
-        uint256 bytesDelivered,
-        bytes calldata voucherSig,
-        bytes calldata capability
-    ) external nonReentrant {
-        if (capability.length != 0) {
-            (uint256 spendingCap, uint64 expiry, bytes memory ownerSig) =
-                abi.decode(capability, (uint256, uint64, bytes));
-            _registerCapability(poolId, signer, spendingCap, expiry, ownerSig);
-        }
-        uint256 paid = _redeemVoucher(poolId, signer, provider, cumulative, bytesDelivered, voucherSig);
-        if (paid == 0) revert NothingToRedeem();
-    }
-
-    /// @notice One `capabilities` entry to register, mirroring `redeem`'s
-    ///         decoded `(spendingCap, expiry, ownerSig)` capability tuple plus
-    ///         the `poolId`/`signer` it names.
+    /// @notice One signer registration inside a pool's batch: the owner's
+    ///         EIP-712 `Capability` signature and the limits it authorizes.
+    ///         The pool is the enclosing [`PoolBatch`].
     struct CapabilityReg {
-        bytes32 poolId;
         address signer;
-        uint256 spendingCap;
+        uint64 spendingCap;
         uint64 expiry;
         bytes ownerSig;
     }
 
-    /// @notice One `vouchers` entry to redeem, mirroring `redeem`'s voucher
-    ///         parameters plus the `poolId` it names.
-    struct RedeemVoucher {
-        bytes32 poolId;
+    /// @notice One lane's voucher inside a pool's batch. Names neither its
+    ///         pool (the enclosing [`PoolBatch`] does) nor its payee: the
+    ///         voucher is redeemed for `msg.sender`, which is also what the
+    ///         EIP-712 hash is rebuilt with, so a voucher signed for a
+    ///         different node fails as `InvalidVoucherSignature`.
+    /// @dev    The signature is the EIP-2098 compact pair `(r, vs)` rather
+    ///         than a `bytes` blob, which is what makes this struct *static*:
+    ///         an array of it carries no per-element offset, no length word,
+    ///         and no padding, so a lane costs 160 calldata bytes instead of
+    ///         288. That width is the binding constraint on how small a lane
+    ///         balance a node can still afford to redeem, so it is worth the
+    ///         one capability it gives up — a voucher signer must be an EOA
+    ///         (see `_verifyVoucher`).
+    struct LaneVoucher {
         address signer;
-        address provider;
-        uint256 cumulative;
-        uint256 bytesDelivered;
-        bytes voucherSig;
+        uint64 cumulative;
+        uint64 bytesDelivered;
+        bytes32 r;
+        bytes32 vs;
     }
 
-    /// @notice Register every capability, then redeem every voucher, in one
-    ///         transaction (ADR 003 § Batch redemption). A node registers the
-    ///         signers it needs and redeems all its lanes at once. The two
-    ///         loops are decoupled: registration never depends on whether any
-    ///         voucher in the batch pays. `_registerCapability` is idempotent
-    ///         (a duplicate or already-registered signer is a no-op) and
-    ///         reverts on a bad owner signature; `_redeemVoucher` returns 0 on
-    ///         every transient-empty voucher (including one whose signer is
-    ///         covered by neither this call's `capabilities` nor a prior
-    ///         registration), which this loop simply skips, and reverts on a
-    ///         structural error (bad voucher signature, wrong provider,
-    ///         closed pool, sub-floor rate) that rolls back the whole batch.
-    function redeemMany(CapabilityReg[] calldata capabilities, RedeemVoucher[] calldata vouchers)
-        external
-        nonReentrant
-        returns (uint256 totalPaid)
-    {
-        for (uint256 i = 0; i < capabilities.length; i++) {
-            CapabilityReg calldata c = capabilities[i];
-            _registerCapability(c.poolId, c.signer, c.spendingCap, c.expiry, c.ownerSig);
+    /// @notice Everything a node redeems against one pool. Naming the pool
+    ///         once per group rather than once per entry is both the calldata
+    ///         saving and what lets the pool's status gate and its
+    ///         `totalRedeemed` write happen once for the whole group.
+    struct PoolBatch {
+        bytes32 poolId;
+        CapabilityReg[] capabilities;
+        LaneVoucher[] vouchers;
+    }
+
+    /// @notice The sole redemption entry point (ADR 003 § Batch redemption):
+    ///         per pool, register every capability, then redeem every
+    ///         voucher, all in one transaction. A node redeems every lane it
+    ///         holds at once; a single lane is a one-pool batch of one.
+    ///         Within a pool the two loops are decoupled: registration never
+    ///         depends on whether any voucher pays. `_registerCapability` is
+    ///         idempotent (a duplicate or already-registered signer is a
+    ///         no-op) and reverts on a bad owner signature; `_applyVoucher`
+    ///         returns `(0, 0)` on every transient-empty voucher (including
+    ///         one whose signer is covered by neither this pool's
+    ///         `capabilities` nor a prior registration), which the loop simply
+    ///         skips, and reverts on a structural error (bad voucher
+    ///         signature, closed pool, sub-floor rate) that rolls back
+    ///         everything.
+    /// @dev    Grouping by pool is what makes the per-pool work per-pool: the
+    ///         status gate is read once per group, and `totalRedeemed`
+    ///         advances in one write at the end of it, so a pool carrying
+    ///         many lanes pays for neither again per lane. `_applyVoucher`
+    ///         touches no pool storage at all — it takes the group's
+    ///         `remaining` and returns what it drew, so the running total is
+    ///         threaded in a local rather than re-read.
+    ///
+    ///         The whole call settles once. Every voucher is redeemed for
+    ///         `msg.sender`, so the payout across every pool collapses into a
+    ///         single `_route(msg.sender, totalBytes, totalPaid)`, and every
+    ///         lane watermark that a per-voucher route would have interleaved
+    ///         with is committed before it. Per-lane detail stays on the wire
+    ///         in each group's `PoolRedeemed`, which carries one entry per
+    ///         lane that paid. Inlining the helpers
+    ///         into these loops measures *slower* under the repo's legacy
+    ///         codegen — the call is a jump, the flattened frame is stack
+    ///         pressure — so they stay factored.
+    function redeemMany(PoolBatch[] calldata batches) external nonReentrant returns (uint256 totalPaid) {
+        uint256 totalBytes = 0;
+
+        for (uint256 b = 0; b < batches.length; b++) {
+            PoolBatch calldata batch = batches[b];
+            bytes32 poolId = batch.poolId;
+            Pool storage p = pools[poolId];
+
+            // Status gate, once for the group: `Open`, or `Closing` before the
+            // grace-window deadline. Nothing inside the group can change it —
+            // the only external call in this function happens after every loop.
+            if (p.status == Status.Closed) revert PoolClosed();
+            // forge-lint: disable-next-line(block-timestamp)
+            if (p.status == Status.Closing && block.timestamp >= p.disputeDeadline) revert PoolClosed();
+
+            for (uint256 i = 0; i < batch.capabilities.length; i++) {
+                CapabilityReg calldata c = batch.capabilities[i];
+                _registerCapability(poolId, c.signer, c.spendingCap, c.expiry, c.ownerSig);
+            }
+
+            // The group's solvency bound, read once and drawn down in a local.
+            // Passing `remaining` in is what keeps `_applyVoucher` free of pool
+            // storage, and it stays exact: every draw this group has already
+            // made is subtracted before the next one is bounded.
+            uint64 remaining = p.deposit - p.totalRedeemed;
+            uint64 poolPaid = 0;
+            // Sized for every voucher and truncated to the ones that paid, so
+            // the group allocates once and the log carries no empty entries.
+            LaneSettled[] memory settled = new LaneSettled[](batch.vouchers.length);
+            uint256 settledCount = 0;
+
+            for (uint256 i = 0; i < batch.vouchers.length; i++) {
+                LaneVoucher calldata v = batch.vouchers[i];
+                (uint64 paid, uint64 bytesPaid, uint64 newCumulative) = _applyVoucher(poolId, v, remaining - poolPaid);
+                if (paid != 0) {
+                    settled[settledCount] =
+                        LaneSettled({ signer: v.signer, newPaidCumulative: newCumulative, bytesPaid: bytesPaid });
+                    settledCount++;
+                    poolPaid += paid;
+                    totalBytes += bytesPaid;
+                }
+            }
+
+            if (poolPaid != 0) {
+                p.totalRedeemed += poolPaid;
+                totalPaid += poolPaid;
+                // Shorten the array to the lanes that paid. Rewriting the
+                // length word in place is the only way to hand `emit` a
+                // right-sized array without copying it; `settledCount` is
+                // bounded by the allocated length just above.
+                // solhint-disable-next-line no-inline-assembly
+                assembly ("memory-safe") {
+                    mstore(settled, settledCount)
+                }
+                emit PoolRedeemed(poolId, msg.sender, settled);
+            }
         }
 
-        for (uint256 i = 0; i < vouchers.length; i++) {
-            RedeemVoucher calldata v = vouchers[i];
-            totalPaid += _redeemVoucher(v.poolId, v.signer, v.provider, v.cumulative, v.bytesDelivered, v.voucherSig);
-        }
+        // A call that paid nothing moves nothing: the router rejects a zero
+        // amount, and there is nothing to settle.
+        if (totalPaid != 0) _route(msg.sender, totalBytes, totalPaid);
     }
 
     // -----------------------------------------------------------------
@@ -585,14 +662,18 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      already-registered signer (`cap != 0 || expiry != 0`) returns
     ///      without re-verifying or overwriting, so a stray capability on a
     ///      later redeem cannot raise the cap or extend the expiry. Factored so
-    ///      the batch `redeemMany` registers each capability before applying its
+    ///      `redeemMany` registers each capability before applying its
     ///      vouchers.
+    /// @dev  `spendingCap` is `uint64` in calldata but hashes as a full word,
+    ///       which is the `uint256 spendingCap` the `Capability` typehash
+    ///       names — narrowing the field changes no signature a client
+    ///       produces.
     function _registerCapability(
         bytes32 poolId,
         address signer,
-        uint256 spendingCap,
+        uint64 spendingCap,
         uint64 expiry,
-        bytes memory ownerSig
+        bytes calldata ownerSig
     ) internal {
         Authorization storage a = authorized[poolId][signer];
         if (a.cap != 0 || a.expiry != 0) return;
@@ -606,98 +687,119 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         a.expiry = expiry;
     }
 
-    /// @dev The cumulative-`min` redemption core (ADR 003 § `redeem` behavior).
-    ///      Returns the routed `paid`, or 0 on a transient-empty voucher that
-    ///      writes no state: an unregistered signer, an expired capability, a
-    ///      cumulative at or below the lane watermark, or a fully drained /
-    ///      cap-reached lane. Reverts only on structural errors: a closed or
-    ///      past-deadline pool (`PoolClosed`), a non-payee caller
-    ///      (`NotProvider`), a bad voucher signature (`InvalidVoucherSignature`),
-    ///      or a sub-floor delivery rate (`RateFloorViolation`). The
-    ///      return-0-vs-revert split is what lets the batch `redeemMany` skip an
-    ///      empty voucher without reverting the whole batch. Follows
-    ///      checks-effects-interactions: the lane, `spent`, and `totalRedeemed`
-    ///      advance before the `_route` external call.
-    // slither-disable-next-line reentrancy-no-eth
-    function _redeemVoucher(
-        bytes32 poolId,
-        address signer,
-        address provider,
-        uint256 cumulative,
-        uint256 bytesDelivered,
-        bytes memory voucherSig
-    ) internal returns (uint256 paid) {
-        Pool storage p = pools[poolId];
-
-        // Status gate: Open, or Closing before the grace-window deadline.
-        if (p.status == Status.Closed) revert PoolClosed();
-        // forge-lint: disable-next-line(block-timestamp)
-        if (p.status == Status.Closing && block.timestamp >= p.disputeDeadline) revert PoolClosed();
-
-        if (provider != msg.sender) revert NotProvider();
+    /// @dev The cumulative-`min` redemption core (ADR 003 § Redemption
+    ///      behavior), applied for the payee `msg.sender`. Returns the `paid`
+    ///      USDC and the paid-proportional `bytesPaid` owed to that payee, or
+    ///      `(0, 0)` on a transient-empty voucher that writes no state: an
+    ///      unregistered signer, an expired capability, a cumulative at or
+    ///      below the lane watermark, or a fully drained / cap-reached lane.
+    ///      Reverts only on structural errors: a bad voucher signature
+    ///      (`InvalidVoucherSignature` — which is also how a voucher signed
+    ///      for a different payee surfaces) or a sub-floor delivery rate
+    ///      (`RateFloorViolation`). The return-0-vs-revert split is what lets
+    ///      `redeemMany` skip an empty voucher without reverting the batch.
+    ///
+    ///      Touches no pool storage. The caller has already gated the pool's
+    ///      status for the whole group and read its `remaining` (`deposit -
+    ///      totalRedeemed`, less whatever earlier vouchers in the group have
+    ///      already drawn), so this reads and writes only the signer's
+    ///      authorization and the lane.
+    ///
+    ///      Pure state advance: it moves no money. The caller owes the returned
+    ///      pair to `_route`, once for the whole call. Keeping the settlement
+    ///      out of here is what makes checks-effects-interactions hold across a
+    ///      batch: every lane, `spent`, and `totalRedeemed` advance lands
+    ///      before the single external call.
+    /// @param remaining The pool's still-payable balance for this voucher.
+    /// @return paid The USDC drawn for this lane.
+    /// @return bytesPaid The paid-proportional served bytes for this lane.
+    /// @return newCumulative The lane's cumulative paid amount after the
+    ///         advance, which the caller reports in `PoolRedeemed`. Returned
+    ///         rather than re-read, since the caller would otherwise pay a
+    ///         second load of a slot this call has just written.
+    function _applyVoucher(bytes32 poolId, LaneVoucher calldata v, uint64 remaining)
+        internal
+        returns (uint64 paid, uint64 bytesPaid, uint64 newCumulative)
+    {
+        address signer = v.signer;
+        uint64 cumulative = v.cumulative;
+        uint64 bytesDelivered = v.bytesDelivered;
 
         Authorization storage a = authorized[poolId][signer];
         // Unregistered signer: transient-empty. The single `redeem` path has
         // registered via `_registerCapability` first; the batch path skips it.
-        if (a.cap == 0 && a.expiry == 0) return 0;
+        if (a.cap == 0 && a.expiry == 0) return (0, 0, 0);
 
-        _verifyVoucher(poolId, signer, provider, cumulative, bytesDelivered, voucherSig);
+        _verifyVoucher(poolId, v);
 
         // Expired capability is transient-empty (skippable in a batch); the
         // single path surfaces it as `NothingToRedeem`.
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp >= a.expiry) return 0;
+        if (block.timestamp >= a.expiry) return (0, 0, 0);
 
         // Per-MB price floor on the cumulative claim, evaluated as a bytes
-        // ceiling via `Math.mulDiv` so a `bytesDelivered` near
-        // `type(uint256).max` reverts cleanly instead of arithmetic-panicking.
-        // `deliveryFloor >= MIN_RATE_FLOOR (1)` keeps the divisor non-zero.
+        // ceiling. `deliveryFloor >= MIN_RATE_FLOOR (1)` keeps the divisor
+        // non-zero, and both operands are `uint64`, so the widened product
+        // cannot overflow the `mulDiv`.
         if (bytesDelivered > Math.mulDiv(cumulative, BYTES_PER_MB, deliveryFloor)) {
             revert RateFloorViolation(cumulative, bytesDelivered, deliveryFloor);
         }
 
-        Lane storage w = watermark[poolId][signer][provider];
+        Lane storage w = watermark[poolId][signer][msg.sender];
         // Regression / already-paid cumulative: transient-empty.
-        if (cumulative <= w.amount) return 0;
+        if (cumulative <= w.amount) return (0, 0, 0);
 
-        uint256 desired = cumulative - w.amount;
-        paid = Math.min(desired, Math.min(a.cap - a.spent, p.deposit - p.totalRedeemed));
+        uint64 desired = cumulative - w.amount;
+        paid = uint64(Math.min(desired, Math.min(a.cap - a.spent, remaining)));
         // Drained pool or cap reached: transient-empty, retriable after a top-up.
-        if (paid == 0) return 0;
+        if (paid == 0) return (0, 0, 0);
 
         // A voucher whose bytesDelivered has not advanced settles its money
         // with zero bytes credited; the byte watermark holds and recovers
         // when a later voucher advances it.
-        uint256 bytesDelta = bytesDelivered > w.bytesDelivered ? bytesDelivered - w.bytesDelivered : 0;
-        uint256 bytesPaid = Math.mulDiv(bytesDelta, paid, desired);
+        uint64 bytesDelta = bytesDelivered > w.bytesDelivered ? bytesDelivered - w.bytesDelivered : 0;
+        // `bytesPaid <= bytesDelta` (paid <= desired), so the result is a
+        // `uint64` by construction.
+        bytesPaid = uint64(Math.mulDiv(bytesDelta, paid, desired));
 
-        // Effects before interactions (checks-effects-interactions).
+        // Effects only; the caller settles.
         w.amount += paid;
         w.bytesDelivered += bytesPaid;
         a.spent += paid;
-        p.totalRedeemed += paid;
-
-        _route(provider, bytesPaid, paid);
-
-        emit PoolRedeemed(poolId, signer, provider, paid, bytesPaid, w.amount);
+        newCumulative = w.amount;
     }
 
-    /// @dev Verify an EIP-712 `Voucher` signature (EOA or ERC-1271) against
-    ///      `signer` over the canonical typed data. Factored out of
-    ///      `_redeemVoucher` to keep that frame within the stack limit.
-    function _verifyVoucher(
-        bytes32 poolId,
-        address signer,
-        address provider,
-        uint256 cumulative,
-        uint256 bytesDelivered,
-        bytes memory voucherSig
-    ) internal view {
-        bytes32 structHash = keccak256(
-            abi.encode(VOUCHER_TYPEHASH, poolId, signer, provider, cumulative, bytesDelivered)
-        );
+    /// @dev Verify an EIP-712 `Voucher` signature against `v.signer` over the
+    ///      canonical typed data, with `msg.sender` as the `provider` the
+    ///      voucher must name. Factored out of `_applyVoucher` to keep that
+    ///      frame within the stack limit. `cumulative` and `bytesDelivered`
+    ///      are `uint64` in calldata but hash as full words, which is exactly
+    ///      the `uint256 amount` / `uint256 bytesDelivered` the `Voucher`
+    ///      typehash names — narrowing the fields changes no signature a
+    ///      client produces.
+    ///
+    ///      **A voucher signer is an EOA.** Recovery is a plain `ecrecover`
+    ///      over the EIP-2098 compact pair, not an ERC-1271 check, so a
+    ///      contract account cannot sign vouchers. That buys the static
+    ///      calldata layout (see `LaneVoucher`) and skips a cold
+    ///      `EXTCODESIZE` on every lane — both of which lower the smallest
+    ///      lane balance a node can profitably redeem. A pool *owner* is
+    ///      unaffected: `_registerCapability` still verifies through
+    ///      `SignatureChecker`, so a Safe or other smart account can own a
+    ///      pool and delegate to EOA voucher signers.
+    function _verifyVoucher(bytes32 poolId, LaneVoucher calldata v) internal view {
+        bytes32 structHash =
+            keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, v.signer, msg.sender, v.cumulative, v.bytesDelivered));
         bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(signer, digest, voucherSig)) revert InvalidVoucherSignature();
+        // The dropped third return is `errorArg`, the offending value behind a
+        // recovery failure. `err` alone decides the outcome here — there is no
+        // per-reason branch to take, and the revert carries no detail.
+        // slither-disable-next-line unused-return
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, v.r, v.vs);
+        // Check the error explicitly rather than trusting the recovered
+        // address: a failed recovery returns `address(0)`, which would match a
+        // signer registered at `address(0)`.
+        if (err != ECDSA.RecoverError.NoError || recovered != v.signer) revert InvalidVoucherSignature();
     }
 
     /// @dev Approve then route a strictly-positive delta to `FeeRouter` in the

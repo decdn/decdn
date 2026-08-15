@@ -96,19 +96,20 @@ async fn run() -> anyhow::Result<()> {
     let auth_after_first = poll(Duration::from_secs(90), || async {
         let auth =
             e2e_assert::read_authorization(chain.admin(), payment_pool, pool_id, signer).await?;
-        Ok((auth.cap > U256::ZERO).then_some(auth))
+        Ok((auth.cap > 0).then_some(auth))
     })
     .await?
     .context("signer was never registered on-chain (getAuthorization.cap stayed zero)")?;
-    // The self-issued capability is UNCAPPED (`U256::MAX`): a self-owned
-    // capability delegates spend to the owner's own key, so the cap bounds
-    // nothing — the pool deposit is the real spending bound (`redeem` pays
-    // `min(desired, cap - spent, remaining)`), and leaving it uncapped keeps a
-    // later `topUp` beyond the opening deposit redeemable.
+    // The self-issued capability sits at the widest cap the pool's `uint64`
+    // field carries: a self-owned capability delegates spend to the owner's own
+    // key, so the cap bounds nothing — the pool deposit is the real spending
+    // bound (redemption pays `min(desired, cap - spent, remaining)`), and
+    // leaving it at the ceiling keeps a later `topUp` beyond the opening
+    // deposit redeemable.
     assert_eq!(
         auth_after_first.cap,
-        U256::MAX,
-        "registered cap must be the self-capability's uncapped spending cap (U256::MAX)"
+        u64::MAX,
+        "registered cap must be the self-capability's uncapped spending cap (u64::MAX)"
     );
 
     // The lane's cumulative-paid watermark advanced past zero — the on-chain
@@ -118,7 +119,7 @@ async fn run() -> anyhow::Result<()> {
             .await?
             .amount;
     anyhow::ensure!(
-        paid_after_first > U256::ZERO,
+        paid_after_first > 0,
         "lane watermark must advance after the first redemption (got {paid_after_first})"
     );
 

@@ -43,10 +43,10 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     address internal tokenHolder = address(0x70);
 
     uint256 internal constant MIN_BOND = 50_000e18;
-    uint256 internal constant DEPOSIT = 1000e6;
-    uint256 internal constant SPENDING_CAP = 800e6;
-    uint256 internal constant SETTLE_AMOUNT = 800e6;
-    uint256 internal constant SETTLE_BYTES = 80_000_000;
+    uint64 internal constant DEPOSIT = 1000e6;
+    uint64 internal constant SPENDING_CAP = 800e6;
+    uint64 internal constant SETTLE_AMOUNT = 800e6;
+    uint64 internal constant SETTLE_BYTES = 80_000_000;
 
     bytes32 internal constant CAPABILITY_TYPEHASH =
         keccak256("Capability(address signer,uint256 spendingCap,bytes32 poolId,uint64 expiry)");
@@ -118,15 +118,29 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         bytes32 poolId = d.paymentPool.openPool(DEPOSIT);
 
         uint64 expiry = uint64(block.timestamp + 365 days);
-        bytes memory capabilitySig = _capabilitySig(poolId, signer, SPENDING_CAP, expiry, OWNER_PK);
-        bytes memory capability = abi.encode(SPENDING_CAP, expiry, capabilitySig);
-        bytes memory voucherSig = _voucherSig(poolId, signer, operator, SETTLE_AMOUNT, SETTLE_BYTES, SIGNER_PK);
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _capabilitySig(poolId, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        (bytes32 vr, bytes32 vvs) = _voucherSig(poolId, signer, operator, SETTLE_AMOUNT, SETTLE_BYTES, SIGNER_PK);
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = PaymentPool.LaneVoucher({
+            signer: signer, cumulative: SETTLE_AMOUNT, bytesDelivered: SETTLE_BYTES, r: vr, vs: vvs
+        });
+        PaymentPool.PoolBatch[] memory batches = new PaymentPool.PoolBatch[](1);
+        batches[0] = PaymentPool.PoolBatch({ poolId: poolId, capabilities: caps, vouchers: vouchers });
 
+        PaymentPool.LaneSettled[] memory expected = new PaymentPool.LaneSettled[](1);
+        expected[0] =
+            PaymentPool.LaneSettled({ signer: signer, newPaidCumulative: SETTLE_AMOUNT, bytesPaid: SETTLE_BYTES });
         vm.expectEmit(true, true, true, true, address(d.paymentPool));
-        emit PoolRedeemed(poolId, signer, operator, SETTLE_AMOUNT, SETTLE_BYTES, SETTLE_AMOUNT);
+        emit PoolRedeemed(poolId, operator, expected);
 
         vm.prank(operator);
-        d.paymentPool.redeem(poolId, signer, operator, SETTLE_AMOUNT, SETTLE_BYTES, voucherSig, capability);
+        d.paymentPool.redeemMany(batches);
 
         // Three-bucket distribution at the configured launch shares (read from
         // cfg, not re-hardcoded, so the assertion tracks the deploy config).
@@ -163,7 +177,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         );
     }
 
-    function _capabilitySig(bytes32 poolId, address signer_, uint256 spendingCap, uint64 expiry, uint256 pk)
+    function _capabilitySig(bytes32 poolId, address signer_, uint64 spendingCap, uint64 expiry, uint256 pk)
         internal
         view
         returns (bytes memory)
@@ -174,27 +188,22 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         return abi.encodePacked(r, s, v);
     }
 
+    /// @dev The EIP-2098 compact pair the contract takes: `vs` is `s` with the
+    ///      recovery bit folded into its top bit.
     function _voucherSig(
         bytes32 poolId,
         address signer_,
         address provider_,
-        uint256 amount,
-        uint256 bytesDelivered,
+        uint64 amount,
+        uint64 bytesDelivered,
         uint256 pk
-    ) internal view returns (bytes memory) {
+    ) internal view returns (bytes32, bytes32) {
         bytes32 structHash = keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(address(d.paymentPool)), structHash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
-        return abi.encodePacked(r, s, v);
+        (uint8 v, bytes32 r, bytes32 sv) = vm.sign(pk, digest);
+        return (r, bytes32(uint256(sv) | (uint256(v - 27) << 255)));
     }
 
     /// @dev Mirrors `PaymentPool.PoolRedeemed` for `vm.expectEmit`.
-    event PoolRedeemed(
-        bytes32 indexed poolId,
-        address indexed signer,
-        address indexed provider,
-        uint256 paid,
-        uint256 bytesPaid,
-        uint256 newPaidCumulative
-    );
+    event PoolRedeemed(bytes32 indexed poolId, address indexed provider, PaymentPool.LaneSettled[] lanes);
 }

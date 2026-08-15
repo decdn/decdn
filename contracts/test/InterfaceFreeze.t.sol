@@ -12,18 +12,13 @@ import { PaymentPool } from "../src/PaymentPool.sol";
 ///        test, forcing a deliberate ABI change + audit re-review.
 contract PaymentPoolInterfaceFreezeTest is Test {
     function test_paymentPool_abiFrozen() public view {
-        assertEq(PaymentPool.openPool.selector, bytes4(keccak256("openPool(uint256)")), "openPool");
-        assertEq(PaymentPool.topUp.selector, bytes4(keccak256("topUp(bytes32,uint256)")), "topUp");
-        assertEq(
-            PaymentPool.redeem.selector,
-            bytes4(keccak256("redeem(bytes32,address,address,uint256,uint256,bytes,bytes)")),
-            "redeem"
-        );
+        assertEq(PaymentPool.openPool.selector, bytes4(keccak256("openPool(uint64)")), "openPool");
+        assertEq(PaymentPool.topUp.selector, bytes4(keccak256("topUp(bytes32,uint64)")), "topUp");
         assertEq(
             PaymentPool.redeemMany.selector,
             bytes4(
                 keccak256(
-                    "redeemMany((bytes32,address,uint256,uint64,bytes)[],(bytes32,address,address,uint256,uint256,bytes)[])"
+                    "redeemMany((bytes32,(address,uint64,uint64,bytes)[],(address,uint64,uint64,bytes32,bytes32)[])[])"
                 )
             ),
             "redeemMany"
