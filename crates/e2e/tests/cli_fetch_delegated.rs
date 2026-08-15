@@ -352,7 +352,7 @@ async fn run() -> anyhow::Result<()> {
         pool.owner
     );
     anyhow::ensure!(
-        pool.deposit == U256::from(DEPOSIT_MICRO_USDC),
+        pool.deposit == DEPOSIT_MICRO_USDC,
         "the deposit must be unchanged at {DEPOSIT_MICRO_USDC} µUSDC (a delegate cannot top up), \
          got {}",
         pool.deposit

@@ -1312,7 +1312,14 @@ where
 
     // A transient state carrying the informational pool facts the context reads
     // (`pool_id`, `deposit`); it is not persisted (the delegate owns no pool row).
-    let state = BuyerPoolState::new(pool_id, pool.owner, pool.token, pool.deposit);
+    // The pool no longer stores its token — it is the contract's immutable
+    // `usdc()`, so read it there rather than duplicating it per pool.
+    let token = contract
+        .usdc()
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+    let state = BuyerPoolState::new(pool_id, pool.owner, token, U256::from(pool.deposit));
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);

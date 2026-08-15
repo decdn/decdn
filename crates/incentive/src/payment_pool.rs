@@ -86,12 +86,10 @@ mod sol_types {
             /// `getPool` ABI tuple.
             struct Pool {
                 address owner;
-                uint64 openedAt;
                 Status status;
-                address token;
                 uint64 disputeDeadline;
-                uint256 deposit;
-                uint256 totalRedeemed;
+                uint64 deposit;
+                uint64 totalRedeemed;
             }
 
             /// Per-`(pool, signer)` authorization, set once on first
@@ -393,6 +391,58 @@ mod tests {
         assert_eq!(decoded.lanes[0].bytesPaid, 2_000);
         assert_eq!(decoded.lanes[1].signer, signer_b);
         assert_eq!(decoded.lanes[1].newPaidCumulative, 7_000);
+    }
+
+    /// Pins the field list of every struct the read surface decodes into, so
+    /// a drift between `contracts/src/PaymentPool.sol` and this binding fails
+    /// the build.
+    ///
+    /// The event pins above do not cover these: a `sol!` block is a *hand-written
+    /// restatement* of the ABI, not something derived from the Solidity source,
+    /// so a struct that gains, loses or narrows a field here compiles perfectly
+    /// against a contract that disagrees. `getPool` then decodes a `Pool` whose
+    /// fields have silently shifted, the node reads a garbage `owner`, and the
+    /// only symptom is a node refusing to serve — no compile error, no decode
+    /// error, nothing until an anvil run. Pinning the layout is what turns that
+    /// into a build failure.
+    ///
+    /// `eip712_encode_type` is used purely as a stable printer for the field
+    /// list; none of these structs is EIP-712 signed.
+    #[test]
+    fn read_surface_struct_layouts_match_contract() {
+        use alloy::sol_types::SolStruct;
+
+        assert_eq!(
+            PaymentPool::Pool::eip712_encode_type(),
+            "Pool(address owner,uint8 status,uint64 disputeDeadline,uint64 deposit,uint64 totalRedeemed)",
+            "getPool"
+        );
+        assert_eq!(
+            PaymentPool::Authorization::eip712_encode_type(),
+            "Authorization(uint64 cap,uint64 expiry,uint64 spent)",
+            "getAuthorization"
+        );
+        assert_eq!(
+            PaymentPool::Lane::eip712_encode_type(),
+            "Lane(uint64 amount,uint64 bytesDelivered)",
+            "getWatermark"
+        );
+    }
+
+    /// The same pin for the two structs `redeemMany` takes as calldata. A
+    /// silent drift here would encode a batch the contract cannot decode.
+    #[test]
+    fn redeem_call_struct_layouts_match_contract() {
+        use alloy::sol_types::SolStruct;
+
+        assert_eq!(
+            PaymentPool::CapabilityReg::eip712_encode_type(),
+            "CapabilityReg(address signer,uint64 spendingCap,uint64 expiry,bytes ownerSig)"
+        );
+        assert_eq!(
+            PaymentPool::LaneVoucher::eip712_encode_type(),
+            "LaneVoucher(address signer,uint64 cumulative,uint64 bytesDelivered,bytes32 r,bytes32 vs)"
+        );
     }
 
     /// Same pin for the other four ABI-tuple-carrying events consumed by

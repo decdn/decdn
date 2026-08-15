@@ -325,14 +325,14 @@ pub async fn open_pool<P: Provider + Clone>(
 /// only lifecycle gate (there is no pool expiry, ADR 003).
 const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 
-/// Cap stamped on the self-owned capability [`open_pool`] signs — the widest
-/// value the pool's `uint64 spendingCap` can hold, which is the effective "no
+/// Cap stamped on a self-owned capability — the widest value the pool's
+/// `uint64 spendingCap` can hold, which is the effective "no
 /// delegated ceiling" for an owner spending against its own pool. The real
 /// bound is the deposit: redemption pays `min(desired, cap - spent, remaining)`.
 /// It is signed as a full EIP-712 word, so it must be a value the contract's
 /// narrower field can also carry — `U256::MAX` would hash to a word the
 /// contract can never reconstruct.
-const SELF_CAPABILITY_CAP: U256 = U256::from_limbs([u64::MAX, 0, 0, 0]);
+pub const SELF_CAPABILITY_CAP: U256 = U256::from_limbs([u64::MAX, 0, 0, 0]);
 
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
 /// credited amount read back from the `PoolToppedUp` event — the shared mechanism

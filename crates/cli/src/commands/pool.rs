@@ -215,14 +215,14 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     ensure_owned(pool.owner, owner, pool_id)?;
 
     let additional = U256::from(args.amount_micro_usdc);
-    ensure_allowance(
-        &rpc,
-        pool.token,
-        owner,
-        chain.payment_pool,
-        Some(additional),
-    )
-    .await?;
+    // The pool no longer stores its token — it is the contract's immutable
+    // `usdc()`, the same address the open path reads.
+    let token = contract
+        .usdc()
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
+    ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
     let credited = top_up(&contract, pool_id, additional).await?;
 

@@ -136,8 +136,7 @@ async fn run() -> anyhow::Result<()> {
     let pool =
         e2e_assert::read_pool(chain.admin(), chain.addrs().payment_pool, expected_pid).await?;
     assert_eq!(
-        pool.deposit,
-        U256::from(DEPOSIT_MICRO_USDC),
+        pool.deposit, DEPOSIT_MICRO_USDC,
         "on-chain pool deposit must match the opened deposit"
     );
 
