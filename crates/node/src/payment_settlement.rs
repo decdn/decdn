@@ -38,13 +38,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
+use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, PoolId, PoolStateStore, StoreError,
 };
@@ -433,51 +434,40 @@ impl<P: Provider + Clone + 'static> Drop for PoolSettlementService<P> {
 /// the voucher a static ABI struct, and so what makes a lane 160 calldata
 /// bytes instead of 288.
 ///
-/// `v` is normalized to the `27`/`28` convention first. The current source
-/// (`Signature::as_bytes`) already emits `27`/`28`, so that is a no-op in
-/// practice; it bridges a raw `0`/`1` y-parity should the encoding ever change.
-///
 /// # Errors
 ///
-/// Errors on a signature that is not 65 bytes, on a `v` outside `27`/`28`, or
-/// on a high-`s` signature. Compaction has nowhere to put the recovery bit
-/// unless `s` is in the lower half of the curve order, which is exactly the
-/// malleability bound the contract enforces anyway — so a signature that fails
-/// here would have been rejected on-chain regardless. A voucher this rejects is
-/// one the node should never have accepted, so the lane is dropped from the
-/// batch rather than sinking it.
+/// Errors on a signature that is not 65 bytes, on a malformed `r`/`s`/`v`, or
+/// on a non-canonical high-`s` signature.
+///
+/// The canonicality check is [`is_high_s`], not "is the top bit of `s` free".
+/// Those are not the same test: `secp256k1n / 2` sits below `2^255`, so about
+/// `2^128` values have a clear top bit and are still high-`s`. Compaction would
+/// happily fold the recovery bit into such a signature and the contract's
+/// `ECDSA.tryRecover` would then reject it — reverting the whole `redeemMany`,
+/// so one hostile lane would sink every honest lane batched with it. The node's
+/// voucher-accept path already refuses high-`s` (#836), so this is the second
+/// gate on a value that should never have been stored; a lane it rejects is
+/// dropped from the batch rather than allowed to sink it.
 fn compact_voucher_signature(sig: &[u8]) -> Result<(B256, B256)> {
-    let (r, rest) = sig
-        .split_at_checked(32)
-        .filter(|_| sig.len() == 65)
-        .context("voucher signature is not 65 bytes (r‖s‖v)")?;
-    let (s_bytes, v_byte) = rest
-        .split_at_checked(32)
-        .context("voucher signature is not 65 bytes (r‖s‖v)")?;
-
-    let v = match v_byte.first().copied() {
-        Some(0 | 27) => 0u8,
-        Some(1 | 28) => 1u8,
-        other => anyhow::bail!("voucher signature carries an unusable recovery id {other:?}"),
-    };
-
-    let mut vs: [u8; 32] = s_bytes
+    let raw: [u8; 65] = sig
         .try_into()
-        .context("voucher signature `s` is not 32 bytes")?;
-    // The top bit of `s` must be free for the recovery bit — i.e. `s` must be
-    // low-half, which every conforming signer produces.
+        .map_err(|_| anyhow::anyhow!("voucher signature is not 65 bytes (r‖s‖v)"))?;
+    let parsed = Signature::from_raw(&raw).context("voucher signature is malformed")?;
+    if is_high_s(&parsed) {
+        anyhow::bail!("voucher signature is non-canonical (high `s`) and would revert on-chain");
+    }
+
+    let r = B256::from(parsed.r().to_be_bytes::<32>());
+    let mut vs = parsed.s().to_be_bytes::<32>();
+    // Canonical `s` is at most `n / 2`, which is below `2^255`, so the top bit
+    // is free for the recovery bit. The `is_high_s` gate above is what
+    // guarantees that.
     let Some(top) = vs.first_mut() else {
         anyhow::bail!("voucher signature `s` is empty");
     };
-    if *top & 0x80 != 0 {
-        anyhow::bail!("voucher signature has a high `s` and cannot be compacted");
-    }
-    *top |= v << 7;
+    *top |= u8::from(parsed.v()) << 7;
 
-    let r_bytes: [u8; 32] = r
-        .try_into()
-        .context("voucher signature `r` is not 32 bytes")?;
-    Ok((B256::from(r_bytes), B256::from(vs)))
+    Ok((r, B256::from(vs)))
 }
 
 /// The settlement watcher's cursor start: resume the durable
@@ -1281,14 +1271,47 @@ mod tests {
         // An unusable recovery id.
         assert!(compact_voucher_signature(&sig_with_v(4)).is_err());
 
-        // High `s`: the top bit is already taken, so the recovery bit has
-        // nowhere to go. The contract's malleability bound would reject this
-        // signature anyway, so refusing here loses nothing.
+        // High `s` with the top bit obviously set.
         let mut high_s = sig_with_v(27);
         if let Some(top) = high_s.get_mut(32) {
             *top = 0xFF;
         }
         assert!(compact_voucher_signature(&high_s).is_err());
+    }
+
+    /// The band a "is the top bit free?" test would wave through: `n / 2` sits
+    /// below `2^255`, so roughly `2^128` values of `s` have a clear top bit and
+    /// are still high-`s`. Compaction would fold the recovery bit into one
+    /// happily, and the contract's `ECDSA.tryRecover` would then reject it —
+    /// reverting the whole `redeemMany` and taking every honest lane in the
+    /// batch with it.
+    #[test]
+    fn compaction_rejects_high_s_whose_top_bit_is_clear() {
+        // n/2 + 1: the smallest high-`s` value, and its top bit is 0.
+        let half_plus_one = alloy::primitives::U256::from_be_bytes([
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46,
+            0x68, 0x1b, 0x20, 0xa1,
+        ]);
+        let s_bytes = half_plus_one.to_be_bytes::<32>();
+        assert_eq!(
+            s_bytes.first().map(|b| b & 0x80),
+            Some(0),
+            "top bit is clear"
+        );
+
+        let mut raw = [7u8; 65];
+        if let Some(slot) = raw.get_mut(32..64) {
+            slot.copy_from_slice(&s_bytes);
+        }
+        if let Some(last) = raw.last_mut() {
+            *last = 27;
+        }
+
+        assert!(
+            compact_voucher_signature(&raw).is_err(),
+            "a clear top bit does not make `s` canonical"
+        );
     }
 
     /// The debounce decorator forwards through to the inner store on the first
