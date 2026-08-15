@@ -107,7 +107,7 @@ impl<P: Provider + Clone + 'static> PoolView for ChainPoolView<P> {
         }
         let status = PoolStatus {
             owner: pool.owner,
-            remaining: pool.deposit.saturating_sub(pool.totalRedeemed),
+            remaining: U256::from(pool.deposit.saturating_sub(pool.totalRedeemed)),
         };
         self.store(pool_id, status);
         Some(status)

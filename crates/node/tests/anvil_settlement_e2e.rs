@@ -71,7 +71,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_client_pull::buyer_pool::issue_self_capability;
+use decdn_client_pull::buyer_pool::{SELF_CAPABILITY_CAP, issue_self_capability};
 use decdn_client_pull::sign_client_binding;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
@@ -616,7 +616,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     // redeemer redeems it. Assert the on-chain watermark advances and the byte
     // delta is routed into the operator's FeeRouter epoch counter.
     // ============================================================
-    let deposit = U256::from(DEPOSIT_MICRO_USDC);
+    // `openPool` takes the pool's own `uint64` USDC width.
+    let deposit = DEPOSIT_MICRO_USDC;
     let open_receipt = pool_client
         .openPool(deposit)
         .send()
@@ -642,7 +643,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let capability = issue_self_capability(
         client_signer.as_ref(),
         pool_id,
-        U256::MAX,
+        SELF_CAPABILITY_CAP,
         unix_now() + 1_000_000,
         &voucher_dom,
     )?;
@@ -650,7 +651,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let ctx = PoolContext {
         pool_id,
         provider: node_addr,
-        deposit,
+        deposit: U256::from(deposit),
         client_signer: Arc::clone(&client_signer),
         voucher_domain: voucher_dom.clone(),
         prior_bytes_delivered: U256::ZERO,
@@ -685,7 +686,7 @@ async fn run_e2e() -> anyhow::Result<()> {
                 .call()
                 .await
                 .ok()
-                .filter(|lane| lane.bytesDelivered > U256::ZERO)
+                .filter(|lane| lane.bytesDelivered > 0)
         }
     })
     .await;
@@ -801,7 +802,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let target_deposit = U256::from(DEPOSIT_MICRO_USDC) + U256::from(TOPUP_MICRO_USDC);
     buyer_service.top_up_pool(target_deposit).await?;
     anyhow::ensure!(
-        buyer_pool.getPool(buyer_pool_id).call().await?.deposit >= target_deposit,
+        U256::from(buyer_pool.getPool(buyer_pool_id).call().await?.deposit) >= target_deposit,
         "topUp must raise the on-chain deposit"
     );
 

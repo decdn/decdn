@@ -29,7 +29,7 @@
 
 // Reuse the production pool binding for the `Pool`/`Authorization`/`Lane`
 // structs + reads (`getPool`/`getAuthorization`/`getWatermark`) and the
-// owner/redeemer writes (`openPool`/`topUp`/`redeem`/`redeemMany`).
+// owner/redeemer writes (`openPool`/`topUp`/`redeemMany`).
 pub use decdn_incentive::payment_pool::PaymentPool;
 // Reuse the node-side ContentBlacklist binding (read view + membership events +
 // governance add/remove writes) — same ABI the runtime watcher decodes.

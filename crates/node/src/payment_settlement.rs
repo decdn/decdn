@@ -38,13 +38,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
-use alloy::sol_types::{SolEvent, SolValue};
+use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
-use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
+use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, PoolId, PoolStateStore, StoreError,
 };
@@ -72,14 +73,6 @@ pub const REDEEM_HINT_CAPACITY: usize = 256;
 /// non-fatal failure (the tx may still mine later; the claim is at worst deferred,
 /// never double-spent, because the on-chain lane watermark is monotone).
 const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
-
-/// Ethereum recovery-id offset the on-chain `ECDSA.recover` requires (`v` ∈
-/// {`27`, `28`}). The stored signature comes from
-/// [`alloy::primitives::Signature::as_bytes`], which already encodes `v` as
-/// `27 + y_parity`, so [`normalize_voucher_signature`] is a no-op on well-formed
-/// signatures today — it exists as defense-in-depth in case the stored/wire
-/// encoding ever switches to a raw `0`/`1` y-parity.
-const ETH_V_OFFSET: u8 = 27;
 
 /// Current Unix time in seconds for on-chain deadline comparisons. A broken
 /// system clock (time before the epoch) yields `0`, which makes every pool look
@@ -435,38 +428,46 @@ impl<P: Provider + Clone + 'static> Drop for PoolSettlementService<P> {
     }
 }
 
-/// Normalize a stored voucher signature (`r‖s‖v`) so `v` is in the `27`/`28`
-/// convention the on-chain `ECDSA.recover` requires. The current source
-/// (`Signature::as_bytes`) already emits `27`/`28`, so this is a no-op in
-/// practice; it bridges a raw `0`/`1` y-parity should the encoding ever change.
-/// A non-65-byte signature (e.g. an ERC-1271 payload) is passed through
-/// unchanged so the contract's own validation produces the authoritative error.
-fn normalize_voucher_signature(sig: &[u8]) -> Vec<u8> {
-    let mut out = sig.to_vec();
-    if out.len() == 65
-        && let Some(v) = out.last_mut()
-        && *v < ETH_V_OFFSET
-    {
-        *v = v.saturating_add(ETH_V_OFFSET);
+/// Fold a stored voucher signature (`r‖s‖v`, 65 bytes) into the EIP-2098
+/// compact pair `(r, vs)` the contract's `LaneVoucher` carries: `vs` is `s`
+/// with the recovery bit in its top bit. Halving the signature is what makes
+/// the voucher a static ABI struct, and so what makes a lane 160 calldata
+/// bytes instead of 288.
+///
+/// # Errors
+///
+/// Errors on a signature that is not 65 bytes, on a malformed `r`/`s`/`v`, or
+/// on a non-canonical high-`s` signature.
+///
+/// The canonicality check is [`is_high_s`], not "is the top bit of `s` free".
+/// Those are not the same test: `secp256k1n / 2` sits below `2^255`, so about
+/// `2^128` values have a clear top bit and are still high-`s`. Compaction would
+/// happily fold the recovery bit into such a signature and the contract's
+/// `ECDSA.tryRecover` would then reject it — reverting the whole `redeemMany`,
+/// so one hostile lane would sink every honest lane batched with it. The node's
+/// voucher-accept path already refuses high-`s` (#836), so this is the second
+/// gate on a value that should never have been stored; a lane it rejects is
+/// dropped from the batch rather than allowed to sink it.
+fn compact_voucher_signature(sig: &[u8]) -> Result<(B256, B256)> {
+    let raw: [u8; 65] = sig
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("voucher signature is not 65 bytes (r‖s‖v)"))?;
+    let parsed = Signature::from_raw(&raw).context("voucher signature is malformed")?;
+    if is_high_s(&parsed) {
+        anyhow::bail!("voucher signature is non-canonical (high `s`) and would revert on-chain");
     }
-    out
-}
 
-/// The single-`redeem` `capability` argument for a not-yet-registered signer:
-/// `abi.encode(uint256 spendingCap, uint64 expiry, bytes ownerSig)`. Non-packed
-/// `abi.encode` left-pads every integer to a 32-byte word, so encoding `expiry`
-/// as a `U256` produces bytes identical to the contract's `uint64` decode. Empty
-/// bytes are returned for an already-registered signer by the caller (this is
-/// only reached with `Some` material).
-fn encode_capability(material: &CapabilityMaterial) -> Bytes {
-    Bytes::from(
-        (
-            material.spending_cap,
-            U256::from(material.expiry),
-            material.owner_sig.clone(),
-        )
-            .abi_encode_params(),
-    )
+    let r = B256::from(parsed.r().to_be_bytes::<32>());
+    let mut vs = parsed.s().to_be_bytes::<32>();
+    // Canonical `s` is at most `n / 2`, which is below `2^255`, so the top bit
+    // is free for the recovery bit. The `is_high_s` gate above is what
+    // guarantees that.
+    let Some(top) = vs.first_mut() else {
+        anyhow::bail!("voucher signature `s` is empty");
+    };
+    *top |= u8::from(parsed.v()) << 7;
+
+    Ok((r, B256::from(vs)))
 }
 
 /// The settlement watcher's cursor start: resume the durable
@@ -517,24 +518,28 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                         return Ok(());
                     }
                 };
-                // Not enough to filter on the event signature — `provider` is the
-                // third indexed topic but the OR-set filter cannot pin it, so
-                // confirm it names this node before recording the watermark.
+                // Not enough to filter on the event signature — `provider` is
+                // an indexed topic but the OR-set filter cannot pin it, so
+                // confirm it names this node before recording anything.
                 if event.provider != self.self_address {
                     return Ok(());
                 }
-                let key = LaneKey {
-                    pool_id: event.poolId,
-                    signer: event.signer,
-                    provider: event.provider,
-                };
-                self.paid.set(key, event.newPaidCumulative);
-                debug!(
-                    pool_id = %event.poolId,
-                    signer = %event.signer,
-                    paid_cumulative = %event.newPaidCumulative,
-                    "recorded lane paid watermark from PoolRedeemed"
-                );
+                // One event carries every lane the batch paid on this pool, so
+                // the watermark write is per entry, not per log.
+                for lane in &event.lanes {
+                    let key = LaneKey {
+                        pool_id: event.poolId,
+                        signer: lane.signer,
+                        provider: event.provider,
+                    };
+                    self.paid.set(key, U256::from(lane.newPaidCumulative));
+                    debug!(
+                        pool_id = %event.poolId,
+                        signer = %lane.signer,
+                        paid_cumulative = lane.newPaidCumulative,
+                        "recorded lane paid watermark from PoolRedeemed"
+                    );
+                }
             }
             Some(sig) if sig == PaymentPool::PoolToppedUp::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
@@ -751,7 +756,7 @@ enum RedeemPlan {
     /// This lane's highest voucher should be redeemed. `register` is `Some` on the
     /// signer's first redemption (attach the capability) and `None` afterward.
     Redeem {
-        voucher: Box<PaymentPool::RedeemVoucher>,
+        voucher: Box<PaymentPool::LaneVoucher>,
         register: Option<PaymentPool::CapabilityReg>,
     },
 }
@@ -800,7 +805,7 @@ async fn plan_redeem<P: Provider + Clone>(
         .call()
         .await
         .context("getAuthorization for redemption")?;
-    let register = if auth.cap.is_zero() {
+    let register = if auth.cap == 0 {
         let Some(material) = capabilities.registration_material(&key) else {
             warn!(
                 pool_id = %key.pool_id,
@@ -810,9 +815,8 @@ async fn plan_redeem<P: Provider + Clone>(
             return Ok(RedeemPlan::Skip);
         };
         Some(PaymentPool::CapabilityReg {
-            poolId: key.pool_id,
             signer: key.signer,
-            spendingCap: material.spending_cap,
+            spendingCap: to_pool_u64(material.spending_cap, "spending cap")?,
             expiry: material.expiry,
             ownerSig: material.owner_sig,
         })
@@ -820,24 +824,28 @@ async fn plan_redeem<P: Provider + Clone>(
         None
     };
 
-    let voucher = Box::new(PaymentPool::RedeemVoucher {
-        poolId: key.pool_id,
+    // The voucher names neither its pool (the enclosing `PoolBatch` does) nor
+    // its payee: `redeemMany` redeems for `msg.sender` and rebuilds the EIP-712
+    // hash with it, so `key.provider` is already pinned by the signature this
+    // lane holds.
+    let (r, vs) =
+        compact_voucher_signature(sig_bytes).context("compact the lane's voucher signature")?;
+    let voucher = Box::new(PaymentPool::LaneVoucher {
         signer: key.signer,
-        provider: key.provider,
-        cumulative: owed,
-        bytesDelivered: st.last_bytes_delivered(),
-        voucherSig: Bytes::from(normalize_voucher_signature(sig_bytes)),
+        cumulative: to_pool_u64(owed, "voucher cumulative")?,
+        bytesDelivered: to_pool_u64(st.last_bytes_delivered(), "voucher bytes delivered")?,
+        r,
+        vs,
     });
     Ok(RedeemPlan::Redeem { voucher, register })
 }
 
 /// Hint-path (and close-path) redemption: plan one lane and, if it wants a
-/// redeem, submit it as a single `redeem` tx. The per-lane path is one lane, so
-/// batching buys nothing — the sweep is where `redeemMany` collapses N legs. Does
-/// NOT seed the paid cache: the `PoolRedeemed` event this tx emits is the single
+/// redeem, submit it as a one-entry `redeemMany`. `redeemMany` is the only
+/// redemption entry point, so a single lane is simply a batch of one. Does NOT
+/// seed the paid cache: the `PoolRedeemed` event this tx emits is the single
 /// write path for the paid side.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::cognitive_complexity)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -869,70 +877,29 @@ async fn redeem_one<P: Provider + Clone>(
     let RedeemPlan::Redeem { voucher, register } = plan else {
         return;
     };
-    let capability = match &register {
-        Some(reg) => encode_capability(&CapabilityMaterial {
-            spending_cap: reg.spendingCap,
-            expiry: reg.expiry,
-            owner_sig: reg.ownerSig.clone(),
-        }),
-        None => Bytes::new(),
-    };
-    let sent = contract
-        .redeem(
-            voucher.poolId,
-            voucher.signer,
-            voucher.provider,
-            voucher.cumulative,
-            voucher.bytesDelivered,
-            voucher.voucherSig.clone(),
-            capability,
-        )
-        .send()
-        .await;
-    match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT)).await {
-        TxOutcome::Landed(receipt) => {
-            info!(
-                pool_id = %key.pool_id,
-                signer = %key.signer,
-                tx = %receipt.transaction_hash,
-                cumulative = %voucher.cumulative,
-                registered = register.is_some(),
-                "redeemed lane voucher"
-            );
-        }
-        TxOutcome::Reverted(receipt) => {
-            metrics.redemption_failure();
-            warn!(
-                pool_id = %key.pool_id,
-                tx = %receipt.transaction_hash,
-                "redeem reverted on-chain; leaving claim for retry"
-            );
-        }
-        TxOutcome::SendErr(err) => {
-            metrics.redemption_failure();
-            warn!(err = %sanitize_rpc_display(&err), pool_id = %key.pool_id, "redeem send failed");
-        }
-        TxOutcome::ReceiptErr(err) => {
-            metrics.redemption_failure();
-            warn!(err = %sanitize_rpc_display(&err), pool_id = %key.pool_id, "redeem receipt failed");
-        }
-        TxOutcome::Timeout => {
-            metrics.redemption_failure();
-            warn!(
-                pool_id = %key.pool_id,
-                timeout = ?REDEEM_RECEIPT_TIMEOUT,
-                "redeem receipt wait elapsed; leaving claim for retry"
-            );
-        }
-    }
+    submit_redeem_many(
+        contract,
+        vec![PaymentPool::PoolBatch {
+            poolId: key.pool_id,
+            capabilities: register.into_iter().collect(),
+            vouchers: vec![*voucher],
+        }],
+        metrics,
+    )
+    .await;
 }
 
-/// Self-tick sweep: scan every persisted lane, partition into the not-yet-
-/// registered signers (one [`PaymentPool::CapabilityReg`] each) and the vouchers
-/// above the threshold (one [`PaymentPool::RedeemVoucher`] each), and submit ONE
-/// `redeemMany` for the whole tick (ADR 003 § Batch redemption). Registration is
-/// decoupled from the voucher: a skipped voucher never loses a registration, and
-/// the contract skips a transient-empty voucher rather than reverting the batch.
+/// Self-tick sweep: scan every persisted lane, plan each one, then bucket the
+/// results **by pool** into one [`PaymentPool::PoolBatch`] each and submit ONE
+/// `redeemMany` for the whole tick (ADR 003 § Batch redemption). Within a pool,
+/// registration is decoupled from the voucher: a skipped voucher never loses a
+/// registration, and the contract skips a transient-empty voucher rather than
+/// reverting.
+///
+/// The bucketing is not a convenience — the contract charges the pool's status
+/// read and its `totalRedeemed` write once per group, so a pool's lanes must
+/// arrive together to get that. Buckets are keyed in insertion order so a tick's
+/// batch is deterministic for a given store ordering.
 ///
 /// Per-lane error isolation runs through the **planning** phase: each lane's
 /// load / `getAuthorization` / threshold check runs independently and a failure
@@ -953,9 +920,11 @@ async fn redeem_sweep<P: Provider + Clone>(
             return;
         }
     };
-    let mut caps: Vec<PaymentPool::CapabilityReg> = Vec::new();
+    // Insertion-ordered so the submitted batch is deterministic: `order` keeps
+    // the pools in the sequence the store yielded them.
+    let mut batches: HashMap<PoolId, PaymentPool::PoolBatch> = HashMap::new();
+    let mut order: Vec<PoolId> = Vec::new();
     let mut seen_signers: HashSet<(PoolId, Address)> = HashSet::new();
-    let mut vouchers: Vec<PaymentPool::RedeemVoucher> = Vec::new();
     for st in states {
         let key = st.key();
         match plan_redeem(
@@ -971,12 +940,20 @@ async fn redeem_sweep<P: Provider + Clone>(
         {
             Ok(RedeemPlan::Skip) => {}
             Ok(RedeemPlan::Redeem { voucher, register }) => {
+                let batch = batches.entry(key.pool_id).or_insert_with(|| {
+                    order.push(key.pool_id);
+                    PaymentPool::PoolBatch {
+                        poolId: key.pool_id,
+                        capabilities: Vec::new(),
+                        vouchers: Vec::new(),
+                    }
+                });
                 if let Some(reg) = register
-                    && seen_signers.insert((reg.poolId, reg.signer))
+                    && seen_signers.insert((key.pool_id, reg.signer))
                 {
-                    caps.push(reg);
+                    batch.capabilities.push(reg);
                 }
-                vouchers.push(*voucher);
+                batch.vouchers.push(*voucher);
             }
             Err(err) => {
                 metrics.redemption_failure();
@@ -984,30 +961,35 @@ async fn redeem_sweep<P: Provider + Clone>(
             }
         }
     }
-    if vouchers.is_empty() {
+    if order.is_empty() {
         return;
     }
-    submit_redeem_many(contract, caps, vouchers, metrics).await;
+    let grouped: Vec<PaymentPool::PoolBatch> = order
+        .into_iter()
+        .filter_map(|pool_id| batches.remove(&pool_id))
+        .collect();
+    submit_redeem_many(contract, grouped, metrics).await;
 }
 
-/// Submit one `redeemMany` for the tick's collected registrations + vouchers.
-/// Does NOT seed the paid cache: each paid voucher emits its own `PoolRedeemed`,
-/// the single write path for the paid side. A batch that reverts (a structurally
-/// invalid entry — bad signature, wrong provider, bad owner-signature) or fails to
-/// send records one `redemption_failure`; the next tick re-prepares and retries.
+/// Submit one `redeemMany` for the tick's per-pool batches. Does NOT seed the
+/// paid cache: each paid voucher emits its own `PoolRedeemed`, the single write
+/// path for the paid side. A call that reverts (a structurally invalid entry —
+/// bad signature, bad owner-signature, closed pool) or fails to send records one
+/// `redemption_failure`; the next tick re-prepares and retries.
 #[allow(clippy::cognitive_complexity)]
 async fn submit_redeem_many<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    caps: Vec<PaymentPool::CapabilityReg>,
-    vouchers: Vec<PaymentPool::RedeemVoucher>,
+    batches: Vec<PaymentPool::PoolBatch>,
     metrics: &Arc<Metrics>,
 ) {
-    let cap_count = caps.len();
-    let voucher_count = vouchers.len();
-    let sent = contract.redeemMany(caps, vouchers).send().await;
+    let cap_count: usize = batches.iter().map(|b| b.capabilities.len()).sum();
+    let voucher_count: usize = batches.iter().map(|b| b.vouchers.len()).sum();
+    let pool_count = batches.len();
+    let sent = contract.redeemMany(batches).send().await;
     match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT)).await {
         TxOutcome::Landed(receipt) => {
             info!(
+                pool_count,
                 cap_count,
                 voucher_count,
                 tx = %receipt.transaction_hash,
@@ -1233,8 +1215,9 @@ impl KeyedCheckpointStore for DebouncedCheckpointStore {
 mod tests {
     use super::*;
 
-    /// A 65-byte signature with the recovery byte set to `v` (a `[u8; 65]` so a
-    /// const index stays provably in-bounds for the anti-panic lints).
+    /// A 65-byte `r‖s‖v` signature with a low `s` and the recovery byte set to
+    /// `v` (a `[u8; 65]` so a const index stays provably in-bounds for the
+    /// anti-panic lints).
     fn sig_with_v(v: u8) -> [u8; 65] {
         let mut s = [7u8; 65];
         if let Some(last) = s.last_mut() {
@@ -1244,56 +1227,91 @@ mod tests {
     }
 
     #[test]
-    fn normalize_lifts_raw_y_parity_to_the_eth_convention() {
+    fn compaction_folds_raw_y_parity_into_the_top_bit_of_s() -> Result<()> {
+        // `s` here is 0x0707…07, so its top bit is free: parity 0 leaves it
+        // clear, parity 1 sets it, and the rest of `s` is untouched.
+        let (r, vs) = compact_voucher_signature(&sig_with_v(0))?;
+        assert_eq!(r, B256::repeat_byte(7), "r passes through unchanged");
         assert_eq!(
-            normalize_voucher_signature(&sig_with_v(0)).last(),
-            Some(&27)
+            vs,
+            B256::repeat_byte(7),
+            "parity 0 leaves the top bit clear"
         );
+
+        let (_, vs_odd) = compact_voucher_signature(&sig_with_v(1))?;
         assert_eq!(
-            normalize_voucher_signature(&sig_with_v(1)).last(),
-            Some(&28)
+            vs_odd.0.first(),
+            Some(&0x87),
+            "parity 1 sets the top bit of s"
         );
+        assert_eq!(vs_odd.0.get(1), Some(&7), "and disturbs nothing else");
+        Ok(())
     }
 
     #[test]
-    fn normalize_leaves_a_well_formed_v_untouched() {
+    fn compaction_accepts_the_eth_v_convention_identically() -> Result<()> {
         assert_eq!(
-            normalize_voucher_signature(&sig_with_v(27)).last(),
-            Some(&27)
+            compact_voucher_signature(&sig_with_v(27))?,
+            compact_voucher_signature(&sig_with_v(0))?,
+            "27 and 0 are the same parity"
         );
         assert_eq!(
-            normalize_voucher_signature(&sig_with_v(28)).last(),
-            Some(&28)
+            compact_voucher_signature(&sig_with_v(28))?,
+            compact_voucher_signature(&sig_with_v(1))?,
+            "28 and 1 are the same parity"
         );
+        Ok(())
     }
 
     #[test]
-    fn normalize_passes_through_a_non_65_byte_payload() {
-        // Not 65 bytes (e.g. an ERC-1271 payload): pass through unchanged so the
-        // contract is the authority on validity — do NOT touch the last byte.
-        let out = normalize_voucher_signature(&[1u8, 2, 3]);
-        assert_eq!(out, vec![1u8, 2, 3]);
+    fn compaction_rejects_a_signature_it_cannot_represent() {
+        // Not 65 bytes: there is no `r‖s‖v` to split.
+        assert!(compact_voucher_signature(&[1u8, 2, 3]).is_err());
+
+        // An unusable recovery id.
+        assert!(compact_voucher_signature(&sig_with_v(4)).is_err());
+
+        // High `s` with the top bit obviously set.
+        let mut high_s = sig_with_v(27);
+        if let Some(top) = high_s.get_mut(32) {
+            *top = 0xFF;
+        }
+        assert!(compact_voucher_signature(&high_s).is_err());
     }
 
+    /// The band a "is the top bit free?" test would wave through: `n / 2` sits
+    /// below `2^255`, so roughly `2^128` values of `s` have a clear top bit and
+    /// are still high-`s`. Compaction would fold the recovery bit into one
+    /// happily, and the contract's `ECDSA.tryRecover` would then reject it —
+    /// reverting the whole `redeemMany` and taking every honest lane in the
+    /// batch with it.
     #[test]
-    fn encode_capability_matches_abi_encode_uint256_uint64_bytes() {
-        let material = CapabilityMaterial {
-            spending_cap: U256::from(1_000u64),
-            expiry: 42,
-            owner_sig: Bytes::from(vec![0xAA, 0xBB]),
-        };
-        let bytes = encode_capability(&material);
-        // Three head words (cap, expiry, offset-to-bytes) + length word + one
-        // right-padded data word for the 2-byte signature = 5 * 32 bytes.
+    fn compaction_rejects_high_s_whose_top_bit_is_clear() {
+        // n/2 + 1: the smallest high-`s` value, and its top bit is 0.
+        let half_plus_one = alloy::primitives::U256::from_be_bytes([
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46,
+            0x68, 0x1b, 0x20, 0xa1,
+        ]);
+        let s_bytes = half_plus_one.to_be_bytes::<32>();
         assert_eq!(
-            bytes.len(),
-            5 * 32,
-            "abi.encode(uint256,uint64,bytes) layout"
+            s_bytes.first().map(|b| b & 0x80),
+            Some(0),
+            "top bit is clear"
         );
-        // The `uint64` expiry occupies a full left-padded word: byte 63 is 42.
-        assert_eq!(bytes.get(63), Some(&42u8));
-        // The dynamic `bytes` length word (word 3) ends in 2.
-        assert_eq!(bytes.get(4 * 32 - 1), Some(&2u8));
+
+        let mut raw = [7u8; 65];
+        if let Some(slot) = raw.get_mut(32..64) {
+            slot.copy_from_slice(&s_bytes);
+        }
+        if let Some(last) = raw.last_mut() {
+            *last = 27;
+        }
+
+        assert!(
+            compact_voucher_signature(&raw).is_err(),
+            "a clear top bit does not make `s` canonical"
+        );
     }
 
     /// The debounce decorator forwards through to the inner store on the first

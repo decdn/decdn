@@ -13,7 +13,12 @@ use alloy::primitives::Signature;
 ///
 /// [`Signature::normalize_s`] returns `Some(_)` exactly when `s` exceeds
 /// `secp256k1n / 2`, i.e. the signature is in malleable high-`s` form.
-pub(crate) fn is_high_s(sig: &Signature) -> bool {
+///
+/// Note this is strictly stronger than "the top bit of `s` is set": `n / 2` is
+/// itself below `2^255`, so roughly `2^128` values carry a clear top bit and are
+/// still high-`s`. A caller folding a recovery bit into that top bit must check
+/// canonicality here rather than infer it from the bit being free.
+pub fn is_high_s(sig: &Signature) -> bool {
     sig.normalize_s().is_some()
 }
 

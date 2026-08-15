@@ -167,9 +167,9 @@ contract PaymentPoolTest is Test {
     uint256 internal constant DISPUTE_WINDOW = 48 hours;
     uint256 internal constant DELIVERY_FLOOR = 1;
     uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
-    uint256 internal constant DEPOSIT = 1000e6;
+    uint64 internal constant DEPOSIT = 1000e6;
     uint256 internal constant BYTES_PER_MB = 1_048_576;
-    uint256 internal constant SPENDING_CAP = 500e6;
+    uint64 internal constant SPENDING_CAP = 500e6;
     uint64 internal expiry; // far-future capability expiry, set in setUp
 
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
@@ -181,14 +181,18 @@ contract PaymentPoolTest is Test {
     bytes32 internal constant POOL_OPENED_SIG = keccak256("PoolOpened(bytes32,address,uint256)");
 
     /// @dev Mirrors `PaymentPool.PoolRedeemed` for `vm.expectEmit`.
-    event PoolRedeemed(
-        bytes32 indexed poolId,
-        address indexed signer,
-        address indexed provider,
-        uint256 paid,
-        uint256 bytesPaid,
-        uint256 newPaidCumulative
-    );
+    event PoolRedeemed(bytes32 indexed poolId, address indexed provider, PaymentPool.LaneSettled[] lanes);
+
+    /// @dev A one-lane `PoolRedeemed` payload.
+    function _settled(address signer_, uint64 newPaidCumulative, uint64 bytesPaid)
+        internal
+        pure
+        returns (PaymentPool.LaneSettled[] memory lanes)
+    {
+        lanes = new PaymentPool.LaneSettled[](1);
+        lanes[0] =
+            PaymentPool.LaneSettled({ signer: signer_, newPaidCumulative: newPaidCumulative, bytesPaid: bytesPaid });
+    }
 
     /// @dev Mirrors for `vm.expectEmit` — close/reclaim + governance setters.
     event PoolCloseInitiated(bytes32 indexed poolId, address indexed owner, uint256 disputeDeadline);
@@ -397,8 +401,8 @@ contract PaymentPoolTest is Test {
         assertEq(feePool.getPool(id).deposit, DEPOSIT, "opened at full value (fee not yet armed)");
 
         feeUsdc.setFeeBps(100);
-        uint256 top = 500e6;
-        uint256 credited = top - (top * 100 / 10_000);
+        uint64 top = 500e6;
+        uint64 credited = top - (top * 100 / 10_000);
         vm.prank(owner);
         feePool.topUp(id, top);
 
@@ -500,7 +504,7 @@ contract PaymentPoolTest is Test {
         address verifyingContract,
         bytes32 poolId,
         address signer_,
-        uint256 spendingCap,
+        uint64 spendingCap,
         uint64 exp,
         uint256 pk
     ) internal view returns (bytes memory) {
@@ -509,29 +513,104 @@ contract PaymentPoolTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    /// @dev A voucher signature in the EIP-2098 compact form the contract
+    ///      takes: `vs` is `s` with the recovery bit folded into its top bit.
+    ///      `vm.sign` always yields a low-`s` signature, which is what makes
+    ///      that bit free.
+    struct Sig {
+        bytes32 r;
+        bytes32 vs;
+    }
+
     function _signVoucherFor(
         address verifyingContract,
         bytes32 poolId,
         address signer_,
         address provider_,
-        uint256 amount,
-        uint256 bytesDelivered,
+        uint64 amount,
+        uint64 bytesDelivered,
         uint256 pk
-    ) internal view returns (bytes memory) {
+    ) internal view returns (Sig memory) {
         bytes32 structHash = keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, _digestFor(verifyingContract, structHash));
-        return abi.encodePacked(r, s, v);
+        return Sig({ r: r, vs: bytes32(uint256(s) | (uint256(v - 27) << 255)) });
     }
 
-    /// @dev Owner-signed capability for `signer`, encoded as the redeem
-    ///      `capability` calldata tuple `(spendingCap, expiry, ownerSig)`.
-    function _cap(bytes32 poolId, uint256 spendingCap, uint64 exp) internal view returns (bytes memory) {
+    /// @dev A [`PaymentPool.LaneVoucher`] from its presented fields plus an
+    ///      already-produced signature, so a test can present values that
+    ///      differ from the ones it signed over.
+    function _laneOf(address signer_, uint64 amount, uint64 bytesDelivered, Sig memory sig)
+        internal
+        pure
+        returns (PaymentPool.LaneVoucher memory)
+    {
+        return PaymentPool.LaneVoucher({
+            signer: signer_, cumulative: amount, bytesDelivered: bytesDelivered, r: sig.r, vs: sig.vs
+        });
+    }
+
+    /// @dev Owner-signed capability for `signer`, packed as the
+    ///      `(spendingCap, expiry, ownerSig)` triple `_redeemOne` unpacks into
+    ///      a `CapabilityReg`.
+    function _cap(bytes32 poolId, uint64 spendingCap, uint64 exp) internal view returns (bytes memory) {
         return
             abi.encode(spendingCap, exp, _signCapabilityFor(address(pool), poolId, signer, spendingCap, exp, OWNER_PK));
     }
 
-    function _voucher(bytes32 poolId, uint256 amount, uint256 bytesDelivered) internal view returns (bytes memory) {
+    function _voucher(bytes32 poolId, uint64 amount, uint64 bytesDelivered) internal view returns (Sig memory) {
         return _signVoucherFor(address(pool), poolId, signer, provider, amount, bytesDelivered, SIGNER_PK);
+    }
+
+    /// @dev A one-lane batch. `redeemMany` is the only redemption entry point,
+    ///      so a per-lane test states its lane as a one-entry batch; this keeps
+    ///      that at one line. The third argument is the payee the voucher
+    ///      names — the contract reads the payee off `msg.sender`, so it is
+    ///      here only to keep a lane test reading like the voucher it signs.
+    ///      Returns `totalPaid`, which is `0` for a transient-empty voucher.
+    function _redeemOne(
+        bytes32 poolId,
+        address signer_,
+        address payee,
+        uint64 amount,
+        uint64 bytesDelivered,
+        Sig memory sig,
+        bytes memory capability
+    ) internal returns (uint256 totalPaid) {
+        return _redeemOneOn(pool, poolId, signer_, payee, amount, bytesDelivered, sig, capability);
+    }
+
+    /// @dev `_redeemOne` against a pool other than the shared fixture.
+    function _redeemOneOn(
+        PaymentPool target,
+        bytes32 poolId,
+        address signer_,
+        address,
+        uint64 amount,
+        uint64 bytesDelivered,
+        Sig memory sig,
+        bytes memory capability
+    ) internal returns (uint256 totalPaid) {
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](capability.length == 0 ? 0 : 1);
+        if (capability.length != 0) {
+            (uint64 spendingCap, uint64 exp, bytes memory ownerSig) = abi.decode(capability, (uint64, uint64, bytes));
+            caps[0] = PaymentPool.CapabilityReg({
+                signer: signer_, spendingCap: spendingCap, expiry: exp, ownerSig: ownerSig
+            });
+        }
+        PaymentPool.LaneVoucher[] memory v = new PaymentPool.LaneVoucher[](1);
+        v[0] = _laneOf(signer_, amount, bytesDelivered, sig);
+        return target.redeemMany(_batch(poolId, caps, v));
+    }
+
+    /// @dev A single [`PaymentPool.PoolBatch`], wrapped as the one-element
+    ///      array `redeemMany` takes.
+    function _batch(bytes32 poolId, PaymentPool.CapabilityReg[] memory caps, PaymentPool.LaneVoucher[] memory vouchers)
+        internal
+        pure
+        returns (PaymentPool.PoolBatch[] memory batches)
+    {
+        batches = new PaymentPool.PoolBatch[](1);
+        batches[0] = PaymentPool.PoolBatch({ poolId: poolId, capabilities: caps, vouchers: vouchers });
     }
 
     // -----------------------------------------------------------------
@@ -543,20 +622,20 @@ contract PaymentPoolTest is Test {
 
         // First redeem carries the capability; it registers `signer`.
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
-        (uint256 cap, uint64 exp, uint256 spent) = pool.authorized(id, signer);
+        (uint64 cap, uint64 exp, uint64 spent) = pool.authorized(id, signer);
         assertEq(cap, SPENDING_CAP, "cap stored");
         assertEq(uint256(exp), uint256(expiry), "expiry stored");
         assertEq(spent, 300e6, "spent advanced by paid");
 
         // Second redeem omits the capability (empty bytes) and still works.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 500e6, 50_000_000, _voucher(id, 500e6, 50_000_000), "");
+        _redeemOne(id, signer, provider, 500e6, 50_000_000, _voucher(id, 500e6, 50_000_000), "");
 
-        (,, uint256 spent2) = pool.authorized(id, signer);
+        (,, uint64 spent2) = pool.authorized(id, signer);
         assertEq(spent2, 500e6, "voucher-only redeem advanced spent");
     }
 
@@ -569,7 +648,7 @@ contract PaymentPoolTest is Test {
 
         vm.prank(provider);
         vm.expectRevert(PaymentPool.InvalidCapabilitySignature.selector);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), badCap);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), badCap);
     }
 
     function test_redeem_firstRedeem_revertsOnCapabilityForOtherOwner() public {
@@ -580,7 +659,7 @@ contract PaymentPoolTest is Test {
 
         vm.prank(provider);
         vm.expectRevert(PaymentPool.InvalidCapabilitySignature.selector);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), cap);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), cap);
     }
 
     // -----------------------------------------------------------------
@@ -591,16 +670,16 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
         // Register with a generous cap so the increment is the only bound.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
 
         assertEq(router.totalRoutedPaid(), 300e6, "first pays full cumulative");
 
         vm.prank(provider);
         vm.expectEmit(true, true, true, true, address(pool));
-        emit PoolRedeemed(id, signer, provider, 200e6, 20_000_000, 500e6);
-        pool.redeem(id, signer, provider, 500e6, 50_000_000, _voucher(id, 500e6, 50_000_000), "");
+        emit PoolRedeemed(id, provider, _settled(signer, 500e6, 20_000_000));
+        _redeemOne(id, signer, provider, 500e6, 50_000_000, _voucher(id, 500e6, 50_000_000), "");
 
-        (uint256 wAmount, uint256 wBytes) = pool.watermark(id, signer, provider);
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
         assertEq(wAmount, 500e6, "watermark tracks cumulative paid");
         assertEq(wBytes, 50_000_000);
         assertEq(router.totalRoutedPaid(), 500e6, "second pays only the increment");
@@ -610,9 +689,9 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open(); // deposit 1000e6
         // Cap exceeds deposit, so the pool balance is the binding limit.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 1500e6, 1_000_000, _voucher(id, 1500e6, 1_000_000), _cap(id, 2000e6, expiry));
+        _redeemOne(id, signer, provider, 1500e6, 1_000_000, _voucher(id, 1500e6, 1_000_000), _cap(id, 2000e6, expiry));
 
-        (uint256 wAmount1,) = pool.watermark(id, signer, provider);
+        (uint64 wAmount1,) = pool.watermark(id, signer, provider);
         assertEq(wAmount1, 1000e6, "drained pool pays only remaining deposit");
         assertEq(pool.getPool(id).totalRedeemed, 1000e6);
 
@@ -621,9 +700,9 @@ contract PaymentPoolTest is Test {
         pool.topUp(id, 500e6);
 
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 1500e6, 1_000_000, _voucher(id, 1500e6, 1_000_000), "");
+        _redeemOne(id, signer, provider, 1500e6, 1_000_000, _voucher(id, 1500e6, 1_000_000), "");
 
-        (uint256 wAmount2, uint256 wBytes2) = pool.watermark(id, signer, provider);
+        (uint64 wAmount2, uint64 wBytes2) = pool.watermark(id, signer, provider);
         assertEq(wAmount2, 1500e6, "watermark advanced by paid, not cumulative; retry collects rest");
         assertEq(wBytes2, 1_000_000, "paid-proportional bytes total the full delivery once collected");
     }
@@ -632,32 +711,35 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
         // Cap 500e6 < voucher cumulative 600e6: pays only up to the cap.
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 600e6, 6_000_000, _voucher(id, 600e6, 6_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
-        (,, uint256 spent) = pool.authorized(id, signer);
+        (,, uint64 spent) = pool.authorized(id, signer);
         assertEq(spent, SPENDING_CAP, "paid capped at cap - spent");
-        (uint256 wAmount,) = pool.watermark(id, signer, provider);
+        (uint64 wAmount,) = pool.watermark(id, signer, provider);
         assertEq(wAmount, SPENDING_CAP);
 
-        // A further voucher fully over cap pays 0 → NothingToRedeem.
+        // A further voucher fully over cap is transient-empty: it pays 0 and
+        // writes nothing, rather than reverting.
+        uint256 callsBefore = router.callCount();
         vm.prank(provider);
-        vm.expectRevert(PaymentPool.NothingToRedeem.selector);
-        pool.redeem(id, signer, provider, 700e6, 7_000_000, _voucher(id, 700e6, 7_000_000), "");
+        uint256 paid = _redeemOne(id, signer, provider, 700e6, 7_000_000, _voucher(id, 700e6, 7_000_000), "");
+        assertEq(paid, 0, "cap-reached lane pays nothing");
+        assertEq(router.callCount(), callsBefore, "and never reaches the router");
     }
 
-    function test_redeem_revertsNothingToRedeem_onStaleOrZero() public {
+    function test_redeem_staleOrZeroVoucherPaysNothing() public {
         bytes32 id = _open();
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
 
         uint256 redeemedBefore = pool.getPool(id).totalRedeemed;
 
-        // Re-present the same cumulative → no increment → NothingToRedeem, no state.
+        // Re-present the same cumulative → no increment → pays 0, no state.
         vm.prank(provider);
-        vm.expectRevert(PaymentPool.NothingToRedeem.selector);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), "");
+        uint256 paid = _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), "");
+        assertEq(paid, 0, "a stale voucher pays nothing");
 
         assertEq(pool.getPool(id).totalRedeemed, redeemedBefore, "stale voucher writes no state");
     }
@@ -666,9 +748,9 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
         // Voucher #1 sets the lane watermark at amount=300e6, bytesDelivered=30_000_000.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, 1000e6, expiry));
 
-        (uint256 wAmount1, uint256 wBytes1) = pool.watermark(id, signer, provider);
+        (uint64 wAmount1, uint64 wBytes1) = pool.watermark(id, signer, provider);
         assertEq(wAmount1, 300e6);
         assertEq(wBytes1, 30_000_000);
         assertEq(router.totalRoutedPaid(), 300e6);
@@ -682,10 +764,10 @@ contract PaymentPoolTest is Test {
         // for this redemption — it does not revert or panic.
         vm.prank(provider);
         vm.expectEmit(true, true, true, true, address(pool));
-        emit PoolRedeemed(id, signer, provider, 100e6, 0, 400e6);
-        pool.redeem(id, signer, provider, 400e6, 10_000_000, _voucher(id, 400e6, 10_000_000), "");
+        emit PoolRedeemed(id, provider, _settled(signer, 400e6, 0));
+        _redeemOne(id, signer, provider, 400e6, 10_000_000, _voucher(id, 400e6, 10_000_000), "");
 
-        (uint256 wAmount2, uint256 wBytes2) = pool.watermark(id, signer, provider);
+        (uint64 wAmount2, uint64 wBytes2) = pool.watermark(id, signer, provider);
         assertEq(wAmount2, 400e6, "amount watermark advances to the new cumulative");
         assertEq(wBytes2, 30_000_000, "bytes watermark holds; the regressed delta credits zero bytes");
         assertEq(router.totalRoutedPaid(), 400e6, "money settles in full despite the bytes regression");
@@ -694,9 +776,9 @@ contract PaymentPoolTest is Test {
         // Voucher #3 advances bytesDelivered past the original watermark
         // (30_000_000): byte accounting recovers across the gap left by #2.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 500e6, 45_000_000, _voucher(id, 500e6, 45_000_000), "");
+        _redeemOne(id, signer, provider, 500e6, 45_000_000, _voucher(id, 500e6, 45_000_000), "");
 
-        (uint256 wAmount3, uint256 wBytes3) = pool.watermark(id, signer, provider);
+        (uint64 wAmount3, uint64 wBytes3) = pool.watermark(id, signer, provider);
         assertEq(wAmount3, 500e6);
         assertEq(wBytes3, 45_000_000, "byte watermark recovers once bytesDelivered advances again");
         assertEq(router.totalRoutedPaid(), 500e6);
@@ -709,29 +791,35 @@ contract PaymentPoolTest is Test {
     // redeem — structural reverts
     // -----------------------------------------------------------------
 
-    function test_redeem_revertsOnWrongProvider() public {
+    /// A voucher names its payee in the signed payload, and the contract
+    /// rebuilds that payload with `msg.sender`. A node presenting another
+    /// node's voucher therefore recovers the wrong signer, so the wrong-payee
+    /// case and the forged-signature case are one and the same revert — there
+    /// is no separate payee field to disagree with.
+    function test_redeem_revertsWhenCallerIsNotTheVouchersPayee() public {
         bytes32 id = _open();
-        // `provider != msg.sender` reverts before any registration/return-0 path.
         vm.prank(stranger);
-        vm.expectRevert(PaymentPool.NotProvider.selector);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), "");
+        vm.expectRevert(PaymentPool.InvalidVoucherSignature.selector);
+        _redeemOne(
+            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
     }
 
     function test_redeem_revertsOnBadVoucherSig() public {
         bytes32 id = _open();
         // Voucher signed over a different amount than submitted → recovery misses signer.
-        bytes memory sig = _voucher(id, 300e6, 30_000_000);
+        Sig memory sig = _voucher(id, 300e6, 30_000_000);
         vm.prank(provider);
         vm.expectRevert(PaymentPool.InvalidVoucherSignature.selector);
-        pool.redeem(id, signer, provider, 301e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
+        _redeemOne(id, signer, provider, 301e6, 30_000_000, sig, _cap(id, SPENDING_CAP, expiry));
     }
 
-    function test_redeem_revertsOnExpiredCapability() public {
+    function test_redeem_expiredCapabilityPaysNothing() public {
         bytes32 id = _open();
         uint64 nearExpiry = uint64(block.timestamp + 1 days);
         // Register + pay while valid.
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id,
             signer,
             provider,
@@ -739,15 +827,15 @@ contract PaymentPoolTest is Test {
             30_000_000,
             _voucher(id, 300e6, 30_000_000),
             abi.encode(
-                uint256(1000e6), nearExpiry, _signCapabilityFor(address(pool), id, signer, 1000e6, nearExpiry, OWNER_PK)
+                uint64(1000e6), nearExpiry, _signCapabilityFor(address(pool), id, signer, 1000e6, nearExpiry, OWNER_PK)
             )
         );
 
-        // After expiry a higher voucher is transient-empty → NothingToRedeem.
+        // After expiry a higher voucher is transient-empty: pays 0, no revert.
         vm.warp(block.timestamp + 2 days);
         vm.prank(provider);
-        vm.expectRevert(PaymentPool.NothingToRedeem.selector);
-        pool.redeem(id, signer, provider, 500e6, 50_000_000, _voucher(id, 500e6, 50_000_000), "");
+        uint256 paid = _redeemOne(id, signer, provider, 500e6, 50_000_000, _voucher(id, 500e6, 50_000_000), "");
+        assertEq(paid, 0, "an expired capability pays nothing");
     }
 
     function test_redeem_revertsOnClosedPool() public {
@@ -766,20 +854,30 @@ contract PaymentPoolTest is Test {
 
         harness.forceStatus(id, PaymentPool.Status.Closed);
 
-        bytes memory sig = _signVoucherFor(address(harness), id, signer, provider, 300e6, 30_000_000, SIGNER_PK);
-        bytes memory cap = abi.encode(
-            SPENDING_CAP, expiry, _signCapabilityFor(address(harness), id, signer, SPENDING_CAP, expiry, OWNER_PK)
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(harness), id, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = _laneOf(
+            signer,
+            300e6,
+            30_000_000,
+            _signVoucherFor(address(harness), id, signer, provider, 300e6, 30_000_000, SIGNER_PK)
         );
         vm.prank(provider);
         vm.expectRevert(PaymentPool.PoolClosed.selector);
-        harness.redeem(id, signer, provider, 300e6, 30_000_000, sig, cap);
+        harness.redeemMany(_batch(id, caps, vouchers));
     }
 
     function test_redeem_allowedDuringClosingBeforeDeadline() public {
         bytes32 id = _open();
 
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 100e6, 10_000_000, _voucher(id, 100e6, 10_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
@@ -788,14 +886,14 @@ contract PaymentPoolTest is Test {
 
         // Still inside the grace window: redeem succeeds.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), "");
+        _redeemOne(id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), "");
         assertEq(pool.getPool(id).totalRedeemed, 200e6);
 
         // Past the deadline: redeem reverts PoolClosed.
         vm.warp(block.timestamp + DISPUTE_WINDOW);
         vm.prank(provider);
         vm.expectRevert(PaymentPool.PoolClosed.selector);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), "");
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), "");
     }
 
     // -----------------------------------------------------------------
@@ -806,32 +904,32 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
         // Fully-paid draw: bytesPaid == bytesDelta == bytesDelivered.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 400e6, 40_000_000, _voucher(id, 400e6, 40_000_000), _cap(id, 1000e6, expiry));
-        (, uint256 wBytes) = pool.watermark(id, signer, provider);
+        _redeemOne(id, signer, provider, 400e6, 40_000_000, _voucher(id, 400e6, 40_000_000), _cap(id, 1000e6, expiry));
+        (, uint64 wBytes) = pool.watermark(id, signer, provider);
         assertEq(wBytes, 40_000_000, "fully paid: bytesPaid equals full bytes");
 
         // Cap-limited partial draw on a fresh pool: bytesPaid == mulDiv(bytesDelta, paid, desired).
         bytes32 id2 = _open();
-        uint256 cumulative = 600e6;
-        uint256 bytesDelivered = 6_000_000;
-        uint256 paid = SPENDING_CAP; // cap-limited
+        uint64 cumulative = 600e6;
+        uint64 bytesDelivered = 6_000_000;
+        uint64 paid = SPENDING_CAP; // cap-limited
         uint256 expectedBytes = Math.mulDiv(bytesDelivered, paid, cumulative);
-        bytes memory sig = _signVoucherFor(address(pool), id2, signer, provider, cumulative, bytesDelivered, SIGNER_PK);
+        Sig memory sig = _signVoucherFor(address(pool), id2, signer, provider, cumulative, bytesDelivered, SIGNER_PK);
         bytes memory cap = abi.encode(
             SPENDING_CAP, expiry, _signCapabilityFor(address(pool), id2, signer, SPENDING_CAP, expiry, OWNER_PK)
         );
         vm.prank(provider);
-        pool.redeem(id2, signer, provider, cumulative, bytesDelivered, sig, cap);
-        (, uint256 wBytes2) = pool.watermark(id2, signer, provider);
+        _redeemOne(id2, signer, provider, cumulative, bytesDelivered, sig, cap);
+        (, uint64 wBytes2) = pool.watermark(id2, signer, provider);
         assertEq(wBytes2, expectedBytes, "partial pay routes paid-proportional bytes");
     }
 
     function test_redeem_routesPaidToFeeRouter() public {
         bytes32 id = _open();
-        uint256 cumulative = 400e6;
-        uint256 bytesDelivered = 40_000_000;
+        uint64 cumulative = 400e6;
+        uint64 bytesDelivered = 40_000_000;
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id,
             signer,
             provider,
@@ -864,12 +962,12 @@ contract PaymentPoolTest is Test {
         vm.prank(owner);
         bytes32 id = p.openPool(DEPOSIT);
 
-        bytes memory sig = _signVoucherFor(address(p), id, signer, provider, 400e6, 40_000_000, SIGNER_PK);
+        Sig memory sig = _signVoucherFor(address(p), id, signer, provider, 400e6, 40_000_000, SIGNER_PK);
         bytes memory cap = abi.encode(
             SPENDING_CAP, expiry, _signCapabilityFor(address(p), id, signer, SPENDING_CAP, expiry, OWNER_PK)
         );
         vm.prank(provider);
-        p.redeem(id, signer, provider, 400e6, 40_000_000, sig, cap);
+        _redeemOneOn(p, id, signer, provider, 400e6, 40_000_000, sig, cap);
 
         // Router pulled amount-1; the `_route` reset must bring the standing
         // allowance back to zero.
@@ -882,7 +980,7 @@ contract PaymentPoolTest is Test {
         router.setPaused(true);
         vm.prank(provider);
         vm.expectRevert(bytes("MockSettlementRouter: paused"));
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
@@ -894,7 +992,7 @@ contract PaymentPoolTest is Test {
         // After unpause the same call (capability included again) redeems cleanly.
         router.setPaused(false);
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
         );
         assertEq(router.callCount(), 1);
@@ -905,22 +1003,24 @@ contract PaymentPoolTest is Test {
     // redeem — ERC-1271 signers
     // -----------------------------------------------------------------
 
-    function test_redeem_acceptsErc1271VoucherSigner() public {
-        // Signer is a smart-account wallet whose owner key is SIGNER_PK.
+    /// A voucher signer must be an EOA. The compact `(r, vs)` pair recovers
+    /// through `ecrecover` alone, so a smart account cannot sign vouchers even
+    /// when its owner key produced a signature it would honour under ERC-1271:
+    /// recovery yields the owner key's address, not the wallet's. This is the
+    /// cost of the static calldata layout, and it is paid deliberately — the
+    /// narrower lane is what lowers the smallest redeemable lane balance.
+    function test_redeem_rejectsErc1271VoucherSigner() public {
         MockERC1271Wallet wallet = new MockERC1271Wallet(signer);
         bytes32 id = _open();
 
-        // Capability names the wallet as the signer; voucher validated via ERC-1271.
         bytes memory cap = abi.encode(
             SPENDING_CAP, expiry, _signCapabilityFor(address(pool), id, address(wallet), SPENDING_CAP, expiry, OWNER_PK)
         );
-        bytes memory sig = _signVoucherFor(address(pool), id, address(wallet), provider, 300e6, 30_000_000, SIGNER_PK);
+        Sig memory sig = _signVoucherFor(address(pool), id, address(wallet), provider, 300e6, 30_000_000, SIGNER_PK);
 
         vm.prank(provider);
-        pool.redeem(id, address(wallet), provider, 300e6, 30_000_000, sig, cap);
-
-        (uint256 wAmount,) = pool.watermark(id, address(wallet), provider);
-        assertEq(wAmount, 300e6, "ERC-1271 voucher signer accepted");
+        vm.expectRevert(PaymentPool.InvalidVoucherSignature.selector);
+        _redeemOne(id, address(wallet), provider, 300e6, 30_000_000, sig, cap);
     }
 
     function test_redeem_acceptsErc1271CapabilityOwner() public {
@@ -936,12 +1036,12 @@ contract PaymentPoolTest is Test {
         bytes memory cap = abi.encode(
             SPENDING_CAP, expiry, _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
         );
-        bytes memory sig = _signVoucherFor(address(pool), id, signer, provider, 300e6, 30_000_000, SIGNER_PK);
+        Sig memory sig = _signVoucherFor(address(pool), id, signer, provider, 300e6, 30_000_000, SIGNER_PK);
 
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, sig, cap);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, sig, cap);
 
-        (uint256 cap2, uint64 exp2,) = pool.authorized(id, signer);
+        (uint64 cap2, uint64 exp2,) = pool.authorized(id, signer);
         assertEq(cap2, SPENDING_CAP, "ERC-1271 capability owner accepted");
         assertEq(uint256(exp2), uint256(expiry));
     }
@@ -952,79 +1052,83 @@ contract PaymentPoolTest is Test {
 
     function test_redeem_rateFloor_boundaryExact() public {
         bytes32 id = _open();
-        uint256 amount = 100;
-        uint256 maxBytes = amount * BYTES_PER_MB / DELIVERY_FLOOR;
+        uint64 amount = 100;
+        uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
 
-        bytes memory sig = _voucher(id, amount, maxBytes);
+        Sig memory sig = _voucher(id, amount, maxBytes);
         bytes memory cap = _cap(id, 1000e6, expiry);
         vm.prank(provider);
-        pool.redeem(id, signer, provider, amount, maxBytes, sig, cap);
-        (, uint256 wBytes) = pool.watermark(id, signer, provider);
+        _redeemOne(id, signer, provider, amount, maxBytes, sig, cap);
+        (, uint64 wBytes) = pool.watermark(id, signer, provider);
         assertEq(wBytes, maxBytes, "exact boundary passes");
 
         // One byte past the ceiling reverts on a fresh pool/signer.
         bytes32 id2 = _open();
-        bytes memory sig2 = _signVoucherFor(address(pool), id2, signer, provider, amount, maxBytes + 1, SIGNER_PK);
+        Sig memory sig2 = _signVoucherFor(address(pool), id2, signer, provider, amount, maxBytes + 1, SIGNER_PK);
         bytes memory cap2 = abi.encode(
-            uint256(1000e6), expiry, _signCapabilityFor(address(pool), id2, signer, 1000e6, expiry, OWNER_PK)
+            uint64(1000e6), expiry, _signCapabilityFor(address(pool), id2, signer, 1000e6, expiry, OWNER_PK)
         );
         vm.prank(provider);
         vm.expectRevert(
             abi.encodeWithSelector(PaymentPool.RateFloorViolation.selector, amount, maxBytes + 1, DELIVERY_FLOOR)
         );
-        pool.redeem(id2, signer, provider, amount, maxBytes + 1, sig2, cap2);
+        _redeemOne(id2, signer, provider, amount, maxBytes + 1, sig2, cap2);
     }
 
     function test_redeem_rateFloor_revertsOnInflatedBytes() public {
         bytes32 id = _open();
-        // 1 base unit permits at most BYTES_PER_MB bytes; a near-max byte count
-        // must revert cleanly (Math.mulDiv ceiling), never arithmetic-panic.
-        uint256 huge = type(uint256).max;
-        bytes memory sig = _voucher(id, 1, huge);
+        // 1 base unit permits at most BYTES_PER_MB bytes; the widest byte count
+        // a voucher can carry must still surface as `RateFloorViolation`. The
+        // `uint64` field is itself the first guard — a byte count larger than
+        // this is not expressible on the wire at all.
+        uint64 huge = type(uint64).max;
+        Sig memory sig = _voucher(id, 1, huge);
         bytes memory cap = _cap(id, 1000e6, expiry);
         vm.prank(provider);
         vm.expectRevert(abi.encodeWithSelector(PaymentPool.RateFloorViolation.selector, 1, huge, DELIVERY_FLOOR));
-        pool.redeem(id, signer, provider, 1, huge, sig, cap);
+        _redeemOne(id, signer, provider, 1, huge, sig, cap);
     }
 
     function test_redeem_rateFloor_honestPathUnaffected() public {
         bytes32 id = _open();
         // ~38 MB for 390 base units at the $0.01/GB market rate clears the floor by ~10x.
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 390, 40_000_000, _voucher(id, 390, 40_000_000), _cap(id, 1000e6, expiry));
-        (, uint256 wBytes) = pool.watermark(id, signer, provider);
+        _redeemOne(id, signer, provider, 390, 40_000_000, _voucher(id, 390, 40_000_000), _cap(id, 1000e6, expiry));
+        (, uint64 wBytes) = pool.watermark(id, signer, provider);
         assertEq(wBytes, 40_000_000, "honest traffic clears the floor");
     }
 
     function test_redeem_rateFloor_routedBytesBoundedByPaidAmount() public {
         bytes32 id = _open();
-        uint256 amount = 100;
-        uint256 maxBytes = amount * BYTES_PER_MB / DELIVERY_FLOOR;
+        uint64 amount = 100;
+        uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
         vm.prank(provider);
-        pool.redeem(id, signer, provider, amount, maxBytes, _voucher(id, amount, maxBytes), _cap(id, 1000e6, expiry));
+        _redeemOne(id, signer, provider, amount, maxBytes, _voucher(id, amount, maxBytes), _cap(id, 1000e6, expiry));
 
         (, uint256 b, uint256 amt) = router.calls(0);
         assertEq(amt, amount);
         assertEq(b, maxBytes, "routed bytes never exceed amount * BYTES_PER_MB / floor");
     }
 
-    function testFuzz_redeem_rateFloor_revertIffBelowFloor(uint256 amount, uint256 bytesDelivered) public {
-        amount = bound(amount, 1, DEPOSIT);
-        uint256 maxBytes = amount * BYTES_PER_MB / DELIVERY_FLOOR;
-        bytesDelivered = bound(bytesDelivered, 0, 2 * maxBytes);
+    function testFuzz_redeem_rateFloor_revertIffBelowFloor(uint64 amount, uint64 bytesDelivered) public {
+        amount = uint64(bound(amount, 1, DEPOSIT));
+        uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
+        // Twice the ceiling for the widest in-bounds `amount` is ~2.1e15, well
+        // inside `uint64`, so the fuzzer explores both sides of the floor.
+        bytesDelivered = uint64(bound(bytesDelivered, 0, 2 * uint256(maxBytes)));
 
         bytes32 id = _open();
-        bytes memory sig = _voucher(id, amount, bytesDelivered);
+        Sig memory sig = _voucher(id, amount, bytesDelivered);
         bytes memory cap = _cap(id, DEPOSIT, expiry);
         vm.prank(provider);
         if (bytesDelivered > maxBytes) {
             vm.expectRevert(
                 abi.encodeWithSelector(PaymentPool.RateFloorViolation.selector, amount, bytesDelivered, DELIVERY_FLOOR)
             );
-            pool.redeem(id, signer, provider, amount, bytesDelivered, sig, cap);
+            _redeemOne(id, signer, provider, amount, bytesDelivered, sig, cap);
         } else {
-            pool.redeem(id, signer, provider, amount, bytesDelivered, sig, cap);
-            (uint256 wAmount,) = pool.watermark(id, signer, provider);
+            _redeemOne(id, signer, provider, amount, bytesDelivered, sig, cap);
+            (uint64 wAmount,) = pool.watermark(id, signer, provider);
             assertEq(wAmount, amount);
         }
     }
@@ -1039,42 +1143,32 @@ contract PaymentPoolTest is Test {
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
         caps[0] = PaymentPool.CapabilityReg({
-            poolId: id,
             signer: signer,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
             ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
         });
 
-        PaymentPool.RedeemVoucher[] memory vouchers1 = new PaymentPool.RedeemVoucher[](1);
-        vouchers1[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 200e6,
-            bytesDelivered: 20_000_000,
-            voucherSig: _voucher(id, 200e6, 20_000_000)
-        });
+        PaymentPool.LaneVoucher[] memory vouchers1 = new PaymentPool.LaneVoucher[](1);
+        vouchers1[0] = _laneOf(signer, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000));
 
         vm.prank(provider);
-        uint256 totalPaid1 = pool.redeemMany(caps, vouchers1);
+        uint256 totalPaid1 = pool.redeemMany(_batch(id, caps, vouchers1));
         assertEq(totalPaid1, 200e6, "capability registers signer; voucher pays in the same call");
 
         // A second call from the other provider, empty `capabilities` since
         // `signer` is already registered, pays its own lane.
         PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
-        PaymentPool.RedeemVoucher[] memory vouchers2 = new PaymentPool.RedeemVoucher[](1);
-        vouchers2[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider2,
-            cumulative: 150e6,
-            bytesDelivered: 15_000_000,
-            voucherSig: _signVoucherFor(address(pool), id, signer, provider2, 150e6, 15_000_000, SIGNER_PK)
-        });
+        PaymentPool.LaneVoucher[] memory vouchers2 = new PaymentPool.LaneVoucher[](1);
+        vouchers2[0] = _laneOf(
+            signer,
+            150e6,
+            15_000_000,
+            _signVoucherFor(address(pool), id, signer, provider2, 150e6, 15_000_000, SIGNER_PK)
+        );
 
         vm.prank(provider2);
-        uint256 totalPaid2 = pool.redeemMany(noCaps, vouchers2);
+        uint256 totalPaid2 = pool.redeemMany(_batch(id, noCaps, vouchers2));
         assertEq(totalPaid2, 150e6);
         assertEq(totalPaid1 + totalPaid2, 350e6, "totalPaid sums across the two lanes");
     }
@@ -1083,23 +1177,16 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
         // A prior single `redeem` registers `signer`.
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
         PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
-        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](1);
-        vouchers[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 300e6,
-            bytesDelivered: 30_000_000,
-            voucherSig: _voucher(id, 300e6, 30_000_000)
-        });
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = _laneOf(signer, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000));
 
         vm.prank(provider);
-        uint256 totalPaid = pool.redeemMany(noCaps, vouchers);
+        uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, vouchers));
         assertEq(totalPaid, 100e6, "empty capabilities still redeems an already-registered signer");
     }
 
@@ -1107,35 +1194,21 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
         // `signer` is registered and funded via a normal `redeem`.
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
         // `stranger` is never registered and is not in this batch's
-        // `capabilities` either; `_redeemVoucher` returns 0 for an
+        // `capabilities` either; `_applyVoucher` returns 0 for an
         // unregistered signer before it even checks the voucher signature,
-        // so a garbage `voucherSig` here is enough.
+        // so a garbage signature here is enough.
         PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
-        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](2);
-        vouchers[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: stranger,
-            provider: provider,
-            cumulative: 100e6,
-            bytesDelivered: 10_000_000,
-            voucherSig: hex"00"
-        });
-        vouchers[1] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 300e6,
-            bytesDelivered: 30_000_000,
-            voucherSig: _voucher(id, 300e6, 30_000_000)
-        });
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](2);
+        vouchers[0] = _laneOf(stranger, 100e6, 10_000_000, Sig({ r: bytes32(0), vs: bytes32(0) }));
+        vouchers[1] = _laneOf(signer, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000));
 
         vm.prank(provider);
-        uint256 totalPaid = pool.redeemMany(noCaps, vouchers);
+        uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, vouchers));
         assertEq(totalPaid, 100e6, "uncovered-signer voucher skips; the covered voucher still pays");
     }
 
@@ -1144,7 +1217,7 @@ contract PaymentPoolTest is Test {
         // Register + pay once via a single `redeem` so a later replay of the
         // same cumulative is stale (transient-empty, not structural).
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
@@ -1153,83 +1226,63 @@ contract PaymentPoolTest is Test {
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
         caps[0] = PaymentPool.CapabilityReg({
-            poolId: id,
             signer: signer2,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
             ownerSig: _signCapabilityFor(address(pool), id, signer2, SPENDING_CAP, expiry, OWNER_PK)
         });
 
-        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](2);
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](2);
         // Stale replay of the already-paid cumulative: pays 0, skipped.
-        vouchers[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 200e6,
-            bytesDelivered: 20_000_000,
-            voucherSig: _voucher(id, 200e6, 20_000_000)
-        });
+        vouchers[0] = _laneOf(signer, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000));
         // Freshly registered signer pays.
-        vouchers[1] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer2,
-            provider: provider,
-            cumulative: 100e6,
-            bytesDelivered: 10_000_000,
-            voucherSig: _signVoucherFor(address(pool), id, signer2, provider, 100e6, 10_000_000, signer2Pk)
-        });
+        vouchers[1] = _laneOf(
+            signer2,
+            100e6,
+            10_000_000,
+            _signVoucherFor(address(pool), id, signer2, provider, 100e6, 10_000_000, signer2Pk)
+        );
 
         vm.prank(provider);
-        uint256 totalPaid = pool.redeemMany(caps, vouchers);
+        uint256 totalPaid = pool.redeemMany(_batch(id, caps, vouchers));
         assertEq(totalPaid, 100e6, "stale lane skipped without reverting; the fresh signer's voucher still pays");
     }
 
     function test_redeemMany_revertsOnBadVoucherSignature() public {
         bytes32 id = _open();
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
         PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
-        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](1);
-        vouchers[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 300e6,
-            bytesDelivered: 30_000_000,
-            voucherSig: _voucher(id, 299e6, 30_000_000) // signed over a different amount
-        });
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        // The signature is over a different amount than the entry presents.
+        vouchers[0] = _laneOf(signer, 300e6, 30_000_000, _voucher(id, 299e6, 30_000_000));
 
         vm.prank(provider);
         vm.expectRevert(PaymentPool.InvalidVoucherSignature.selector);
-        pool.redeemMany(noCaps, vouchers);
+        pool.redeemMany(_batch(id, noCaps, vouchers));
     }
 
-    function test_redeemMany_revertsOnWrongProviderEntry() public {
+    /// A batch is redeemed for `msg.sender`, and every voucher's signature is
+    /// checked against that payee. A node cannot present a batch of another
+    /// node's vouchers: each one recovers the wrong signer.
+    function test_redeemMany_revertsWhenCallerIsNotTheVouchersPayee() public {
         bytes32 id = _open();
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
         PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
-        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](1);
-        vouchers[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 300e6,
-            bytesDelivered: 30_000_000,
-            voucherSig: _voucher(id, 300e6, 30_000_000)
-        });
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = _laneOf(signer, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000));
 
-        // Caller is not the `provider` named in the voucher entry.
+        // The voucher is signed for `provider`, not for this caller.
         vm.prank(stranger);
-        vm.expectRevert(PaymentPool.NotProvider.selector);
-        pool.redeemMany(noCaps, vouchers);
+        vm.expectRevert(PaymentPool.InvalidVoucherSignature.selector);
+        pool.redeemMany(_batch(id, noCaps, vouchers));
     }
 
     function test_redeemMany_revertsOnBadCapabilityOwnerSig() public {
@@ -1237,18 +1290,17 @@ contract PaymentPoolTest is Test {
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
         caps[0] = PaymentPool.CapabilityReg({
-            poolId: id,
             signer: signer,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
             // Signed over a different cap than advertised → recovery misses the owner.
             ownerSig: _signCapabilityFor(address(pool), id, signer, 999e6, expiry, OWNER_PK)
         });
-        PaymentPool.RedeemVoucher[] memory noVouchers = new PaymentPool.RedeemVoucher[](0);
+        PaymentPool.LaneVoucher[] memory noVouchers = new PaymentPool.LaneVoucher[](0);
 
         vm.prank(provider);
         vm.expectRevert(PaymentPool.InvalidCapabilitySignature.selector);
-        pool.redeemMany(caps, noVouchers);
+        pool.redeemMany(_batch(id, caps, noVouchers));
     }
 
     function test_redeemMany_registersSignerOncePerNewSigner() public {
@@ -1256,7 +1308,6 @@ contract PaymentPoolTest is Test {
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](2);
         caps[0] = PaymentPool.CapabilityReg({
-            poolId: id,
             signer: signer,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
@@ -1265,74 +1316,277 @@ contract PaymentPoolTest is Test {
         // A duplicate entry for the same signer, advertising a different
         // cap/expiry and a signature that would fail if re-verified. The
         // second registration is a no-op, so it is never evaluated.
-        caps[1] =
-            PaymentPool.CapabilityReg({ poolId: id, signer: signer, spendingCap: 1, expiry: 1, ownerSig: hex"00" });
-        PaymentPool.RedeemVoucher[] memory noVouchers = new PaymentPool.RedeemVoucher[](0);
+        caps[1] = PaymentPool.CapabilityReg({ signer: signer, spendingCap: 1, expiry: 1, ownerSig: hex"00" });
+        PaymentPool.LaneVoucher[] memory noVouchers = new PaymentPool.LaneVoucher[](0);
 
         vm.prank(provider);
-        pool.redeemMany(caps, noVouchers);
+        pool.redeemMany(_batch(id, caps, noVouchers));
 
-        (uint256 cap, uint64 exp,) = pool.authorized(id, signer);
+        (uint64 cap, uint64 exp,) = pool.authorized(id, signer);
         assertEq(cap, SPENDING_CAP, "first registration wins");
         assertEq(uint256(exp), uint256(expiry));
     }
 
-    function test_redeemMany_emitsPerPaidVoucher() public {
+    function test_redeemMany_emitsOneEventCarryingEveryPaidLane() public {
         bytes32 id = _open();
         uint256 signer2Pk = 0xBEEF3;
         address signer2 = vm.addr(signer2Pk);
 
         PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](2);
         caps[0] = PaymentPool.CapabilityReg({
-            poolId: id,
             signer: signer,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
             ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
         });
         caps[1] = PaymentPool.CapabilityReg({
-            poolId: id,
             signer: signer2,
             spendingCap: SPENDING_CAP,
             expiry: expiry,
             ownerSig: _signCapabilityFor(address(pool), id, signer2, SPENDING_CAP, expiry, OWNER_PK)
         });
 
-        PaymentPool.RedeemVoucher[] memory vouchers = new PaymentPool.RedeemVoucher[](2);
-        vouchers[0] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer,
-            provider: provider,
-            cumulative: 100e6,
-            bytesDelivered: 10_000_000,
-            voucherSig: _voucher(id, 100e6, 10_000_000)
-        });
-        vouchers[1] = PaymentPool.RedeemVoucher({
-            poolId: id,
-            signer: signer2,
-            provider: provider,
-            cumulative: 150e6,
-            bytesDelivered: 15_000_000,
-            voucherSig: _signVoucherFor(address(pool), id, signer2, provider, 150e6, 15_000_000, signer2Pk)
-        });
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](2);
+        vouchers[0] = _laneOf(signer, 100e6, 10_000_000, _voucher(id, 100e6, 10_000_000));
+        vouchers[1] = _laneOf(
+            signer2,
+            150e6,
+            15_000_000,
+            _signVoucherFor(address(pool), id, signer2, provider, 150e6, 15_000_000, signer2Pk)
+        );
+
+        PaymentPool.LaneSettled[] memory expected = new PaymentPool.LaneSettled[](2);
+        expected[0] = PaymentPool.LaneSettled({ signer: signer, newPaidCumulative: 100e6, bytesPaid: 10_000_000 });
+        expected[1] = PaymentPool.LaneSettled({ signer: signer2, newPaidCumulative: 150e6, bytesPaid: 15_000_000 });
 
         vm.prank(provider);
         vm.expectEmit(true, true, true, true, address(pool));
-        emit PoolRedeemed(id, signer, provider, 100e6, 10_000_000, 100e6);
-        vm.expectEmit(true, true, true, true, address(pool));
-        emit PoolRedeemed(id, signer2, provider, 150e6, 15_000_000, 150e6);
-        uint256 totalPaid = pool.redeemMany(caps, vouchers);
-        assertEq(totalPaid, 250e6, "one PoolRedeemed per paid voucher; totalPaid sums both");
+        emit PoolRedeemed(id, provider, expected);
+        uint256 totalPaid = pool.redeemMany(_batch(id, caps, vouchers));
+        assertEq(totalPaid, 250e6, "one event carries an entry per paid lane; totalPaid sums both");
+    }
+
+    /// Every voucher in a batch names the same payee (`provider == msg.sender`
+    /// is enforced per entry), so the batch settles through the router exactly
+    /// once, carrying the summed amount and the summed paid bytes — not one
+    /// `routeSettlement` per voucher.
+    /// The pool's remaining deposit is read ONCE per group and drawn down in a
+    /// local, so a second voucher on the same pool is bounded by what the first
+    /// already took. Without that threading each voucher would re-read a
+    /// `totalRedeemed` the group has not written yet, and the two would both be
+    /// bounded by the full remaining balance — letting a batch overdraw the pool.
+    function test_redeemMany_secondVoucherOnAPoolSeesTheFirstsDraw() public {
+        bytes32 id = _open(); // DEPOSIT = 1000e6
+        uint256 signer2Pk = 0xD12E57;
+        address signer2 = vm.addr(signer2Pk);
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](2);
+        caps[0] = PaymentPool.CapabilityReg({
+            signer: signer,
+            spendingCap: DEPOSIT,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, DEPOSIT, expiry, OWNER_PK)
+        });
+        caps[1] = PaymentPool.CapabilityReg({
+            signer: signer2,
+            spendingCap: DEPOSIT,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer2, DEPOSIT, expiry, OWNER_PK)
+        });
+
+        // Two vouchers wanting 800e6 each against a 1000e6 pool. The first must
+        // take its full 800e6; the second must be clamped to the 200e6 left.
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](2);
+        vouchers[0] = _laneOf(signer, 800e6, 80_000_000, _voucher(id, 800e6, 80_000_000));
+        vouchers[1] = _laneOf(
+            signer2,
+            800e6,
+            80_000_000,
+            _signVoucherFor(address(pool), id, signer2, provider, 800e6, 80_000_000, signer2Pk)
+        );
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(_batch(id, caps, vouchers));
+
+        assertEq(totalPaid, DEPOSIT, "the batch draws the deposit and not one unit more");
+        assertEq(pool.getPool(id).totalRedeemed, DEPOSIT, "totalRedeemed lands in one write at the group's end");
+        (uint64 lane1,) = pool.watermark(id, signer, provider);
+        (uint64 lane2,) = pool.watermark(id, signer2, provider);
+        assertEq(lane1, 800e6, "the first voucher takes its full draw");
+        assertEq(lane2, 200e6, "the second is bounded by what is left, and stays retriable for the rest");
+        assertEq(usdc.balanceOf(address(router)), DEPOSIT, "the router received exactly the deposit");
+    }
+
+    /// Several pools in one call: each group gates and advances its own pool,
+    /// and the whole call still settles through the router exactly once.
+    function test_redeemMany_spansPoolsAndStillSettlesOnce() public {
+        bytes32 idA = _open();
+        bytes32 idB = _open();
+
+        PaymentPool.PoolBatch[] memory batches = new PaymentPool.PoolBatch[](2);
+        batches[0] = _soloGroup(idA, SIGNER_PK, 100e6, 10_000_000);
+        batches[1] = _soloGroup(idB, 0xB0015, 150e6, 15_000_000);
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(batches);
+
+        assertEq(totalPaid, 250e6);
+        assertEq(pool.getPool(idA).totalRedeemed, 100e6, "each pool advances its own counter");
+        assertEq(pool.getPool(idB).totalRedeemed, 150e6);
+        assertEq(router.callCount(), 1, "two pools still settle in one routeSettlement");
+        (address op, uint256 b, uint256 amt) = router.calls(0);
+        assertEq(op, provider);
+        assertEq(amt, 250e6, "the routed amount sums across pools");
+        assertEq(b, 25_000_000, "so does the routed byte count");
+    }
+
+    /// @dev A one-signer group on `poolId`: the signer's registration plus its
+    ///      single voucher. Factored out so a multi-pool test does not carry
+    ///      every group's locals in one frame.
+    function _soloGroup(bytes32 poolId, uint256 pk, uint64 amount, uint64 bytesDelivered)
+        internal
+        view
+        returns (PaymentPool.PoolBatch memory)
+    {
+        address s_ = vm.addr(pk);
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](1);
+        caps[0] = PaymentPool.CapabilityReg({
+            signer: s_,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), poolId, s_, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        return PaymentPool.PoolBatch({
+            poolId: poolId, capabilities: caps, vouchers: _soloVoucher(poolId, pk, amount, bytesDelivered)
+        });
+    }
+
+    /// @dev The one-voucher half of [`_soloGroup`], split out to keep either
+    ///      frame inside the legacy codegen's stack limit.
+    function _soloVoucher(bytes32 poolId, uint256 pk, uint64 amount, uint64 bytesDelivered)
+        internal
+        view
+        returns (PaymentPool.LaneVoucher[] memory vouchers)
+    {
+        address s_ = vm.addr(pk);
+        vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = _laneOf(
+            s_, amount, bytesDelivered, _signVoucherFor(address(pool), poolId, s_, provider, amount, bytesDelivered, pk)
+        );
+    }
+
+    /// A closed pool anywhere in the call reverts the whole thing, including
+    /// the registrations and draws of pools that came before it.
+    function test_redeemMany_aClosedPoolRevertsEveryGroup() public {
+        bytes32 idA = _open();
+        bytes32 idB = _open();
+
+        vm.prank(owner);
+        pool.closePool(idB);
+        vm.warp(block.timestamp + DISPUTE_WINDOW);
+
+        PaymentPool.CapabilityReg[] memory capsA = new PaymentPool.CapabilityReg[](1);
+        capsA[0] = PaymentPool.CapabilityReg({
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), idA, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        PaymentPool.LaneVoucher[] memory vouchersA = new PaymentPool.LaneVoucher[](1);
+        vouchersA[0] = _laneOf(signer, 100e6, 10_000_000, _voucher(idA, 100e6, 10_000_000));
+
+        PaymentPool.PoolBatch[] memory batches = new PaymentPool.PoolBatch[](2);
+        batches[0] = PaymentPool.PoolBatch({ poolId: idA, capabilities: capsA, vouchers: vouchersA });
+        batches[1] = PaymentPool.PoolBatch({
+            poolId: idB, capabilities: new PaymentPool.CapabilityReg[](0), vouchers: new PaymentPool.LaneVoucher[](0)
+        });
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.PoolClosed.selector);
+        pool.redeemMany(batches);
+
+        assertEq(pool.getPool(idA).totalRedeemed, 0, "the earlier group rolled back too");
+        (uint64 cap,,) = pool.authorized(idA, signer);
+        assertEq(cap, 0, "and so did its registration");
+    }
+
+    function test_redeemMany_settlesOnceForTheWholeBatch() public {
+        bytes32 id = _open();
+        uint256 signer2Pk = 0xBEEF4;
+        address signer2 = vm.addr(signer2Pk);
+
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](2);
+        caps[0] = PaymentPool.CapabilityReg({
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
+        });
+        caps[1] = PaymentPool.CapabilityReg({
+            signer: signer2,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer2, SPENDING_CAP, expiry, OWNER_PK)
+        });
+
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](2);
+        vouchers[0] = _laneOf(signer, 100e6, 10_000_000, _voucher(id, 100e6, 10_000_000));
+        vouchers[1] = _laneOf(
+            signer2,
+            150e6,
+            15_000_000,
+            _signVoucherFor(address(pool), id, signer2, provider, 150e6, 15_000_000, signer2Pk)
+        );
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(_batch(id, caps, vouchers));
+
+        assertEq(totalPaid, 250e6);
+        assertEq(router.callCount(), 1, "two paid vouchers settle in one routeSettlement");
+        (address op, uint256 b, uint256 amt) = router.calls(0);
+        assertEq(op, provider, "the batch's single payee");
+        assertEq(amt, 250e6, "the routed amount is the batch total");
+        assertEq(b, 25_000_000, "the routed byte count is the batch total");
+    }
+
+    /// A batch in which every voucher is transient-empty pays nothing and
+    /// touches the router not at all — a zero-amount `routeSettlement` would
+    /// revert, so the settlement leg has to be skipped rather than called with 0.
+    function test_redeemMany_allEmptyBatchNeverCallsRouter() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        _redeemOne(
+            id, signer, provider, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000), _cap(id, SPENDING_CAP, expiry)
+        );
+        uint256 callsBefore = router.callCount();
+
+        // Stale replay of the already-paid cumulative: the only entry, pays 0.
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
+        vouchers[0] = _laneOf(signer, 200e6, 20_000_000, _voucher(id, 200e6, 20_000_000));
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, vouchers));
+
+        assertEq(totalPaid, 0);
+        assertEq(router.callCount(), callsBefore, "an all-empty batch never reaches the router");
     }
 
     function test_redeemMany_bothArraysEmptyReturnsZeroNoRevert() public {
-        _open();
+        bytes32 id = _open();
         PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
-        PaymentPool.RedeemVoucher[] memory noVouchers = new PaymentPool.RedeemVoucher[](0);
+        PaymentPool.LaneVoucher[] memory noVouchers = new PaymentPool.LaneVoucher[](0);
 
         vm.prank(provider);
-        uint256 totalPaid = pool.redeemMany(noCaps, noVouchers);
+        uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, noVouchers));
         assertEq(totalPaid, 0, "nothing structurally wrong with an empty/empty batch");
+    }
+
+    /// An empty top-level array is the degenerate case one step further out:
+    /// no pool is even named, so nothing is read and nothing settles.
+    function test_redeemMany_noBatchesReturnsZeroNoRevert() public {
+        vm.prank(provider);
+        assertEq(pool.redeemMany(new PaymentPool.PoolBatch[](0)), 0, "an empty call is a no-op");
     }
 
     // -----------------------------------------------------------------
@@ -1404,7 +1658,7 @@ contract PaymentPoolTest is Test {
         bytes32 id = _open();
 
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
@@ -1520,7 +1774,7 @@ contract PaymentPoolTest is Test {
     function test_getAuthorization_returnsCapExpirySpent() public {
         bytes32 id = _open();
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
@@ -1533,7 +1787,7 @@ contract PaymentPoolTest is Test {
     function test_getWatermark_returnsLane() public {
         bytes32 id = _open();
         vm.prank(provider);
-        pool.redeem(
+        _redeemOne(
             id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
         );
 
@@ -1605,14 +1859,14 @@ contract PaymentPoolTest is Test {
         // voucher.
         bytes32 id = _open();
         bytes memory cap = _cap(id, SPENDING_CAP, expiry);
-        bytes memory voucher = _voucher(id, 300e6, 30_000_000);
+        Sig memory voucher = _voucher(id, 300e6, 30_000_000);
 
         MockSettlementRouter newRouter = new MockSettlementRouter(usdc);
         vm.prank(admin);
         pool.setFeeRouter(address(newRouter));
 
         vm.prank(provider);
-        pool.redeem(id, signer, provider, 300e6, 30_000_000, voucher, cap);
+        _redeemOne(id, signer, provider, 300e6, 30_000_000, voucher, cap);
         assertEq(pool.getPool(id).totalRedeemed, 300e6, "pre-signed voucher still redeems after re-point");
         assertEq(newRouter.callCount(), 1, "the NEW router receives the routed settlement");
     }

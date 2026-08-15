@@ -188,7 +188,7 @@ async fn run() -> anyhow::Result<()> {
         .context("getPool")?
         .deposit;
     anyhow::ensure!(
-        onchain == expected,
+        U256::from(onchain) == expected,
         "topUp must raise the on-chain deposit to {expected}, got {onchain}"
     );
     let persisted = store
@@ -374,7 +374,7 @@ async fn run_reactive_topup() -> anyhow::Result<()> {
         .context("getPool")?
         .deposit;
     anyhow::ensure!(
-        onchain == U256::from(WORKING_DEPOSIT_MICRO_USDC),
+        onchain == WORKING_DEPOSIT_MICRO_USDC,
         "the on-chain pool deposit must have grown to the working deposit: got {onchain}, \
          expected {WORKING_DEPOSIT_MICRO_USDC}"
     );
@@ -1175,7 +1175,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         .context("read on-chain pool")?
         .deposit;
     anyhow::ensure!(
-        onchain == persisted.deposit,
+        U256::from(onchain) == persisted.deposit,
         "the persisted deposit must match the chain after two top-ups: local {} vs chain \
          {onchain}",
         persisted.deposit

@@ -20,7 +20,7 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
-use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::{BuyerPoolState, Capability, PoolOpenFailureReason, SignedCapability};
 use tracing::{debug, error, info};
 
@@ -226,7 +226,11 @@ pub async fn open_pool<P: Provider + Clone>(
     owner: Address,
     deposit: U256,
 ) -> Result<OpenedPool> {
-    let pending = match contract.openPool(deposit).send().await {
+    let pending = match contract
+        .openPool(to_pool_u64(deposit, "deposit")?)
+        .send()
+        .await
+    {
         Ok(pending) => pending,
         Err(err) => {
             // A deterministic revert (a zero deposit, USDC balance/allowance too
@@ -288,13 +292,14 @@ pub async fn open_pool<P: Provider + Clone>(
     let state = BuyerPoolState::new(pool_id, owner, token, credited);
     // A self-owned capability delegates spend to the owner's OWN key, so the cap
     // bounds nothing a delegated capability would: the pool deposit is already
-    // the real spending bound (`redeem` pays min(desired, cap-spent, remaining),
-    // and `remaining` is the pool balance). Leave it uncapped so a later `topUp`
-    // beyond the opening deposit is redeemable too.
+    // the real spending bound (redemption pays min(desired, cap-spent,
+    // remaining), and `remaining` is the pool balance). Leave it at the widest
+    // cap the pool's `uint64` field can hold, so a later `topUp` beyond the
+    // opening deposit is redeemable too.
     let capability = issue_self_capability(
         signer.as_ref(),
         pool_id,
-        U256::MAX,
+        SELF_CAPABILITY_CAP,
         SELF_CAPABILITY_EXPIRY,
         voucher_domain,
     )?;
@@ -320,6 +325,15 @@ pub async fn open_pool<P: Provider + Clone>(
 /// only lifecycle gate (there is no pool expiry, ADR 003).
 const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 
+/// Cap stamped on a self-owned capability — the widest value the pool's
+/// `uint64 spendingCap` can hold, which is the effective "no
+/// delegated ceiling" for an owner spending against its own pool. The real
+/// bound is the deposit: redemption pays `min(desired, cap - spent, remaining)`.
+/// It is signed as a full EIP-712 word, so it must be a value the contract's
+/// narrower field can also carry — `U256::MAX` would hash to a word the
+/// contract can never reconstruct.
+pub const SELF_CAPABILITY_CAP: U256 = U256::from_limbs([u64::MAX, 0, 0, 0]);
+
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
 /// credited amount read back from the `PoolToppedUp` event — the shared mechanism
 /// behind the node's cache-miss buyer (#744) and the CLI fetch buyer's auto-refill
@@ -341,7 +355,7 @@ pub async fn top_up<P: Provider + Clone>(
     additional: U256,
 ) -> Result<U256> {
     let receipt = contract
-        .topUp(pool_id, additional)
+        .topUp(pool_id, to_pool_u64(additional, "top-up")?)
         .send()
         .await
         .context("submit topUp")?

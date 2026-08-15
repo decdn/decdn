@@ -302,7 +302,7 @@ async fn run_rotation() -> anyhow::Result<()> {
     )
     .await?;
     assert!(
-        lane.bytesDelivered > U256::ZERO,
+        lane.bytesDelivered > 0,
         "the pre-rotation pool's lane to this operator still carries the settled watermark — the \
          lane keys on the operator's Ethereum address, which rotation does not change"
     );

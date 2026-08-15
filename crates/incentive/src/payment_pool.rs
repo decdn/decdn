@@ -86,52 +86,67 @@ mod sol_types {
             /// `getPool` ABI tuple.
             struct Pool {
                 address owner;
-                uint64 openedAt;
                 Status status;
-                address token;
                 uint64 disputeDeadline;
-                uint256 deposit;
-                uint256 totalRedeemed;
+                uint64 deposit;
+                uint64 totalRedeemed;
             }
 
             /// Per-`(pool, signer)` authorization, set once on first
             /// redemption for that signer from the owner-signed capability.
             /// Field order is part of the `getAuthorization` ABI tuple.
             struct Authorization {
-                uint256 cap;
+                uint64 cap;
                 uint64 expiry;
-                uint256 spent;
+                uint64 spent;
             }
 
             /// Per-`(pool, signer, provider)` redemption lane. Field order
             /// is part of the `getWatermark` ABI tuple.
             struct Lane {
-                uint256 amount;
-                uint256 bytesDelivered;
+                uint64 amount;
+                uint64 bytesDelivered;
             }
 
-            /// One `capabilities` entry in a batched `redeemMany` call —
-            /// mirrors `redeem`'s decoded `(spendingCap, expiry, ownerSig)`
-            /// capability tuple plus the `poolId`/`signer` it names. Field
-            /// order is part of the ABI tuple; do not rearrange.
+            /// One signer registration inside a pool's batch: the owner's
+            /// EIP-712 `Capability` signature and the limits it authorizes.
+            /// The pool is the enclosing `PoolBatch`. Field order is part of
+            /// the ABI tuple; do not rearrange.
             struct CapabilityReg {
-                bytes32 poolId;
                 address signer;
-                uint256 spendingCap;
+                uint64 spendingCap;
                 uint64 expiry;
                 bytes ownerSig;
             }
 
-            /// One `vouchers` entry in a batched `redeemMany` call — mirrors
-            /// `redeem`'s voucher parameters plus the `poolId` it names.
-            /// Field order is part of the ABI tuple; do not rearrange.
-            struct RedeemVoucher {
-                bytes32 poolId;
+            /// One lane's voucher inside a pool's batch. Names neither its
+            /// pool (the enclosing `PoolBatch` does) nor its payee: the
+            /// contract redeems for `msg.sender` and rebuilds the EIP-712
+            /// hash with it, so a voucher signed for another node fails as
+            /// `InvalidVoucherSignature`. The signature is the EIP-2098
+            /// compact pair `(r, vs)`, which makes this struct *static*: an
+            /// array of it carries no per-element offset, no length word and
+            /// no padding, so a lane costs 160 calldata bytes instead of 288.
+            /// A voucher signer must therefore be an EOA — the contract
+            /// recovers with `ecrecover`, not ERC-1271. Field order is part
+            /// of the ABI tuple; do not rearrange.
+            struct LaneVoucher {
                 address signer;
-                address provider;
-                uint256 cumulative;
-                uint256 bytesDelivered;
-                bytes voucherSig;
+                uint64 cumulative;
+                uint64 bytesDelivered;
+                bytes32 r;
+                bytes32 vs;
+            }
+
+            /// Everything a node redeems against one pool. Naming the pool
+            /// once per group rather than once per entry is both the
+            /// calldata saving and what lets the pool's status gate and its
+            /// `totalRedeemed` write happen once for the whole group. Field
+            /// order is part of the ABI tuple; do not rearrange.
+            struct PoolBatch {
+                bytes32 poolId;
+                CapabilityReg[] capabilities;
+                LaneVoucher[] vouchers;
             }
 
             // -----------------------------------------------------------------
@@ -184,13 +199,13 @@ mod sol_types {
             /// Open a USDC pool; transfers `deposit` in and derives
             /// `poolId = keccak256(owner, ownerPoolNonce[owner])`. Names no
             /// provider and no signer — a pool is bound to no payee at open.
-            function openPool(uint256 deposit) external returns (bytes32 poolId);
+            function openPool(uint64 deposit) external returns (bytes32 poolId);
 
             /// Owner-only: add `additionalDeposit` USDC to an open pool.
-            function topUp(bytes32 poolId, uint256 additionalDeposit) external;
+            function topUp(bytes32 poolId, uint64 additionalDeposit) external;
 
             /// Owner-only: start the grace-window close on `poolId`. Moves
-            /// no funds — `redeem` stays callable until `disputeDeadline`.
+            /// no funds — redemption stays callable until `disputeDeadline`.
             function closePool(bytes32 poolId) external;
 
             /// Callable by anyone once the grace window has elapsed:
@@ -202,36 +217,20 @@ mod sol_types {
             // Write functions (redeemer / node path)
             // -----------------------------------------------------------------
 
-            /// Pay a node against a monotone cumulative voucher while the
-            /// pool is `Open` or inside the grace window. The payee
-            /// (`provider == msg.sender`) presents the highest voucher it
-            /// holds; redemption pays the increment over the lane
-            /// watermark, bounded by the signer's remaining cap and the
-            /// pool's remaining deposit, then routes the paid USDC through
-            /// `FeeRouter.routeSettlement` in the same transaction.
-            /// `capability` is the ABI-encoded `(spendingCap, expiry,
-            /// ownerSig)` tuple on a signer's first redemption, or empty
-            /// bytes for every later redemption of an already-registered
-            /// signer.
-            function redeem(
-                bytes32 poolId,
-                address signer,
-                address provider,
-                uint256 cumulative,
-                uint256 bytesDelivered,
-                bytes calldata voucherSig,
-                bytes calldata capability
-            ) external;
-
-            /// Register every capability, then redeem every voucher, in one
-            /// transaction. A node registers the signers it needs and
-            /// redeems all its lanes at once; a transient-empty voucher
-            /// (already-registered signer, expired capability, stale
-            /// cumulative, or a drained lane/cap) is skipped rather than
-            /// reverting the whole batch.
-            function redeemMany(CapabilityReg[] calldata capabilities, RedeemVoucher[] calldata vouchers)
-                external
-                returns (uint256 totalPaid);
+            /// The sole redemption entry point: per pool, register every
+            /// capability, then redeem every voucher, all in one
+            /// transaction. A node redeems every lane it holds at once, and
+            /// a single lane is a one-pool batch of one. Each voucher pays
+            /// the increment over its lane watermark, bounded by the
+            /// signer's remaining cap and the pool's remaining deposit; a
+            /// transient-empty voucher (already-registered signer, expired
+            /// capability, stale cumulative, or a drained lane/cap) is
+            /// skipped rather than reverting. Grouping by pool is what makes
+            /// the pool's status gate and its `totalRedeemed` write happen
+            /// once per group instead of once per lane. Every voucher is
+            /// redeemed for `msg.sender`, so the whole call's payout settles
+            /// through `FeeRouter.routeSettlement` in one go.
+            function redeemMany(PoolBatch[] calldata batches) external returns (uint256 totalPaid);
 
             // -----------------------------------------------------------------
             // Events
@@ -246,21 +245,27 @@ mod sol_types {
             /// instead of rejecting them against a stale deposit.
             event PoolToppedUp(bytes32 indexed poolId, uint256 additionalDeposit, uint256 newDeposit);
 
-            /// A node cashed a voucher against its lane. `paid` is the USDC
-            /// routed to `FeeRouter` this call, `bytesPaid` the
-            /// paid-proportional served bytes stamped into the operator's
-            /// epoch, and `newPaidCumulative` the lane's cumulative paid
-            /// amount after the advance. A node follows this event
-            /// (filtered on its own `provider`) as the single write path
-            /// for the paid side.
-            event PoolRedeemed(
-                bytes32 indexed poolId,
-                address indexed signer,
-                address indexed provider,
-                uint256 paid,
-                uint256 bytesPaid,
-                uint256 newPaidCumulative
-            );
+            /// One lane's outcome inside a `PoolRedeemed`.
+            /// `newPaidCumulative` is the lane's cumulative paid amount
+            /// after the advance — the value a node writes to its paid
+            /// watermark, cumulative rather than a delta so the stream is
+            /// idempotent and survives a gap. `bytesPaid` is the
+            /// paid-proportional served byte count, carried for per-lane
+            /// accounting. Field order is part of the ABI tuple; do not
+            /// rearrange.
+            struct LaneSettled {
+                address signer;
+                uint64 newPaidCumulative;
+                uint64 bytesPaid;
+            }
+
+            /// A node cashed vouchers against one pool: one event per pool
+            /// group, with an entry per lane that actually paid. Emitting
+            /// once for the group rather than once per lane is what keeps
+            /// the log base and its topics off the per-lane cost. A node
+            /// follows this event, filtered on its own `provider`, as the
+            /// single write path for the paid side.
+            event PoolRedeemed(bytes32 indexed poolId, address indexed provider, LaneSettled[] lanes);
 
             /// The owner started the grace-window close on `poolId`.
             /// `redeem` stays callable until `disputeDeadline`.
@@ -282,13 +287,32 @@ mod sol_types {
 
 pub use sol_types::PaymentPool;
 
+/// Narrow a USDC amount, or a byte count, to the `uint64` the `PaymentPool`
+/// carries in its packed fields.
+///
+/// Off-chain the amounts travel as `U256`, because that is the width the ERC-20
+/// surface and the voucher store speak. On-chain every USDC counter and both
+/// lane watermarks are `uint64`: at USDC's six decimals that ceiling is about
+/// $18.4 trillion, and 18.4 exabytes for a byte count, so this rejects only a
+/// value that could never have been a real lane. Call it at the contract
+/// boundary rather than widening the callers.
+///
+/// # Errors
+///
+/// Errors if `value` does not fit `u64`, naming `what` so the caller's context
+/// says which field overflowed.
+pub fn to_pool_u64(value: alloy::primitives::U256, what: &str) -> anyhow::Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| anyhow::anyhow!("{what} {value} exceeds the PaymentPool's uint64 field"))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use alloy::primitives::{Address, B256, U256};
     use alloy::sol_types::SolEvent;
 
-    use super::PaymentPool;
+    use super::{PaymentPool, to_pool_u64};
 
     /// Pins the `PoolRedeemed` event signature (and therefore its topic-0
     /// selector) to `contracts/src/PaymentPool.sol`'s field list, so a drift
@@ -302,69 +326,145 @@ mod tests {
     fn pool_redeemed_signature_matches_contract() {
         assert_eq!(
             PaymentPool::PoolRedeemed::SIGNATURE,
-            "PoolRedeemed(bytes32,address,address,uint256,uint256,uint256)"
+            "PoolRedeemed(bytes32,address,(address,uint64,uint64)[])"
         );
     }
 
-    /// Pins which `PoolRedeemed` params are `indexed`: `poolId`, `signer`,
-    /// and `provider` land in the log's topics (topic0 is the selector,
-    /// topics 1-3 the indexed params); `paid`, `bytesPaid`, and
-    /// `newPaidCumulative` land in the log data. The signature-string pin
-    /// above is blind to this split, so a future edit that moves `indexed`
-    /// onto the wrong param (e.g. onto `paid` instead of `provider`) would
-    /// pass that test while silently breaking a node's `provider`-topic
-    /// filter for its settlement watcher. This test constructs the event
-    /// with distinct sentinel values and checks each field landed in the
-    /// slot the ABI encoding independently computes for it.
+    /// Pins which `PoolRedeemed` params are `indexed`: `poolId` and
+    /// `provider` land in the log's topics (topic0 is the selector, topics
+    /// 1-2 the indexed params); the `lanes` array lands in the log data,
+    /// carrying `signer` per entry rather than as a topic. The
+    /// signature-string pin above is blind to this split, so a future edit
+    /// that moved `indexed` onto the wrong param would pass that test while
+    /// silently breaking a node's `provider`-topic filter for its settlement
+    /// watcher. This test builds the event with distinct sentinel values and
+    /// checks each one landed where the ABI encoding puts it.
     #[test]
     fn pool_redeemed_indexed_layout_matches_contract() {
         let pool_id = B256::repeat_byte(0x11);
-        let signer = Address::repeat_byte(0x22);
         let provider = Address::repeat_byte(0x33);
-        let paid = U256::from(1_000_u64);
-        let bytes_paid = U256::from(2_000_u64);
-        let new_paid_cumulative = U256::from(3_000_u64);
+        let signer_a = Address::repeat_byte(0x22);
+        let signer_b = Address::repeat_byte(0x44);
 
         let event = PaymentPool::PoolRedeemed {
             poolId: pool_id,
-            signer,
             provider,
-            paid,
-            bytesPaid: bytes_paid,
-            newPaidCumulative: new_paid_cumulative,
+            lanes: vec![
+                PaymentPool::LaneSettled {
+                    signer: signer_a,
+                    newPaidCumulative: 3_000,
+                    bytesPaid: 2_000,
+                },
+                PaymentPool::LaneSettled {
+                    signer: signer_b,
+                    newPaidCumulative: 7_000,
+                    bytesPaid: 5_000,
+                },
+            ],
         };
         let log = event.encode_log_data();
 
-        // topic0 (selector) + exactly the 3 indexed params.
-        assert_eq!(log.topics().len(), 4);
+        // topic0 (selector) + exactly the 2 indexed params. `signer` is per
+        // lane now, so it cannot be a topic — a node keys the lane from the
+        // decoded entry instead.
+        assert_eq!(log.topics().len(), 3);
         assert_eq!(
             log.topics().first(),
             Some(&PaymentPool::PoolRedeemed::SIGNATURE_HASH)
         );
-        // Each indexed param lands in its own topic slot, address-padded
-        // into a word the same way the ABI encoder does it independently
-        // of the sol! macro's own topic-encoding path.
         assert_eq!(log.topics().get(1), Some(&pool_id));
-        assert_eq!(log.topics().get(2), Some(&signer.into_word()));
-        assert_eq!(log.topics().get(3), Some(&provider.into_word()));
+        assert_eq!(log.topics().get(2), Some(&provider.into_word()));
 
-        // The 3 non-indexed params are ABI-tuple-encoded into the data,
-        // in declaration order, and none of the indexed sentinels leak in.
-        let mut expected_data = Vec::new();
-        expected_data.extend_from_slice(paid.to_be_bytes::<32>().as_slice());
-        expected_data.extend_from_slice(bytes_paid.to_be_bytes::<32>().as_slice());
-        expected_data.extend_from_slice(new_paid_cumulative.to_be_bytes::<32>().as_slice());
-        assert_eq!(log.data.as_ref(), expected_data.as_slice());
+        // The dynamic array is head-encoded (offset, then length, then the
+        // static entries), so the whole payload is 2 framing words plus 3
+        // words per lane — which is the shape the per-lane log cost rests on.
+        assert_eq!(log.data.len(), 32 * (2 + 3 * 2));
 
-        // Round-trip through the decoder recovers the same struct, proving
-        // the topic/data split above is exactly what a real watcher decodes.
+        // Round-trip through the decoder recovers the same lanes, proving the
+        // topic/data split above is exactly what a real watcher decodes.
         let decoded = PaymentPool::PoolRedeemed::decode_log_data(&log).unwrap();
         assert_eq!(decoded.poolId, pool_id);
-        assert_eq!(decoded.signer, signer);
         assert_eq!(decoded.provider, provider);
-        assert_eq!(decoded.paid, paid);
-        assert_eq!(decoded.bytesPaid, bytes_paid);
-        assert_eq!(decoded.newPaidCumulative, new_paid_cumulative);
+        assert_eq!(decoded.lanes.len(), 2);
+        assert_eq!(decoded.lanes[0].signer, signer_a);
+        assert_eq!(decoded.lanes[0].newPaidCumulative, 3_000);
+        assert_eq!(decoded.lanes[0].bytesPaid, 2_000);
+        assert_eq!(decoded.lanes[1].signer, signer_b);
+        assert_eq!(decoded.lanes[1].newPaidCumulative, 7_000);
+    }
+
+    /// The narrowing guard on the money path: every USDC amount crosses into
+    /// the contract through here, so the ceiling is worth pinning at the exact
+    /// boundary rather than trusting the `try_from`. `u64::MAX` is a legal
+    /// deposit (~$18.4 trillion at six decimals); one base unit more is not
+    /// expressible on-chain and must be refused rather than truncated — a
+    /// silent wrap here would understate a pool's deposit.
+    #[test]
+    fn to_pool_u64_accepts_the_ceiling_and_refuses_one_past_it() -> anyhow::Result<()> {
+        let ceiling = U256::from(u64::MAX);
+        assert_eq!(to_pool_u64(ceiling, "deposit")?, u64::MAX);
+
+        let over = ceiling + U256::from(1u8);
+        let Err(err) = to_pool_u64(over, "deposit") else {
+            anyhow::bail!("one base unit past the ceiling must be refused, not truncated");
+        };
+        assert!(
+            err.to_string().contains("deposit"),
+            "the error names the field that overflowed, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// Pins the field list of every struct the read surface decodes into, so
+    /// a drift between `contracts/src/PaymentPool.sol` and this binding fails
+    /// the build.
+    ///
+    /// The event pins above do not cover these: a `sol!` block is a *hand-written
+    /// restatement* of the ABI, not something derived from the Solidity source,
+    /// so a struct that gains, loses or narrows a field here compiles perfectly
+    /// against a contract that disagrees. `getPool` then decodes a `Pool` whose
+    /// fields have silently shifted, the node reads a garbage `owner`, and the
+    /// only symptom is a node refusing to serve — no compile error, no decode
+    /// error, nothing until an anvil run. Pinning the layout is what turns that
+    /// into a build failure.
+    ///
+    /// `eip712_encode_type` is used purely as a stable printer for the field
+    /// list; none of these structs is EIP-712 signed.
+    #[test]
+    fn read_surface_struct_layouts_match_contract() {
+        use alloy::sol_types::SolStruct;
+
+        assert_eq!(
+            PaymentPool::Pool::eip712_encode_type(),
+            "Pool(address owner,uint8 status,uint64 disputeDeadline,uint64 deposit,uint64 totalRedeemed)",
+            "getPool"
+        );
+        assert_eq!(
+            PaymentPool::Authorization::eip712_encode_type(),
+            "Authorization(uint64 cap,uint64 expiry,uint64 spent)",
+            "getAuthorization"
+        );
+        assert_eq!(
+            PaymentPool::Lane::eip712_encode_type(),
+            "Lane(uint64 amount,uint64 bytesDelivered)",
+            "getWatermark"
+        );
+    }
+
+    /// The same pin for the two structs `redeemMany` takes as calldata. A
+    /// silent drift here would encode a batch the contract cannot decode.
+    #[test]
+    fn redeem_call_struct_layouts_match_contract() {
+        use alloy::sol_types::SolStruct;
+
+        assert_eq!(
+            PaymentPool::CapabilityReg::eip712_encode_type(),
+            "CapabilityReg(address signer,uint64 spendingCap,uint64 expiry,bytes ownerSig)"
+        );
+        assert_eq!(
+            PaymentPool::LaneVoucher::eip712_encode_type(),
+            "LaneVoucher(address signer,uint64 cumulative,uint64 bytesDelivered,bytes32 r,bytes32 vs)"
+        );
     }
 
     /// Same pin for the other four ABI-tuple-carrying events consumed by
