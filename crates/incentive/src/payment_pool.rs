@@ -309,10 +309,10 @@ pub fn to_pool_u64(value: alloy::primitives::U256, what: &str) -> anyhow::Result
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
-    use alloy::primitives::{Address, B256};
+    use alloy::primitives::{Address, B256, U256};
     use alloy::sol_types::SolEvent;
 
-    use super::PaymentPool;
+    use super::{PaymentPool, to_pool_u64};
 
     /// Pins the `PoolRedeemed` event signature (and therefore its topic-0
     /// selector) to `contracts/src/PaymentPool.sol`'s field list, so a drift
@@ -391,6 +391,28 @@ mod tests {
         assert_eq!(decoded.lanes[0].bytesPaid, 2_000);
         assert_eq!(decoded.lanes[1].signer, signer_b);
         assert_eq!(decoded.lanes[1].newPaidCumulative, 7_000);
+    }
+
+    /// The narrowing guard on the money path: every USDC amount crosses into
+    /// the contract through here, so the ceiling is worth pinning at the exact
+    /// boundary rather than trusting the `try_from`. `u64::MAX` is a legal
+    /// deposit (~$18.4 trillion at six decimals); one base unit more is not
+    /// expressible on-chain and must be refused rather than truncated — a
+    /// silent wrap here would understate a pool's deposit.
+    #[test]
+    fn to_pool_u64_accepts_the_ceiling_and_refuses_one_past_it() -> anyhow::Result<()> {
+        let ceiling = U256::from(u64::MAX);
+        assert_eq!(to_pool_u64(ceiling, "deposit")?, u64::MAX);
+
+        let over = ceiling + U256::from(1u8);
+        let Err(err) = to_pool_u64(over, "deposit") else {
+            anyhow::bail!("one base unit past the ceiling must be refused, not truncated");
+        };
+        assert!(
+            err.to_string().contains("deposit"),
+            "the error names the field that overflowed, got: {err}"
+        );
+        Ok(())
     }
 
     /// Pins the field list of every struct the read surface decodes into, so
