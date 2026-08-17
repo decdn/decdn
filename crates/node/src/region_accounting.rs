@@ -2,7 +2,7 @@
 //!
 //! Aggregates bytes served (and, via a documented seam, pulled) keyed by the
 //! counterparty peer's operator-attested region (ADR 030), resolved from the
-//! on-chain `CapacityBond` registry projection rather than gossip. Region is
+//! on-chain `CapacityBond` registry projection. Region is
 //! resolved through [`RegionResolver`] — the production impl reads the
 //! registry's `NodeId → regionHint` map; tests inject a stub. Totals are
 //! cumulative since process start (Prometheus-counter semantics) and live

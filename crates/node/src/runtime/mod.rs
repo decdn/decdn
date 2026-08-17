@@ -22,12 +22,9 @@ use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey};
-use iroh_gossip::ALPN as GOSSIP_ALPN;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-
-use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable, build_gossip};
 
 use crate::admin;
 use crate::channel_store::PersistentPoolStateStore;
@@ -35,7 +32,6 @@ use crate::dht::{DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
-use crate::handlers::limited::LimitedHandler;
 use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePolicy};
 use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
@@ -63,10 +59,9 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// The acquire path already prunes opportunistically when the keyspace
 /// exceeds `cap + cap/10`, but a node whose connection rate falls below
 /// the over-cap threshold can carry millions of stale buckets
-/// indefinitely. 60s matches the steady-state cadence of the gossip
-/// peer-table TTL sweeper and is comfortably larger than the longest
-/// realistic bucket refill window, so the sweep is essentially free
-/// when the keyspace is empty.
+/// indefinitely. 60s is comfortably larger than the longest realistic
+/// bucket refill window, so the sweep is essentially free when the
+/// keyspace is empty.
 const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Interval between periodic GC sweeps of the DHT rate-limiter's per-IP
@@ -357,12 +352,11 @@ struct Infra {
     pull_through_origin: Option<Arc<crate::node_origin::NodeOrigin>>,
     cache: CacheEngine,
     ep: Endpoint,
-    gossip: iroh_gossip::net::Gossip,
     limiter: Arc<ConnectionLimiter>,
 }
 
 /// Front bring-up phase: RPC preflight, identity/keystore load, voucher-state
-/// and receipt stores, cache + origin chain, iroh endpoint, gossip, and the
+/// and receipt stores, cache + origin chain, iroh endpoint, and the
 /// connection limiter. Extracted verbatim from [`run`]; the two `reload_state`
 /// attach side effects stay inline at their original positions so a SIGHUP
 /// delivered mid-bring-up still finds a target.
@@ -560,14 +554,6 @@ async fn build_infra(
         .register_iroh_endpoint(&ep)
         .context("failed to register iroh metrics")?;
 
-    // Pin iroh-gossip's per-actor frame ceiling to a deCDN-controlled
-    // value (ADR 013 §Gossip Framing, #660). `read_lp` enforces this
-    // cap before allocating the inbound `BytesMut`, bounding per-peer
-    // DoS exposure. Constructed via `build_gossip` so a regression
-    // that drops the cap fails the gossip-crate test that exercises
-    // the same helper.
-    let gossip = build_gossip(ep.clone());
-
     let limiter = Arc::new(ConnectionLimiter::new(
         &cfg.security,
         Arc::clone(&node_metrics),
@@ -592,12 +578,11 @@ async fn build_infra(
         pull_through_origin,
         cache,
         ep,
-        gossip,
         limiter,
     })
 }
 
-/// By-value bundle of the endpoint, handlers, gossip, limiter, and blacklist
+/// By-value bundle of the endpoint, handlers, limiter, and blacklist
 /// readiness receiver consumed when [`serve_until_shutdown`] builds the router.
 /// Every field is moved into the router builder (or its gate), so none is
 /// referenced by [`run`] after the serve call returns.
@@ -606,8 +591,6 @@ struct ServeInputs {
     probe_handler: Arc<ProbeHandler>,
     client_handler: Arc<ClientHandler>,
     dht_handler: Arc<DhtHandler>,
-    gossip: iroh_gossip::net::Gossip,
-    limiter: Arc<ConnectionLimiter>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
 }
 
@@ -629,12 +612,10 @@ async fn serve_until_shutdown(
         probe_handler,
         client_handler,
         dht_handler,
-        gossip,
-        limiter,
         blacklist_ready_rx,
     } = serve_in;
 
-    // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
+    // No Probe, Client, or DHT ALPN is registered before the mandatory
     // first global + operator-region blacklist replay/scope pass succeeds. The
     // gate sits here — after the metrics/admin listeners are bound and every
     // background task is spawned — so a *slow* (still-pending) initial sync keeps
@@ -651,10 +632,6 @@ async fn serve_until_shutdown(
             .accept(ProbeHandler::ALPN, probe_handler)
             .accept(ClientHandler::ALPN, client_handler)
             .accept(DhtHandler::ALPN, dht_handler)
-            .accept(
-                GOSSIP_ALPN,
-                LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
-            )
             .spawn()
     })
     .await?;
@@ -720,8 +697,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
-    peer_table: Arc<RwLock<PeerTable>>,
-    announce_origin_deny: Arc<crate::announce_gate::AnnounceOriginDenySet>,
     region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     client_handler: Arc<ClientHandler>,
     payment_service: PoolSettlementService<P>,
@@ -925,12 +900,6 @@ async fn build_chain_and_handlers(
         stake_lane_policy,
     ));
 
-    // Wrap the foreign `iroh-gossip` handler with `LimitedHandler` so the
-    // gossip ALPN goes through the same `ConnectionLimiter` (#235) that
-    // gates the probe ALPN. Without the wrapper, a connection flood on
-    // `iroh-gossip/0` bypasses the global semaphore entirely (#433): the
-    // per-task resource ceiling holds for probe but not network-wide.
-    //
     // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
     // Store all wired up; iterative requester-side lookup and the
     // republish scheduler land in PR 4 of #320. Three-layer rate limiter
@@ -1058,31 +1027,6 @@ async fn build_chain_and_handlers(
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_pool_addr);
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
-
-    // Shared gossip peer table (ADR 001). Built here — ahead of the client
-    // handler and admin wiring — so the per-region bandwidth accountant (#750)
-    // can resolve regions through it and be attached to the handler below.
-    // `PeerTable::new` depends only on resolved `cfg.gossip.*`, so this is
-    // safe to construct this early.
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(
-        cfg.gossip.peer_ttl_sec.saturating_mul(1_000_000),
-        // `None` => no cap: map to the peer table's `0`-means-unlimited
-        // sentinel. `Some(n)` saturates at `usize::MAX` on 32-bit targets
-        // where the configured `u64` cap might not fit; mirrors the
-        // saturating cast pattern already used on `i64::try_from(table.len())`
-        // in the sweeper path. The resolver rejects `Some(0)`, so a set cap
-        // never collapses into the unlimited sentinel by accident.
-        cfg.gossip
-            .max_peer_entries
-            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
-    )));
-
-    // Origin-blacklist announce deny-set (#1398). Shared (via Arc) between the
-    // blacklist watcher, which feeds it the `NodeId`s of origin-blacklisted
-    // operators, and the `NodeAnnounce` admission gate below, which refuses
-    // them — closing the re-entry gap the advisory peer-table removal leaves,
-    // since `setOriginBlacklist`/`emergencyAddOrigin` do not eject.
-    let announce_origin_deny = Arc::new(crate::announce_gate::AnnounceOriginDenySet::new());
 
     // Per-region bandwidth accountant (#750). Resolves regions from the on-chain
     // CapacityBond registry projection; shared (via Arc) with the client handler
@@ -1291,9 +1235,6 @@ async fn build_chain_and_handlers(
         blacklist_ready_tx,
         &infra.node_metrics,
         Arc::clone(&content_denylist),
-        capacity_bond_addr,
-        Arc::clone(&peer_table),
-        Arc::clone(&announce_origin_deny),
     )
     .await
     .context("blacklist compliance watcher boot enumeration")?;
@@ -1353,8 +1294,6 @@ async fn build_chain_and_handlers(
         origin_watcher,
         dht_handler,
         dht_routing,
-        peer_table,
-        announce_origin_deny,
         region_accountant,
         client_handler,
         payment_service,
@@ -1387,8 +1326,6 @@ struct Background {
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
-    gossip_shutdown: CancellationToken,
-    gossip_handles: Vec<tokio::task::JoinHandle<()>>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     drain_trigger: Arc<admin::DrainTrigger>,
     tasks: JoinSet<()>,
@@ -1396,7 +1333,7 @@ struct Background {
 
 /// Background-tasks phase extracted verbatim from the middle of [`run`] (issue
 /// #1253 PR5): construct the buyer-side provider/stores, spawn every periodic
-/// GC / DHT / gossip / metrics / admin task, and emit the startup
+/// GC / DHT / metrics / admin task, and emit the startup
 /// banner. Borrows [`Infra`] and [`ChainHandlers`]; the by-value `ch` moves the
 /// region performed on owned locals (`rpc_url` and the three EIP-712 domains)
 /// become `.clone()`s here since they are read through a shared reference — each
@@ -1738,9 +1675,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // each tick; a sustained transition fires an alert. `interval == 0`
     // disables the watchdog entirely (operators can opt out for offline
     // dev). Spawned outside the `JoinSet` because we drive it via its own
-    // `oneshot` and an explicit `await` during drain — same shape as the
-    // gossip handles, since `JoinSet::abort_all` cancels eagerly and we'd
-    // rather let the watchdog observe its `shutdown` arm.
+    // `oneshot` and an explicit `await` during drain, since `JoinSet::abort_all`
+    // cancels eagerly and we'd rather let the watchdog observe its `shutdown`
+    // arm.
     //
     // Seed the gauge to `1` here unconditionally: the startup
     // `check_rpc_reachability` above already established the endpoint is
@@ -1769,10 +1706,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         None
     };
 
-    // Admin HTTP surface (ADR 025). Bind here — *before* the gossip service
-    // spawns — so startup fails fast on a port collision rather than after
-    // side-effectful subscriptions have registered. The `serve` task itself
-    // is spawned later, once the rest of the runtime state it reads is wired.
+    // Admin HTTP surface (ADR 025). Bind here so startup fails fast on a port
+    // collision rather than after side-effectful subscriptions have
+    // registered. The `serve` task itself is spawned later, once the rest of
+    // the runtime state it reads is wired.
     let admin_listener = if let Some(admin_port) = cfg.observability.admin_port {
         let admin_addr = std::net::SocketAddr::from(([127, 0, 0, 1], admin_port));
         Some(admin::bind(admin_addr).context("failed to bind admin listener")?)
@@ -1781,29 +1718,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         None
     };
 
-    let gossip_runtime_cfg = GossipRuntimeConfig {
-        announce_interval_sec: cfg.gossip.announce_interval_sec,
-        subscribe_global: cfg.gossip.subscribe_global,
-        region: cfg.identity.region.clone(),
-    };
-    // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
-    // node. Enforced against the live on-chain registry (`staker_set`, kept
-    // fresh by the CapacityBond event tail) — not a static allowlist. Bootstrap
-    // failure already aborted startup above, so this is always
-    // `AnnounceGate::Enforce` (`announce_staked_gate` is the unit-tested
-    // guarantee of that).
-    let announce_gate = crate::announce_gate::announce_staked_gate(
-        Arc::clone(&ch.staker_set),
-        Arc::clone(&ch.announce_origin_deny),
-    );
-    let gossip_metrics: Arc<dyn GossipMetrics> =
-        Arc::new(NodeGossipMetrics::new(Arc::clone(&infra.node_metrics)));
-
     // Local per-peer EWMA reputation score store (ADR 008 §Local Score
     // Calculation). Reputation is local-only: a node ranks its peers solely from
-    // its own delivery observations — there is no gossip propagation or
-    // cross-node aggregation. The store feeds node selection via the
-    // `NodeOrigin` pull path (provisioned below).
+    // its own delivery observations — there is no cross-node aggregation. The
+    // store feeds node selection via the `NodeOrigin` pull path (provisioned
+    // below).
     // Opt into ADR 008 §Score Clamping's ±0.05 per-report clamp (the library
     // default is a no-op cap) so one bad interaction cannot over-penalize an
     // otherwise good peer (#1176).
@@ -1982,28 +1901,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         let _ = buyer_bootstrap_stop_rx.await;
     });
 
-    // GossipService owns its own shutdown via this token (#805): cancelling
-    // it makes the publisher / subscriber / TTL-sweeper loops return at a
-    // clean await boundary, so the runtime stops them through the token rather
-    // than `.abort()`. The handles still live outside the `JoinSet` because we
-    // cancel the token *after* `router.shutdown()` (an `abort_all()` would
-    // cancel eagerly), then await them in the drain phase below.
-    let gossip_shutdown = CancellationToken::new();
-    let decdn_gossip::GossipHandles {
-        tasks: gossip_handles,
-        announce_trigger: _,
-    } = GossipService::spawn(
-        infra.secret_key.clone(),
-        infra.gossip.clone(),
-        gossip_runtime_cfg,
-        Arc::clone(&ch.peer_table),
-        gossip_metrics,
-        gossip_shutdown.clone(),
-        announce_gate,
-    )
-    .await
-    .context("gossip service failed to start")?;
-
     // Drain trigger for `admin_v1_drain` (issue #244). Constructed
     // unconditionally so the admin handler always has a live target —
     // there is no "drain disabled" state analogous to "no region" or
@@ -2091,7 +1988,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         has_origin = !cfg.cache.origins.is_empty(),
         origin_count = cfg.cache.origins.len(),
         origin_kinds = %origin_kinds_label(&cfg.cache.origins),
-        subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
 
@@ -2108,8 +2004,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         bucket_refresh_stop_tx,
         buyer_bootstrap_stop_tx,
         rpc_watchdog,
-        gossip_shutdown,
-        gossip_handles,
         admin_stop_tx,
         drain_trigger,
         tasks,
@@ -2117,7 +2011,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 }
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
-/// server and gossip tasks, and run until a shutdown signal is received.
+/// server and other background tasks, and run until a shutdown signal is
+/// received.
 ///
 /// SIGHUP triggers a hot-reload of mutable config fields via
 /// [`RuntimeReloadState`] (see issue #236). Other signals
@@ -2168,8 +2063,6 @@ pub async fn run(
             probe_handler: ch.probe_handler,
             client_handler: ch.client_handler,
             dht_handler: ch.dht_handler,
-            gossip: infra.gossip,
-            limiter: infra.limiter,
             blacklist_ready_rx: ch.blacklist_ready_rx,
         },
     )
@@ -2192,12 +2085,10 @@ pub async fn run(
         origin_watcher: ch.origin_watcher,
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
-        gossip_shutdown: bg.gossip_shutdown,
         capacity_bond_watcher: ch.capacity_bond_watcher,
         slash_watcher: ch.slash_watcher,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
-        gossip_handles: bg.gossip_handles,
         receipt_writer: infra.receipt_writer,
         tasks: bg.tasks,
     };
@@ -2229,12 +2120,10 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
-    gossip_shutdown: CancellationToken,
     capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
     slash_watcher: crate::slash_watcher::SlashWatcher,
     receipt_writer_shutdown: CancellationToken,
     payment_service: PoolSettlementService<P>,
-    gossip_handles: Vec<tokio::task::JoinHandle<()>>,
     receipt_writer: tokio::task::JoinHandle<()>,
     tasks: JoinSet<()>,
 }
@@ -2270,12 +2159,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
         origin_watcher,
         mut admin_stop_tx,
         rpc_watchdog,
-        gossip_shutdown,
         capacity_bond_watcher,
         slash_watcher,
         receipt_writer_shutdown,
         payment_service,
-        gossip_handles,
         receipt_writer,
         mut tasks,
     } = handles;
@@ -2371,16 +2258,12 @@ async fn shutdown<P: Provider + Clone + 'static>(
     };
 
     // Router::shutdown waits for ProtocolHandler::shutdown on each handler,
-    // then closes the endpoint. After this returns we cancel gossip's
-    // shutdown token so its infinite loops (publisher / subscriber / TTL
-    // sweeper) exit cooperatively at their next await boundary, letting the
-    // drain phase finish rather than hitting the 15s timeout every time.
+    // then closes the endpoint.
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
-    gossip_shutdown.cancel();
-    // The three watchers stopped here for the same reason gossip is: cooperative
-    // exit of an infinite loop at its next await, once nothing depends on it any more.
+    // The two watchers stopped here exit cooperatively — each cancels its own
+    // loop at its next await boundary, once nothing depends on it any more.
     //
     // *After* `router.shutdown` deliberately, and the capacity-bond one is why:
     // its projection is the cached active-staker set, which gates DHT `Store`
@@ -2448,21 +2331,16 @@ async fn shutdown<P: Provider + Clone + 'static>(
         tracing::error!(%err, "cache shutdown failed; store state may be inconsistent");
     }
 
-    // Last-resort abort handles for the tasks that live *outside* the
-    // `JoinSet` — the gossip loops and the RPC watchdog. On the normal path
-    // the cooperative cancel (above) and the watchdog oneshot drain them
-    // cleanly; these are fired only if `drain` overruns `SHUTDOWN_DEADLINE`,
-    // because dropping the timed-out `drain` future would otherwise merely
-    // *detach* a wedged task (a dropped `JoinHandle` keeps running), not stop
-    // it. `tasks.abort_all()` covers the `JoinSet` (reaped + logged per task
-    // below); these cover the rest as fire-and-forget aborts — we do NOT await
-    // them past the deadline, since `abort()` only lands at a poll point and a
-    // truly non-yielding loop would re-hang the shutdown the timeout escaped.
-    // The aggregate count is logged so a post-mortem knows they were hit.
-    let gossip_aborts: Vec<_> = gossip_handles
-        .iter()
-        .map(tokio::task::JoinHandle::abort_handle)
-        .collect();
+    // Last-resort abort handle for the RPC watchdog, which lives *outside* the
+    // `JoinSet`. On the normal path the watchdog oneshot drains it cleanly;
+    // this is fired only if `drain` overruns `SHUTDOWN_DEADLINE`, because
+    // dropping the timed-out `drain` future would otherwise merely *detach*
+    // a wedged task (a dropped `JoinHandle` keeps running), not stop it.
+    // `tasks.abort_all()` covers the `JoinSet` (reaped + logged per task
+    // below); this covers the watchdog as a fire-and-forget abort — we do NOT
+    // await it past the deadline, since `abort()` only lands at a poll point
+    // and a truly non-yielding loop would re-hang the shutdown the timeout
+    // escaped.
     let watchdog_abort = rpc_watchdog_handle
         .as_ref()
         .map(tokio::task::JoinHandle::abort_handle);
@@ -2474,24 +2352,14 @@ async fn shutdown<P: Provider + Clone + 'static>(
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
         }
-        // Await the gossip tasks so the runtime doesn't return while they're
-        // still draining. Cancelling the token (above) makes each loop return
-        // `Ok(())` cleanly; `log_join_result` reports a genuine panic at `warn`
-        // and a cancellation at `debug`, matching how every other drained task
-        // is logged. A loop that never reached an await boundary would keep
-        // `drain` from completing, in which case the `SHUTDOWN_DEADLINE` timeout
-        // below fires and the `else` branch force-aborts via `gossip_aborts`.
-        for handle in gossip_handles {
-            log_join_result(handle.await, "gossip-shutdown");
-        }
         // Await the receipt writer so the runtime doesn't return while it's
         // still flushing its tail. The cancel (above) makes it drain the queue
         // and return cleanly; a panic surfaces at `warn` and a cancellation at
-        // `debug`, matching the gossip handling.
+        // `debug`, matching how every other drained task is logged.
         log_join_result(receipt_writer.await, "receipt-writer-shutdown");
         // Await the RPC watchdog. We signalled it via oneshot above, so
         // a healthy run resolves cleanly here. A panic surfaces as a
-        // warning; cancellation is silent (matches gossip handling).
+        // warning; cancellation is silent (same as the receipt writer).
         if let Some(handle) = rpc_watchdog_handle
             && let Err(err) = handle.await
             && !err.is_cancelled()
@@ -2504,19 +2372,15 @@ async fn shutdown<P: Provider + Clone + 'static>(
     } else {
         tracing::warn!(
             deadline = ?SHUTDOWN_DEADLINE,
-            out_of_joinset_aborts =
-                gossip_aborts.len() + usize::from(watchdog_abort.is_some()) + 1,
+            out_of_joinset_aborts = usize::from(watchdog_abort.is_some()) + 1,
             "graceful shutdown timed out; aborting remaining tasks",
         );
         tasks.abort_all();
-        // The gossip loops and RPC watchdog live outside `tasks`; dropping the
-        // timed-out `drain` only detached them, so abort explicitly. Unlike the
-        // `JoinSet`, these are not reaped/awaited afterwards (see the rationale
-        // where the abort handles are collected) — the count above is their
+        // The RPC watchdog lives outside `tasks`; dropping the timed-out
+        // `drain` only detached it, so abort explicitly. Unlike the
+        // `JoinSet`, it is not reaped/awaited afterwards (see the rationale
+        // where the abort handle is collected) — the count above is its
         // only per-shutdown record.
-        for abort in &gossip_aborts {
-            abort.abort();
-        }
         if let Some(abort) = &watchdog_abort {
             abort.abort();
         }
@@ -2600,9 +2464,7 @@ async fn build_endpoint(
     // (a correlated relay blip during a rolling restart must not wedge the
     // fleet). Note the probe is a bare TCP connect, so it proves liveness of the
     // host:port, not relay-protocol health — a fronting LB / reverse proxy can
-    // accept the connection while the relay behind it is unhealthy. The gossip
-    // service shares this endpoint (`build_gossip(ep.clone())`), so it inherits
-    // the same relay map for free.
+    // accept the connection while the relay behind it is unhealthy.
     if !relay_urls.is_empty() {
         let relays = parse_relay_urls(relay_urls)?;
         let tally = probe_relays(&relays).await;
@@ -2858,40 +2720,6 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
     // id, so this binding only matters for any future `eth_sendTransaction`
     // path; keeping it single-sourced is defensive against that future code.
     Ok(signer.with_chain_id(Some(cfg.blockchain.chain_id)))
-}
-
-/// Adapter: implements `decdn_gossip::GossipMetrics` against the node's
-/// Prometheus registry.
-#[derive(Debug)]
-struct NodeGossipMetrics {
-    metrics: Arc<metrics::Metrics>,
-}
-
-impl NodeGossipMetrics {
-    const fn new(metrics: Arc<metrics::Metrics>) -> Self {
-        Self { metrics }
-    }
-}
-
-impl GossipMetrics for NodeGossipMetrics {
-    fn inc_published(&self, topic: &str) {
-        self.metrics.gossip_published(topic);
-    }
-    fn inc_received(&self, topic: &str) {
-        self.metrics.gossip_received(topic);
-    }
-    fn inc_rejected(&self, reason: &'static str) {
-        self.metrics.gossip_rejected(reason);
-    }
-    fn set_peer_table_size(&self, n: i64) {
-        self.metrics.gossip_peer_table_size(n);
-    }
-    fn inc_reconnected(&self, topic: &str) {
-        self.metrics.gossip_reconnected(topic);
-    }
-    fn add_evicted_ttl(&self, n: u64) {
-        self.metrics.peer_table_evicted_ttl(n);
-    }
 }
 
 /// Log a `JoinError` from a shutdown-drained task with a phase label.
@@ -3269,7 +3097,7 @@ const RPC_PREFLIGHT_MAX_ATTEMPTS: u32 = 5;
 /// timeout) response with bounded backoff (#1108) — a rate-limited endpoint must
 /// not crash-loop the node at startup. A fatal (other 4xx) response, or an
 /// exhausted retry budget, aborts bring-up so operators still catch typos and
-/// dead endpoints before the node binds ports and joins the gossip network.
+/// dead endpoints before the node binds ports and starts serving.
 async fn check_rpc_reachability(rpc_url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

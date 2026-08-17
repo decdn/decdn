@@ -11,7 +11,7 @@
 //!
 //! Two sources feed it and they are deliberately kept in separate slots:
 //!
-//! - **Local**, from `[content] denied_origins`. Operator-set, ungossiped, and
+//! - **Local**, from `[content] denied_origins`. Operator-set, local-only, and
 //!   applied on the next reload without a restart. ADR 011 §One-hour removal
 //!   orders makes this the only mechanism sized to a sub-day statutory deadline,
 //!   because it is the only one entirely within the order recipient's control.

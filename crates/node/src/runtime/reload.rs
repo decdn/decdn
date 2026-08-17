@@ -14,8 +14,7 @@
 //! Any non-reloadable field the file carries gets a "requires restart"
 //! message (logged on presence, not on change) — the runtime would
 //! otherwise need to tear down the iroh endpoint, the metrics listener,
-//! the gossip subscriptions, etc., which is far beyond the scope of a
-//! quick reload.
+//! etc., which is far beyond the scope of a quick reload.
 //!
 //! The reload entry point ([`RuntimeReloadState::reload`]) is also
 //! called directly by tests, so its only side effects are mutating
