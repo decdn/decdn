@@ -1042,7 +1042,7 @@ mod e2e_tests {
     #[tokio::test]
     async fn e2e_pipeline_reads_real_metrics_server() -> anyhow::Result<()> {
         // Bind on an ephemeral loopback port; same pattern the
-        // sibling tests in `tests/admin_peers.rs` use.
+        // sibling tests in `tests/admin_rpc.rs` use.
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr: SocketAddr = listener.local_addr()?;
         let metrics = Arc::new(decdn_node::metrics::Metrics::new());

@@ -69,6 +69,10 @@ At each on-chain redemption the lane's cumulative amount and byte count are publ
 
 ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, paid stream, or key delivery session, letting a network observer classify connections by type. Standard for any QUIC multi-protocol system; not a significant concern — the protocols are not secret.
 
+##### Registry enumeration (P-12)
+
+The on-chain registry active set is public, so a T1 observer reads it without probing or connecting to any node. See [§ Network enumeration (P-12, P-13)](#network-enumeration-p-12-p-13) for the full analysis.
+
 #### T2: Active Protocol Participant
 
 Can probe nodes, read the on-chain registry, and observe responses to its own interactions. Primary added concern: content access pattern leakage.

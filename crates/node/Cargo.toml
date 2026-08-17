@@ -99,9 +99,6 @@ decdn-client-pull = { workspace = true, features = ["test-util"] }
 # shape as `decdn-client-pull` above.
 decdn-incentive = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
-# `blake3::hash` builds test fixtures in `tests/client_loopback.rs`; the node's
-# own code hashes content via `bao_tree::blake3`, so this is test-only.
-blake3 = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):
 # xor_distance metric laws and the fixed-bucket / within-K invariants under
 # random insert/remove sequences. Mirrors the `proptest` usage already in

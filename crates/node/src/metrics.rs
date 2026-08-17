@@ -222,12 +222,11 @@ pub struct DecdnMetrics {
     ///
     /// **This is the documented exception, not the convention** (#1475) — the
     /// one labeled *reason split*, which is not the same as the crate's only
-    /// `Family` — `streams_active` is another. Every
-    /// other reason-style split in this crate — `dispatch_rejected_*`,
-    /// `probe_rate_limit_rejected_*`, and `pool_open_failures_*` — fans out to
-    /// sibling unlabeled counters, and that stays the default for a new split:
-    /// sibling counters
-    /// need no `EncodeLabelSet` type, no pre-materialization to keep a series
+    /// `Family` — `streams_active` is another. Every other reason-style split
+    /// in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
+    /// and `pool_open_failures_*` — fans out to sibling unlabeled counters,
+    /// and that stays the default for a new split: sibling counters need no
+    /// `EncodeLabelSet` type, no pre-materialization to keep a series
     /// exporting at zero, and no alert rewrite when a reason is added.
     ///
     /// The exception is earned because the three values share one *aggregate*
