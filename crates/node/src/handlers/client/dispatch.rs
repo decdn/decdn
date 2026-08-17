@@ -348,50 +348,37 @@ impl ClientHandler {
         }
         let _lane_slot = lane_slot;
 
-        // Per-pool cumulative floor-credit admission gate (ADR 003 §Pool solvency,
-        // stateful-B). Unlike the per-lane #1697 cap above, this sums floor credit
-        // across ALL distinct lanes on the pool and bounds it to `remaining − M`,
-        // closing the fan-out hole where many distinct signers each draw one
-        // un-vouchered floor on the same pool. A full floor is reserved for this
-        // stream's lifetime; the `FloorReservation` guard reconciles it to the actual
-        // unpaid loss at stream end.
+        // Per-pool cumulative floor-credit admission reservation (ADR 003 §Pool
+        // solvency, stateful-B). Unlike the per-lane #1697 cap above, it sums floor
+        // credit across ALL distinct lanes on the pool and bounds it to
+        // `remaining − M`, closing the fan-out hole where many distinct signers each
+        // draw one un-vouchered floor on the same pool. The reservation is span-capped
+        // to what THIS request can draw — at most one voucher-interval floor, less for
+        // a bounded range or tail resume — and held for the stream's lifetime; the
+        // `FloorReservation` guard reconciles it to the actual unpaid loss at stream
+        // end.
         //
-        // The budget check AND the `live_reservation += floor` increment run under
-        // ONE `pool_floor` lock hold inside `try_reserve_floor`, so two concurrent
-        // admissions on a near-exhausted pool cannot both pass the check and then
-        // both reserve — the TOCTOU over-commit a separate check-then-reserve would
-        // allow. An open-time refusal collapses to `InsufficientDeposit` → wire
-        // `NotFound`, indistinguishable from any other miss (no balance leak).
-        let mut floor_reservation: Option<FloorReservation> = None;
-        if let Some(status) = pool_status {
-            let floor = decdn_incentive::floor_micro(rate_per_mb);
-            let pool_id = B256::from(req.pool_id);
-            match self.try_reserve_floor(pool_id, status.remaining, floor) {
-                None => {
-                    let headroom = status
-                        .remaining
-                        .saturating_sub(self.pool_min_remaining_deposit);
-                    self.log_deposit_refusal(pool_id, hash, headroom, floor);
-                    return self
-                        .respond_error(
-                            &mut send,
-                            &req,
-                            ServeRejectReason::InsufficientDeposit,
-                            rate_per_mb,
-                        )
-                        .await;
-                }
-                Some(guard) => floor_reservation = Some(guard),
-            }
-        }
+        // The guard is opened at the point the billed span is knowable, NOT here: an
+        // open-ended tail (`byte_len == 0`, `byte_offset > 0`) only knows its span
+        // once `total_bytes` is resolved, so reserving a full floor here would refuse
+        // a tail resume the channel funded for its tail. The miss legs open it at the
+        // pre-spend gate below (before any USDC fronting, so fan-out stays gated); the
+        // direct-serve leg opens it at the floor-`M` gate, where `total_bytes` gives
+        // the exact aligned span. Both use `try_reserve_floor`, whose budget check and
+        // `live_reservation += reserved` increment run under ONE `pool_floor` lock, so
+        // two concurrent admissions on a near-exhausted pool cannot both pass. A
+        // refusal collapses to `InsufficientDeposit` → wire `NotFound`,
+        // indistinguishable from any other miss (no balance leak).
+        //
         // Held at fn scope so the reservation reconciles on EVERY exit via `Drop`.
         // The direct-serve path at the end of this function MOVES it into `deliver`,
         // which notes the live unpaid balance each iteration and releases the
         // reservation once the stream repays one floor, so `Drop` reconciles to the
         // actual unpaid loss. The `serve_via_backend_origin` / `serve_via_window_pull_through`
         // legs return before that move and run their own serve loop; the guard drops
-        // here, which frees the live reservation (those legs do not note unpaid, so
+        // there, which frees the live reservation (those legs do not note unpaid, so
         // no dead charge is folded).
+        let mut floor_reservation: Option<FloorReservation> = None;
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
@@ -499,14 +486,18 @@ impl ClientHandler {
                 // pull leg's `RampPacer`, #1669, paces against the SAME ramp as it
                 // pays). Do not delete it on the strength of this floor alone.
                 //
-                // Pre-spend floor-M guard (shared-payment-pool model). Refuse to
-                // front any fill when the pool's on-chain **remaining**
-                // (`getPool.deposit − getPool.totalRedeemed`) minus the refundable
-                // floor `M` cannot cover the reserved credit-window floor: see
-                // [`ClientHandler::pool_remaining_covers_window`], the pure policy
-                // this site calls. `reserved` is one interval (the ramp floor at
-                // `paid = 0`), capped by the request's own aligned span when it
-                // bounds itself.
+                // Pre-spend floor reservation (shared-payment-pool model). Open the
+                // per-pool `FloorReservation` HERE, before any fill tier fronts USDC,
+                // so `remaining − M` must cover this pool's already-committed floor
+                // credit plus this stream's floor before the node spends: see
+                // [`ClientHandler::try_reserve_floor`]. The reserved amount is one
+                // interval (the ramp floor at `paid = 0`), capped by the request's own
+                // aligned span when it bounds itself. A bounded range carries its
+                // `byte_len`, so its span is knowable without `total_bytes`; an
+                // open-ended request (`byte_len == 0`, whole blob or tail) reserves the
+                // full floor — the miss path cannot resolve a tail's span pre-fill, so
+                // an unbounded tail is refused cold and served warm through the
+                // direct-serve gate, which does know `total_bytes`.
                 //
                 // `remaining` comes from the cached `getPool` view resolved above;
                 // a `None` view fails open (the on-chain `redeem` is the backstop).
@@ -515,31 +506,30 @@ impl ClientHandler {
                 if known_lane.is_some()
                     && let Some(status) = pool_status
                 {
-                    let interval_bytes = VOUCHER_INTERVAL_BYTES;
-                    let window = self.credit_window(interval_bytes, 0);
-                    let reserved = if req.byte_len > 0 {
+                    let window = self.credit_window(VOUCHER_INTERVAL_BYTES, 0);
+                    let reserved_bytes = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
                         window
                     };
-                    if !self.pool_remaining_covers_window(status.remaining, reserved, rate_per_mb) {
-                        let headroom = status
-                            .remaining
-                            .saturating_sub(self.pool_min_remaining_deposit);
-                        self.log_deposit_refusal(
-                            B256::from(req.pool_id),
-                            hash,
-                            headroom,
-                            decdn_incentive::min_payment(reserved, rate_per_mb),
-                        );
-                        return self
-                            .respond_error(
-                                &mut send,
-                                &req,
-                                ServeRejectReason::InsufficientDeposit,
-                                rate_per_mb,
-                            )
-                            .await;
+                    let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
+                    let pool_id = B256::from(req.pool_id);
+                    match self.try_reserve_floor(pool_id, status.remaining, reserved) {
+                        None => {
+                            let headroom = status
+                                .remaining
+                                .saturating_sub(self.pool_min_remaining_deposit);
+                            self.log_deposit_refusal(pool_id, hash, headroom, reserved);
+                            return self
+                                .respond_error(
+                                    &mut send,
+                                    &req,
+                                    ServeRejectReason::InsufficientDeposit,
+                                    rate_per_mb,
+                                )
+                                .await;
+                        }
+                        Some(guard) => floor_reservation = Some(guard),
                     }
                 }
 
@@ -882,47 +872,65 @@ impl ClientHandler {
                 .await;
         };
 
-        // Pre-flight floor-M gate — the direct-serve twin of the pull-through
-        // guard in `window.rs` (keep the two in step). Without it the node signs
+        // Pre-flight floor gate — the direct-serve twin of the pull-through guard
+        // in `window.rs` (keep the two in step). Without it the node signs
         // `ok: true` and streams a full interval before the first voucher's
         // pool-solvency check can fire, so a pool that cannot cover even that
         // first interval gets it free on every request (#1516).
         //
-        // In the shared-payment-pool model the quantity is the pool's on-chain
-        // **remaining** (`getPool.deposit − getPool.totalRedeemed`) minus the
-        // refundable floor `M`, checked against the credit-window cost via
-        // [`ClientHandler::pool_remaining_covers_window`]. `guard_bytes` is the
-        // chunk-group-aligned span (what `export_bao_range_stream` bills), capped
-        // by the credit-window floor at `paid = 0` — the ramp has not started yet
-        // on a fresh request.
+        // `guard_bytes` is the chunk-group-aligned span (what `export_bao_range_stream`
+        // bills), capped by the credit-window floor at `paid = 0` — the ramp has not
+        // started yet on a fresh request. Here `total_bytes` is known, so it is the
+        // EXACT billed span, including for an open-ended tail (`byte_len == 0`,
+        // `byte_offset > 0`) the miss gate could only price at the full floor.
         //
-        // `remaining` comes from the cached `getPool` view resolved above. When it
-        // is `Some`, refuse `InsufficientDeposit` if the pool's remaining minus the
-        // refundable floor `M` can no longer cover the reserved credit-window
-        // floor; a `None` view fails open (see the gate's construction above).
+        // A direct-serve HIT reaches this gate with no reservation yet (the miss
+        // legs, which spend, open theirs pre-fill above). Open it HERE, span-capped
+        // to `guard_bytes`, via [`ClientHandler::try_reserve_floor`] — its
+        // `remaining − M ≥ committed + reserved` check both admits the stream and
+        // bounds the pool's cumulative cross-lane floor credit. A miss-fill stream
+        // already holds its reservation, so re-validate solvency defensively against
+        // the tighter span via [`ClientHandler::pool_remaining_covers_window`].
+        //
+        // `remaining` comes from the cached `getPool` view resolved above; a `None`
+        // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
+        // `InsufficientDeposit` when the pool can no longer cover the span-capped
+        // floor.
         let interval_bytes = VOUCHER_INTERVAL_BYTES;
         let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
             .min(self.credit_window(interval_bytes, 0));
-        if let Some(status) = pool_status
-            && !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
-        {
-            let headroom = status
-                .remaining
-                .saturating_sub(self.pool_min_remaining_deposit);
-            self.log_deposit_refusal(
-                B256::from(req.pool_id),
-                hash,
-                headroom,
-                decdn_incentive::min_payment(guard_bytes, rate_per_mb),
-            );
-            return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::InsufficientDeposit,
-                    rate_per_mb,
-                )
-                .await;
+        if let Some(status) = pool_status {
+            let refused = if floor_reservation.is_none() {
+                let reserved = decdn_incentive::min_payment(guard_bytes, rate_per_mb);
+                match self.try_reserve_floor(B256::from(req.pool_id), status.remaining, reserved) {
+                    Some(guard) => {
+                        floor_reservation = Some(guard);
+                        false
+                    }
+                    None => true,
+                }
+            } else {
+                !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
+            };
+            if refused {
+                let headroom = status
+                    .remaining
+                    .saturating_sub(self.pool_min_remaining_deposit);
+                self.log_deposit_refusal(
+                    B256::from(req.pool_id),
+                    hash,
+                    headroom,
+                    decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                );
+                return self
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::InsufficientDeposit,
+                        rate_per_mb,
+                    )
+                    .await;
+            }
         }
 
         // Build and sign the success response.

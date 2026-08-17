@@ -194,7 +194,7 @@ pub(super) struct FloorReservation {
     map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
     store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
     pool_id: B256,
-    floor: U256,
+    reserved: U256,
     /// Last-noted unpaid `µUSDC` (`u64`, saturating). Read once at drop to size the
     /// `dead_charge` fold.
     unpaid: AtomicU64,
@@ -205,25 +205,26 @@ pub(super) struct FloorReservation {
 
 #[allow(dead_code)]
 impl FloorReservation {
-    /// Reserve one floor of the pool's budget. Charges `live_reservation += floor`
-    /// (saturating) under the sync lock — an O(1) map touch with no `.await` held,
-    /// so a blocking lock is correct even on the async serve path (mirrors
-    /// `lane_metrics_refresh`). A poisoned lock recovers the guard rather than
-    /// panicking; the reservation is best-effort accounting, never a safety gate.
+    /// Reserve `reserved` `µUSDC` of the pool's budget. Charges
+    /// `live_reservation += reserved` (saturating) under the sync lock — an O(1) map
+    /// touch with no `.await` held, so a blocking lock is correct even on the async
+    /// serve path (mirrors `lane_metrics_refresh`). A poisoned lock recovers the
+    /// guard rather than panicking; the reservation is best-effort accounting, never
+    /// a safety gate.
     fn reserve(
         map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
         store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
         pool_id: B256,
-        floor: U256,
+        reserved: U256,
     ) -> Self {
         {
             let mut guard = map
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = guard.entry(pool_id).or_default();
-            entry.live_reservation = entry.live_reservation.saturating_add(floor);
+            entry.live_reservation = entry.live_reservation.saturating_add(reserved);
         }
-        Self::new_charged(map, store, pool_id, floor)
+        Self::new_charged(map, store, pool_id, reserved)
     }
 
     /// Build a guard for a floor that is ALREADY charged to `live_reservation`
@@ -237,13 +238,13 @@ impl FloorReservation {
         map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
         store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
         pool_id: B256,
-        floor: U256,
+        reserved: U256,
     ) -> Self {
         Self {
             map,
             store,
             pool_id,
-            floor,
+            reserved,
             unpaid: AtomicU64::new(0),
             repaid: AtomicBool::new(false),
         }
@@ -257,7 +258,7 @@ impl FloorReservation {
     }
 
     /// Mark the reservation repaid: the lane's cumulative payment reached a floor,
-    /// so free the live reservation now (`live_reservation -= floor`, saturating)
+    /// so free the live reservation now (`live_reservation -= reserved`, saturating)
     /// and make the eventual drop a no-op. Idempotent — only the first call moves
     /// the live counter.
     fn release_live_repaid(&self) {
@@ -269,7 +270,7 @@ impl FloorReservation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = guard.entry(self.pool_id).or_default();
-        entry.live_reservation = entry.live_reservation.saturating_sub(self.floor);
+        entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
     }
 }
 
@@ -282,14 +283,14 @@ impl Drop for FloorReservation {
         // at one floor) into the durable dead charge. All under the sync lock, all
         // saturating — an O(1) update that never blocks the reactor.
         let unpaid = U256::from(self.unpaid.load(Ordering::Relaxed));
-        let dead_add = self.floor.min(unpaid);
+        let dead_add = self.reserved.min(unpaid);
         let new_dead = {
             let mut guard = self
                 .map
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = guard.entry(self.pool_id).or_default();
-            entry.live_reservation = entry.live_reservation.saturating_sub(self.floor);
+            entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
             entry.dead_charge = entry.dead_charge.saturating_add(dead_add);
             entry.dead_charge
         };
@@ -1247,12 +1248,12 @@ impl ClientHandler {
     /// reservation and any residual dead charge against the per-pool accumulator
     /// (and the durable [`Self::floor_loss_store`]).
     #[allow(dead_code)] // the serve loop opens a reservation per admitted stream
-    pub(super) fn reserve_floor(&self, pool_id: B256, floor: U256) -> FloorReservation {
+    pub(super) fn reserve_floor(&self, pool_id: B256, reserved: U256) -> FloorReservation {
         FloorReservation::reserve(
             Arc::clone(&self.pool_floor),
             self.floor_loss_store.clone(),
             pool_id,
-            floor,
+            reserved,
         )
     }
 
@@ -1296,14 +1297,14 @@ impl ClientHandler {
     /// pass the check and then both reserve — the TOCTOU over-commit a separate
     /// [`Self::pool_budget_covers_reserve`] call followed by [`Self::reserve_floor`]
     /// would allow. The guard is built from the already-charged state
-    /// ([`FloorReservation::new_charged`]) so the floor is charged exactly once. A
-    /// poisoned lock recovers the guard rather than panicking (best-effort
+    /// ([`FloorReservation::new_charged`]) so the reserved amount is charged exactly
+    /// once. A poisoned lock recovers the guard rather than panicking (best-effort
     /// accounting, never a safety gate).
     pub(super) fn try_reserve_floor(
         &self,
         pool_id: B256,
         remaining: U256,
-        floor: U256,
+        reserved: U256,
     ) -> Option<FloorReservation> {
         {
             let mut guard = self
@@ -1316,17 +1317,17 @@ impl ClientHandler {
                 remaining,
                 self.pool_min_remaining_deposit,
                 committed,
-                floor,
+                reserved,
             ) {
                 return None;
             }
-            entry.live_reservation = entry.live_reservation.saturating_add(floor);
+            entry.live_reservation = entry.live_reservation.saturating_add(reserved);
         }
         Some(FloorReservation::new_charged(
             Arc::clone(&self.pool_floor),
             self.floor_loss_store.clone(),
             pool_id,
-            floor,
+            reserved,
         ))
     }
 
