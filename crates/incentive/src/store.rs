@@ -407,6 +407,78 @@ impl PendingSettleStore for MemoryPendingSettleStore {
     }
 }
 
+/// Durable per-pool accumulator of unrecoverable floor-credit loss (`µUSDC`), keyed
+/// by pool id (ADR 003 §Pool solvency — the `dead_charge`). Persisted so a node
+/// restart does not grant a pool a fresh free-floor budget: the un-vouchered floor
+/// is un-redeemable, so it appears in no on-chain quantity and must be stored here.
+///
+/// Implementations MUST commit durably (fsync, on disk-backed impls) before
+/// returning `Ok`, mirroring the [`PoolStateStore`] contract. The stored value is
+/// monotonic per pool by caller discipline; the store does not enforce it.
+pub trait PoolFloorLossStore: Send + Sync {
+    /// Persist the pool's cumulative dead-charge total, overwriting any prior value.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the durable write fails.
+    fn record_loss(&self, pool_id: B256, micro_usdc: u128) -> Result<(), StoreError>;
+
+    /// Load every pool's persisted dead charge. Called once at bring-up to hydrate
+    /// the in-memory accumulator.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the backing store is unreadable.
+    fn load_losses(&self) -> Result<Vec<(B256, u128)>, StoreError>;
+
+    /// Drop a pool's entry (on pool close/reclaim). Idempotent.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the durable delete fails.
+    fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError>;
+}
+
+/// In-memory [`PoolFloorLossStore`] for tests. Not durable — drops with the
+/// process. The runtime uses the redb-backed impl in `crates/node`.
+#[derive(Debug, Default)]
+pub struct MemoryPoolFloorLossStore {
+    inner: Mutex<HashMap<B256, u128>>,
+}
+
+impl MemoryPoolFloorLossStore {
+    /// Construct an empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PoolFloorLossStore for MemoryPoolFloorLossStore {
+    fn record_loss(&self, pool_id: B256, micro_usdc: u128) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        guard.insert(pool_id, micro_usdc);
+        Ok(())
+    }
+
+    fn load_losses(&self) -> Result<Vec<(B256, u128)>, StoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        Ok(guard.iter().map(|(&k, &v)| (k, v)).collect())
+    }
+
+    fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        guard.remove(&pool_id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +597,26 @@ mod tests {
         store.forget_pending(b256!(
             "2222222222222222222222222222222222222222222222222222222222222222"
         ))?;
+        Ok(())
+    }
+
+    #[test]
+    fn floor_loss_store_round_trip_and_forget() -> anyhow::Result<()> {
+        let store = MemoryPoolFloorLossStore::new();
+        let a = b256!("0000000000000000000000000000000000000000000000000000000000000011");
+        let b = b256!("0000000000000000000000000000000000000000000000000000000000000022");
+        store.record_loss(a, 400)?;
+        store.record_loss(b, 4_000_000)?;
+        // Overwrite (monotonic advance is the caller's job; the store just stores).
+        store.record_loss(a, 800)?;
+        let mut all = store.load_losses()?;
+        all.sort_by_key(|(k, _)| *k);
+        anyhow::ensure!(all.len() == 2);
+        anyhow::ensure!(all.first() == Some(&(a, 800u128)));
+        store.forget_loss(a)?;
+        anyhow::ensure!(store.load_losses()?.len() == 1);
+        // Forgetting an unknown pool is a no-op.
+        store.forget_loss(a)?;
         Ok(())
     }
 }
