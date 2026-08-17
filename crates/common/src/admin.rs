@@ -28,37 +28,6 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
 
-/// JSON view of a gossip peer entry emitted by `admin_v1_peersList`.
-///
-/// Defined separately from any peer-table internal type so that
-/// table-internal fields (per-peer counters, debug flags, etc.) that may
-/// accrete in the future can't silently leak into the wire format.
-///
-/// Also used by `decdn node peers` and the integration tests to
-/// deserialize the server response — sharing the type here prevents the
-/// two sides from drifting field-for-field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerView {
-    /// Lowercase hex of the peer's Ed25519 public key (ADR 001).
-    pub node_id: String,
-    /// ISO 3166-1 alpha-2 region code from the announce.
-    pub region: String,
-    /// Microseconds-since-epoch the peer was first inserted into the table.
-    pub first_seen_us: u64,
-    /// Microseconds-since-epoch the peer's most recent announce was accepted.
-    pub last_seen_us: u64,
-    /// `timestamp_us` carried inside the signed announce body.
-    pub announced_at_us: u64,
-}
-
-/// Response body for `admin_v1_peersList`. Shared between the server
-/// (serializes), `decdn node peers` (deserializes via the generated
-/// client), and the integration tests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeersResponse {
-    pub peers: Vec<PeerView>,
-}
-
 /// Whether the node's local iroh key is the one bound to its operator address
 /// on-chain (#1034).
 ///
@@ -102,8 +71,7 @@ pub enum BindingStatus {
 /// has it been up since I started watching?" with one RPC call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
-    /// Lowercase hex of this node's iroh `PublicKey` — same encoding as
-    /// `PeerView::node_id`.
+    /// Lowercase hex of this node's iroh `PublicKey`.
     pub node_id: String,
     /// Whole seconds since the runtime captured the process-start
     /// `Instant` at the top of `decdn-node run` (before any `await`,
@@ -222,20 +190,6 @@ pub struct EvictPreview {
     /// path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origin_kinds: Vec<decdn_config_types::OriginKind>,
-}
-
-/// Response body for `admin_v1_announce` (issue #280).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnnounceResponse {
-    /// Always `true` on a non-error response — the request landed on the
-    /// publisher task's notify slot. This is "queued", not "delivered":
-    /// the actual gossip broadcast happens asynchronously after this RPC
-    /// returns and may still fail (no neighbors, transport error), in
-    /// which case the publisher emits a `warn!` log line. The "publisher
-    /// disabled" case (no region configured) returns
-    /// [`PUBLISHER_DISABLED_CODE`] rather than `triggered: false` so
-    /// operators get a specific message.
-    pub triggered: bool,
 }
 
 /// Response body for `admin_v1_reload` (issue #373). Reports the
@@ -410,7 +364,7 @@ pub struct LaneSnapshot {
     /// destination, and the subject of the ADR-011 blacklist gates.
     /// Rendered as an EIP-55 mixed-case checksummed hex string
     /// (`0x`-prefixed) — `alloy`'s `Address` `Display`. Note this differs
-    /// from [`PeerView::node_id`], which is plain lowercase hex of an iroh
+    /// from an iroh node id, which is plain lowercase hex of an Ed25519
     /// public key (a different identity type, not an EVM address). It is
     /// *not* necessarily the voucher signer — see [`Self::voucher_signer`].
     pub counterparty: String,
@@ -543,12 +497,6 @@ pub struct RegionStatsResponse {
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
 
-/// JSON-RPC error code: the server can't satisfy this method right now.
-/// Used when `admin_v1_announce` is invoked on a node whose gossip
-/// publisher is disabled (no region configured) — operators get a
-/// specific message instead of a generic failure.
-pub const PUBLISHER_DISABLED_CODE: i32 = -32_001;
-
 /// JSON-RPC error code: the cache layer reported an error during evict
 /// (e.g. the underlying iroh-blobs store I/O failed when persisting the
 /// evicted-hash log).
@@ -605,11 +553,6 @@ pub const SLASH_DETECTION_UNAVAILABLE_CODE: i32 = -32_009;
 /// within `v1`, a breaking change cuts over to `admin_v2_...`.
 #[rpc(server, client, namespace = "admin_v1")]
 pub trait AdminRpc {
-    /// Return the current gossip peer table. Ordering is most-recently-
-    /// seen first.
-    #[method(name = "peersList")]
-    async fn peers_list(&self) -> RpcResult<PeersResponse>;
-
     /// Return this node's identity and process uptime.
     #[method(name = "health")]
     async fn health(&self) -> RpcResult<HealthResponse>;
@@ -632,11 +575,6 @@ pub trait AdminRpc {
     /// pre-mutation state.
     #[method(name = "evict")]
     async fn evict(&self, req: EvictRequest) -> RpcResult<EvictResponse>;
-
-    /// Trigger an immediate `NodeAnnounce` broadcast (issue #280). Returns
-    /// [`PUBLISHER_DISABLED_CODE`] when the publisher is off (no region).
-    #[method(name = "announce")]
-    async fn announce(&self) -> RpcResult<AnnounceResponse>;
 
     /// Re-read the config file the node was started with and apply the
     /// reloadable subset (issue #373) — the same path SIGHUP triggers,

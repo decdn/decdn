@@ -327,7 +327,8 @@ struct MetricsPortObservability {
 
 /// Resolve the metrics URL. Mirrors `resolve_admin_url` in
 /// `crates/cli/src/commands/node.rs` so the operator's config-file
-/// experience for `node top` is identical to `node peers`. The host
+/// experience for `node top` is identical to the other `node`
+/// subcommands. The host
 /// is hard-coded to `127.0.0.1` because the daemon's `metrics_bind`
 /// can be `0.0.0.0` / `::`, and a client that dials that goes
 /// nowhere; the operator overrides the host explicitly via

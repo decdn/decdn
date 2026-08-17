@@ -1771,9 +1771,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 
     // Admin HTTP surface (ADR 025). Bind here — *before* the gossip service
     // spawns — so startup fails fast on a port collision rather than after
-    // side-effectful subscriptions have registered. The `serve` task is
-    // spawned later, once gossip has produced its `AnnounceTrigger`, so the
-    // `admin_v1_announce` method has somewhere to forward to.
+    // side-effectful subscriptions have registered. The `serve` task itself
+    // is spawned later, once the rest of the runtime state it reads is wired.
     let admin_listener = if let Some(admin_port) = cfg.observability.admin_port {
         let admin_addr = std::net::SocketAddr::from(([127, 0, 0, 1], admin_port));
         Some(admin::bind(admin_addr).context("failed to bind admin listener")?)
@@ -1992,7 +1991,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let gossip_shutdown = CancellationToken::new();
     let decdn_gossip::GossipHandles {
         tasks: gossip_handles,
-        announce_trigger,
+        announce_trigger: _,
     } = GossipService::spawn(
         infra.secret_key.clone(),
         infra.gossip.clone(),
@@ -2012,10 +2011,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // `Arc::clone`) and the select loop arm below.
     let drain_trigger = Arc::new(admin::DrainTrigger::new());
 
-    // Now that gossip is up and we know whether the publisher produced an
-    // `AnnounceTrigger`, spawn the admin serve task with the full state.
-    // Bind happened earlier (see `admin_listener` above) so a port collision
-    // would have failed startup before any side-effectful subscribes ran.
+    // Spawn the admin serve task with the full state. Bind happened
+    // earlier (see `admin_listener` above) so a port collision would
+    // have failed startup before any side-effectful subscribes ran.
     let admin_stop_tx = if let Some(listener) = admin_listener {
         let (tx, rx) = oneshot::channel::<()>();
         // Build the reload hook only when a config file path was passed
@@ -2029,11 +2027,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             config_path: path.clone(),
         });
         let state = admin::AdminState::new(
-            Arc::clone(&ch.peer_table),
             *infra.secret_key.public().as_bytes(),
             started_at,
             infra.cache.clone(),
-            announce_trigger,
             reload_hook,
             Arc::clone(&drain_trigger),
             Arc::clone(&infra.node_metrics),
