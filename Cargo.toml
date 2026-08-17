@@ -79,7 +79,7 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
-base64 = "0.22"
+base64 = "0.23"
 
 # Cryptography
 ed25519-dalek = { version = "2", features = ["serde"] }
