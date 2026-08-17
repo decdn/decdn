@@ -209,20 +209,22 @@ impl LaneState {
     /// successor state plus its [`VoucherApplied`] — the pure, in-memory half of
     /// [`Self::apply_voucher`], persisting nothing.
     ///
-    /// Exposed for **group commit** (#1483): a caller stages several vouchers
-    /// against an advancing candidate clone, then makes ONE durable
-    /// `store.record` of the final candidate and swaps it into the live lane.
-    /// Because vouchers are cumulative — each carries the running `amount` /
-    /// `bytes_delivered` — the final staged state supersedes every intermediate
-    /// one, so a single record commits the whole batch (one fsync) with no loss.
+    /// The per-voucher serve loop calls this to verify and advance one voucher
+    /// with no side effect; the caller then records the successor to the buffered
+    /// lane store and swaps it into the live lane. Because vouchers are cumulative
+    /// — each carries the running `amount` / `bytes_delivered` — a later voucher
+    /// supersedes every earlier one.
     ///
-    /// **Durability obligation.** The returned state MUST be persisted
-    /// (`store.record`) before it is swapped into a live lane or used to deliver
-    /// further bytes — the #527 replay guard requires durability before
-    /// acknowledgement, and staging alone advances nothing durable.
-    /// `stage_voucher` takes `&self` (never mutates the caller's state) so an
-    /// un-persisted candidate can be discarded on a mid-batch rejection without
-    /// touching the committed prefix.
+    /// **Durability.** The caller records the returned state to the lane store,
+    /// which buffers it in memory and makes it durable on a background flush (ADR
+    /// 003 §Off-chain voucher state persistence). A crash loses at most the
+    /// frontier advanced since the last flush, which is safe — an honest client
+    /// resumes forward and an un-redeemed replay stays on-chain-payable — so the
+    /// serve loop advances and delivers without waiting for the fsync; the
+    /// redeemed watermark is floored separately by a flush before every on-chain
+    /// redeem. `stage_voucher` takes `&self` (never mutates the caller's state) so
+    /// an un-recorded candidate is discarded on a rejection without touching the
+    /// live lane.
     ///
     /// # Errors
     ///
@@ -714,10 +716,9 @@ mod tests {
         Ok(())
     }
 
-    /// Group-commit primitive (#1483): staging a batch of vouchers against an
-    /// advancing candidate and recording ONLY the final state once yields the
-    /// same in-memory result AND the same single persisted row as applying each
-    /// voucher through `apply_voucher`.
+    /// Staging vouchers against an advancing candidate and recording ONLY the
+    /// final state yields the same in-memory result AND the same single persisted
+    /// row as applying each voucher through `apply_voucher`.
     #[test]
     fn stage_batch_then_record_once_equals_sequential_apply() -> anyhow::Result<()> {
         let (signer, base, domain, batch_store) = fixture();
@@ -759,8 +760,8 @@ mod tests {
     }
 
     /// Staging is pure: a rejected voucher leaves the candidate that produced it
-    /// untouched, so a caller can commit the valid prefix and reject the
-    /// offender — the group-commit mid-batch split.
+    /// untouched, so a caller can keep the advanced state and reject the offender
+    /// without rolling back.
     #[test]
     fn stage_voucher_rejects_without_advancing_candidate() -> anyhow::Result<()> {
         let (signer, base, domain, _store) = fixture();

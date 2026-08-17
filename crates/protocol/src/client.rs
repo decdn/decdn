@@ -734,8 +734,8 @@ pub enum StreamError {
         /// is `0` until settlement), so this lets it self-heal: re-seed the
         /// ledger's PAYMENT BASELINE to `bytes_delivered` (a pool-cumulative
         /// counter, NOT a blob `byte_offset`) and re-sign from the new
-        /// baseline. `None` for every handler-direct reason (`RetryLater`,
-        /// `RateFloorRaised`, …) and whenever the signer does not recover to
+        /// baseline. `None` for every handler-direct reason (`RateFloorRaised`,
+        /// …) and whenever the signer does not recover to
         /// `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
@@ -775,15 +775,11 @@ impl StreamError {
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
 /// matches those exhaustively so a new `PoolError` variant fails to compile
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
-/// variants have no validation-enum counterpart and are emitted directly by the
-/// `cdn/client/v1` handler: [`Self::RetryLater`] is the wire expression of a
-/// transient persist-write failure (`PoolError::Store`,
-/// `decdn_incentive::RetrySignal`), the one rejection where the client should
-/// resend the **same** voucher rather than treat the failure as permanent
-/// (ADR 003 §Off-chain voucher state persistence); and [`Self::RateFloorRaised`]
-/// is the honest-buyer re-quote signal when the live delivery floor rose above
-/// a stream's quoted rate (#1382). Variant order is frozen — new handler-direct
-/// reasons append at the end.
+/// variant has no validation-enum counterpart and is emitted directly by the
+/// `cdn/client/v1` handler: [`Self::RateFloorRaised`] is the honest-buyer
+/// re-quote signal when the live delivery floor rose above a stream's quoted
+/// rate (#1382). Variant order is frozen — new handler-direct reasons append
+/// at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -806,14 +802,6 @@ pub enum VoucherRejectReason {
     /// exceeds what the capability has left to spend, or the capability
     /// itself has expired. `PoolError::CapExceeded`.
     CapExceeded,
-    /// Transient node-side persist-write failure (`PoolError::Store`,
-    /// surfaced via `decdn_incentive::RetrySignal`). The voucher itself was
-    /// valid and in-memory state did not advance, so the client should resend
-    /// the **same** voucher on a fresh stream rather than refreshing state or
-    /// topping up. No validation-enum counterpart — `voucher_reject_reason`
-    /// never returns this; the `cdn/client/v1` handler emits it directly (ADR
-    /// 003 §Off-chain voucher state persistence).
-    RetryLater,
     /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
     /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
     /// stream was quoted at, after the signed `StreamResponse` but before this
@@ -835,8 +823,8 @@ impl VoucherRejectReason {
     /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the three
     /// regression/exhaustion reasons a wallet-less client cannot distinguish
     /// from chain, since its local watermark is the only thing that could be
-    /// wrong. Every handler-direct reason (`RetryLater`, `RateFloorRaised`,
-    /// plus the signer/pool/provider mismatches) is never eligible — a bundle
+    /// wrong. Every handler-direct reason (`RateFloorRaised`, plus the
+    /// signer/pool/provider mismatches) is never eligible — a bundle
     /// would not help there, since the fix is not "resync the watermark".
     ///
     /// Single source of truth for the gate: the node checks this before
@@ -1186,7 +1174,6 @@ mod tests {
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
             VoucherRejectReason::CapExceeded,
-            VoucherRejectReason::RetryLater,
             VoucherRejectReason::RateFloorRaised,
         ]
         .into_iter()

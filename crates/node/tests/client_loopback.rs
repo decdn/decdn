@@ -6,8 +6,9 @@
 //! channel state advances; the error paths prove a zero-rate response is
 //! rejected on receive (#252), an unknown channel is cleanly rejected with
 //! `VoucherRejected { WrongChannel }` (the #327 boundary), and a transient
-//! persist-write failure is cleanly rejected with `VoucherRejected { RetryLater }`
-//! (ADR 003 §332) rather than dropping the connection.
+//! persist-write failure cleanly ABORTS the stream (ADR 003 §332) — no in-band
+//! reject reason, just a clean finish — so the client resends the same voucher
+//! on a fresh stream.
 //!
 //! Delivery/authorization gates also covered: `BlobTooLarge` (size gate),
 //! `EvictedSinceProbe` (evicted between probe and stream), the client-binding
@@ -58,7 +59,6 @@ use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VOUCHER_INTERVAL_BYTES,
-    VoucherRejectReason,
 };
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
@@ -643,295 +643,6 @@ async fn divisor_zero_serves_the_full_credit_max_immediately() -> anyhow::Result
     read_exact_chunks(&mut recv, CREDIT_MAX).await?;
     // ...and not one byte more (exposure bounded to exactly the ceiling).
     assert_parked_awaiting_voucher(&mut recv).await?;
-
-    conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
-    Ok(())
-}
-
-/// A `PoolStateStore` that records through to an inner memory store while
-/// counting `record` calls — the direct proof that group commit (#1483)
-/// amortizes the fsync: N cumulative vouchers durably commit with ONE `record`,
-/// not N. Seed the INNER store directly so only voucher-commit records count.
-#[derive(Debug)]
-struct CountingRecordStore {
-    inner: MemoryPoolStateStore,
-    records: std::sync::atomic::AtomicUsize,
-}
-
-impl CountingRecordStore {
-    fn record_count(&self) -> usize {
-        self.records.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl PoolStateStore for CountingRecordStore {
-    fn load_all(&self) -> Result<Vec<LaneState>, decdn_incentive::StoreError> {
-        self.inner.load_all()
-    }
-    fn record(&self, state: &LaneState) -> Result<(), decdn_incentive::StoreError> {
-        self.records
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.record(state)
-    }
-    fn forget(&self, pool_id: LaneKey) -> Result<(), decdn_incentive::StoreError> {
-        self.inner.forget(pool_id)
-    }
-    fn get(&self, pool_id: LaneKey) -> Result<Option<LaneState>, decdn_incentive::StoreError> {
-        self.inner.get(pool_id)
-    }
-}
-
-/// Build a pipelined serving handler with an explicit credit-window ceiling AND
-/// group-commit interval (#1483). `credit_ramp_divisor = 0` opens the full
-/// `credit_max` ceiling immediately (independent of the ramp), so these batching
-/// tests can read a whole window ahead of any payment exactly as before #1669. A
-/// generous `commit_interval_ms` lets the batch gather a whole burst of vouchers
-/// into one fsync deterministically, rather than flushing on a straggler
-/// timeout.
-async fn spawn_batching_server(
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-    credit_max: u64,
-    commit_interval_ms: u64,
-) -> anyhow::Result<(
-    EndpointAddr,
-    Arc<PrivateKeySigner>,
-    Endpoint,
-    tokio::task::JoinHandle<()>,
-)> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_full_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store,
-        RATE_PER_MB,
-        &loopback_domains(),
-        0,
-        16,
-        |deps| {
-            deps.credit_max = credit_max;
-            deps.credit_ramp_divisor = 0;
-            deps.voucher_commit_interval = Some(Duration::from_millis(commit_interval_ms));
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth, server_ep, server_task))
-}
-
-/// Sign the `count` cumulative vouchers that pay for the first `count` completed
-/// voucher intervals of a stream (`bytes_delivered = k * interval`,
-/// `amount = min_payment(...)`, strictly increasing in `amount`), for a client
-/// that bursts them at the server.
-fn burst_vouchers(
-    signer: &PrivateKeySigner,
-    count: u64,
-) -> anyhow::Result<Vec<decdn_incentive::SignedVoucher>> {
-    (1..=count)
-        .map(|k| {
-            let bytes = HARNESS_INTERVAL_BYTES.saturating_mul(k);
-            Voucher {
-                pool_id: pool_id(),
-                signer: signer.address(),
-                provider: operator_addr(),
-                amount: min_payment(bytes, RATE_PER_MB),
-                bytes_delivered: U256::from(bytes),
-            }
-            .sign(signer, &payment_domain())
-            .map_err(|e| anyhow::anyhow!("sign voucher {k}: {e}"))
-        })
-        .collect()
-}
-
-/// #1483: with a credit window several intervals wide, the vouchers that pay for
-/// a window's worth of already-delivered bytes are committed with a SINGLE
-/// fsynced `record` instead of one per voucher — the throughput win. The window
-/// equals the blob; the client reads the whole window, bursts every cumulative
-/// voucher, and the server group-commits them once.
-#[tokio::test(flavor = "multi_thread")]
-async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()> {
-    const WINDOW: u64 = 8 * 1024 * 1024;
-    let intervals = WINDOW / HARNESS_INTERVAL_BYTES;
-    // Blob larger than the window so the WINDOW (not the blob) bounds the first
-    // batch; the wire delivered up to the window is exactly `intervals` intervals.
-    let payload = vec![0x77u8; 16 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-
-    let signer = Arc::new(PrivateKeySigner::random());
-    let deposit = U256::from(10_000_000u64);
-    let inner = MemoryPoolStateStore::new();
-    inner.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        deposit,
-        0,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-    ))?;
-    let counting = Arc::new(CountingRecordStore {
-        inner,
-        records: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let store: Arc<dyn PoolStateStore> = Arc::clone(&counting) as Arc<dyn PoolStateStore>;
-
-    // A generous commit interval so the whole voucher burst is gathered into
-    // ONE commit rather than flushed early on a straggler timeout.
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_batching_server(cache, store, WINDOW, 1_000).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let client_node_id = B256::from(*client_ep.id().as_bytes());
-    let ext = binding_ext(&signer, client_node_id)?;
-    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-
-    // Read the full window ahead of any payment — the server has now delivered
-    // exactly `intervals` completed intervals and parks awaiting their vouchers.
-    read_exact_chunks(&mut recv, WINDOW).await?;
-
-    // Burst all `intervals` cumulative vouchers — the gather sees the whole batch
-    // buffered and commits it once. Acceptance is implicit (the node sends no
-    // ack), so the batch's effect is observed through the store, not a reply.
-    for voucher in burst_vouchers(&signer, intervals)? {
-        write_client_msg(
-            &mut send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
-        )
-        .await?;
-    }
-
-    // Acceptance is implicit (no ack), so the commit lands asynchronously. Wait
-    // for the durable watermark to reach the batch's highest voucher — once every
-    // voucher is persisted, the fsync count is final and the group-commit invariant
-    // is checkable.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let persisted = loop {
-        let row = counting
-            .get(lane_key(signer.address()))?
-            .filter(|r| r.last_bytes_delivered() == U256::from(WINDOW));
-        if let Some(row) = row {
-            break row;
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "the burst never committed to WINDOW bytes; record_count = {}",
-            counting.record_count()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    // The whole batch committed with ONE fsync — the group-commit invariant.
-    anyhow::ensure!(
-        counting.record_count() == 1,
-        "expected exactly ONE record for {intervals} vouchers, got {}",
-        counting.record_count()
-    );
-    anyhow::ensure!(
-        persisted.last_bytes_delivered() == U256::from(WINDOW),
-        "persisted bytes must be the batch's highest, got {}",
-        persisted.last_bytes_delivered()
-    );
-
-    conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
-    Ok(())
-}
-
-/// #1483 crash/rollback guard: when the batched commit's fsync fails, the WHOLE
-/// batch is rejected with `RetryLater` and NO voucher is acknowledged — nothing
-/// is ever acked without a durable record (ADR 003 §Off-chain voucher state
-/// persistence). The client bursts a batch of vouchers; the failing store rejects the
-/// commit; the client sees one `RetryLater` and zero acks, and the watermark
-/// never advances.
-#[tokio::test(flavor = "multi_thread")]
-async fn group_commit_failure_rejects_whole_batch_with_retry_later() -> anyhow::Result<()> {
-    const WINDOW: u64 = 8 * 1024 * 1024;
-    let intervals = WINDOW / HARNESS_INTERVAL_BYTES;
-    let payload = vec![0x33u8; 16 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-
-    let signer = Arc::new(PrivateKeySigner::random());
-    let deposit = U256::from(10_000_000u64);
-    let inner = MemoryPoolStateStore::new();
-    inner.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        deposit,
-        0,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-    ))?;
-    let store: Arc<dyn PoolStateStore> = Arc::new(FailingRecordStore { inner });
-
-    let (target, _server_eth, server_ep, server_task) =
-        spawn_batching_server(cache, Arc::clone(&store), WINDOW, 1_000).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let client_node_id = B256::from(*client_ep.id().as_bytes());
-    let ext = binding_ext(&signer, client_node_id)?;
-    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-
-    read_exact_chunks(&mut recv, WINDOW).await?;
-
-    for voucher in burst_vouchers(&signer, intervals)? {
-        write_client_msg(
-            &mut send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
-        )
-        .await?;
-    }
-
-    // The batch commit failed, so the server's FIRST response is a single
-    // `RetryLater` — never an ack — and the stream then finishes.
-    match read_client_msg(&mut recv).await? {
-        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
-            reason,
-            bundle,
-        }) => {
-            anyhow::ensure!(
-                reason == VoucherRejectReason::RetryLater,
-                "expected RetryLater, got {reason:?}"
-            );
-            // `RetryLater` is never a watermark-gated reason (#1481 §5).
-            anyhow::ensure!(
-                bundle.is_none(),
-                "RetryLater must not carry a watermark bundle"
-            );
-        }
-        other => anyhow::bail!("expected VoucherRejected {{ RetryLater }}, got {other:?}"),
-    }
-    // The persisted watermark never advanced past the seed (zero bytes).
-    let persisted = store
-        .get(lane_key(signer.address()))?
-        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
-    anyhow::ensure!(
-        persisted.last_bytes_delivered() == U256::ZERO,
-        "a failed commit must not advance the watermark, got {}",
-        persisted.last_bytes_delivered()
-    );
 
     conn.close(0u32.into(), b"done");
     client_ep.close().await;
@@ -2959,7 +2670,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
 /// through the REAL `ChannelReceiptSink` + background writer (not the inline
 /// `DirectReceiptSink`), with the underlying log stalled on every `append`, the
 /// full blob must still deliver and hash-verify — the buggy pre-#803 code
-/// awaited the append inline before `VoucherAck`, so it would hang here. After
+/// awaited the append inline before continuing delivery, so it would hang here. After
 /// releasing the stall and draining the writer, every receipt is recovered,
 /// proving the decoupling loses nothing on a clean shutdown.
 #[tokio::test(flavor = "multi_thread")]
@@ -4096,8 +3807,8 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
 }
 
 /// A `PoolStateStore` that hydrates its seeded channels (so vouchers reach
-/// the apply path) but fails every `record` with a transient I/O error —
-/// exercises the `ChannelError::Store` → `RetryLater` in-band rejection.
+/// the apply path) but fails every `record` — exercises the store-record
+/// failure path in [`ClientHandler::commit_one_voucher`].
 #[derive(Debug)]
 struct FailingRecordStore {
     inner: MemoryPoolStateStore,
@@ -4123,12 +3834,14 @@ impl PoolStateStore for FailingRecordStore {
     }
 }
 
-/// A transient persist-write failure (`ChannelError::Store`) is surfaced in-band
-/// as `VoucherRejected { RetryLater }` and the stream finishes cleanly (no QUIC
-/// reset) — the client reads the reason and can resend the same voucher rather
-/// than seeing an opaque drop (ADR 003 §332). The node must not `VoucherAck`.
+/// A `record` failure is now a hard serve fault, not a clean in-band rejection:
+/// the buffered lane store's `record` is expected to fail only on a poisoned
+/// mutex (ADR 003 §Off-chain voucher state persistence), so `commit_one_voucher`
+/// treats it as a fault and aborts the stream rather than writing a `StreamError`
+/// frame — the client sees a transport-level failure, and the store never
+/// observes the advanced watermark.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
+async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 4096];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -4158,7 +3871,7 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
         &metrics,
         limiter,
         cache,
-        store,
+        Arc::clone(&store),
         RATE_PER_MB,
     )?;
 
@@ -4167,25 +3880,33 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, client_signer, deposit);
+    let ctx = channel_context(&client_ep, client_signer.clone(), deposit);
 
-    let err = stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth.address(),
-        *hash.as_bytes(),
-        0,
-        0x9abc,
-        Duration::from_secs(10),
-    )
-    .await
-    .err()
-    .ok_or_else(|| anyhow::anyhow!("transient store failure must reject the voucher"))?;
     anyhow::ensure!(
-        err.to_string().contains("RetryLater"),
-        "error should surface the RetryLater rejection: {err}"
+        stream_fetch(
+            &client_ep,
+            target,
+            &ctx,
+            &slash_domain(),
+            server_eth.address(),
+            *hash.as_bytes(),
+            0,
+            0x9abc,
+            Duration::from_secs(10),
+        )
+        .await
+        .is_err(),
+        "a store record failure must not complete the fetch"
+    );
+    // The lane's watermark never advanced past the seed — the record failure
+    // never reached the durable side, so nothing was ever accepted.
+    let persisted = store
+        .get(lane_key(client_signer.address()))?
+        .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
+    anyhow::ensure!(
+        persisted.last_bytes_delivered() == U256::ZERO,
+        "a failed record must not advance the watermark, got {}",
+        persisted.last_bytes_delivered()
     );
 
     client_ep.close().await;

@@ -6,6 +6,11 @@ aderyn-report.sarif
 lcov.info
 baseline/
 
+# vm.snapshotGasLastCall / vm.startSnapshotGas output. Local scratch for
+# reading a named gas value during development; the repo's pinned gas
+# artifact is .gas-snapshot (per-test totals via `forge snapshot`).
+snapshots/
+
 # Test-only deploy manifests. DeployProtocolScriptTest and the crates/e2e
 # ChainFixture write deployments/31337[67]*.json (test-only chain ids in the
 # 3133769xxxx..3133775xxxx band); a failed/interrupted run can leave one on disk
