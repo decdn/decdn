@@ -97,8 +97,8 @@ pub use probe_sig::{
     slash_judge_domain,
 };
 pub use rate::{
-    BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, dead_charge_micro, floor_micro, min_payment,
-    pool_budget_covers, verify_rate,
+    BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, floor_micro, min_payment, pool_budget_covers,
+    verify_rate,
 };
 pub use store::{
     CheckpointKey, KeyedCheckpointStore, MemoryPendingSettleStore, MemoryPoolFloorLossStore,

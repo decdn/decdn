@@ -1344,6 +1344,33 @@ impl ClientHandler {
         ))
     }
 
+    /// Drop a reclaimed pool's floor-credit accounting: remove its in-memory
+    /// `PoolFloorState` and its durable `dead_charge` row. Called once when a pool
+    /// is reclaimed on-chain; a reclaimed `pool_id` never recurs (monotonic open
+    /// nonce), so its accumulated `dead_charge` is permanently moot.
+    pub(crate) async fn forget_pool_floor(&self, pool_id: B256) {
+        {
+            let mut guard = self
+                .pool_floor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&pool_id);
+        }
+        let Some(store) = self.floor_loss_store.clone() else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || store.forget_loss(pool_id)).await;
+        match result {
+            Ok(Err(e)) => {
+                tracing::warn!(%pool_id, error = %e, "pool dead-charge forget failed");
+            }
+            Err(e) => {
+                tracing::warn!(%pool_id, error = %e, "pool dead-charge forget join failed");
+            }
+            Ok(Ok(())) => {}
+        }
+    }
+
     /// The group-commit interval for this handler (ADR 003 §Off-chain voucher
     /// state persistence, #1483): the most the recoup phase waits to gather
     /// another voucher into the current fsynced batch before committing what it

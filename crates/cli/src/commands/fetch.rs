@@ -1593,7 +1593,7 @@ mod tests {
     /// A delegated `SpendingCapExhausted` is reconnected to the owner-side remedy; the
     /// delegate holds no wallet on the pool, so "top up / re-issue" is the fix.
     #[test]
-    fn delegated_cap_exceeded_gets_the_owner_remedy_hint() {
+    fn delegated_spending_cap_exhausted_gets_the_owner_remedy_hint() {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
