@@ -16,12 +16,14 @@
 //!   pool's lanes. The watcher reconciles like every other chain watcher —
 //!   enumerate `PoolRedeemed` from a pinned block, then tail live, resyncing on a
 //!   missed range — so paid is rebuilt from the event log, never guessed.
-//! - **Redemption (threshold + on-shutdown).** On a redeem hint (a [`LaneKey`])
-//!   emitted by the voucher-accept path, the node reads the lane's owed voucher
-//!   and its cached paid watermark and submits `redeem` once `owed − paid`
-//!   crosses a configurable threshold. A low-frequency self-tick sweeps every
-//!   persisted lane into one `redeemMany` so a dropped hint never strands an
-//!   above-threshold claim.
+//! - **Redemption (per-chunk floor + on-shutdown).** On a redeem hint (a
+//!   [`LaneKey`]) emitted by the voucher-accept path, the node reads the lane's
+//!   owed voucher and its cached paid watermark and plans the lane for
+//!   redemption. A low-frequency self-tick sweeps every persisted lane, packs
+//!   the planned lanes into chunks, and submits a chunk — one `redeemMany` —
+//!   only once the aggregate unredeemed value across that chunk's lanes clears
+//!   a configurable floor, so a dropped hint never strands a lane whose chunk
+//!   has cleared the floor.
 //! - **Close monitor.** A pool is owner-closed only. On a `PoolCloseInitiated`
 //!   for a pool this node holds lanes against, the monitor redeems its highest
 //!   voucher per lane before `disputeDeadline` (ADR 003 § Owner reclaims before a
@@ -341,8 +343,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     }
 
     /// Sender the voucher-accept path uses to hint that a lane's accrued claim
-    /// may have crossed the redemption threshold. Cloneable; dropping all senders
-    /// simply ends the redemption task cleanly.
+    /// may be ready to plan into a chunk whose aggregate clears the redemption
+    /// floor. Cloneable; dropping all senders simply ends the redemption task
+    /// cleanly.
     #[must_use]
     pub fn redeem_hint_sender(&self) -> mpsc::Sender<LaneKey> {
         self.redeem_tx.clone()
@@ -350,8 +353,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
 
     /// Graceful shutdown: stop the watcher, flush the scan checkpoint, quiesce the
     /// redeemer, then run one final best-effort redeem sweep bounded by `deadline`
-    /// so an above-threshold lane is not left un-redeemed across the stop. A pool
-    /// is owner-closed only, so there is nothing to close here — only redeem.
+    /// so a lane whose chunk has cleared the floor is not left un-redeemed across
+    /// the stop. A pool is owner-closed only, so there is nothing to close here —
+    /// only redeem.
     pub async fn shutdown(&self, deadline: Duration) {
         self.watcher.shutdown();
         self.flush_checkpoint_on_shutdown();
@@ -367,8 +371,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         }
     }
 
-    /// One last `redeemMany` over every above-threshold lane, so shutdown secures
-    /// earnings the next boot would otherwise wait a hint/sweep to collect.
+    /// One last pass of `redeemMany` chunks over every lane whose chunk clears the
+    /// floor, so shutdown secures earnings the next boot would otherwise wait a
+    /// hint/sweep to collect.
     async fn final_redeem_sweep(&self) {
         redeem_sweep(
             &self.contract,
@@ -674,7 +679,7 @@ fn saturating_u64(v: U256) -> u64 {
 /// Redeem this node's highest voucher per lane of a closing pool before its grace
 /// deadline (ADR 003 § Owner reclaims before a node redeems). Best-effort: a
 /// per-lane failure is logged and never propagated. Forces redemption regardless
-/// of the threshold — a node that has not redeemed by the deadline forfeits its
+/// of the floor — a node that has not redeemed by the deadline forfeits its
 /// outstanding vouchers.
 #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn redeem_pool_on_close<P: Provider + Clone>(
@@ -717,11 +722,12 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
     redeem_planned_lanes(contract, plans, U256::ZERO, max_vouchers, metrics).await;
 }
 
-/// Redemption task: `redeem` a lane's accrued claim once it crosses the
-/// threshold, driven by two sources — advisory hints ([`LaneKey`]) from the
-/// voucher-accept path and a low-frequency self-tick that sweeps every lane into
-/// one `redeemMany` so a dropped hint can never strand an above-threshold claim.
-/// Ends cleanly when every hint sender is dropped.
+/// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
+/// its aggregate unredeemed value clears the floor, driven by two sources —
+/// advisory hints ([`LaneKey`]) from the voucher-accept path and a
+/// low-frequency self-tick that sweeps every lane into chunked `redeemMany`
+/// transactions so a dropped hint can never strand a lane whose chunk has
+/// cleared the floor. Ends cleanly when every hint sender is dropped.
 #[allow(clippy::too_many_arguments)]
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
