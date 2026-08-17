@@ -577,6 +577,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         capability_source,
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        300,
         Duration::from_secs(300),
         Duration::from_millis(250),
         e2e_head(&node_provider),

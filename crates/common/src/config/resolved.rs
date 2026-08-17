@@ -133,13 +133,20 @@ pub struct ResolvedBlockchain {
     /// `RateBoundsUpdated` event subscription. Defaults to 3600s
     /// (`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`); the resolver rejects `0`.
     pub rate_bounds_poll_interval_sec: u64,
-    /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the seller
-    /// settlement path submits an on-chain redeem against the pool (#327).
-    /// Defaults to 1 USDC (`1_000_000` `µUSDC`) when unset.
+    /// Per-chunk redemption floor (base units, `µUSDC`). The seller
+    /// settlement path submits an on-chain redemption transaction for a
+    /// chunk of lanes only once the aggregate un-redeemed value across that
+    /// chunk's lanes reaches this floor; every lane in a submitted chunk
+    /// settles. Defaults to 1 USDC (`1_000_000` `µUSDC`) when unset.
     pub redeem_threshold_micro_usdc: u64,
+    /// Maximum vouchers per `redeemMany` transaction (the redemption chunk size).
+    /// Defaults to `300` (`DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`); the resolver
+    /// rejects `0`.
+    pub redeem_max_vouchers_per_tx: u64,
     /// Seconds between the redeemer self-tick sweeps (#327, #751): the
-    /// low-frequency backstop that scans every pool for an above-threshold
-    /// claim independent of the advisory per-voucher hints. Defaults to 300s
+    /// low-frequency backstop that sweeps every lane and redeems the chunks
+    /// that clear the redemption floor, independent of the advisory per-voucher
+    /// hints. Defaults to 300s
     /// (`DEFAULT_REDEEM_INTERVAL_SECS`); the resolver rejects `0`.
     pub redeem_interval_secs: u64,
     /// First-contact pool-open deposit (base units, `µUSDC`). Defaults to
