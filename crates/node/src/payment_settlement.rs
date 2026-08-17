@@ -15,14 +15,16 @@
 //!   lanes. The watcher reconciles like every other chain watcher — enumerate
 //!   `PoolRedeemed` from a pinned block, then tail live, resyncing on a missed
 //!   range — so paid is rebuilt from the event log, never guessed.
-//! - **Redemption (purely periodic).** A self-tick, on each interval, first
-//!   flushes the lane store durable (so the redeemed watermark floor reflects
-//!   every voucher accepted since the last flush, ADR 003 § Off-chain voucher
-//!   state persistence) then sweeps every persisted lane into one `redeemMany`
-//!   for each [`LaneKey`] whose accrued claim (`owed − paid`) crosses a
-//!   configurable threshold. A flush failure defers the whole cycle to the next
-//!   tick rather than redeeming against a watermark that might regress on
-//!   restart.
+//! - **Redemption (purely periodic).** A self-tick, on each interval, plans one
+//!   `redeemMany` batch for every [`LaneKey`] whose accrued claim (`owed −
+//!   paid`) crosses a configurable threshold, flushes the lane store durable
+//!   (so the redeemed watermark floor covers every cumulative amount about to
+//!   be submitted, ADR 003 § Off-chain voucher state persistence), then submits
+//!   the batch. Flushing after planning and before submitting is what keeps the
+//!   floor sound: the lane store advances monotonically, so a flush taken after
+//!   the batch's amounts are read is guaranteed to persist at least those
+//!   amounts. A flush failure defers the whole cycle to the next tick rather
+//!   than redeeming against a watermark that might regress on restart.
 //! - **Close monitor.** A pool is owner-closed only. On a `PoolCloseInitiated`
 //!   for a pool this node holds lanes against, the monitor redeems its highest
 //!   voucher per lane before `disputeDeadline` (ADR 003 § Owner reclaims before a
@@ -338,7 +340,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// One last `redeemMany` over every above-threshold lane, so shutdown secures
     /// earnings the next self-tick would otherwise wait to collect.
     async fn final_redeem_sweep(&self) {
-        let _ = flush_before_redeem(&self.store, &self.metrics);
         redeem_sweep(
             &self.contract,
             &self.store,
@@ -537,12 +538,11 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                 // Best-effort and INLINE: redeem the node's highest voucher per
                 // lane before the owner can reclaim. Never returns `Err` — a
                 // benign revert (already fully redeemed, window closed) must not
-                // fail the tick and re-scan the window. Flush first so the
-                // redeemed watermark reflects every voucher accepted so far; a
-                // close redeem is forced regardless of threshold, so it still
-                // proceeds even if the flush failed (forfeiting the whole pool at
-                // the deadline is worse than a marginal re-serve risk).
-                let _ = flush_before_redeem(&self.store, &self.metrics);
+                // fail the tick and re-scan the window. `redeem_one` flushes the
+                // lane store durable right before it submits; a close redeem is
+                // forced regardless of threshold, so it still proceeds even if
+                // the flush failed (forfeiting the whole pool at the deadline is
+                // worse than a marginal re-serve risk).
                 redeem_pool_on_close(
                     &self.contract,
                     &self.store,
@@ -655,11 +655,11 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
     }
 }
 
-/// Redemption task: on each self-tick, flush the lane store durable (so the
-/// redeemed watermark is floored — post-crash on-disk `owed ≥ what we submit`,
-/// ADR 003 §Off-chain voucher state persistence) then `redeemMany` every lane
-/// whose accrued claim crosses the threshold. Ends when the shutdown abort
-/// lands.
+/// Redemption task: on each self-tick, plan every above-threshold lane, flush
+/// the lane store durable (so the redeemed watermark is floored — post-crash
+/// on-disk `owed ≥ what was submitted`, ADR 003 §Off-chain voucher state
+/// persistence), then submit one `redeemMany` for the tick. Ends when the
+/// shutdown abort lands.
 #[allow(clippy::too_many_arguments)]
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
@@ -676,13 +676,6 @@ async fn redeemer_loop<P: Provider + Clone>(
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if !flush_before_redeem(&store, &metrics) {
-            // Flush failed: the redeemed-watermark floor is not guaranteed, so
-            // skip this cycle rather than redeem on an unflushed frontier. The
-            // next tick retries; a deferred redeem never double-spends (the
-            // on-chain lane watermark is monotone).
-            continue;
-        }
         redeem_sweep(
             &contract,
             &store,
@@ -696,14 +689,22 @@ async fn redeemer_loop<P: Provider + Clone>(
     }
 }
 
-/// Flush the lane store durable before a redeem. Returns `true` on success. A
-/// failure is metered and logged; the caller skips that redeem cycle.
-fn flush_before_redeem(store: &Arc<dyn PoolStateStore>, metrics: &Arc<Metrics>) -> bool {
-    match store.flush() {
-        Ok(()) => true,
-        Err(err) => {
+/// Flush the lane store durable off the async worker (the fsync must not block a
+/// runtime worker). Returns `true` on success; a failure is metered and logged.
+/// A redeem that requires the redeemed-watermark floor (the periodic sweep) skips
+/// its submit when this returns `false`; the forced close/shutdown paths proceed.
+async fn flush_store_durable(store: &Arc<dyn PoolStateStore>, metrics: &Arc<Metrics>) -> bool {
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || store.flush()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
             metrics.lane_flush_failure();
-            warn!(%err, "pre-redeem lane store flush failed; deferring redeem to next cycle");
+            warn!(%err, "pre-redeem lane store flush failed; deferring redeem");
+            false
+        }
+        Err(join_err) => {
+            metrics.lane_flush_failure();
+            warn!(%join_err, "pre-redeem lane store flush task join failed");
             false
         }
     }
@@ -845,6 +846,8 @@ async fn redeem_one<P: Provider + Clone>(
             capabilities: register.into_iter().collect(),
             vouchers: vec![*voucher],
         }],
+        store,
+        false,
         metrics,
     )
     .await;
@@ -929,20 +932,38 @@ async fn redeem_sweep<P: Provider + Clone>(
         .into_iter()
         .filter_map(|pool_id| batches.remove(&pool_id))
         .collect();
-    submit_redeem_many(contract, grouped, metrics).await;
+    submit_redeem_many(contract, grouped, store, true, metrics).await;
 }
 
-/// Submit one `redeemMany` for the tick's per-pool batches. Does NOT seed the
-/// paid cache: each paid voucher emits its own `PoolRedeemed`, the single write
-/// path for the paid side. A call that reverts (a structurally invalid entry —
-/// bad signature, bad owner-signature, closed pool) or fails to send records one
-/// `redemption_failure`; the next tick re-prepares and retries.
+/// Submit one `redeemMany` for the tick's per-pool batches. Floors the
+/// redeemed watermark first: flushes the lane store durable AFTER this batch's
+/// cumulative amounts were read (by the caller's planning pass) and BEFORE they
+/// go on-chain, so a crash right after this submit still finds on-disk
+/// `owed ≥ submitted` (`record` is monotone, so the flush persists at least
+/// every value in the batch). The periodic sweep requires this floor and skips
+/// its submit on a failed flush (`strict_flush`); the forced close/shutdown
+/// paths redeem regardless, since forfeiting the whole claim at the deadline is
+/// worse than a bounded re-serve risk.
+///
+/// Does NOT seed the paid cache: each paid voucher emits its own
+/// `PoolRedeemed`, the single write path for the paid side. A call that reverts
+/// (a structurally invalid entry — bad signature, bad owner-signature, closed
+/// pool) or fails to send records one `redemption_failure`; the next tick
+/// re-prepares and retries.
 #[allow(clippy::cognitive_complexity)]
 async fn submit_redeem_many<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     batches: Vec<PaymentPool::PoolBatch>,
+    store: &Arc<dyn PoolStateStore>,
+    strict_flush: bool,
     metrics: &Arc<Metrics>,
 ) {
+    if batches.is_empty() {
+        return;
+    }
+    if !flush_store_durable(store, metrics).await && strict_flush {
+        return;
+    }
     let cap_count: usize = batches.iter().map(|b| b.capabilities.len()).sum();
     let voucher_count: usize = batches.iter().map(|b| b.vouchers.len()).sum();
     let pool_count = batches.len();
