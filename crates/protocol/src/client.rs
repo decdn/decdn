@@ -601,11 +601,14 @@ impl ChunkData {
 /// reconstructs the full EIP-712 typed data `{poolId, signer, provider, amount,
 /// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed for
 /// the stream) plus the self-described `amount` and `bytesDelivered`. There is
-/// no nonce: `amount` and `bytes_delivered` are the monotone cumulative totals,
-/// and together they order vouchers and reject replays — a voucher whose
-/// `amount` is no greater than the highest accepted is stale. Both are 256-bit
-/// values in big-endian bytes — the protocol crate has no `U256`, and
-/// truncating to `u64` would break pools whose totals exceed `u64::MAX`.
+/// no nonce: `amount` is the sole ordering and replay key — a voucher whose
+/// `amount` is no greater than the highest accepted is stale. `bytes_delivered`
+/// is an additional signed, monotone cumulative that must not regress below the
+/// highest accepted; it is what the node verifies against (rather than
+/// reconstructing) so same-lane vouchers settle independent of arrival order.
+/// Both are 256-bit values in big-endian bytes — the protocol crate has no
+/// `U256`, and truncating to `u64` would break pools whose totals exceed
+/// `u64::MAX`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).

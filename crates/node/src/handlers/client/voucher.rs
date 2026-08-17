@@ -453,9 +453,15 @@ impl ClientHandler {
         let total_delta: u64 = staged.iter().map(|s| s.delta_bytes).sum();
         let new_credited = (guard.paid_credited + U256::from(total_delta)).min(candidate_bytes);
         let credited = new_credited.saturating_sub(guard.paid_credited);
+        // `credited <= total_delta` (a `u64`) by construction, so this conversion
+        // is infallible. Surface a hard error rather than saturating: `u64::MAX`
+        // would advance `paid` catastrophically (opening the credit window for the
+        // whole blob), so a broken paid-frontier invariant must fail the batch, not
+        // over-credit. `paid_credited` is advanced only after the conversion holds.
+        let credited_bytes = u64::try_from(credited).map_err(|_| {
+            anyhow::anyhow!("credited bytes exceeded u64 — paid-frontier invariant broke")
+        })?;
         guard.paid_credited = new_credited;
-        // `credited <= total_delta <= u64::MAX` by construction.
-        let credited_bytes = u64::try_from(credited).unwrap_or(u64::MAX);
         drop(guard);
 
         // Post-commit, per-voucher bookkeeping. All side effects here are
