@@ -10,7 +10,7 @@ A deCDN deployment has two unrelated jobs:
 - run a long-lived cache-node daemon (lives in containers, runs under
   systemd, reachable on QUIC `:4433` and metrics `:9090`), and
 - run one-shot human commands an operator or publisher types in a
-  terminal — `probe`, `node peers`, `key-gen`, `config validate`, and
+  terminal — `probe`, `node region-stats`, `key-gen`, `config validate`, and
   the deferred `pull`, `bundle …`, `fetch`, `publish`, `pool`,
   `wallet`.
 
@@ -31,13 +31,13 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   easy to containerise, minimal supply-chain surface.
 - **`decdn`** (`crates/cli`, package `decdn-cli`) — single
   human-facing CLI. Carries every command anyone types: `probe`,
-  `node {peers,health,announce,drain,evict,reload}`, `key-gen`,
+  `node {health,region-stats,evict,reload,drain}`, `key-gen`,
   `config {init,validate}`, and the deferred `pull`, `bundle …`,
   `fetch`, `publish`, `pool`, `wallet`.
 - **`decdn-common`** (`crates/common`) — shared types both binaries
   need: the TOML config schema and resolver, identity loading, the
   `AdminRpc` trait + DTOs, and clap argument structs. No runtime, no
-  peer table, no engine handles. The config-vocabulary value types it
+  engine handles. The config-vocabulary value types it
   is built from (`DecompressMode`, `RetryPolicy`, `OriginUrl`,
   `OriginKind`, `PinnedHashes`, `Hash`) and the `Hash` returned by
   `parse_hash_arg` live in the `decdn-config-types` leaf crate
@@ -54,12 +54,12 @@ friendly redirect — operators starting the daemon use `decdn-node run`.
 
 ### Why the `node` admin namespace lives on `decdn`, not `decdn-node`
 
-Operator-local admin (`peers`, `health`, `announce`, `drain`, `evict`,
-`reload`) is loopback-HTTP-only per the [ADR 025 admin appendix](appendix-local-admin-http.md#appendix-local-admin-http-surface):
+Operator-local admin (`health`, `region-stats`, `evict`, `reload`,
+`drain`) is loopback-HTTP-only per the [ADR 025 admin appendix](appendix-local-admin-http.md#appendix-local-admin-http-surface):
 the binary running the commands need not be the daemon, just on the
 daemon's host. So the `node` namespace fits the user CLI naturally —
 operators don't track which binary owns it, the daemon stays focused
-on starting up, and it reads symmetrically (`decdn node peers`,
+on starting up, and it reads symmetrically (`decdn node health`,
 `decdn node drain`, `decdn node evict <hash>`), with `node` as the
 noun the command operates on.
 

@@ -788,7 +788,7 @@ A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-00
 
 Three tiers, from simplest to most scalable:
 
-1. **View functions.** `getRegisteredNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip)).
+1. **View functions.** `getRegisteredNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then track the registry active set for ongoing discovery (see [ADR 001 § Node Discovery](001-network.md#node-discovery-registry)).
 
 2. **Event logs.** Clients index `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events (indexed by `nodeId`) to maintain a local cache. More efficient than repeated view calls for larger node sets.
 

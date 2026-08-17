@@ -30,7 +30,7 @@ Before any on-chain or protocol activity:
 
 1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) for operator economics.
 
-2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#clock-synchronization)). Nodes SHOULD expose a `decdn_gossip_messages_rejected_clock_skew_total` Prometheus counter ([Appendix: Observability](appendix-observability.md#gossip-metrics)) — a sibling of the aggregate `decdn_gossip_announces_rejected_total`, not a label on it (see [§ Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels)).
+2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). Nodes SHOULD expose a `decdn_gossip_messages_rejected_clock_skew_total` Prometheus counter ([Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics)) — a sibling of the aggregate `decdn_gossip_announces_rejected_total`, not a label on it (see [§ Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels)).
 
 3. **Generate iroh identity.** Run the node binary's `keys generate` (or equivalent) subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`. The private key MUST be stored securely:
    - **PoC:** encrypted file on disk (passphrase-protected or operator-managed).
@@ -137,7 +137,7 @@ After the initial enumeration, the node follows the contract's blacklist events 
 
 Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the peer table. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
 
-This registry snapshot is the initial peer table; gossip updates (Phase 4) keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#registry-cache)).
+This registry snapshot is the initial peer table; gossip updates (Phase 4) keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#node-discovery-registry)).
 
 If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no peer table = cannot participate in gossip, DHT lookups, or probing).
 
@@ -173,7 +173,7 @@ NodeAnnounce {
 
 Publish to `cdn/global/v1` and `cdn/region/{cc}/v1`. The announce interval is operator-configurable (PoC default: 60 seconds).
 
-After this publish the node appears in peers' peer tables (subject to gossip validation: active registry membership, valid signature, fresh timestamp, valid region — see [ADR 001](001-network.md#gossip-validation)). Peers discovering it begin probing it for content.
+After this publish the node appears in peers' peer tables (subject to gossip validation: active registry membership, valid signature, fresh timestamp, valid region — see [ADR 001](001-network.md#node-discovery-registry)). Peers discovering it begin probing it for content.
 
 #### Step 4.3 — Observe incoming `NodeAnnounce` messages
 

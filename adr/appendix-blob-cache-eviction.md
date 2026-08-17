@@ -54,7 +54,7 @@ This appendix adds nothing to the hold mechanism itself — a separate layer wit
 
 ### Reputation does not factor into eviction
 
-Reputation governs *selection*, not local-cache retention. The unified score lives in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and [ADR 008](008-reputation.md#adr-008-reputation-system). A blob's reputation-derived "value" is irrelevant to the cache; only access recency matters. This mirrors [appendix-peer-table-eviction.md § Reputation does not factor into eviction](appendix-peer-table-eviction.md#reputation-does-not-factor-into-eviction) for the same reasons. Coupling reputation to eviction would conflate two concerns whose designs live in separate ADRs.
+Reputation governs *selection*, not local-cache retention. The unified score lives in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and [ADR 008](008-reputation.md#adr-008-reputation-system). A blob's reputation-derived "value" is irrelevant to the cache; only access recency matters. Coupling reputation to eviction would conflate two concerns whose designs live in separate ADRs.
 
 ### Observability
 

@@ -16,7 +16,7 @@ Without this document, operators cannot build dashboards, detect slashable condi
 
 ### Note on existing ADR names
 
-Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This appendix is the authoritative canonical registry. The names below are the canonical forms of those informal references, with identical semantic intent.
+Several ADRs reference informal metric names (e.g., `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 005, 011). This appendix is the authoritative canonical registry. The names below are the canonical forms of those informal references, with identical semantic intent.
 
 ## Decision
 
@@ -153,11 +153,6 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |
 | `decdn_pool_grace_closes_total` | Counter | R | planned | Pools observed entering the redemption grace window (owner close) while this node holds unredeemed vouchers. |
 
-#### Gossip Metrics
-
-The node exposes no gossip metrics. `NodeAnnounce` gossip, the peer table, and
-the announce gate are not part of the node's wire surface.
-
 #### Reputation Metrics
 
 Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-system) — no cross-node propagation, so the only reputation metric is the local score gauge.
@@ -193,7 +188,7 @@ Both rate-limit trios come from the same `RejectLayer` enum and the same shared 
 
 ##### Active-Staker Set Watcher Metrics
 
-The shared `capacity-bond` watcher follows `CapacityBond` membership events to keep a cached active-staker set in sync with chain state. That one loop also feeds the `NodeId → operator address` bindings projection, so these metrics are its health for both — there is no separate node-address watcher family ([ADR 022 § STORE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale), [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)). On a mid-run watcher RPC outage the cache can **drift** from chain state, so the watcher re-enumerates `getRegisteredNodes` on a fixed interval (a correctness backstop, not a tuning knob) to repair any membership event lost to a reorg or a backoff gap; the drift window is bounded by that cadence rather than persisting until a restart. That drift is revenue-impacting while it lasts: the cached set decides which probes the stake-lane reservation sheds ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)) and gates DHT `Store` admission. These metrics make the drift window alertable rather than log-grep-only — `decdn_rpc_healthy` tracks the reachability watchdog, **not** this watcher.
+The shared `capacity-bond` watcher follows `CapacityBond` membership events to keep a cached active-staker set in sync with chain state. That one loop also feeds the `NodeId → operator address` bindings projection, so these metrics are its health for both — there is no separate node-address watcher family ([ADR 022 § STORE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale), [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)). On a mid-run watcher RPC outage the cache can **drift** from chain state, so the watcher re-enumerates `getRegisteredNodes` on a fixed interval (a correctness backstop, not a tuning knob) to repair any membership event lost to a reorg or a backoff gap; the drift window is bounded by that cadence rather than persisting until a restart. That drift is revenue-impacting while it lasts: the cached set decides which probes the stake-lane reservation sheds ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)) and gates DHT `Store` admission. These metrics make the drift window alertable rather than log-grep-only — `decdn_rpc_healthy` tracks the reachability watchdog, **not** this watcher.
 
 | Metric | Type | Tier | Status | Labels | Description |
 |--------|------|------|--------|--------|-------------|
@@ -244,7 +239,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
   "blacklist_version": 42,
   "blacklist_synced": true,
   "rate_bounds_loaded": true,
-  "peer_table_size": 12,
+  "staker_set_active_count": 27,
   "lanes_open": 3,
   "pool_deposit_usdc": "15.23",
   "node_uptime_seconds": 3601
@@ -255,7 +250,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 
 | JSON key | Prometheus metric | Notes |
 |----------|------------------|-------|
-| `peer_table_size` | `decdn_gossip_peer_table_size` | Direct gauge value |
+| `staker_set_active_count` | `decdn_staker_set_active_count` | Cached active-staker set size (registry health) |
 | `lanes_open` | `decdn_lanes_open` | Direct gauge value |
 | `pool_deposit_usdc` | `decdn_pool_deposit_usdc` | Formatted as decimal string for readability; metric stores raw value |
 | `node_uptime_seconds` | `decdn_node_uptime_seconds` | Direct gauge value |
@@ -266,7 +261,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 | `status` | Meaning |
 |----------|---------|
 | `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5--accepting-paid-delivery)); serving traffic. |
-| `degraded` | Running but one or more non-critical conditions impaired (e.g., gossip mesh thin, peer table sparse). Traffic still accepted. |
+| `degraded` | Running but one or more non-critical conditions impaired (e.g., DHT routing table sparse, a chain-event watcher in backoff). Traffic still accepted. |
 | `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate floor not loaded, not registered). Not accepting traffic. |
 
 HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
@@ -280,7 +275,7 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
 - **Log levels:**
   - `ERROR` — unrecoverable, needs operator intervention (startup failures, RPC unreachable after all retries).
   - `WARN` — recoverable degraded conditions (blacklist poll lag > 1 interval, startup clock skew > 10 s, probe hold slot saturation > 90%).
-  - `INFO` — significant lifecycle events (node ready, pool opened/redeemed, peer joined/left, `NodeAnnounce` published).
+  - `INFO` — significant lifecycle events (node ready, pool opened/redeemed, registry active-set change, config reloaded).
   - `DEBUG` — per-stream and per-probe events. Not for high-volume production.
 
 **Mandatory log fields** on every event:
@@ -296,7 +291,6 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 
 | Informal name | Canonical name | Source ADR |
 |---------------|----------------|------------|
-| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_clock_skew_total` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | `probe_hold_violations` | `decdn_probe_hold_unavailable_total{reason="exhausted"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
 | `probe_holds_disabled` | `decdn_probe_hold_unavailable_total{reason="disabled"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol) |
 | `probe_stake_lane_reserved` | `decdn_probe_hold_unavailable_total{reason="stake_lane_reserved"}` | [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority) |
