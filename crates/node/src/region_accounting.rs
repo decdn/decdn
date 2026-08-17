@@ -1,59 +1,67 @@
 //! Per-region bandwidth accounting (#750).
 //!
 //! Aggregates bytes served (and, via a documented seam, pulled) keyed by the
-//! counterparty peer's self-attested `NodeAnnounceBody.region` (ADR 030).
-//! Region is resolved through [`RegionResolver`] — the production impl reads
-//! the gossip peer table; tests inject a stub. Totals are cumulative since
-//! process start (Prometheus-counter semantics) and live only in memory.
+//! counterparty peer's operator-attested region (ADR 030), resolved from the
+//! on-chain `CapacityBond` registry projection rather than gossip. Region is
+//! resolved through [`RegionResolver`] — the production impl reads the
+//! registry's `NodeId → regionHint` map; tests inject a stub. Totals are
+//! cumulative since process start (Prometheus-counter semantics) and live
+//! only in memory.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use decdn_common::admin::RegionBytes;
-use decdn_gossip::PeerTable;
-use tokio::sync::RwLock;
+
+use crate::dht::routing::NodeId;
 
 /// Region-bucket key for traffic whose counterparty has no known region — a
-/// non-peer end-client, or a peer not currently in the gossip peer table.
-/// Re-exported from [`decdn_common::admin`] so this crate and the wire DTOs
-/// share a single sentinel.
+/// non-peer end-client, or a peer not currently in the registry's region
+/// projection. Re-exported from [`decdn_common::admin`] so this crate and the
+/// wire DTOs share a single sentinel.
 pub use decdn_common::admin::UNKNOWN_REGION;
 
-/// Resolve an iroh node id (32 raw bytes) to its self-attested region.
+/// Resolve an iroh node id (32 raw bytes) to its operator-attested region.
 ///
-/// Async because the production impl reads the `tokio::sync::RwLock`-guarded
-/// peer table. Boxed via `async-trait` so the accountant can hold an
-/// `Arc<dyn RegionResolver>` and tests can inject a stub.
+/// Async because the trait is boxed via `async-trait` so the accountant can
+/// hold an `Arc<dyn RegionResolver>` and tests can inject a stub; the
+/// production impl's body is a synchronous map read.
 #[async_trait]
 pub trait RegionResolver: Send + Sync {
     /// The peer's region code, or `None` if the peer is unknown.
     async fn region_of(&self, node_id: &[u8; 32]) -> Option<String>;
 }
 
-/// Production resolver: looks the node id up in the shared gossip peer table.
-pub struct PeerTableResolver(Arc<RwLock<PeerTable>>);
+/// Production resolver: reads the `NodeId → regionHint` projection kept current
+/// by the `CapacityBond` registry watcher (the same enumeration + event tail that
+/// maintains the active set). Region is operator-attested on-chain via
+/// `registerNode`; the ADR-030 RTT penalty guards against a mismatched claim.
+pub struct RegistryRegionResolver(Arc<RwLock<HashMap<NodeId, String>>>);
 
-impl PeerTableResolver {
+impl RegistryRegionResolver {
     #[must_use]
-    pub const fn new(peer_table: Arc<RwLock<PeerTable>>) -> Self {
-        Self(peer_table)
+    pub const fn new(regions: Arc<RwLock<HashMap<NodeId, String>>>) -> Self {
+        Self(regions)
     }
 }
 
-impl std::fmt::Debug for PeerTableResolver {
+impl std::fmt::Debug for RegistryRegionResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `PeerTable` carries no `Debug` bound; name the struct without
-        // formatting its lock-guarded interior.
-        f.debug_struct("PeerTableResolver").finish_non_exhaustive()
+        f.debug_struct("RegistryRegionResolver")
+            .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl RegionResolver for PeerTableResolver {
+impl RegionResolver for RegistryRegionResolver {
     async fn region_of(&self, node_id: &[u8; 32]) -> Option<String> {
-        let guard = self.0.read().await;
-        guard.get(node_id).map(|e| e.announce.body.region.clone())
+        // A poisoned lock (a writer panicked) resolves to `None` — an unknown
+        // region, folded into the UNKNOWN bucket by `region_for`. The registry
+        // watcher's writes are short infallible map swaps, so poisoning is not
+        // expected in practice.
+        let guard = self.0.read().ok()?;
+        guard.get(&NodeId::from_bytes(*node_id)).cloned()
     }
 }
 
@@ -138,11 +146,11 @@ impl RegionAccountant {
         out
     }
 
-    /// The peer's self-attested region, or `None` if it is not in the peer
-    /// table. Exposes the shared [`RegionResolver`] so the pull path can read a
-    /// candidate's region (ADR 030) without wiring a second resolver — unlike the
-    /// private `region_for`, it does not fold an unknown peer into the
-    /// [`UNKNOWN_REGION`] bucket.
+    /// The peer's operator-attested region, or `None` if it is not in the
+    /// registry's region projection. Exposes the shared [`RegionResolver`] so
+    /// the pull path can read a candidate's region (ADR 030) without wiring a
+    /// second resolver — unlike the private `region_for`, it does not fold an
+    /// unknown peer into the [`UNKNOWN_REGION`] bucket.
     pub async fn region_of(&self, peer: &[u8; 32]) -> Option<String> {
         self.resolver.region_of(peer).await
     }
@@ -308,27 +316,19 @@ mod tests {
         assert_eq!(de.bytes_out, 100_000);
     }
 
-    /// The production [`PeerTableResolver`] resolves a node id to the region
-    /// carried on its `NodeAnnounce`, and reports `None` for an unknown id.
+    /// The production [`RegistryRegionResolver`] resolves a node id to the region
+    /// captured from the on-chain registry, and reports `None` for an unknown id.
     #[tokio::test]
-    async fn peer_table_resolver_reads_announce_region() {
-        use decdn_gossip::PeerTable;
-        use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
+    async fn registry_region_resolver_reads_the_region_map() {
+        use std::sync::RwLock as StdRwLock;
+
+        use crate::dht::routing::NodeId;
 
         let node_id = [4u8; 32];
-        let announce = NodeAnnounce {
-            body: NodeAnnounceBody {
-                node_id,
-                region: "FR".to_string(),
-                timestamp_us: 1,
-            },
-            signature: vec![0u8; 64],
-        };
+        let mut map = HashMap::new();
+        map.insert(NodeId::from_bytes(node_id), "FR".to_string());
 
-        let mut table = PeerTable::new(0, 0);
-        table.insert_or_refresh(announce, 100).unwrap();
-
-        let resolver = PeerTableResolver::new(Arc::new(RwLock::new(table)));
+        let resolver = RegistryRegionResolver::new(Arc::new(StdRwLock::new(map)));
         assert_eq!(resolver.region_of(&node_id).await, Some("FR".to_string()));
         assert_eq!(resolver.region_of(&[0u8; 32]).await, None);
     }

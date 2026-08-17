@@ -828,6 +828,7 @@ async fn build_chain_and_handlers(
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
     let staker_set: Arc<dyn StakerSet> = registry.staker_set;
+    let registry_regions = Arc::clone(&registry.regions);
     // The shared registry watcher, held for the ordered graceful stop below (it
     // cancels *after* `router.shutdown`, as its staker set gates DHT admission
     // during drain). Also held inside both façades' projections.
@@ -1083,12 +1084,11 @@ async fn build_chain_and_handlers(
     // since `setOriginBlacklist`/`emergencyAddOrigin` do not eject.
     let announce_origin_deny = Arc::new(crate::announce_gate::AnnounceOriginDenySet::new());
 
-    // Per-region bandwidth accountant (#750). Resolves regions from the shared
-    // peer table; shared (via Arc) with the client handler (records served
-    // bytes) and the admin surface (admin_v1_regionStats reads the snapshot,
-    // wired below).
+    // Per-region bandwidth accountant (#750). Resolves regions from the on-chain
+    // CapacityBond registry projection; shared (via Arc) with the client handler
+    // (records served bytes) and the admin surface (admin_v1_regionStats).
     let region_accountant = Arc::new(crate::region_accounting::RegionAccountant::new(Arc::new(
-        crate::region_accounting::PeerTableResolver::new(Arc::clone(&peer_table)),
+        crate::region_accounting::RegistryRegionResolver::new(registry_regions),
     )));
 
     // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
