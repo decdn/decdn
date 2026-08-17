@@ -63,7 +63,7 @@ impl ClientHandler {
     ///
     /// **Durability ordering (ADR 003 §Off-chain voucher state persistence).**
     /// Acceptance is **implicit**: the fsynced commit runs first, then the node
-    /// simply keeps delivering — no positive `VoucherAck` is written; only a
+    /// simply keeps delivering — no positive ack is written; only a
     /// rejection is ever signalled. A commit failure fails the WHOLE batch — every
     /// voucher gets `RetryLater`, and in-memory state is left unchanged — so the
     /// client resends the batch on a fresh stream (#527). Delaying the durable
