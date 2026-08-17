@@ -36,6 +36,7 @@
 //! poll retry — the paid-watermark watcher via its `WatcherHandle`, the redeemer
 //! via a [`JoinHandle`] aborted on shutdown or drop.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -828,7 +829,7 @@ fn chunk_redemptions(
     let k = plans.len().div_ceil(cap);
     // Sort by unredeemed descending so round-robin dealing balances value across
     // chunks (largest lanes land in distinct buckets first).
-    plans.sort_by_key(|plan| std::cmp::Reverse(plan.unredeemed));
+    plans.sort_by_key(|plan| Reverse(plan.unredeemed));
     let mut buckets: Vec<Vec<PlannedLane>> = (0..k).map(|_| Vec::new()).collect();
     for (i, plan) in plans.into_iter().enumerate() {
         if let Some(bucket) = buckets.get_mut(i % k) {

@@ -144,8 +144,9 @@ pub struct ResolvedBlockchain {
     /// rejects `0`.
     pub redeem_max_vouchers_per_tx: u64,
     /// Seconds between the redeemer self-tick sweeps (#327, #751): the
-    /// low-frequency backstop that scans every pool for an above-threshold
-    /// claim independent of the advisory per-voucher hints. Defaults to 300s
+    /// low-frequency backstop that sweeps every lane and redeems the chunks
+    /// that clear the redemption floor, independent of the advisory per-voucher
+    /// hints. Defaults to 300s
     /// (`DEFAULT_REDEEM_INTERVAL_SECS`); the resolver rejects `0`.
     pub redeem_interval_secs: u64,
     /// First-contact pool-open deposit (base units, `µUSDC`). Defaults to
