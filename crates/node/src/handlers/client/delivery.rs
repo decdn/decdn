@@ -275,7 +275,12 @@ impl ClientHandler {
                     )
                     .await?;
                 match stop {
-                    VoucherStop::Continue => paid = paid.saturating_add(delta),
+                    // Advance `paid` by the watermark-capped credit (rule #1), not the
+                    // raw delivered delta: a benign already-satisfied voucher credits
+                    // nothing and cannot reopen the credit window for unsettled bytes.
+                    VoucherStop::Continue { credited_bytes } => {
+                        paid = paid.saturating_add(credited_bytes);
+                    }
                     VoucherStop::Rejected => return Ok(()),
                 }
             }

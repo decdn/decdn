@@ -147,7 +147,7 @@ impl ClientHandler {
             // delivers no new byte AND clears no voucher has stalled — the client
             // stopped paying.
             let delivered_at_iter_start = delivered;
-            let mut committed_this_iter = 0usize;
+            let mut credited_this_iter = 0u64;
 
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
@@ -217,15 +217,44 @@ impl ClientHandler {
                     }
                 };
                 match stop {
-                    VoucherStop::Continue => {
-                        committed_this_iter += 1;
-                        paid = paid.saturating_add(delta);
-                        // Publish the PAID CONTENT frontier for the pull leg's pacer.
+                    VoucherStop::Continue { credited_bytes } => {
+                        // Advance `paid` by the watermark-capped credit (rule #1): a
+                        // benign already-satisfied voucher raises the watermark by
+                        // nothing, so it credits nothing here and cannot reopen the
+                        // credit window for bytes the lane has not settled.
+                        credited_this_iter = credited_this_iter.saturating_add(credited_bytes);
+                        paid = paid.saturating_add(credited_bytes);
+                        // Publish the PAID CONTENT frontier for the pull leg's
+                        // `WindowPacer`, mapping paid WIRE back into content space (the
+                        // largest chunk-group boundary provably inside the paid wire
+                        // prefix — conservative, so the pull never overshoots its
+                        // window). One contiguous delivery from `offset`, so `offset`
+                        // is the single fetch-start.
                         let served = content_paid_frontier(offset, total_bytes, paid);
+                        // `fetch_max`, not `store`: N observers advance the SHARED
+                        // frontier and the pull's `WindowPacer` binds on the
+                        // MAX-over-observers paid frontier (DECISION-B), so a slower
+                        // observer must not regress a faster one. Behavior-preserving
+                        // for N=1 (a single contiguous delivery is already monotone,
+                        // so `fetch_max == store`).
                         session
                             .served_frontier()
                             .fetch_max(served, Ordering::Relaxed);
                         session.served_advanced().notify_waiters();
+                        // Under partial-overlap coalescing this serve leg is fed by
+                        // more than its own pull: each attached sibling pull produces
+                        // the OVERLAP this leg also consumes and bills. The sibling's
+                        // `served_paid` is a contiguous paid PREFIX, but this leg
+                        // consumes a SUFFIX of the sibling's covered range (starting at
+                        // `offset`) — so it may only EXTEND the sibling's frontier INTO
+                        // the overlap, never claim the sibling's `[start, offset)`
+                        // prefix, which only the sibling's OWN observers pay for. Guard
+                        // on the sibling having itself already cleared up to `offset`:
+                        // only then is this leg's payment a sound prefix extension (each
+                        // overlap byte is fetched once and recouped by the fastest of
+                        // its shared observers — DECISION-B). Without the guard a fast
+                        // overlap payer would relax the sibling pull's window over bytes
+                        // no one has paid for. Empty in the common N=1 case.
                         for extra in also_pace {
                             if extra.served_frontier().load(Ordering::Relaxed) >= offset {
                                 extra.served_frontier().fetch_max(served, Ordering::Relaxed);
@@ -272,7 +301,7 @@ impl ClientHandler {
             // an honest-but-slow client (patience = one voucher read timeout) is
             // never dropped early.
             let made_delivery_progress = delivered > delivered_at_iter_start;
-            let made_payment_progress = committed_this_iter > 0;
+            let made_payment_progress = credited_this_iter > 0;
             if !made_delivery_progress && !made_payment_progress {
                 // The client stopped paying (#856 drop-after-fill): meter the abandon,
                 // then stop cleanly.

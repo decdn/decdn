@@ -74,6 +74,24 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// At this size the ~$0.10 redeem gas is a few percent of the redeemed
 /// amount while bounding unsettled exposure to ~1 USDC per pool (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
+/// Default redemption chunk size: 300 vouchers per `redeemMany` transaction.
+/// The benchmarks in `contracts/test/PaymentPool.t.sol` pin two marginals for
+/// one added cold-lane voucher: ~34.5k gas when the signer is already
+/// registered (`test_redeemMany_gas_N…`), and ~63.4k gas when the signer is
+/// first-time and its capability registers in the same call
+/// (`test_redeemMany_gas_firstTime_N…`). A high-fan-out node serving one-time
+/// payers hits the first-time case on every lane, so ~63.4k is the sizing
+/// figure. Registration cost is bounded: the node only redeems capabilities
+/// whose owner signature it verified off-chain against an EOA pool owner
+/// (`ClientHandler::intake_capability` rejects contract/ERC-1271 owners), so no
+/// unbounded owner-signature verification enters a `redeemMany`. Against
+/// Arbitrum One's block gas limit (~32M gas, an external reference — confirm
+/// live via `eth_getBlockByNumber` before a deploy decision), 300 first-time
+/// lanes cost ~19M gas: they fit a full block (the first-time ceiling is ~504
+/// lanes) but exceed a conservative half-block budget (~252 lanes). The
+/// reactive halve-retry in `submit_chunk` splits any chunk that a live block
+/// still rejects, so 300 stays safe with that backstop.
+const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
@@ -1409,6 +1427,21 @@ fn resolve_blockchain_into(
         },
     );
 
+    let redeem_max_vouchers_per_tx = file
+        .and_then(|b| b.redeem_max_vouchers_per_tx)
+        .unwrap_or(DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX);
+    // A `0` chunk size could never carry a voucher, stranding every redemption.
+    // Reject it; operators tuning gas set a small positive value.
+    bag.check_with(
+        redeem_max_vouchers_per_tx > 0,
+        "blockchain.redeem_max_vouchers_per_tx",
+        || {
+            "blockchain.redeem_max_vouchers_per_tx must be > 0 (a 0 chunk size \
+             carries no vouchers and strands every redemption)"
+                .to_string()
+        },
+    );
+
     let buyer_initial_deposit_micro_usdc = file
         .and_then(|b| b.buyer_initial_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
@@ -1476,6 +1509,7 @@ fn resolve_blockchain_into(
         event_poll_interval_ms,
         rate_bounds_poll_interval_sec,
         redeem_threshold_micro_usdc,
+        redeem_max_vouchers_per_tx,
         redeem_interval_secs,
         buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
@@ -8794,6 +8828,61 @@ swap_pool_address = \"0xPool\"
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert_eq!(resolved.redeem_interval_secs, DEFAULT_REDEEM_INTERVAL_SECS);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_redeem_max_vouchers_per_tx() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_max_vouchers_per_tx: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem_max_vouchers_per_tx is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_max_vouchers_per_tx"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_redeem_max_vouchers_per_tx_when_absent()
+    -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(
+            resolved.redeem_max_vouchers_per_tx,
+            DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX
+        );
         Ok(())
     }
 

@@ -19,7 +19,10 @@
 //! construction (see [`ClientHandler::new`]) and, for a lane first seen live,
 //! created on the first voucher from its off-chain capability handle. A voucher
 //! whose `pool_id` names an unknown pool is rejected with
-//! [`VoucherRejectReason::WrongPool`].
+//! [`VoucherRejectReason::WrongPool`]. After accepting a voucher the handler
+//! emits a redeem hint (via the `redeem_hint` sender wired on
+//! [`ClientHandlerDeps`]) so the settlement service can redeem the accrued claim
+//! once it crosses its threshold.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -48,7 +51,7 @@ use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
@@ -113,6 +116,12 @@ struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes delivered as of the last accepted voucher.
     bytes_delivered_cumulative: U256,
+    /// Cumulative wire bytes CREDITED to streams' paid headroom on this lane
+    /// (design rule #1). Monotone and never exceeds `bytes_delivered_cumulative`
+    /// (the settled watermark), so a benign already-satisfied voucher — which
+    /// does not raise the watermark — can only advance a stream's window for
+    /// bytes the lane has actually settled, never for unpaid delivered bytes.
+    paid_credited: U256,
     /// Count of same-lane streams currently admitted and delivering. The serve-path
     /// admission gate charges each already-active stream one credit-window floor of
     /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
@@ -406,6 +415,7 @@ pub struct ClientHandlerDeps {
     /// `ContentDenylist::empty()` explicitly.
     pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
+    pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
     pub voucher_activity: Option<Arc<VoucherActivity>>,
     pub region_accountant: Option<Arc<RegionAccountant>>,
     pub pull_through: Option<Duration>,
@@ -478,6 +488,7 @@ impl ClientHandlerDeps {
             max_blob_size_bytes,
             max_concurrent_streams,
             content_deny,
+            redeem_hint: None,
             voucher_activity: None,
             region_accountant: None,
             pull_through: None,
@@ -532,6 +543,11 @@ pub struct ClientHandler {
     /// Serializes absolute lane snapshots without holding the lane map while
     /// individual lane state (which may be fsync-bound) is locked.
     lane_metrics_refresh: Mutex<()>,
+    /// Redeem-hint sender to the on-chain settlement service (#327), set at
+    /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
+    /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
+    /// full channel just skips it. Keyed by [`LaneKey`]: redemption is per-lane.
+    redeem_hint: Option<mpsc::Sender<LaneKey>>,
     /// In-memory last-voucher clock shared with `admin_v1_channels`
     /// (issue #749), set at construction via [`ClientHandlerDeps`]. `None` when
     /// no admin surface is wired (e.g. tests) — stamping is best-effort, so the
@@ -635,8 +651,8 @@ impl ClientHandler {
     /// Construct the handler from [`ClientHandlerDeps`], hydrating per-channel
     /// state from the deps' `channel_state_store`.
     ///
-    /// All optional runtime wiring (pull-through deadlines, the window/leech
-    /// providers, …) is supplied on `deps` as
+    /// All optional runtime wiring (settlement redeem hints, pull-through
+    /// deadlines, the window/leech providers, …) is supplied on `deps` as
     /// `Some`/`None` at construction — there is no post-construction attach step,
     /// so a handler's full wiring is one reviewable literal at its call site.
     ///
@@ -654,6 +670,7 @@ impl ClientHandler {
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
                     bytes_delivered_cumulative: bytes,
+                    paid_credited: bytes,
                     active_streams: Arc::new(AtomicU32::new(0)),
                 })),
             );
@@ -678,6 +695,7 @@ impl ClientHandler {
             pool_view: deps.pool_view,
             lanes: Arc::new(Mutex::new(map)),
             lane_metrics_refresh: Mutex::new(()),
+            redeem_hint: deps.redeem_hint,
             voucher_activity: deps.voucher_activity,
             region_accountant: deps.region_accountant,
             pull_through: deps.pull_through,
@@ -848,6 +866,7 @@ impl ClientHandler {
             Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
+                paid_credited: bytes,
                 active_streams: Arc::new(AtomicU32::new(0)),
             }))
         });
@@ -1072,10 +1091,13 @@ impl ClientHandler {
 /// Terminal disposition of one voucher collected by
 /// [`ClientHandler::commit_one_voucher`].
 enum VoucherStop {
-    /// The voucher verified and its watermark advanced in memory; keep serving.
-    Continue,
-    /// The voucher was rejected — the reject frame was written and the stream
-    /// finishes cleanly; the loop returns `Ok(())`.
+    /// Verified and advanced in memory; keep serving. `credited_bytes` is the
+    /// watermark-capped wire bytes to advance the serve loop's `paid` by (rule
+    /// #1) — at most the amount the lane watermark advanced, so a benign
+    /// already-satisfied voucher contributes zero.
+    Continue { credited_bytes: u64 },
+    /// Rejected — the reject frame was written and the stream finishes cleanly;
+    /// the loop returns `Ok(())`.
     Rejected,
 }
 
@@ -1416,6 +1438,7 @@ mod tests {
                     None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
+                paid_credited: U256::ZERO,
                 active_streams: Arc::new(AtomicU32::new(0)),
             })),
         );

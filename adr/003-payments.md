@@ -90,12 +90,14 @@ The contract enforces the per-signer cap, but the cap gives **isolation, not sol
 **Node logic collapses to three lines:**
 
 1. serve while remaining balance `> M`;
-2. batch-redeem lanes when their unredeemed value crosses a redemption threshold `t`;
+2. batch-redeem a chunk of lanes once its aggregate unredeemed value clears a redemption floor `t`;
 3. stop serving at remaining balance `≤ M`.
 
-The threshold `t` is a **gas knob**, not a security parameter: a larger `t` means fewer, fatter redemptions. It is trust-graduated for gas efficiency — a trusted, never-draining pool redeems lazily (large `t`), a fresh pool eagerly (small `t`) — but trust is now purely a gas concern. **`M` is the security parameter.**
+A chunk is one `redeemMany` transaction. The node packs lanes into chunks and submits a chunk only once the aggregate unredeemed value across that chunk's lanes reaches `t`. Every lane in a submitted chunk settles, so a small (dust) lane rides alongside the larger lanes that cleared the floor. The redeemer also splits a sweep into at most `redeem_max_vouchers_per_tx` vouchers per transaction, so no single chunk exceeds the block gas limit.
 
-**Sizing.** `M` covers the worst-case total in-flight, `M ≥ N · t` (fan-out `N` × per-lane threshold `t`). Equivalently `M = k · ρ · B · Δ`, where `ρ` is the price per bandwidth-time (`$0.00125` per Gbps·s at the `$0.01/GB` market rate), `B` is the maximum aggregate bandwidth the pool is defended against (fan-out × per-node throughput), `Δ` is the **detection delay** (how fast nodes notice the balance crossing `M` and stop — chain-dependent; see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)), and `k ≈ 2` is a safety factor. The per-lane threshold is `t = ρ · V · Δ` for a lane serving at bandwidth `V`.
+The floor `t` is a **gas knob**, not a security parameter: a larger `t` means fewer, fatter redemptions. It is trust-graduated for gas efficiency — a trusted, never-draining pool redeems lazily (large `t`), a fresh pool eagerly (small `t`) — but trust is now purely a gas concern. **`M` is the security parameter.**
+
+**Sizing.** `M` covers the worst-case total in-flight, `M ≥ N · t` (fan-out `N` × per-lane threshold `t`). Equivalently `M = k · ρ · B · Δ`, where `ρ` is the price per bandwidth-time (`$0.00125` per Gbps·s at the `$0.01/GB` market rate), `B` is the maximum aggregate bandwidth the pool is defended against (fan-out × per-node throughput), `Δ` is the **detection delay** (how fast nodes notice the balance crossing `M` and stop — chain-dependent; see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)), and `k ≈ 2` is a safety factor. The per-lane threshold is `t = ρ · V · Δ` for a lane serving at bandwidth `V`. A serve-time solvency gate separately bounds per-lane exposure against an over-subscribed pool; its sizing is specified separately.
 
 **`M` kills both the tail and node-vs-node racing.** Racing existed only because a *draining* pool had insufficient funds for everyone; with `M ≥` in-flight there is always enough to pay every outstanding voucher, so no node eats a shortfall and there is nothing to race for. One refundable reserve resolves both, which is why it replaces the whole dynamic-window apparatus.
 

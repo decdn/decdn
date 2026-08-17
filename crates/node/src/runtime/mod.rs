@@ -1191,6 +1191,13 @@ async fn build_chain_and_handlers(
     // is a compliance gate, so a construction site that forgets to wire it must
     // not silently degrade to "deny nothing".
     let content_denylist = reload_state.content_denylist();
+    // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
+    // so the sender can be cloned into the handler deps below while the service
+    // takes the receiver. `redeem_tx` is cloned into the handler deps and also
+    // handed to the service (so `redeem_hint_sender()` keeps working); `redeem_rx`
+    // drives the service's redeemer loop.
+    let (redeem_tx, redeem_rx) =
+        tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1234,6 +1241,9 @@ async fn build_chain_and_handlers(
     // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
     client_deps.credit_max = cfg.payment.credit_max;
     client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
+    // Hint the settlement service on each accepted voucher so a lane's accrued
+    // claim is planned into a chunk promptly rather than waiting the self-tick.
+    client_deps.redeem_hint = Some(redeem_tx.clone());
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1275,10 +1285,13 @@ async fn build_chain_and_handlers(
         Arc::clone(&client_handler),
         capability_source,
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+        usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
+        redeem_tx,
+        redeem_rx,
     )
     .await
     .context("PaymentPool settlement service bootstrap")?;
@@ -3713,6 +3726,7 @@ mod tests {
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
+                redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
                 buyer_initial_deposit_micro_usdc: 10_000_000,
                 buyer_working_deposit_micro_usdc: 10_000_000,

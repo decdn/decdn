@@ -191,16 +191,25 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
     /// be `0` (that would poll every tick); rejected at config resolution.
     pub rate_bounds_poll_interval_sec: Option<u64>,
-    /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the node
-    /// submits an on-chain redeem against the pool (#327, ADR 003 § Operator
-    /// early withdrawal). Larger values amortize gas across more delivery;
-    /// smaller values bound unsettled exposure. Absent => default
-    /// (1 USDC = `1_000_000` `µUSDC`).
+    /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
+    /// early withdrawal). The node submits an on-chain redemption
+    /// transaction for a chunk of lanes only once the aggregate un-redeemed
+    /// value across that chunk's lanes reaches this floor; every lane in a
+    /// submitted chunk settles, so a small (dust) lane rides alongside the
+    /// larger lanes that cleared the floor. Larger values amortize gas
+    /// across more delivery; smaller values bound unsettled exposure.
+    /// Absent => default (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
+    /// Maximum vouchers packed into one `redeemMany` transaction. The redeemer
+    /// splits a sweep across this many vouchers per transaction so a high-fan-out
+    /// node stays under the block gas limit; a chunk that still fails to send
+    /// oversized is halved and retried. Absent => default (`300`). Must not be
+    /// `0`; rejected at config resolution.
+    pub redeem_max_vouchers_per_tx: Option<u64>,
     /// Seconds between the redeemer's self-tick sweeps (#327, #751): the
-    /// low-frequency backstop that scans every pool for an above-threshold
-    /// claim independent of the advisory per-voucher hints, so a dropped hint can
-    /// never strand an accrued balance. Smaller values withdraw earnings sooner
+    /// low-frequency backstop that sweeps every lane and redeems the chunks
+    /// that clear the redemption floor, independent of the advisory per-voucher
+    /// hints, so a dropped hint can never strand an accrued balance. Smaller values withdraw earnings sooner
     /// at the cost of more pool-state reads; larger values lean harder on the
     /// hints. Absent => default (300s / 5 min). Must not be `0`; rejected at
     /// config resolution.

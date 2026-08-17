@@ -122,10 +122,6 @@ const MIB: usize = 1024 * 1024;
 // delivered voucher crosses it and the redeemer submits `redeem`.
 const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
 
-// Redemption is purely periodic (no per-voucher hint): a short self-tick so
-// the seller-path assertions below observe an on-chain `redeem` within their
-// `poll_until` budget instead of production's multi-minute cadence.
-const REDEEM_INTERVAL: Duration = Duration::from_secs(2);
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path
 // Warp past any governable pool grace window so `reclaim` is permitted on-chain
@@ -531,7 +527,13 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher: voucher_dom.clone(),
         binding: bind_domain.clone(),
     };
+    // Redeem-hint channel, created by the caller (the settlement service no longer
+    // mints it): the sender is wired into the handler at construction, the
+    // receiver drives the service's redeemer loop.
+    let (redeem_tx, redeem_rx) =
+        tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
     let handler = {
+        let hint = redeem_tx.clone();
         let cap_store = Arc::clone(&concrete_store);
         let view_provider = node_provider.clone();
         build_handler_full_configured(
@@ -546,6 +548,7 @@ async fn run_e2e() -> anyhow::Result<()> {
             0,
             16,
             move |deps| {
+                deps.redeem_hint = Some(hint);
                 // Owner-signed capability intake: the serve gate persists a
                 // presented capability so the redeemer registers the signer on
                 // its first redemption.
@@ -575,10 +578,13 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         capability_source,
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
-        REDEEM_INTERVAL,
+        300,
+        Duration::from_secs(300),
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
+        redeem_tx,
+        redeem_rx,
     )
     .await?;
 
