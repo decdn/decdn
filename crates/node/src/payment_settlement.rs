@@ -1291,6 +1291,25 @@ impl KeyedCheckpointStore for DebouncedCheckpointStore {
     }
 }
 
+/// Whether a `redeemMany` send error looks like "the transaction is too big to
+/// include" — exceeding the block gas limit or the node/mempool transaction-size
+/// cap — rather than a revert or a transient RPC fault. Matched case-insensitively
+/// against a small set of client markers; the caller also bounds retry depth, so a
+/// false negative simply leaves the claim for the next sweep and a false positive
+/// costs at most a bounded number of doomed smaller sends.
+#[allow(dead_code)] // wired into the chunked submit path in a later task
+fn is_oversize_send_err(msg: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "gas required exceeds",
+        "exceeds block gas limit",
+        "oversized data",
+        "transaction too large",
+        "request entity too large",
+    ];
+    let m = msg.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| m.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,5 +1564,24 @@ mod tests {
         // A flush forces the buffered block out durably (the shutdown path).
         let _ = deb.flush_checkpoint(key);
         assert_eq!(load(&inner), Some(8));
+    }
+
+    #[test]
+    fn is_oversize_send_err_matches_known_markers() {
+        for m in [
+            "err: gas required exceeds allowance (30000000)",
+            "transaction exceeds block gas limit",
+            "oversized data",
+            "TRANSACTION TOO LARGE",
+        ] {
+            assert!(is_oversize_send_err(m), "should flag: {m}");
+        }
+    }
+
+    #[test]
+    fn is_oversize_send_err_ignores_unrelated_errors() {
+        for m in ["nonce too low", "connection refused", "execution reverted"] {
+            assert!(!is_oversize_send_err(m), "should not flag: {m}");
+        }
     }
 }
