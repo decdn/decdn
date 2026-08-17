@@ -1257,6 +1257,7 @@ async fn build_chain_and_handlers(
         Arc::clone(&client_handler),
         capability_source,
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+        usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         event_poll_interval,
         Arc::clone(&head),

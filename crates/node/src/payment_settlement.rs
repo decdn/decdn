@@ -34,7 +34,7 @@
 //! poll retry — the paid-watermark watcher via its `WatcherHandle`, the redeemer
 //! via a [`JoinHandle`] aborted on shutdown or drop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,12 @@ pub const REDEEM_HINT_CAPACITY: usize = 256;
 /// non-fatal failure (the tx may still mine later; the claim is at worst deferred,
 /// never double-spent, because the on-chain lane watermark is monotone).
 const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Bound on the reactive halve-and-retry when a chunk fails to send oversized.
+/// A default-sized chunk (300) sits far under the block-gas ceiling, so a real
+/// oversize needs at most one or two halvings; this caps the worst-case fan-out
+/// (a transient error mis-flagged as oversize) at 2^6 doomed sub-sends.
+const MAX_SPLIT_DEPTH: u32 = 6;
 
 /// Current Unix time in seconds for on-chain deadline comparisons. A broken
 /// system clock (time before the epoch) yields `0`, which makes every pool look
@@ -200,6 +206,7 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     paid: PaidWatermarks,
     self_address: Address,
     redeem_threshold: U256,
+    redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
     /// The paid-watermark watcher, owning both its task and the shutdown token
     /// that stops it. Held (not `_`-dropped) so graceful `shutdown()` runs before
@@ -232,6 +239,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         handler: Arc<ClientHandler>,
         capabilities: Arc<dyn CapabilitySource>,
         redeem_threshold: U256,
+        redeem_max_vouchers_per_tx: usize,
         redeem_interval: Duration,
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
@@ -271,6 +279,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             paid: paid.clone(),
             capabilities: Arc::clone(&capabilities),
             redeem_tx: redeem_tx.clone(),
+            redeem_max_vouchers_per_tx,
             metrics: Arc::clone(&metrics),
         };
         let cfg = WatcherConfig::new(
@@ -309,6 +318,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             paid.clone(),
             self_address,
             redeem_threshold,
+            redeem_max_vouchers_per_tx,
             redeem_interval,
             redeem_rx,
             Arc::clone(&metrics),
@@ -322,6 +332,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             paid,
             self_address,
             redeem_threshold,
+            redeem_max_vouchers_per_tx,
             metrics,
             watcher,
             redeemer: std::sync::Mutex::new(Some(redeemer)),
@@ -366,6 +377,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             &self.paid,
             self.self_address,
             self.redeem_threshold,
+            self.redeem_max_vouchers_per_tx,
             &self.metrics,
         )
         .await;
@@ -503,6 +515,7 @@ struct PoolSettlementSink<P: Provider + Clone> {
     paid: PaidWatermarks,
     capabilities: Arc<dyn CapabilitySource>,
     redeem_tx: mpsc::Sender<LaneKey>,
+    redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
 }
 
@@ -580,6 +593,7 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                     self.self_address,
                     event.poolId,
                     saturating_u64(event.disputeDeadline),
+                    self.redeem_max_vouchers_per_tx,
                     &self.metrics,
                 )
                 .await;
@@ -662,7 +676,7 @@ fn saturating_u64(v: U256) -> u64 {
 /// per-lane failure is logged and never propagated. Forces redemption regardless
 /// of the threshold — a node that has not redeemed by the deadline forfeits its
 /// outstanding vouchers.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 async fn redeem_pool_on_close<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -671,6 +685,7 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
     self_address: Address,
     pool_id: PoolId,
     dispute_deadline: u64,
+    max_vouchers: usize,
     metrics: &Arc<Metrics>,
 ) {
     if is_expired(unix_now(), dispute_deadline) {
@@ -684,22 +699,22 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
             return;
         }
     };
+    let mut plans: Vec<PlannedLane> = Vec::new();
     for st in states {
         if st.pool_id != pool_id || st.provider != self_address {
             continue;
         }
-        redeem_one(
-            contract,
-            store,
-            capabilities,
-            paid,
-            self_address,
-            U256::ZERO, // force: any unredeemed balance is worth redeeming before reclaim
-            st.key(),
-            metrics,
-        )
-        .await;
+        match plan_redeem(contract, store, capabilities, paid, self_address, st.key()).await {
+            Ok(Some(lane)) => plans.push(lane),
+            Ok(None) => {}
+            Err(err) => {
+                metrics.redemption_failure();
+                warn!(err = %sanitize_rpc_display(&err), %pool_id, "close-redeem planning failed");
+            }
+        }
     }
+    // Force: any non-zero unredeemed balance is worth redeeming before reclaim.
+    redeem_planned_lanes(contract, plans, U256::ZERO, max_vouchers, metrics).await;
 }
 
 /// Redemption task: `redeem` a lane's accrued claim once it crosses the
@@ -715,6 +730,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     paid: PaidWatermarks,
     self_address: Address,
     redeem_threshold: U256,
+    max_vouchers: usize,
     redeem_interval: Duration,
     mut redeem_rx: mpsc::Receiver<LaneKey>,
     metrics: Arc<Metrics>,
@@ -729,7 +745,7 @@ async fn redeemer_loop<P: Provider + Clone>(
                 Some(key) => {
                     redeem_one(
                         &contract, &store, &capabilities, &paid, self_address,
-                        redeem_threshold, key, &metrics,
+                        redeem_threshold, max_vouchers, key, &metrics,
                     )
                     .await;
                 }
@@ -739,7 +755,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             _ = ticker.tick() => {
                 redeem_sweep(
                     &contract, &store, &capabilities, &paid, self_address,
-                    redeem_threshold, &metrics,
+                    redeem_threshold, max_vouchers, &metrics,
                 )
                 .await;
             }
@@ -748,23 +764,9 @@ async fn redeemer_loop<P: Provider + Clone>(
     debug!("PaymentPool redeemer loop ended (all hint senders dropped)");
 }
 
-/// The outcome of evaluating one lane for redemption, without yet submitting.
-enum RedeemPlan {
-    /// Nothing to redeem: below threshold, not this node's, no signature, an
-    /// unredeemed balance of zero, or an unregisterable signer.
-    Skip,
-    /// This lane's highest voucher should be redeemed. `register` is `Some` on the
-    /// signer's first redemption (attach the capability) and `None` afterward.
-    Redeem {
-        voucher: Box<PaymentPool::LaneVoucher>,
-        register: Option<PaymentPool::CapabilityReg>,
-    },
-}
-
 /// One lane planned for redemption: its pool, its unredeemed value (for the
 /// per-chunk floor), the highest voucher to submit, and — on the signer's first
 /// redemption — the owner-signed capability to register.
-#[allow(dead_code)] // wired into the chunked submit path in a later task
 struct PlannedLane {
     pool_id: PoolId,
     unredeemed: U256,
@@ -777,7 +779,6 @@ struct PlannedLane {
 /// write across its lanes. A lane's capability registration (present only on a
 /// signer's first redemption) rides in its pool's batch; each `(pool, signer)`
 /// lane is distinct, so no capability is ever duplicated within a batch.
-#[allow(dead_code)] // wired into the chunked submit path in a later task
 fn group_by_pool(lanes: &[PlannedLane]) -> Vec<PaymentPool::PoolBatch> {
     let mut order: Vec<PoolId> = Vec::new();
     let mut by_pool: HashMap<PoolId, PaymentPool::PoolBatch> = HashMap::new();
@@ -809,7 +810,6 @@ fn group_by_pool(lanes: &[PlannedLane]) -> Vec<PaymentPool::PoolBatch> {
 /// respects `max_vouchers`, and high-value lanes are dealt round-robin across the
 /// chunks so dust rides alongside real value instead of segregating into a
 /// below-floor chunk.
-#[allow(dead_code)] // wired into the chunked submit path in a later task
 fn chunk_redemptions(
     mut plans: Vec<PlannedLane>,
     floor: U256,
@@ -842,44 +842,39 @@ fn chunk_redemptions(
 }
 
 /// Read the lane's persisted highest voucher and its cached paid watermark; if
-/// `owed − paid` meets `threshold` and the lane is still redeemable, return the
-/// voucher (plus a capability registration on the signer's first redemption). A
-/// `threshold` of `U256::ZERO` forces any non-zero unredeemed balance (the
-/// close-monitor path). This does the per-lane chain read (`getAuthorization`) but
-/// submits nothing itself, so it is the shared error-isolation boundary: the sweep
-/// runs it per lane and drops only a failing leg from the batch.
+/// the lane is this node's, signed, and has a non-zero unredeemed balance, return
+/// a `PlannedLane` (with a capability registration on the signer's first
+/// redemption). No value threshold is applied here — the per-chunk floor is the
+/// caller's, so a small lane is still planned and only dropped if its chunk
+/// cannot clear the floor. This does the per-lane chain read (`getAuthorization`)
+/// but submits nothing, so it is the shared error-isolation boundary: a sweep runs
+/// it per lane and drops only a failing leg.
 async fn plan_redeem<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
     capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
-    threshold: U256,
     key: LaneKey,
-) -> Result<RedeemPlan> {
+) -> Result<Option<PlannedLane>> {
     let Some(st) = store.get(key).context("load lane state for redemption")? else {
-        // Lane not (yet) persisted — e.g. a hint raced the voucher-accept commit.
-        return Ok(RedeemPlan::Skip);
+        return Ok(None);
     };
-    // Defensive: only redeem lanes this node provides, with a signed voucher.
     if st.provider != self_address {
-        return Ok(RedeemPlan::Skip);
+        return Ok(None);
     }
     let Some(sig_bytes) = st.last_signature() else {
-        return Ok(RedeemPlan::Skip);
+        return Ok(None);
     };
     let owed = st.last_amount();
     if owed.is_zero() {
-        return Ok(RedeemPlan::Skip);
+        return Ok(None);
     }
     let unredeemed = owed.saturating_sub(paid.get(&key));
-    if unredeemed.is_zero() || unredeemed < threshold {
-        return Ok(RedeemPlan::Skip);
+    if unredeemed.is_zero() {
+        return Ok(None);
     }
 
-    // Register-once: a signer with `cap == 0` on-chain is not yet registered, so
-    // the redemption must carry the owner-signed capability. Without the material
-    // the signer cannot be registered and the lane is skipped until it arrives.
     let auth = contract
         .getAuthorization(key.pool_id, key.signer)
         .call()
@@ -892,7 +887,7 @@ async fn plan_redeem<P: Provider + Clone>(
                 signer = %key.signer,
                 "signer not registered on-chain and no capability held; skipping redemption"
             );
-            return Ok(RedeemPlan::Skip);
+            return Ok(None);
         };
         Some(PaymentPool::CapabilityReg {
             signer: key.signer,
@@ -904,27 +899,26 @@ async fn plan_redeem<P: Provider + Clone>(
         None
     };
 
-    // The voucher names neither its pool (the enclosing `PoolBatch` does) nor
-    // its payee: `redeemMany` redeems for `msg.sender` and rebuilds the EIP-712
-    // hash with it, so `key.provider` is already pinned by the signature this
-    // lane holds.
     let (r, vs) =
         compact_voucher_signature(sig_bytes).context("compact the lane's voucher signature")?;
-    let voucher = Box::new(PaymentPool::LaneVoucher {
+    let voucher = PaymentPool::LaneVoucher {
         signer: key.signer,
         cumulative: to_pool_u64(owed, "voucher cumulative")?,
         bytesDelivered: to_pool_u64(st.last_bytes_delivered(), "voucher bytes delivered")?,
         r,
         vs,
-    });
-    Ok(RedeemPlan::Redeem { voucher, register })
+    };
+    Ok(Some(PlannedLane {
+        pool_id: key.pool_id,
+        unredeemed,
+        voucher,
+        register,
+    }))
 }
 
-/// Hint-path (and close-path) redemption: plan one lane and, if it wants a
-/// redeem, submit it as a one-entry `redeemMany`. `redeemMany` is the only
-/// redemption entry point, so a single lane is simply a batch of one. Does NOT
-/// seed the paid cache: the `PoolRedeemed` event this tx emits is the single
-/// write path for the paid side.
+/// Hint-path redemption: plan one lane and, if it clears the per-chunk `floor`,
+/// submit it as a one-lane `redeemMany`. A sub-floor hint defers to the next
+/// sweep, which packs it with other lanes.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -932,21 +926,12 @@ async fn redeem_one<P: Provider + Clone>(
     capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
-    threshold: U256,
+    floor: U256,
+    max_vouchers: usize,
     key: LaneKey,
     metrics: &Arc<Metrics>,
 ) {
-    let plan = match plan_redeem(
-        contract,
-        store,
-        capabilities,
-        paid,
-        self_address,
-        threshold,
-        key,
-    )
-    .await
-    {
+    let plan = match plan_redeem(contract, store, capabilities, paid, self_address, key).await {
         Ok(plan) => plan,
         Err(err) => {
             metrics.redemption_failure();
@@ -954,43 +939,26 @@ async fn redeem_one<P: Provider + Clone>(
             return;
         }
     };
-    let RedeemPlan::Redeem { voucher, register } = plan else {
+    let Some(lane) = plan else {
         return;
     };
-    submit_redeem_many(
-        contract,
-        vec![PaymentPool::PoolBatch {
-            poolId: key.pool_id,
-            capabilities: register.into_iter().collect(),
-            vouchers: vec![*voucher],
-        }],
-        metrics,
-    )
-    .await;
+    redeem_planned_lanes(contract, vec![lane], floor, max_vouchers, metrics).await;
 }
 
-/// Self-tick sweep: scan every persisted lane, plan each one, then bucket the
-/// results **by pool** into one [`PaymentPool::PoolBatch`] each and submit ONE
-/// `redeemMany` for the whole tick (ADR 003 § Batch redemption). Within a pool,
-/// registration is decoupled from the voucher: a skipped voucher never loses a
-/// registration, and the contract skips a transient-empty voucher rather than
-/// reverting.
-///
-/// The bucketing is not a convenience — the contract charges the pool's status
-/// read and its `totalRedeemed` write once per group, so a pool's lanes must
-/// arrive together to get that. Buckets are keyed in insertion order so a tick's
-/// batch is deterministic for a given store ordering.
-///
-/// Per-lane error isolation runs through the **planning** phase: each lane's
-/// load / `getAuthorization` / threshold check runs independently and a failure
-/// drops only that leg. A store-load failure logs and skips this tick.
+/// Self-tick sweep: scan every persisted lane, plan each (per-lane error
+/// isolation through the planning phase), then chunk the survivors under the
+/// per-chunk floor + voucher-count cap and submit each chunk as its own
+/// `redeemMany`. Value is spread across chunks so dust settles alongside real
+/// value; a chunk that cannot clear the floor defers to a later tick.
+#[allow(clippy::too_many_arguments)]
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
     capabilities: &Arc<dyn CapabilitySource>,
     paid: &PaidWatermarks,
     self_address: Address,
-    redeem_threshold: U256,
+    floor: U256,
+    max_vouchers: usize,
     metrics: &Arc<Metrics>,
 ) {
     let states = match store.load_all() {
@@ -1000,70 +968,40 @@ async fn redeem_sweep<P: Provider + Clone>(
             return;
         }
     };
-    // Insertion-ordered so the submitted batch is deterministic: `order` keeps
-    // the pools in the sequence the store yielded them.
-    let mut batches: HashMap<PoolId, PaymentPool::PoolBatch> = HashMap::new();
-    let mut order: Vec<PoolId> = Vec::new();
-    let mut seen_signers: HashSet<(PoolId, Address)> = HashSet::new();
+    let mut plans: Vec<PlannedLane> = Vec::new();
     for st in states {
         let key = st.key();
-        match plan_redeem(
-            contract,
-            store,
-            capabilities,
-            paid,
-            self_address,
-            redeem_threshold,
-            key,
-        )
-        .await
-        {
-            Ok(RedeemPlan::Skip) => {}
-            Ok(RedeemPlan::Redeem { voucher, register }) => {
-                let batch = batches.entry(key.pool_id).or_insert_with(|| {
-                    order.push(key.pool_id);
-                    PaymentPool::PoolBatch {
-                        poolId: key.pool_id,
-                        capabilities: Vec::new(),
-                        vouchers: Vec::new(),
-                    }
-                });
-                if let Some(reg) = register
-                    && seen_signers.insert((key.pool_id, reg.signer))
-                {
-                    batch.capabilities.push(reg);
-                }
-                batch.vouchers.push(*voucher);
-            }
+        match plan_redeem(contract, store, capabilities, paid, self_address, key).await {
+            Ok(Some(lane)) => plans.push(lane),
+            Ok(None) => {}
             Err(err) => {
                 metrics.redemption_failure();
                 warn!(err = %sanitize_rpc_display(&err), pool_id = %key.pool_id, "redemption planning failed");
             }
         }
     }
-    if order.is_empty() {
-        return;
-    }
-    let grouped: Vec<PaymentPool::PoolBatch> = order
-        .into_iter()
-        .filter_map(|pool_id| batches.remove(&pool_id))
-        .collect();
-    submit_redeem_many(contract, grouped, metrics).await;
+    redeem_planned_lanes(contract, plans, floor, max_vouchers, metrics).await;
 }
 
-/// Submit one `redeemMany` for the tick's per-pool batches. Does NOT seed the
-/// paid cache: each paid voucher emits its own `PoolRedeemed`, the single write
-/// path for the paid side. A call that reverts (a structurally invalid entry —
-/// bad signature, bad owner-signature, closed pool) or fails to send records one
-/// `redemption_failure`; the next tick re-prepares and retries.
+/// Submit one chunk of planned lanes as a single `redeemMany`. On an oversize
+/// send failure (`is_oversize_send_err`) with more than one lane, halve the chunk
+/// and retry each half, bounded by `MAX_SPLIT_DEPTH`. A revert / receipt failure /
+/// timeout / non-oversize send error records one `redemption_failure` and leaves
+/// the claims for the next sweep (cumulative, monotone, retry-safe). Does NOT seed
+/// the paid cache — each paid voucher emits its own `PoolRedeemed`.
 #[allow(clippy::cognitive_complexity)]
-async fn submit_redeem_many<P: Provider + Clone>(
+async fn submit_chunk<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    batches: Vec<PaymentPool::PoolBatch>,
+    mut lanes: Vec<PlannedLane>,
     metrics: &Arc<Metrics>,
+    depth: u32,
 ) {
+    if lanes.is_empty() {
+        return;
+    }
+    let batches = group_by_pool(&lanes);
     let cap_count: usize = batches.iter().map(|b| b.capabilities.len()).sum();
-    let voucher_count: usize = batches.iter().map(|b| b.vouchers.len()).sum();
+    let voucher_count = lanes.len();
     let pool_count = batches.len();
     let sent = contract.redeemMany(batches).send().await;
     match send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT)).await {
@@ -1076,13 +1014,23 @@ async fn submit_redeem_many<P: Provider + Clone>(
                 "batched lane redemption landed (redeemMany)"
             );
         }
-        TxOutcome::Reverted(receipt) => {
-            metrics.redemption_failure();
+        TxOutcome::SendErr(err)
+            if lanes.len() >= 2
+                && depth < MAX_SPLIT_DEPTH
+                && is_oversize_send_err(&err.to_string()) =>
+        {
+            let mid = lanes.len() / 2;
+            let right = lanes.split_off(mid);
             warn!(
                 voucher_count,
-                tx = %receipt.transaction_hash,
-                "redeemMany reverted on-chain; leaving claims for retry"
+                depth, "redeemMany send rejected oversized; halving chunk and retrying"
             );
+            Box::pin(submit_chunk(contract, lanes, metrics, depth + 1)).await;
+            Box::pin(submit_chunk(contract, right, metrics, depth + 1)).await;
+        }
+        TxOutcome::Reverted(receipt) => {
+            metrics.redemption_failure();
+            warn!(voucher_count, tx = %receipt.transaction_hash, "redeemMany reverted on-chain; leaving claims for retry");
         }
         TxOutcome::SendErr(err) => {
             metrics.redemption_failure();
@@ -1094,12 +1042,22 @@ async fn submit_redeem_many<P: Provider + Clone>(
         }
         TxOutcome::Timeout => {
             metrics.redemption_failure();
-            warn!(
-                voucher_count,
-                timeout = ?REDEEM_RECEIPT_TIMEOUT,
-                "redeemMany receipt wait elapsed; leaving claims for retry"
-            );
+            warn!(voucher_count, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out; leaving claims for retry");
         }
+    }
+}
+
+/// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
+/// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
+async fn redeem_planned_lanes<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    plans: Vec<PlannedLane>,
+    floor: U256,
+    max_vouchers: usize,
+    metrics: &Arc<Metrics>,
+) {
+    for chunk in chunk_redemptions(plans, floor, max_vouchers) {
+        submit_chunk(contract, chunk, metrics, 0).await;
     }
 }
 
@@ -1297,7 +1255,6 @@ impl KeyedCheckpointStore for DebouncedCheckpointStore {
 /// against a small set of client markers; the caller also bounds retry depth, so a
 /// false negative simply leaves the claim for the next sweep and a false positive
 /// costs at most a bounded number of doomed smaller sends.
-#[allow(dead_code)] // wired into the chunked submit path in a later task
 fn is_oversize_send_err(msg: &str) -> bool {
     const MARKERS: [&str; 5] = [
         "gas required exceeds",
