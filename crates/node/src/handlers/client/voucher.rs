@@ -210,7 +210,7 @@ impl ClientHandler {
         };
 
         // Validate + advance the lane state in memory. `stage_voucher` never
-        // touches a store, so it can never surface `RetryLater` here.
+        // touches a store, so `Err(RetrySignal)` below can never surface here.
         match state.stage_voucher(&signed, &self.voucher_domain) {
             Ok((next_state, _applied)) => Ok(VerifiedVoucher {
                 next_state,
@@ -220,10 +220,15 @@ impl ClientHandler {
             Err(e) => {
                 // Map to the wire reject reason. `Err(RetrySignal)` (a transient
                 // store failure) cannot occur here — `stage_voucher` touches no
-                // store — so a defensive fallback maps it to `RetryLater`.
+                // store — so this is defensive: abort the stream rather than
+                // inventing a wire reason for a fault this path cannot produce.
                 let reason = match voucher_reject_reason(&e) {
                     Ok(reason) => reason,
-                    Err(RetrySignal) => VoucherRejectReason::RetryLater,
+                    Err(RetrySignal) => {
+                        return Err(VerifyStop::Bail(
+                            "stage_voucher touches no store; unexpected RetrySignal".to_string(),
+                        ));
+                    }
                 };
                 // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
                 // reason whose rejected voucher recovers to the pinned signer,

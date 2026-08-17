@@ -6,8 +6,9 @@
 //! channel state advances; the error paths prove a zero-rate response is
 //! rejected on receive (#252), an unknown channel is cleanly rejected with
 //! `VoucherRejected { WrongChannel }` (the #327 boundary), and a transient
-//! persist-write failure is cleanly rejected with `VoucherRejected { RetryLater }`
-//! (ADR 003 §332) rather than dropping the connection.
+//! persist-write failure cleanly ABORTS the stream (ADR 003 §332) — no in-band
+//! reject reason, just a clean finish — so the client resends the same voucher
+//! on a fresh stream.
 //!
 //! Delivery/authorization gates also covered: `BlobTooLarge` (size gate),
 //! `EvictedSinceProbe` (evicted between probe and stream), the client-binding
