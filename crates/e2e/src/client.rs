@@ -420,8 +420,8 @@ impl ClientFixture {
     /// Deliberately never pays, which bounds what it can see. The node streams
     /// `StreamResponse` + every `ChunkData` up to the voucher interval and then
     /// blocks on payment, so for a sub-interval blob this captures **every
-    /// message the node emits before it blocks** — but never `VoucherAck` or
-    /// `StreamEnd`, which are emitted only after a voucher arrives. The capture
+    /// message the node emits before it blocks** — but never `StreamEnd`,
+    /// which is emitted only after a voucher arrives. The capture
     /// ends when the node falls silent for a few seconds (that payment pause) or
     /// the stream closes cleanly.
     ///
