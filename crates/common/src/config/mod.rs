@@ -75,14 +75,22 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// amount while bounding unsettled exposure to ~1 USDC per pool (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default redemption chunk size: 300 vouchers per `redeemMany` transaction.
-/// `test_redeemMany_gas_NVouchers` / `test_redeemMany_gas_NPlus1Vouchers`
-/// (contracts/test/PaymentPool.t.sol) pin the marginal on-chain gas of one
-/// added cold-lane voucher at ~34.5k gas. Against Arbitrum One's block gas
-/// limit (~32M gas, an external reference — confirm live via
-/// `eth_getBlockByNumber` before leaning on it for a deploy decision),
-/// spending half the block on one `redeemMany` call bounds a safe chunk at
-/// roughly 458 vouchers, so 300 clears with about 1.5x headroom for
-/// sequencer-variance cost.
+/// The benchmarks in `contracts/test/PaymentPool.t.sol` pin two marginals for
+/// one added cold-lane voucher: ~34.5k gas when the signer is already
+/// registered (`test_redeemMany_gas_N…`), and ~63.4k gas when the signer is
+/// first-time and its capability registers in the same call
+/// (`test_redeemMany_gas_firstTime_N…`). A high-fan-out node serving one-time
+/// payers hits the first-time case on every lane, so ~63.4k is the sizing
+/// figure. Registration cost is bounded: the node only redeems capabilities
+/// whose owner signature it verified off-chain against an EOA pool owner
+/// (`ClientHandler::intake_capability` rejects contract/ERC-1271 owners), so no
+/// unbounded owner-signature verification enters a `redeemMany`. Against
+/// Arbitrum One's block gas limit (~32M gas, an external reference — confirm
+/// live via `eth_getBlockByNumber` before a deploy decision), 300 first-time
+/// lanes cost ~19M gas: they fit a full block (the first-time ceiling is ~504
+/// lanes) but exceed a conservative half-block budget (~252 lanes). The
+/// reactive halve-retry in `submit_chunk` splits any chunk that a live block
+/// still rejects, so 300 stays safe with that backstop.
 const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
