@@ -80,13 +80,10 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> WireVoucher {
 ///
 /// [`PoolError::Store`] is the only transient failure: in-memory state did not
 /// advance, so it returns [`RetrySignal`] rather than a permanent reason. The
-/// `cdn/client/v1` handler surfaces that signal on the wire as
-/// [`VoucherRejectReason::RetryLater`] (sent in-band, then the stream is finished
-/// cleanly), so the client resends the **same** voucher on a fresh stream instead
-/// of seeing an opaque connection drop (ADR 003 §Off-chain voucher state
-/// persistence). `RetryLater` has no `PoolError` counterpart here — it is produced
-/// by the handler from the `Err(RetrySignal)` arm, not by this mapping. Every
-/// other variant is a permanent rejection.
+/// `cdn/client/v1` handler surfaces that signal by aborting the stream (no
+/// in-band wire reason), so the client resends the **same** voucher on a
+/// fresh stream (ADR 003 §Off-chain voucher state persistence). Every other
+/// variant is a permanent rejection.
 pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReason, RetrySignal> {
     match err {
         PoolError::WrongPool { .. } => Ok(VoucherRejectReason::WrongPool),
@@ -100,9 +97,9 @@ pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReaso
         PoolError::Signature(VoucherError::WrongSigner { .. }) => {
             Ok(VoucherRejectReason::WrongSigner)
         }
-        // Transient — in-memory state unchanged. The handler emits this on the
-        // wire as `VoucherRejectReason::RetryLater`; the client resends the same
-        // voucher (#527, ADR 003 §Off-chain voucher state persistence).
+        // Transient — in-memory state unchanged. The handler aborts the stream
+        // rather than emitting an in-band wire reason; the client resends the
+        // same voucher (ADR 003 §Off-chain voucher state persistence).
         PoolError::Store(_) => Err(RetrySignal),
     }
 }
@@ -116,10 +113,9 @@ pub enum WireVoucherError {
 }
 
 /// Signals that a [`PoolError`] was transient ([`PoolError::Store`]): in-memory
-/// state did not advance, so the caller surfaces it as a
-/// [`VoucherRejectReason::RetryLater`] in-band rejection (no ack) and the client
-/// resends the **same** voucher on a fresh stream (#527, ADR 003) —
-/// distinguishable from a permanent rejection or a network drop.
+/// state did not advance, so the caller aborts the stream (no in-band wire
+/// reason) and the client resends the **same** voucher on a fresh stream (ADR
+/// 003) — distinguishable from a permanent rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetrySignal;
 

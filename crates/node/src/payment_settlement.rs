@@ -23,7 +23,9 @@
 //!   the planned lanes into chunks, and submits a chunk — one `redeemMany` —
 //!   only once the aggregate unredeemed value across that chunk's lanes clears
 //!   a configurable floor, so a dropped hint never strands a lane whose chunk
-//!   has cleared the floor.
+//!   has cleared the floor. The node flushes the lane store durable after
+//!   planning a chunk and before submitting it, so post-crash on-disk
+//!   `owed ≥ submitted`.
 //! - **Close monitor.** A pool is owner-closed only. On a `PoolCloseInitiated`
 //!   for a pool this node holds lanes against, the monitor redeems its highest
 //!   voucher per lane before `disputeDeadline` (ADR 003 § Owner reclaims before a
@@ -376,6 +378,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// floor, so shutdown secures earnings the next boot would otherwise wait a
     /// hint/sweep to collect.
     async fn final_redeem_sweep(&self) {
+        // Shutdown redeems regardless of a flush failure (`strict_flush` false):
+        // forfeiting the claim across the stop is worse than a bounded re-serve
+        // risk, matching the close path.
         redeem_sweep(
             &self.contract,
             &self.store,
@@ -384,6 +389,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             self.self_address,
             self.redeem_threshold,
             self.redeem_max_vouchers_per_tx,
+            false,
             &self.metrics,
         )
         .await;
@@ -720,7 +726,18 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
         }
     }
     // Force: any non-zero unredeemed balance is worth redeeming before reclaim.
-    redeem_planned_lanes(contract, plans, U256::ZERO, max_vouchers, metrics).await;
+    // The close path redeems regardless of a flush failure — forfeiting the claim
+    // at the deadline is worse than a bounded re-serve risk (`strict_flush` false).
+    redeem_planned_lanes(
+        contract,
+        store,
+        plans,
+        U256::ZERO,
+        max_vouchers,
+        false,
+        metrics,
+    )
+    .await;
 }
 
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
@@ -762,7 +779,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             _ = ticker.tick() => {
                 redeem_sweep(
                     &contract, &store, &capabilities, &paid, self_address,
-                    redeem_threshold, max_vouchers, &metrics,
+                    redeem_threshold, max_vouchers, true, &metrics,
                 )
                 .await;
             }
@@ -949,7 +966,18 @@ async fn redeem_one<P: Provider + Clone>(
     let Some(lane) = plan else {
         return;
     };
-    redeem_planned_lanes(contract, vec![lane], floor, max_vouchers, metrics).await;
+    // Hint path: require the durability floor and skip the submit on a failed
+    // flush (`strict_flush`); the lane defers to the next sweep.
+    redeem_planned_lanes(
+        contract,
+        store,
+        vec![lane],
+        floor,
+        max_vouchers,
+        true,
+        metrics,
+    )
+    .await;
 }
 
 /// Self-tick sweep: scan every persisted lane, plan each (per-lane error
@@ -966,6 +994,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     self_address: Address,
     floor: U256,
     max_vouchers: usize,
+    strict_flush: bool,
     metrics: &Arc<Metrics>,
 ) {
     let states = match store.load_all() {
@@ -987,7 +1016,16 @@ async fn redeem_sweep<P: Provider + Clone>(
             }
         }
     }
-    redeem_planned_lanes(contract, plans, floor, max_vouchers, metrics).await;
+    redeem_planned_lanes(
+        contract,
+        store,
+        plans,
+        floor,
+        max_vouchers,
+        strict_flush,
+        metrics,
+    )
+    .await;
 }
 
 /// Submit one chunk of planned lanes as a single `redeemMany`. On an oversize
@@ -1054,16 +1092,55 @@ async fn submit_chunk<P: Provider + Clone>(
     }
 }
 
+/// Flush the lane store durable off the async worker (the fsync must not block a
+/// runtime worker). Returns `true` on success; a failure is metered and logged.
+/// A redeem that requires the redeemed-watermark floor (the periodic sweep) skips
+/// its submit when this returns `false`; the forced close/shutdown paths proceed.
+async fn flush_store_durable(store: &Arc<dyn PoolStateStore>, metrics: &Arc<Metrics>) -> bool {
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || store.flush()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            metrics.lane_flush_failure();
+            warn!(%err, "pre-redeem lane store flush failed; deferring redeem");
+            false
+        }
+        Err(join_err) => {
+            metrics.lane_flush_failure();
+            warn!(%join_err, "pre-redeem lane store flush task join failed");
+            false
+        }
+    }
+}
+
 /// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
 /// each chunk. `floor == U256::ZERO` forces every lane (the close/shutdown path).
+///
+/// Floors the redeemed watermark first: flushes the lane store durable AFTER the
+/// lanes were planned (their cumulative amounts already read) and BEFORE any
+/// chunk goes on-chain, so a crash right after a submit still finds on-disk
+/// `owed ≥ submitted` (`record` is monotone, so the flush persists at least every
+/// value in the batch). The periodic sweep and hint path require this floor and
+/// skip their submit on a failed flush (`strict_flush`); the forced
+/// close/shutdown paths redeem regardless, since forfeiting the whole claim at the
+/// deadline is worse than a bounded re-serve risk.
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &Arc<dyn PoolStateStore>,
     plans: Vec<PlannedLane>,
     floor: U256,
     max_vouchers: usize,
+    strict_flush: bool,
     metrics: &Arc<Metrics>,
 ) {
-    for chunk in chunk_redemptions(plans, floor, max_vouchers) {
+    let chunks = chunk_redemptions(plans, floor, max_vouchers);
+    if chunks.is_empty() {
+        return;
+    }
+    if !flush_store_durable(store, metrics).await && strict_flush {
+        return;
+    }
+    for chunk in chunks {
         submit_chunk(contract, chunk, metrics, 0).await;
     }
 }

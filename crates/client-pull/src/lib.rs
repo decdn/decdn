@@ -610,9 +610,9 @@ pub struct UpstreamVoucherRejected {
 impl std::fmt::Display for UpstreamVoucherRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The `{:?}` rendering of the reason is load-bearing: the loopback tests
-        // assert `.contains("RetryLater")` / `.contains("Expired")` on this string.
-        // A custom `Display` for `VoucherRejectReason` would have to reproduce the
-        // variant names verbatim, so keep the Debug rendering here.
+        // assert `.contains("CapExceeded")` / `.contains("Expired")`-style substrings
+        // on this string. A custom `Display` for `VoucherRejectReason` would have to
+        // reproduce the variant names verbatim, so keep the Debug rendering here.
         write!(f, "voucher rejected: {:?}", self.reason)
     }
 }
