@@ -761,6 +761,46 @@ enum RedeemPlan {
     },
 }
 
+/// One lane planned for redemption: its pool, its unredeemed value (for the
+/// per-chunk floor), the highest voucher to submit, and — on the signer's first
+/// redemption — the owner-signed capability to register.
+#[allow(dead_code)] // wired into the chunked submit path in a later task
+struct PlannedLane {
+    pool_id: PoolId,
+    unredeemed: U256,
+    voucher: PaymentPool::LaneVoucher,
+    register: Option<PaymentPool::CapabilityReg>,
+}
+
+/// Group planned lanes into one `PoolBatch` per distinct pool, in first-seen
+/// order, so the contract amortizes each pool's status read and `totalRedeemed`
+/// write across its lanes. A lane's capability registration (present only on a
+/// signer's first redemption) rides in its pool's batch; each `(pool, signer)`
+/// lane is distinct, so no capability is ever duplicated within a batch.
+#[allow(dead_code)] // wired into the chunked submit path in a later task
+fn group_by_pool(lanes: &[PlannedLane]) -> Vec<PaymentPool::PoolBatch> {
+    let mut order: Vec<PoolId> = Vec::new();
+    let mut by_pool: HashMap<PoolId, PaymentPool::PoolBatch> = HashMap::new();
+    for lane in lanes {
+        let batch = by_pool.entry(lane.pool_id).or_insert_with(|| {
+            order.push(lane.pool_id);
+            PaymentPool::PoolBatch {
+                poolId: lane.pool_id,
+                capabilities: Vec::new(),
+                vouchers: Vec::new(),
+            }
+        });
+        if let Some(reg) = &lane.register {
+            batch.capabilities.push(reg.clone());
+        }
+        batch.vouchers.push(lane.voucher.clone());
+    }
+    order
+        .into_iter()
+        .filter_map(|pool_id| by_pool.remove(&pool_id))
+        .collect()
+}
+
 /// Read the lane's persisted highest voucher and its cached paid watermark; if
 /// `owed − paid` meets `threshold` and the lane is still redeemable, return the
 /// voucher (plus a capability registration on the signer's first redemption). A
@@ -1214,6 +1254,51 @@ impl KeyedCheckpointStore for DebouncedCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a [`PlannedLane`] for a given pool/signer, with an optional
+    /// capability registration, for `group_by_pool` tests.
+    fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane {
+        let signer_addr = Address::from([signer; 20]);
+        let reg = register.then(|| PaymentPool::CapabilityReg {
+            signer: signer_addr,
+            spendingCap: 1_000_000,
+            expiry: 0,
+            ownerSig: Bytes::from(vec![9u8; 65]),
+        });
+        PlannedLane {
+            pool_id: PoolId::from([pool; 32]),
+            unredeemed: U256::from(unredeemed),
+            voucher: PaymentPool::LaneVoucher {
+                signer: signer_addr,
+                cumulative: unredeemed,
+                bytesDelivered: 0,
+                r: B256::ZERO,
+                vs: B256::ZERO,
+            },
+            register: reg,
+        }
+    }
+
+    #[test]
+    fn group_by_pool_buckets_lanes_and_keeps_insertion_order() {
+        let lanes = vec![
+            planned(1, 10, 100, true),
+            planned(2, 11, 200, false),
+            planned(1, 12, 300, true),
+        ];
+        let batches = group_by_pool(&lanes);
+        // Two pools, first-seen order: pool 1 then pool 2. Indexed via `.first()`
+        // / `.get()` rather than `[]` per the workspace's anti-panic policy.
+        assert_eq!(batches.len(), 2);
+        let batch0 = batches.first();
+        assert_eq!(batch0.map(|b| b.poolId), Some(PoolId::from([1u8; 32])));
+        assert_eq!(batch0.map(|b| b.vouchers.len()), Some(2)); // both pool-1 lanes
+        assert_eq!(batch0.map(|b| b.capabilities.len()), Some(2)); // both registered
+        let batch1 = batches.get(1);
+        assert_eq!(batch1.map(|b| b.poolId), Some(PoolId::from([2u8; 32])));
+        assert_eq!(batch1.map(|b| b.vouchers.len()), Some(1));
+        assert_eq!(batch1.map(|b| b.capabilities.len()), Some(0)); // register == false
+    }
 
     /// A 65-byte `r‖s‖v` signature with a low `s` and the recovery byte set to
     /// `v` (a `[u8; 65]` so a const index stays provably in-bounds for the
