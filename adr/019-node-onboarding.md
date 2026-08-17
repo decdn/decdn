@@ -5,23 +5,22 @@
 
 ## Context
 
-Existing ADRs specify individual node-lifecycle components in isolation — staking in [ADR 026](026-tokenomics.md#adr-026-tokenomics), on-chain registration in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), payment channel bindings in [ADR 003](003-payments.md#adr-003-payment-model), gossip validation in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), blacklist sync in [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), contract deployment order in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). No single document describes the complete ordered procedure from "operator has a server" to "actively accepting paid delivery requests."
+Existing ADRs specify individual node-lifecycle components in isolation — staking in [ADR 026](026-tokenomics.md#adr-026-tokenomics), on-chain registration in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), payment channel bindings in [ADR 003](003-payments.md#adr-003-payment-model), blacklist sync in [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), contract deployment order in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). No single document describes the complete ordered procedure from "operator has a server" to "actively accepting paid delivery requests."
 
-This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (gossip messages rejected without error because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
+This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (probe and slash timestamps rejected because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
 
 ## Decision
 
-Node onboarding proceeds in five sequential phases. A node MUST NOT advance to the next phase until all MUST-level requirements of the current phase are satisfied.
+Node onboarding proceeds in four sequential phases. A node MUST NOT advance to the next phase until all MUST-level requirements of the current phase are satisfied.
 
 ```mermaid
 flowchart TD
     P1["Phase 1\nPre-flight\n(operator environment)"]
     P2["Phase 2\nOn-chain setup\n(stake + register)"]
     P3["Phase 3\nNode startup\n(sync state, configure)"]
-    P4["Phase 4\nJoin the mesh\n(gossip subscription)"]
-    P5["Phase 5\nAccepting paid delivery\n(open for business)"]
+    P4["Phase 4\nAccepting paid delivery\n(open for business)"]
 
-    P1 --> P2 --> P3 --> P4 --> P5
+    P1 --> P2 --> P3 --> P4
 ```
 
 ### Phase 1 — Pre-flight (Operator Environment)
@@ -30,7 +29,7 @@ Before any on-chain or protocol activity:
 
 1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) for operator economics.
 
-2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. Clock skew ≥ 60 s causes gossip messages to be silently rejected by all peers ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). Nodes SHOULD expose a `decdn_gossip_messages_rejected_clock_skew_total` Prometheus counter ([Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics)) — a sibling of the aggregate `decdn_gossip_announces_rejected_total`, not a label on it (see [§ Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels)).
+2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. A correct clock underpins voucher freshness and the probe and slashing timestamp windows: vouchers carry timestamps, and probe-derived slash evidence is bounded by a maximum evidence age ([ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). A skewed clock produces stale vouchers and out-of-window slash timestamps.
 
 3. **Generate iroh identity.** Run the node binary's `keys generate` (or equivalent) subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`. The private key MUST be stored securely:
    - **PoC:** encrypted file on disk (passphrase-protected or operator-managed).
@@ -43,7 +42,7 @@ Before any on-chain or protocol activity:
 
    - **Wallet, gas sponsorship, and session keys.** A plain EOA keystore is the documented default, and it is the only wallet that can sign `slash_sig` acceptably today — a paying client verifies the `StreamResponse` signature off-chain by recovering the signer against the node's registered address, so a Safe-addressed operator cannot complete a paid delivery. Production migrates the operator wallet to a Safe (2-of-3) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) for the optional EOA → Safe migration and its constraints.
 
-5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code best representing the node's physical location. Self-reported, accepted at face value as the production posture ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)). Submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
+5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code best representing the node's physical location. Self-reported, accepted at face value as the production posture ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)). Submitted on-chain as `regionHint` — it determines which regional blacklists the node must enforce.
 
 6. **Configure origin backend (optional).** If the node will act as an origin-backed
    node (serving specific content from S3/R2/B2/NFS/local disk), configure backend
@@ -133,57 +132,23 @@ Enumerate the full current deny-set from the `ContentBlacklist` contract at a si
 
 After the initial enumeration, the node follows the contract's blacklist events for live updates and periodically re-enumerates as the backstop. There is no version checkpoint to record: every boot rebuilds the complete deny-set, so a node returning from any downtime is immediately current.
 
-#### Step 3.3 — Build initial peer table from on-chain registry
+#### Step 3.3 — Build initial node view from on-chain registry
 
-Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the peer table. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
+Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the local node view. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
 
-This registry snapshot is the initial peer table; gossip updates (Phase 4) keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#node-discovery-registry)).
+This registry snapshot is the initial node view. The node subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to keep the view fresh ([ADR 001 § Node Discovery (Registry)](001-network.md#node-discovery-registry)).
 
-If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no peer table = cannot participate in gossip, DHT lookups, or probing).
+If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts at 1s, 5s, 30s). If all retries fail, the node cannot start (no node view = cannot participate in DHT lookups or probing).
 
 #### Step 3.4 — Configure local rate
 
 Set the node's `rate_per_mb` at or above the floor fetched in Step 3.1, satisfying `deliveryFloor ≤ rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised in `ProbeResponse` messages. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
 
-### Phase 4 — Joining the Mesh (Gossip Subscription)
+### Phase 4 — Accepting Paid Delivery
 
-Once startup state is synchronized, the node joins the iroh-gossip mesh.
+After Phases 1–3, the node is fully operational and should accept traffic. On-chain registration alone makes the node discoverable: peers reading the `CapacityBond` active set find it and begin probing it for content.
 
-#### Step 4.1 — Subscribe to gossip topics
-
-Subscribe to:
-
-- `cdn/global/v1` — all staked nodes publish and subscribe.
-- `cdn/region/{cc}/v1` — subscribe to the node's own declared region topic.
-
-Topic names are string literals used as iroh-gossip topic IDs.
-
-#### Step 4.2 — Publish first `NodeAnnounce`
-
-Construct and sign a `NodeAnnounce` message:
-
-```rust
-NodeAnnounce {
-    node_id:        <iroh NodeId>,
-    region:         <ISO 3166-1 alpha-2, e.g. "DE">,
-    timestamp_us:   <current unix microseconds>,
-    signature:      <ed25519 over NodeAnnounceBody via postcard>,
-}
-```
-
-Publish to `cdn/global/v1` and `cdn/region/{cc}/v1`. The announce interval is operator-configurable (PoC default: 60 seconds).
-
-After this publish the node appears in peers' peer tables (subject to gossip validation: active registry membership, valid signature, fresh timestamp, valid region — see [ADR 001](001-network.md#node-discovery-registry)). Peers discovering it begin probing it for content.
-
-#### Step 4.3 — Observe incoming `NodeAnnounce` messages
-
-Process incoming `NodeAnnounce` messages from existing peers, populating the local peer table. After a full gossip cycle (≥ 1 announce interval, ~60 seconds), the peer table converges to the full active node set.
-
-The node need not wait for convergence before Phase 5 — it can accept connections immediately after Phase 3, even with a sparse peer table.
-
-### Phase 5 — Accepting Paid Delivery
-
-After Phases 1–4, the node is fully operational and should accept traffic.
+After Phase 3, the node can accept connections immediately, even before every peer's registry view reflects the new registration. Sub-second L2 block times keep that convergence window small.
 
 **Acceptance criteria (all must hold):**
 
@@ -193,17 +158,15 @@ After Phases 1–4, the node is fully operational and should accept traffic.
 | 2 | Rate floor loaded | Node has `deliveryFloor` in memory |
 | 3 | Blacklist synced | Local blacklist is at the current `blacklistVersion` |
 | 4 | QUIC listener open | `iroh::Endpoint` bound and listening on configured port(s) |
-| 5 | Gossip subscribed | Node is subscribed to `cdn/global/v1` and regional topic |
-| 6 | `NodeAnnounce` published | At least one announce sent since startup |
-| 7 | Multiaddrs synchronized | On-chain multiaddrs match `iroh::Endpoint::direct_addresses()` (or relay placeholder if direct addresses are not yet resolved) |
+| 5 | Multiaddrs synchronized | On-chain multiaddrs match `iroh::Endpoint::direct_addresses()` (or relay placeholder if direct addresses are not yet resolved) |
 
-A node satisfying all seven criteria is ready to:
+A node satisfying all five criteria is ready to:
 
 - Respond to `ProbeRequest` messages on `cdn/probe/v1`
 - Accept `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment pools opened by clients and other nodes
 
-**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 peers=12`) once all seven criteria hold, so operators can confirm correct startup without grepping multiple log sources.
+**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 peers=12`) once all five criteria hold, so operators can confirm correct startup without grepping multiple log sources.
 
 ### NAT and Multiaddr Handling
 
@@ -273,7 +236,7 @@ Mechanism-specific guidance — particular hash-match databases, reporting endpo
 
 - Operators have a single, ordered reference for joining the PoC testnet.
 - All startup prerequisites (rate floor, blacklist, registry) are explicitly ordered, eliminating a silent-failure class.
-- The acceptance criteria table (Phase 5) provides a machine-checkable health signal for readiness probes and operational monitoring.
+- The acceptance criteria table (Phase 4) provides a machine-checkable health signal for readiness probes and operational monitoring.
 - Re-onboarding (post-ejection) is explicitly covered, preventing nonce confusion.
 - Onboarding records an explicit operator-duty floor, foreclosing the unaware-operator posture without adding any on-chain content gate.
 - Terms versioning is an ordinary governance parameter (`currentTermsHash`), so the network can launch with an initial version and adopt a reviewed successor by a hash bump, with no contract migration.

@@ -147,7 +147,7 @@ struct BlacklistEntry {
 >
 > A region key is the region string packed left-aligned and zero-padded into `bytes32`, matching Solidity's own `bytes32("literal")` packing. Two sentinels are reserved: `bytes32("GLOBAL")` marks a global entry, and `bytes32(0)` is *unset* — never a valid region. `addHashRegional`, `removeHashRegional`, and `registerRegionalBody` all reject both sentinels, so a regional body can neither reach a global entry nor write against an unset key.
 >
-> `bytes32` rather than a narrower `bytes2` — the key must be comparable against the value scope matching reads, which is the operator's **on-chain `regionHint`**, and `CapacityBond` caps that field at 16 bytes, not 2 (`MAX_REGION_HINT_BYTES`; [ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation) is where the slash path performs the comparison). Gossip separately constrains the *gossiped* region to an ISO 3166-1 alpha-2 code, but that is a different field on a different layer — the on-chain `regionHint` the scope check reads is not gossip-validated, so a two-byte entry key could not represent every region the registry admits. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` index `region` directly. The `BlacklistEntry` layout is the struct above.
+> `bytes32` rather than a narrower `bytes2` — the key must be comparable against the value scope matching reads, which is the operator's **on-chain `regionHint`**, and `CapacityBond` caps that field at 16 bytes, not 2 (`MAX_REGION_HINT_BYTES`; [ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation) is where the slash path performs the comparison). The on-chain `regionHint` is the only region the scope check reads, and it can hold values wider than a two-byte ISO 3166-1 alpha-2 code, so a two-byte entry key could not represent every region the registry admits. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` index `region` directly. The `BlacklistEntry` layout is the struct above.
 
 ### Blacklist version
 
@@ -213,7 +213,7 @@ Both windows are governable parameters sharing one set of hardcoded bounds: mini
 
 ### One-hour removal orders
 
-Some statutory regimes bind the operator that receives a removal order to a sub-day deadline — the EU Terrorist Content Online Regulation's one-hour clock is the tightest. Such an order is discharged at the operator level: the receiving operator adds the hash to its [local denylist](#local-denylist), which takes effect on the next reload (no restart, no gossip, no governance round-trip) and is scoped to that operator's own node. This is the fastest removal path the protocol offers, it is entirely within the recipient's control, and it binds exactly what the order binds — the recipient's own serving.
+Some statutory regimes bind the operator that receives a removal order to a sub-day deadline — the EU Terrorist Content Online Regulation's one-hour clock is the tightest. Such an order is discharged at the operator level: the receiving operator adds the hash to its [local denylist](#local-denylist), which takes effect on the next reload (no restart, no propagation step, no governance round-trip) and is scoped to that operator's own node. This is the fastest removal path the protocol offers, it is entirely within the recipient's control, and it binds exactly what the order binds — the recipient's own serving.
 
 The network does not build a sub-hour global propagation lane, and none is required. A removal order reaches one operator, not every node; the rest of the network is covered by the protocol-level paths — an emergency multisig `emergencyAdd` (effective immediately, `effectiveAt = addedAt`, two-hour compliance window) for network-wide removal, or a standard or regional governance add for the slower cases. The one-hour compliance-window floor above and the emergency multisig's mandate to discharge a one-hour-clock removal order (see [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)) already size the on-chain mechanisms to this clock. A dedicated sub-hour global broadcast would add propagation surface and centralization pressure without changing what any single order requires.
 
@@ -333,8 +333,8 @@ interface IOriginAssignment {
     // contract performs the lookup itself rather than trusting the caller. This
     // pattern avoids the unbounded gas cost of removing a blacklisted operator
     // from every namespace in one transaction; runtime authorization checks
-    // (probe, peer table) consult ContentBlacklist directly so cleanup latency
-    // does not affect security.
+    // (probe, registry-derived node view) consult ContentBlacklist directly so
+    // cleanup latency does not affect security.
     function pruneBlacklistedOrigin(uint256 namespaceId, address operator) external;
 
     // Wires the read-direction integration with ContentBlacklist for
@@ -455,7 +455,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 
 The publish-first ordering is critical: continuing to serve a blacklisted hash after the compliance window is a blacklist-violation slashing offense ([ADR 014 § SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract)), and a signed response for that hash is dispositive evidence. Disk eviction can be async; DHT-record and probe-response suppression must be synchronous.
 
-When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` whose pool is owned by that operator address, and removes all of that origin's NodeIds from its local peer table.
+When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` whose pool is owned by that operator address, and removes all of that origin's NodeIds from its local registry-derived node view.
 
 In-flight streams for a blacklisted hash — or on a channel funded by a newly blacklisted origin — are terminated at the next MB boundary, after the voucher for the bytes already delivered is collected. Termination is a stream reset with no `StreamEnd` sentinel, not an error frame: [ADR 005 § Stream errors](005-protocol.md#adr-005-wire-protocol) makes `VoucherRejected` the only `StreamError` that travels mid-stream, and the QUIC code is `NO_ERROR` so the client does not score the node as faulty for discharging a takedown ([ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)). A client that re-requests the hash gets the signed `HashBlacklisted` refusal from the open-time gate, and can request a refund of the unused channel balance.
 
@@ -481,7 +481,7 @@ denied_origins = [
 
 Hashes take the same bare 64-character lowercase-hex form as `cache.pinned_hashes`, so an operator has one hash spelling across the whole config file. An invalid entry fails startup rather than being skipped: a typo in a takedown must not silently leave content served.
 
-Local denylist entries take effect on the next reload and behave identically to governance blacklist entries. They are not gossiped to peers and require no governance action. This covers operators receiving direct legal notices affecting only their node, or operators proactively removing content they find objectionable.
+Local denylist entries take effect on the next reload and behave identically to governance blacklist entries. They are local to the node and require no governance action. This covers operators receiving direct legal notices affecting only their node, or operators proactively removing content they find objectionable.
 
 The lists are hot-reloadable (`decdn node reload` / SIGHUP), which is load-bearing rather than convenient: [§ One-hour removal orders](#one-hour-removal-orders) makes this the only mechanism sized to a sub-day statutory deadline, and a restart-only denylist would put a daemon bounce — dropping every in-flight paid stream — on the critical path of discharging a legal order.
 

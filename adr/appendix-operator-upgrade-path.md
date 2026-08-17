@@ -15,8 +15,8 @@ Per [ADR 013 § Decision](013-schema-evolution.md#adr-013-schema-evolution), eac
 | Tier | Trigger | Wire identifier | Operator action |
 |------|---------|------|-----------------|
 | **1 — Minor** | Append optional fields to an existing struct via two-phase deserialization | Same (e.g. `cdn/client/v1`) | None — see [§ Tier 1 — minor evolution](#tier-1--minor-evolution) |
-| **2 — Medium** | Add new optional protocol or gossip payload variants, no ALPN bump | Same | Config-only (opt-in flags), see [§ Tier 2 — medium evolution](#tier-2--medium-evolution) |
-| **3 — Major** | Remove a field; change a type; reorder enum variants; add a mandatory field; change signed-field set; change framing; bump `GossipEnvelope.version` | Bumped ALPN or topic | Follow the focused migration ADR shipped with the breaking change — see [§ Tier 3 — major break](#tier-3--major-break-alpn-or-topic-bump) |
+| **2 — Medium** | Add new optional protocol message variants, no ALPN bump | Same | Config-only (opt-in flags), see [§ Tier 2 — medium evolution](#tier-2--medium-evolution) |
+| **3 — Major** | Remove a field; change a type; reorder enum variants; add a mandatory field; change signed-field set; change framing | Bumped ALPN | Follow the focused migration ADR shipped with the breaking change — see [§ Tier 3 — major break](#tier-3--major-break-alpn-bump) |
 
 ## Restarting a node safely
 
@@ -59,9 +59,9 @@ A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepal
 
 Payment pools and stake state are unaffected.
 
-## Tier 3 — major break (ALPN or topic bump)
+## Tier 3 — major break (ALPN bump)
 
-Tier 3 is a classification boundary, not a standing rollout procedure. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`), a gossip topic's semantic contract changes, or the gossip envelope format itself changes. The accompanying ADR MUST define the supported-version set, deployment order, client behavior, channel or signature migration, rollback conditions, observability, and retirement criteria that the actual break requires.
+Tier 3 is a classification boundary, not a standing rollout procedure. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`). The accompanying ADR MUST define the supported-version set, deployment order, client behavior, channel or signature migration, rollback conditions, observability, and retirement criteria that the actual break requires.
 
 The current runtime supports the `…/v1` identifiers documented by the protocol ADRs. No transition guarantee exists until a concrete Tier 3 ADR defines and implements it.
 

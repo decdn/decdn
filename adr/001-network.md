@@ -32,9 +32,9 @@ graph TD
 
 ### Node Discovery (Registry)
 
-A node discovers its peers from the on-chain `CapacityBond` registry active set. The node reads the active set at startup and keeps it fresh by subscribing to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events; sub-second L2 block times keep the staleness window small. The same active set seeds the `cdn/dht/v1` routing table ([ADR 022 § Routing Table](022-content-discovery.md#routing-table)).
+A node discovers its peers from the on-chain `CapacityBond` registry active set. The node reads the active set at startup. It keeps the set fresh by subscribing to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events. Sub-second L2 block times keep the staleness window small. The same active set seeds the `cdn/dht/v1` routing table ([ADR 022 § Routing Table](022-content-discovery.md#routing-table)).
 
-A node dials any peer by its iroh `NodeId` through iroh's built-in discovery, which resolves the `NodeId` to reachable transport addresses and performs NAT traversal. The registry supplies each active peer's `NodeId`, so a node needs no separate address-exchange layer.
+A node dials any peer by its iroh `NodeId` through iroh's built-in discovery. That discovery resolves the `NodeId` to reachable transport addresses. It also performs NAT traversal. The registry supplies each active peer's `NodeId`. A node therefore needs no separate address-exchange layer.
 
 The active set is the sole membership source. A node checks it before it initiates a paid pull (see Content Discovery), and the `cdn/dht/v1` STORE path admits records only from an active-bonded `NodeId` ([ADR 022 § STORE Flow](022-content-discovery.md#store-flow-cache-event--dht-publish)). A `NodeDeregistered` or `NodeAutoEjected` event removes the peer from the local view in the same handler that updates the cached active set.
 
@@ -106,7 +106,7 @@ Node identity is the iroh `NodeId` (ed25519 public key). All bonded nodes regist
 
 - No external infrastructure is reachable — origin-backed nodes completely hide their backends, so no client or node can bypass the payment layer via a direct storage URL
 - All nodes share the same discovery and transport protocols. The cache-only role remains permissionless — any staked operator may pull cached blobs from authorized origins and re-serve them. The origin role is DAO-governed: governance vets a publisher wallet in `OriginAssignment`, the vetted publisher seats its own operators, and namespace 0 (content published without a namespace) has no authorized origins. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)
-- Node discovery reads directly from the on-chain registry, so a node needs no separate metadata-broadcast layer and carries no per-peer broadcast bandwidth. The active set is authoritative and bounded by the bonded operator set
+- Node discovery reads directly from the on-chain registry. Per-node discovery bandwidth is negligible and bounded by the bonded operator set. The active set is authoritative
 - Content discovery via `cdn/dht/v1` provides targeted O(log N) provider lookup; probe confirms live availability. No stale content inventory to maintain — stale DHT records self-expire within TTL (1 hour)
 - Probe cache prevents redundant probe batches for popular content within a 15-second window
 - Once a node in a region caches a blob, other regional nodes pull from it at competitive rates rather than origin-backed prices — popular content gets cheaper as it spreads

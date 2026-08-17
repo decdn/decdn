@@ -303,13 +303,7 @@ A node redeems accrued funds while the pool is still `Open`. This is the ordinar
 
 Attacker surrounds a client with malicious nodes so all probe responses come from nodes under attacker control.
 
-BLAKE3 verification catches data corruption regardless of peer-table composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy.
-
-#### Gossip flooding
-
-Node sends high-volume `NodeAnnounce` messages to exhaust peer table memory or crowd out legitimate announcements.
-
-Registry check + per-sender rate limiting. Residual gap: the local registry cache may be up to 10 minutes stale, briefly allowing recently-unbonded nodes to flood; mitigated by tightening the registry cache refresh on high flood detection.
+BLAKE3 verification catches data corruption regardless of node-set composition; the remaining DoS variant (attacker-controlled peer set refuses to serve) is resolved in [ADR 012 § Bootstrap and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model): production uses multi-source bootstrap (on-chain registry + hardcoded DNS seeds) so an attacker must compromise both to fully eclipse a client; minimum honest-peer diversity is a supplementary client-side policy.
 
 #### Sybil nodes
 
@@ -329,7 +323,7 @@ Origin-backed nodes set the effective price ceiling for any blob. Clients can al
 
 #### Content withholding
 
-A node bonds, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in the peer table without actually participating.
+A node bonds, responds to probes with `has_blob: true`, but refuses to serve — collecting credibility in clients' registry-derived node views without actually participating.
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. The protocol does not guarantee availability; publishers who want fault tolerance opt into it by seating multiple operators, and the network deprioritizes flaky nodes through reputation:
 
@@ -1001,6 +995,6 @@ Slashing and pools are independent by design.
 
 - Outstanding vouchers redeem normally. Owner funds are never trapped.
 - The ejected node cannot be selected for new service (clients verify node registration, and nodes verify counterparty status before accepting a `StreamRequest`).
-- The ejected node is removed from gossip routing, so it receives no new client connections.
+- The ejected node is removed from the registry active set, so it receives no new client connections.
 - `redeemMany` remains callable on any pool a node holds vouchers against — it checks pool and register state, not registry status, so a slashed or ejected operator can still redeem revenue it already earned. `closePool` / `reclaim` are unaffected on the owner side.
 - The node must re-bond at the full tier minimum (`bond_required(declared_capacity)`) and re-register to resume operations.

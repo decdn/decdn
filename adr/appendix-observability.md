@@ -260,7 +260,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 
 | `status` | Meaning |
 |----------|---------|
-| `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5--accepting-paid-delivery)); serving traffic. |
+| `ready` | All Phase 4 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-4--accepting-paid-delivery)); serving traffic. |
 | `degraded` | Running but one or more non-critical conditions impaired (e.g., DHT routing table sparse, a chain-event watcher in backoff). Traffic still accepted. |
 | `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate floor not loaded, not registered). Not accepting traffic. |
 

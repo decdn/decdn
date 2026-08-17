@@ -9,15 +9,15 @@
 
 The network needs to rank nodes beyond staking alone. Staking provides Sybil resistance but does not measure service quality. Clients need to prefer fast, reliable nodes and avoid slow or unresponsive ones without on-chain proof for every quality metric.
 
-Reputation is **local-only**: each node scores its peers from its own direct delivery observations, and nothing else. There is no gossip propagation of reputation, no cross-node aggregation, and no network-wide reputation score. A node's ranking of a peer reflects only interactions that node has witnessed itself — the same tit-for-tat principle BitTorrent uses for peer selection, which needs no global reputation to function at scale.
+Reputation is **local-only**: each node scores its peers from its own direct delivery observations, and nothing else. There is no network propagation of reputation, no cross-node aggregation, and no network-wide reputation score. A node's ranking of a peer reflects only interactions that node has witnessed itself — the same tit-for-tat principle BitTorrent uses for peer selection, which needs no global reputation to function at scale.
 
-This is deliberate. Reputation is not the Sybil or corruption defense — stake, the capacity bond, mandatory progressive BLAKE3 verification, and no-payment-on-failed-delivery are (see [ADR 002](002-content-addressing.md#adr-002-content-addressing), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 026](026-tokenomics.md#adr-026-tokenomics)). Reputation only tunes each client's selection probability among otherwise-eligible nodes. Keeping it local avoids the failure modes a gossiped, aggregated score would introduce: herding onto incumbents (a shared score concentrates load and starves cold nodes), an incumbency amplifier (credibility-weighted reporters), and a permanent gossip attack surface (eclipse, coordinated negative reports, replay, clock-sync). A local score has none of these: a peer a node has never used stays neutral and fully selectable, so traffic keeps exploring rather than converging.
+This is deliberate. Reputation is not the Sybil or corruption defense — stake, the capacity bond, mandatory progressive BLAKE3 verification, and no-payment-on-failed-delivery are (see [ADR 002](002-content-addressing.md#adr-002-content-addressing), [ADR 003](003-payments.md#adr-003-payment-model), [ADR 026](026-tokenomics.md#adr-026-tokenomics)). Reputation only tunes each client's selection probability among otherwise-eligible nodes. Keeping it local avoids the failure modes a shared, aggregated score would introduce: herding onto incumbents (a shared score concentrates load and starves cold nodes), an incumbency amplifier (credibility-weighted reporters), and a permanent attack surface (eclipse, coordinated negative reports, replay, clock-sync). A local score has none of these: a peer a node has never used stays neutral and fully selectable, so traffic keeps exploring rather than converging.
 
 ## Decision
 
 ### Local Scoring
 
-Each node maintains a per-peer score derived solely from its own interactions. No gossip topic, no reporter weighting, no on-chain reputation state.
+Each node maintains a per-peer score derived solely from its own interactions. No network propagation, no reporter weighting, no on-chain reputation state.
 
 - Score range: 0.0 to 1.0 (stored internally as u32, 0 to 1,000,000, for 6-decimal precision)
 - Initial score for new nodes: 0.5 (neutral)
@@ -105,7 +105,7 @@ flowchart TD
 ### Positive
 
 - A node's ranking of a peer always reflects its own experience — there is no subjective network score, no convergence problem, and no reporter-credibility incumbency advantage.
-- No reputation gossip topic, no reporter weighting, no distinct-counterparty / settled-value machinery, no clock-sync dependency, and no eclipse or coordinated-gossip attack surface — none of it exists to attack or maintain.
+- No reputation propagation, no reporter weighting, no distinct-counterparty / settled-value machinery, no clock-sync dependency, and no eclipse or coordinated-reporting attack surface — none of it exists to attack or maintain.
 - Naturally load-spreading: a peer a node has never used stays neutral (0.5) and fully selectable, so traffic keeps exploring new and cold nodes rather than herding onto established ones (the role BitTorrent gives optimistic unchoking).
 - Score clamping limits the damage from any single bad interaction; decay prevents stale scores from persisting.
 - Reputation is decoupled from settlement and governance entirely — an operator's USDC earnings and served-bytes vote weight ([ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) never depend on any peer's opinion of it.
