@@ -2,7 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
-import { Vm } from "forge-std/Vm.sol";
+import { Vm, VmSafe } from "forge-std/Vm.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
@@ -1651,6 +1651,20 @@ contract PaymentPoolTest is Test {
         return _signVoucherFor(address(pool), id, signer_, provider, amountEach, bytesEach, pk);
     }
 
+    /// @dev The `test_redeemMany_gas_*` benchmarks pin absolute gas against the
+    ///      optimized build. `forge coverage` compiles with the optimizer and
+    ///      `via_ir` off, which inflates every measurement tens of thousands of
+    ///      gas past the assertion tolerance. Under the coverage context the
+    ///      benchmarks skip; the `redeemMany` path they exercise stays covered
+    ///      by the functional tests. Callers `return` on a `true` result.
+    function _skipGasBenchmarkUnderCoverage() internal returns (bool) {
+        if (vm.isContext(VmSafe.ForgeContext.Coverage)) {
+            vm.skip(true);
+            return true;
+        }
+        return false;
+    }
+
     /// @dev Opens a fresh pool, primes `count` distinct signer lanes on it,
     ///      redeems one voucher per lane in a single `redeemMany`, and pins
     ///      that call's gas via `snapshotGasLastCall` (surfaced afterward in
@@ -1713,6 +1727,7 @@ contract PaymentPoolTest is Test {
     ///         `eth_getBlockByNumber("latest")`'s `gasLimit` on the target
     ///         network before leaning on it for a deploy decision.
     function test_redeemMany_gas_NVouchers() public {
+        if (_skipGasBenchmarkUnderCoverage()) return;
         uint256 gasUsed = _redeemFreshLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N, "redeemMany_marginal_N");
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N vouchers", gasUsed);
@@ -1727,6 +1742,7 @@ contract PaymentPoolTest is Test {
     ///         one more voucher. See that test's docstring for why this is a
     ///         separate function rather than a second call inside it.
     function test_redeemMany_gas_NPlus1Vouchers() public {
+        if (_skipGasBenchmarkUnderCoverage()) return;
         uint256 gasUsed = _redeemFreshLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N + 1, "redeemMany_marginal_Np1");
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N+1 vouchers", gasUsed);
@@ -1784,6 +1800,7 @@ contract PaymentPoolTest is Test {
     ///         its own test function (fresh, cold EVM state) rather than a
     ///         second call sharing a function with its N+1 companion.
     function test_redeemMany_gas_firstTime_NVouchers() public {
+        if (_skipGasBenchmarkUnderCoverage()) return;
         uint256 gasUsed = _redeemFirstTimeLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N, "redeemMany_firstTime_N");
         assertLt(gasUsed, 3_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, first-time N vouchers", gasUsed);
@@ -1802,6 +1819,7 @@ contract PaymentPoolTest is Test {
     ///         workload, where a one-time payer's capability registration
     ///         and voucher settlement both land in its single redemption.
     function test_redeemMany_gas_firstTime_NPlus1Vouchers() public {
+        if (_skipGasBenchmarkUnderCoverage()) return;
         uint256 gasUsed =
             _redeemFirstTimeLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N + 1, "redeemMany_firstTime_Np1");
         assertLt(gasUsed, 3_000_000, "sanity ceiling on a small fixed-N batch");
