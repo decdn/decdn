@@ -171,6 +171,9 @@ contract PaymentPoolTest is Test {
     uint256 internal constant BYTES_PER_MB = 1_048_576;
     uint64 internal constant SPENDING_CAP = 500e6;
     uint64 internal expiry; // far-future capability expiry, set in setUp
+    /// Vouchers-per-call for the Task 7 marginal-gas benchmark pair
+    /// (`test_redeemMany_gas_NVouchers` / `test_redeemMany_gas_NPlus1Vouchers`).
+    uint256 internal constant REDEEM_MANY_GAS_BENCHMARK_N = 10;
 
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 internal constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
@@ -1587,6 +1590,134 @@ contract PaymentPoolTest is Test {
     function test_redeemMany_noBatchesReturnsZeroNoRevert() public {
         vm.prank(provider);
         assertEq(pool.redeemMany(new PaymentPool.PoolBatch[](0)), 0, "an empty call is a no-op");
+    }
+
+    // -----------------------------------------------------------------
+    // redeemMany — marginal per-voucher gas (Task 7 chunk-size validation)
+    // -----------------------------------------------------------------
+
+    /// @dev Registers `count` distinct signer capabilities on `id` ahead of
+    ///      time, via their own `redeemMany` call (empty voucher array), so
+    ///      a later timed call carries voucher-verify-and-settle cost only —
+    ///      not one-time capability registration. Signer keys start at
+    ///      `seed + 1` so no lane ever lands on the zero private key.
+    function _primeLanes(bytes32 id, uint256 seed, uint256 count)
+        internal
+        returns (uint256[] memory pks, address[] memory signers)
+    {
+        pks = new uint256[](count);
+        signers = new address[](count);
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](count);
+        for (uint256 i = 0; i < count; i++) {
+            uint256 pk = seed + i + 1;
+            address who = vm.addr(pk);
+            pks[i] = pk;
+            signers[i] = who;
+            caps[i] = PaymentPool.CapabilityReg({
+                signer: who,
+                spendingCap: SPENDING_CAP,
+                expiry: expiry,
+                ownerSig: _signCapabilityFor(address(pool), id, who, SPENDING_CAP, expiry, OWNER_PK)
+            });
+        }
+        PaymentPool.LaneVoucher[] memory noVouchers = new PaymentPool.LaneVoucher[](0);
+        vm.prank(provider);
+        pool.redeemMany(_batch(id, caps, noVouchers));
+    }
+
+    /// @dev One voucher per already-registered signer in `signers`, each for
+    ///      `amountEach`/`bytesEach` — every lane's first-ever redeem, so
+    ///      every watermark write in the timed call is a cold SSTORE.
+    function _lanesOf(bytes32 id, uint256[] memory pks, address[] memory signers, uint64 amountEach, uint64 bytesEach)
+        internal
+        view
+        returns (PaymentPool.LaneVoucher[] memory vouchers)
+    {
+        vouchers = new PaymentPool.LaneVoucher[](signers.length);
+        for (uint256 i = 0; i < signers.length; i++) {
+            Sig memory sig = _voucherFor(id, signers[i], amountEach, bytesEach, pks[i]);
+            vouchers[i] = _laneOf(signers[i], amountEach, bytesEach, sig);
+        }
+    }
+
+    /// @dev `_signVoucherFor` against `provider` with the payload broken out
+    ///      of the call site — keeps `_lanesOf`'s loop body under the stack
+    ///      depth `solc` allows without `via_ir`.
+    function _voucherFor(bytes32 id, address signer_, uint64 amountEach, uint64 bytesEach, uint256 pk)
+        internal
+        view
+        returns (Sig memory)
+    {
+        return _signVoucherFor(address(pool), id, signer_, provider, amountEach, bytesEach, pk);
+    }
+
+    /// @dev Opens a fresh pool, primes `count` distinct signer lanes on it,
+    ///      redeems one voucher per lane in a single `redeemMany`, and pins
+    ///      that call's gas via `snapshotGasLastCall` (surfaced afterward in
+    ///      `contracts/.gas-snapshot` / `snapshots/PaymentPool.json` under
+    ///      `snapshotName`). Factored out purely to keep each call site's
+    ///      stack shallow enough for `solc` without `via_ir`.
+    function _redeemFreshLanesAndSnapshotGas(uint256 count, string memory snapshotName) internal returns (uint256) {
+        uint64 amount = 1e6;
+        uint64 bytesDelivered = 100_000;
+
+        bytes32 id = _open();
+        (uint256[] memory pks, address[] memory signers) =
+            _primeLanes(id, uint256(keccak256(bytes(snapshotName))), count);
+        PaymentPool.LaneVoucher[] memory vouchers = _lanesOf(id, pks, signers, amount, bytesDelivered);
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, vouchers));
+        assertEq(totalPaid, count * uint256(amount), "every primed lane must actually settle");
+        return vm.snapshotGasLastCall("PaymentPool", snapshotName);
+    }
+
+    /// @notice Task 7: pins the on-chain gas of a `redeemMany` call redeeming
+    ///         N already-registered-capability vouchers, to validate
+    ///         `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX` (300,
+    ///         `crates/common/src/config/mod.rs`) against the block gas
+    ///         limit. Paired with `test_redeemMany_gas_NPlus1Vouchers` below;
+    ///         `gas(N+1) - gas(N)` (read from the two pinned
+    ///         `contracts/.gas-snapshot` entries after `forge snapshot`) is
+    ///         the marginal per-voucher cost.
+    ///
+    ///         **Why two test functions and not one measuring both calls:**
+    ///         `forge` gives every test function its own fresh EVM state, so
+    ///         each call below starts from a genuinely cold EIP-2929 access
+    ///         list — matching a real standalone on-chain `redeemMany` tx.
+    ///         A single test issuing both calls back-to-back was tried and
+    ///         rejected: the second call inherits the first's now-*warm*
+    ///         router/USDC/allowance slots, making it artificially cheaper
+    ///         by tens of thousands of gas — enough to hide the true
+    ///         per-voucher marginal, or even flip its sign.
+    ///
+    ///         Every lane here is that lane's first-ever redeem — a
+    ///         cold-storage watermark write per voucher, the worst case a
+    ///         chunk of unrelated-client vouchers sees in production — so
+    ///         the marginal these two tests pin is a conservative
+    ///         (upper-bound) per-voucher cost. Capability registration for
+    ///         all N lanes happens in an earlier, unmeasured `redeemMany`
+    ///         call within the same test (`_primeLanes`), so this call's gas
+    ///         carries voucher-verify-and-settle cost only.
+    ///
+    ///         The Arbitrum One block gas limit used in this task's
+    ///         analysis (~32,000,000) is an external reference recorded from
+    ///         prior observation, NOT read live — this test has no RPC
+    ///         access. Confirm the current live limit via
+    ///         `eth_getBlockByNumber("latest")`'s `gasLimit` on the target
+    ///         network before leaning on it for a deploy decision.
+    function test_redeemMany_gas_NVouchers() public {
+        uint256 gasUsed = _redeemFreshLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N, "redeemMany_marginal_N");
+        assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
+    }
+
+    /// @notice Companion to `test_redeemMany_gas_NVouchers` — same setup,
+    ///         one more voucher. See that test's docstring for why this is a
+    ///         separate function rather than a second call inside it.
+    function test_redeemMany_gas_NPlus1Vouchers() public {
+        uint256 gasUsed = _redeemFreshLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N + 1, "redeemMany_marginal_Np1");
+        assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
     }
 
     // -----------------------------------------------------------------

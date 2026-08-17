@@ -75,9 +75,14 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// amount while bounding unsettled exposure to ~1 USDC per pool (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default redemption chunk size: 300 vouchers per `redeemMany` transaction.
-/// Sized well under the ~1000-voucher block-gas ceiling on Arbitrum One
-/// (~32M gas / ~30k per cold-lane voucher) so a chunk clears with generous
-/// headroom for cold-lane and sequencer-variance cost.
+/// `test_redeemMany_gas_NVouchers` / `test_redeemMany_gas_NPlus1Vouchers`
+/// (contracts/test/PaymentPool.t.sol) pin the marginal on-chain gas of one
+/// added cold-lane voucher at ~34.5k gas. Against Arbitrum One's block gas
+/// limit (~32M gas, an external reference — confirm live via
+/// `eth_getBlockByNumber` before leaning on it for a deploy decision),
+/// spending half the block on one `redeemMany` call bounds a safe chunk at
+/// roughly 460 vouchers, so 300 clears with about 1.5x headroom for
+/// sequencer-variance cost.
 const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
