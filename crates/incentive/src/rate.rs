@@ -18,6 +18,7 @@
 //! client does when computing `amount = ceil(bytes / 1_048_576) * rate`.
 
 use alloy::primitives::U256;
+use decdn_protocol::client::VOUCHER_INTERVAL_BYTES;
 
 /// 1 `MB` in bytes per ADR 005 §Probe-Triggered Eviction Hold's `MB`
 /// definition.
@@ -105,6 +106,31 @@ pub fn min_payment(bytes: u64, rate_per_mb: u64) -> U256 {
     U256::from(bytes)
         .saturating_mul(U256::from(rate_per_mb))
         .div_ceil(U256::from(BYTES_PER_MB))
+}
+
+/// One voucher-interval floor priced in `µUSDC` — the un-self-funded credit a fresh
+/// lane draws before its first voucher (ADR 003 §Credit window / §Pool solvency).
+#[must_use]
+pub fn floor_micro(rate_per_mb: u64) -> U256 {
+    min_payment(VOUCHER_INTERVAL_BYTES, rate_per_mb)
+}
+
+/// The unrecoverable floor loss a lane leaves at stream end: the value of its
+/// still-unpaid delivered bytes, capped at one floor (everything above the floor is
+/// self-funded and bounded by the ramped credit window). Saturating.
+#[must_use]
+pub fn dead_charge_micro(rate_per_mb: u64, delivered: u64, paid_bytes: u64) -> U256 {
+    let unpaid = delivered.saturating_sub(paid_bytes);
+    min_payment(unpaid, rate_per_mb).min(floor_micro(rate_per_mb))
+}
+
+/// Stateful-B pool solvency: the pool's remaining deposit minus the refundable
+/// floor `M` must cover its already-committed concurrent floor credit plus this
+/// stream's new reservation. Saturating (a `remaining` below `M` yields no
+/// headroom rather than underflowing).
+#[must_use]
+pub fn pool_budget_covers(remaining: U256, m: U256, committed: U256, new_reserve: U256) -> bool {
+    remaining.saturating_sub(m) >= committed.saturating_add(new_reserve)
 }
 
 /// Failure modes for [`verify_rate`].
@@ -344,5 +370,65 @@ mod tests {
             verify_rate(amount, U256::from(bytes), rate, 0)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn floor_micro_is_one_interval() {
+        // 4 MiB interval at 100 µUSDC/MB = 4 * 100 = 400 µUSDC (4 MiB = 4 MB-units here per min_payment rounding).
+        let f = floor_micro(100);
+        assert_eq!(
+            f,
+            min_payment(decdn_protocol::client::VOUCHER_INTERVAL_BYTES, 100)
+        );
+        assert!(f > U256::ZERO);
+    }
+
+    #[test]
+    fn dead_charge_is_proportional_and_capped_at_floor() {
+        let rate = 1000;
+        let floor = floor_micro(rate);
+        // Fully repaid (delivered == paid) → zero dead charge.
+        assert_eq!(
+            dead_charge_micro(rate, 4 * 1024 * 1024, 4 * 1024 * 1024),
+            U256::ZERO
+        );
+        // Full withhold of a whole interval → exactly the floor.
+        assert_eq!(
+            dead_charge_micro(rate, decdn_protocol::client::VOUCHER_INTERVAL_BYTES, 0),
+            floor
+        );
+        // Early abort after a fraction of an interval → proportional, below the floor.
+        let partial = dead_charge_micro(rate, 1024 * 1024, 0);
+        assert!(partial > U256::ZERO && partial < floor);
+        // Delivered beyond an interval but only a floor unpaid stays capped at the floor.
+        let capped = dead_charge_micro(rate, 100 * 1024 * 1024, 96 * 1024 * 1024);
+        assert!(capped <= floor);
+    }
+
+    #[test]
+    fn pool_budget_covers_saturates_and_reserves_m() {
+        let m = U256::from(1_000_000u64);
+        let remaining = U256::from(1_000_400u64); // M + 400
+        // committed 0, reserve 400 → exactly covered.
+        assert!(pool_budget_covers(
+            remaining,
+            m,
+            U256::ZERO,
+            U256::from(400u64)
+        ));
+        // committed 400, another 1 → over budget.
+        assert!(!pool_budget_covers(
+            remaining,
+            m,
+            U256::from(400u64),
+            U256::from(1u64)
+        ));
+        // remaining below M saturates to zero headroom, never panics.
+        assert!(!pool_budget_covers(
+            U256::from(500_000u64),
+            m,
+            U256::ZERO,
+            U256::from(1u64)
+        ));
     }
 }
