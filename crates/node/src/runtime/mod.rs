@@ -348,6 +348,9 @@ struct Infra {
     receipt_writer_shutdown: CancellationToken,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
     receipt_writer: tokio::task::JoinHandle<()>,
+    /// Periodic lane-store flush timer (ADR 003 §Off-chain voucher state
+    /// persistence). Aborted after one final durable flush on shutdown.
+    lane_flush_task: tokio::task::JoinHandle<()>,
     node_origin: Option<crate::node_origin::NodeOrigin>,
     pull_through_origin: Option<Arc<crate::node_origin::NodeOrigin>>,
     cache: CacheEngine,
@@ -484,8 +487,8 @@ async fn build_infra(
 
     // Decouple the audit write from the paid-delivery hot path (#803): a single
     // background task owns the receipt log and drains a bounded queue, so the
-    // voucher-accept path only does a non-blocking enqueue before `VoucherAck`
-    // and a slow/full disk can never back-pressure delivery. The token is
+    // voucher-accept path only does a non-blocking enqueue before it continues
+    // delivery and a slow/full disk can never back-pressure delivery. The token is
     // cancelled after the router drains on shutdown (below) so the writer
     // flushes its tail before exiting.
     let receipt_writer_shutdown = CancellationToken::new();
@@ -494,6 +497,35 @@ async fn build_infra(
         Arc::clone(&node_metrics),
         receipt_writer_shutdown.clone(),
     );
+
+    // Background lane-store flush (ADR 003 §Off-chain voucher state persistence):
+    // mirror the in-memory voucher watermark to disk every
+    // `payment.voucher_commit_interval_ms`. A failed flush retains the dirty set
+    // for the next tick; it never blocks delivery.
+    let flush_store = Arc::clone(&channel_state_store);
+    let flush_metrics = Arc::clone(&node_metrics);
+    let flush_interval =
+        std::time::Duration::from_millis(cfg.payment.voucher_commit_interval_ms.max(1));
+    let lane_flush_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(flush_interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            let store = Arc::clone(&flush_store);
+            let res = tokio::task::spawn_blocking(move || store.flush()).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    flush_metrics.lane_flush_failure();
+                    tracing::warn!(%err, "lane store background flush failed; retrying next tick");
+                }
+                Err(join_err) => {
+                    flush_metrics.lane_flush_failure();
+                    tracing::warn!(%join_err, "lane store flush task join failed");
+                }
+            }
+        }
+    });
 
     // Node-to-node pull-through origin (#831, ADR 001/022). Constructed empty up
     // front so it can be appended to the cache's origin chain here; its
@@ -574,6 +606,7 @@ async fn build_infra(
         receipt_writer_shutdown,
         receipt_sink,
         receipt_writer,
+        lane_flush_task,
         node_origin,
         pull_through_origin,
         cache,
@@ -1035,14 +1068,6 @@ async fn build_chain_and_handlers(
         crate::region_accounting::RegistryRegionResolver::new(registry_regions),
     )));
 
-    // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
-    // so the handler takes the sender at construction (no post-construction attach)
-    // while the service takes the receiver. `redeem_tx` is cloned into the handler
-    // deps below and also handed to the service (so `redeem_hint_sender()` keeps
-    // working); `redeem_rx` drives the service's redeemer loop.
-    let (redeem_tx, redeem_rx) =
-        tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
-
     // In-memory last-voucher clock shared between the client handler (writer:
     // stamps on each accepted voucher) and `admin_v1_channels` (reader:
     // reports "time since last voucher"), issue #749. Non-durable by design —
@@ -1110,6 +1135,13 @@ async fn build_chain_and_handlers(
     // is a compliance gate, so a construction site that forgets to wire it must
     // not silently degrade to "deny nothing".
     let content_denylist = reload_state.content_denylist();
+    // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
+    // so the sender can be cloned into the handler deps below while the service
+    // takes the receiver. `redeem_tx` is cloned into the handler deps and also
+    // handed to the service (so `redeem_hint_sender()` keeps working); `redeem_rx`
+    // drives the service's redeemer loop.
+    let (redeem_tx, redeem_rx) =
+        tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1130,7 +1162,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&content_denylist),
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
     );
-    client_deps.redeem_hint = Some(redeem_tx.clone());
     // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
     // gate persists a presented capability so the redeemer registers the signer
     // on first redemption. Same redb file every lane record lives in.
@@ -1154,12 +1185,9 @@ async fn build_chain_and_handlers(
     // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
     client_deps.credit_max = cfg.payment.credit_max;
     client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
-    // Group-commit interval (ADR 003 §Off-chain voucher state persistence, #1483):
-    // amortize the per-voucher fsync across a batch, acking each only after the
-    // durable commit.
-    client_deps.voucher_commit_interval = Some(std::time::Duration::from_millis(
-        cfg.payment.voucher_commit_interval_ms,
-    ));
+    // Hint the settlement service on each accepted voucher so a lane's accrued
+    // claim is planned into a chunk promptly rather than waiting the self-tick.
+    client_deps.redeem_hint = Some(redeem_tx.clone());
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1167,8 +1195,8 @@ async fn build_chain_and_handlers(
     // `closeChannel` transactions with the same eth keystore signer. The
     // bootstrap self-checks the contract via `usdc()`; the watcher persists
     // channels opened against this node so the handler accepts their vouchers,
-    // and forgets settled ones. The redeem hint lets the handler nudge the
-    // service when an accrued claim may have crossed the threshold.
+    // and forgets settled ones. Redemption is purely periodic: a self-tick
+    // flushes the lane store then sweeps every above-threshold lane.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it
     // *prepares* a tx; if that send then fails (e.g. its `eth_estimateGas`
@@ -1201,6 +1229,7 @@ async fn build_chain_and_handlers(
         Arc::clone(&client_handler),
         capability_source,
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+        usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         event_poll_interval,
         Arc::clone(&head),
@@ -2090,6 +2119,9 @@ pub async fn run(
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
         receipt_writer: infra.receipt_writer,
+        lane_flush_task: infra.lane_flush_task,
+        channel_state_store: infra.channel_state_store,
+        node_metrics: infra.node_metrics,
         tasks: bg.tasks,
     };
     shutdown(handles, router, signal, &bg.drain_trigger, infra.cache).await
@@ -2125,6 +2157,11 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     receipt_writer_shutdown: CancellationToken,
     payment_service: PoolSettlementService<P>,
     receipt_writer: tokio::task::JoinHandle<()>,
+    /// Periodic lane-store flush timer, aborted below after one final durable
+    /// flush of `channel_state_store`.
+    lane_flush_task: tokio::task::JoinHandle<()>,
+    channel_state_store: Arc<dyn PoolStateStore>,
+    node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
 }
 
@@ -2164,6 +2201,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
         receipt_writer_shutdown,
         payment_service,
         receipt_writer,
+        lane_flush_task,
+        channel_state_store,
+        node_metrics,
         mut tasks,
     } = handles;
 
@@ -2293,6 +2333,23 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // redeem sweep so an above-threshold lane is not left un-redeemed. Bounded by
     // the deadline so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
+
+    // Final durable flush before stop, so the last interval of frontier lands.
+    // The router has drained and the redeem sweep above already ran, so the
+    // in-memory lane state is final; this is the last write before the
+    // background flush task is aborted below.
+    let flush_result = match tokio::task::spawn_blocking(move || channel_state_store.flush()).await
+    {
+        Ok(result) => result,
+        Err(join_err) => Err(decdn_incentive::StoreError::Backend(format!(
+            "flush join: {join_err}"
+        ))),
+    };
+    if let Err(err) = flush_result {
+        node_metrics.lane_flush_failure();
+        tracing::warn!(%err, "final lane store flush on shutdown failed");
+    }
+    lane_flush_task.abort();
 
     // Late admin stop (issue #604 `AfterRouter` path). The polling
     // client (`decdn node drain --wait`) needed admin to stay open
@@ -3493,6 +3550,7 @@ mod tests {
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
+                redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
                 buyer_initial_deposit_micro_usdc: 10_000_000,
                 buyer_working_deposit_micro_usdc: 10_000_000,

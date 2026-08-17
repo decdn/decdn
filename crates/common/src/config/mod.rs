@@ -74,6 +74,24 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// At this size the ~$0.10 redeem gas is a few percent of the redeemed
 /// amount while bounding unsettled exposure to ~1 USDC per pool (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
+/// Default redemption chunk size: 300 vouchers per `redeemMany` transaction.
+/// The benchmarks in `contracts/test/PaymentPool.t.sol` pin two marginals for
+/// one added cold-lane voucher: ~34.5k gas when the signer is already
+/// registered (`test_redeemMany_gas_N…`), and ~63.4k gas when the signer is
+/// first-time and its capability registers in the same call
+/// (`test_redeemMany_gas_firstTime_N…`). A high-fan-out node serving one-time
+/// payers hits the first-time case on every lane, so ~63.4k is the sizing
+/// figure. Registration cost is bounded: the node only redeems capabilities
+/// whose owner signature it verified off-chain against an EOA pool owner
+/// (`ClientHandler::intake_capability` rejects contract/ERC-1271 owners), so no
+/// unbounded owner-signature verification enters a `redeemMany`. Against
+/// Arbitrum One's block gas limit (~32M gas, an external reference — confirm
+/// live via `eth_getBlockByNumber` before a deploy decision), 300 first-time
+/// lanes cost ~19M gas: they fit a full block (the first-time ceiling is ~504
+/// lanes) but exceed a conservative half-block budget (~252 lanes). The
+/// reactive halve-retry in `submit_chunk` splits any chunk that a live block
+/// still rejects, so 300 stays safe with that backstop.
+const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
@@ -286,32 +304,19 @@ pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
 /// exceeds half the revenue the stream has already confirmed. Lower ramps faster;
 /// `0` opens the full [`DEFAULT_CREDIT_MAX`] from the first byte.
 pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
-/// Default group-commit interval in milliseconds when
+/// Default background flush period in milliseconds when
 /// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
-/// state persistence): 5 ms.
+/// state persistence): 5 s.
 ///
-/// The serve loop amortizes the per-voucher fsynced redb commit (~3 ms on local
-/// SSD) across a batch — one fsync for several vouchers, each acknowledged only
-/// *after* the commit is durable, so the replay guard is preserved verbatim. The
-/// batch is gathered by delivering ahead within the ramped [credit
-/// window](DEFAULT_CREDIT_MAX) and collecting the vouchers that arrive; this
-/// interval bounds how long the loop waits for a straggling batch-mate before
-/// committing what it has, so a client that pauses payment is never stalled
-/// longer than this. It is bounded above by the window: at most `credit_window /
-/// VOUCHER_INTERVAL_BYTES` vouchers can be outstanding, so the batch never
-/// exceeds that regardless of this value.
-///
-/// **Sizing constraint.** The interval spends credit-window headroom, not
-/// throughput: to keep the link saturated while acknowledgements lag one commit
-/// interval, size the window so that
-/// `credit_window ≥ throughput × (RTT + commit_interval)`. At a fully-ramped 64
-/// MiB window and a 50 ms RTT, a 5–20 ms interval is comfortable. `0` disables
-/// the gather wait (commit each blocking-read batch immediately); a
-/// stop-and-wait window (≤ one interval) ignores it entirely, since only one
-/// voucher is ever outstanding. Node-local policy, not a wire or governance
-/// parameter — like the voucher interval and the credit window it has no
-/// on-chain counterpart.
-pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
+/// The node advances each lane's voucher watermark in memory on verify and
+/// mirrors the working set to the redb lane store on this interval — one fsynced
+/// transaction covering every dirty lane. A crash loses at most one interval of
+/// *frontier*, which is safe to lose: an honest client resumes forward and an
+/// un-redeemed replay is still on-chain-payable. The redeemed watermark is
+/// floored separately by the pre-redeem flush, so this interval trades only
+/// throughput-nines against seconds of harmless frontier replay. Must be `> 0`.
+/// Node-local policy, not a wire or governance parameter.
+pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5_000;
 
 /// Default size at which the download-receipt log rotates (#802): 128 MiB.
 /// With the default `retained_files` this bounds the audit log to ~640 MiB
@@ -1375,6 +1380,21 @@ fn resolve_blockchain_into(
         },
     );
 
+    let redeem_max_vouchers_per_tx = file
+        .and_then(|b| b.redeem_max_vouchers_per_tx)
+        .unwrap_or(DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX);
+    // A `0` chunk size could never carry a voucher, stranding every redemption.
+    // Reject it; operators tuning gas set a small positive value.
+    bag.check_with(
+        redeem_max_vouchers_per_tx > 0,
+        "blockchain.redeem_max_vouchers_per_tx",
+        || {
+            "blockchain.redeem_max_vouchers_per_tx must be > 0 (a 0 chunk size \
+             carries no vouchers and strands every redemption)"
+                .to_string()
+        },
+    );
+
     let buyer_initial_deposit_micro_usdc = file
         .and_then(|b| b.buyer_initial_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
@@ -1442,6 +1462,7 @@ fn resolve_blockchain_into(
         event_poll_interval_ms,
         rate_bounds_poll_interval_sec,
         redeem_threshold_micro_usdc,
+        redeem_max_vouchers_per_tx,
         redeem_interval_secs,
         buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
@@ -2405,13 +2426,21 @@ pub fn resolve_payment_into(
     let credit_ramp_divisor = file
         .and_then(|p| p.credit_ramp_divisor)
         .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
-    // Group-commit interval (ADR 003 §Off-chain voucher state persistence).
-    // Default 5 ms; `0` (commit each blocking-read batch immediately) is a
-    // valid setting, so it merges as a first-class value rather than falling
-    // back to the default.
+    // Background flush period (ADR 003 §Off-chain voucher state persistence).
+    // `0` would build a zero-period `tokio::time::interval`, which panics; reject
+    // it so an operator wanting tight durability sets a small positive value.
     let voucher_commit_interval_ms = file
         .and_then(|p| p.voucher_commit_interval_ms)
         .unwrap_or(DEFAULT_VOUCHER_COMMIT_INTERVAL_MS);
+    bag.check_with(
+        voucher_commit_interval_ms > 0,
+        "payment.voucher_commit_interval_ms",
+        || {
+            "payment.voucher_commit_interval_ms must be > 0 (a 0 interval is not a \
+             valid flush period)"
+                .to_string()
+        },
+    );
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
@@ -4622,9 +4651,9 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_payment_threads_explicit_commit_interval() -> anyhow::Result<()> {
-        // Explicit values thread through, including `0` (commit each batch
-        // immediately) which must NOT fall back to the default.
-        for set in [Some(0u64), Some(20)] {
+        // A non-zero explicit value threads through rather than falling back to
+        // the default.
+        for set in [Some(20u64), Some(1_000)] {
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
                 delivery_floor: None,
@@ -4639,6 +4668,18 @@ swap_pool_address = \"0xPool\"
                 resolved.voucher_commit_interval_ms
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_rejects_zero_commit_interval() -> anyhow::Result<()> {
+        let file = types::PaymentConfig {
+            voucher_commit_interval_ms: Some(0),
+            ..Default::default()
+        };
+        let err = resolve_payment(&empty_payment_args(), Some(&file))
+            .expect_err("zero flush interval must be rejected");
+        anyhow::ensure!(err.to_string().contains("voucher_commit_interval_ms"));
         Ok(())
     }
 
@@ -8462,6 +8503,61 @@ swap_pool_address = \"0xPool\"
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert_eq!(resolved.redeem_interval_secs, DEFAULT_REDEEM_INTERVAL_SECS);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_redeem_max_vouchers_per_tx() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_max_vouchers_per_tx: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem_max_vouchers_per_tx is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_max_vouchers_per_tx"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_redeem_max_vouchers_per_tx_when_absent()
+    -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(
+            resolved.redeem_max_vouchers_per_tx,
+            DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX
+        );
         Ok(())
     }
 

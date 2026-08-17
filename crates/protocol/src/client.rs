@@ -597,23 +597,28 @@ impl ChunkData {
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
 ///
-/// Only `{signature, amount}` travel on the wire; the receiver reconstructs
-/// the full EIP-712 typed data `{poolId, signer, provider, amount,
-/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed
-/// for the stream, `bytesDelivered` the node's per-pool cumulative counter).
-/// There is no nonce: `amount` is monotone cumulative spend within the pool,
-/// and it alone orders vouchers and rejects replays — a voucher with an
-/// `amount` no greater than the highest one already accepted is stale.
-/// `amount` is a 256-bit value in big-endian bytes — the protocol crate has
-/// no `U256`, and truncating to `u64` would break pools whose cumulative
-/// spend exceeds `u64::MAX`.
+/// The wire carries `{signature, amount, bytes_delivered}`; the receiver
+/// reconstructs the full EIP-712 typed data `{poolId, signer, provider, amount,
+/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed for
+/// the stream) plus the self-described `amount` and `bytesDelivered`. There is
+/// no nonce: `amount` is the sole ordering and replay key — a voucher whose
+/// `amount` is no greater than the highest accepted is stale. `bytes_delivered`
+/// is an additional signed, monotone cumulative that must not regress below the
+/// highest accepted; it is what the node verifies against (rather than
+/// reconstructing) so same-lane vouchers settle independent of arrival order.
+/// Both are 256-bit values in big-endian bytes — the protocol crate has no
+/// `U256`, and truncating to `u64` would break pools whose totals exceed
+/// `u64::MAX`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).
     pub signature: Vec<u8>,
-    /// Cumulative payment in token base units, big-endian `uint256`. The sole
-    /// ordering and replay key.
+    /// Cumulative payment in token base units, big-endian `uint256`.
     pub amount: [u8; 32],
+    /// Cumulative bytes delivered, big-endian `uint256`. Signed by the client
+    /// and transmitted so the node verifies against exactly what was signed,
+    /// independent of same-lane stream ordering.
+    pub bytes_delivered: [u8; 32],
 }
 
 impl Voucher {
@@ -729,8 +734,8 @@ pub enum StreamError {
         /// is `0` until settlement), so this lets it self-heal: re-seed the
         /// ledger's PAYMENT BASELINE to `bytes_delivered` (a pool-cumulative
         /// counter, NOT a blob `byte_offset`) and re-sign from the new
-        /// baseline. `None` for every handler-direct reason (`RetryLater`,
-        /// `RateFloorRaised`, …) and whenever the signer does not recover to
+        /// baseline. `None` for every handler-direct reason (`RateFloorRaised`,
+        /// …) and whenever the signer does not recover to
         /// `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
@@ -770,15 +775,11 @@ impl StreamError {
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
 /// matches those exhaustively so a new `PoolError` variant fails to compile
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
-/// variants have no validation-enum counterpart and are emitted directly by the
-/// `cdn/client/v1` handler: [`Self::RetryLater`] is the wire expression of a
-/// transient persist-write failure (`PoolError::Store`,
-/// `decdn_incentive::RetrySignal`), the one rejection where the client should
-/// resend the **same** voucher rather than treat the failure as permanent
-/// (ADR 003 §Off-chain voucher state persistence); and [`Self::RateFloorRaised`]
-/// is the honest-buyer re-quote signal when the live delivery floor rose above
-/// a stream's quoted rate (#1382). Variant order is frozen — new handler-direct
-/// reasons append at the end.
+/// variant has no validation-enum counterpart and is emitted directly by the
+/// `cdn/client/v1` handler: [`Self::RateFloorRaised`] is the honest-buyer
+/// re-quote signal when the live delivery floor rose above a stream's quoted
+/// rate (#1382). Variant order is frozen — new handler-direct reasons append
+/// at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -801,14 +802,6 @@ pub enum VoucherRejectReason {
     /// exceeds what the capability has left to spend, or the capability
     /// itself has expired. `PoolError::CapExceeded`.
     CapExceeded,
-    /// Transient node-side persist-write failure (`PoolError::Store`,
-    /// surfaced via `decdn_incentive::RetrySignal`). The voucher itself was
-    /// valid and in-memory state did not advance, so the client should resend
-    /// the **same** voucher on a fresh stream rather than refreshing state or
-    /// topping up. No validation-enum counterpart — `voucher_reject_reason`
-    /// never returns this; the `cdn/client/v1` handler emits it directly (ADR
-    /// 003 §Off-chain voucher state persistence).
-    RetryLater,
     /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
     /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
     /// stream was quoted at, after the signed `StreamResponse` but before this
@@ -830,8 +823,8 @@ impl VoucherRejectReason {
     /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the three
     /// regression/exhaustion reasons a wallet-less client cannot distinguish
     /// from chain, since its local watermark is the only thing that could be
-    /// wrong. Every handler-direct reason (`RetryLater`, `RateFloorRaised`,
-    /// plus the signer/pool/provider mismatches) is never eligible — a bundle
+    /// wrong. Every handler-direct reason (`RateFloorRaised`, plus the
+    /// signer/pool/provider mismatches) is never eligible — a bundle
     /// would not help there, since the fix is not "resync the watermark".
     ///
     /// Single source of truth for the gate: the node checks this before
@@ -910,6 +903,7 @@ mod tests {
         Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x11u8; 32],
+            bytes_delivered: [0x22u8; 32],
         }
     }
 
@@ -1180,7 +1174,6 @@ mod tests {
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
             VoucherRejectReason::CapExceeded,
-            VoucherRejectReason::RetryLater,
             VoucherRejectReason::RateFloorRaised,
         ]
         .into_iter()
@@ -1271,12 +1264,14 @@ mod tests {
         let v = Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x01u8; 32],
+            bytes_delivered: [0x02u8; 32],
         };
         let bytes = postcard::to_allocvec(&v)?;
         let mut expected = Vec::new();
         expected.push(VOUCHER_SIG_LEN as u8); // signature length prefix (65)
         expected.extend_from_slice(&[0xCDu8; VOUCHER_SIG_LEN]); // signature
         expected.extend_from_slice(&[0x01u8; 32]); // amount (no length prefix)
+        expected.extend_from_slice(&[0x02u8; 32]); // bytes_delivered (no length prefix)
         assert_eq!(bytes, expected);
         Ok(())
     }

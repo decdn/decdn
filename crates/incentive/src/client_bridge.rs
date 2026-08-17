@@ -2,13 +2,12 @@
 //! state machine.
 //!
 //! The protocol crate ([`decdn_protocol::Voucher`]) is crypto-free: a wire
-//! voucher carries only `{signature, amount}` as raw bytes. Validating it
-//! against a lane requires the full EIP-712 typed data
+//! voucher carries `{signature, amount, bytes_delivered}` as raw bytes.
+//! Validating it against a lane requires the full EIP-712 typed data
 //! `{pool_id, signer, provider, amount, bytes_delivered}` — and `pool_id`,
-//! `signer`, `provider`, and `bytes_delivered` are **not** on the wire (ADR 005
-//! §Voucher wire format). They come from stream context: `pool_id` from the
-//! signed `StreamRequest`, `signer` the capability key, `provider` this node,
-//! and `bytes_delivered` the node's per-lane cumulative byte counter.
+//! `signer`, and `provider` are **not** on the wire (ADR 005 §Voucher wire
+//! format). They come from stream context: `pool_id` from the signed
+//! `StreamRequest`, `signer` the capability key, and `provider` this node.
 //! [`wire_voucher_to_signed`] reconstructs the [`SignedVoucher`] from a wire
 //! voucher plus that context; [`signed_to_wire_voucher`] is the requester-side
 //! inverse.
@@ -27,10 +26,10 @@ use crate::voucher::{SignedVoucher, Voucher, VoucherError};
 
 /// Reconstruct a [`SignedVoucher`] from a wire voucher plus lane context.
 ///
-/// `pool_id`, `signer`, `provider`, and `bytes_delivered` are not carried on the
-/// wire — the node supplies `pool_id` from the originating `StreamRequest`,
-/// `signer` from the registered capability, `provider` from its own identity,
-/// and `bytes_delivered` from its per-lane cumulative byte counter.
+/// `pool_id`, `signer`, and `provider` are not carried on the wire — the node
+/// supplies `pool_id` from the originating `StreamRequest`, `signer` from the
+/// registered capability, and `provider` from its own identity. `amount` and
+/// `bytes_delivered` ride the wire.
 ///
 /// # Errors
 ///
@@ -41,7 +40,6 @@ pub fn wire_voucher_to_signed(
     pool_id: B256,
     signer: Address,
     provider: Address,
-    bytes_delivered: U256,
 ) -> Result<SignedVoucher, WireVoucherError> {
     // Length is checked by the protocol's own `Voucher::validate` (it pins
     // `VOUCHER_SIG_LEN`); `Signature::from_raw` then enforces well-formedness.
@@ -55,20 +53,21 @@ pub fn wire_voucher_to_signed(
             signer,
             provider,
             amount: U256::from_be_bytes(wire.amount),
-            bytes_delivered,
+            bytes_delivered: U256::from_be_bytes(wire.bytes_delivered),
         },
         signature,
     })
 }
 
 /// Encode a [`SignedVoucher`] to its wire form (requester side). The
-/// lane-context fields (`pool_id`, `signer`, `provider`, `bytes_delivered`) are
-/// dropped — the receiver reconstructs them.
+/// lane-context fields (`pool_id`, `signer`, `provider`) are dropped — the
+/// receiver reconstructs them.
 #[must_use]
 pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> WireVoucher {
     WireVoucher {
         signature: signed.signature.as_bytes().to_vec(),
         amount: signed.voucher.amount.to_be_bytes::<32>(),
+        bytes_delivered: signed.voucher.bytes_delivered.to_be_bytes::<32>(),
     }
 }
 
@@ -81,13 +80,10 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> WireVoucher {
 ///
 /// [`PoolError::Store`] is the only transient failure: in-memory state did not
 /// advance, so it returns [`RetrySignal`] rather than a permanent reason. The
-/// `cdn/client/v1` handler surfaces that signal on the wire as
-/// [`VoucherRejectReason::RetryLater`] (sent in-band, then the stream is finished
-/// cleanly), so the client resends the **same** voucher on a fresh stream instead
-/// of seeing an opaque connection drop (ADR 003 §Off-chain voucher state
-/// persistence). `RetryLater` has no `PoolError` counterpart here — it is produced
-/// by the handler from the `Err(RetrySignal)` arm, not by this mapping. Every
-/// other variant is a permanent rejection.
+/// `cdn/client/v1` handler surfaces that signal by aborting the stream (no
+/// in-band wire reason), so the client resends the **same** voucher on a
+/// fresh stream (ADR 003 §Off-chain voucher state persistence). Every other
+/// variant is a permanent rejection.
 pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReason, RetrySignal> {
     match err {
         PoolError::WrongPool { .. } => Ok(VoucherRejectReason::WrongPool),
@@ -101,9 +97,9 @@ pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReaso
         PoolError::Signature(VoucherError::WrongSigner { .. }) => {
             Ok(VoucherRejectReason::WrongSigner)
         }
-        // Transient — in-memory state unchanged. The handler emits this on the
-        // wire as `VoucherRejectReason::RetryLater`; the client resends the same
-        // voucher (#527, ADR 003 §Off-chain voucher state persistence).
+        // Transient — in-memory state unchanged. The handler aborts the stream
+        // rather than emitting an in-band wire reason; the client resends the
+        // same voucher (ADR 003 §Off-chain voucher state persistence).
         PoolError::Store(_) => Err(RetrySignal),
     }
 }
@@ -117,10 +113,9 @@ pub enum WireVoucherError {
 }
 
 /// Signals that a [`PoolError`] was transient ([`PoolError::Store`]): in-memory
-/// state did not advance, so the caller surfaces it as a
-/// [`VoucherRejectReason::RetryLater`] in-band rejection (no ack) and the client
-/// resends the **same** voucher on a fresh stream (#527, ADR 003) —
-/// distinguishable from a permanent rejection or a network drop.
+/// state did not advance, so the caller aborts the stream (no in-band wire
+/// reason) and the client resends the **same** voucher on a fresh stream (ADR
+/// 003) — distinguishable from a permanent rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetrySignal;
 
@@ -158,8 +153,7 @@ mod tests {
         let wire = signed_to_wire_voucher(&signed);
         anyhow::ensure!(wire.signature.len() == decdn_protocol::VOUCHER_SIG_LEN);
 
-        let rebuilt =
-            wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER, bytes_delivered)?;
+        let rebuilt = wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER)?;
         anyhow::ensure!(rebuilt == signed, "bridge must preserve the signed voucher");
         rebuilt.verify_signer(signer.address(), &domain)?;
         Ok(())
@@ -170,8 +164,9 @@ mod tests {
         let wire = WireVoucher {
             signature: vec![0u8; 10],
             amount: [0u8; 32],
+            bytes_delivered: [0u8; 32],
         };
-        let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER, U256::ZERO)
+        let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected BadSignature, got Ok"))?;
         anyhow::ensure!(matches!(err, WireVoucherError::BadSignature));
@@ -190,8 +185,9 @@ mod tests {
         let wire = WireVoucher {
             signature,
             amount: [0u8; 32],
+            bytes_delivered: [0u8; 32],
         };
-        let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER, U256::ZERO)
+        let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected BadSignature, got Ok"))?;
         anyhow::ensure!(matches!(err, WireVoucherError::BadSignature));
@@ -350,9 +346,10 @@ mod prop_tests {
 
             let wire = signed_to_wire_voucher(&signed);
             prop_assert_eq!(wire.amount, amount.to_be_bytes::<32>());
+            prop_assert_eq!(wire.bytes_delivered, bytes_delivered.to_be_bytes::<32>());
 
             let rebuilt =
-                wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER, bytes_delivered)
+                wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER)
                     .unwrap();
             prop_assert_eq!(&rebuilt, &signed, "bridge must preserve the signed voucher");
             prop_assert!(rebuilt.verify_signer(signer.address(), &domain).is_ok());
@@ -366,9 +363,12 @@ mod prop_tests {
             signature in prop::collection::vec(any::<u8>(), 0..200),
             amount in proptest::array::uniform32(any::<u8>()),
         ) {
-            let wire = WireVoucher { signature: signature.clone(), amount };
-            let result =
-                wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER, U256::ZERO);
+            let wire = WireVoucher {
+                signature: signature.clone(),
+                amount,
+                bytes_delivered: [0u8; 32],
+            };
+            let result = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER);
             if signature.len() != decdn_protocol::VOUCHER_SIG_LEN {
                 prop_assert_eq!(result.err(), Some(WireVoucherError::BadSignature));
             }

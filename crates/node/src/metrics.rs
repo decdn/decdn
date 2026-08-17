@@ -531,6 +531,11 @@ pub struct DecdnMetrics {
     /// sweep. Either way a non-zero rate flags a struggling channel store or RPC.
     /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
+    /// Lane-store background flushes that failed (the dirty set is retained and
+    /// retried next tick). A sustained non-zero rate means the store cannot be
+    /// fsynced — the frontier-only replay surface is widening. Operator-visible
+    /// name: `decdn_lane_flush_failures_total`.
+    pub lane_flush_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
     /// bring-up backfill and the live stream (#1032). A non-zero value means the
@@ -1938,6 +1943,12 @@ recorders! {
     /// so their context surfaces in `resumable_watcher::run`'s loop-level
     /// `warn!` ("watcher RPC error; restarting after backoff") instead.
     watcher_persist_failure => watcher_persist_failures.inc();
+
+    /// A lane-store background flush failed — the dirty in-memory set is
+    /// retained and retried on the next timer tick, or a final flush on
+    /// shutdown failed. Pairs with the `warn!`s in the background flush task
+    /// and the shutdown flush in `runtime/mod.rs`.
+    lane_flush_failure => lane_flush_failures.inc();
 
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).

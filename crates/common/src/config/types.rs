@@ -189,16 +189,25 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
     /// be `0` (that would poll every tick); rejected at config resolution.
     pub rate_bounds_poll_interval_sec: Option<u64>,
-    /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the node
-    /// submits an on-chain redeem against the pool (#327, ADR 003 § Operator
-    /// early withdrawal). Larger values amortize gas across more delivery;
-    /// smaller values bound unsettled exposure. Absent => default
-    /// (1 USDC = `1_000_000` `µUSDC`).
+    /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
+    /// early withdrawal). The node submits an on-chain redemption
+    /// transaction for a chunk of lanes only once the aggregate un-redeemed
+    /// value across that chunk's lanes reaches this floor; every lane in a
+    /// submitted chunk settles, so a small (dust) lane rides alongside the
+    /// larger lanes that cleared the floor. Larger values amortize gas
+    /// across more delivery; smaller values bound unsettled exposure.
+    /// Absent => default (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
+    /// Maximum vouchers packed into one `redeemMany` transaction. The redeemer
+    /// splits a sweep across this many vouchers per transaction so a high-fan-out
+    /// node stays under the block gas limit; a chunk that still fails to send
+    /// oversized is halved and retried. Absent => default (`300`). Must not be
+    /// `0`; rejected at config resolution.
+    pub redeem_max_vouchers_per_tx: Option<u64>,
     /// Seconds between the redeemer's self-tick sweeps (#327, #751): the
-    /// low-frequency backstop that scans every pool for an above-threshold
-    /// claim independent of the advisory per-voucher hints, so a dropped hint can
-    /// never strand an accrued balance. Smaller values withdraw earnings sooner
+    /// low-frequency backstop that sweeps every lane and redeems the chunks
+    /// that clear the redemption floor, independent of the advisory per-voucher
+    /// hints, so a dropped hint can never strand an accrued balance. Smaller values withdraw earnings sooner
     /// at the cost of more pool-state reads; larger values lean harder on the
     /// hints. Absent => default (300s / 5 min). Must not be `0`; rejected at
     /// config resolution.
@@ -757,18 +766,8 @@ pub struct PaymentConfig {
     /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
     /// behavior. It is node-local config, not a governance-owned parameter.
     pub credit_ramp_divisor: Option<u64>,
-    /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
-    /// persistence): how long the serve loop waits to gather more vouchers
-    /// into one fsynced commit before committing what it has, so a single
-    /// durable write amortizes across a batch. Each voucher is still
-    /// acknowledged only after the commit is durable, so the replay guard is
-    /// unchanged. Absent => [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]
-    /// (5 ms). `0` commits each blocking-read batch immediately. Composes with
-    /// [`Self::credit_max`] via `credit_window ≥ throughput × (RTT +
-    /// commit_interval)`; bounded above by the window (at most
-    /// `credit_window / VOUCHER_INTERVAL_BYTES` vouchers are ever outstanding).
-    /// Like [`Self::credit_max`] it is node-local, not a governance-owned
-    /// parameter.
+    /// Background flush period for the lane store, in ms. See
+    /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.
     pub voucher_commit_interval_ms: Option<u64>,
 }
 

@@ -338,6 +338,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             event_poll_interval_ms: 7000,
             rate_bounds_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
+            redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
             buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
