@@ -82,9 +82,10 @@ pub trait PoolStateStore: Send + Sync {
     /// Force all buffered lane state durable (fsync, for disk-backed impls).
     ///
     /// The default is a no-op: a volatile store ([`MemoryPoolStateStore`]) holds
-    /// nothing to flush. The redb-backed runtime store overrides this to write
-    /// its dirty set in one fsynced transaction. The background persist task and
-    /// the pre-redeem path call it; `record` and `forget` only mutate memory.
+    /// nothing to flush, and a store that commits inside `record` has nothing
+    /// buffered. A disk-backed implementation MAY override this to buffer
+    /// `record` and `forget` in memory and make them durable here in one fsynced
+    /// transaction.
     ///
     /// # Errors
     ///
@@ -111,8 +112,7 @@ pub struct PendingSettle {
 /// a timestamp gate — not the voucher state — and the lifecycles differ.
 ///
 /// Implementations MUST commit durably (fsync, on disk-backed impls) before
-/// returning `Ok` from `record_pending` / `forget_pending`, mirroring the
-/// [`PoolStateStore`] durability contract.
+/// returning `Ok` from `record_pending` / `forget_pending`.
 pub trait PendingSettleStore: Send + Sync {
     /// Persist a closed pool awaiting settlement. Overwrites any existing entry
     /// for the same pool (a re-close re-stamps the deadline).
@@ -181,8 +181,7 @@ impl CheckpointKey {
 /// re-scanning the overlap is harmless.
 ///
 /// A directly disk-backed implementation MUST commit durably (fsync) before
-/// returning `Ok` from [`record_checkpoint`](Self::record_checkpoint), mirroring
-/// the [`PoolStateStore`] durability contract. A debouncing *decorator* MAY relax
+/// returning `Ok` from [`record_checkpoint`](Self::record_checkpoint). A debouncing *decorator* MAY relax
 /// that per-call fsync — buffering in memory and coarsening the durable write
 /// cadence — provided it preserves the two invariants this contract rests on,
 /// **per key**: the persisted block is **monotonic** (never lowered) and the
