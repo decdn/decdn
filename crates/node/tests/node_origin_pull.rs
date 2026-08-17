@@ -12862,9 +12862,12 @@ struct TopUpFixture {
 
 impl TopUpFixture {
     async fn shutdown(self) {
-        self.ep_b.close().await;
-        self.ep_a.close().await;
         self.task_a.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            self.ep_b.close().await;
+            self.ep_a.close().await;
+        })
+        .await;
     }
 }
 
