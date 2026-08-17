@@ -594,13 +594,16 @@ impl std::error::Error for PullTimeout {}
 /// only for the gated regression/exhaustion reasons, and only when the node
 /// verified the rejected voucher recovered to the pool capability.s pinned
 /// `signer` before attaching it. A caller that sees `Some` alongside
-/// `AmountRegression`/`BytesRegression`/`CapExceeded` can self-heal — re-seed
-/// its ledger to the bundle's watermark ([`crate::ledger::Cumulative::from`])
-/// and resume from `bytes_delivered` — rather than treating the rejection as
-/// terminal. `CapExceeded` with `bundle: None` means there is no
-/// signer-verified watermark to resume from (or, more commonly, that a
-/// wallet-less delegate simply has no local means to add deposit) — the
-/// caller must surface that to the app rather than loop.
+/// `AmountRegression`/`BytesRegression`/`SpendingCapExhausted` can self-heal —
+/// re-seed its ledger to the bundle's watermark
+/// ([`crate::ledger::Cumulative::from`]) and resume from `bytes_delivered` —
+/// rather than treating the rejection as terminal. `SpendingCapExhausted`
+/// with `bundle: None` means there is no signer-verified watermark to resume
+/// from (or, more commonly, that a wallet-less delegate simply has no local
+/// means to add deposit) — the caller must surface that to the app rather
+/// than loop. `CapabilityExpired` and `PoolExhausted` are never
+/// watermark-gated (no bundle is ever attached) and are always terminal —
+/// the fix is a fresh capability or an owner top-up, not a resync.
 #[derive(Debug)]
 pub struct UpstreamVoucherRejected {
     pub reason: VoucherRejectReason,
@@ -1485,7 +1488,7 @@ async fn open_stream(
 
 /// Wallet-less resume (issue #1481 §5): the maximum number of times a fetch
 /// will reopen a fresh stream after a gated, bundled
-/// `AmountRegression`/`BytesRegression`/`CapExceeded`
+/// `AmountRegression`/`BytesRegression`/`SpendingCapExhausted`
 /// rejection. Bounds a node that keeps rejecting (a buggy or adversarial
 /// peer echoing a bundle that never lets the client catch up) to a handful
 /// of round trips rather than looping forever; a healthy self-heal needs
@@ -1498,7 +1501,7 @@ pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Reactive graduation (#1497): the maximum number of times the STREAMING fetch
 /// (`crates/cli/src/commands/fetch.rs`) will `topUp` a channel toward its
-/// `working_deposit` after a genuine mid-fetch `CapExceeded` (validated
+/// `working_deposit` after a genuine mid-fetch `SpendingCapExhausted` (validated
 /// against the buyer's own ledger via [`genuine_exhaustion`]) and resume at the
 /// PAID FRONTIER ([`sink::content_paid_frontier`]) — not at the failed leg's own
 /// offset, which would re-pay for the credited-but-unpaid tail. Separate from [`MAX_RESUME_ATTEMPTS`]: a top-up is a funding
@@ -1552,7 +1555,7 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// The daemon's node-to-node cache-miss buyer leg does not use this wrapper: it
 /// drives its own resume loop over [`open_progressive_pull`] in
 /// `decdn-node`'s `node_origin/resume.rs`, which reseeds on the same contract and
-/// additionally answers a genuine `CapExceeded` with an on-chain top-up —
+/// additionally answers a genuine `SpendingCapExhausted` with an on-chain top-up —
 /// the thing a from-zero buffered retry could never do without re-paying for the
 /// delivered prefix. Either way `pull_verdict` / `voucher_verdict` in `decdn-node`
 /// see only the terminal outcome, so the `OurDeadChannel` classification there
@@ -1708,9 +1711,9 @@ pub fn resumable_watermark<'a>(
     .then_some(bundle)
 }
 
-/// True iff `err` is a `CapExceeded` voucher rejection that the buyer's OWN ledger
+/// True iff `err` is a `SpendingCapExhausted` voucher rejection that the buyer's OWN ledger
 /// corroborates as genuine exhaustion, AND the buyer's remaining spendable deposit is below the
-/// cost of the next voucher. A node claiming `CapExceeded` while the buyer's ledger
+/// cost of the next voucher. A node claiming `SpendingCapExhausted` while the buyer's ledger
 /// still shows headroom is NOT corroborated (returns `false`) — the caller must refuse to fund
 /// it.
 ///
@@ -1739,7 +1742,7 @@ pub fn genuine_exhaustion(
     let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() else {
         return false;
     };
-    if rejected.reason != VoucherRejectReason::CapExceeded {
+    if rejected.reason != VoucherRejectReason::SpendingCapExhausted {
         return false;
     }
     // An authenticated bundle that ADVANCES our committed amount is a healable desync — let the
@@ -3166,7 +3169,7 @@ mod tests {
         Ok(())
     }
 
-    /// True twin: `CapExceeded` with no bundle (nothing for `resumable_watermark` to
+    /// True twin: `SpendingCapExhausted` with no bundle (nothing for `resumable_watermark` to
     /// reseed from) and our own ledger confirming we truly cannot cover the next voucher.
     #[test]
     fn genuine_exhaustion_true_when_insufficient_and_ledger_drained() {
@@ -3180,7 +3183,7 @@ mod tests {
         let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
 
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         });
         // remaining 10 µUSDC, next voucher needs 1000 -> truly out.
@@ -3193,7 +3196,7 @@ mod tests {
         ));
     }
 
-    /// A node crying `CapExceeded` while our OWN ledger still shows headroom is NOT
+    /// A node crying `SpendingCapExhausted` while our OWN ledger still shows headroom is NOT
     /// corroborated — the caller must refuse to fund it (a lying or buggy node must not be
     /// able to solicit an unnecessary top-up).
     #[test]
@@ -3208,7 +3211,7 @@ mod tests {
         let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
 
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         });
         assert!(!genuine_exhaustion(
@@ -3220,7 +3223,7 @@ mod tests {
         ));
     }
 
-    /// Any rejection reason other than `CapExceeded` is never exhaustion, regardless
+    /// Any rejection reason other than `SpendingCapExhausted` is never exhaustion, regardless
     /// of what the ledger shows.
     #[test]
     fn genuine_exhaustion_false_for_non_insufficient_reason() {
@@ -3248,7 +3251,7 @@ mod tests {
 
     /// A healable watermark desync — an authenticated bundle that ADVANCES our committed
     /// watermark (the node knows about a voucher nonce we do not) — is NOT genuine exhaustion,
-    /// even if it rides on an `CapExceeded` rejection and even if the ledger looks
+    /// even if it rides on an `SpendingCapExhausted` rejection and even if the ledger looks
     /// drained: the caller should reseed and resume, not fund a top-up.
     #[test]
     fn genuine_exhaustion_false_when_healable_desync_bundle_advances_committed()
@@ -3278,7 +3281,7 @@ mod tests {
             U256::from(4096u64),
         )?;
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: Some(bundle),
         });
 
@@ -3335,7 +3338,7 @@ mod tests {
             U256::from(4096u64),
         )?;
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: Some(bundle),
         });
 

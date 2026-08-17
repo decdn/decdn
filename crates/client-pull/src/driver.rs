@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     /// A [`BlobSource`] wrapper that fails its FIRST open with a scripted
-    /// upstream `CapExceeded` voucher rejection — the shape a genuine
+    /// upstream `SpendingCapExhausted` voucher rejection — the shape a genuine
     /// mid-fetch exhaustion refusal takes — and delegates every later open to
     /// the inner [`ScriptedSource`]. Regression coverage for the pacer bug where
     /// `BudgetPacer` proactively returned `Wait` after every top-up, forcing the
@@ -1152,7 +1152,7 @@ mod tests {
                         interval_bytes: 1024 * 1024,
                     };
                     let fault = UpstreamVoucherRejected {
-                        reason: VoucherRejectReason::CapExceeded,
+                        reason: VoucherRejectReason::SpendingCapExhausted,
                         bundle: None,
                     };
                     return Ok((
@@ -1178,7 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn a_top_up_is_followed_by_an_immediate_reopen_not_a_settle_wait() {
         // The buyer starts under-deposited, so the first open's genuine
-        // `CapExceeded` refusal is corroborated by the buyer's OWN
+        // `SpendingCapExhausted` refusal is corroborated by the buyer's OWN
         // ledger (0 remaining < any nonzero voucher cost) and the pacer tops
         // up. Before the fix, `BudgetPacer::decide` proactively returned `Wait`
         // right after that top-up, and the driver slept the WHOLE settle

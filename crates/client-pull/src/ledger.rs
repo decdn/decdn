@@ -222,7 +222,7 @@ impl PoolLedger {
 
     /// Wallet-less self-heal (issue #1481): overwrite the committed watermark to
     /// `cum` — typically [`Cumulative::from`] a [`WatermarkBundle`] the node
-    /// attached to a gated `AmountRegression` / `BytesRegression` / `CapExceeded`
+    /// attached to a gated `AmountRegression` / `BytesRegression` / `SpendingCapExhausted`
     /// rejection — and clear the rewind + armed state, since the node has just
     /// told us its authoritative watermark. The next [`Self::issue`] builds on
     /// `cum`, matching what the node will accept next.
@@ -485,20 +485,20 @@ mod tests {
         Ok(())
     }
 
-    /// `CapExceeded` with NO bundle (a genuinely exhausted capability, nothing to
+    /// `SpendingCapExhausted` with NO bundle (a genuinely exhausted capability, nothing to
     /// resume from) must not be treated as self-healable — a caller checking
     /// `bundle.is_none()` sees the "give up / top up" signal. This pins the
     /// type-shape contract the resume path depends on.
     #[test]
     fn cap_exceeded_without_a_bundle_is_not_self_healable() -> anyhow::Result<()> {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         });
         let upstream = err
             .downcast_ref::<UpstreamVoucherRejected>()
             .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
-        assert_eq!(upstream.reason, VoucherRejectReason::CapExceeded);
+        assert_eq!(upstream.reason, VoucherRejectReason::SpendingCapExhausted);
         assert!(
             upstream.bundle.is_none(),
             "no bundle means no self-heal path — the caller must surface a top-up need"

@@ -698,7 +698,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             || {},
         )
         .await;
-        // On the delegated path a terminal `CapExceeded` reconnects to the
+        // On the delegated path a terminal `SpendingCapExhausted` reconnects to the
         // owner-side remedy (the delegate cannot top up), the same as `fetch`.
         match (result, self.grant.is_some()) {
             (Ok(_bytes), _) => Ok(()),

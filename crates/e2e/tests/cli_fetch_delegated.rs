@@ -410,7 +410,7 @@ async fn run_cli_capture(
 /// Run `decdn fetch`, retrying until the node's chain watcher has observed the
 /// owner's freshly-opened pool (`decdn fetch` has no internal retry for that
 /// race). The only expected transient here is the readiness `NotFound`; the
-/// delegated cap is far larger than one delivery costs, so a `CapExceeded` cannot
+/// delegated cap is far larger than one delivery costs, so a `SpendingCapExhausted` cannot
 /// arise to be masked by the retry.
 async fn run_fetch_until_ready(home: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);

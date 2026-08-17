@@ -2508,7 +2508,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(
             rejected.reason,
-            decdn_protocol::client::VoucherRejectReason::CapExceeded
+            decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
         ),
         "the exhausted channel must surface its own rejection reason; got {:?}",
         rejected.reason
@@ -4125,9 +4125,9 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
 
 /// A lane whose capability `expiry` is already in the past is refused in-band and
 /// the stream finishes cleanly (no QUIC reset) — the client reads an actionable
-/// reason instead of an opaque drop (#751). In the shared-payment-pool model an
-/// expired grant surfaces as `VoucherRejected { CapExceeded }` (its cap is
-/// exhausted for all vouchers past expiry); the separate `Expired` reason is gone.
+/// reason instead of an opaque drop (#751). An expired grant surfaces as
+/// `VoucherRejected { CapabilityExpired }`, distinct from a cap-exhausted
+/// `SpendingCapExhausted` — the fix is a fresh capability, not a cap raise.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 4096];
@@ -4189,8 +4189,8 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
     .err()
     .ok_or_else(|| anyhow::anyhow!("expired channel must reject the voucher"))?;
     anyhow::ensure!(
-        err.to_string().contains("CapExceeded"),
-        "error should surface the expired grant as CapExceeded: {err}"
+        err.to_string().contains("CapabilityExpired"),
+        "error should surface the expired grant as CapabilityExpired: {err}"
     );
 
     client_ep.close().await;

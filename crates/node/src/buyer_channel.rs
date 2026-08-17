@@ -716,7 +716,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Raise the node's pool toward `target_deposit` and return the pool's NEW
     /// total deposit (#1530). The reactive counterpart of the proactive low-water
     /// refill: the node-to-node pull loop calls this when an upstream rejects a
-    /// voucher `CapExceeded` AND the buyer's own ledger corroborates it,
+    /// voucher `SpendingCapExhausted` AND the buyer's own ledger corroborates it,
     /// then resumes on the larger deposit.
     ///
     /// `target_deposit` targets **spendable headroom**: the shortfall is computed

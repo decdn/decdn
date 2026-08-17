@@ -129,12 +129,13 @@ impl ClientHandler {
         // §Capability delegation). A batch spans milliseconds, so a mid-batch
         // expiry race is bounded exactly as the pre-batch per-interval check
         // bounded it. `expiry == 0` means "not tracked" and never expires. An
-        // expired grant surfaces as `CapExceeded` (its cap is exhausted for all
-        // practical purposes — the on-chain `redeem` would revert identically).
+        // expired grant surfaces as `CapabilityExpired` — distinct from a
+        // cap-exhausted `SpendingCapExhausted`, since the fix is a fresh
+        // capability, not a cap raise.
         let expiry = guard.state.expiry;
         if expiry != 0 && crate::payment_settlement::unix_now() >= expiry {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::CapExceeded, None)
+            self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
@@ -331,7 +332,7 @@ impl ClientHandler {
     /// (#1481 §5), or `None` when the voucher is not eligible. Returns `Some`
     /// only when ALL hold:
     /// - `reason` is one of the watermark-gated regression/exhaustion reasons
-    ///   (`AmountRegression` / `BytesRegression` / `CapExceeded`);
+    ///   (`AmountRegression` / `BytesRegression` / `SpendingCapExhausted`);
     /// - the `rejected` voucher's signature recovers to `state.signer`, the
     ///   lane's pinned capability signer — otherwise anyone who guessed the
     ///   chain-derivable `pool_id` could pull a lane's private watermark;
