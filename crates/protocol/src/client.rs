@@ -597,23 +597,25 @@ impl ChunkData {
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
 ///
-/// Only `{signature, amount}` travel on the wire; the receiver reconstructs
-/// the full EIP-712 typed data `{poolId, signer, provider, amount,
-/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed
-/// for the stream, `bytesDelivered` the node's per-pool cumulative counter).
-/// There is no nonce: `amount` is monotone cumulative spend within the pool,
-/// and it alone orders vouchers and rejects replays — a voucher with an
-/// `amount` no greater than the highest one already accepted is stale.
-/// `amount` is a 256-bit value in big-endian bytes — the protocol crate has
-/// no `U256`, and truncating to `u64` would break pools whose cumulative
-/// spend exceeds `u64::MAX`.
+/// The wire carries `{signature, amount, bytes_delivered}`; the receiver
+/// reconstructs the full EIP-712 typed data `{poolId, signer, provider, amount,
+/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed for
+/// the stream) plus the self-described `amount` and `bytesDelivered`. There is
+/// no nonce: `amount` and `bytes_delivered` are the monotone cumulative totals,
+/// and together they order vouchers and reject replays — a voucher whose
+/// `amount` is no greater than the highest accepted is stale. Both are 256-bit
+/// values in big-endian bytes — the protocol crate has no `U256`, and
+/// truncating to `u64` would break pools whose totals exceed `u64::MAX`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).
     pub signature: Vec<u8>,
-    /// Cumulative payment in token base units, big-endian `uint256`. The sole
-    /// ordering and replay key.
+    /// Cumulative payment in token base units, big-endian `uint256`.
     pub amount: [u8; 32],
+    /// Cumulative bytes delivered, big-endian `uint256`. Signed by the client
+    /// and transmitted so the node verifies against exactly what was signed,
+    /// independent of same-lane stream ordering.
+    pub bytes_delivered: [u8; 32],
 }
 
 impl Voucher {
@@ -910,6 +912,7 @@ mod tests {
         Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x11u8; 32],
+            bytes_delivered: [0x22u8; 32],
         }
     }
 
@@ -1271,12 +1274,14 @@ mod tests {
         let v = Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: [0x01u8; 32],
+            bytes_delivered: [0x02u8; 32],
         };
         let bytes = postcard::to_allocvec(&v)?;
         let mut expected = Vec::new();
         expected.push(VOUCHER_SIG_LEN as u8); // signature length prefix (65)
         expected.extend_from_slice(&[0xCDu8; VOUCHER_SIG_LEN]); // signature
         expected.extend_from_slice(&[0x01u8; 32]); // amount (no length prefix)
+        expected.extend_from_slice(&[0x02u8; 32]); // bytes_delivered (no length prefix)
         assert_eq!(bytes, expected);
         Ok(())
     }

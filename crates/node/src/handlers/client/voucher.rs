@@ -216,9 +216,14 @@ impl ClientHandler {
     }
 
     /// The node-side verify half for ONE voucher, evaluated against the advancing
-    /// candidate (`state` / `cumulative_bytes`) with no durable side effect. Two
-    /// distinct rate checks:
-    /// - the per-delta **advertised-rate** check bails on a genuine underpayment
+    /// candidate `state` with no durable side effect. `bytes_delivered` is
+    /// self-describing: it comes straight off the wire, so verification does not
+    /// depend on the order same-lane streams settle in. `stage_voucher` runs
+    /// first (signature + amount/bytes monotonicity); the two rate checks then
+    /// run on the advance path against the aggregate span
+    /// (`applied.amount_delta()` / `applied.bytes_delta()`), which is
+    /// order-independent because it is measured against the lane watermark:
+    /// - the per-span **advertised-rate** check bails on a genuine underpayment
     ///   (no wire reason; delivery just stops);
     /// - the cumulative **live-floor** check rejects cleanly with
     ///   `RateFloorRaised` when a governance floor raise made the quote stale
@@ -228,87 +233,84 @@ impl ClientHandler {
     fn verify_voucher(
         &self,
         state: &LaneState,
-        cumulative_bytes: U256,
+        _cumulative_bytes: U256,
         wire: &decdn_protocol::client::Voucher,
         rate_per_mb: u64,
         delta_bytes: u64,
     ) -> Result<VerifiedVoucher, VerifyStop> {
-        let new_bytes = cumulative_bytes.saturating_add(U256::from(delta_bytes));
-        let amount = U256::from_be_bytes(wire.amount);
-        let amount_delta = amount.saturating_sub(state.last_amount());
+        // Self-describing: the voucher's cumulative bytes come from the WIRE (ADR
+        // 005 §Voucher wire format), so verification does not depend on the order
+        // same-lane streams settle in.
+        let new_bytes = U256::from_be_bytes(wire.bytes_delivered);
 
-        // Advertised-rate check (ADR 003 §Voucher withholding). Match every
-        // `RateError` arm (#845) so a future variant is a build failure here.
-        match verify_rate(
-            amount_delta,
-            U256::from(delta_bytes),
-            rate_per_mb,
-            DEFAULT_TOLERANCE_BPS,
-        ) {
-            Ok(()) => {}
-            Err(RateError::Underpayment { .. }) => {
-                return Err(VerifyStop::Bail(format!(
-                    "voucher underpays for {delta_bytes} delivered bytes"
-                )));
-            }
-            Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
-                return Err(VerifyStop::Bail(format!(
-                    "voucher fails rate check for {delta_bytes} delivered bytes: {e}"
-                )));
-            }
-        }
-
-        // Hard per-byte price floor (#846), checked on the CUMULATIVE watermark
-        // the voucher carries (mirrors the on-chain `redeem` `RateFloorViolation`
-        // guard at ZERO tolerance). Snapshot the live floor once so the check and
-        // the rejection classification cannot disagree.
-        let live_floor = self.rate_bounds.floor();
-        match verify_rate(amount, new_bytes, live_floor, 0) {
-            Ok(()) => {}
-            Err(RateError::Underpayment { .. }) => {
-                self.metrics.voucher_rate_floor_rejected();
-                if live_floor > rate_per_mb {
-                    // A governance floor raise landed between the signed quote and
-                    // this voucher (#1382): the buyer is honest, its quote is
-                    // stale. Surface the typed re-quote signal in-band.
-                    return Err(VerifyStop::Reject(
-                        VoucherRejectReason::RateFloorRaised,
-                        None,
-                    ));
-                }
-                return Err(VerifyStop::Bail(format!(
-                    "voucher below the cumulative rate floor for {delta_bytes} delivered bytes"
-                )));
-            }
-            Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
-                return Err(VerifyStop::Bail(format!(
-                    "voucher fails floor check for {delta_bytes} delivered bytes: {e}"
-                )));
-            }
-        }
-
-        // Reconstruct the signed voucher from wire + lane context (`pool_id`,
-        // `signer`, `provider`, and the cumulative `bytes_delivered` are not on
-        // the wire — ADR 005 §Voucher wire format).
-        let Ok(signed) =
-            wire_voucher_to_signed(wire, state.pool_id, state.signer, state.provider, new_bytes)
+        // Reconstruct the signed voucher from wire + lane context. `pool_id`,
+        // `signer`, and `provider` are fixed for the lane; `amount`/`bytes_delivered`
+        // ride the wire.
+        let Ok(signed) = wire_voucher_to_signed(wire, state.pool_id, state.signer, state.provider)
         else {
             return Err(VerifyStop::Reject(VoucherRejectReason::BadSignature, None));
         };
 
-        // Validate + advance the candidate in memory only (no store). Cumulative
-        // vouchers mean the returned `next` supersedes `state`, so the batch
-        // records only the final candidate (one fsync). `stage_voucher` never
-        // touches a store, so it can never surface `RetryLater` here.
+        // `stage_voucher` verifies the signature, then the amount/bytes monotonicity
+        // guards, and returns the advanced candidate. It touches no store, so it can
+        // never surface `RetrySignal` here.
         match state.stage_voucher(&signed, &self.voucher_domain) {
-            Ok((next_state, _applied)) => Ok(VerifiedVoucher {
-                next_state,
-                new_bytes,
-                staged: StagedVoucher {
-                    delta_bytes,
-                    amount: wire.amount,
-                },
-            }),
+            Ok((next_state, applied)) => {
+                // ADVANCE: this voucher raises the lane watermark. Rate-check the
+                // aggregate span it covers (`applied.*_delta()` is measured against
+                // the lane watermark, so it is order-independent).
+                let amount = U256::from_be_bytes(wire.amount);
+
+                // Advertised-rate check (ADR 003 §Voucher withholding). Match every
+                // `RateError` arm (#845) so a future variant is a build failure here.
+                match verify_rate(
+                    applied.amount_delta(),
+                    applied.bytes_delta(),
+                    rate_per_mb,
+                    DEFAULT_TOLERANCE_BPS,
+                ) {
+                    Ok(()) => {}
+                    Err(RateError::Underpayment { .. }) => {
+                        return Err(VerifyStop::Bail(
+                            "voucher underpays for its delivered-byte span".to_string(),
+                        ));
+                    }
+                    Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
+                        return Err(VerifyStop::Bail(format!("voucher fails rate check: {e}")));
+                    }
+                }
+
+                // Hard per-byte price floor (#846) on the cumulative watermark the
+                // voucher carries (mirrors on-chain `redeem` at zero tolerance).
+                let live_floor = self.rate_bounds.floor();
+                match verify_rate(amount, new_bytes, live_floor, 0) {
+                    Ok(()) => {}
+                    Err(RateError::Underpayment { .. }) => {
+                        self.metrics.voucher_rate_floor_rejected();
+                        if live_floor > rate_per_mb {
+                            return Err(VerifyStop::Reject(
+                                VoucherRejectReason::RateFloorRaised,
+                                None,
+                            ));
+                        }
+                        return Err(VerifyStop::Bail(
+                            "voucher below the cumulative rate floor".to_string(),
+                        ));
+                    }
+                    Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
+                        return Err(VerifyStop::Bail(format!("voucher fails floor check: {e}")));
+                    }
+                }
+
+                Ok(VerifiedVoucher {
+                    next_state,
+                    new_bytes,
+                    staged: StagedVoucher {
+                        delta_bytes,
+                        amount: wire.amount,
+                    },
+                })
+            }
             Err(e) => {
                 // Map to the wire reject reason. `Err(RetrySignal)` (a transient
                 // store failure) cannot occur here — `stage_voucher` touches no
@@ -634,6 +636,7 @@ mod tests {
         let wire = decdn_protocol::client::Voucher {
             signature: signed_voucher.signature.as_bytes().to_vec(),
             amount: amount.to_be_bytes(),
+            bytes_delivered: new_bytes.to_be_bytes(),
         };
 
         // verify_voucher advances the CANDIDATE in memory only (no store write).

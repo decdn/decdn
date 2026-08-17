@@ -2217,23 +2217,18 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The current limitation that motivates the self-describing-voucher follow-up:
-/// a SKIP-AHEAD voucher — one whose cumulative `bytes_delivered` assumes another
-/// same-lane stream's bytes are already settled, sent before that stream is paid
-/// — is rejected. The node reconstructs a voucher's cumulative bytes from the
-/// shared lane counter plus THIS stream's delivered delta (see
-/// `voucher.rs::verify_voucher`), so a voucher signed over a larger cumulative
-/// than the node has delivered on the lane recovers a different address than it
-/// was signed under and comes back as `VoucherRejected { WrongSigner }` (the
-/// signature is well-formed — it just no longer recovers the lane's pinned
-/// signer against the reconstructed watermark). This is why a client with
-/// concurrent same-lane streams must serialize its voucher signing rather than
-/// pay out of order. Enabling concurrent (skip-ahead) settlement is a deliberate
-/// protocol change that must flip this test — with the accompanying footguns in
-/// view (per-hash receipts, `paid ≤ delivered` clamp, rate re-derivation,
-/// single-signer, coalescing frontier guards).
+/// A SKIP-AHEAD voucher — one whose cumulative `bytes_delivered` assumes
+/// another same-lane stream's bytes are already settled, sent before that
+/// stream is paid — is accepted. The voucher's cumulative bytes come from the
+/// WIRE (ADR 005 §Voucher wire format), self-described and signed by the
+/// client, so the node verifies it directly against the lane's pinned signer
+/// instead of reconstructing a per-stream cumulative from the shared lane
+/// counter plus this stream's delivered delta. That reconstruction was what
+/// made a skip-ahead voucher recover a different address than it was signed
+/// under; with the wire value verified directly, settlement no longer depends
+/// on the order concurrent same-lane streams pay in.
 #[tokio::test(flavor = "multi_thread")]
-async fn skip_ahead_voucher_on_a_concurrent_lane_is_rejected() -> anyhow::Result<()> {
+async fn skip_ahead_voucher_on_a_concurrent_lane_is_accepted() -> anyhow::Result<()> {
     // Both blobs sit under one voucher interval, so each stream has a single
     // closing voucher; their sizes differ so a skip-ahead cumulative cannot
     // coincidentally match the reconstructed per-stream value.
@@ -2272,10 +2267,7 @@ async fn skip_ahead_voucher_on_a_concurrent_lane_is_rejected() -> anyhow::Result
     .await?;
 
     // On stream B, pay a voucher that SKIPS AHEAD: its cumulative bytes/amount
-    // assume A's bytes are already on the lane. But A has not been paid, so the
-    // node reconstructs B's cumulative as `0 + wire_b`, not `wire_a + wire_b`, and
-    // the signature — made over the larger total — recovers a different address
-    // than the lane's pinned signer.
+    // assume A's bytes are already on the lane, even though A has not been paid.
     let skip_ahead_bytes = blob_a
         .wire_bytes
         .checked_add(blob_b.wire_bytes)
@@ -2287,31 +2279,30 @@ async fn skip_ahead_voucher_on_a_concurrent_lane_is_rejected() -> anyhow::Result
     let reply = stalled_b
         .send_cumulative_voucher(&fx.client_signer, skip_ahead_bytes, skip_ahead_amount)
         .await?;
+
+    // Self-describing bytes: B's voucher carries the aggregate cumulative it
+    // was signed over, so the node verifies it directly and advances the lane
+    // watermark to A+B — the skip-ahead voucher is accepted, not WrongSigner.
     match reply {
-        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
-            reason,
-            ..
-        }) => {
-            anyhow::ensure!(
-                reason == VoucherRejectReason::WrongSigner,
-                "a skip-ahead voucher must be rejected as WrongSigner, got {reason:?}"
-            );
+        ClientMessage::StreamError(err) => {
+            anyhow::bail!("skip-ahead voucher must be accepted, got StreamError {err:?}")
         }
-        other => anyhow::bail!(
-            "expected VoucherRejected {{ WrongSigner }} for a skip-ahead voucher, got {other:?}"
-        ),
+        // A clean acceptance surfaces as continued delivery ending in StreamEnd
+        // (B's whole range is already on the wire), or no immediate reply frame.
+        ClientMessage::StreamEnd | ClientMessage::ChunkData(_) => {}
+        other => anyhow::bail!("unexpected reply to an accepted voucher: {other:?}"),
     }
 
-    // The rejected voucher never advanced the lane: the persisted watermark stays
-    // at the seed (zero).
+    // The accepted aggregate is the persisted watermark.
     let persisted = fx.store.load_all()?;
-    if let Some(only) = persisted.first() {
-        anyhow::ensure!(
-            only.last_bytes_delivered() == U256::ZERO,
-            "a rejected skip-ahead voucher must not advance the lane watermark, got {}",
-            only.last_bytes_delivered(),
-        );
-    }
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("lane state must persist after an accepted voucher"))?;
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(skip_ahead_bytes),
+        "an accepted skip-ahead voucher lands the aggregate watermark, got {}",
+        only.last_bytes_delivered(),
+    );
 
     client_ep.close().await;
     fx.server_ep.close().await;
