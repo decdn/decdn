@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -158,6 +158,150 @@ impl Drop for LaneSlot {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
+    }
+}
+
+/// Per-pool floor-credit accounting (ADR 003 §Pool solvency). `live_reservation`
+/// is the `µUSDC` currently reserved by in-flight streams — ephemeral, cleared on
+/// restart since no stream is live then; `dead_charge` is the durable, cumulative
+/// unrecoverable floor loss, persisted in a [`decdn_incentive::PoolFloorLossStore`]
+/// and reloaded at bring-up.
+// The floor accumulator, its RAII guard, and their accessors form the serve
+// path's pool-solvency surface. They are self-contained and unit-tested on their
+// own; the serve loop is their only caller and does not reach them yet, so
+// `dead_code` is allowed on the not-yet-called surface.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct PoolFloorState {
+    live_reservation: U256,
+    dead_charge: U256,
+}
+
+/// RAII hold for one stream's full-floor reservation against a pool's budget.
+///
+/// Construction ([`Self::reserve`]) charges one floor to the pool's
+/// `live_reservation`. The serve loop keeps the current unpaid `µUSDC` updated via
+/// [`Self::note_unpaid`], and calls [`Self::release_live_repaid`] once the lane's
+/// cumulative payment reaches a floor — which frees the live reservation
+/// immediately. On drop (every exit path — success, `?`, disconnect, panic) the
+/// guard releases the live reservation if it was not already repaid and folds the
+/// last-noted unpaid amount (capped at one floor) into the durable `dead_charge`,
+/// then persists the new dead total best-effort. Mirrors [`LaneSlot`]: the
+/// reservation is owned by the guard and never adjusted by hand, and every counter
+/// update saturates.
+#[allow(dead_code)]
+pub(super) struct FloorReservation {
+    map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+    store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+    pool_id: B256,
+    floor: U256,
+    /// Last-noted unpaid `µUSDC` (`u64`, saturating). Read once at drop to size the
+    /// `dead_charge` fold.
+    unpaid: AtomicU64,
+    /// Set by [`Self::release_live_repaid`]; makes drop a no-op (live already freed,
+    /// no dead charge). Idempotent.
+    repaid: AtomicBool,
+}
+
+#[allow(dead_code)]
+impl FloorReservation {
+    /// Reserve one floor of the pool's budget. Charges `live_reservation += floor`
+    /// (saturating) under the sync lock — an O(1) map touch with no `.await` held,
+    /// so a blocking lock is correct even on the async serve path (mirrors
+    /// `lane_metrics_refresh`). A poisoned lock recovers the guard rather than
+    /// panicking; the reservation is best-effort accounting, never a safety gate.
+    fn reserve(
+        map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+        store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+        pool_id: B256,
+        floor: U256,
+    ) -> Self {
+        {
+            let mut guard = map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = guard.entry(pool_id).or_default();
+            entry.live_reservation = entry.live_reservation.saturating_add(floor);
+        }
+        Self {
+            map,
+            store,
+            pool_id,
+            floor,
+            unpaid: AtomicU64::new(0),
+            repaid: AtomicBool::new(false),
+        }
+    }
+
+    /// Record the stream's current unpaid `µUSDC`, read at drop to size the
+    /// `dead_charge` fold if the reservation is never repaid. Saturating to `u64`.
+    fn note_unpaid(&self, micro: U256) {
+        self.unpaid
+            .store(micro.saturating_to::<u64>(), Ordering::Relaxed);
+    }
+
+    /// Mark the reservation repaid: the lane's cumulative payment reached a floor,
+    /// so free the live reservation now (`live_reservation -= floor`, saturating)
+    /// and make the eventual drop a no-op. Idempotent — only the first call moves
+    /// the live counter.
+    fn release_live_repaid(&self) {
+        if self.repaid.swap(true, Ordering::Relaxed) {
+            return; // already repaid; live already released
+        }
+        let mut guard = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = guard.entry(self.pool_id).or_default();
+        entry.live_reservation = entry.live_reservation.saturating_sub(self.floor);
+    }
+}
+
+impl Drop for FloorReservation {
+    fn drop(&mut self) {
+        if self.repaid.load(Ordering::Relaxed) {
+            return; // repaid: live already released, no dead charge
+        }
+        // Not repaid: release the live reservation and fold the unpaid tail (capped
+        // at one floor) into the durable dead charge. All under the sync lock, all
+        // saturating — an O(1) update that never blocks the reactor.
+        let unpaid = U256::from(self.unpaid.load(Ordering::Relaxed));
+        let dead_add = self.floor.min(unpaid);
+        let new_dead = {
+            let mut guard = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = guard.entry(self.pool_id).or_default();
+            entry.live_reservation = entry.live_reservation.saturating_sub(self.floor);
+            entry.dead_charge = entry.dead_charge.saturating_add(dead_add);
+            entry.dead_charge
+        };
+        // Persist the new dead total best-effort. The in-memory `dead_charge` above
+        // is authoritative for the running process; the durable copy only guards a
+        // restart, so a lost persist is the documented small crash-window residual —
+        // logged, never panicked or propagated. The `record_loss` write may fsync,
+        // so offload it to a blocking task when a runtime is available; a drop that
+        // fires outside any runtime (e.g. a sync test) records inline.
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let pool_id = self.pool_id;
+        let micro = new_dead.saturating_to::<u128>();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    if let Err(e) = store.record_loss(pool_id, micro) {
+                        tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
+                    }
+                });
+            }
+            Err(_) => {
+                if let Err(e) = store.record_loss(pool_id, micro) {
+                    tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
+                }
+            }
+        }
     }
 }
 
@@ -444,6 +588,12 @@ pub struct ClientHandlerDeps {
     /// (5 ms). The runtime sets it from `payment.voucher_commit_interval_ms`.
     pub voucher_commit_interval: Option<Duration>,
     pub idle_timeout: Option<Duration>,
+    /// Durable mirror of each pool's `dead_charge` (ADR 003 §Pool solvency). The
+    /// constructor hydrates the in-memory floor accumulator from it, and each
+    /// per-stream floor reservation persists a new dead total to it best-effort on
+    /// drop. `None` (the default and in tests) keeps the floor accounting in-memory
+    /// only.
+    pub floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -506,6 +656,7 @@ impl ClientHandlerDeps {
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             voucher_commit_interval: None,
             idle_timeout: None,
+            floor_loss_store: None,
         }
     }
 }
@@ -552,6 +703,18 @@ pub struct ClientHandler {
     /// Serializes absolute lane snapshots without holding the lane map while
     /// individual lane state (which may be fsync-bound) is locked.
     lane_metrics_refresh: Mutex<()>,
+    /// Per-pool floor-credit accumulator (ADR 003 §Pool solvency). Guards an O(1)
+    /// map only and is never held across `.await` — a plain `std::sync::Mutex`, so
+    /// a [`FloorReservation`]'s `Drop` can reconcile under it (a tokio mutex cannot
+    /// be locked in `Drop`). Hydrated from `floor_loss_store` at construction.
+    #[allow(dead_code)]
+    // read by the serve path via `reserve_floor` / `pool_budget_covers_reserve`
+    pool_floor: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+    /// Durable mirror of each pool's `dead_charge`; `None` in tests (in-memory
+    /// only). A [`FloorReservation`]'s `Drop` writes the new dead total here
+    /// best-effort.
+    #[allow(dead_code)] // handed to each `FloorReservation` by `reserve_floor`
+    floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
     /// Redeem-hint sender to the on-chain settlement service (#327), set at
     /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
@@ -695,6 +858,29 @@ impl ClientHandler {
         // lane, so the seller-side snapshot reports lane count only.
         deps.metrics
             .set_inbound_lane_snapshot(map.len(), U256::ZERO);
+        // Hydrate the per-pool floor accumulator: no stream is live at boot, so
+        // `live_reservation` starts at zero; each pool's persisted `dead_charge`
+        // carries forward so a restart does not grant a fresh free-floor budget.
+        let mut pool_floor: HashMap<B256, PoolFloorState> = HashMap::new();
+        if let Some(store) = deps.floor_loss_store.as_ref() {
+            match store.load_losses() {
+                Ok(rows) => {
+                    for (pool_id, micro) in rows {
+                        pool_floor.insert(
+                            pool_id,
+                            PoolFloorState {
+                                live_reservation: U256::ZERO,
+                                dead_charge: U256::from(micro),
+                            },
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "floor-loss store load failed; starting with empty dead-charge"
+                ),
+            }
+        }
         Ok(Self {
             node_id: deps.node_id,
             metrics: deps.metrics,
@@ -711,6 +897,8 @@ impl ClientHandler {
             pool_view: deps.pool_view,
             lanes: Arc::new(Mutex::new(map)),
             lane_metrics_refresh: Mutex::new(()),
+            pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
+            floor_loss_store: deps.floor_loss_store,
             redeem_hint: deps.redeem_hint,
             voucher_activity: deps.voucher_activity,
             region_accountant: deps.region_accountant,
@@ -1034,6 +1222,51 @@ impl ClientHandler {
     ) -> bool {
         let refundable_headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
         refundable_headroom >= min_payment(reserved_bytes, rate_per_mb)
+    }
+
+    /// Open a full-floor [`FloorReservation`] against `pool_id`'s budget for one
+    /// stream. The serve loop holds the returned guard for the stream's lifetime:
+    /// it notes the stream's unpaid balance as it delivers and releases the
+    /// reservation once a floor is repaid; on drop the guard reconciles the live
+    /// reservation and any residual dead charge against the per-pool accumulator
+    /// (and the durable [`Self::floor_loss_store`]).
+    #[allow(dead_code)] // the serve loop opens a reservation per admitted stream
+    pub(super) fn reserve_floor(&self, pool_id: B256, floor: U256) -> FloorReservation {
+        FloorReservation::reserve(
+            Arc::clone(&self.pool_floor),
+            self.floor_loss_store.clone(),
+            pool_id,
+            floor,
+        )
+    }
+
+    /// Stateful-B pool solvency: does the pool's `remaining − M` cover its
+    /// already-committed floor credit (`live_reservation + dead_charge`) plus
+    /// `new_reserve`? Reads the per-pool accumulator; pure arithmetic otherwise. A
+    /// poisoned accumulator lock recovers the guard rather than panicking (the
+    /// reservation is best-effort accounting, never a safety gate).
+    #[allow(dead_code)] // the serve-path admission gate consults this before reserving
+    pub(super) fn pool_budget_covers_reserve(
+        &self,
+        pool_id: B256,
+        remaining: U256,
+        new_reserve: U256,
+    ) -> bool {
+        let committed = {
+            let guard = self
+                .pool_floor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.get(&pool_id).map_or(U256::ZERO, |s| {
+                s.live_reservation.saturating_add(s.dead_charge)
+            })
+        };
+        decdn_incentive::pool_budget_covers(
+            remaining,
+            self.pool_min_remaining_deposit,
+            committed,
+            new_reserve,
+        )
     }
 
     /// The group-commit interval for this handler (ADR 003 §Off-chain voucher
@@ -1908,5 +2141,115 @@ mod tests {
             0,
             "slot must release on drop"
         );
+    }
+
+    /// Lock the floor map for a test assertion, surfacing a poisoned lock as an
+    /// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
+    fn lock_floor(
+        map: &Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, HashMap<B256, PoolFloorState>>> {
+        map.lock()
+            .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))
+    }
+
+    /// A stream that never reaches a floor of payment leaves its unpaid tail (capped
+    /// at one floor) as the pool's durable `dead_charge`, and frees the live
+    /// reservation, when its [`FloorReservation`] drops. No tokio runtime is present,
+    /// so `Drop` persists synchronously via the direct-call fallback.
+    #[test]
+    fn floor_reservation_reconciles_partial_loss_on_drop() -> anyhow::Result<()> {
+        use decdn_incentive::PoolFloorLossStore as _;
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+        let pool = B256::repeat_byte(0x5A);
+        let floor = decdn_incentive::floor_micro(1000);
+        let quarter = floor / U256::from(4u64);
+        {
+            let res = FloorReservation::reserve(map.clone(), Some(store.clone()), pool, floor);
+            // Live reservation is held while the guard lives.
+            let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
+            anyhow::ensure!(
+                live == Some(floor),
+                "live reservation is held while the guard lives"
+            );
+            // Stream delivered a partial (unpaid) floor.
+            res.note_unpaid(quarter);
+        } // drop → reconcile: live released, dead_charge = min(floor, unpaid) = floor/4
+        let st = lock_floor(&map)?.get(&pool).copied().unwrap_or_default();
+        anyhow::ensure!(
+            st.live_reservation == U256::ZERO,
+            "live reservation is released on drop"
+        );
+        anyhow::ensure!(
+            st.dead_charge == quarter,
+            "dead_charge folds in the unpaid tail (min of floor and unpaid)"
+        );
+        let persisted = store
+            .load_losses()
+            .map_err(|e| anyhow::anyhow!("load_losses: {e}"))?
+            .first()
+            .map(|(_, v)| *v);
+        anyhow::ensure!(
+            persisted == Some(quarter.to::<u128>()),
+            "the new dead total is persisted best-effort on drop"
+        );
+        Ok(())
+    }
+
+    /// The pool-budget guard counts a pool's committed floor credit (live
+    /// reservations plus durable dead charge) against `remaining − M`.
+    #[tokio::test]
+    async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
+        let pool = B256::repeat_byte(0x11);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        // Empty pool, M = 0: remaining must cover the new reserve exactly.
+        anyhow::ensure!(
+            handler.pool_budget_covers_reserve(pool, floor, floor),
+            "remaining equal to the reserve is covered"
+        );
+        anyhow::ensure!(
+            !handler.pool_budget_covers_reserve(
+                pool,
+                floor.saturating_sub(U256::from(1u64)),
+                floor
+            ),
+            "remaining one below the reserve is not covered"
+        );
+        // A live reservation consumes the budget: the same remaining no longer
+        // covers a second identical reserve.
+        let _guard = handler.reserve_floor(pool, floor);
+        anyhow::ensure!(
+            !handler.pool_budget_covers_reserve(pool, floor, floor),
+            "an in-flight floor reservation is committed against the budget"
+        );
+        Ok(())
+    }
+
+    /// A stream whose cumulative payment reaches a floor releases its live
+    /// reservation immediately and leaves no `dead_charge` — the drop is a no-op.
+    #[test]
+    fn floor_reservation_repaid_leaves_no_dead_charge() -> anyhow::Result<()> {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pool = B256::repeat_byte(0x5B);
+        let floor = decdn_incentive::floor_micro(1000);
+        {
+            let res = FloorReservation::reserve(map.clone(), None, pool, floor);
+            res.release_live_repaid(); // paid ≥ floor
+            let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
+            anyhow::ensure!(
+                live == Some(U256::ZERO),
+                "live reservation is freed the moment the floor is repaid"
+            );
+        } // drop is a no-op: already repaid
+        let st = lock_floor(&map)?.get(&pool).copied().unwrap_or_default();
+        anyhow::ensure!(
+            st.dead_charge == U256::ZERO,
+            "a repaid reservation folds no dead charge"
+        );
+        Ok(())
     }
 }
