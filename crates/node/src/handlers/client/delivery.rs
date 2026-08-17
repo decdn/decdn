@@ -7,8 +7,9 @@ use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
 use super::{
-    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES, VecDeque,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
+    VOUCHER_INTERVAL_BYTES, VecDeque,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -124,7 +125,7 @@ impl ClientHandler {
     /// cumulative over bytes already delivered, so it never pays ahead. With the
     /// window at one interval (the unconfigured default) this reduces to the
     /// pre-credit-window stop-and-wait cadence exactly.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn deliver(
         &self,
         send: &mut SendStream,
@@ -137,7 +138,13 @@ impl ClientHandler {
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
+        floor_reservation: Option<FloorReservation>,
     ) -> anyhow::Result<()> {
+        // Owned here so the pool floor reservation reconciles at every exit —
+        // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
+        // below keeps its `note_unpaid` current and releases it once the stream
+        // repays a floor; `Drop` folds any residual unpaid loss into `dead_charge`.
+        let floor_reservation = floor_reservation;
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
         // side, AC#4). `export_bao_range_stream` reads the persisted outboard and
@@ -310,6 +317,32 @@ impl ClientHandler {
                     BatchStop::Rejected => return Ok(()),
                     BatchStop::Continue => {}
                 }
+            }
+
+            // Reconcile the pool floor reservation against this stream's live
+            // balance (ADR 003 §Pool solvency). `paid` and `delivered` are BYTE
+            // counters (see their declaration above); the reservation accounts in
+            // µUSDC, so every byte quantity crosses over through `min_payment` —
+            // the two units are never compared directly.
+            if let Some(res) = floor_reservation.as_ref() {
+                // Once cumulative payment covers one voucher interval the reserved
+                // floor is repaid: free the pool's live reservation now, since
+                // everything above the floor is self-funded (bounded by the credit
+                // window). `floor_micro(rate) == min_payment(VOUCHER_INTERVAL_BYTES,
+                // rate)`, so `paid >= VOUCHER_INTERVAL_BYTES` is exactly "one floor
+                // repaid" expressed in bytes.
+                if paid >= VOUCHER_INTERVAL_BYTES {
+                    res.release_live_repaid();
+                }
+                // Keep the drop-time reconcile honest with the CURRENT unpaid
+                // balance: on an un-repaid stream `Drop` folds `min(floor, this)`
+                // into `dead_charge`. A fully-settled stream ends `delivered == paid`,
+                // so the last note here is `min_payment(0, rate) == 0` and `Drop`
+                // charges nothing.
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
             }
 
             // Done when the whole blob is on the wire and every interval, closing

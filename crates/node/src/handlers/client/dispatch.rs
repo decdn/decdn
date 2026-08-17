@@ -384,11 +384,14 @@ impl ClientHandler {
                 Some(guard) => floor_reservation = Some(guard),
             }
         }
-        // Task 9 threads this into `deliver` and wires the loop's note_unpaid /
-        // release_live_repaid hooks. Until then, bind it at fn scope so its `Drop`
-        // still fires on every exit path — conservatively a full-floor dead charge
-        // if the stream ends before those hooks land, corrected in Task 9.
-        let _floor_reservation = floor_reservation;
+        // Held at fn scope so the reservation reconciles on EVERY exit via `Drop`.
+        // The direct-serve path at the end of this function MOVES it into `deliver`,
+        // which notes the live unpaid balance each iteration and releases the
+        // reservation once the stream repays one floor, so `Drop` reconciles to the
+        // actual unpaid loss. The `serve_via_backend_origin` / `serve_via_window_pull_through`
+        // legs return before that move and run their own serve loop; the guard drops
+        // here, which frees the live reservation (those legs do not note unpaid, so
+        // no dead charge is folded).
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
@@ -948,6 +951,7 @@ impl ClientHandler {
             Some(&lane),
             client_node_id,
             rate_per_mb,
+            floor_reservation,
         )
         .await
     }
