@@ -801,6 +801,46 @@ fn group_by_pool(lanes: &[PlannedLane]) -> Vec<PaymentPool::PoolBatch> {
         .collect()
 }
 
+/// Partition planned lanes into gas-bounded redemption chunks (each an
+/// independent `redeemMany`). Every returned chunk has at most `max_vouchers`
+/// lanes and an aggregate unredeemed value `>= floor`; a chunk that cannot clear
+/// the floor is dropped and its lanes defer to a later sweep (the force path
+/// passes `floor == 0` to keep every chunk). The chunk count is the minimum that
+/// respects `max_vouchers`, and high-value lanes are dealt round-robin across the
+/// chunks so dust rides alongside real value instead of segregating into a
+/// below-floor chunk.
+#[allow(dead_code)] // wired into the chunked submit path in a later task
+fn chunk_redemptions(
+    mut plans: Vec<PlannedLane>,
+    floor: U256,
+    max_vouchers: usize,
+) -> Vec<Vec<PlannedLane>> {
+    if plans.is_empty() {
+        return Vec::new();
+    }
+    let cap = max_vouchers.max(1);
+    let k = plans.len().div_ceil(cap);
+    // Sort by unredeemed descending so round-robin dealing balances value across
+    // chunks (largest lanes land in distinct buckets first).
+    plans.sort_by_key(|plan| std::cmp::Reverse(plan.unredeemed));
+    let mut buckets: Vec<Vec<PlannedLane>> = (0..k).map(|_| Vec::new()).collect();
+    for (i, plan) in plans.into_iter().enumerate() {
+        if let Some(bucket) = buckets.get_mut(i % k) {
+            bucket.push(plan);
+        }
+    }
+    buckets
+        .into_iter()
+        .filter(|bucket| {
+            let sum = bucket
+                .iter()
+                .map(|l| l.unredeemed)
+                .fold(U256::ZERO, |a, b| a + b);
+            sum >= floor
+        })
+        .collect()
+}
+
 /// Read the lane's persisted highest voucher and its cached paid watermark; if
 /// `owed − paid` meets `threshold` and the lane is still redeemable, return the
 /// voucher (plus a capability registration on the signer's first redemption). A
@@ -1298,6 +1338,68 @@ mod tests {
         assert_eq!(batch1.map(|b| b.poolId), Some(PoolId::from([2u8; 32])));
         assert_eq!(batch1.map(|b| b.vouchers.len()), Some(1));
         assert_eq!(batch1.map(|b| b.capabilities.len()), Some(0)); // register == false
+    }
+
+    /// Sum a chunk's unredeemed values, for `chunk_redemptions` tests.
+    fn total_unredeemed(chunk: &[PlannedLane]) -> U256 {
+        chunk
+            .iter()
+            .map(|l| l.unredeemed)
+            .fold(U256::ZERO, |a, b| a + b)
+    }
+
+    #[test]
+    fn chunk_redemptions_caps_vouchers_per_chunk() {
+        // 5 lanes, cap 2 => 3 chunks (2 + 2 + 1). All above floor.
+        let plans = (0..5).map(|i| planned(1, i, 1_000_000, false)).collect();
+        let chunks = chunk_redemptions(plans, U256::from(1u64), 2);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() <= 2));
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn chunk_redemptions_drops_below_floor_chunk() {
+        // One dust lane, floor 1 USDC => nothing submitted (defers).
+        let plans = vec![planned(1, 0, 10, false)];
+        let chunks = chunk_redemptions(plans, U256::from(1_000_000u64), 300);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_redemptions_zero_floor_keeps_everything() {
+        // Force path: floor 0 keeps even a pure-dust chunk.
+        let plans = vec![planned(1, 0, 1, false), planned(1, 1, 1, false)];
+        let chunks = chunk_redemptions(plans, U256::ZERO, 300);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.first().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn chunk_redemptions_spreads_value_so_dust_rides_along() {
+        // 2 whales + 2 dust, cap 2 => 2 chunks. Value-spreading puts one whale in
+        // each chunk, so each chunk clears a floor no single dust lane could.
+        let plans = vec![
+            planned(1, 0, 1_000_000, false), // whale
+            planned(1, 1, 1_000_000, false), // whale
+            planned(1, 2, 5, false),         // dust
+            planned(1, 3, 5, false),         // dust
+        ];
+        let chunks = chunk_redemptions(plans, U256::from(500_000u64), 2);
+        assert_eq!(chunks.len(), 2);
+        // Every submitted chunk clears the floor (dust rode along with a whale).
+        assert!(
+            chunks
+                .iter()
+                .all(|c| total_unredeemed(c) >= U256::from(500_000u64))
+        );
+        // All four lanes survived (none stranded).
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 4);
+    }
+
+    #[test]
+    fn chunk_redemptions_empty_input_is_empty() {
+        assert!(chunk_redemptions(Vec::new(), U256::ZERO, 300).is_empty());
     }
 
     /// A 65-byte `r‖s‖v` signature with a low `s` and the recovery byte set to
