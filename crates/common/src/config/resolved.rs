@@ -137,6 +137,10 @@ pub struct ResolvedBlockchain {
     /// settlement path submits an on-chain redeem against the pool (#327).
     /// Defaults to 1 USDC (`1_000_000` `µUSDC`) when unset.
     pub redeem_threshold_micro_usdc: u64,
+    /// Maximum vouchers per `redeemMany` transaction (the redemption chunk size).
+    /// Defaults to `300` (`DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`); the resolver
+    /// rejects `0`.
+    pub redeem_max_vouchers_per_tx: u64,
     /// Seconds between the redeemer self-tick sweeps (#327, #751): the
     /// low-frequency backstop that scans every pool for an above-threshold
     /// claim independent of the advisory per-voucher hints. Defaults to 300s

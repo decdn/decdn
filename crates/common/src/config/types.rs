@@ -197,6 +197,12 @@ pub struct BlockchainConfig {
     /// smaller values bound unsettled exposure. Absent => default
     /// (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
+    /// Maximum vouchers packed into one `redeemMany` transaction. The redeemer
+    /// splits a sweep across this many vouchers per transaction so a high-fan-out
+    /// node stays under the block gas limit; a chunk that still fails to send
+    /// oversized is halved and retried. Absent => default (`300`). Must not be
+    /// `0`; rejected at config resolution.
+    pub redeem_max_vouchers_per_tx: Option<u64>,
     /// Seconds between the redeemer's self-tick sweeps (#327, #751): the
     /// low-frequency backstop that scans every pool for an above-threshold
     /// claim independent of the advisory per-voucher hints, so a dropped hint can
