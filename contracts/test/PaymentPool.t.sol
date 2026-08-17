@@ -1670,6 +1670,11 @@ contract PaymentPoolTest is Test {
         vm.prank(provider);
         uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, vouchers));
         assertEq(totalPaid, count * uint256(amount), "every primed lane must actually settle");
+        // `snapshotGasLastCall` returns the measured gas of the call above (it
+        // also mirrors it into the gitignored `snapshots/PaymentPool.json`,
+        // which is not readable from tracked state) — capture the return so
+        // callers can pin it in a tracked assertion instead of relying on
+        // that file.
         return vm.snapshotGasLastCall("PaymentPool", snapshotName);
     }
 
@@ -1710,6 +1715,12 @@ contract PaymentPoolTest is Test {
     function test_redeemMany_gas_NVouchers() public {
         uint256 gasUsed = _redeemFreshLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N, "redeemMany_marginal_N");
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
+        emit log_named_uint("redeemMany gas, N vouchers", gasUsed);
+        // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
+        // doc comment (crates/common/src/config/mod.rs): N = 507,093 gas.
+        // Tolerance covers toolchain/compiler-version gas drift without
+        // masking a real regression.
+        assertApproxEqAbs(gasUsed, 507_093, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
     }
 
     /// @notice Companion to `test_redeemMany_gas_NVouchers` — same setup,
@@ -1718,6 +1729,12 @@ contract PaymentPoolTest is Test {
     function test_redeemMany_gas_NPlus1Vouchers() public {
         uint256 gasUsed = _redeemFreshLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N + 1, "redeemMany_marginal_Np1");
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
+        emit log_named_uint("redeemMany gas, N+1 vouchers", gasUsed);
+        // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
+        // doc comment (crates/common/src/config/mod.rs): N+1 = 541,614 gas.
+        // Tolerance covers toolchain/compiler-version gas drift without
+        // masking a real regression.
+        assertApproxEqAbs(gasUsed, 541_614, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
     }
 
     // -----------------------------------------------------------------

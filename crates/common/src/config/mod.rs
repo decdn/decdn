@@ -81,7 +81,7 @@ const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// limit (~32M gas, an external reference — confirm live via
 /// `eth_getBlockByNumber` before leaning on it for a deploy decision),
 /// spending half the block on one `redeemMany` call bounds a safe chunk at
-/// roughly 460 vouchers, so 300 clears with about 1.5x headroom for
+/// roughly 458 vouchers, so 300 clears with about 1.5x headroom for
 /// sequencer-variance cost.
 const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// Default redeemer self-tick interval: 300s (5 min). Kept well below the
