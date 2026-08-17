@@ -12722,7 +12722,9 @@ async fn serve_with_deposit_ceiling(
     // the whole blob at `byte_offset == 0` and lets its ranged store dedupe the prefix,
     // so a `byte_offset > 0` gate never fires on this path and the throttle would be
     // inert.
-    if read_deposit(deposit)? > initial_ceiling && !resume_delay.is_zero() {
+    // `resume_delay.is_zero()` first so the common (un-throttled) case short-circuits
+    // before taking the ceiling lock.
+    if !resume_delay.is_zero() && read_deposit(deposit)? > initial_ceiling {
         tokio::time::sleep(resume_delay).await;
     }
 
