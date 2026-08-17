@@ -353,6 +353,9 @@ struct Infra {
     receipt_writer_shutdown: CancellationToken,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
     receipt_writer: tokio::task::JoinHandle<()>,
+    /// Periodic lane-store flush timer (ADR 003 §Off-chain voucher state
+    /// persistence). Aborted after one final durable flush on shutdown.
+    lane_flush_task: tokio::task::JoinHandle<()>,
     node_origin: Option<crate::node_origin::NodeOrigin>,
     pull_through_origin: Option<Arc<crate::node_origin::NodeOrigin>>,
     cache: CacheEngine,
@@ -501,6 +504,35 @@ async fn build_infra(
         receipt_writer_shutdown.clone(),
     );
 
+    // Background lane-store flush (ADR 003 §Off-chain voucher state persistence):
+    // mirror the in-memory voucher watermark to disk every
+    // `payment.voucher_commit_interval_ms`. A failed flush retains the dirty set
+    // for the next tick; it never blocks delivery.
+    let flush_store = Arc::clone(&channel_state_store);
+    let flush_metrics = Arc::clone(&node_metrics);
+    let flush_interval =
+        std::time::Duration::from_millis(cfg.payment.voucher_commit_interval_ms.max(1));
+    let lane_flush_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(flush_interval);
+        ticker.tick().await; // skip the immediate first tick
+        loop {
+            ticker.tick().await;
+            let store = Arc::clone(&flush_store);
+            let res = tokio::task::spawn_blocking(move || store.flush()).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    flush_metrics.lane_flush_failure();
+                    tracing::warn!(%err, "lane store background flush failed; retrying next tick");
+                }
+                Err(join_err) => {
+                    flush_metrics.lane_flush_failure();
+                    tracing::warn!(%join_err, "lane store flush task join failed");
+                }
+            }
+        }
+    });
+
     // Node-to-node pull-through origin (#831, ADR 001/022). Constructed empty up
     // front so it can be appended to the cache's origin chain here; its
     // dependencies (DHT, buyer channel, reputation handles) don't exist yet and
@@ -588,6 +620,7 @@ async fn build_infra(
         receipt_writer_shutdown,
         receipt_sink,
         receipt_writer,
+        lane_flush_task,
         node_origin,
         pull_through_origin,
         cache,
@@ -2203,6 +2236,9 @@ pub async fn run(
         payment_service: ch.payment_service,
         gossip_handles: bg.gossip_handles,
         receipt_writer: infra.receipt_writer,
+        lane_flush_task: infra.lane_flush_task,
+        channel_state_store: infra.channel_state_store,
+        node_metrics: infra.node_metrics,
         tasks: bg.tasks,
     };
     shutdown(handles, router, signal, &bg.drain_trigger, infra.cache).await
@@ -2240,6 +2276,11 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     payment_service: PoolSettlementService<P>,
     gossip_handles: Vec<tokio::task::JoinHandle<()>>,
     receipt_writer: tokio::task::JoinHandle<()>,
+    /// Periodic lane-store flush timer, aborted below after one final durable
+    /// flush of `channel_state_store`.
+    lane_flush_task: tokio::task::JoinHandle<()>,
+    channel_state_store: Arc<dyn PoolStateStore>,
+    node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
 }
 
@@ -2281,6 +2322,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
         payment_service,
         gossip_handles,
         receipt_writer,
+        lane_flush_task,
+        channel_state_store,
+        node_metrics,
         mut tasks,
     } = handles;
 
@@ -2414,6 +2458,23 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // redeem sweep so an above-threshold lane is not left un-redeemed. Bounded by
     // the deadline so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
+
+    // Final durable flush before stop, so the last interval of frontier lands.
+    // The router has drained and the redeem sweep above already ran, so the
+    // in-memory lane state is final; this is the last write before the
+    // background flush task is aborted below.
+    let flush_result = match tokio::task::spawn_blocking(move || channel_state_store.flush()).await
+    {
+        Ok(result) => result,
+        Err(join_err) => Err(decdn_incentive::StoreError::Backend(format!(
+            "flush join: {join_err}"
+        ))),
+    };
+    if let Err(err) = flush_result {
+        node_metrics.lane_flush_failure();
+        tracing::warn!(%err, "final lane store flush on shutdown failed");
+    }
+    lane_flush_task.abort();
 
     // Late admin stop (issue #604 `AfterRouter` path). The polling
     // client (`decdn node drain --wait`) needed admin to stay open
