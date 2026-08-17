@@ -176,6 +176,66 @@ Numeric per-ADR index.
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md#adr-009-governance-model))
 - A node cannot serve a blacklisted hash after the compliance window — doing so is a slashable offense (see [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
 
+## Threat Model
+
+This is the coverage map for adversarial behavior. Each ADR reasons about the attacks against its own subsystem; this table names every adversary class and points to the one section that owns the defense. Add the attack here when you write it, and link to that home instead of re-deriving the argument.
+
+Two things shape how a defense reads in its home ADR. First: most defenses are **node-local policy**, not protocol rules. A node bounds its own exposure because doing so is its rational optimum — the ADR's job is to prove that local self-interest is sufficient, not to pin the knob. Protocol-enforced defenses (signatures, on-chain checks, slash evidence) are marked below; everything else is node policy and is tunable per operator. Second: the durable content is the **invariant** a defense preserves, not the mechanism that preserves it. The mechanism (credit window, admission cap, rate-bucket size) is local and tunable and lives in code and config; the ADR fixes the property.
+
+**Free-riding or resource-exhausting client** — wants bytes without paying, or wants to burn node resources.
+
+| Attack | Bounded by | Home |
+|---|---|---|
+| Voucher withholding | Self-enforcing per-lane credit window; loss capped at one interval | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
+| Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
+| Owner reclaims before a node redeems | Grace window + in-process redemption monitor (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
+| Probe fishing / resource exhaustion | Layered per-peer + per-IP + global token bucket (node policy) | [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) |
+
+**Malicious serving node** — wants payment without honest service, or to cheat pricing, region, or takedown.
+
+| Attack | Bounded by | Home |
+|---|---|---|
+| Data withholding | Self-enforcing; client never pays past acknowledged bytes, resumes elsewhere | [ADR 003 § Data withholding](003-payments.md#data-withholding) |
+| Corrupted delivery | Progressive BLAKE3 verification voids payment for a corrupt window (protocol) | [ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery) |
+| Rate bait-and-switch | Signed probe/stream pair is on-chain slash evidence (protocol) | [ADR 003 § Rate bait-and-switch](003-payments.md#rate-bait-and-switch) |
+| Content withholding (advertise, refuse to serve) | Reputation penalty only — not slashable; publishers seat redundant operators | [ADR 003 § Content withholding](003-payments.md#content-withholding) |
+| Serving a blacklisted hash | Slashable after the compliance window (protocol) | [ADR 011 § Slashing](011-content-takedown.md#slashing) |
+| Region mis-attestation | Self-attestation is canonical; challengeable, not trusted-by-default | [ADR 030 § Self-attestation is canonical](030-node-region-self-attestation.md#self-attestation-is-canonical) |
+| Third-party forced close / redeeming another's lane | Access control: `closePool` is owner-only, redemption binds `msg.sender` (protocol) | [ADR 003 § Third-party forced close (DoS)](003-payments.md#third-party-forced-close-dos) |
+
+**Network / peer-layer adversary** — wants to poison discovery, isolate a client, or flood the mesh.
+
+| Attack | Bounded by | Home |
+|---|---|---|
+| Eclipse | Multi-source bootstrap (on-chain registry + DNS seeds) | [ADR 012 § Bootstrap Procedure](012-client.md#bootstrap-procedure) |
+| Peer-table poisoning / gossip replay | Signed announce + registry check + monotonic timestamp (protocol) | [ADR 001 § ADR 001: Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh) |
+| Gossip flooding | Registry check + per-sender rate limiting (node policy) | [ADR 003 § Gossip flooding](003-payments.md#gossip-flooding) |
+| DHT poisoning / flooding | Per-record signature + DHT rate limiting (protocol + node policy) | [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) |
+| Voucher replay | Cumulative watermark pays `0` on a re-submitted voucher (protocol) | [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers) |
+
+**Sybil / economic adversary** — wants cheap identities to dominate selection, pricing, or voting weight.
+
+| Attack | Bounded by | Home |
+|---|---|---|
+| Sybil nodes | Capacity bond per node + selection score + reputation lag | [ADR 003 § Sybil nodes](003-payments.md#sybil-nodes) |
+| Rate manipulation cartel | Origin-backed nodes cap price; permissionless cache-only entry disciplines it | [ADR 003 § Rate manipulation cartel](003-payments.md#rate-manipulation-cartel) |
+| Wash-trading for vote-buying | Fee cut on every self-dealt cycle taxes fabricated volume (protocol) | [ADR 036 § Threat Model](036-served-bytes-voting-weight.md#threat-model) |
+
+**Governance / dispute adversary** — wants to capture parameters or abuse the appeal path.
+
+| Attack | Bounded by | Home |
+|---|---|---|
+| Governance capture | Hardcoded safety bounds on every governable parameter (protocol) | [ADR 009 § Governable Parameters with Safety Bounds](009-governance.md#governable-parameters-with-safety-bounds) |
+| Frivolous slash appeals | Appeal bond + hard caps + frequency limits | [ADR 028 § Frivolous-appeal abuse model](028-slashing-appeals.md#frivolous-appeal-abuse-model) |
+
+**Privacy adversary** — wants to deanonymize clients or nodes, or link their activity.
+
+| Attack | Bounded by | Home |
+|---|---|---|
+| Traffic analysis, endpoint linkage (tiered T1–T4) | Adversary-tier analysis + prioritized mitigations | [ADR 017 § Analysis by Adversary Tier](017-privacy.md#analysis-by-adversary-tier) |
+
+Attacks the protocol does **not** defend against — where it relies on an outside assumption instead — are listed under Trust Assumptions below.
+
 ## Trust Assumptions
 
 The system relies on several infrastructure-level assumptions beyond the cryptographic guarantees verified on-chain or in-protocol. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents the client-specific trust boundary (verified / trusted / not trusted); this section covers system-wide assumptions that span multiple components.
