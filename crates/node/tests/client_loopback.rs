@@ -4347,6 +4347,189 @@ async fn spawn_handler_server_with_pool(
     Ok((target, server_eth, server_ep, server_task, metrics))
 }
 
+/// A [`PoolView`] whose `remaining` collapses from `high` to `low` the instant a
+/// shared `drained` flag is set — the fixture for a pool that drains mid-flight
+/// (other lanes redeeming its `remaining` down) so the mid-stream pool-solvency
+/// re-check can be driven end-to-end. `owner` is fixed.
+#[derive(Debug)]
+struct DrainingPoolView {
+    owner: Address,
+    high: U256,
+    low: U256,
+    drained: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for DrainingPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        let remaining = if self.drained.load(std::sync::atomic::Ordering::Relaxed) {
+            self.low
+        } else {
+            self.high
+        };
+        Some(decdn_node::pool_view::PoolStatus {
+            owner: self.owner,
+            remaining,
+        })
+    }
+}
+
+/// `spawn_handler_server_with_pool` wired with a [`DrainingPoolView`] instead of a
+/// fixed one, so a test can drop the pool's `remaining` mid-stream by flipping the
+/// shared `drained` flag.
+async fn spawn_handler_server_with_draining_pool(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    high: U256,
+    low: U256,
+    drained: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<(EndpointAddr, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let owner = operator_addr();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        |deps| {
+            deps.pool_view = Some(Arc::new(DrainingPoolView {
+                owner,
+                high,
+                low,
+                drained,
+            }));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_ep, server_task))
+}
+
+/// Mid-stream `PoolExhausted`: a live stream stops IN-BAND at a voucher boundary
+/// once its pool can no longer fund the pool's already-committed floor credit.
+///
+/// Two DISTINCT lanes on ONE pool — different signers, so their voucher
+/// watermarks are independent (no shared-lane aggregate voucher): a "holder" (A)
+/// that parks mid-delivery holding its live floor reservation, and a "driven"
+/// stream (B) whose first voucher boundary the test crosses AFTER draining the
+/// pool. When B pays interval 1 it releases its own floor, leaving A's floor as
+/// the pool's committed credit; the drained `remaining` (`low = 10`) no longer
+/// covers it (`HARNESS_FLOOR_COST = 40`, `M = 0`), so B's boundary re-check emits
+/// a clean `PoolExhausted` and finishes the stream — not a QUIC reset. Per the
+/// loopback close-code caveat we assert the received reason, never an app code.
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()> {
+    // A is > one interval so it parks (never finishes) holding its reservation; B
+    // is multi-interval so its first boundary is `!done` and the re-check runs.
+    let payload_a = vec![0xA1u8; 6 * 1024 * 1024];
+    let payload_b = vec![0xB2u8; 16 * 1024 * 1024];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let signer_a = Arc::new(PrivateKeySigner::random());
+    let signer_b = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    for signer in [&signer_a, &signer_b] {
+        store.record(&LaneState::hydrate(
+            pool_id(),
+            signer.address(),
+            operator_addr(),
+            U256::from(10_000_000u64),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        ))?;
+    }
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    // `high` (10_000) covers both lanes' admission floors (2 × 40); `low` (10)
+    // covers neither, so once A's floor is the pool's only committed credit
+    // `remaining − M (10) < 40` and B's re-check trips. M = 0 in this fixture.
+    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (target, server_ep, server_task) = spawn_handler_server_with_draining_pool(
+        cache,
+        store_dyn,
+        U256::from(10_000u64),
+        U256::from(10u64),
+        Arc::clone(&drained),
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let ext_a = binding_ext(&signer_a, client_node_id)?;
+    let ext_b = binding_ext(&signer_b, client_node_id)?;
+
+    // A: admit (reserves one floor), deliver its first interval, then leave it
+    // PARKED reading a voucher we never send — it holds its live floor reservation
+    // for the pool's whole `committed` while the test runs, well inside the 10s
+    // voucher-read timeout. `_send_a` is kept so the stream stays open.
+    let (_send_a, mut recv_a) = open_paid_stream(&conn, *hash_a.as_bytes(), Some(&ext_a)).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_a).await?;
+
+    // B: admit (reserves a second floor — `high` covers both), deliver its first
+    // interval, park.
+    let (mut send_b, mut recv_b) =
+        open_paid_stream(&conn, *hash_b.as_bytes(), Some(&ext_b)).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_b).await?;
+
+    // Drain the pool: `remaining` now reads `low` on every subsequent `status()`.
+    drained.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Pay B's first interval. The server commits it, releases B's own floor, then
+    // runs the mid-stream re-check: A's still-held floor is the pool's committed
+    // credit and the drained `remaining` cannot cover it, so B stops in-band.
+    pay_cumulative(&mut send_b, &signer_b, HARNESS_INTERVAL_BYTES).await?;
+
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv_b)).await?? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+            bundle,
+        }) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::PoolExhausted,
+                "expected PoolExhausted, got {reason:?}"
+            );
+            anyhow::ensure!(
+                bundle.is_none(),
+                "PoolExhausted is not watermark-gated, so no bundle attaches"
+            );
+        }
+        other => anyhow::bail!("expected VoucherRejected {{ PoolExhausted }}, got {other:?}"),
+    }
+
+    // The stream ended CLEANLY (in-band error then `finish`), not a QUIC reset:
+    // the next read hits the FIN as a clean end-of-stream, never another frame.
+    anyhow::ensure!(
+        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv_b))
+            .await?
+            .is_err(),
+        "after PoolExhausted the server finishes the stream; no further frame is sent"
+    );
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// True if `encoded` (`OpenMetrics` text from `Metrics::encode`) contains `line`
 /// as a full line — mirrors the `has_metric_line` helper in `metrics.rs` so the
 /// reject counters are asserted on an exact `name value` match, not a substring.

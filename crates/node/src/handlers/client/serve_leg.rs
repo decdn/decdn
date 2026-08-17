@@ -40,7 +40,7 @@ use decdn_client_pull::sink::content_paid_frontier;
 use super::{
     Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage,
     FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream,
-    VOUCHER_INTERVAL_BYTES, VecDeque,
+    U256, VOUCHER_INTERVAL_BYTES, VecDeque, VoucherRejectReason,
 };
 
 impl ClientHandler {
@@ -346,6 +346,32 @@ impl ClientHandler {
             // what bills the credit-window tail the client received ahead of its
             // voucher.
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
+
+            // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
+            // symmetric with the takedown re-check below and under the same
+            // `collected_any && !done` boundary gate: re-read the cached pool
+            // status after each committed batch. A pool drains mid-flight — other
+            // lanes redeem `remaining` down, or `dead_charge` rises — so a long
+            // stream must stop once `remaining − M` no longer covers the pool's
+            // already-committed floor credit. `new_reserve = ZERO` asks exactly
+            // that: is the total ALREADY committed (this stream included) still
+            // within budget? On `false` the pool can no longer fund further credit,
+            // so stop IN-BAND with a clean `PoolExhausted` (not a QUIC reset, unlike
+            // a takedown) so the owner learns to top up — `PoolExhausted` is
+            // post-auth, so naming the condition leaks nothing an open-time refusal
+            // must hide, and it is not watermark-gated (no bundle). A `None` pool
+            // view fails OPEN (the on-chain redeem is the backstop). The caller
+            // drops the concurrent pull leg when this returns, bounding the upstream
+            // spend just as the takedown and no-progress exits do.
+            if collected_any
+                && !done
+                && let Some(status) = self.pool_view_status(lane_key.pool_id).await
+                && !self.pool_budget_covers_reserve(lane_key.pool_id, status.remaining, U256::ZERO)
+            {
+                self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                    .await?;
+                return Ok(());
+            }
 
             // ADR 011 §On Blacklist Event: terminate an in-flight delivery at the
             // next voucher boundary once a takedown lands. Gated on `collected_any`

@@ -937,13 +937,25 @@ impl ClientHandler {
         })
     }
 
+    /// The pool's cached `getPool` status (owner + `remaining`), or `None` when no
+    /// pool-view is wired or the read faulted. Both the takedown funder resolution
+    /// ([`Self::pool_funder`]) and the mid-stream pool-solvency re-check read
+    /// through this; a `None` result makes those checks fail open — a transient RPC
+    /// blip must not stop a paying stream, and the on-chain `redeem` is the
+    /// backstop. Cached, so a per-voucher-boundary call is cheap.
+    pub(super) async fn pool_view_status(
+        &self,
+        pool_id: B256,
+    ) -> Option<crate::pool_view::PoolStatus> {
+        self.pool_view.as_ref()?.status(pool_id).await
+    }
+
     /// The pool's funder (`getPool.owner`) for the ADR 011 mid-stream takedown
     /// re-check, or `None` when no pool-view is wired or the read faulted (the
     /// re-check then falls back to the open-time gates and the hash-denylist
     /// re-check). Cached, so a per-MB call is cheap.
     pub(super) async fn pool_funder(&self, pool_id: B256) -> Option<Address> {
-        let view = self.pool_view.as_ref()?;
-        view.status(pool_id).await.map(|s| s.owner)
+        self.pool_view_status(pool_id).await.map(|s| s.owner)
     }
 
     /// Accept an owner-signed capability presented at session start (ADR 003
