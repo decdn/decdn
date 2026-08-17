@@ -4530,6 +4530,468 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Seed a fresh in-memory pool store with `n` DISTINCT-signer lanes on the one
+/// [`pool_id`], each generously funded on its own capability so the only budget
+/// that ever bites is the pool-level floor-credit bound. Returns the store and the
+/// signers, one per lane. The aggregate-bound tests drive each signer as its own
+/// lane so the property under test is "total free floor data across ALL lanes is
+/// bounded to `remaining − M`", never a per-lane limit.
+fn store_with_distinct_lanes(
+    n: usize,
+) -> anyhow::Result<(Arc<MemoryPoolStateStore>, Vec<Arc<PrivateKeySigner>>)> {
+    let store = Arc::new(MemoryPoolStateStore::new());
+    let mut signers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let signer = Arc::new(PrivateKeySigner::random());
+        store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+        signers.push(signer);
+    }
+    Ok((store, signers))
+}
+
+/// `spawn_handler_server_with_pool` plus a wired in-memory [`PoolFloorLossStore`],
+/// returned so a test can OBSERVE the durable per-pool `dead_charge` a dropped
+/// `FloorReservation` folds. A guard's `Drop` writes `record_loss` AFTER it has
+/// already advanced the in-memory `dead_charge` the admission gate reads, so once
+/// the store reports a value the in-memory gate is guaranteed to see at least that
+/// much committed credit. That ordering is the deterministic sync the
+/// sequential-lane bound test needs between one lane's disconnect and the next
+/// lane's admission — no sleeps, no clock faking. `remaining`/ramp are wired the
+/// same way [`spawn_handler_server_with_pool`] does (M defaults to 0).
+async fn spawn_pool_server_with_loss(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    remaining: U256,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<decdn_incentive::MemoryPoolFloorLossStore>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let owner = operator_addr();
+    let loss = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+    let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = loss.clone();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        |deps| {
+            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
+            deps.credit_max = decdn_common::config::DEFAULT_CREDIT_MAX;
+            deps.credit_ramp_divisor = decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR;
+            deps.floor_loss_store = Some(loss_dyn);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_ep, server_task, loss))
+}
+
+/// Poll `loss` until [`pool_id`]'s recorded dead charge in `µUSDC` reaches the target
+/// `want`, or bail on overshoot / a 10 s stall. The dead-charge fold is a best-effort `Drop`
+/// side effect persisted off-task via `spawn_blocking`, so a test cannot know the
+/// exact instant it lands — it waits for the value, never for a fixed duration,
+/// which keeps the assertion deterministic under parallel load.
+async fn await_pool_dead_charge(
+    loss: &decdn_incentive::MemoryPoolFloorLossStore,
+    want: u128,
+) -> anyhow::Result<()> {
+    use decdn_incentive::PoolFloorLossStore as _;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = loss
+            .load_losses()?
+            .into_iter()
+            .find(|(pool, _)| *pool == pool_id())
+            .map_or(0u128, |(_, micro)| micro);
+        if current == want {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            current <= want,
+            "pool dead_charge {current} overshot the expected {want}"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "pool dead_charge stalled at {current}, expected {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Sign a voucher whose `signer` field names `lane_signer` (so the node resolves
+/// the right lane) but whose ECDSA signature is produced by a DIFFERENT key, so it
+/// recovers to the wrong address and is rejected `WrongSigner`. Drives the
+/// first-iteration rejection path: a stream that took one free floor then sent an
+/// unusable voucher.
+async fn send_bad_signature_voucher(
+    send: &mut SendStream,
+    lane_signer: &PrivateKeySigner,
+    bytes_delivered: u64,
+) -> anyhow::Result<()> {
+    let wrong = PrivateKeySigner::random();
+    let amount = min_payment(bytes_delivered, RATE_PER_MB);
+    let voucher = Voucher {
+        pool_id: pool_id(),
+        signer: lane_signer.address(),
+        provider: operator_addr(),
+        amount,
+        bytes_delivered: U256::from(bytes_delivered),
+    }
+    .sign(&wrong, &payment_domain())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+    )
+    .await
+}
+
+/// CORE security property (sequential): total FREE floor bytes a low-deposit pool
+/// gives away is bounded to ~`remaining − M`, NOT `lanes × floor`, even as every
+/// lane disconnects between admissions.
+///
+/// `remaining = 140`, `M = 0`, one floor costs `HARNESS_FLOOR_COST = 40`, so the
+/// pool can fund `140 / 40 = 3` floors of un-vouchered credit. Each round opens a
+/// DISTINCT-signer lane on its OWN connection, reads exactly one floor, withholds
+/// its voucher, and disconnects — so the stream's `FloorReservation` drops and
+/// folds one floor (`40`) into the pool's DURABLE `dead_charge`. The test waits for
+/// the loss store to confirm the fold before the next admission, so the counts are
+/// exact. After three such lanes the pool has `dead_charge = 120`, and a FOURTH
+/// distinct lane is refused `NotFound` at admission — proving the bound survives
+/// each lane's disconnect. Without the durable `dead_charge`, a disconnected lane
+/// would release its whole reservation and the pool would re-admit fresh lanes
+/// forever (`lanes × floor` unbounded); the fourth refusal is exactly what that
+/// non-durable design could never produce.
+#[tokio::test(flavor = "multi_thread")]
+async fn sequential_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<()> {
+    // > one interval so each lane parks after its floor rather than finishing.
+    let payload = vec![0x5Au8; 6 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // remaining funds exactly THREE floors of dead credit; the fourth lane is refused.
+    let affordable_floors = 3u128;
+    let remaining = U256::from(u128::from(HARNESS_FLOOR_COST) * affordable_floors + 20);
+    let (store, signers) = store_with_distinct_lanes(affordable_floors as usize + 1)?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let (target, server_ep, server_task, loss) =
+        spawn_pool_server_with_loss(cache, store_dyn, remaining).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+
+    // Three lanes each take one free floor and vanish; `dead_charge` climbs 40 → 120.
+    for (i, signer) in signers.iter().take(affordable_floors as usize).enumerate() {
+        let conn = client_ep
+            .connect(target.clone(), ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect lane {i}: {e}"))?;
+        let ext = binding_ext(signer, client_node_id)?;
+        let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        assert_parked_awaiting_voucher(&mut recv).await?;
+        // Disconnect while withholding: the server's read errors, its serve returns,
+        // and the `FloorReservation` folds one floor into the durable dead charge.
+        drop(send);
+        drop(recv);
+        conn.close(0u32.into(), b"withhold");
+        let expected = u128::from(HARNESS_FLOOR_COST) * (i as u128 + 1);
+        await_pool_dead_charge(&loss, expected).await?;
+    }
+
+    // The fourth DISTINCT lane is refused: `dead_charge (120) + floor (40) > remaining
+    // − M (140)`. A durable bound the three disconnects could not reset.
+    let last = signers
+        .get(affordable_floors as usize)
+        .ok_or_else(|| anyhow::anyhow!("missing the fourth lane signer"))?;
+    let conn = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect refused lane: {e}"))?;
+    let ext = binding_ext(last, client_node_id)?;
+    let refusal = open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "the fourth distinct lane must be refused once the pool's free-floor budget is spent"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// CORE security property (concurrent): with many DISTINCT-signer streams held open
+/// at once, admissions stop as soon as `Σ live floors` would exceed `remaining −
+/// M`. The concurrent twin of the sequential test — here the bound is enforced by
+/// the LIVE reservation, not the durable dead charge.
+///
+/// `remaining = 140`, `M = 0`, floor `40`: three lanes fit (`3 × 40 = 120 ≤ 140`),
+/// a fourth does not (`160 > 140`). Each lane is opened on its own bi-stream,
+/// reads one floor, and PARKS holding its live reservation; the streams stay open
+/// (their send/recv halves are kept alive) so all three reservations are held
+/// concurrently. With three live floors held, a fourth distinct lane is refused
+/// `NotFound`. Non-vacuous: a fourth lane on its own would fit (`40 ≤ 140`); it is
+/// refused only because the three concurrent reservations already committed the
+/// budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<()> {
+    let payload = vec![0x6Bu8; 6 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let affordable_floors = 3usize;
+    let remaining = U256::from(u128::from(HARNESS_FLOOR_COST) * affordable_floors as u128 + 20);
+    let (store, signers) = store_with_distinct_lanes(affordable_floors + 1)?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        remaining,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // Admit and PARK three concurrent distinct lanes; keep every stream alive so its
+    // live floor reservation is held for the duration.
+    let mut held = Vec::new();
+    for (i, signer) in signers.iter().take(affordable_floors).enumerate() {
+        let ext = binding_ext(signer, client_node_id)?;
+        let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        assert_parked_awaiting_voucher(&mut recv).await?;
+        held.push((i, send, recv));
+    }
+
+    // Fourth concurrent distinct lane: refused — `Σ live floors (120) + floor (40) >
+    // remaining − M (140)`.
+    let fourth = signers
+        .get(affordable_floors)
+        .ok_or_else(|| anyhow::anyhow!("missing the fourth lane signer"))?;
+    let ext = binding_ext(fourth, client_node_id)?;
+    let refusal = open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "the fourth concurrent lane must be refused while three live floors are held"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    drop(held);
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// A topped-up (high-`remaining`) pool serves many concurrent distinct lanes with
+/// NO refusal — the Netflix case is unaffected by the floor-credit bound. The
+/// control for the two bound tests above: the same concurrent distinct-lane setup,
+/// but a `remaining` so large the bound never bites, so every lane is admitted and
+/// served. `open_paid_stream` bails on any non-`ok` `StreamResponse`, so all six
+/// opens succeeding IS the "no refusal" assertion; reading a floor from each proves
+/// each was really served, not merely admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn topped_up_pool_serves_many_lanes() -> anyhow::Result<()> {
+    let payload = vec![0x7Cu8; 6 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // Six lanes × one floor = 240 µUSDC of live credit, dwarfed by `remaining`.
+    let lanes = 6usize;
+    let remaining = U256::from(10_000_000u64);
+    let (store, signers) = store_with_distinct_lanes(lanes)?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
+        cache,
+        store_dyn,
+        remaining,
+        decdn_common::config::DEFAULT_CREDIT_MAX,
+        decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+    )
+    .await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let mut held = Vec::new();
+    for (i, signer) in signers.iter().enumerate() {
+        let ext = binding_ext(signer, client_node_id)?;
+        // `open_paid_stream` bails if the server refuses (`!ok`), so reaching the
+        // read proves lane `i` was admitted against the topped-up budget.
+        let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext))
+            .await
+            .map_err(|e| anyhow::anyhow!("lane {i} must be admitted on a topped-up pool: {e}"))?;
+        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        held.push((send, recv));
+    }
+    anyhow::ensure!(
+        held.len() == lanes,
+        "every one of the {lanes} distinct lanes must be served on a topped-up pool, served {}",
+        held.len()
+    );
+
+    drop(held);
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Folded-in coverage: a stream that takes one free floor then DISCONNECTS folds
+/// exactly one floor into the pool's durable `dead_charge`. The sequential bound
+/// test asserts this indirectly (via a later refusal); here it is asserted
+/// DIRECTLY against the loss store — `dead_charge == HARNESS_FLOOR_COST` after one
+/// withholding lane — pinning the fold AMOUNT, not just its existence.
+///
+/// This runs on the HIT path (`deliver`). The MISS path (`serve_via_backend_origin`
+/// / `serve_via_window_pull_through` → `serve_leg`) folds `dead_charge` through the
+/// SAME `FloorReservation::note_unpaid` / `Drop` hooks — a real miss-path loopback
+/// assertion would need an origin/pull-through server fixture this test module does
+/// not yet stand up (see the task report), but the accounting it exercises is
+/// identical.
+#[tokio::test(flavor = "multi_thread")]
+async fn withholding_lane_records_one_floor_of_dead_charge() -> anyhow::Result<()> {
+    let payload = vec![0x8Du8; 6 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // remaining comfortably admits one floor; the point is the fold amount, not a refusal.
+    let remaining = U256::from(1_000u64);
+    let (store, signers) = store_with_distinct_lanes(1)?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let signer = signers
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing lane signer"))?;
+
+    let (target, server_ep, server_task, loss) =
+        spawn_pool_server_with_loss(cache, store_dyn, remaining).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let ext = binding_ext(signer, client_node_id)?;
+    let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"withhold");
+
+    // Exactly one floor folded — not zero (the interval WAS delivered) and not more
+    // (the fold is capped at the reserved floor).
+    await_pool_dead_charge(&loss, u128::from(HARNESS_FLOOR_COST)).await?;
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Folded-in coverage (guards commit `d441c025`): a stream that takes one free
+/// floor then sends a REJECTED first voucher still folds one floor into
+/// `dead_charge`. The rejection returns from the recoup block on the stream's FIRST
+/// iteration, before the end-of-iteration reconcile — so the fold relies on the
+/// pre-recoup `note_unpaid` that `d441c025` added. A regression that dropped that
+/// note would leave `dead_charge == 0` here, letting "connect, take one free
+/// interval, send garbage, vanish" escape the accounting.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_first_voucher_still_records_dead_charge() -> anyhow::Result<()> {
+    let payload = vec![0x9Eu8; 6 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let remaining = U256::from(1_000u64);
+    let (store, signers) = store_with_distinct_lanes(1)?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+    let signer = signers
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing lane signer"))?;
+
+    let (target, server_ep, server_task, loss) =
+        spawn_pool_server_with_loss(cache, store_dyn, remaining).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let ext = binding_ext(signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // First voucher's signature recovers to the wrong address → WrongSigner; the
+    // server rejects it in-band and finishes the serve, dropping the reservation on
+    // its first iteration.
+    send_bad_signature_voucher(&mut send, signer, HARNESS_INTERVAL_BYTES).await?;
+
+    // The client receives the in-band rejection...
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv)).await?? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+            ..
+        }) => anyhow::ensure!(
+            reason == VoucherRejectReason::WrongSigner,
+            "expected WrongSigner, got {reason:?}"
+        ),
+        other => anyhow::bail!("expected VoucherRejected {{ WrongSigner }}, got {other:?}"),
+    }
+
+    // ...and the delivered-but-unpaid floor is folded despite the first-iteration exit.
+    await_pool_dead_charge(&loss, u128::from(HARNESS_FLOOR_COST)).await?;
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// True if `encoded` (`OpenMetrics` text from `Metrics::encode`) contains `line`
 /// as a full line — mirrors the `has_metric_line` helper in `metrics.rs` so the
 /// reject counters are asserted on an exact `name value` match, not a substring.
