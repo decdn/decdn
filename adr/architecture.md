@@ -204,8 +204,6 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 | Attack | Bounded by | Home |
 |---|---|---|
 | Eclipse | Multi-source bootstrap (on-chain registry + DNS seeds) | [ADR 012 § Bootstrap Procedure](012-client.md#bootstrap-procedure) |
-| Peer-table poisoning / gossip replay | Signed announce + registry check + monotonic timestamp (protocol) | [ADR 001 § ADR 001: Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh) |
-| Gossip flooding | Registry check + per-sender rate limiting (node policy) | [ADR 003 § Gossip flooding](003-payments.md#gossip-flooding) |
 | DHT poisoning / flooding | Per-record signature + DHT rate limiting (protocol + node policy) | [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) |
 | Voucher replay | Cumulative watermark pays `0` on a re-submitted voucher (protocol) | [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers) |
 
