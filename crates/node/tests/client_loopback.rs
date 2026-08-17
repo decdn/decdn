@@ -2670,7 +2670,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
 /// through the REAL `ChannelReceiptSink` + background writer (not the inline
 /// `DirectReceiptSink`), with the underlying log stalled on every `append`, the
 /// full blob must still deliver and hash-verify — the buggy pre-#803 code
-/// awaited the append inline before `VoucherAck`, so it would hang here. After
+/// awaited the append inline before continuing delivery, so it would hang here. After
 /// releasing the stall and draining the writer, every receipt is recovered,
 /// proving the decoupling loses nothing on a clean shutdown.
 #[tokio::test(flavor = "multi_thread")]

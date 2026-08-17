@@ -493,8 +493,8 @@ async fn build_infra(
 
     // Decouple the audit write from the paid-delivery hot path (#803): a single
     // background task owns the receipt log and drains a bounded queue, so the
-    // voucher-accept path only does a non-blocking enqueue before `VoucherAck`
-    // and a slow/full disk can never back-pressure delivery. The token is
+    // voucher-accept path only does a non-blocking enqueue before it continues
+    // delivery and a slow/full disk can never back-pressure delivery. The token is
     // cancelled after the router drains on shutdown (below) so the writer
     // flushes its tail before exiting.
     let receipt_writer_shutdown = CancellationToken::new();

@@ -1944,7 +1944,7 @@ fn spawn_server_concurrent(
 
 /// A protocol-correct upstream that serves the *right* bytes but rejects the
 /// closing voucher with `StreamError(VoucherRejected { StaleNonce })` instead of
-/// `VoucherAck` — the buyer-side payment failure of #857/#852. Drives the
+/// accepting it — the buyer-side payment failure of #857/#852. Drives the
 /// requester to `UpstreamVoucherRejected`. Modelled on [`serve_wrong_bytes`] but
 /// serving the correct payload so the failure is unambiguously the voucher leg,
 /// not corruption.
@@ -7514,7 +7514,7 @@ fn decode_bao_whole(hash: Hash, total: u64, wire: &[u8]) -> Option<Vec<u8>> {
 /// A leaf client that drives B's window-paced serve: it sends a bound
 /// `StreamRequest` (so B's `pull_authorized` passes), then pays one cumulative
 /// voucher per interval as bytes arrive. With `drop_after_acks = Some(n)` it
-/// closes the connection immediately after the n-th `VoucherAck` — the #856
+/// closes the connection immediately after paying the n-th voucher — the #856
 /// abandon shape. The wire carries the bao verified-stream (content + proof,
 /// ADR 038), so it paces on the bao-encoded WIRE size and decodes the buffer
 /// back to plaintext to verify the content hash.
