@@ -271,6 +271,22 @@ impl ClientHandler {
                 unvouchered = 0;
             }
 
+            // Capture this iteration's maximum in-flight unpaid balance NOW — after
+            // the deliver phase advanced `delivered` and before the recoup phase can
+            // advance `paid` or take an early exit. A stream that dies in its first
+            // iteration (a rejected first voucher returns from the recoup block, or a
+            // `?` faults there) never reaches the end-of-iteration hook below, so
+            // without this note its last-noted unpaid stays 0 and `Drop` would fold
+            // nothing — letting "connect, take one free interval, vanish" escape the
+            // `dead_charge` accounting. Noting here keeps the guard honest at every
+            // exit path (ADR 003 §Pool solvency).
+            if let Some(res) = floor_reservation.as_ref() {
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
+            }
+
             // --- recoup phase: batch up to `batch_cap` completed intervals into
             // ONE fsynced commit, acking each voucher only after the commit is
             // durable (#1483, group commit). When the window blocks the deliver
@@ -335,10 +351,10 @@ impl ClientHandler {
                     res.release_live_repaid();
                 }
                 // Keep the drop-time reconcile honest with the CURRENT unpaid
-                // balance: on an un-repaid stream `Drop` folds `min(floor, this)`
-                // into `dead_charge`. A fully-settled stream ends `delivered == paid`,
-                // so the last note here is `min_payment(0, rate) == 0` and `Drop`
-                // charges nothing.
+                // balance: on an un-repaid stream `Drop` folds `min(reserved, this)`
+                // (the span-capped reservation) into `dead_charge`. A fully-settled
+                // stream ends `delivered == paid`, so the last note here is
+                // `min_payment(0, rate) == 0` and `Drop` charges nothing.
                 res.note_unpaid(decdn_incentive::min_payment(
                     delivered.saturating_sub(paid),
                     rate_per_mb,

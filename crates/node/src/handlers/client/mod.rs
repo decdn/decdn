@@ -177,15 +177,16 @@ pub(super) struct PoolFloorState {
     dead_charge: U256,
 }
 
-/// RAII hold for one stream's full-floor reservation against a pool's budget.
+/// RAII hold for one stream's span-capped reservation against a pool's budget.
 ///
-/// Construction ([`Self::reserve`]) charges one floor to the pool's
+/// Construction ([`Self::reserve`]) charges the reserved amount to the pool's
 /// `live_reservation`. The serve loop keeps the current unpaid `µUSDC` updated via
 /// [`Self::note_unpaid`], and calls [`Self::release_live_repaid`] once the lane's
 /// cumulative payment reaches a floor — which frees the live reservation
 /// immediately. On drop (every exit path — success, `?`, disconnect, panic) the
 /// guard releases the live reservation if it was not already repaid and folds the
-/// last-noted unpaid amount (capped at one floor) into the durable `dead_charge`,
+/// last-noted unpaid amount (capped at the reserved amount) into the durable
+/// `dead_charge`,
 /// then persists the new dead total best-effort. Mirrors [`LaneSlot`]: the
 /// reservation is owned by the guard and never adjusted by hand, and every counter
 /// update saturates.
@@ -1241,7 +1242,7 @@ impl ClientHandler {
         refundable_headroom >= min_payment(reserved_bytes, rate_per_mb)
     }
 
-    /// Open a full-floor [`FloorReservation`] against `pool_id`'s budget for one
+    /// Open a span-capped [`FloorReservation`] against `pool_id`'s budget for one
     /// stream. The serve loop holds the returned guard for the stream's lifetime:
     /// it notes the stream's unpaid balance as it delivers and releases the
     /// reservation once a floor is repaid; on drop the guard reconciles the live
