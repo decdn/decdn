@@ -371,13 +371,15 @@ impl ClientHandler {
         // indistinguishable from any other miss (no balance leak).
         //
         // Held at fn scope so the reservation reconciles on EVERY exit via `Drop`.
-        // The direct-serve path at the end of this function MOVES it into `deliver`,
-        // which notes the live unpaid balance each iteration and releases the
-        // reservation once the stream repays one floor, so `Drop` reconciles to the
-        // actual unpaid loss. The `serve_via_backend_origin` / `serve_via_window_pull_through`
-        // legs return before that move and run their own serve loop; the guard drops
-        // there, which frees the live reservation (those legs do not note unpaid, so
-        // no dead charge is folded).
+        // Every serve path that reaches a serve loop MOVES it in and threads it through:
+        // the direct-serve path hands it to `deliver`, and the
+        // `serve_via_backend_origin` / `serve_via_window_pull_through` miss legs take it
+        // by value and pass it by reference into their shared `serve_leg`. All three
+        // note the live unpaid balance each iteration and release the reservation once
+        // the stream repays one floor, so `Drop` reconciles to the actual unpaid loss —
+        // the miss legs fold proportional `dead_charge` for the upstream USDC they front,
+        // exactly like the hit path. On a refusal before the serve loop the guard drops
+        // with `note_unpaid` at 0, so no dead charge is folded.
         let mut floor_reservation: Option<FloorReservation> = None;
 
         // Set by the origin-tier range pull-through below (#823) when a
@@ -604,6 +606,7 @@ impl ClientHandler {
                                             total,
                                             pool_status.map(|s| s.remaining),
                                             rate_per_mb,
+                                            floor_reservation,
                                         ))
                                         .await;
                                     }
@@ -720,6 +723,7 @@ impl ClientHandler {
                             pool_status.map(|s| s.remaining),
                             fault_seen,
                             rate_per_mb,
+                            floor_reservation,
                         ))
                         .await;
                     }

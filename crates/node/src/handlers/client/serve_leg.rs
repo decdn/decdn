@@ -38,9 +38,9 @@ use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
 
 use super::{
-    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES,
-    VecDeque,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream,
+    VOUCHER_INTERVAL_BYTES, VecDeque,
 };
 
 impl ClientHandler {
@@ -91,6 +91,7 @@ impl ClientHandler {
         len: u64,
         total_bytes: u64,
         window: u64,
+        floor_reservation: Option<&FloorReservation>,
     ) -> anyhow::Result<()> {
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
         // convention); otherwise clamp to the tree size.
@@ -192,6 +193,25 @@ impl ClientHandler {
             if done_delivering && unvouchered > 0 {
                 pending.push_back(unvouchered);
                 unvouchered = 0;
+            }
+
+            // Reconcile the pool floor reservation the SAME way the hit path does
+            // (`deliver`), so a cache-miss stream — which fronts upstream USDC — folds
+            // proportional `dead_charge` too. Capture this iteration's maximum in-flight
+            // unpaid balance NOW: after the deliver phase advanced `delivered` and
+            // before the recoup phase can advance `paid` or take the `BatchStop::Rejected`
+            // early return / a `?` fault below. A stream that dies in its first
+            // iteration never reaches the end-of-iteration hook, so without this note its
+            // last-noted unpaid stays 0 and `Drop` would fold nothing — letting "connect,
+            // take one free interval, vanish" escape the `dead_charge` accounting.
+            // `delivered`/`paid` are WIRE BYTES (see their declaration); the reservation
+            // accounts in µUSDC, so the byte quantity crosses over through `min_payment` —
+            // the two units are never compared directly (ADR 003 §Pool solvency).
+            if let Some(res) = floor_reservation {
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
             }
 
             // --- recoup phase: batch up to `batch_cap` completed intervals into
@@ -296,6 +316,29 @@ impl ClientHandler {
                     }
                     BatchStop::Continue => {}
                 }
+            }
+
+            // Reconcile the floor reservation against this stream's live balance now
+            // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
+            // counters; the reservation accounts in µUSDC, so every byte quantity
+            // crosses over through `min_payment` — never compared directly.
+            if let Some(res) = floor_reservation {
+                // Once cumulative payment covers one voucher interval the reserved floor
+                // is repaid: free the pool's live reservation now, since everything above
+                // the floor is self-funded (bounded by the credit window). `floor_micro(rate)
+                // == min_payment(VOUCHER_INTERVAL_BYTES, rate)`, so `paid >= VOUCHER_INTERVAL_BYTES`
+                // is exactly "one floor repaid" expressed in bytes.
+                if paid >= VOUCHER_INTERVAL_BYTES {
+                    res.release_live_repaid();
+                }
+                // Keep the drop-time reconcile honest with the CURRENT unpaid balance: on
+                // an un-repaid stream `Drop` folds `min(reserved, this)` into `dead_charge`.
+                // A fully-settled stream ends `delivered == paid`, so the last note here is
+                // `min_payment(0, rate) == 0` and `Drop` charges nothing.
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
             }
 
             // Done when the whole range is on the wire and every interval — closing
