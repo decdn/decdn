@@ -11,7 +11,7 @@ All wire messages are serialized with [postcard](https://docs.rs/postcard) — a
 
 Several messages contain cryptographically signed fields ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Signatures are a byte-level commitment: appending a field to a signed struct makes old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
 
-The protocol therefore defines framing, compatible in-version changes, and the boundary at which a new ALPN or topic is required.
+The protocol therefore defines framing, compatible in-version changes, and the boundary at which a new ALPN is required.
 
 ## Decision
 

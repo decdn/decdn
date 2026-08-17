@@ -6,7 +6,7 @@
 
 The protocol evolves under the [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major), which specifies the wire mechanics but not the operator question — *what do I do when a release ships?*
 
-This runbook answers that question for Tier 1 and Tier 2, which keep the current ALPN and have stable standing procedures, plus the restart hygiene every release shares. Tier 3 changes the ALPN or topic contract, so its rollout is designed around the concrete break and defined by the ADR that ships it. Nothing here redefines a protocol mechanism.
+This runbook answers that question for Tier 1 and Tier 2, which keep the current ALPN and have stable standing procedures, plus the restart hygiene every release shares. Tier 3 changes the ALPN contract, so its rollout is designed around the concrete break and defined by the ADR that ships it. Nothing here redefines a protocol mechanism.
 
 ## Tier overview
 
