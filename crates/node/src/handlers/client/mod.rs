@@ -223,6 +223,22 @@ impl FloorReservation {
             let entry = guard.entry(pool_id).or_default();
             entry.live_reservation = entry.live_reservation.saturating_add(floor);
         }
+        Self::new_charged(map, store, pool_id, floor)
+    }
+
+    /// Build a guard for a floor that is ALREADY charged to `live_reservation`
+    /// under the caller's own lock hold. This does NOT touch the map — the
+    /// increment happens exactly once, at the caller's atomic check-and-reserve,
+    /// so re-incrementing here would double-charge the pool. Used by
+    /// [`ClientHandler::try_reserve_floor`], whose single lock hold covers both the
+    /// budget check and the increment; [`Self::reserve`] is the standalone form
+    /// that increments first, then delegates here.
+    fn new_charged(
+        map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
+        store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+        pool_id: B256,
+        floor: U256,
+    ) -> Self {
         Self {
             map,
             store,
@@ -1269,6 +1285,51 @@ impl ClientHandler {
         )
     }
 
+    /// Atomically check the pool's solvency and reserve one `floor` against its
+    /// budget, returning the [`FloorReservation`] guard on success or `None` when
+    /// `remaining − M` cannot cover the pool's already-committed floor credit plus
+    /// this new floor.
+    ///
+    /// The budget read (`live_reservation + dead_charge`), the solvency test, and
+    /// the `live_reservation += floor` increment all happen under ONE `pool_floor`
+    /// lock hold, so two concurrent admissions on a near-exhausted pool cannot both
+    /// pass the check and then both reserve — the TOCTOU over-commit a separate
+    /// [`Self::pool_budget_covers_reserve`] call followed by [`Self::reserve_floor`]
+    /// would allow. The guard is built from the already-charged state
+    /// ([`FloorReservation::new_charged`]) so the floor is charged exactly once. A
+    /// poisoned lock recovers the guard rather than panicking (best-effort
+    /// accounting, never a safety gate).
+    pub(super) fn try_reserve_floor(
+        &self,
+        pool_id: B256,
+        remaining: U256,
+        floor: U256,
+    ) -> Option<FloorReservation> {
+        {
+            let mut guard = self
+                .pool_floor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = guard.entry(pool_id).or_default();
+            let committed = entry.live_reservation.saturating_add(entry.dead_charge);
+            if !decdn_incentive::pool_budget_covers(
+                remaining,
+                self.pool_min_remaining_deposit,
+                committed,
+                floor,
+            ) {
+                return None;
+            }
+            entry.live_reservation = entry.live_reservation.saturating_add(floor);
+        }
+        Some(FloorReservation::new_charged(
+            Arc::clone(&self.pool_floor),
+            self.floor_loss_store.clone(),
+            pool_id,
+            floor,
+        ))
+    }
+
     /// The group-commit interval for this handler (ADR 003 §Off-chain voucher
     /// state persistence, #1483): the most the recoup phase waits to gather
     /// another voucher into the current fsynced batch before committing what it
@@ -2224,6 +2285,34 @@ mod tests {
         anyhow::ensure!(
             !handler.pool_budget_covers_reserve(pool, floor, floor),
             "an in-flight floor reservation is committed against the budget"
+        );
+        Ok(())
+    }
+
+    /// `try_reserve_floor` reserves atomically: it charges the budget only when
+    /// `remaining − M` covers the pool's committed floor credit plus the new floor,
+    /// and the charge is visible to the very next call so a second reserve on an
+    /// exhausted pool is refused.
+    #[tokio::test]
+    async fn try_reserve_floor_charges_only_when_budget_covers() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
+        let pool = B256::repeat_byte(0x22);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        // Budget covers exactly one floor: the first reserve succeeds.
+        let first = handler.try_reserve_floor(pool, floor, floor);
+        anyhow::ensure!(first.is_some(), "a floor within remaining − M is reserved");
+        // The charge is live: a second identical reserve against the SAME remaining
+        // now sees `committed = floor` and is refused (no over-commit).
+        anyhow::ensure!(
+            handler.try_reserve_floor(pool, floor, floor).is_none(),
+            "a second reserve over the same budget is refused"
+        );
+        // Dropping the first guard frees its live reservation, reopening the budget.
+        drop(first);
+        anyhow::ensure!(
+            handler.try_reserve_floor(pool, floor, floor).is_some(),
+            "budget reopens once the live reservation is released"
         );
         Ok(())
     }

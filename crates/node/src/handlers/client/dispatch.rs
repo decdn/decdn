@@ -4,10 +4,10 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, Hash, LaneKey, LaneSlot, Mutex, OwnedSemaphorePermit,
-    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt, read_first_message,
-    reset_stream, verify_binding,
+    FillOutcome, FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex,
+    OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
+    ServeRejectReason, StreamReadError, StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt,
+    read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 use std::sync::atomic::Ordering;
@@ -347,6 +347,48 @@ impl ClientHandler {
             lane_slot = Some(LaneSlot::new(active));
         }
         let _lane_slot = lane_slot;
+
+        // Per-pool cumulative floor-credit admission gate (ADR 003 §Pool solvency,
+        // stateful-B). Unlike the per-lane #1697 cap above, this sums floor credit
+        // across ALL distinct lanes on the pool and bounds it to `remaining − M`,
+        // closing the fan-out hole where many distinct signers each draw one
+        // un-vouchered floor on the same pool. A full floor is reserved for this
+        // stream's lifetime; the `FloorReservation` guard reconciles it to the actual
+        // unpaid loss at stream end.
+        //
+        // The budget check AND the `live_reservation += floor` increment run under
+        // ONE `pool_floor` lock hold inside `try_reserve_floor`, so two concurrent
+        // admissions on a near-exhausted pool cannot both pass the check and then
+        // both reserve — the TOCTOU over-commit a separate check-then-reserve would
+        // allow. An open-time refusal collapses to `InsufficientDeposit` → wire
+        // `NotFound`, indistinguishable from any other miss (no balance leak).
+        let mut floor_reservation: Option<FloorReservation> = None;
+        if let Some(status) = pool_status {
+            let floor = decdn_incentive::floor_micro(rate_per_mb);
+            let pool_id = B256::from(req.pool_id);
+            match self.try_reserve_floor(pool_id, status.remaining, floor) {
+                None => {
+                    let headroom = status
+                        .remaining
+                        .saturating_sub(self.pool_min_remaining_deposit);
+                    self.log_deposit_refusal(pool_id, hash, headroom, floor);
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::InsufficientDeposit,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+                Some(guard) => floor_reservation = Some(guard),
+            }
+        }
+        // Task 9 threads this into `deliver` and wires the loop's note_unpaid /
+        // release_live_repaid hooks. Until then, bind it at fn scope so its `Drop`
+        // still fires on every exit path — conservatively a full-floor dead charge
+        // if the stream ends before those hooks land, corrected in Task 9.
+        let _floor_reservation = floor_reservation;
 
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
