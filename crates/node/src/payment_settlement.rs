@@ -11,17 +11,18 @@
 //! - **Paid-watermark watcher.** The paid side of every lane is driven by
 //!   consuming `PoolRedeemed` events filtered on this node's own `provider`
 //!   address (ADR 003 § Tracking owed vs. paid): each event sets the lane's paid
-//!   cumulative to `newPaidCumulative`. `PoolToppedUp` re-drives a pool's lanes
-//!   (a dry pool may have left `owed > paid`), and `PoolReclaimed` forgets the
-//!   pool's lanes. The watcher reconciles like every other chain watcher —
-//!   enumerate `PoolRedeemed` from a pinned block, then tail live, resyncing on a
-//!   missed range — so paid is rebuilt from the event log, never guessed.
-//! - **Redemption (threshold + on-shutdown).** On a redeem hint (a [`LaneKey`])
-//!   emitted by the voucher-accept path, the node reads the lane's owed voucher
-//!   and its cached paid watermark and submits `redeem` once `owed − paid`
-//!   crosses a configurable threshold. A low-frequency self-tick sweeps every
-//!   persisted lane into one `redeemMany` so a dropped hint never strands an
-//!   above-threshold claim.
+//!   cumulative to `newPaidCumulative`, and `PoolReclaimed` forgets the pool's
+//!   lanes. The watcher reconciles like every other chain watcher — enumerate
+//!   `PoolRedeemed` from a pinned block, then tail live, resyncing on a missed
+//!   range — so paid is rebuilt from the event log, never guessed.
+//! - **Redemption (purely periodic).** A self-tick, on each interval, first
+//!   flushes the lane store durable (so the redeemed watermark floor reflects
+//!   every voucher accepted since the last flush, ADR 003 § Off-chain voucher
+//!   state persistence) then sweeps every persisted lane into one `redeemMany`
+//!   for each [`LaneKey`] whose accrued claim (`owed − paid`) crosses a
+//!   configurable threshold. A flush failure defers the whole cycle to the next
+//!   tick rather than redeeming against a watermark that might regress on
+//!   restart.
 //! - **Close monitor.** A pool is owner-closed only. On a `PoolCloseInitiated`
 //!   for a pool this node holds lanes against, the monitor redeems its highest
 //!   voucher per lane before `disputeDeadline` (ADR 003 § Owner reclaims before a
@@ -49,7 +50,6 @@ use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, PoolId, PoolStateStore, StoreError,
 };
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -61,12 +61,6 @@ use crate::chain_events::shared_head::HeadSource;
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-
-/// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
-/// delays a redemption until the next voucher or self-tick sweep), so a bounded
-/// channel that drops on overflow is acceptable — sized for a burst of concurrent
-/// lanes without backpressuring the voucher-accept path.
-pub const REDEEM_HINT_CAPACITY: usize = 256;
 
 /// Bounded receipt wait for a redemption transaction. A stuck/dropped/replaced tx
 /// must not wedge a background tick; a lapse yields [`TxOutcome::Timeout`], a
@@ -194,7 +188,6 @@ impl PaidWatermarks {
 /// `redeemMany` write path). Cheap to construct; owns its background tasks.
 pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     contract: PaymentPool::PaymentPoolInstance<P>,
-    redeem_tx: mpsc::Sender<LaneKey>,
     store: Arc<dyn PoolStateStore>,
     capabilities: Arc<dyn CapabilitySource>,
     paid: PaidWatermarks,
@@ -236,8 +229,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
-        redeem_tx: mpsc::Sender<LaneKey>,
-        redeem_rx: mpsc::Receiver<LaneKey>,
     ) -> Result<Self> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
 
@@ -270,7 +261,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             handler,
             paid: paid.clone(),
             capabilities: Arc::clone(&capabilities),
-            redeem_tx: redeem_tx.clone(),
             metrics: Arc::clone(&metrics),
         };
         let cfg = WatcherConfig::new(
@@ -279,7 +269,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 .address(payment_pool_addr)
                 .event_signature(vec![
                     PaymentPool::PoolRedeemed::SIGNATURE_HASH,
-                    PaymentPool::PoolToppedUp::SIGNATURE_HASH,
                     PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
                     PaymentPool::PoolReclaimed::SIGNATURE_HASH,
                 ]),
@@ -310,13 +299,11 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             self_address,
             redeem_threshold,
             redeem_interval,
-            redeem_rx,
             Arc::clone(&metrics),
         ));
 
         Ok(Self {
             contract,
-            redeem_tx,
             store,
             capabilities,
             paid,
@@ -327,14 +314,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeemer: std::sync::Mutex::new(Some(redeemer)),
             checkpoint_store,
         })
-    }
-
-    /// Sender the voucher-accept path uses to hint that a lane's accrued claim
-    /// may have crossed the redemption threshold. Cloneable; dropping all senders
-    /// simply ends the redemption task cleanly.
-    #[must_use]
-    pub fn redeem_hint_sender(&self) -> mpsc::Sender<LaneKey> {
-        self.redeem_tx.clone()
     }
 
     /// Graceful shutdown: stop the watcher, flush the scan checkpoint, quiesce the
@@ -357,8 +336,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     }
 
     /// One last `redeemMany` over every above-threshold lane, so shutdown secures
-    /// earnings the next boot would otherwise wait a hint/sweep to collect.
+    /// earnings the next self-tick would otherwise wait to collect.
     async fn final_redeem_sweep(&self) {
+        let _ = flush_before_redeem(&self.store, &self.metrics);
         redeem_sweep(
             &self.contract,
             &self.store,
@@ -502,7 +482,6 @@ struct PoolSettlementSink<P: Provider + Clone> {
     handler: Arc<ClientHandler>,
     paid: PaidWatermarks,
     capabilities: Arc<dyn CapabilitySource>,
-    redeem_tx: mpsc::Sender<LaneKey>,
     metrics: Arc<Metrics>,
 }
 
@@ -541,19 +520,6 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                     );
                 }
             }
-            Some(sig) if sig == PaymentPool::PoolToppedUp::SIGNATURE_HASH => {
-                let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(%err, "skipping undecodable PoolToppedUp log");
-                        return Ok(());
-                    }
-                };
-                // A top-up may re-open lanes a dry pool left `owed > paid`.
-                // Re-drive by hinting the redeemer for each of the pool's lanes
-                // this node provides.
-                self.redrive_pool_lanes(event.poolId);
-            }
             Some(sig) if sig == PaymentPool::PoolCloseInitiated::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolCloseInitiated::decode_log_data(&log.inner.data)
                 {
@@ -571,7 +537,12 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                 // Best-effort and INLINE: redeem the node's highest voucher per
                 // lane before the owner can reclaim. Never returns `Err` — a
                 // benign revert (already fully redeemed, window closed) must not
-                // fail the tick and re-scan the window.
+                // fail the tick and re-scan the window. Flush first so the
+                // redeemed watermark reflects every voucher accepted so far; a
+                // close redeem is forced regardless of threshold, so it still
+                // proceeds even if the flush failed (forfeiting the whole pool at
+                // the deadline is worse than a marginal re-serve risk).
+                let _ = flush_before_redeem(&self.store, &self.metrics);
                 redeem_pool_on_close(
                     &self.contract,
                     &self.store,
@@ -606,24 +577,6 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
 }
 
 impl<P: Provider + Clone> PoolSettlementSink<P> {
-    /// Hint the redeemer for every lane of `pool_id` this node provides, so a
-    /// top-up re-drives lanes a dry pool left `owed > paid`. Best-effort: a full
-    /// hint channel drops the nudge (the self-tick sweep is the backstop).
-    fn redrive_pool_lanes(&self, pool_id: PoolId) {
-        let states = match self.store.load_all() {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(%err, %pool_id, "top-up re-drive: failed to load lane state");
-                return;
-            }
-        };
-        for st in states {
-            if st.pool_id == pool_id && st.provider == self.self_address {
-                let _ = self.redeem_tx.try_send(st.key());
-            }
-        }
-    }
-
     /// Forget every lane of a reclaimed `pool_id` this node provides — the pool is
     /// `Closed`, so no further voucher can be redeemed against it.
     #[allow(clippy::cognitive_complexity)]
@@ -702,11 +655,11 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
     }
 }
 
-/// Redemption task: `redeem` a lane's accrued claim once it crosses the
-/// threshold, driven by two sources — advisory hints ([`LaneKey`]) from the
-/// voucher-accept path and a low-frequency self-tick that sweeps every lane into
-/// one `redeemMany` so a dropped hint can never strand an above-threshold claim.
-/// Ends cleanly when every hint sender is dropped.
+/// Redemption task: on each self-tick, flush the lane store durable (so the
+/// redeemed watermark is floored — post-crash on-disk `owed ≥ what we submit`,
+/// ADR 003 §Off-chain voucher state persistence) then `redeemMany` every lane
+/// whose accrued claim crosses the threshold. Ends when the shutdown abort
+/// lands.
 #[allow(clippy::too_many_arguments)]
 async fn redeemer_loop<P: Provider + Clone>(
     contract: PaymentPool::PaymentPoolInstance<P>,
@@ -716,36 +669,44 @@ async fn redeemer_loop<P: Provider + Clone>(
     self_address: Address,
     redeem_threshold: U256,
     redeem_interval: Duration,
-    mut redeem_rx: mpsc::Receiver<LaneKey>,
     metrics: Arc<Metrics>,
 ) {
     let mut ticker = tokio::time::interval(redeem_interval);
-    // Skip the immediate first tick: nothing has accrued right after bootstrap,
-    // and the first vouchers hint anyway.
+    // Skip the immediate first tick: nothing has accrued right after bootstrap.
     ticker.tick().await;
     loop {
-        tokio::select! {
-            hint = redeem_rx.recv() => match hint {
-                Some(key) => {
-                    redeem_one(
-                        &contract, &store, &capabilities, &paid, self_address,
-                        redeem_threshold, key, &metrics,
-                    )
-                    .await;
-                }
-                // All hint senders dropped — the service is going away.
-                None => break,
-            },
-            _ = ticker.tick() => {
-                redeem_sweep(
-                    &contract, &store, &capabilities, &paid, self_address,
-                    redeem_threshold, &metrics,
-                )
-                .await;
-            }
+        ticker.tick().await;
+        if !flush_before_redeem(&store, &metrics) {
+            // Flush failed: the redeemed-watermark floor is not guaranteed, so
+            // skip this cycle rather than redeem on an unflushed frontier. The
+            // next tick retries; a deferred redeem never double-spends (the
+            // on-chain lane watermark is monotone).
+            continue;
+        }
+        redeem_sweep(
+            &contract,
+            &store,
+            &capabilities,
+            &paid,
+            self_address,
+            redeem_threshold,
+            &metrics,
+        )
+        .await;
+    }
+}
+
+/// Flush the lane store durable before a redeem. Returns `true` on success. A
+/// failure is metered and logged; the caller skips that redeem cycle.
+fn flush_before_redeem(store: &Arc<dyn PoolStateStore>, metrics: &Arc<Metrics>) -> bool {
+    match store.flush() {
+        Ok(()) => true,
+        Err(err) => {
+            metrics.lane_flush_failure();
+            warn!(%err, "pre-redeem lane store flush failed; deferring redeem to next cycle");
+            false
         }
     }
-    debug!("PaymentPool redeemer loop ended (all hint senders dropped)");
 }
 
 /// The outcome of evaluating one lane for redemption, without yet submitting.
@@ -778,7 +739,7 @@ async fn plan_redeem<P: Provider + Clone>(
     key: LaneKey,
 ) -> Result<RedeemPlan> {
     let Some(st) = store.get(key).context("load lane state for redemption")? else {
-        // Lane not (yet) persisted — e.g. a hint raced the voucher-accept commit.
+        // Lane not (yet) persisted — e.g. registration is still in flight.
         return Ok(RedeemPlan::Skip);
     };
     // Defensive: only redeem lanes this node provides, with a signed voucher.
@@ -840,11 +801,11 @@ async fn plan_redeem<P: Provider + Clone>(
     Ok(RedeemPlan::Redeem { voucher, register })
 }
 
-/// Hint-path (and close-path) redemption: plan one lane and, if it wants a
-/// redeem, submit it as a one-entry `redeemMany`. `redeemMany` is the only
-/// redemption entry point, so a single lane is simply a batch of one. Does NOT
-/// seed the paid cache: the `PoolRedeemed` event this tx emits is the single
-/// write path for the paid side.
+/// Close-path redemption: plan one lane and, if it wants a redeem, submit it
+/// as a one-entry `redeemMany`. `redeemMany` is the only redemption entry
+/// point, so a single lane is simply a batch of one. Does NOT seed the paid
+/// cache: the `PoolRedeemed` event this tx emits is the single write path for
+/// the paid side.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,

@@ -1124,14 +1124,6 @@ async fn build_chain_and_handlers(
         crate::region_accounting::PeerTableResolver::new(Arc::clone(&peer_table)),
     )));
 
-    // Redeem-hint channel (#327), created outside `PoolSettlementService::bootstrap`
-    // so the handler takes the sender at construction (no post-construction attach)
-    // while the service takes the receiver. `redeem_tx` is cloned into the handler
-    // deps below and also handed to the service (so `redeem_hint_sender()` keeps
-    // working); `redeem_rx` drives the service's redeemer loop.
-    let (redeem_tx, redeem_rx) =
-        tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
-
     // In-memory last-voucher clock shared between the client handler (writer:
     // stamps on each accepted voucher) and `admin_v1_channels` (reader:
     // reports "time since last voucher"), issue #749. Non-durable by design —
@@ -1219,7 +1211,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&content_denylist),
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
     );
-    client_deps.redeem_hint = Some(redeem_tx.clone());
     // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
     // gate persists a presented capability so the redeemer registers the signer
     // on first redemption. Same redb file every lane record lives in.
@@ -1243,12 +1234,6 @@ async fn build_chain_and_handlers(
     // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
     client_deps.credit_max = cfg.payment.credit_max;
     client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
-    // Group-commit interval (ADR 003 §Off-chain voucher state persistence, #1483):
-    // amortize the per-voucher fsync across a batch, acking each only after the
-    // durable commit.
-    client_deps.voucher_commit_interval = Some(std::time::Duration::from_millis(
-        cfg.payment.voucher_commit_interval_ms,
-    ));
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1256,8 +1241,8 @@ async fn build_chain_and_handlers(
     // `closeChannel` transactions with the same eth keystore signer. The
     // bootstrap self-checks the contract via `usdc()`; the watcher persists
     // channels opened against this node so the handler accepts their vouchers,
-    // and forgets settled ones. The redeem hint lets the handler nudge the
-    // service when an accrued claim may have crossed the threshold.
+    // and forgets settled ones. Redemption is purely periodic: a self-tick
+    // flushes the lane store then sweeps every above-threshold lane.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it
     // *prepares* a tx; if that send then fails (e.g. its `eth_estimateGas`
@@ -1294,8 +1279,6 @@ async fn build_chain_and_handlers(
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
-        redeem_tx,
-        redeem_rx,
     )
     .await
     .context("PaymentPool settlement service bootstrap")?;
