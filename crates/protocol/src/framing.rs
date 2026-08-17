@@ -125,9 +125,10 @@ fn leading_varint_u32(frame: &[u8]) -> Option<u32> {
 ///
 /// This is the synchronous, non-consuming counterpart to [`read_frame`], for a
 /// caller that fills a byte buffer incrementally with **cancellation-safe**
-/// reads and must split frames off it after each top-up — e.g. the group-commit
-/// voucher gather (#1483), which reads ahead under a timeout that [`read_frame`]
-/// (built on `read_exact`) could not survive without losing partial bytes. The
+/// reads and must split frames off it after each top-up — e.g. the per-voucher
+/// reader's read-ahead (#1486), which reads ahead under a timeout that
+/// [`read_frame`] (built on `read_exact`) could not survive without losing
+/// partial bytes. The
 /// caller slices the payload as `buf[header_len..header_len + payload_len]`,
 /// decodes it with [`decode_message`], then drains `header_len + payload_len`
 /// bytes.
