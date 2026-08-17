@@ -7,9 +7,11 @@ use super::{
     VoucherRejectReason, WatermarkBundle, verify_rate, voucher_reject_reason,
     wire_voucher_to_signed,
 };
+use decdn_incentive::PoolError;
 
 /// A voucher that passed the node-side verify half against the advancing
 /// candidate and is awaiting the batch's single durable commit (#1483).
+#[derive(Debug)]
 struct StagedVoucher {
     /// Bytes this voucher pays for (its interval delta) — for `paid` accounting,
     /// the audit receipt, and per-region / seed-leech crediting.
@@ -22,6 +24,7 @@ struct StagedVoucher {
 
 /// A voucher that passed the node-side verify half, carrying the advanced
 /// candidate state, its cumulative byte watermark, and the staged bookkeeping.
+#[derive(Debug)]
 struct VerifiedVoucher {
     next_state: LaneState,
     new_bytes: U256,
@@ -233,7 +236,7 @@ impl ClientHandler {
     fn verify_voucher(
         &self,
         state: &LaneState,
-        _cumulative_bytes: U256,
+        cumulative_bytes: U256,
         wire: &decdn_protocol::client::Voucher,
         rate_per_mb: u64,
         delta_bytes: u64,
@@ -305,6 +308,31 @@ impl ClientHandler {
                 Ok(VerifiedVoucher {
                     next_state,
                     new_bytes,
+                    staged: StagedVoucher {
+                        delta_bytes,
+                        amount: wire.amount,
+                    },
+                })
+            }
+            Err(PoolError::AmountRegression { last, .. }) => {
+                // A voucher at-or-below the lane watermark: a concurrent same-lane
+                // sibling already settled this cumulative. Benign — treat as
+                // ALREADY-SATISFIED: do not advance the watermark, do not reject,
+                // and stage this stream's own delta so its headroom + per-hash
+                // receipt still progress (the watermark already covers this stream's
+                // delivered). The one exception is a DIVERGENT voucher at the SAME
+                // amount claiming MORE bytes — same money, more bytes — which is a
+                // single-signer fault (#1699 rule 4).
+                let amount = U256::from_be_bytes(wire.amount);
+                if amount == last && new_bytes > state.last_bytes_delivered() {
+                    return Err(VerifyStop::Reject(
+                        VoucherRejectReason::BytesRegression,
+                        None,
+                    ));
+                }
+                Ok(VerifiedVoucher {
+                    next_state: state.clone(),
+                    new_bytes: cumulative_bytes,
                     staged: StagedVoucher {
                         delta_bytes,
                         amount: wire.amount,
@@ -445,7 +473,7 @@ enum CommitOutcome {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
@@ -683,5 +711,143 @@ mod tests {
             after.bytes_delivered_cumulative, new_bytes,
             "the cumulative byte counter advanced to the voucher's bytes"
         );
+    }
+
+    /// A voucher at-or-below the lane watermark — a concurrent sibling raced ahead
+    /// — is `AlreadySatisfied`: `verify_voucher` returns Ok WITHOUT advancing the
+    /// candidate watermark, and stages this stream's delta so its own headroom and
+    /// receipt still progress. It must NOT reject (that would kill an honest lagging
+    /// stream, #1699).
+    #[tokio::test]
+    async fn stale_voucher_is_benign_and_does_not_regress_watermark() {
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+            as Arc<dyn PoolStateStore>;
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let signer_key = PrivateKeySigner::random();
+        let signer = signer_key.address();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        let rate_per_mb = 1_000_000u64;
+        // Seed the lane already advanced to 2 MB (a sibling settled it).
+        let two_mb = decdn_incentive::rate::BYTES_PER_MB * 2;
+        let high_amount = decdn_incentive::min_payment(two_mb, rate_per_mb);
+        let seed = LaneState::hydrate(
+            pool_id,
+            signer,
+            provider,
+            U256::MAX,
+            0,
+            high_amount,
+            U256::from(two_mb),
+            Some([9u8; 65]),
+        );
+
+        // A LOWER cumulative voucher: 1 MB. Signed correctly by the lane signer.
+        let one_mb = decdn_incentive::rate::BYTES_PER_MB;
+        let low_amount = decdn_incentive::min_payment(one_mb, rate_per_mb);
+        let signed_low = decdn_incentive::Voucher {
+            pool_id,
+            signer,
+            provider,
+            amount: low_amount,
+            bytes_delivered: U256::from(one_mb),
+        }
+        .sign(&signer_key, &domain)
+        .expect("sign low voucher");
+        let wire = decdn_protocol::client::Voucher {
+            signature: signed_low.signature.as_bytes().to_vec(),
+            amount: low_amount.to_be_bytes(),
+            bytes_delivered: U256::from(one_mb).to_be_bytes(),
+        };
+
+        // verify against the high watermark. delta_bytes is this stream's own
+        // pending interval (1 MB), which the sibling's watermark already covers.
+        let verified = handler
+            .verify_voucher(&seed, U256::from(two_mb), &wire, rate_per_mb, one_mb)
+            .expect("a superseded but well-signed voucher is benign, not a reject");
+        assert_eq!(
+            verified.new_bytes,
+            U256::from(two_mb),
+            "the candidate watermark must NOT regress to the stale voucher"
+        );
+        assert_eq!(
+            verified.next_state.last_amount(),
+            high_amount,
+            "the candidate amount must stay at the sibling-settled watermark"
+        );
+        assert_eq!(
+            verified.staged.delta_bytes, one_mb,
+            "this stream's delta is still staged for its own receipt + headroom"
+        );
+    }
+
+    /// The single-signer guard (#1699 rule 4): a voucher at the SAME amount but a
+    /// HIGHER `bytes_delivered` — same money, more bytes claimed — is a divergent
+    /// fault, not a benign supersede.
+    #[tokio::test]
+    async fn divergent_voucher_at_equal_amount_is_rejected() {
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+            as Arc<dyn PoolStateStore>;
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let signer_key = PrivateKeySigner::random();
+        let signer = signer_key.address();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        let rate_per_mb = 1_000_000u64;
+        let one_mb = decdn_incentive::rate::BYTES_PER_MB;
+        let amount = decdn_incentive::min_payment(one_mb, rate_per_mb);
+        // Seed at (amount, 1 MB).
+        let seed = LaneState::hydrate(
+            pool_id,
+            signer,
+            provider,
+            U256::MAX,
+            0,
+            amount,
+            U256::from(one_mb),
+            Some([9u8; 65]),
+        );
+        // Same amount, but claims 2 MB of bytes.
+        let two_mb = one_mb * 2;
+        let divergent_voucher = decdn_incentive::Voucher {
+            pool_id,
+            signer,
+            provider,
+            amount,
+            bytes_delivered: U256::from(two_mb),
+        }
+        .sign(&signer_key, &domain)
+        .expect("sign divergent voucher");
+        let wire = decdn_protocol::client::Voucher {
+            signature: divergent_voucher.signature.as_bytes().to_vec(),
+            amount: amount.to_be_bytes(),
+            bytes_delivered: U256::from(two_mb).to_be_bytes(),
+        };
+
+        let err = handler
+            .verify_voucher(&seed, U256::from(one_mb), &wire, rate_per_mb, one_mb)
+            .expect_err("a divergent equal-amount voucher must be rejected");
+        match err {
+            super::VerifyStop::Reject(reason, _) => assert_eq!(
+                reason,
+                decdn_protocol::client::VoucherRejectReason::BytesRegression,
+                "divergent equal-amount voucher rejects as BytesRegression"
+            ),
+            super::VerifyStop::Bail(msg) => panic!("expected a Reject, got Bail({msg})"),
+        }
     }
 }

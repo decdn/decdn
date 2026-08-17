@@ -2310,6 +2310,86 @@ async fn skip_ahead_voucher_on_a_concurrent_lane_is_accepted() -> anyhow::Result
     Ok(())
 }
 
+/// #1699 out-of-order settlement: after a higher (aggregate) voucher settles
+/// the lane, a lower voucher arriving on a slower stream is ALREADY-SATISFIED —
+/// the node does not kill that stream and the watermark never regresses. This
+/// is the case a naive wire+verify change would fail (fatal regression).
+#[tokio::test(flavor = "multi_thread")]
+async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Result<()> {
+    let payload_a = vec![0x71u8; 512 * 1024];
+    let payload_b = vec![0x82u8; 384 * 1024];
+    let idle = Duration::from_secs(30);
+    let fx = idle_fixture_with_two_blobs(&payload_a, &payload_b, idle).await?;
+    let blob_a = fx.blob(0)?;
+    let blob_b = fx.blob(1)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+
+    let mut stalled_a = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_a.hash.as_bytes(),
+        blob_a.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+    let mut stalled_b = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob_b.hash.as_bytes(),
+        blob_b.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+
+    // Settle the aggregate (A+B) on stream B first — the "higher" voucher.
+    let agg_bytes = blob_a.wire_bytes + blob_b.wire_bytes;
+    let agg_amount =
+        min_payment(blob_a.wire_bytes, RATE_PER_MB) + min_payment(blob_b.wire_bytes, RATE_PER_MB);
+    let reply_b = stalled_b
+        .send_cumulative_voucher(&fx.client_signer, agg_bytes, agg_amount)
+        .await?;
+    anyhow::ensure!(
+        !matches!(reply_b, ClientMessage::StreamError(_)),
+        "aggregate voucher on B must be accepted, got {reply_b:?}"
+    );
+
+    // Now the LOWER standalone voucher for just A arrives on stream A. It is
+    // below the A+B watermark — already satisfied, NOT a WrongSigner/regression
+    // kill.
+    let reply_a = stalled_a
+        .send_cumulative_voucher(
+            &fx.client_signer,
+            blob_a.wire_bytes,
+            min_payment(blob_a.wire_bytes, RATE_PER_MB),
+        )
+        .await?;
+    anyhow::ensure!(
+        !matches!(reply_a, ClientMessage::StreamError(_)),
+        "a superseded lower voucher must be already-satisfied, got StreamError: {reply_a:?}"
+    );
+
+    // The watermark holds at the aggregate; it did not regress to A.
+    let persisted = fx.store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("lane state must persist"))?;
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(agg_bytes),
+        "watermark must stay at the aggregate, got {}",
+        only.last_bytes_delivered(),
+    );
+
+    client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
 /// Regression for #1054: a 0-byte blob delivers end-to-end over `cdn/client/v1`.
 /// The serve emits no `ChunkData` and no voucher (0 wire bytes), the requester
 /// proves the empty stream against the empty root `Hash::new(&[])` and returns
