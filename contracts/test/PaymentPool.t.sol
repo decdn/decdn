@@ -1737,6 +1737,81 @@ contract PaymentPoolTest is Test {
         assertApproxEqAbs(gasUsed, 541_614, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
     }
 
+    /// @dev Opens a fresh pool and, unlike `_redeemFreshLanesAndSnapshotGas`,
+    ///      does NOT pre-register the lanes' capabilities in a separate call.
+    ///      Every signer is brand-new: its `CapabilityReg` rides in the SAME
+    ///      measured `redeemMany` as its voucher, one owner-signed
+    ///      registration plus one cold voucher-verify-and-settle per lane —
+    ///      the realistic shape of this feature's target workload (millions
+    ///      of one-time payers, each a new signer registered on its single
+    ///      redemption). Pins the call's gas via `snapshotGasLastCall`, same
+    ///      as the registered-signer helper above.
+    function _redeemFirstTimeLanesAndSnapshotGas(uint256 count, string memory snapshotName) internal returns (uint256) {
+        uint64 amount = 1e6;
+        uint64 bytesDelivered = 100_000;
+        uint256 seed = uint256(keccak256(bytes(snapshotName)));
+
+        bytes32 id = _open();
+        uint256[] memory pks = new uint256[](count);
+        address[] memory signers = new address[](count);
+        PaymentPool.CapabilityReg[] memory caps = new PaymentPool.CapabilityReg[](count);
+        for (uint256 i = 0; i < count; i++) {
+            uint256 pk = seed + i + 1;
+            address who = vm.addr(pk);
+            pks[i] = pk;
+            signers[i] = who;
+            caps[i] = PaymentPool.CapabilityReg({
+                signer: who,
+                spendingCap: SPENDING_CAP,
+                expiry: expiry,
+                ownerSig: _signCapabilityFor(address(pool), id, who, SPENDING_CAP, expiry, OWNER_PK)
+            });
+        }
+        PaymentPool.LaneVoucher[] memory vouchers = _lanesOf(id, pks, signers, amount, bytesDelivered);
+
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(_batch(id, caps, vouchers));
+        assertEq(totalPaid, count * uint256(amount), "every first-time lane must actually settle");
+        return vm.snapshotGasLastCall("PaymentPool", snapshotName);
+    }
+
+    /// @notice First-time-signer companion to `test_redeemMany_gas_NVouchers`:
+    ///         same N, but every lane's `CapabilityReg` rides in THIS
+    ///         measured call instead of an earlier unmeasured one — the
+    ///         realistic per-lane cost for a one-time payer whose capability
+    ///         is registered on its single redemption. See
+    ///         `test_redeemMany_gas_NVouchers`'s docstring for why this needs
+    ///         its own test function (fresh, cold EVM state) rather than a
+    ///         second call sharing a function with its N+1 companion.
+    function test_redeemMany_gas_firstTime_NVouchers() public {
+        uint256 gasUsed = _redeemFirstTimeLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N, "redeemMany_firstTime_N");
+        assertLt(gasUsed, 3_000_000, "sanity ceiling on a small fixed-N batch");
+        emit log_named_uint("redeemMany gas, first-time N vouchers", gasUsed);
+        // Pinned from an actual `forge test -vv` run on this branch. Includes
+        // N owner-signed capability registrations plus N cold voucher
+        // settlements in one call.
+        assertApproxEqAbs(
+            gasUsed, 795_817, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
+        );
+    }
+
+    /// @notice Companion to `test_redeemMany_gas_firstTime_NVouchers` — same
+    ///         setup, one more first-time lane.
+    ///         `gas(firstTime N+1) - gas(firstTime N)` is the first-time
+    ///         marginal: the per-lane cost of this feature's target
+    ///         workload, where a one-time payer's capability registration
+    ///         and voucher settlement both land in its single redemption.
+    function test_redeemMany_gas_firstTime_NPlus1Vouchers() public {
+        uint256 gasUsed =
+            _redeemFirstTimeLanesAndSnapshotGas(REDEEM_MANY_GAS_BENCHMARK_N + 1, "redeemMany_firstTime_Np1");
+        assertLt(gasUsed, 3_000_000, "sanity ceiling on a small fixed-N batch");
+        emit log_named_uint("redeemMany gas, first-time N+1 vouchers", gasUsed);
+        // Pinned from an actual `forge test -vv` run on this branch.
+        assertApproxEqAbs(
+            gasUsed, 859_221, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
+        );
+    }
+
     // -----------------------------------------------------------------
     // closePool
     // -----------------------------------------------------------------
