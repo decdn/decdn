@@ -36,7 +36,6 @@ pub decdn_protocol::client::VoucherRejectReason::BytesRegression
 pub decdn_protocol::client::VoucherRejectReason::CapabilityExpired
 pub decdn_protocol::client::VoucherRejectReason::PoolExhausted
 pub decdn_protocol::client::VoucherRejectReason::RateFloorRaised
-pub decdn_protocol::client::VoucherRejectReason::RetryLater
 pub decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::client::VoucherRejectReason::WrongPool
 pub decdn_protocol::client::VoucherRejectReason::WrongProvider
@@ -81,6 +80,7 @@ pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::client::Voucher
 pub decdn_protocol::client::Voucher::amount: [u8; 32]
+pub decdn_protocol::client::Voucher::bytes_delivered: [u8; 32]
 pub decdn_protocol::client::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
@@ -351,7 +351,6 @@ pub decdn_protocol::VoucherRejectReason::BytesRegression
 pub decdn_protocol::VoucherRejectReason::CapabilityExpired
 pub decdn_protocol::VoucherRejectReason::PoolExhausted
 pub decdn_protocol::VoucherRejectReason::RateFloorRaised
-pub decdn_protocol::VoucherRejectReason::RetryLater
 pub decdn_protocol::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::VoucherRejectReason::WrongPool
 pub decdn_protocol::VoucherRejectReason::WrongProvider
@@ -501,6 +500,7 @@ pub decdn_protocol::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::Voucher
 pub decdn_protocol::Voucher::amount: [u8; 32]
+pub decdn_protocol::Voucher::bytes_delivered: [u8; 32]
 pub decdn_protocol::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>

@@ -1,10 +1,14 @@
 //! Disk-backed `PoolStateStore` for the node runtime.
 //!
 //! Implements [`PoolStateStore`] against a single `redb` database file at
-//! `<data_dir>/lanes.redb`. Every successful `record` call performs an
-//! fsynced commit (redb's default [`redb::Durability::Immediate`], set
-//! explicitly here so a future redb default change doesn't silently weaken
-//! the durability guarantee).
+//! `<data_dir>/lanes.redb`. The lane table is buffered in memory: `open()`
+//! hydrates the working set from disk, `record`/`forget` mutate that working
+//! set only, and an explicit `flush()` call writes every dirty lane and
+//! applies every tombstone in one fsynced commit (redb's default
+//! [`redb::Durability::Immediate`], set explicitly here so a future redb
+//! default change doesn't silently weaken the durability guarantee). A crash
+//! between two flushes loses the unflushed lane advances; the caller decides
+//! the flush cadence.
 //!
 //! See [`decdn_incentive::store`] for the trait contract and
 //! [ADR 003 §Off-chain voucher state persistence] for the protocol rule
@@ -30,7 +34,9 @@
 //!
 //! [ADR 003 §Off-chain voucher state persistence]: ../../../adr/003-payments.md
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
@@ -279,16 +285,31 @@ impl StoredLaneState {
     }
 }
 
+/// In-memory working set for the lane (frontier) table. The map is the
+/// authoritative copy after `open()` hydrates it from disk; `record`/`forget`
+/// mutate it and mark `dirty`/`tombstones`, and `flush` drains those into one
+/// fsynced redb transaction. `dirty` and `tombstones` are disjoint: `record`
+/// clears a key's tombstone, `forget` clears its dirty mark.
+#[derive(Debug, Default)]
+struct LaneBuffer {
+    lanes: HashMap<LaneKey, LaneState>,
+    dirty: HashSet<LaneKey>,
+    tombstones: HashSet<LaneKey>,
+}
+
 /// `redb`-backed persistent implementation of [`PoolStateStore`].
 ///
 /// Construct via [`PersistentPoolStateStore::open`]. The database is
-/// owned for the lifetime of this value; drop closes the handle. The store
-/// is thread-safe — redb serialises writes internally via single-writer
-/// transactions, and reads are MVCC.
+/// owned for the lifetime of this value; drop closes the handle. The lane
+/// table is buffered in memory: `record`/`forget` mutate the buffer only, and
+/// a caller must call [`PoolStateStore::flush`] to commit it to disk. The
+/// store is thread-safe — redb serialises writes internally via
+/// single-writer transactions, and reads are MVCC.
 #[derive(Debug)]
 pub struct PersistentPoolStateStore {
     db: Database,
     path: PathBuf,
+    buffer: Mutex<LaneBuffer>,
 }
 
 impl PersistentPoolStateStore {
@@ -405,7 +426,50 @@ impl PersistentPoolStateStore {
             return Err(chmod_err);
         }
 
-        Ok(Self { db, path })
+        let lanes = Self::hydrate_lanes(&db)?;
+        Ok(Self {
+            db,
+            path,
+            buffer: Mutex::new(LaneBuffer {
+                lanes,
+                dirty: HashSet::new(),
+                tombstones: HashSet::new(),
+            }),
+        })
+    }
+
+    /// Read the whole lane table into an in-memory map at open. A corrupt or
+    /// forward-schema record aborts startup (running past it would reopen the
+    /// issue #527 voucher-replay window).
+    fn hydrate_lanes(db: &Database) -> Result<HashMap<LaneKey, LaneState>, StoreError> {
+        let read_txn = db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(LANE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut out = HashMap::new();
+        let iter = table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
+            let state = decode_record(&key_bytes, value_guard.value())?;
+            out.insert(state.key(), state);
+        }
+        Ok(out)
+    }
+
+    /// Lock the working-set buffer, mapping a poisoned mutex to a backend error
+    /// (anti-panic policy — never `unwrap` the guard).
+    fn lock_buffer(&self) -> Result<std::sync::MutexGuard<'_, LaneBuffer>, StoreError> {
+        self.buffer
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("lane buffer mutex poisoned: {err}")))
     }
 
     /// Operator-facing logging for the chmod-failure cleanup branch. Extracted
@@ -534,101 +598,46 @@ fn decode_record(
 }
 
 impl PoolStateStore for PersistentPoolStateStore {
-    /// Hydrate the seller table. A corrupt or forward-schema record **aborts
-    /// startup** — running past it would reopen the #527 voucher-replay window.
+    /// Every persisted lane, from the in-memory working set hydrated at `open()`.
     fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        // open_table on a never-written database returns TableDoesNotExist;
-        // treat that as an empty store rather than an error so first boot
-        // (no vouchers ever accepted) succeeds cleanly.
-        let table = match read_txn.open_table(LANE_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let mut out = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
-        for entry in iter {
-            let (key_guard, value_guard) =
-                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
-            let value_bytes = value_guard.value();
-            out.push(decode_record(&key_bytes, value_bytes)?);
-        }
-        Ok(out)
+        let buf = self.lock_buffer()?;
+        Ok(buf.lanes.values().cloned().collect())
     }
 
     fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
-        let key_bytes = lane_key_bytes(&key);
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(LANE_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let Some(value_guard) = table
-            .get(&key_bytes)
-            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_record(&key_bytes, value_guard.value())?))
+        let buf = self.lock_buffer()?;
+        Ok(buf.lanes.get(&key).cloned())
     }
 
+    /// Advance the in-memory lane state and mark it dirty. Durability is the
+    /// background flush's job (ADR 003 §Off-chain voucher state persistence).
     fn record(&self, state: &LaneState) -> Result<(), StoreError> {
-        let encoded = postcard::to_allocvec(&StoredLaneState::from(state))
-            .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
-        let key_bytes = lane_key_bytes(&state.key());
-
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        // Force fsync-on-commit. This is redb's default but pinned here so a
-        // future default change cannot silently weaken the issue #527 guarantee.
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        {
-            let mut table = write_txn
-                .open_table(LANE_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            table
-                .insert(&key_bytes, encoded.as_slice())
-                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        let key = state.key();
+        let mut buf = self.lock_buffer()?;
+        buf.lanes.insert(key, state.clone());
+        buf.tombstones.remove(&key);
+        buf.dirty.insert(key);
         Ok(())
     }
 
+    /// Drop the lane from the working set and mark it for deletion on the next
+    /// flush. Idempotent.
     fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
-        let key_bytes = lane_key_bytes(&key);
+        let mut buf = self.lock_buffer()?;
+        buf.lanes.remove(&key);
+        buf.dirty.remove(&key);
+        buf.tombstones.insert(key);
+        Ok(())
+    }
 
-        // Check first whether the table has ever been created. forget on a
-        // never-written store is a no-op by contract and must not create the
-        // table as a side effect.
-        {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-            match read_txn.open_table(LANE_TABLE) {
-                Ok(_) => {}
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-            }
+    /// Write every dirty lane and apply every tombstone in ONE fsynced redb
+    /// transaction, then clear both sets. Idempotent — a no-op when clean. Holds
+    /// the buffer lock across the commit so no `record` interleaves the drain.
+    fn flush(&self) -> Result<(), StoreError> {
+        let mut buf = self.lock_buffer()?;
+        if buf.dirty.is_empty() && buf.tombstones.is_empty() {
+            return Ok(());
         }
-
         let mut write_txn = self
             .db
             .begin_write()
@@ -640,13 +649,29 @@ impl PoolStateStore for PersistentPoolStateStore {
             let mut table = write_txn
                 .open_table(LANE_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            table
-                .remove(&key_bytes)
-                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+            for key in &buf.dirty {
+                let Some(state) = buf.lanes.get(key) else {
+                    continue;
+                };
+                let encoded = postcard::to_allocvec(&StoredLaneState::from(state))
+                    .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
+                let key_bytes = lane_key_bytes(key);
+                table
+                    .insert(&key_bytes, encoded.as_slice())
+                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+            }
+            for key in &buf.tombstones {
+                let key_bytes = lane_key_bytes(key);
+                table
+                    .remove(&key_bytes)
+                    .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+            }
         }
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        buf.dirty.clear();
+        buf.tombstones.clear();
         Ok(())
     }
 }
@@ -1241,6 +1266,27 @@ mod tests {
         )
     }
 
+    /// Build a hydrated [`LaneState`] with the given identity + spending cap.
+    /// `pool_byte` seeds the pool id, `signer_byte` the signer; the provider is
+    /// a fixed non-signer address so a signer/provider transposition would be
+    /// caught.
+    fn mk_lane(pool_byte: u8, signer_byte: u8, cap: u64) -> LaneState {
+        let mut pool = [0u8; 32];
+        pool[31] = pool_byte;
+        let mut signer = [0u8; 20];
+        signer[19] = signer_byte;
+        LaneState::hydrate(
+            B256::from(pool),
+            Address::from(signer),
+            address!("00000000000000000000000000000000000000de"),
+            U256::from(cap),
+            1_900_000_000,
+            U256::from(1_234u64),
+            U256::from(4_096u64),
+            Some([0xABu8; 65]),
+        )
+    }
+
     /// The capability store round-trips: what the seller intake persists via
     /// [`CapabilitySink::store_capability`] is exactly what the redeemer reads
     /// through [`StoredCapabilitySource`], and a `(pool_id, signer)` with no
@@ -1328,6 +1374,7 @@ mod tests {
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
             store.record(&s)?;
+            store.flush()?;
         }
         let store = PersistentPoolStateStore::open(dir.path())?;
         let all = store.load_all()?;
@@ -1475,6 +1522,7 @@ mod tests {
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
             store.record(&recorded)?;
+            store.flush()?;
         }
 
         let path_buf = dir.path().join(LANES_DB_FILE);
@@ -1545,9 +1593,9 @@ mod tests {
             }
             wtx.commit()?;
         }
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        let err = store
-            .load_all()
+        // Hydration at open() eagerly decodes the whole table, so the future
+        // schema version is caught on reopen rather than on the first `load_all`.
+        let err = PersistentPoolStateStore::open(dir.path())
             .err()
             .ok_or_else(|| anyhow::anyhow!("expected UnsupportedSchema"))?;
         anyhow::ensure!(
@@ -1563,12 +1611,12 @@ mod tests {
     #[test]
     fn extra_trailing_bytes_are_tolerated() -> anyhow::Result<()> {
         let dir = data_dir()?;
-        let store = PersistentPoolStateStore::open(dir.path())?;
         let s = sample(0x42);
         let key_bytes = lane_key_bytes(&s.key());
         let mut encoded = postcard::to_allocvec(&StoredLaneState::from(&s))?;
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
         {
+            let store = PersistentPoolStateStore::open(dir.path())?;
             let mut tx = store.db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
@@ -1577,6 +1625,9 @@ mod tests {
             }
             tx.commit()?;
         }
+        // Hydration at open() reads the whole table, so reopen to pick up the
+        // record this test wrote directly (bypassing the buffer).
+        let store = PersistentPoolStateStore::open(dir.path())?;
         let all = store.load_all()?;
         anyhow::ensure!(all.len() == 1);
         let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
@@ -1590,13 +1641,13 @@ mod tests {
     #[test]
     fn wrong_length_signature_is_corrupt() -> anyhow::Result<()> {
         let dir = data_dir()?;
-        let store = PersistentPoolStateStore::open(dir.path())?;
         let s = sample(0x77);
         let key_bytes = lane_key_bytes(&s.key());
         let mut stored = StoredLaneState::from(&s);
         stored.signature = vec![0xCD; 64];
         let encoded = postcard::to_allocvec(&stored)?;
         {
+            let store = PersistentPoolStateStore::open(dir.path())?;
             let mut tx = store.db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             {
@@ -1605,8 +1656,9 @@ mod tests {
             }
             tx.commit()?;
         }
-        let err = store
-            .load_all()
+        // Hydration at open() eagerly decodes the whole table, so the corrupt
+        // signature is caught on reopen rather than on the first `load_all`.
+        let err = PersistentPoolStateStore::open(dir.path())
             .err()
             .ok_or_else(|| anyhow::anyhow!("wrong-length signature must reject"))?;
         anyhow::ensure!(
@@ -1751,6 +1803,48 @@ mod tests {
         anyhow::ensure!(
             buyer_set.len() == 1 && buyer_set.first().map(|p| p.pool_id) == Some(buyer_pool)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn record_is_buffered_until_flush_then_reload_sees_it() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let s = PersistentPoolStateStore::open(dir.path())?;
+        s.record(&mk_lane(1, 0xAA, 2_000_000))?;
+        // Buffered in this handle immediately.
+        anyhow::ensure!(s.load_all()?.len() == 1, "record visible in-memory");
+        // A fresh open BEFORE flush must NOT see it (nothing fsynced yet).
+        drop(s);
+        let s2 = PersistentPoolStateStore::open(dir.path())?;
+        anyhow::ensure!(s2.load_all()?.is_empty(), "unflushed record is not durable");
+        s2.record(&mk_lane(1, 0xAA, 2_000_000))?;
+        s2.flush()?;
+        drop(s2);
+        let s3 = PersistentPoolStateStore::open(dir.path())?;
+        anyhow::ensure!(s3.load_all()?.len() == 1, "flushed record survives reopen");
+        Ok(())
+    }
+
+    #[test]
+    fn forget_tombstone_applies_on_flush() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let s = PersistentPoolStateStore::open(dir.path())?;
+        let lane = mk_lane(2, 0xBB, 100_000);
+        s.record(&lane)?;
+        s.flush()?;
+        s.forget(lane.key())?;
+        s.flush()?;
+        drop(s);
+        let s2 = PersistentPoolStateStore::open(dir.path())?;
+        anyhow::ensure!(s2.load_all()?.is_empty(), "flushed forget survives reopen");
+        Ok(())
+    }
+
+    #[test]
+    fn flush_when_clean_is_noop_ok() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let s = PersistentPoolStateStore::open(dir.path())?;
+        s.flush()?; // nothing dirty
         Ok(())
     }
 }

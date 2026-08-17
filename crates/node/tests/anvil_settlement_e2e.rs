@@ -121,6 +121,7 @@ const MIB: usize = 1024 * 1024;
 // The redeem threshold sits below the seller stream's ~15 µUSDC claim so the
 // delivered voucher crosses it and the redeemer submits `redeem`.
 const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
+
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path
 // Warp past any governable pool grace window so `reclaim` is permitted on-chain
@@ -528,7 +529,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     };
     // Redeem-hint channel, created by the caller (the settlement service no longer
     // mints it): the sender is wired into the handler at construction, the
-    // receiver drives the service's redeemer loop (#1254).
+    // receiver drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
     let handler = {
@@ -577,6 +578,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         capability_source,
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        300,
         Duration::from_secs(300),
         Duration::from_millis(250),
         e2e_head(&node_provider),

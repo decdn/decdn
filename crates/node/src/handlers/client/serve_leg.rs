@@ -38,9 +38,9 @@ use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
 
 use super::{
-    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage,
-    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream,
-    U256, VOUCHER_INTERVAL_BYTES, VecDeque, VoucherRejectReason,
+    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, FloorReservation,
+    Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256,
+    VOUCHER_INTERVAL_BYTES, VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -49,7 +49,7 @@ impl ClientHandler {
     /// the downstream (seller) half of the decoupled serve-miss (ADR
     /// 037). `len == 0` means "to the end of the blob".
     ///
-    /// Delivery, billing, the credit window, group-commit voucher batching, the
+    /// Delivery, billing, the credit window, per-voucher recoup, the
     /// in-flight takedown boundary, and client-disconnect handling all read from
     /// the cache: a coherent whole-range bao encoder reads the cache the pull leg
     /// fills. The caller (orchestration) has
@@ -106,11 +106,6 @@ impl ClientHandler {
         // Backpressure bound, floored at one interval so the loop can always make
         // progress (deliver a full interval, then recoup its voucher).
         let window = window.max(interval_bytes);
-        // Group-commit cap (#1483): at most this many vouchers share one fsync,
-        // bounded by how many intervals fit in the window.
-        let batch_cap = usize::try_from(window / interval_bytes)
-            .unwrap_or(usize::MAX)
-            .max(1);
 
         // The in-flight takedown re-check (ADR 011) keys on the pool FUNDER (the
         // pool owner, `getPool.owner`), resolved from the cached pool-view. `None`
@@ -128,9 +123,9 @@ impl ClientHandler {
         // collection — together they are exactly `delivered − paid`.
         let mut unvouchered: u64 = 0;
         let mut pending: VecDeque<u64> = VecDeque::new();
-        // One buffered voucher reader for the whole stream (#1483): every read
-        // goes through it so pipelined vouchers buffered ahead of a batch commit
-        // are not lost.
+        // One buffered voucher reader for the whole stream: every read goes
+        // through it so a pipelined voucher buffered ahead of the current one is
+        // not lost.
         let mut reader = BufferedVoucherReader::default();
 
         // The coherent whole-range bao encoder (ADR 038): ONE verified stream for
@@ -153,7 +148,7 @@ impl ClientHandler {
             // delivers no new byte AND clears no voucher has stalled — the client
             // stopped paying.
             let delivered_at_iter_start = delivered;
-            let mut committed_this_iter = 0usize;
+            let mut credited_this_iter = 0u64;
 
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
@@ -199,7 +194,7 @@ impl ClientHandler {
             // (`deliver`), so a cache-miss stream — which fronts upstream USDC — folds
             // proportional `dead_charge` too. Capture this iteration's maximum in-flight
             // unpaid balance NOW: after the deliver phase advanced `delivered` and
-            // before the recoup phase can advance `paid` or take the `BatchStop::Rejected`
+            // before the recoup phase can advance `paid` or take the `VoucherStop::Rejected`
             // early return / a `?` fault below. A stream that dies in its first
             // iteration never reaches the end-of-iteration hook, so without this note its
             // last-noted unpaid stays 0 and `Drop` would fold nothing — letting "connect,
@@ -214,23 +209,13 @@ impl ClientHandler {
                 ));
             }
 
-            // --- recoup phase: batch up to `batch_cap` completed intervals into
-            // ONE fsynced commit, acking each voucher only after it is durable
-            // (#1483, group commit). ---
-            let mut deltas: Vec<u64> = Vec::with_capacity(batch_cap);
-            while deltas.len() < batch_cap {
-                match pending.pop_front() {
-                    Some(delta) => deltas.push(delta),
-                    None => break,
-                }
-            }
-            let collected_any = !deltas.is_empty();
-            if collected_any {
-                // A transport drop or an underpayment bail surfaces as `Err`;
-                // propagate so the caller drops the pull leg (bounding the
-                // upstream spend and persisting the buyer watermark).
-                let outcome = match self
-                    .collect_voucher_batch(
+            // --- recoup phase: recoup each completed interval with one voucher.
+            // The voucher advances the in-memory lane watermark; the background
+            // flush persists it (ADR 003 §Off-chain voucher state persistence). ---
+            let collected_any = !pending.is_empty();
+            while let Some(delta) = pending.pop_front() {
+                let stop = match self
+                    .commit_one_voucher(
                         send,
                         recv,
                         &mut reader,
@@ -239,82 +224,68 @@ impl ClientHandler {
                         Some(lane),
                         client_node_id,
                         rate_per_mb,
-                        &deltas,
+                        delta,
                     )
                     .await
                 {
-                    Ok(outcome) => outcome,
+                    Ok(stop) => stop,
                     Err(e) => {
-                        // A transport drop or an underpayment bail (#856/#857): meter
-                        // the client-abandon, then propagate so the caller drops
-                        // the pull leg and bounds the upstream spend.
+                        // Transport drop or underpayment bail (#856/#857): meter the
+                        // abandon, then propagate so the caller drops the pull leg.
                         self.metrics.node_pull_through_client_abandoned();
                         return Err(e);
                     }
                 };
-                committed_this_iter = outcome.committed;
-                // Advance `paid` by exactly the committed prefix's WIRE bytes.
-                let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
-                paid = paid.saturating_add(paid_bytes);
-                if outcome.committed > 0 {
-                    // Publish the PAID CONTENT frontier for the pull leg's
-                    // `WindowPacer`, mapping paid WIRE back into content space (the
-                    // largest chunk-group boundary provably inside the paid wire
-                    // prefix — conservative, so the pull never overshoots its
-                    // window). One contiguous delivery from `offset`, so `offset`
-                    // is the single fetch-start.
-                    let served = content_paid_frontier(offset, total_bytes, paid);
-                    // `fetch_max`, not `store`: N observers advance the SHARED frontier
-                    // and the pull's `WindowPacer` binds on the MAX-over-observers paid
-                    // frontier (DECISION-B), so a slower observer must not regress a
-                    // faster one. Behavior-preserving for N=1 (a single contiguous
-                    // delivery is already monotone, so `fetch_max == store`).
-                    session
-                        .served_frontier()
-                        .fetch_max(served, Ordering::Relaxed);
-                    session.served_advanced().notify_waiters();
-                    // Under partial-overlap coalescing this serve leg is fed by more
-                    // than its own pull: each attached sibling pull produces the OVERLAP
-                    // this leg also consumes and bills. The sibling's `served_paid` is a
-                    // contiguous paid PREFIX, but this leg consumes a SUFFIX of the
-                    // sibling's covered range (starting at `offset`) — so it may only
-                    // EXTEND the sibling's frontier INTO the overlap, never claim the
-                    // sibling's `[start, offset)` prefix, which only the sibling's OWN
-                    // observers pay for. Guard on the sibling having itself already
-                    // cleared up to `offset`: only then is this leg's payment a sound
-                    // prefix extension (each overlap byte is fetched once and recouped by
-                    // the fastest of its shared observers — DECISION-B). Without the
-                    // guard a fast overlap payer would relax the sibling pull's window
-                    // over bytes no one has paid for. Empty in the common N=1 case.
-                    for extra in also_pace {
-                        if extra.served_frontier().load(Ordering::Relaxed) >= offset {
-                            extra.served_frontier().fetch_max(served, Ordering::Relaxed);
-                            extra.served_advanced().notify_waiters();
+                match stop {
+                    VoucherStop::Continue { credited_bytes } => {
+                        // Advance `paid` by the watermark-capped credit (rule #1): a
+                        // benign already-satisfied voucher raises the watermark by
+                        // nothing, so it credits nothing here and cannot reopen the
+                        // credit window for bytes the lane has not settled.
+                        credited_this_iter = credited_this_iter.saturating_add(credited_bytes);
+                        paid = paid.saturating_add(credited_bytes);
+                        // Publish the PAID CONTENT frontier for the pull leg's
+                        // `WindowPacer`, mapping paid WIRE back into content space (the
+                        // largest chunk-group boundary provably inside the paid wire
+                        // prefix — conservative, so the pull never overshoots its
+                        // window). One contiguous delivery from `offset`, so `offset`
+                        // is the single fetch-start.
+                        let served = content_paid_frontier(offset, total_bytes, paid);
+                        // `fetch_max`, not `store`: N observers advance the SHARED
+                        // frontier and the pull's `WindowPacer` binds on the
+                        // MAX-over-observers paid frontier (DECISION-B), so a slower
+                        // observer must not regress a faster one. Behavior-preserving
+                        // for N=1 (a single contiguous delivery is already monotone,
+                        // so `fetch_max == store`).
+                        session
+                            .served_frontier()
+                            .fetch_max(served, Ordering::Relaxed);
+                        session.served_advanced().notify_waiters();
+                        // Under partial-overlap coalescing this serve leg is fed by
+                        // more than its own pull: each attached sibling pull produces
+                        // the OVERLAP this leg also consumes and bills. The sibling's
+                        // `served_paid` is a contiguous paid PREFIX, but this leg
+                        // consumes a SUFFIX of the sibling's covered range (starting at
+                        // `offset`) — so it may only EXTEND the sibling's frontier INTO
+                        // the overlap, never claim the sibling's `[start, offset)`
+                        // prefix, which only the sibling's OWN observers pay for. Guard
+                        // on the sibling having itself already cleared up to `offset`:
+                        // only then is this leg's payment a sound prefix extension (each
+                        // overlap byte is fetched once and recouped by the fastest of
+                        // its shared observers — DECISION-B). Without the guard a fast
+                        // overlap payer would relax the sibling pull's window over bytes
+                        // no one has paid for. Empty in the common N=1 case.
+                        for extra in also_pace {
+                            if extra.served_frontier().load(Ordering::Relaxed) >= offset {
+                                extra.served_frontier().fetch_max(served, Ordering::Relaxed);
+                                extra.served_advanced().notify_waiters();
+                            }
                         }
                     }
-                }
-                // Re-queue deltas the client had not paid yet (a short batch),
-                // preserving order at the front.
-                for &delta in deltas
-                    .get(outcome.committed..)
-                    .unwrap_or_default()
-                    .iter()
-                    .rev()
-                {
-                    pending.push_front(delta);
-                }
-                match outcome.stop {
-                    // A voucher was rejected (or the commit hit `RetryLater`): the
-                    // rejection was already written and any valid prefix committed
-                    // + acked. Stop cleanly; the caller drops the pull leg. An
-                    // underpaid/rejected voucher is a client-abandon (#856) — meter it
-                    // so a node paying upstream for a client that won't pay is
-                    // alertable.
-                    BatchStop::Rejected => {
+                    VoucherStop::Rejected => {
                         self.metrics.node_pull_through_client_abandoned();
                         return Ok(());
                     }
-                    BatchStop::Continue => {}
                 }
             }
 
@@ -391,15 +362,15 @@ impl ClientHandler {
 
             // No-progress guard: an iteration that delivered no new byte (delivery
             // blocked on the credit window, waiting for payment) AND cleared no
-            // voucher (the client stopped paying — `collect_voucher_batch` timed out
-            // with nothing committed) cannot make progress. The client has abandoned
+            // voucher (the client stopped paying — the voucher read timed out with
+            // nothing committed) cannot make progress. The client has abandoned
             // (#856 drop-after-fill): stop cleanly. The caller then cancels the pull
             // leg, which bounds the upstream spend (#1610) and persists the buyer
             // watermark (#852). Any delivery or payment this iteration resets it, so
-            // an honest-but-slow client (patience = one `collect_voucher_batch`
-            // read timeout) is never dropped early.
+            // an honest-but-slow client (patience = one voucher read timeout) is
+            // never dropped early.
             let made_delivery_progress = delivered > delivered_at_iter_start;
-            let made_payment_progress = committed_this_iter > 0;
+            let made_payment_progress = credited_this_iter > 0;
             if !made_delivery_progress && !made_payment_progress {
                 // The client stopped paying (#856 drop-after-fill): meter the abandon,
                 // then stop cleanly.

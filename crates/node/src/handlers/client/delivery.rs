@@ -7,9 +7,9 @@ use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
 use super::{
-    Arc, B256, BatchStop, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage,
-    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256,
-    VOUCHER_INTERVAL_BYTES, VecDeque, VoucherRejectReason,
+    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, FloorReservation,
+    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VOUCHER_INTERVAL_BYTES,
+    VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -181,15 +181,6 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
 
         let interval_bytes = VOUCHER_INTERVAL_BYTES;
-        // Group-commit cap (#1483): at most this many vouchers share one fsync.
-        // Bounded by how many intervals fit in the widest window the ramp can
-        // reach (`credit_max`), so the batch size is stable as the window grows
-        // instead of shrinking and growing on every recompute. `interval_bytes >=
-        // 1` (floored in `credit_window`), so the division never divides by zero.
-        let ceiling = self.credit_window(interval_bytes, u64::MAX);
-        let batch_cap = usize::try_from(ceiling / interval_bytes.max(1))
-            .unwrap_or(usize::MAX)
-            .max(1);
 
         // The in-flight takedown re-check (ADR 011 compliance) keys on the pool
         // FUNDER — the pool owner (`getPool.owner`), resolved from the cached
@@ -206,8 +197,8 @@ impl ClientHandler {
         // collection — together they are exactly `delivered − paid`.
         let mut unvouchered: u64 = 0;
         let mut pending: VecDeque<u64> = VecDeque::new();
-        // One buffered voucher reader for the whole stream (#1483): it buffers
-        // pipelined vouchers across recoup calls, so every voucher read MUST go
+        // One buffered voucher reader for the whole stream: it buffers a
+        // pipelined voucher across recoup calls, so every voucher read MUST go
         // through it — a second reader would lose bytes it read ahead.
         let mut reader = BufferedVoucherReader::default();
 
@@ -287,24 +278,13 @@ impl ClientHandler {
                 ));
             }
 
-            // --- recoup phase: batch up to `batch_cap` completed intervals into
-            // ONE fsynced commit, acking each voucher only after the commit is
-            // durable (#1483, group commit). When the window blocks the deliver
-            // phase there is always a completed interval to collect (the
-            // one-interval floor guarantees it), so the loop never spins without an
-            // await. At `batch_cap == 1` (stop-and-wait) this is one voucher per
-            // recoup — the pre-batch cadence. ---
-            let mut deltas: Vec<u64> = Vec::with_capacity(batch_cap);
-            while deltas.len() < batch_cap {
-                match pending.pop_front() {
-                    Some(delta) => deltas.push(delta),
-                    None => break,
-                }
-            }
-            let collected_any = !deltas.is_empty();
-            if collected_any {
-                let outcome = self
-                    .collect_voucher_batch(
+            // --- recoup phase: one voucher per completed interval; the voucher
+            // advances the in-memory lane watermark and the background flush
+            // persists it (ADR 003 §Off-chain voucher state persistence). ---
+            let collected_any = !pending.is_empty();
+            while let Some(delta) = pending.pop_front() {
+                let stop = self
+                    .commit_one_voucher(
                         send,
                         recv,
                         &mut reader,
@@ -313,25 +293,17 @@ impl ClientHandler {
                         lane,
                         client_node_id,
                         rate_per_mb,
-                        &deltas,
+                        delta,
                     )
                     .await?;
-                // Advance `paid` by exactly the committed prefix's bytes.
-                let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
-                paid = paid.saturating_add(paid_bytes);
-                // Re-queue deltas the client had not yet paid (a short batch — it
-                // has not sent those vouchers yet), preserving order at the front.
-                for &delta in deltas
-                    .get(outcome.committed..)
-                    .unwrap_or_default()
-                    .iter()
-                    .rev()
-                {
-                    pending.push_front(delta);
-                }
-                match outcome.stop {
-                    BatchStop::Rejected => return Ok(()),
-                    BatchStop::Continue => {}
+                match stop {
+                    // Advance `paid` by the watermark-capped credit (rule #1), not the
+                    // raw delivered delta: a benign already-satisfied voucher credits
+                    // nothing and cannot reopen the credit window for unsettled bytes.
+                    VoucherStop::Continue { credited_bytes } => {
+                        paid = paid.saturating_add(credited_bytes);
+                    }
+                    VoucherStop::Rejected => return Ok(()),
                 }
             }
 

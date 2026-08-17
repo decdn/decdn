@@ -2307,12 +2307,9 @@ enum PullVerdict {
     /// intact and available to every other lane.
     OurDeadLane(VoucherRejectReason),
     /// The peer rejected a voucher we presented, but the pool is FINE — nothing to
-    /// suppress, nothing to top up. Two reasons land here: `RetryLater` (a
-    /// transient node-side persist fault upstream; ADR 003 has its state not advance, so the
-    /// SAME voucher can be resent on a fresh stream) and `RateFloorRaised` (a governance
-    /// delivery-floor raise made the quoted rate stale, #1382, so the client re-probes and
-    /// re-quotes at the new floor on a fresh stream). Different client remedy, same action
-    /// here: keep the healthy pool and retry.
+    /// suppress, nothing to top up. `RateFloorRaised` lands here: a governance
+    /// delivery-floor raise made the quoted rate stale (#1382), so the client re-probes and
+    /// re-quotes at the new floor on a fresh stream. Keep the healthy pool and retry.
     OurVoucherRetryable(VoucherRejectReason),
     /// The peer refused delivery, carrying the wire code's own verdict (#1144).
     Refused(RefusalVerdict),
@@ -2407,11 +2404,9 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   further credit (`PoolExhausted`). No further voucher on this lane is accepted, but the
 ///   pool row still holds a deposit worth keeping — so the provider is suppressed for a
 ///   bounded window and the pool row is KEPT rather than deleted.
-/// - **Try again.** `RetryLater` (the voucher was valid and the upstream's state did not
-///   advance, ADR 003, so the same voucher can go out on a fresh stream) and
-///   `RateFloorRaised` (a governance floor raise made the quoted rate stale, #1382, so the
-///   client re-probes/re-quotes at the new floor on a fresh stream). Different remedies,
-///   same action here: the pool is healthy, so leave it alone and retry.
+/// - **Try again.** `RateFloorRaised` (a governance floor raise made the quoted rate stale,
+///   #1382, so the client re-probes/re-quotes at the new floor on a fresh stream). The pool
+///   is healthy, so leave it alone and retry.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
 /// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`, and it does not need to.
@@ -2431,11 +2426,9 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
             PullVerdict::OurLocalFault
         }
-        // Pool and signer both fine — resend (`RetryLater`) or re-quote at the new floor
-        // (`RateFloorRaised`, #1382); either way keep the pool and try again.
-        VoucherRejectReason::RetryLater | VoucherRejectReason::RateFloorRaised => {
-            PullVerdict::OurVoucherRetryable(reason)
-        }
+        // Pool and signer both fine — re-quote at the new floor (`RateFloorRaised`, #1382);
+        // keep the pool and try again.
+        VoucherRejectReason::RateFloorRaised => PullVerdict::OurVoucherRetryable(reason),
         // Terminal for THIS lane while the pool row is still worth keeping. The signer's
         // cap is spent (`SpendingCapExhausted`) or its capability expired
         // (`CapabilityExpired`), our accounting drifted
@@ -2634,11 +2627,10 @@ fn classify_pull_failure(
             deps.metrics.node_pull_voucher_rejected();
             wedged_channel(deps, pk, provider_addr, hash_bytes, reason, channel);
         }
-        // The pool is fine: either the upstream hit a transient persist fault and its
-        // state did not advance (`RetryLater`, ADR 003, so the same voucher can be resent) or
-        // a governance floor raise made the quote stale (`RateFloorRaised`, #1382, so a retry
-        // re-probes and re-quotes at the new floor). Skip the candidate this once and leave
-        // the pool alone — suppressing here would throw away a healthy pool over a hiccup.
+        // The pool is fine: a governance floor raise made the quote stale (`RateFloorRaised`,
+        // #1382), so a retry re-probes and re-quotes at the new floor. Skip the candidate this
+        // once and leave the pool alone — suppressing here would throw away a healthy pool
+        // over a hiccup.
         PullVerdict::OurVoucherRetryable(reason) => {
             deps.metrics.node_pull_voucher_rejected();
             debug!(
@@ -2947,7 +2939,7 @@ mod tests {
             StreamError::Overloaded,
             StreamError::BlobTooLarge,
             StreamError::VoucherRejected {
-                reason: VoucherRejectReason::RetryLater,
+                reason: VoucherRejectReason::RateFloorRaised,
                 bundle: None,
             },
         ] {

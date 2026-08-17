@@ -420,8 +420,8 @@ impl ClientFixture {
     /// Deliberately never pays, which bounds what it can see. The node streams
     /// `StreamResponse` + every `ChunkData` up to the voucher interval and then
     /// blocks on payment, so for a sub-interval blob this captures **every
-    /// message the node emits before it blocks** — but never `VoucherAck` or
-    /// `StreamEnd`, which are emitted only after a voucher arrives. The capture
+    /// message the node emits before it blocks** — but never `StreamEnd`,
+    /// which is emitted only after a voucher arrives. The capture
     /// ends when the node falls silent for a few seconds (that payment pause) or
     /// the stream closes cleanly.
     ///
@@ -881,11 +881,13 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// refuses delivery up front — its `getPool` view has not resolved the pool yet,
 /// which reaches us as the wire `NotFound` that `ServeRejectReason::wire_error`
 /// collapses seven reject reasons onto. That, transport errors, a per-attempt
-/// `PullTimeout`, a `PullStalled` (#1134 — an upstream that went silent
+/// `PullTimeout`, and a `PullStalled` (#1134 — an upstream that went silent
 /// mid-stream; retryable here because in a loopback fixture the node is coming
-/// up, not dying), and the node's explicit `RetryLater` resend signal are all
-/// retryable. `NotFound` and `RetryLater` are decided by explicit arms (the
-/// `UpstreamRefused` and `UpstreamVoucherRejected` downcasts below); transport
+/// up, not dying) are all retryable. A node-side persist fault also lands here:
+/// it aborts the stream cleanly with no in-band voucher rejection, so it reaches
+/// us as one of these same transport/stall errors rather than a typed downcast,
+/// and the client resends the same voucher on a fresh stream. `NotFound` is
+/// decided by an explicit arm (the `UpstreamRefused` downcast below); transport
 /// errors, `PullTimeout`, and `PullStalled` reach the closing `true` by
 /// fallthrough.
 ///
@@ -906,14 +908,11 @@ fn is_retryable(err: &anyhow::Error) -> bool {
     {
         return false;
     }
-    if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
-        // `RetryLater` is a transient node-side persist failure that asks us to
-        // resend the same voucher on a fresh stream; every other reason is a
-        // terminal payment-state desync.
-        return matches!(
-            rejected.reason,
-            decdn_protocol::VoucherRejectReason::RetryLater
-        );
+    if err.downcast_ref::<UpstreamVoucherRejected>().is_some() {
+        // Every mid-stream voucher rejection is a terminal payment-state desync
+        // — a node-side persist fault aborts the stream instead of surfacing
+        // here, so it never reaches this arm.
+        return false;
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         // Allowlist the genuinely transient refusals: `NotFound` is the readiness

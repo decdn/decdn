@@ -21,11 +21,6 @@ use crate::lane::{LaneKey, LaneState, PoolId};
 
 /// Durable backing store for [`LaneState`], keyed by [`LaneKey`].
 ///
-/// Implementations MUST persist `record` calls (including fsync, for any
-/// disk-backed impl) before returning `Ok` — `apply_voucher` advances its
-/// in-memory state only after `record` succeeds, so a successful return is the
-/// protocol-level commit point.
-///
 /// The trait is intentionally synchronous: it's invoked from
 /// [`LaneState::apply_voucher`], which is itself sync. Callers running on a
 /// Tokio runtime should invoke the voucher-acceptance path from
@@ -42,8 +37,11 @@ pub trait PoolStateStore: Send + Sync {
     /// corrupt entries.
     fn load_all(&self) -> Result<Vec<LaneState>, StoreError>;
 
-    /// Persist the post-acceptance state for one lane. MUST be durable (fsynced
-    /// for disk-backed impls) before returning `Ok`.
+    /// Record the post-acceptance state for one lane in the store's working set.
+    /// A disk-backed store MAY buffer this in memory and make it durable later
+    /// via [`flush`](PoolStateStore::flush); it is not required to fsync before
+    /// returning `Ok`. Frontier state is safe to lose on a crash (an honest
+    /// client resumes forward; an un-redeemed replay is still on-chain-payable).
     ///
     /// Callers MUST pass a `LaneState` whose `last_*` tuple is a non-strict
     /// monotonic successor of any previously-recorded state for the same
@@ -53,20 +51,20 @@ pub trait PoolStateStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`StoreError`] if the write or fsync fails. Callers MUST NOT
+    /// Returns a [`StoreError`] if the write fails. Callers MUST NOT
     /// advance their in-memory state on failure.
     fn record(&self, state: &LaneState) -> Result<(), StoreError>;
 
     /// Drop the persisted entry for a settled lane. A no-op if the lane has no
     /// record.
     ///
-    /// Implementations MUST commit durably (fsync, on disk-backed impls) before
-    /// returning `Ok` — same contract as `record`.
+    /// A disk-backed store MAY buffer the removal and apply it on the next
+    /// [`flush`](PoolStateStore::flush); it is not required to fsync before
+    /// returning `Ok`.
     ///
     /// # Errors
     ///
-    /// Returns a [`StoreError`] if the underlying delete or durable commit
-    /// fails.
+    /// Returns a [`StoreError`] if the underlying delete fails.
     fn forget(&self, key: LaneKey) -> Result<(), StoreError>;
 
     /// Point-lookup the persisted state for one lane, or `None` if no record
@@ -80,6 +78,21 @@ pub trait PoolStateStore: Send + Sync {
     /// Returns a [`StoreError`] if the backing store is unreadable or the record
     /// is corrupt.
     fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError>;
+
+    /// Force all buffered lane state durable (fsync, for disk-backed impls).
+    ///
+    /// The default is a no-op: a volatile store ([`MemoryPoolStateStore`]) holds
+    /// nothing to flush, and a store that commits inside `record` has nothing
+    /// buffered. A disk-backed implementation MAY override this to buffer
+    /// `record` and `forget` in memory and make them durable here in one fsynced
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn flush(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// A pool this node closed on-chain (graceful shutdown or grace-window sweep)
@@ -99,8 +112,7 @@ pub struct PendingSettle {
 /// a timestamp gate — not the voucher state — and the lifecycles differ.
 ///
 /// Implementations MUST commit durably (fsync, on disk-backed impls) before
-/// returning `Ok` from `record_pending` / `forget_pending`, mirroring the
-/// [`PoolStateStore`] durability contract.
+/// returning `Ok` from `record_pending` / `forget_pending`.
 pub trait PendingSettleStore: Send + Sync {
     /// Persist a closed pool awaiting settlement. Overwrites any existing entry
     /// for the same pool (a re-close re-stamps the deadline).
@@ -169,8 +181,7 @@ impl CheckpointKey {
 /// re-scanning the overlap is harmless.
 ///
 /// A directly disk-backed implementation MUST commit durably (fsync) before
-/// returning `Ok` from [`record_checkpoint`](Self::record_checkpoint), mirroring
-/// the [`PoolStateStore`] durability contract. A debouncing *decorator* MAY relax
+/// returning `Ok` from [`record_checkpoint`](Self::record_checkpoint). A debouncing *decorator* MAY relax
 /// that per-call fsync — buffering in memory and coarsening the durable write
 /// cadence — provided it preserves the two invariants this contract rests on,
 /// **per key**: the persisted block is **monotonic** (never lowered) and the
@@ -558,6 +569,16 @@ mod tests {
             signer: address!("00000000000000000000000000000000000000a1"),
             provider: address!("00000000000000000000000000000000000000b2"),
         })?;
+        Ok(())
+    }
+
+    #[test]
+    fn memory_store_flush_is_noop_ok() -> anyhow::Result<()> {
+        let store = MemoryPoolStateStore::new();
+        store.record(&sample(1, 1))?;
+        // Volatile store: flush has nothing to do and must succeed.
+        store.flush()?;
+        anyhow::ensure!(store.len() == 1);
         Ok(())
     }
 

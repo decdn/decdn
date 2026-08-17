@@ -83,14 +83,6 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
-/// Group-commit interval when the handler is built without an explicit one
-/// (`voucher_commit_interval == None`, i.e. tests and any construction that does
-/// not thread `payment.voucher_commit_interval_ms`). Mirrors the config default
-/// [`decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]; the runtime
-/// always sets an explicit value from resolved config, so this only backs the
-/// `None` case. See [`ClientHandler::commit_interval`] (#1483).
-const DEFAULT_COMMIT_INTERVAL: Duration =
-    Duration::from_millis(decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS);
 /// Fallback overall deadline for opening a window-paced pull (#856) when no
 /// pull-through deadline is configured. In practice the runtime always sets
 /// one alongside the window provider, so this only guards a misconfiguration.
@@ -124,6 +116,12 @@ struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes delivered as of the last accepted voucher.
     bytes_delivered_cumulative: U256,
+    /// Cumulative wire bytes CREDITED to streams' paid headroom on this lane
+    /// (design rule #1). Monotone and never exceeds `bytes_delivered_cumulative`
+    /// (the settled watermark), so a benign already-satisfied voucher — which
+    /// does not raise the watermark — can only advance a stream's window for
+    /// bytes the lane has actually settled, never for unpaid delivered bytes.
+    paid_credited: U256,
     /// Count of same-lane streams currently admitted and delivering. The serve-path
     /// admission gate charges each already-active stream one credit-window floor of
     /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
@@ -599,12 +597,6 @@ pub struct ClientHandlerDeps {
     /// sets it from `payment.credit_ramp_divisor`. `0` opens the full ceiling
     /// immediately.
     pub credit_ramp_divisor: u64,
-    /// Group-commit interval (ADR 003 §Off-chain voucher state persistence,
-    /// #1483): how long the serve loop waits to gather more vouchers into one
-    /// fsynced commit before committing what it has. `None` (the default, and in
-    /// tests) reads as the `DEFAULT_VOUCHER_COMMIT_INTERVAL_MS` config default
-    /// (5 ms). The runtime sets it from `payment.voucher_commit_interval_ms`.
-    pub voucher_commit_interval: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     /// Durable mirror of each pool's `dead_charge` (ADR 003 §Pool solvency). The
     /// constructor hydrates the in-memory floor accumulator from it, and each
@@ -672,7 +664,6 @@ impl ClientHandlerDeps {
             pull_through_origin: None,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
-            voucher_commit_interval: None,
             idle_timeout: None,
             floor_loss_store: None,
         }
@@ -789,14 +780,6 @@ pub struct ClientHandler {
     /// construction via [`ClientHandlerDeps`]. Read through
     /// [`Self::credit_window`].
     credit_ramp_divisor: u64,
-    /// Group-commit interval (ADR 003 §Off-chain voucher state persistence,
-    /// #1483), set at construction via [`ClientHandlerDeps`]. The serve loop
-    /// waits at most this long to gather additional vouchers into one fsynced
-    /// commit before committing the batch it has, amortizing the per-voucher
-    /// fsync while still acknowledging each voucher only after it is durable.
-    /// `None` reads as [`DEFAULT_COMMIT_INTERVAL`]. Read through
-    /// [`Self::commit_interval`].
-    voucher_commit_interval: Option<Duration>,
     /// Live content deny-set (ADR 011). Consulted at three points, all of which
     /// must gate or the check is bypassable: the hash gate above the
     /// availability check in `serve_stream`, the origin gate right after channel
@@ -868,6 +851,7 @@ impl ClientHandler {
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
                     bytes_delivered_cumulative: bytes,
+                    paid_credited: bytes,
                     active_streams: Arc::new(AtomicU32::new(0)),
                 })),
             );
@@ -925,7 +909,6 @@ impl ClientHandler {
             pull_through_origin: deps.pull_through_origin,
             credit_max: deps.credit_max,
             credit_ramp_divisor: deps.credit_ramp_divisor,
-            voucher_commit_interval: deps.voucher_commit_interval,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
@@ -1101,6 +1084,7 @@ impl ClientHandler {
             Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
+                paid_credited: bytes,
                 active_streams: Arc::new(AtomicU32::new(0)),
             }))
         });
@@ -1371,19 +1355,6 @@ impl ClientHandler {
         }
     }
 
-    /// The group-commit interval for this handler (ADR 003 §Off-chain voucher
-    /// state persistence, #1483): the most the recoup phase waits to gather
-    /// another voucher into the current fsynced batch before committing what it
-    /// has. `None` reads as [`DEFAULT_COMMIT_INTERVAL`]. Zero is a valid setting
-    /// (commit each blocking-read batch immediately) and is preserved. The batch
-    /// is bounded above by the credit window regardless — at most
-    /// `credit_window / interval` vouchers are ever outstanding — so this only
-    /// governs the *wait* for a straggler, never grows the batch past the window.
-    pub(super) fn commit_interval(&self) -> Duration {
-        self.voucher_commit_interval
-            .unwrap_or(DEFAULT_COMMIT_INTERVAL)
-    }
-
     /// Has a takedown landed on this stream since it opened (ADR 011 §On
     /// Blacklist Event: "In-flight streams for a blacklisted hash are terminated
     /// at the next MB boundary")?
@@ -1452,26 +1423,16 @@ impl ClientHandler {
     }
 }
 
-/// How far a group-commit voucher batch got, returned by
-/// [`ClientHandler::collect_voucher_batch`] (#1483).
-struct BatchOutcome {
-    /// Number of vouchers durably committed AND acknowledged this call. The
-    /// serve loop advances its `paid` counter by the sum of the corresponding
-    /// deltas and re-queues any deltas beyond this — a *short* batch, meaning the
-    /// client had not sent those vouchers yet — for the next recoup.
-    committed: usize,
-    /// Whether the stream must end now.
-    stop: BatchStop,
-}
-
-/// Terminal disposition of a voucher batch.
-enum BatchStop {
-    /// Every gathered voucher committed and acked; keep serving.
-    Continue,
-    /// A voucher was rejected, or the batch commit failed (`RetryLater`). The
-    /// rejection frame was already written and the stream finished cleanly (any
-    /// valid prefix was committed + acked first, reflected in
-    /// [`BatchOutcome::committed`]); the loop returns `Ok(())`.
+/// Terminal disposition of one voucher collected by
+/// [`ClientHandler::commit_one_voucher`].
+enum VoucherStop {
+    /// Verified and advanced in memory; keep serving. `credited_bytes` is the
+    /// watermark-capped wire bytes to advance the serve loop's `paid` by (rule
+    /// #1) — at most the amount the lane watermark advanced, so a benign
+    /// already-satisfied voucher contributes zero.
+    Continue { credited_bytes: u64 },
+    /// Rejected — the reject frame was written and the stream finishes cleanly;
+    /// the loop returns `Ok(())`.
     Rejected,
 }
 
@@ -1575,23 +1536,22 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
     }
 }
 
-/// Cancellation-safe, buffered reader for `cdn/client/v1` voucher frames
-/// (#1483 group commit). Owns a byte buffer that PERSISTS across [`Self::read`]
-/// calls, so a `read` future cancelled by an outer `timeout` — the batch gather
-/// waits on stragglers under [`ClientHandler::commit_interval`] — loses no bytes:
-/// any partial frame stays buffered for the next call.
+/// Cancellation-safe, buffered reader for `cdn/client/v1` voucher frames. Owns
+/// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
+/// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
+/// frame stays buffered for the next call.
 ///
-/// This is what makes the group-commit gather safe. [`read_frame`] is built on
-/// `read_exact` and is NOT cancellation-safe — a `timeout` firing mid-frame
-/// would drop already-consumed bytes and desync the stream. Reading instead via
-/// the cancel-safe [`tokio::io::AsyncReadExt::read`] into an owned buffer, then
-/// splitting whole frames off it with [`decdn_protocol::framing::parse_frame`],
-/// keeps every byte. Borrows the `RecvStream` per call so the caller retains it
-/// for stream teardown.
+/// [`read_frame`] is built on `read_exact` and is NOT cancellation-safe — a
+/// `timeout` firing mid-frame would drop already-consumed bytes and desync the
+/// stream. Reading instead via the cancel-safe [`tokio::io::AsyncReadExt::read`]
+/// into an owned buffer, then splitting whole frames off it with
+/// [`decdn_protocol::framing::parse_frame`], keeps every byte. Borrows the
+/// `RecvStream` per call so the caller retains it for stream teardown.
 ///
 /// All voucher reads on a given stream MUST go through ONE instance: it may read
-/// ahead (buffering the next pipelined voucher, #1486) while a batch commits, and
-/// a second reader on the same `RecvStream` would lose those buffered bytes.
+/// ahead (buffering the next pipelined voucher, #1486) while the current one is
+/// verified and recorded, and a second reader on the same `RecvStream` would
+/// lose those buffered bytes.
 #[derive(Default)]
 pub(super) struct BufferedVoucherReader {
     /// Unconsumed bytes read from the stream, at a frame boundary or partway
@@ -1813,6 +1773,7 @@ mod tests {
                     None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
+                paid_credited: U256::ZERO,
                 active_streams: Arc::new(AtomicU32::new(0)),
             })),
         );
