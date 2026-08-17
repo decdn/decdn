@@ -47,6 +47,7 @@ use decdn_incentive::{
     bind_node_id_domain, binding_signing_hash, min_payment, signed_to_wire_voucher,
     slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
 };
+use decdn_node::channel_store::PersistentPoolStateStore;
 use decdn_node::client_requester::{
     Cumulative, PoolContext, PoolLedger, PullDeadlines, RateAboveCeiling, UpstreamVoucherRejected,
     VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
@@ -8341,5 +8342,203 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
     client_ep.close().await;
     server_ep.close().await;
     server_task.await?;
+    Ok(())
+}
+
+/// `spawn_pool_server_with_loss` but wired over an EXTERNALLY supplied loss
+/// store instead of a fresh in-memory one — the durable-restart test needs the
+/// SAME store handle to back both the lane table and the floor-loss table, so
+/// `record_loss`/`load_losses` persist to the caller's own redb file rather
+/// than an ephemeral in-memory one.
+async fn spawn_pool_server_with_stores(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    loss: Arc<dyn decdn_incentive::PoolFloorLossStore>,
+    remaining: U256,
+) -> anyhow::Result<(EndpointAddr, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let owner = operator_addr();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        |deps| {
+            deps.pool_view = Some(Arc::new(FixedRemainingPoolView { owner, remaining }));
+            deps.credit_max = decdn_common::config::DEFAULT_CREDIT_MAX;
+            deps.credit_ramp_divisor = decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR;
+            deps.floor_loss_store = Some(loss);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_ep, server_task))
+}
+
+/// Poll a [`PersistentPoolStateStore`] directly (not the in-memory shortcut
+/// `await_pool_dead_charge` uses) until [`pool_id`]'s durable `dead_charge`
+/// reaches `want`, or bail on overshoot / a 10 s stall. Mirrors
+/// `await_pool_dead_charge`'s deterministic wait-for-value discipline so the
+/// restart test never guesses at a fixed sleep for the `Drop` guard's
+/// off-task `spawn_blocking` fold to land.
+async fn await_persistent_pool_dead_charge(
+    store: &PersistentPoolStateStore,
+    want: u128,
+) -> anyhow::Result<()> {
+    use decdn_incentive::PoolFloorLossStore as _;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = store
+            .load_losses()?
+            .into_iter()
+            .find(|(pool, _)| *pool == pool_id())
+            .map_or(0u128, |(_, micro)| micro);
+        if current == want {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            current <= want,
+            "pool dead_charge {current} overshot the expected {want}"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "pool dead_charge stalled at {current}, expected {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `dead_charge` survives a handler rebuild (simulated restart): withhold a
+/// floor on lane A, let the reservation's `Drop` reconcile and durably persist
+/// the fold to redb, drop the handler AND the redb handle, reopen the SAME
+/// `data_dir` as a fresh [`PersistentPoolStateStore`], and rebuild the handler
+/// over it. Handler construction hydrates `dead_charge` from
+/// `floor_loss_store.load_losses()`, so a brand-new distinct lane B — never
+/// touched before the restart — is still refused: the persisted `dead_charge`
+/// alone consumes the pool's whole free-floor budget. A design that forgot to
+/// persist (or failed to rehydrate) `dead_charge` would admit B on a fresh
+/// in-memory zero, and this refusal would not happen — that is exactly the
+/// "withhold then restart" escape this test rules out.
+///
+/// `remaining = HARNESS_FLOOR_COST + 20 = 60`, `M = 0`: lane A's withheld
+/// floor folds `dead_charge` to `40`. A second floor would need
+/// `40 + 40 = 80 > 60`, so lane B is refused after the restart, even though it
+/// never touched the pool before.
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
+    use decdn_incentive::PoolFloorLossStore as _;
+
+    let payload = vec![0x7Cu8; 6 * 1024 * 1024];
+
+    let dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let remaining = U256::from(u128::from(HARNESS_FLOOR_COST) + 20);
+    let signer_a = Arc::new(PrivateKeySigner::random());
+    let signer_b = Arc::new(PrivateKeySigner::random());
+
+    // --- "Boot 1": withhold lane A's voucher, fold its floor into dead_charge. ---
+    {
+        let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+        let redb_store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        redb_store.record(&fresh_lane(signer_a.address(), U256::from(10_000_000u64)))?;
+        let store_dyn: Arc<dyn PoolStateStore> = redb_store.clone();
+        let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = redb_store.clone();
+
+        let (target, server_ep, server_task) =
+            spawn_pool_server_with_stores(cache, store_dyn, loss_dyn, remaining).await?;
+
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let client_node_id = B256::from(*client_ep.id().as_bytes());
+        let conn = client_ep
+            .connect(target, ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect lane A: {e}"))?;
+        let ext = binding_ext(&signer_a, client_node_id)?;
+        let (send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+        read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+        assert_parked_awaiting_voucher(&mut recv).await?;
+        // Disconnect while withholding: the server's read errors, its serve
+        // returns, and the `FloorReservation` folds one floor into redb.
+        drop(send);
+        drop(recv);
+        conn.close(0u32.into(), b"withhold");
+
+        await_persistent_pool_dead_charge(&redb_store, u128::from(HARNESS_FLOOR_COST)).await?;
+
+        client_ep.close().await;
+        server_ep.close().await;
+        server_task.await?;
+        // `redb_store` (and every other reference to it) drops at the end of
+        // this block, releasing redb's process-exclusive lock on `dir.path()`
+        // before the reopen below — reopening while still held returns
+        // `StoreError::Backend("... AlreadyOpen ...")`.
+    }
+
+    // --- Simulated restart: reopen the SAME redb file, rebuild the handler. ---
+    let (cache_b, hash_b, _cache_tmp_b) = cache_with_blob(&payload).await?;
+    let reopened = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+
+    // The reopened store shows the persisted dead_charge on its own, independent
+    // of whatever handler #2 hydrates internally.
+    let persisted = reopened
+        .load_losses()?
+        .into_iter()
+        .find(|(pool, _)| *pool == pool_id())
+        .map(|(_, micro)| micro);
+    anyhow::ensure!(
+        persisted == Some(u128::from(HARNESS_FLOOR_COST)),
+        "expected the durable dead_charge to survive reopen, got {persisted:?}"
+    );
+
+    reopened.record(&fresh_lane(signer_b.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = reopened.clone();
+    let loss_dyn: Arc<dyn decdn_incentive::PoolFloorLossStore> = reopened.clone();
+
+    let (target_b, server_ep_b, server_task_b) =
+        spawn_pool_server_with_stores(cache_b, store_dyn, loss_dyn, remaining).await?;
+
+    let (client_ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id_b = B256::from(*client_ep_b.id().as_bytes());
+    let conn_b = client_ep_b
+        .connect(target_b, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect lane B: {e}"))?;
+    let ext_b = binding_ext(&signer_b, client_node_id_b)?;
+
+    // Lane B is BRAND NEW — never touched before the restart — yet handler #2's
+    // hydrated `dead_charge` alone consumes the pool's free-floor budget, so it
+    // is refused. A fresh in-memory `dead_charge` (the bug this test guards
+    // against) would admit it instead.
+    let refusal = open_expecting_refusal(&conn_b, *hash_b.as_bytes(), Some(&ext_b)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "lane B must be refused: the restored dead_charge already spends the free-floor budget"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    conn_b.close(0u32.into(), b"done");
+    client_ep_b.close().await;
+    server_ep_b.close().await;
+    server_task_b.await?;
     Ok(())
 }
