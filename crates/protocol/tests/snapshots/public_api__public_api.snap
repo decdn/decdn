@@ -78,14 +78,14 @@ pub decdn_protocol::client::StreamResponseBody::redirect: core::option::Option<d
 pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::client::Voucher
-pub decdn_protocol::client::Voucher::amount: [u8; 32]
-pub decdn_protocol::client::Voucher::bytes_delivered: [u8; 32]
+pub decdn_protocol::client::Voucher::amount: u64
+pub decdn_protocol::client::Voucher::bytes_delivered: u64
 pub decdn_protocol::client::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::WatermarkBundle
-pub decdn_protocol::client::WatermarkBundle::amount: [u8; 32]
-pub decdn_protocol::client::WatermarkBundle::bytes_delivered: [u8; 32]
+pub decdn_protocol::client::WatermarkBundle::amount: u64
+pub decdn_protocol::client::WatermarkBundle::bytes_delivered: u64
 pub decdn_protocol::client::WatermarkBundle::last_signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::WatermarkBundle
 pub const fn decdn_protocol::client::WatermarkBundle::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
@@ -497,8 +497,8 @@ pub decdn_protocol::StreamResponseBody::redirect: core::option::Option<decdn_pro
 pub decdn_protocol::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::Voucher
-pub decdn_protocol::Voucher::amount: [u8; 32]
-pub decdn_protocol::Voucher::bytes_delivered: [u8; 32]
+pub decdn_protocol::Voucher::amount: u64
+pub decdn_protocol::Voucher::bytes_delivered: u64
 pub decdn_protocol::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>

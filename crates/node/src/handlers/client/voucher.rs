@@ -16,10 +16,9 @@ struct StagedVoucher {
     /// Bytes this voucher pays for (its interval delta) — for `paid` accounting,
     /// the audit receipt, and per-region / seed-leech crediting.
     delta_bytes: u64,
-    /// The voucher's cumulative amount (big-endian), for the audit receipt
-    /// (#248/#803). Amount is the pool voucher's sole ordering key — there is no
-    /// nonce.
-    amount: [u8; 32],
+    /// The voucher's cumulative amount, for the audit receipt (#248/#803).
+    /// Amount is the pool voucher's sole ordering key — there is no nonce.
+    amount: u64,
 }
 
 /// A voucher that passed the node-side verify half, carrying the advanced
@@ -250,7 +249,7 @@ impl ClientHandler {
         // Self-describing: the voucher's cumulative bytes come from the WIRE (ADR
         // 005 §Voucher wire format), so verification does not depend on the order
         // same-lane streams settle in.
-        let new_bytes = U256::from_be_bytes(wire.bytes_delivered);
+        let new_bytes = U256::from(wire.bytes_delivered);
 
         // Reconstruct the signed voucher from wire + lane context. `pool_id`,
         // `signer`, and `provider` are fixed for the lane; `amount`/`bytes_delivered`
@@ -268,7 +267,7 @@ impl ClientHandler {
                 // ADVANCE: this voucher raises the lane watermark. Rate-check the
                 // aggregate span it covers (`applied.*_delta()` is measured against
                 // the lane watermark, so it is order-independent).
-                let amount = U256::from_be_bytes(wire.amount);
+                let amount = U256::from(wire.amount);
 
                 // Advertised-rate check (ADR 003 §Voucher withholding). Match every
                 // `RateError` arm (#845) so a future variant is a build failure here.
@@ -329,7 +328,7 @@ impl ClientHandler {
                 // delivered). The one exception is a DIVERGENT voucher at the SAME
                 // amount claiming MORE bytes — same money, more bytes — which is a
                 // single-signer fault (#1699 rule 4).
-                let amount = U256::from_be_bytes(wire.amount);
+                let amount = U256::from(wire.amount);
                 if amount == last && new_bytes > state.last_bytes_delivered() {
                     return Err(VerifyStop::Reject(
                         VoucherRejectReason::BytesRegression,
@@ -393,8 +392,8 @@ impl ClientHandler {
         }
         let last_signature = state.last_signature()?;
         Some(WatermarkBundle {
-            amount: state.last_amount().to_be_bytes(),
-            bytes_delivered: state.last_bytes_delivered().to_be_bytes(),
+            amount: u64::try_from(state.last_amount()).ok()?,
+            bytes_delivered: u64::try_from(state.last_bytes_delivered()).ok()?,
             last_signature: last_signature.to_vec(),
         })
     }
@@ -589,7 +588,7 @@ mod tests {
         );
         let staged = vec![StagedVoucher {
             delta_bytes: 500,
-            amount: U256::from(500u64).to_be_bytes(),
+            amount: 500u64,
         }];
 
         let guard = lane.lock().await;
@@ -691,8 +690,8 @@ mod tests {
         .expect("sign voucher");
         let wire = decdn_protocol::client::Voucher {
             signature: signed_voucher.signature.as_bytes().to_vec(),
-            amount: amount.to_be_bytes(),
-            bytes_delivered: new_bytes.to_be_bytes(),
+            amount: u64::try_from(amount).expect("amount fits u64 in this test"),
+            bytes_delivered: u64::try_from(new_bytes).expect("bytes fit u64 in this test"),
         };
 
         // verify_voucher advances the CANDIDATE in memory only (no store write).
@@ -798,7 +797,7 @@ mod tests {
         );
         let staged = vec![StagedVoucher {
             delta_bytes: 500,
-            amount: U256::ZERO.to_be_bytes(),
+            amount: 0,
         }];
 
         let guard = lane.lock().await;
@@ -877,7 +876,7 @@ mod tests {
         );
         let staged = vec![StagedVoucher {
             delta_bytes: 500,
-            amount: U256::from(500u64).to_be_bytes(),
+            amount: 500u64,
         }];
 
         let guard = lane.lock().await;
@@ -953,8 +952,8 @@ mod tests {
         .expect("sign low voucher");
         let wire = decdn_protocol::client::Voucher {
             signature: signed_low.signature.as_bytes().to_vec(),
-            amount: low_amount.to_be_bytes(),
-            bytes_delivered: U256::from(one_mb).to_be_bytes(),
+            amount: u64::try_from(low_amount).expect("amount fits u64 in this test"),
+            bytes_delivered: one_mb,
         };
 
         // verify against the high watermark. delta_bytes is this stream's own
@@ -1024,8 +1023,8 @@ mod tests {
         .expect("sign divergent voucher");
         let wire = decdn_protocol::client::Voucher {
             signature: divergent_voucher.signature.as_bytes().to_vec(),
-            amount: amount.to_be_bytes(),
-            bytes_delivered: U256::from(two_mb).to_be_bytes(),
+            amount: u64::try_from(amount).expect("amount fits u64 in this test"),
+            bytes_delivered: two_mb,
         };
 
         let err = handler

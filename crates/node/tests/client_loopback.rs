@@ -525,7 +525,7 @@ async fn pay_cumulative(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client_msg(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
     )
     .await
 }
@@ -811,7 +811,7 @@ async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()>
     for voucher in burst_vouchers(&signer, intervals)? {
         write_client_msg(
             &mut send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
         )
         .await?;
     }
@@ -899,7 +899,7 @@ async fn group_commit_failure_rejects_whole_batch_with_retry_later() -> anyhow::
     for voucher in burst_vouchers(&signer, intervals)? {
         write_client_msg(
             &mut send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
         )
         .await?;
     }
@@ -1346,7 +1346,7 @@ impl StalledDelivery {
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
         write_client_msg(
             &mut self.send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
         )
         .await?;
 
@@ -1381,7 +1381,7 @@ impl StalledDelivery {
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
         write_client_msg(
             &mut self.send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
         )
         .await?;
         read_client_msg(&mut self.recv).await
