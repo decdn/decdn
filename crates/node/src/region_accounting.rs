@@ -56,11 +56,19 @@ impl std::fmt::Debug for RegistryRegionResolver {
 #[async_trait]
 impl RegionResolver for RegistryRegionResolver {
     async fn region_of(&self, node_id: &[u8; 32]) -> Option<String> {
-        // A poisoned lock (a writer panicked) resolves to `None` — an unknown
-        // region, folded into the UNKNOWN bucket by `region_for`. The registry
-        // watcher's writes are short infallible map swaps, so poisoning is not
-        // expected in practice.
-        let guard = self.0.read().ok()?;
+        // Recover a poisoned lock (a writer panicked) rather than resolving to
+        // `None`. The map is intact behind the poison, and returning `None` would
+        // fold every peer into the UNKNOWN region bucket for the process lifetime,
+        // silently disabling region accounting and the ADR-030 penalty. This
+        // matches the poison-recovery convention `RegionAccountant` uses on its
+        // own counters lock.
+        let guard = match self.0.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!("registry region map lock poisoned (holder panicked); recovering");
+                poisoned.into_inner()
+            }
+        };
         guard.get(&NodeId::from_bytes(*node_id)).cloned()
     }
 }

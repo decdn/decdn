@@ -166,7 +166,7 @@ A node satisfying all five criteria is ready to:
 - Accept `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment pools opened by clients and other nodes
 
-**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 peers=12`) once all five criteria hold, so operators can confirm correct startup without grepping multiple log sources.
+**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 active_nodes=12`) once all five criteria hold, so operators can confirm correct startup without grepping multiple log sources.
 
 ### NAT and Multiaddr Handling
 
