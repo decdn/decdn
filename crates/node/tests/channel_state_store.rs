@@ -108,6 +108,9 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
         anyhow::ensure!(state.last_amount() == U256::from(5_000u64));
+        // The lane store buffers `record` in memory; flush explicitly so the
+        // restart this test simulates below observes a durable write.
+        store.flush()?;
     }
 
     // Phase 2: simulate the restart. Reopen the store, rebuild `state` from
@@ -151,6 +154,9 @@ fn replay_same_nonce_after_restart_is_rejected() -> anyhow::Result<()> {
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
+        // The lane store buffers `record` in memory; flush explicitly so the
+        // restart this test simulates below observes a durable write.
+        store.flush()?;
     }
 
     let store = PersistentPoolStateStore::open(dir.path())?;
@@ -181,6 +187,9 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
         state.apply_voucher(&v5, &domain, &store)?;
+        // The lane store buffers `record` in memory; flush explicitly so the
+        // restart this test simulates below observes a durable write.
+        store.flush()?;
     }
 
     let store = PersistentPoolStateStore::open(dir.path())?;
