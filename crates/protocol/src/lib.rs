@@ -6,7 +6,6 @@
 pub mod client;
 pub mod dht;
 pub mod framing;
-pub mod gossip;
 pub mod identity;
 pub mod message;
 pub mod region;
@@ -25,9 +24,6 @@ pub use framing::{
     FrameError, MAX_MESSAGE_SIZE, TopLevelEnum, decode_message, encode_message, is_unknown_variant,
     read_frame, write_frame,
 };
-pub use gossip::{
-    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, SIGNATURE_LEN,
-};
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{
     MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest, ProbeResponse,
@@ -43,12 +39,6 @@ pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
 
 /// ALPN protocol identifier for Kademlia-based content discovery (ADR 022).
 pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
-
-/// Gossip topic for global node announcements and rate changes.
-pub const TOPIC_GLOBAL: &str = "cdn/global/v1";
-
-/// Gossip topic prefix for regional node announcements.
-pub const TOPIC_REGION_PREFIX: &str = "cdn/region/";
 
 /// Connection rejected by the per-source or global rate limiter (ADR 013 §0x10).
 ///

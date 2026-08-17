@@ -26,8 +26,6 @@ pub struct FileConfig {
     pub payment: Option<PaymentConfig>,
     /// Observability settings.
     pub observability: Option<ObservabilityConfig>,
-    /// Gossip settings.
-    pub gossip: Option<GossipConfig>,
     /// Connection rate-limiting settings.
     pub security: Option<SecurityConfig>,
     /// `cdn/dht/v1` Kademlia DHT settings (ADR 022). Absent => defaults
@@ -774,29 +772,6 @@ pub struct PaymentConfig {
     pub voucher_commit_interval_ms: Option<u64>,
 }
 
-/// Gossip section of the config file (ADR 001).
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GossipConfig {
-    /// Seconds between outgoing `NodeAnnounce` messages. Default 60.
-    pub announce_interval_sec: Option<u64>,
-    /// Seconds after which a peer-table entry is evicted if unrefreshed.
-    /// Default 600.
-    pub peer_ttl_sec: Option<u64>,
-    /// Whether to subscribe to and publish on the global topic
-    /// (`cdn/global/v1`). Default true.
-    pub subscribe_global: Option<bool>,
-    /// Optional hard cap on `PeerTable` entry count
-    /// (appendix-peer-table-eviction § No hard size cap). Once the table is
-    /// at the cap, new announces from previously-unseen node IDs are
-    /// rejected after a one-shot inline TTL sweep; existing entries are
-    /// still refreshed. Absent => no cap (unlimited);
-    /// `decdn_gossip_peer_table_size`
-    /// is the early-warning signal operators watch to set the ceiling
-    /// reactively. Must be `> 0` when set.
-    pub max_peer_entries: Option<u64>,
-}
-
 /// Security / rate-limiting section of the config file.
 ///
 /// All fields are optional; defaults produce a safe configuration out of
@@ -1028,10 +1003,10 @@ pub struct ReceiptsConfig {
 /// Local content-denylist section of the config file (ADR 011 §Local Denylist).
 ///
 /// The operator's own removal lever, independent of governance: entries take
-/// effect on the next reload, are never gossiped, and bind only this node. ADR
-/// 011 §One-hour removal orders makes this the only mechanism sized to a
-/// sub-day statutory deadline (the EU TCO one-hour clock), because it is the
-/// only one entirely within the order recipient's control.
+/// effect on the next reload and bind only this node. ADR 011 §One-hour
+/// removal orders makes this the only mechanism sized to a sub-day statutory
+/// deadline (the EU TCO one-hour clock), because it is the only one entirely
+/// within the order recipient's control.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentConfig {

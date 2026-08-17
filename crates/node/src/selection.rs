@@ -155,7 +155,8 @@ pub struct Candidate {
     pub rtt_ms: u32,
     /// Local reputation in `[0.0, 1.0]` from the reputation engine.
     pub reputation: f32,
-    /// ISO 3166-1 alpha-2 region from `NodeAnnounce`. Used by the
+    /// ISO 3166-1 alpha-2 region self-attested by the peer on-chain (ADR 030),
+    /// resolved from the `CapacityBond` registry projection. Used by the
     /// geo-diversity tie-break tier.
     pub region: String,
     /// On-chain stake in TOKEN base units; higher stake wins the stake

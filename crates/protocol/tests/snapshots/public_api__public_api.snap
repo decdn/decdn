@@ -178,23 +178,6 @@ pub fn decdn_protocol::framing::is_unknown_variant<M: decdn_protocol::framing::T
 pub fn decdn_protocol::framing::parse_frame(&[u8]) -> core::result::Result<core::option::Option<(usize, usize)>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::framing::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::framing::write_frame<W: tokio::io::async_write::AsyncWrite + core::marker::Unpin>(&mut W, &[u8]) -> core::result::Result<(), decdn_protocol::framing::FrameError>
-pub mod decdn_protocol::gossip
-pub enum decdn_protocol::gossip::GossipPayload
-pub decdn_protocol::gossip::GossipPayload::NodeAnnounce(decdn_protocol::gossip::NodeAnnounce)
-pub struct decdn_protocol::gossip::GossipEnvelope
-pub decdn_protocol::gossip::GossipEnvelope::payload: decdn_protocol::gossip::GossipPayload
-pub decdn_protocol::gossip::GossipEnvelope::version: u8
-pub struct decdn_protocol::gossip::NodeAnnounce
-pub decdn_protocol::gossip::NodeAnnounce::body: decdn_protocol::gossip::NodeAnnounceBody
-pub decdn_protocol::gossip::NodeAnnounce::signature: alloc::vec::Vec<u8>
-pub struct decdn_protocol::gossip::NodeAnnounceBody
-pub decdn_protocol::gossip::NodeAnnounceBody::node_id: [u8; 32]
-pub decdn_protocol::gossip::NodeAnnounceBody::region: alloc::string::String
-pub decdn_protocol::gossip::NodeAnnounceBody::timestamp_us: u64
-impl decdn_protocol::gossip::NodeAnnounceBody
-pub fn decdn_protocol::gossip::NodeAnnounceBody::signing_bytes(&self) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
-pub const decdn_protocol::gossip::GOSSIP_VERSION: u8
-pub const decdn_protocol::gossip::SIGNATURE_LEN: usize
 pub mod decdn_protocol::identity
 #[repr(transparent)] pub struct decdn_protocol::identity::ContentHash(_)
 impl decdn_protocol::identity::ContentHash
@@ -304,8 +287,6 @@ pub decdn_protocol::FrameError::Decode(postcard::error::Error)
 pub decdn_protocol::FrameError::Io(std::io::error::Error)
 pub decdn_protocol::FrameError::TooLarge(u32)
 pub decdn_protocol::FrameError::Varint
-pub enum decdn_protocol::GossipPayload
-pub decdn_protocol::GossipPayload::NodeAnnounce(decdn_protocol::gossip::NodeAnnounce)
 pub enum decdn_protocol::MessageValidationError
 pub decdn_protocol::MessageValidationError::ChunkTooLarge
 pub decdn_protocol::MessageValidationError::ChunkTooLarge::len: usize
@@ -407,22 +388,10 @@ pub struct decdn_protocol::FindValueResponse
 pub decdn_protocol::FindValueResponse::closer_nodes: decdn_protocol::dht::CloserNodes
 pub decdn_protocol::FindValueResponse::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::FindValueResponse::providers: alloc::vec::Vec<decdn_protocol::identity::NodeId>
-pub struct decdn_protocol::GossipEnvelope
-pub decdn_protocol::GossipEnvelope::payload: decdn_protocol::gossip::GossipPayload
-pub decdn_protocol::GossipEnvelope::version: u8
 pub struct decdn_protocol::InvalidRegion
 impl core::error::Error for decdn_protocol::region::InvalidRegion
 impl core::fmt::Display for decdn_protocol::region::InvalidRegion
 pub fn decdn_protocol::region::InvalidRegion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_protocol::NodeAnnounce
-pub decdn_protocol::NodeAnnounce::body: decdn_protocol::gossip::NodeAnnounceBody
-pub decdn_protocol::NodeAnnounce::signature: alloc::vec::Vec<u8>
-pub struct decdn_protocol::NodeAnnounceBody
-pub decdn_protocol::NodeAnnounceBody::node_id: [u8; 32]
-pub decdn_protocol::NodeAnnounceBody::region: alloc::string::String
-pub decdn_protocol::NodeAnnounceBody::timestamp_us: u64
-impl decdn_protocol::gossip::NodeAnnounceBody
-pub fn decdn_protocol::gossip::NodeAnnounceBody::signing_bytes(&self) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 #[repr(transparent)] pub struct decdn_protocol::NodeId(_)
 impl decdn_protocol::identity::NodeId
 pub const fn decdn_protocol::identity::NodeId::as_bytes(&self) -> &[u8; 32]
@@ -506,7 +475,6 @@ pub const decdn_protocol::ALPN_PROBE: &[u8]
 pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_SIZE: usize
-pub const decdn_protocol::GOSSIP_VERSION: u8
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::MAX_CLOSER_NODES: usize
@@ -514,10 +482,7 @@ pub const decdn_protocol::MAX_MESSAGE_SIZE: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MB_BYTES: u64
-pub const decdn_protocol::SIGNATURE_LEN: usize
 pub const decdn_protocol::SLASH_SIG_LEN: usize
-pub const decdn_protocol::TOPIC_GLOBAL: &str
-pub const decdn_protocol::TOPIC_REGION_PREFIX: &str
 pub const decdn_protocol::VOUCHER_INTERVAL_BYTES: u64
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize
 pub trait decdn_protocol::TopLevelEnum

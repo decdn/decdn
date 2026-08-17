@@ -3466,8 +3466,8 @@ mod tests {
     #[allow(clippy::too_many_lines)] // exhaustive ResolvedConfig test builder
     fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, ResolvedConfig) {
         use decdn_common::config::{
-            ResolvedBlockchain, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
-            ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+            ResolvedBlockchain, ResolvedIdentity, ResolvedNetwork, ResolvedObservability,
+            ResolvedPayment, ResolvedSecurity,
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let cache_dir = tmp.path().to_path_buf();
@@ -3548,12 +3548,6 @@ mod tests {
                 otlp_endpoint: None,
                 region_accounting_interval_sec:
                     decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
-            },
-            gossip: ResolvedGossip {
-                announce_interval_sec: 60,
-                peer_ttl_sec: 600,
-                subscribe_global: false,
-                max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

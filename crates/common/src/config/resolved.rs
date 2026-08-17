@@ -432,23 +432,6 @@ pub struct ResolvedPayment {
     pub voucher_commit_interval_ms: u64,
 }
 
-/// Resolved gossip fields (ADR 001).
-#[derive(Debug)]
-pub struct ResolvedGossip {
-    /// Seconds between outgoing `NodeAnnounce` messages.
-    pub announce_interval_sec: u64,
-    /// Seconds after which a peer-table entry is evicted if unrefreshed.
-    pub peer_ttl_sec: u64,
-    /// Whether to subscribe to and publish on `cdn/global/v1`.
-    pub subscribe_global: bool,
-    /// Optional hard cap on `PeerTable` entry count
-    /// (appendix-peer-table-eviction § No hard size cap). `None` => no cap
-    /// (unlimited); `Some(n)` is always positive (the resolver rejects `0`).
-    /// The runtime maps `None` to the peer table's `0`-means-unlimited
-    /// sentinel and casts `Some(n)` to `usize` when constructing the table.
-    pub max_peer_entries: Option<u64>,
-}
-
 /// Resolved observability fields.
 #[derive(Debug)]
 pub struct ResolvedObservability {
@@ -605,7 +588,6 @@ pub struct ResolvedConfig {
     pub cache: ResolvedCache,
     pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
-    pub gossip: ResolvedGossip,
     pub security: ResolvedSecurity,
     pub dht: ResolvedDht,
     pub probe: ResolvedProbe,

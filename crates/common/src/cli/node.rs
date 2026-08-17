@@ -534,7 +534,7 @@ pub struct RegisterArgs {
     /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. NAT'd nodes may
     /// register a relay placeholder and promote direct addresses later via
     /// `updateMultiaddrs`; omitting it entirely registers an empty set and
-    /// relies on gossip / iroh discovery for reachability.
+    /// relies on `cdn/dht/v1` discovery (ADR 022) for reachability.
     #[arg(long = "multiaddr", value_name = "MA")]
     pub multiaddrs: Vec<String>,
 

@@ -33,8 +33,8 @@ use std::time::Duration;
 use decdn_common::cli::common::LogLevel;
 use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
+    ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
 use decdn_node::metrics::Metrics;
@@ -118,12 +118,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             otlp_endpoint: None,
             region_accounting_interval_sec:
                 decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
-        },
-        gossip: ResolvedGossip {
-            announce_interval_sec: 60,
-            peer_ttl_sec: 600,
-            subscribe_global: false,
-            max_peer_entries: Some(100_000),
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,
@@ -359,7 +353,7 @@ async fn sighup_applies_security_changes() {
 
 /// SIGHUP must apply changes to the mutable `observability.log_level` while
 /// restart-required sections (`payment`, `network`, `blockchain`, `cache`,
-/// `identity`, `gossip`) surface an `info`-level "ignoring change to X
+/// `identity`) surface an `info`-level "ignoring change to X
 /// (requires restart)" notice — never a silently-applied or silently-dropped
 /// value (#499). `payment.rate_per_mb` is restart-required, so a `[payment]`
 /// change earns the notice like any other non-reloadable section.
@@ -377,7 +371,7 @@ async fn sighup_applies_security_changes() {
 ///   - **Reload #1** carries `[network]` and `[payment]` → one notice each;
 ///     `[blockchain]` / `[cache]` (absent from the file) stay silent.
 ///   - **Reload #2** carries `[network]` and `[payment]` again plus new
-///     `[blockchain]` / `[cache]` / `[identity]` / `[gossip]` → each present
+///     `[blockchain]` / `[cache]` / `[identity]` → each present
 ///     restart-required section emits one notice (no cross-reload suppression),
 ///     all alongside the mutable `observability.log_level` change that must
 ///     still apply.
@@ -510,7 +504,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     // --- Reload #2: the mutable `log_level` change applies, bundled with
     //     restart-required ones. payment/network/blockchain/identity/
-    //     gossip/dht/probe/receipts warn on presence; `[cache]`
+    //     dht/probe/receipts warn on presence; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
     //     pinned_hashes-only edit would not); `[observability]` does NOT warn
     //     because it sets only the reloadable `log_level`; `[security]` is
@@ -531,8 +525,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          cache_dir = \"/tmp/decdn-test-other-cache\"\n\n\
          [identity]\n\
          region = \"US\"\n\n\
-         [gossip]\n\
-         announce_interval_sec = 120\n\n\
          [dht]\n\n\
          [probe]\n\n\
          [receipts]\n\n\
@@ -561,7 +553,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         "blockchain",
         "cache",
         "identity",
-        "gossip",
         "dht",
         "probe",
         "receipts",

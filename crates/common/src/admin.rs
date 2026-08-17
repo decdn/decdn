@@ -469,7 +469,7 @@ pub struct SlashesResponse {
 pub const UNKNOWN_REGION: &str = "UNKNOWN";
 
 /// One region's cumulative byte counters (issue #750). `region` is an
-/// ISO 3166-1 alpha-2 code (the peer's self-attested `NodeAnnounceBody.region`,
+/// ISO 3166-1 alpha-2 code (the peer's self-attested on-chain region hint,
 /// ADR 030) or the [`UNKNOWN_REGION`] bucket for traffic whose counterparty
 /// has no known region (a non-peer end-client, or a peer not in the table).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -645,7 +645,7 @@ pub trait AdminRpc {
 
     /// Return cumulative per-region bandwidth (issue #750): bytes served to
     /// and pulled from each region, keyed by the counterparty peer's
-    /// self-attested `NodeAnnounceBody.region` (ADR 030), with a `"UNKNOWN"`
+    /// self-attested on-chain region hint (ADR 030), with a `"UNKNOWN"`
     /// bucket for unattributable traffic. Totals are cumulative since process
     /// start. Backs `decdn node region-stats`. Returns an empty list (not an
     /// error) on a node with no accounting wired.

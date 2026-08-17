@@ -345,19 +345,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  probe.global_rate_per_sec: {}",
         resolved.probe.global_rate_per_sec
     )?;
-    writeln!(
-        w,
-        "  gossip.subscribe_global:  {}",
-        resolved.gossip.subscribe_global
-    )?;
-    writeln!(
-        w,
-        "  gossip.max_peer_entries: {}",
-        resolved
-            .gossip
-            .max_peer_entries
-            .map_or_else(|| "unlimited".to_string(), |n| n.to_string())
-    )?;
     // Download-receipt audit log (#802). The log lives at a fixed filename
     // inside data_dir; surface the resolved path so an operator can confirm
     // where receipts land without reading the daemon source, alongside the
@@ -679,12 +666,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # region_accounting_interval_sec = 3600    # 0 disables the per-region bandwidth log (#750)
 # otlp_endpoint = "http://localhost:4317"  # requires --features otlp
 
-[gossip]
-# announce_interval_sec = 60                # seconds between outgoing NodeAnnounce messages (ADR 001)
-# peer_ttl_sec = 600                        # evict a peer-table entry after this long unrefreshed
-# subscribe_global = true                   # subscribe/publish on cdn/global/v1
-# max_peer_entries = 100000                 # optional hard cap on PeerTable entries; omit = unlimited; must be > 0 when set
-
 [security]
 # max_concurrent_handlers = 256             # global cap on in-flight QUIC handler tasks; 0 disables the cap
 # per_source_rate_per_sec = 100.0           # per-source rate-limit refill (cells/sec); 0.0 disables the layer
@@ -717,12 +698,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [content]
 # ADR 011 local denylist — this operator's own removal lever, independent of
-# governance. Entries take effect on `decdn node reload` (no restart), are never
-# gossiped, and bind only this node. This is the fastest removal path the
-# protocol offers and the one sized to a sub-day statutory deadline (e.g. the EU
-# TCO one-hour clock), because it is entirely within the order recipient's
-# control. Refused requests are signed as HashBlacklisted / OriginBlacklisted,
-# which do not reveal whether the entry is local or on-chain.
+# governance. Entries take effect on `decdn node reload` (no restart) and bind
+# only this node. This is the fastest removal path the protocol offers and the
+# one sized to a sub-day statutory deadline (e.g. the EU TCO one-hour clock),
+# because it is entirely within the order recipient's control. Refused
+# requests are signed as HashBlacklisted / OriginBlacklisted, which do not
+# reveal whether the entry is local or on-chain.
 #
 # Hashes are bare 64-char lowercase hex — the same spelling as
 # cache.pinned_hashes. An invalid entry FAILS startup rather than being skipped:
@@ -757,7 +738,6 @@ mod tests {
             cache,
             payment,
             observability,
-            gossip,
             security,
             dht,
             probe,
@@ -775,7 +755,6 @@ mod tests {
             ("cache", cache.is_some()),
             ("payment", payment.is_some()),
             ("observability", observability.is_some()),
-            ("gossip", gossip.is_some()),
             ("security", security.is_some()),
             ("dht", dht.is_some()),
             ("probe", probe.is_some()),
