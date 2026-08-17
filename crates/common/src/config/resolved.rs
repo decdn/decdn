@@ -423,12 +423,8 @@ pub struct ResolvedPayment {
     pub credit_max: u64,
     /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.
     pub credit_ramp_divisor: u64,
-    /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
-    /// persistence): how long the serve loop waits to batch more vouchers into
-    /// one fsynced commit before committing what it has. Default
-    /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 ms); `0` commits
-    /// each blocking-read batch immediately. Bounded above by the ramped window
-    /// (see [`Self::credit_max`]).
+    /// Background flush period for the lane store, in ms. See
+    /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.
     pub voucher_commit_interval_ms: u64,
 }
 

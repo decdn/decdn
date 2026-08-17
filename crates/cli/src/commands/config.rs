@@ -668,7 +668,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
 # credit_max = 67108864                    # downstream credit-window ceiling in bytes (ADR 003 §Credit window); the window ramps toward this cap as the stream pays; default 64 MiB; floored at one voucher interval (4 MiB)
 # credit_ramp_divisor = 2                  # ramp divisor (ADR 003 §Credit window); window is paid/credit_ramp_divisor, capped at credit_max; 0 opens the full ceiling immediately
-# voucher_commit_interval_ms = 5           # group-commit interval for durable voucher persistence (ADR 003, #1483); 0 commits each batch immediately; default 5ms
+# voucher_commit_interval_ms = 5000        # background flush period (ms) for durable voucher persistence (ADR 003); must be > 0; default 5000 (5s)
 
 [observability]
 # log_level = "info"

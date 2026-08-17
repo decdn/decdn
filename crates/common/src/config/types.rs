@@ -759,18 +759,8 @@ pub struct PaymentConfig {
     /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
     /// behavior. It is node-local config, not a governance-owned parameter.
     pub credit_ramp_divisor: Option<u64>,
-    /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
-    /// persistence): how long the serve loop waits to gather more vouchers
-    /// into one fsynced commit before committing what it has, so a single
-    /// durable write amortizes across a batch. Each voucher is still
-    /// acknowledged only after the commit is durable, so the replay guard is
-    /// unchanged. Absent => [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]
-    /// (5 ms). `0` commits each blocking-read batch immediately. Composes with
-    /// [`Self::credit_max`] via `credit_window ≥ throughput × (RTT +
-    /// commit_interval)`; bounded above by the window (at most
-    /// `credit_window / VOUCHER_INTERVAL_BYTES` vouchers are ever outstanding).
-    /// Like [`Self::credit_max`] it is node-local, not a governance-owned
-    /// parameter.
+    /// Background flush period for the lane store, in ms. See
+    /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.
     pub voucher_commit_interval_ms: Option<u64>,
 }
 
