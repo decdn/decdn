@@ -283,7 +283,7 @@ impl Drop for FloorReservation {
         // saturating — an O(1) update that never blocks the reactor.
         let unpaid = U256::from(self.unpaid.load(Ordering::Relaxed));
         let dead_add = self.reserved.min(unpaid);
-        let new_dead = {
+        {
             let mut guard = self
                 .map
                 .lock()
@@ -291,32 +291,45 @@ impl Drop for FloorReservation {
             let entry = guard.entry(self.pool_id).or_default();
             entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
             entry.dead_charge = entry.dead_charge.saturating_add(dead_add);
-            entry.dead_charge
-        };
-        // Persist the new dead total best-effort. The in-memory `dead_charge` above
-        // is authoritative for the running process; the durable copy only guards a
+        }
+        // Persist the dead total best-effort. The in-memory `dead_charge` above is
+        // authoritative for the running process; the durable copy only guards a
         // restart, so a lost persist is the documented small crash-window residual —
-        // logged, never panicked or propagated. The `record_loss` write may fsync,
-        // so offload it to a blocking task when a runtime is available; a drop that
-        // fires outside any runtime (e.g. a sync test) records inline.
+        // logged, never panicked or propagated. The persist re-reads the CURRENT
+        // in-memory `dead_charge` at write time rather than a value captured now:
+        // concurrent drops on the same pool can complete out of order, and writing
+        // the latest authoritative (monotonic) total keeps a late-running write from
+        // regressing the durable row to a smaller value. A pool forgotten in the
+        // meantime (its entry removed by `forget_pool_floor`) has nothing to persist,
+        // so a stale drop cannot resurrect a reclaimed pool's row. `record_loss` may
+        // fsync, so offload it to a blocking task when a runtime is available; a drop
+        // outside any runtime (e.g. a sync test) records inline.
         let Some(store) = self.store.clone() else {
             return;
         };
         let pool_id = self.pool_id;
-        let micro = new_dead.saturating_to::<u128>();
+        let map = Arc::clone(&self.map);
+        let persist = move || {
+            let current = {
+                let guard = map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard
+                    .get(&pool_id)
+                    .map(|s| s.dead_charge.saturating_to::<u128>())
+            };
+            let Some(micro) = current else {
+                return; // pool forgotten since this drop began — nothing to persist
+            };
+            if let Err(e) = store.record_loss(pool_id, micro) {
+                tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
+            }
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(move || {
-                    if let Err(e) = store.record_loss(pool_id, micro) {
-                        tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
-                    }
-                });
+                handle.spawn_blocking(persist);
             }
-            Err(_) => {
-                if let Err(e) = store.record_loss(pool_id, micro) {
-                    tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
-                }
-            }
+            Err(_) => persist(),
         }
     }
 }

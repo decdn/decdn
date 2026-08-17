@@ -6,7 +6,7 @@ use super::{
     Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
     FillOutcome, FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex,
     OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamResponseBody, VOUCHER_INTERVAL_BYTES, VarInt,
+    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VOUCHER_INTERVAL_BYTES, VarInt,
     read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
@@ -893,8 +893,11 @@ impl ClientHandler {
         // to `guard_bytes`, via [`ClientHandler::try_reserve_floor`] — its
         // `remaining − M ≥ committed + reserved` check both admits the stream and
         // bounds the pool's cumulative cross-lane floor credit. A miss-fill stream
-        // already holds its reservation, so re-validate solvency defensively against
-        // the tighter span via [`ClientHandler::pool_remaining_covers_window`].
+        // already holds its reservation, so re-validate solvency against the pool's
+        // already-committed floor credit (`live_reservation + dead_charge`) via
+        // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
+        // same stateful check the mid-stream gate applies, so a `dead_charge` that
+        // grew since the reservation refuses here rather than serving a free interval.
         //
         // `remaining` comes from the cached `getPool` view resolved above; a `None`
         // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
@@ -914,7 +917,11 @@ impl ClientHandler {
                     None => true,
                 }
             } else {
-                !self.pool_remaining_covers_window(status.remaining, guard_bytes, rate_per_mb)
+                !self.pool_budget_covers_reserve(
+                    B256::from(req.pool_id),
+                    status.remaining,
+                    U256::ZERO,
+                )
             };
             if refused {
                 let headroom = status
