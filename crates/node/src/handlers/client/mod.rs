@@ -124,6 +124,12 @@ struct LaneDeliveryState {
     state: LaneState,
     /// Lane-wide cumulative bytes delivered as of the last accepted voucher.
     bytes_delivered_cumulative: U256,
+    /// Cumulative wire bytes CREDITED to streams' paid headroom on this lane
+    /// (design rule #1). Monotone and never exceeds `bytes_delivered_cumulative`
+    /// (the settled watermark), so a benign already-satisfied voucher — which
+    /// does not raise the watermark — can only advance a stream's window for
+    /// bytes the lane has actually settled, never for unpaid delivered bytes.
+    paid_credited: U256,
     /// Count of same-lane streams currently admitted and delivering. The serve-path
     /// admission gate charges each already-active stream one credit-window floor of
     /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
@@ -687,6 +693,7 @@ impl ClientHandler {
                 Arc::new(Mutex::new(LaneDeliveryState {
                     state,
                     bytes_delivered_cumulative: bytes,
+                    paid_credited: bytes,
                     active_streams: Arc::new(AtomicU32::new(0)),
                 })),
             );
@@ -883,6 +890,7 @@ impl ClientHandler {
             Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
+                paid_credited: bytes,
                 active_streams: Arc::new(AtomicU32::new(0)),
             }))
         });
@@ -1125,6 +1133,10 @@ struct BatchOutcome {
     /// deltas and re-queues any deltas beyond this — a *short* batch, meaning the
     /// client had not sent those vouchers yet — for the next recoup.
     committed: usize,
+    /// Watermark-capped wire bytes to advance the serve loop's `paid` by this
+    /// call (rule #1) — at most the amount the lane watermark advanced, so a
+    /// benign already-satisfied voucher contributes zero.
+    credited_bytes: u64,
     /// Whether the stream must end now.
     stop: BatchStop,
 }
@@ -1478,6 +1490,7 @@ mod tests {
                     None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
+                paid_credited: U256::ZERO,
                 active_streams: Arc::new(AtomicU32::new(0)),
             })),
         );

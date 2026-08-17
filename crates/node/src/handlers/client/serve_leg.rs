@@ -152,7 +152,7 @@ impl ClientHandler {
             // delivers no new byte AND clears no voucher has stalled — the client
             // stopped paying.
             let delivered_at_iter_start = delivered;
-            let mut committed_this_iter = 0usize;
+            let mut credited_this_iter = 0u64;
 
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
@@ -232,10 +232,12 @@ impl ClientHandler {
                         return Err(e);
                     }
                 };
-                committed_this_iter = outcome.committed;
-                // Advance `paid` by exactly the committed prefix's WIRE bytes.
-                let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
-                paid = paid.saturating_add(paid_bytes);
+                credited_this_iter = outcome.credited_bytes;
+                // Advance `paid` by the watermark-capped credit (rule #1): a
+                // benign already-satisfied voucher raises the watermark by
+                // nothing, so it credits nothing here and cannot reopen the
+                // credit window for bytes the lane has not settled.
+                paid = paid.saturating_add(outcome.credited_bytes);
                 if outcome.committed > 0 {
                     // Publish the PAID CONTENT frontier for the pull leg's
                     // `WindowPacer`, mapping paid WIRE back into content space (the
@@ -330,7 +332,7 @@ impl ClientHandler {
             // an honest-but-slow client (patience = one `collect_voucher_batch`
             // read timeout) is never dropped early.
             let made_delivery_progress = delivered > delivered_at_iter_start;
-            let made_payment_progress = committed_this_iter > 0;
+            let made_payment_progress = credited_this_iter > 0;
             if !made_delivery_progress && !made_payment_progress {
                 // The client stopped paying (#856 drop-after-fill): meter the abandon,
                 // then stop cleanly.

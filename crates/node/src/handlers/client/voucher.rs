@@ -95,6 +95,7 @@ impl ClientHandler {
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
+                credited_bytes: 0,
                 stop: BatchStop::Rejected,
             });
         };
@@ -141,6 +142,7 @@ impl ClientHandler {
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
+                credited_bytes: 0,
                 stop: BatchStop::Rejected,
             });
         }
@@ -168,7 +170,7 @@ impl ClientHandler {
 
         // (3) COMMIT the verified prefix with ONE fsync, then keep serving.
         let committed = staged.len();
-        if committed > 0 {
+        let credited_bytes = if committed > 0 {
             match self
                 .commit_batch(
                     guard,
@@ -190,27 +192,31 @@ impl ClientHandler {
                         .await?;
                     return Ok(BatchOutcome {
                         committed: 0,
+                        credited_bytes: 0,
                         stop: BatchStop::Rejected,
                     });
                 }
-                CommitOutcome::Committed => {}
+                CommitOutcome::Committed { credited_bytes } => credited_bytes,
             }
         } else {
             // No voucher verified (the first one was rejected/bailed): drop the
             // lock before emitting the rejection, matching the committed path.
             drop(guard);
-        }
+            0
+        };
 
         // (4) Emit any pending verify rejection/bail AFTER the prefix is durable.
         match pending_stop {
             None => Ok(BatchOutcome {
                 committed,
+                credited_bytes,
                 stop: BatchStop::Continue,
             }),
             Some(VerifyStop::Reject(reason, bundle)) => {
                 self.write_reject(send, reason, bundle).await?;
                 Ok(BatchOutcome {
                     committed,
+                    credited_bytes,
                     stop: BatchStop::Rejected,
                 })
             }
@@ -437,6 +443,19 @@ impl ClientHandler {
         // release the lock before any further work.
         guard.state = candidate;
         guard.bytes_delivered_cumulative = candidate_bytes;
+
+        // Rule #1 cap: credit paid headroom by at most the amount the watermark
+        // advanced. `paid_credited` is monotone and bounded by the settled
+        // watermark, so a benign already-satisfied voucher (candidate_bytes
+        // unchanged) credits nothing and cannot reopen the credit window for
+        // bytes no voucher settled. Computed under the guard so the read of
+        // `paid_credited` and its store cannot interleave with another batch.
+        let total_delta: u64 = staged.iter().map(|s| s.delta_bytes).sum();
+        let new_credited = (guard.paid_credited + U256::from(total_delta)).min(candidate_bytes);
+        let credited = new_credited.saturating_sub(guard.paid_credited);
+        guard.paid_credited = new_credited;
+        // `credited <= total_delta <= u64::MAX` by construction.
+        let credited_bytes = u64::try_from(credited).unwrap_or(u64::MAX);
         drop(guard);
 
         // Post-commit, per-voucher bookkeeping. All side effects here are
@@ -459,14 +478,15 @@ impl ClientHandler {
         {
             self.metrics.redeem_hint_dropped();
         }
-        Ok(CommitOutcome::Committed)
+        Ok(CommitOutcome::Committed { credited_bytes })
     }
 }
 
 /// Outcome of the durable half of a voucher batch ([`ClientHandler::commit_batch`]).
 enum CommitOutcome {
-    /// The batch fsynced and in-memory state advanced.
-    Committed,
+    /// The batch fsynced and in-memory state advanced. `credited_bytes` is the
+    /// watermark-capped wire bytes the serve loop advances `paid` by (rule #1).
+    Committed { credited_bytes: u64 },
     /// The fsynced `store.record` failed; in-memory state is unchanged. The
     /// caller rejects the whole batch with `RetryLater`.
     StoreFailed,
@@ -541,6 +561,7 @@ mod tests {
         let lane = Arc::new(Mutex::new(LaneDeliveryState {
             state: seed,
             bytes_delivered_cumulative: U256::ZERO,
+            paid_credited: U256::ZERO,
             active_streams: Arc::new(AtomicU32::new(0)),
         }));
         handler
@@ -638,6 +659,7 @@ mod tests {
         let lane = Arc::new(Mutex::new(LaneDeliveryState {
             state: seed,
             bytes_delivered_cumulative: U256::ZERO,
+            paid_credited: U256::ZERO,
             active_streams: Arc::new(AtomicU32::new(0)),
         }));
         handler
@@ -696,10 +718,13 @@ mod tests {
             )
             .await
             .expect("commit_batch returns Ok on a clean record");
-        assert!(
-            matches!(outcome, CommitOutcome::Committed),
-            "a clean record commits the batch"
-        );
+        match outcome {
+            CommitOutcome::Committed { credited_bytes } => assert_eq!(
+                credited_bytes, delta,
+                "an advance commit credits the full delivered delta"
+            ),
+            CommitOutcome::StoreFailed => panic!("a clean record must commit the batch"),
+        }
 
         let after = lane.lock().await;
         assert_eq!(
@@ -711,6 +736,165 @@ mod tests {
             after.bytes_delivered_cumulative, new_bytes,
             "the cumulative byte counter advanced to the voucher's bytes"
         );
+    }
+
+    /// Rule #1: `commit_batch` credits a stream's paid headroom by at most the
+    /// amount the watermark advanced. A BENIGN voucher (candidate watermark
+    /// unchanged) on a lane with no slack credits ZERO — this is what blocks the
+    /// free-download leech (a client that delivers a window then pays only (0,0)
+    /// vouchers must not have its window reopened).
+    #[tokio::test]
+    async fn benign_commit_with_no_slack_credits_zero() {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+            as Arc<dyn PoolStateStore>;
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        let lane_key = LaneKey {
+            pool_id: alloy::primitives::B256::repeat_byte(0x33),
+            signer: Address::repeat_byte(0x44),
+            provider: Address::repeat_byte(0x55),
+        };
+        // Fresh lane at (0,0), paid_credited 0.
+        let seed = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::from(1_000_000u64),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState {
+            state: seed,
+            bytes_delivered_cumulative: U256::ZERO,
+            paid_credited: U256::ZERO,
+            active_streams: Arc::new(AtomicU32::new(0)),
+        }));
+        handler
+            .lanes
+            .lock()
+            .await
+            .insert(lane_key, Arc::clone(&lane));
+
+        // A benign commit: the candidate watermark is UNCHANGED (still 0 bytes),
+        // but a real delivered delta of 500 wire bytes is staged.
+        let candidate = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::from(1_000_000u64),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let staged = vec![StagedVoucher {
+            delta_bytes: 500,
+            amount: U256::ZERO.to_be_bytes(),
+        }];
+
+        let guard = lane.lock().await;
+        let outcome = handler
+            .commit_batch(
+                guard,
+                lane_key,
+                Hash::from_bytes([9u8; 32]),
+                alloy::primitives::B256::repeat_byte(0x66),
+                candidate,
+                U256::ZERO,
+                &staged,
+            )
+            .await
+            .expect("commit_batch returns Ok");
+        match outcome {
+            CommitOutcome::Committed { credited_bytes } => assert_eq!(
+                credited_bytes, 0,
+                "a benign commit with no watermark slack must credit ZERO (leech block)"
+            ),
+            CommitOutcome::StoreFailed => panic!("clean store must commit"),
+        }
+        assert_eq!(
+            lane.lock().await.paid_credited,
+            U256::ZERO,
+            "paid_credited must not advance past the watermark"
+        );
+    }
+
+    /// Rule #1 twin: an ADVANCE commit (candidate watermark grew to cover the
+    /// delta) credits the full delta — no behavior change for honest flows.
+    #[tokio::test]
+    async fn advance_commit_credits_full_delta() {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+            as Arc<dyn PoolStateStore>;
+        let (handler, _dir) = handler_over_store(&metrics, store).await;
+
+        let lane_key = LaneKey {
+            pool_id: alloy::primitives::B256::repeat_byte(0x33),
+            signer: Address::repeat_byte(0x44),
+            provider: Address::repeat_byte(0x55),
+        };
+        let seed = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::MAX,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        let lane = Arc::new(Mutex::new(LaneDeliveryState {
+            state: seed,
+            bytes_delivered_cumulative: U256::ZERO,
+            paid_credited: U256::ZERO,
+            active_streams: Arc::new(AtomicU32::new(0)),
+        }));
+        handler
+            .lanes
+            .lock()
+            .await
+            .insert(lane_key, Arc::clone(&lane));
+
+        // Candidate watermark advanced to 500 bytes, staged delta 500.
+        let candidate = LaneState::hydrate(
+            lane_key.pool_id,
+            lane_key.signer,
+            lane_key.provider,
+            U256::MAX,
+            0,
+            U256::from(500u64),
+            U256::from(500u64),
+            Some([7u8; 65]),
+        );
+        let staged = vec![StagedVoucher {
+            delta_bytes: 500,
+            amount: U256::from(500u64).to_be_bytes(),
+        }];
+
+        let guard = lane.lock().await;
+        let outcome = handler
+            .commit_batch(
+                guard,
+                lane_key,
+                Hash::from_bytes([1u8; 32]),
+                alloy::primitives::B256::repeat_byte(0x66),
+                candidate,
+                U256::from(500u64),
+                &staged,
+            )
+            .await
+            .expect("commit_batch returns Ok");
+        match outcome {
+            CommitOutcome::Committed { credited_bytes } => assert_eq!(
+                credited_bytes, 500,
+                "an advance commit credits the full delivered delta"
+            ),
+            CommitOutcome::StoreFailed => panic!("clean store must commit"),
+        }
+        assert_eq!(lane.lock().await.paid_credited, U256::from(500u64));
     }
 
     /// A voucher at-or-below the lane watermark — a concurrent sibling raced ahead
