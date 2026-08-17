@@ -5,34 +5,25 @@
 
 ## Context
 
-Nodes and clients communicate over QUIC connections established via iroh. This ADR defines what protocols run over those connections: how a client or node requests a blob and pays for it, and how content availability is broadcast across the network.
+Nodes and clients communicate over QUIC connections established via iroh. This ADR defines what protocols run over those connections: how a client or node requests a blob and pays for it, and how a node discovers content across the network.
 
 The protocol layer is distinct from the transport layer (iroh/QUIC) and the payment layer (vouchers, pools) so each can evolve independently.
 
 ## Decision
 
-Three core protocols negotiated via ALPN, plus the built-in iroh-gossip protocol:
+Three core protocols negotiated via ALPN:
 
 | Protocol | Participants | Purpose |
 | --- | --- | --- |
 | `cdn/probe/v1` | any node ↔ any node | Latency and availability check before committing to a node |
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/dht/v1` | any node ↔ any node | Kademlia content discovery (FIND_VALUE / STORE / FIND_NODE) — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
-| iroh-gossip (built-in) | all nodes | Node metadata announcements (`NodeAnnounce`), node discovery |
 
-### Gossip topics
-
-The iroh-gossip protocol carries multiple message types on distinct topics:
-
-| Topic | Message Type | Source ADR |
-| --- | --- | --- |
-| `cdn/global/v1`, `cdn/region/{cc}/v1` | `NodeAnnounce` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
-
-All gossip topics use the `cdn/` namespace prefix. There is no protocol-level role for settlement monitoring — anyone may run an off-chain analyzer against the L2 chain ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)).
+There is no protocol-level role for settlement monitoring — anyone may run an off-chain analyzer against the L2 chain ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)).
 
 ### Rate discovery
 
-Nodes do not gossip rate changes. The current rate is included in every signed `ProbeResponse`; clients query rates by probing. A node's last probe-quoted rate is binding for any stream opened within the 30-second slashing window — see [`cdn/probe/v1` — latency probe](#cdnprobev1--latency-probe) and the rate-manipulation slashing path in [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence).
+The current rate is included in every signed `ProbeResponse`; clients query rates by probing. A node's last probe-quoted rate is binding for any stream opened within the 30-second slashing window — see [`cdn/probe/v1` — latency probe](#cdnprobev1--latency-probe) and the rate-manipulation slashing path in [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence).
 
 ### `cdn/probe/v1` — latency probe
 
@@ -190,13 +181,13 @@ Delivery and payment are not lock-stepped at the interval, though. A node stream
 
 > **Relationship to iroh-blobs:** The `cdn/client/v1` protocol wraps iroh-blobs' verified streaming within its own message framing. iroh-blobs provides BLAKE3 tree-hash verification at the chunk level; `ChunkData` payloads carry the bao interleaved verified-stream encoding (chunk-group data with the proof nodes that anchor it to the root), alongside the payment and delivery control messages (`Voucher`, `StreamEnd`, `StreamError`) that iroh-blobs' native transfer protocol does not support. The BLAKE3 content hash in `StreamRequest` is the iroh-blobs hash, and verification uses iroh-blobs' incremental tree-hash mechanism — receivers need not buffer the full blob before confirming integrity, and a range beginning at any `byte_offset` is verifiable against the root on its own. See [ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1) for the verification model and wire encoding.
 
-### Gossip — node metadata
+### Node metadata
 
-Node metadata is broadcast over iroh-gossip on region-scoped topics (`cdn/region/{cc}/v1`) and a global topic (`cdn/global/v1`). All staked nodes publish `NodeAnnounce` messages containing node-level metadata: just the self-reported region. `NodeAnnounce` does not carry content inventories — content discovery uses `cdn/dht/v1` (O(log N) FIND_VALUE) with `cdn/probe/v1` as live-availability confirmation. See [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) and [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh).
+Node-level metadata is a single field: the node's self-reported region. A node declares its region on-chain as `regionHint` at `CapacityBond.registerNode`. The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map. See [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata) and [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation).
 
-Region codes (`{cc}` in topic names) are self-declared ISO 3166-1 alpha-2 country codes carried in each node's `NodeAnnounce`. Gossip validation ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) enforces that the `region` field is exactly 2 ASCII uppercase letters matching a known ISO 3166-1 alpha-2 code — messages with invalid region values are dropped. Misreporting a valid but incorrect region is mitigated by latency-based reputation scoring: clients penalize nodes whose observed RTT contradicts the claimed region (e.g., RTT > 150 ms to a node in the same claimed region). See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the full `NodeAnnounce` struct, gossip validation rules, and region-misreporting mitigation.
+The region is an ISO 3166-1 alpha-2 country code. It is self-attested and accepted at face value. A client penalizes a node whose observed RTT contradicts the claimed region (e.g., RTT > 150 ms to a node in the same claimed region). See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the region-misreporting mitigation.
 
-Gossip messages are lightweight (~800 bytes worst case), well within iroh-gossip message limits. Clients and nodes maintain a peer table (`NodeId → NodeAnnounce`) from received messages. The probe step determines which peers hold specific content, along with their cost and latency.
+Content discovery uses `cdn/dht/v1` (O(log N) FIND_VALUE) with `cdn/probe/v1` as live-availability confirmation. See [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale). The probe step determines which nodes hold specific content, along with their cost and latency.
 
 ### Connection Management
 

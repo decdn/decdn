@@ -56,8 +56,6 @@ pub struct NodeArgs {
 /// Subcommands under `decdn node`.
 #[derive(Subcommand, Debug)]
 pub enum NodeCommand {
-    /// List gossip peers currently known to a running node.
-    Peers(PeersArgs),
     /// Print a running node's identity and process uptime.
     Health(HealthArgs),
     /// Print a snapshot of the running node's DHT participation health
@@ -86,17 +84,6 @@ pub enum NodeCommand {
     /// Useful for DMCA takedown, corruption recovery, and storage
     /// reclamation.
     Evict(EvictArgs),
-    /// Publish a one-shot `NodeAnnounce` to gossip peers immediately
-    /// rather than waiting for the periodic announce interval (issue
-    /// #280). Useful after a config edit changes a field carried in the
-    /// announce body — see `decdn-protocol::NodeAnnounceBody` — or as a
-    /// post-restart "I'm here" nudge so peers don't wait the full
-    /// `announce_interval_sec` to learn about us. The trigger is a
-    /// queue-and-coalesce signal: rapid back-to-back invocations within a
-    /// single publisher cycle fold into one extra broadcast (see
-    /// `decdn-gossip::AnnounceTrigger`), and a successful response means
-    /// the request was queued, not that it has hit the wire.
-    Announce(AnnounceArgs),
     /// Re-read the running node's config file and apply hot-reloadable
     /// fields (issue #373). Equivalent to `kill -HUP <pid>` but goes
     /// through the loopback admin surface, so operator tooling that
@@ -387,29 +374,6 @@ pub struct EvictArgs {
     pub timeout_ms: u64,
 }
 
-/// `decdn node announce` — publish a one-shot `NodeAnnounce` to gossip
-/// peers via `admin_v1_announce` (issue #280).
-#[derive(Args, Debug)]
-pub struct AnnounceArgs {
-    /// Base URL of the node's admin HTTP surface. See `health --admin-url`
-    /// for resolution precedence.
-    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
-    pub admin_url: Option<String>,
-
-    /// Path to the TOML config file used to derive the admin URL when
-    /// `--admin-url` / `DECDN_ADMIN_URL` are unset.
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    /// Emit the admin response as JSON instead of a one-line confirmation.
-    #[arg(long)]
-    pub json: bool,
-
-    /// Roundtrip timeout in milliseconds.
-    #[arg(long, value_name = "MS", default_value_t = 5_000)]
-    pub timeout_ms: u64,
-}
-
 /// `decdn node reload` — re-read the running node's config file via
 /// `admin_v1_reload` (issue #373) and print the post-reload `rate_per_mb`
 /// and `log_level`.
@@ -505,40 +469,6 @@ pub struct DrainArgs {
     pub wait_poll_ms: NonZeroU64,
 }
 
-/// `decdn node peers` — list the gossip peer table of a running node.
-#[derive(Args, Debug)]
-pub struct PeersArgs {
-    /// Base URL of the node's admin HTTP surface.
-    ///
-    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
-    /// var into this field. If still unset, the admin port is derived
-    /// from `observability.admin_port` in the config file (see
-    /// `--config`). Example: `http://127.0.0.1:9191`.
-    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
-    pub admin_url: Option<String>,
-
-    /// Path to the TOML config file used to derive the admin URL when
-    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Takes precedence
-    /// over the top-level `decdn --config`; if neither is set,
-    /// resolution falls through to `~/.decdn/node.toml` and then the
-    /// built-in default port.
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    /// Filter output to peers whose region matches exactly
-    /// (case-insensitive). Applied client-side after fetching.
-    #[arg(long, value_name = "CODE")]
-    pub region: Option<String>,
-
-    /// Emit the admin response body as JSON instead of a human table.
-    #[arg(long)]
-    pub json: bool,
-
-    /// Roundtrip timeout in milliseconds.
-    #[arg(long, value_name = "MS", default_value_t = 5_000)]
-    pub timeout_ms: u64,
-}
-
 /// Shared blockchain coordinates + keys for the on-chain `node` subcommands
 /// (`register`, `bond`). Flattened into each command's args so they expose
 /// an identical flag group. The common coordinates live in
@@ -604,7 +534,7 @@ pub struct RegisterArgs {
     /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. NAT'd nodes may
     /// register a relay placeholder and promote direct addresses later via
     /// `updateMultiaddrs`; omitting it entirely registers an empty set and
-    /// relies on gossip / iroh discovery for reachability.
+    /// relies on `cdn/dht/v1` discovery (ADR 022) for reachability.
     #[arg(long = "multiaddr", value_name = "MA")]
     pub multiaddrs: Vec<String>,
 
@@ -890,7 +820,7 @@ pub struct TopArgs {
 
     /// Path to the TOML config file used to derive the metrics URL
     /// when `--metrics-url` / `DECDN_METRICS_URL` are unset. Same
-    /// resolution semantics as `decdn node peers --config`.
+    /// resolution semantics as `decdn node health --config`.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 

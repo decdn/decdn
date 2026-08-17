@@ -6,11 +6,11 @@
 
 ## Context
 
-Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration (`regionHint` on `CapacityBond`) and in every gossiped `NodeAnnounce` (the `region` field on the signed body; see [ADR 001 § NodeAnnounce](001-network.md#adr-001-network-topology-and-peer-mesh)). The declared region is load-bearing in four places:
+Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration as `regionHint` on `CapacityBond` (see [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata)). The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map. The declared region is load-bearing in three places:
 
 - **Regional blacklist enforcement.** A node applies only blacklist entries that are global or match its declared region ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)), and is slashable only for serving a hash blacklisted in its declared scope ([ADR 011 § Slashing](011-content-takedown.md#slashing)).
-- **Gossip topic routing.** Nodes publish to the regional topic `cdn/region/{cc}/v1` alongside the global topic ([ADR 001 § Gossip Topics](001-network.md#adr-001-network-topology-and-peer-mesh)).
-- **Peer-selection geo-diversity.** Clients prefer geographically diverse providers on ranking ties ([ADR 001 § Selection](001-network.md#adr-001-network-topology-and-peer-mesh), implemented in `crates/node/src/selection.rs`).
+- **Region byte-accounting.** Served-byte accounting aggregates delivery by the node's declared region, read from the same registry-resolved `NodeId → region` map.
+- **Peer-selection penalty.** A client applies the RTT-vs-claim reputation penalty against a node whose measured latency contradicts its declared region ([ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm), implemented in `crates/node/src/selection.rs`).
 
 Three ADRs ([001 § Consequences](001-network.md#consequences), [011 § Regional Scope](011-content-takedown.md#regional-scope), [019 § Deferred & Open](019-node-onboarding.md#deferred--open)) name "a decentralized oracle or third-party attestation service" as the production mitigation against region misreporting, but specify no design — oracle choice, IP→region resolution, mismatch handling, slashing implications, and operator UX are all open. This gap is production-blocking: without a decision, regional compliance under [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) is structurally fragile, and the reactive blacklist-scope flip ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)) remains open.
 
@@ -20,7 +20,7 @@ This ADR closes the gap by **rejecting** the oracle/attestation-service path and
 
 ### Self-attestation is canonical
 
-A node's region is whatever the operator declares — at `CapacityBond.registerNode`, in `CapacityBond.updateRegion` calls ([§ Region-stability window](#region-stability-window)), and in every signed `NodeAnnounce` body. The protocol accepts it at face value: no on-chain or in-gossip IP-geolocation cross-check, no required third-party attestation signature. Gossip-layer validation in `crates/gossip/src/validation.rs:127-130` stays shape-only (any two-byte ASCII-uppercase value). [ADR 001 § Gossip validation](001-network.md#gossip-validation) describes a stricter known-code-set check; tightening `validation.rs` to enforce it is orthogonal and not a precondition — logged in Cross-ADR Impact, not silently carried.
+A node's region is whatever the operator declares — at `CapacityBond.registerNode` and in `CapacityBond.updateRegion` calls ([§ Region-stability window](#region-stability-window)). The protocol accepts it at face value: no on-chain IP-geolocation cross-check, no required third-party attestation signature. The contract stores `regionHint` as a `string` and validates only its length ([§ Region-stability window](#region-stability-window)); it does not verify that the code names the node's physical location.
 
 ### Soft mitigation: latency-vs.-claim reputation penalty (canonical)
 
@@ -90,7 +90,7 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 
 ### Risks
 
-- **Coordinated region-spoofing attack on a region's reputation.** A fleet of misdeclaring nodes could pollute regional gossip topics and depress the region's measured reputation. Bounded by (a) the latency penalty (attacker reputation collapses as fast as RTTs are sampled), (b) the capacity-bond cost per node ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), and (c) gossip-bandwidth cost. Not free; self-correcting.
+- **Coordinated region-spoofing attack on a region's reputation.** A fleet of misdeclaring nodes could depress the region's measured reputation. Bounded by (a) the latency penalty (attacker reputation collapses as fast as RTTs are sampled), (b) the capacity-bond cost per node ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), and (c) the on-chain registration transaction cost per node. Not free; self-correcting.
 - **Governance-set `REGION_STABILITY_WINDOW` drift.** Lowering the window toward the 3-day floor weakens the blacklist-scope protection. The hard bounds `[3d, 30d]` per [ADR 009](009-governance.md#adr-009-governance-model) make this an above-the-line governance question rather than a silent regression; the floor was raised from 1d to 3d so the worst legal setting still keeps a flip uneconomic (see Threshold rationale).
 - **Serve-time slash window has two accepted edges.** Evaluating the slash-path ripening window at `responseTs` closes the flip-then-stall evasion of a prev-region entry, but two edges remain, both consciously accepted:
   - *Honest-relocator current-leg exposure.* The current-region leg (`entry.region == regionHint`) applies regardless of timestamp — declaring a region opts into its entries immediately. A node that served compliantly in `X`, then genuinely relocates to `Y`, is in scope for `Y`-region entries the moment it declares `Y`, including for an already-served blob also blacklisted in `Y`. Fully exempting the pre-relocation serve would require reconstructing the node's region *at* `responseTs` — multi-level region history — which the single `regionPrev` slot deliberately does not store; widening that storage is rejected on `CapacityBond` runtime-size (EIP-170) grounds. Backstopped by the evidence-age window ([ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness)), which bounds how stale a `responseTs` a challenge may carry.
@@ -99,5 +99,4 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 ## Cross-ADR Impact
 
 - Tightening the [ADR 001 § Consequences](001-network.md#consequences) latency-vs-claim reputation penalty (threshold, sample size, window, decay) is in scope for the [ADR 008](008-reputation.md#adr-008-reputation-system) reputation domain, not blocked by this ADR.
-- Tracked spec/impl divergence: `crates/gossip/src/validation.rs` enforces only the shape check (two ASCII-uppercase bytes), not the [ADR 001 § Gossip validation](001-network.md#gossip-validation) known-ISO-3166-1-alpha-2 set check. Closing it is in scope for the [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) gossip-validation domain — logged here so the gap is not silent.
 - Contract-level `regionLastChanged` / `regionPrev` / `updateRegion` (incl. the stability-window cooldown) land with the `CapacityBond` implementation; the [§ Region-stability window](#region-stability-window) interface spec is the canonical reference for that work.

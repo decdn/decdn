@@ -8,7 +8,6 @@ members = [
     "crates/cache",
     "crates/incentive",
     "crates/reputation",
-    "crates/gossip",
     "crates/common",
     "crates/client-pull",
     "crates/cli",
@@ -44,7 +43,6 @@ decdn-bao-range = { path = "crates/bao-range", version = "0.1.1" }
 decdn-cache = { path = "crates/cache", version = "0.1.1" }
 decdn-incentive = { path = "crates/incentive", version = "0.1.1" }
 decdn-reputation = { path = "crates/reputation", version = "0.1.1" }
-decdn-gossip = { path = "crates/gossip", version = "0.1.1" }
 decdn-common = { path = "crates/common", version = "0.1.1" }
 decdn-client-pull = { path = "crates/client-pull", version = "0.1.1" }
 decdn-node = { path = "crates/node", version = "0.1.1" }
@@ -57,7 +55,6 @@ decdn-node = { path = "crates/node", version = "0.1.1" }
 # deliberate — bump Cargo.lock and record the new baseline in ADR 000.
 iroh = "1"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
-iroh-gossip = { version = "0.101", features = ["net"] }
 iroh-metrics = "1"
 # bao verified-range codec (#823). Pinned to the version `iroh-blobs` 0.103
 # carries transitively (0.16) so the on-disk outboard / interleaved-stream

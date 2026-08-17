@@ -12,8 +12,8 @@ use clap::Parser;
 use decdn_cli::commands::config as commands;
 use decdn_common::cli::{ConfigValidateArgs, RunArgs};
 use decdn_common::config::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
+    ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 use tempfile::TempDir;
 
@@ -143,7 +143,7 @@ fn validate_fails_when_required_field_missing() -> anyhow::Result<()> {
 fn validate_fails_for_unknown_field_in_section() -> anyhow::Result<()> {
     // #842: a typo'd key inside a known section must fail at load rather than
     // silently keeping the default for the intended (security-relevant) knob.
-    let body = format!("{VALID_CONFIG}\n[gossip]\nsubscribe_globall = false\n");
+    let body = format!("{VALID_CONFIG}\n[security]\nmax_concurrent_handlerss = 10\n");
     let dir = TempDir::new()?;
     let path = write_config(&dir, &body)?;
     fs::write(dir.path().join("keystore.json"), "")?;
@@ -152,7 +152,7 @@ fn validate_fails_for_unknown_field_in_section() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
     let msg = format!("{err:#}");
     anyhow::ensure!(
-        msg.contains("subscribe_globall"),
+        msg.contains("max_concurrent_handlerss"),
         "error should name the unknown key: {msg}"
     );
     Ok(())
@@ -239,9 +239,6 @@ max_blob_size_mb = 500
 
 [payment]
 rate_per_mb = 0
-
-[gossip]
-subscribe_global = false
 "#;
 
 #[test]
@@ -394,12 +391,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             otlp_endpoint: None,
             region_accounting_interval_sec:
                 decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
-        },
-        gossip: ResolvedGossip {
-            announce_interval_sec: 60,
-            peer_ttl_sec: 600,
-            subscribe_global: true,
-            max_peer_entries: Some(100_000),
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,

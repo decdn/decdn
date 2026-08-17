@@ -2109,7 +2109,7 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
 /// with `RangeOutOfBounds`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivers_empty_blob() -> anyhow::Result<()> {
-    // Empty payload → `hash` is the empty root `blake3::hash(&[])` by construction.
+    // Empty payload → `hash` is the empty root, computed via `bao_tree::blake3`, by construction.
     let payload: Vec<u8> = Vec::new();
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 

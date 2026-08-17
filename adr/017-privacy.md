@@ -9,7 +9,7 @@ The protocol makes deliberate privacy tradeoffs favoring decentralization and ac
 
 This ADR consolidates that analysis. It introduces no new functionality — it systematizes privacy properties other ADRs already specify, assigns an explicit disposition to each, and prioritizes mitigations for PoC versus production.
 
-**Scope boundary:** Covers protocol-level privacy — data observable through CDN protocol participation, on-chain interactions, and gossip. Application-level privacy is out of scope and remains the application's responsibility.
+**Scope boundary:** Covers protocol-level privacy — data observable through CDN protocol participation and on-chain interactions. Application-level privacy is out of scope and remains the application's responsibility.
 
 ## Decision
 
@@ -19,8 +19,8 @@ Organized by adversary capability. Each tier subsumes the tier below it.
 
 | Tier | Adversary | Capabilities | Real-World Examples |
 |------|-----------|-------------|---------------------|
-| T1 | Passive network observer | Observes QUIC connection metadata (IP pairs, timing, volume), public gossip messages, on-chain transactions and events | ISP, nation-state passive surveillance, blockchain analytics firm |
-| T2 | Active protocol participant | All of T1 plus: operates staked nodes, sends probes, opens payment pools, subscribes to gossip topics, observes probe responses | Competing CDN, curious node operator, researcher |
+| T1 | Passive network observer | Observes QUIC connection metadata (IP pairs, timing, volume), on-chain transactions and events | ISP, nation-state passive surveillance, blockchain analytics firm |
+| T2 | Active protocol participant | All of T1 plus: operates staked nodes, sends probes, opens payment pools, observes probe responses | Competing CDN, curious node operator, researcher |
 | T3 | Infrastructure operator | All of T2 plus: operates an RPC endpoint or iroh relay | RPC provider (Alchemy, Infura), relay operator |
 | T4 | Compromised endpoint | Has memory or disk access to a specific client or node | Device theft, malware, law enforcement with warrant |
 
@@ -38,7 +38,7 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-09 | Probe content leakage | All probed nodes (the DHT-returned candidate set) learn which content hash the requester wants | T2 | [005](005-protocol.md#adr-005-wire-protocol) § Probe |
 | P-10 | Cache miss detection | Probes triggered by cache misses are visible to the targeted DHT candidate set, plus DHT FIND_VALUE traffic is visible to nodes close to the hash in keyspace — both reveal regionally uncommon content | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh) § Content Discovery |
 | P-11 | Probe cache timing correlation | 15-second probe cache ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) means the interval between probe and subsequent `StreamRequest` is trivially observable | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [005](005-protocol.md#adr-005-wire-protocol) |
-| P-12 | Gossip topic enumeration | An attacker joining regional gossip topics (`cdn/region/{cc}/v1`) can enumerate all nodes and their region announcements | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [005](005-protocol.md#adr-005-wire-protocol) |
+| P-12 | Registry node enumeration | Reading the on-chain `CapacityBond` active set (`getRegisteredNodes`) enumerates every active node with its self-reported `regionHint` | T1 | [001](001-network.md#adr-001-network-topology-and-peer-mesh), [003](003-payments.md#adr-003-payment-model) |
 | P-13 | GeoIP inference | Self-reported `regionHint` combined with IP addresses from `multiaddrs` enables geolocation | T2 | [001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | P-15 | RPC provider query visibility | Registry queries, blacklist polling, and rate-bounds lookups are visible to the RPC provider | T3 | [architecture.md](architecture.md#architecture-overview) § Trust Assumptions |
 | P-17 | Relay connection metadata | iroh relays see source/destination IP pairs and connection timing for relayed connections | T3 | [architecture.md](architecture.md#architecture-overview) § Trust Assumptions |
@@ -51,11 +51,11 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 
 #### T1: Passive Network Observer
 
-Sees gossip, on-chain state, and QUIC connection metadata. Key concern: whether aggregating signals reveals more than any single one.
+Sees on-chain state and QUIC connection metadata. Key concern: whether aggregating signals reveals more than any single one.
 
 ##### Content demand patterns (P-08)
 
-BLAKE3 hashes are deterministic global identifiers; repeated requests are correlatable across observers. No `popular_hashes` gossip signal exists; demand is observable only through DHT FIND_VALUE traffic to the K closest nodes for a hash and cache-miss timing inferences. Intrinsic to a content-addressed network; not eliminable without protocol-level mixing.
+BLAKE3 hashes are deterministic global identifiers; repeated requests are correlatable across observers. The protocol publishes no `popular_hashes` demand signal; demand is observable only through DHT FIND_VALUE traffic to the K closest nodes for a hash and cache-miss timing inferences. Intrinsic to a content-addressed network; not eliminable without protocol-level mixing.
 
 ##### Payment and identity linkability (P-02, P-03, P-07)
 
@@ -69,9 +69,13 @@ At each on-chain redemption the lane's cumulative amount and byte count are publ
 
 ALPN negotiation in the QUIC TLS ClientHello reveals whether a connection is a probe, paid stream, or key delivery session, letting a network observer classify connections by type. Standard for any QUIC multi-protocol system; not a significant concern — the protocols are not secret.
 
+##### Registry enumeration (P-12)
+
+The on-chain registry active set is public, so a T1 observer reads it without probing or connecting to any node. See [§ Network enumeration (P-12, P-13)](#network-enumeration-p-12-p-13) for the full analysis.
+
 #### T2: Active Protocol Participant
 
-Can probe nodes, join gossip topics, and observe responses to its own interactions. Primary added concern: content access pattern leakage.
+Can probe nodes, read the on-chain registry, and observe responses to its own interactions. Primary added concern: content access pattern leakage.
 
 ##### Probe content leakage (P-09, P-10, P-11)
 
@@ -79,7 +83,7 @@ Probing peers for a hash tells all probed nodes what is requested. Cache-miss pr
 
 ##### Network enumeration (P-12, P-13)
 
-Regional gossip topics are enumerable; joining reveals all participating nodes' identities and self-reported regions. Combined with `multiaddrs` from the on-chain registry, this enables geolocation. Inherent to any system where nodes must be discoverable to serve content.
+The on-chain registry active set is enumerable; reading it reveals all active nodes' identities and self-reported regions. Combined with `multiaddrs` from the same registry, this enables geolocation. Inherent to any system where nodes must be discoverable to serve content.
 
 ##### `slash_sig` as content inventory proof (P-23)
 
@@ -121,7 +125,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 | P-09 | Probe content leakage | Accept | Probes are public by design ([ADR 005](005-protocol.md#adr-005-wire-protocol)); delivering node must know the hash | — |
 | P-10 | Cache miss detection | Accept | Inherent to probing and DHT lookups for cache-miss pulls | — |
 | P-11 | Probe cache timing | Accept | 15-second window is an optimization tradeoff; attacker already sees the probe | — |
-| P-12 | Gossip topic enumeration | Accept | Inherent to any system with discoverable nodes | — |
+| P-12 | Registry node enumeration | Accept | Inherent to any system with discoverable nodes | — |
 | P-13 | GeoIP inference | Accept | Self-reported region is intentionally public for client selection | — |
 | P-15 | RPC provider visibility | Mitigate | Operational guidance reduces single-provider trust | Pre-mainnet |
 | P-17 | Relay connection metadata | Accept | Standard relay behavior; traffic is E2E encrypted | — |
@@ -189,14 +193,14 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 
 ### Negative
 
-- Must be kept in sync as other ADRs evolve — any new protocol feature or gossip message must be evaluated against [§ Privacy Surface Inventory](#privacy-surface-inventory)
+- Must be kept in sync as other ADRs evolve — any new protocol feature or message must be evaluated against [§ Privacy Surface Inventory](#privacy-surface-inventory)
 - Some "accept" dispositions may need revisiting as the threat landscape or regulatory requirements change, or the network scales beyond PoC
 - Does not cover application-layer privacy (content provider's app server data, subscriber analytics) — an explicit scope boundary, not an oversight
 - The adversary model assumes rational actors; state-level adversaries with traffic analysis may extract more from T1-level data than this analysis suggests
 
 ## References
 
-- [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh): `NodeAnnounce`, DHT-candidate probing, gossip topics
+- [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh): registry enumeration, DHT-candidate probing
 - [ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing): BLAKE3 as global content identifier
 - [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model): payment pool on-chain visibility, probe fishing rate limits
 - [ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol): probe publicity statement, ALPN definitions

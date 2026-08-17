@@ -2737,7 +2737,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     );
 
     // A wedged open is OUR chain lane, not the peer's fault: neither wedged provider
-    // may take a reputation hit, locally or over gossip. This is the same exoneration
+    // may take a local reputation hit. This is the same exoneration
     // `PullTimeout` gets, and for the same reason.
     for (wedged_id, label) in [(w_id, "W1"), (w2_id, "W2")] {
         anyhow::ensure!(
@@ -2975,8 +2975,8 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     );
 
     // Each staller hit OUR per-candidate deadline — a buyer-side budget, not evidence
-    // the provider is bad — so both are exonerated: no local EWMA hit, nothing
-    // gossiped (#857). Identical to the buffered path's contract.
+    // the provider is bad — so both are exonerated: no local EWMA hit (#857).
+    // Identical to the buffered path's contract.
     for (label, s_id) in [("S1", s1_id), ("S2", s2_id)] {
         anyhow::ensure!(
             (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
@@ -3267,10 +3267,10 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
 /// rejects the buyer's closing voucher (a stale nonce / our payment fault). The
 /// pull must fail to a clean `NotFound`, and — crucially — the provider must NOT
 /// be tarred: a voucher rejection is OUR payment-side fault, so no observation is
-/// emitted (local or gossiped), the local score stays neutral, and only the
+/// emitted, the local score stays neutral, and only the
 /// buyer-side `node_pull_voucher_rejected` counter moves (no unreachable, no
 /// corruption). Before the fix, this self-inflicted failure mapped to
-/// `Outcome::Unreachable` and defamed the honest provider network-wide.
+/// `Outcome::Unreachable` and unfairly defamed the honest provider's local reputation.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
@@ -5360,7 +5360,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
 /// The mirror image of the test above, and the line between them is the whole point: a peer
 /// that never sent a FIRST byte must NOT be scored `Unreachable` (#1145 review).
 ///
-/// `PullStalled` earns the right to gossip about a peer from the deadline's reset — a clock
+/// `PullStalled` earns the right to score a peer `Unreachable` from the deadline's reset — a clock
 /// that resets on every byte can only fire on a peer that stopped delivering. That argument
 /// needs a byte to have arrived. Before the first one there has been no reset, and the clock
 /// is measuring something else entirely: the server's TIME TO FIRST BYTE, which scales with
@@ -5595,7 +5595,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
 
-    // Nothing gossiped, and the local score untouched: the peer answered honestly.
+    // The local score stays untouched: the peer answered honestly.
     // The mirror of the stall test's `< 0.5`: a stall drops the score below neutral, an
     // honest refusal must not touch it.
     anyhow::ensure!(
@@ -5958,7 +5958,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         "an `InsufficientDeposit` channel must keep its row so the deposit can be reclaimed"
     );
 
-    // Our payment fault, not the peer's: it is not scored, here or over gossip.
+    // Our payment fault, not the peer's: it is not scored.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
@@ -6324,7 +6324,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 ///
 /// Every refusal used to score `Outcome::Unreachable`, which punished a healthy,
 /// answering node exactly as hard for truthfully saying it lacks a blob as for
-/// being dead — and gossiped that verdict network-wide. (`NotFound` is
+/// being dead in its local reputation score. (`NotFound` is
 /// NODE-scoped, not blob-scoped: seven `ServeRejectReason`s collapse onto it so
 /// channel existence cannot be probed, so it is not even reliable evidence about
 /// the blob.)

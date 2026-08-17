@@ -17,10 +17,9 @@ use decdn_node::commands;
     version,
     about = "deCDN cache node daemon",
     long_about = "Run a deCDN cache node. The daemon listens for QUIC \
-                  client/peer connections, gossip announces, and \
-                  loopback admin RPC. Use the `decdn` CLI for one-shot \
-                  user/operator commands (probe, node admin, key-gen, \
-                  config)."
+                  client/peer connections and loopback admin RPC. Use the \
+                  `decdn` CLI for one-shot user/operator commands (probe, \
+                  node admin, key-gen, config)."
 )]
 struct DaemonCli {
     /// Path to TOML config file [default: ~/.decdn/node.toml].

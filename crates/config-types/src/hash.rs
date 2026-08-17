@@ -234,7 +234,7 @@ impl Default for PinnedHashes {
 
 /// Operator-denied blob hashes — the local denylist from ADR 011 §Local
 /// Denylist (`[content] denied_hashes`). A hash here is refused at the delivery
-/// path immediately and ungossiped, whether or not the node holds it.
+/// path immediately, whether or not the node holds it.
 ///
 /// This is the "future blocklist" [`PinnedHashes`] warns about, and it is a
 /// distinct nominal type for exactly that reason: the two are both

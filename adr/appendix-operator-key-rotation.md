@@ -8,7 +8,7 @@ A node operator routinely holds three keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
-| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake and signs `NodeAnnounce` gossip ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution moved to `slash_sig` — see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
+| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution is `slash_sig` — see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
 | **Ethereum signing key** | secp256k1 | On-chain identity for staking, pool ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)); the latter's hot-signing burden motivates the production session-key path. | EVM keystore (EOA) — the default and the only form requesters can verify off-chain — **or** a Safe owner key, if the operator chose a Safe (cold paths only; see [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)) **or** session key delegated by a Safe (production [§ Voucher session-key rotation (production)](#voucher-session-key-rotation-production) of [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)) |
 | **Slash-sig session key** *(production only)* | secp256k1 | Per-message hot-signing of `slash_sig` digests on `ProbeResponse`/`StreamResponse` at wire speed under a 2-of-3 Safe; authorized via `erc7579/smartsessions` ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions)). Client-side voucher session keys (also production, also smartsessions) are a separate client-owned concern. | Signing host, scoped by the session-key policy |
 
@@ -88,7 +88,7 @@ Use `--bind-existing` to bind the key that is already at `node.secret`. This rep
 7. **Restart** the node, confirm:
    - `/health` reports `ready`
    - `decdn_node_uptime_seconds` advancing
-   - Outgoing `NodeAnnounce` carries the new NodeId (visible in peers' gossip logs)
+   - Peers reach the node at the new NodeId once their registry view reflects the `NodeIdBound` event
 8. **Un-drain** — accept inbound connections again.
 9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) [§ SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract) Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (rate, blacklist) resolve at reveal time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
 
@@ -99,7 +99,6 @@ Use `--bind-existing` to bind the key that is already at `node.secret`. This rep
 | `bindNodeId` reverts `"NodeId bound to another address"` | A separate operator already registered `newNodeId` | Generate a different keypair and retry. The ed25519 ownership proof prevents squatting, but a pre-existing binding by a different *legitimate* owner is a hard collision. |
 | `bindNodeId` reverts `"invalid signature"` | `bindingNonce[ethAddress]` advanced or EIP-712 digest mis-built | Re-read the on-chain nonce, re-sign, resubmit |
 | Restarted node serves `ok: false` for hashes it just probed `has_blob: true` | Probe holds not drained before stop | Availability/reputation ding only — the just-advertised blobs did not survive the restart. Let the probe hold window (35s per [ADR 005](005-protocol.md#adr-005-wire-protocol)) elapse before re-advertising; drain probe holds first next rotation |
-| Peers continue to address the old NodeId | Gossip re-propagation lag | Up to one `node_announce_interval`; if it persists past two intervals, restart gossip subscription |
 
 ## Ethereum signing-key rotation only
 

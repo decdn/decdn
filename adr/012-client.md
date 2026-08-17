@@ -5,7 +5,7 @@
 
 ## Context
 
-Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Four gaps block PoC functionality:
+Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, track the set of nodes from the on-chain registry, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Four gaps block PoC functionality:
 
 1. **Bootstrap** — how a client discovers initial peers. [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) specifies registry query and retry, but interleaves it with node-specific concerns and omits client identity loading.
 2. **Key management** — clients hold an iroh Ed25519 key (NodeId) and an Ethereum secp256k1 key. That key carries two roles the pool keeps separate: **owner** (opening pools, topping up, signing capabilities, receiving reclaims) and **voucher signer** (a capability-authorized key whose vouchers a node accepts). Generation, storage, and rotation are unspecified.
@@ -32,8 +32,8 @@ A client is a lightweight QUIC endpoint that streams content and pays per MB. It
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
 - Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
-- Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); publishes nothing to the mesh
-- Maintains a local peer table (from the on-chain registry) and reputation scores
+- Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); it shares them with no one
+- Maintains a local node list (from the on-chain registry) and reputation scores
 - Signs vouchers authorizing off-chain USDC payments, from a capability-authorized signer key the pool owner delegates (its own key by default)
 
 ### Bootstrap Procedure
@@ -64,7 +64,7 @@ Startup sequence from first launch to ready state:
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
 5. Connect to iroh relay (for NAT traversal)
-6. Build peer table from the resolved bootstrap peers
+6. Build node list from the resolved bootstrap peers
      (registry results, or the cached peers.json on fallback)
 7. Persist peer list to the peer cache
      A successful but *empty* read is the exception: it does not overwrite the
@@ -75,9 +75,9 @@ Startup sequence from first launch to ready state:
 
 The peer cache is `peers.json` under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
 
-The on-chain registry is the sole discovery source; a cached peer list from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh: they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the job of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability. A client stays online only long enough to fetch and gains nothing from mesh participation.
+The on-chain registry is the sole discovery source. Nodes and clients both build their node list from it. A cached peer list from the last successful query covers a transient RPC outage. A client stays online only long enough to fetch, so it holds no long-lived network role.
 
-Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry).
+Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-node-view-from-on-chain-registry).
 
 ### Key Management
 
