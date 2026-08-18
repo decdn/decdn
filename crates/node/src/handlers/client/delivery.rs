@@ -358,7 +358,7 @@ impl ClientHandler {
             // the admission gate and the takedown funder resolution.
             if collected_any
                 && !done
-                && let Some(status) = self.pool_view_status(lane_key.pool_id).await
+                && let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
                 && !self.pool_budget_covers_reserve(lane_key.pool_id, status.remaining, U256::ZERO)
             {
                 self.write_reject(send, VoucherRejectReason::PoolExhausted, None)

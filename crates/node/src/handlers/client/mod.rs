@@ -977,15 +977,30 @@ impl ClientHandler {
 
     /// The pool's cached `getPool` status (owner + `remaining`), or `None` when no
     /// pool-view is wired or the read faulted. Both the takedown funder resolution
-    /// ([`Self::pool_funder`]) and the mid-stream pool-solvency re-check read
-    /// through this; a `None` result makes those checks fail open — a transient RPC
-    /// blip must not stop a paying stream, and the on-chain `redeem` is the
-    /// backstop. Cached, so a per-voucher-boundary call is cheap.
+    /// ([`Self::pool_funder`]) reads through this at the START of a serve leg; a
+    /// `None` result makes the caller fail open — a transient RPC blip must not stop
+    /// a paying stream, and the on-chain `redeem` is the backstop. MAY block on a
+    /// `getPool` fetch on a cache miss, so it is NOT for the per-voucher-boundary
+    /// path — the mid-stream re-check uses [`Self::pool_view_status_cached`].
     pub(super) async fn pool_view_status(
         &self,
         pool_id: B256,
     ) -> Option<crate::pool_view::PoolStatus> {
         self.pool_view.as_ref()?.status(pool_id).await
+    }
+
+    /// CACHE-ONLY pool status for the per-voucher-boundary mid-stream solvency
+    /// re-check: never triggers a `getPool` `eth_call`, so it cannot stall the serve
+    /// loop when the RPC is slow. Returns `None` when nothing fresh is cached (the
+    /// re-check then fails open, exactly as on a fetch fault) — a long stream whose
+    /// admission read has aged past the cache TTL simply stops re-checking rather
+    /// than blocking delivery on a fresh read. The on-chain `redeem` remains the
+    /// backstop, and a wider serve-path RPC reduction is tracked separately.
+    pub(super) async fn pool_view_status_cached(
+        &self,
+        pool_id: B256,
+    ) -> Option<crate::pool_view::PoolStatus> {
+        self.pool_view.as_ref()?.cached_status(pool_id).await
     }
 
     /// The pool's funder (`getPool.owner`) for the ADR 011 mid-stream takedown
