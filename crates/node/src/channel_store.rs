@@ -2055,14 +2055,19 @@ mod tests {
         let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
         let stop = Arc::new(AtomicBool::new(false));
 
-        // A flusher hammering the store while the writers advance lanes.
+        // A flusher committing repeatedly while the writers advance lanes. It
+        // yields between commits rather than busy-spinning (a tight loop would
+        // burn a core, especially when a flush is a no-op), and surfaces any
+        // flush error instead of swallowing it.
         let flusher = {
             let store = Arc::clone(&store);
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
+            std::thread::spawn(move || -> anyhow::Result<()> {
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = store.flush();
+                    store.flush()?;
+                    std::thread::yield_now();
                 }
+                Ok(())
             })
         };
 
@@ -2085,7 +2090,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         flusher
             .join()
-            .map_err(|_| anyhow::anyhow!("flusher thread panicked"))?;
+            .map_err(|_| anyhow::anyhow!("flusher thread panicked"))??;
 
         // A final flush drains whatever the last records re-marked, then reopen
         // and confirm every lane reached its highest watermark on disk.
