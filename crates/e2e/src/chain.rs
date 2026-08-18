@@ -2405,6 +2405,162 @@ mod tests {
         assert!(!forge_script_body_completed(b""));
     }
 
+    // The shared-deployment cache helpers are pure (no anvil/forge), so pin their
+    // correctness here rather than only through the gated journeys.
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn write_json(path: &Path, json: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, json).expect("write json fixture");
+    }
+
+    /// A minimal deploy manifest with distinct, valid addresses for each field.
+    fn sample_manifest_json() -> String {
+        let addr = |n: u8| format!("0x{n:0>40x}");
+        format!(
+            r#"{{
+              "contracts": {{
+                "CapacityBond": "{}", "PaymentPool": "{}", "FeeRouter": "{}",
+                "Token": "{}", "SlashJudge": "{}", "SlashAppeal": "{}",
+                "DecdnGovernor": "{}", "TimelockController": "{}",
+                "PublisherRegistry": "{}", "OriginAssignment": "{}",
+                "ManualVettingPolicy": "{}", "ContentBlacklist": "{}"
+              }},
+              "externalDeps": {{ "usdc": "{}" }}
+            }}"#,
+            addr(1),
+            addr(2),
+            addr(3),
+            addr(4),
+            addr(5),
+            addr(6),
+            addr(7),
+            addr(8),
+            addr(9),
+            addr(10),
+            addr(11),
+            addr(12),
+            addr(0xff),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn short_hash_is_stable_distinct_and_hex() {
+        let a = short_hash(b"alpha");
+        assert_eq!(a, short_hash(b"alpha"), "same input, same hash");
+        assert_ne!(a, short_hash(b"beta"), "different input, different hash");
+        assert_eq!(a.len(), 16, "8 bytes as hex");
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn write_atomic_commits_whole_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        assert!(!nonempty_file(&path), "absent before write");
+        write_atomic(&path, b"0xdeadbeef").expect("atomic write");
+        assert!(nonempty_file(&path), "present after write");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"0xdeadbeef");
+        // No sibling temp file is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name() != "state.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file renamed away, found {leftovers:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn read_manifest_parses_contracts_and_usdc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("manifest.json");
+        write_json(&path, &sample_manifest_json());
+        let (addrs, usdc) = read_manifest(&path).expect("parse manifest");
+        assert_eq!(addrs.capacity_bond, Address::with_last_byte(1));
+        assert_eq!(addrs.content_blacklist, Address::with_last_byte(12));
+        assert_eq!(usdc, Address::with_last_byte(0xff));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn read_manifest_requires_usdc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("manifest.json");
+        // Strip externalDeps: the settlement token must be present.
+        write_json(&path, r#"{ "contracts": {} }"#);
+        assert!(read_manifest(&path).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn load_cached_deployment_needs_both_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state.json");
+        let manifest = dir.path().join("manifest.json");
+
+        // Neither present, or only one present, is a miss.
+        assert!(
+            load_cached_deployment(&state, &manifest)
+                .expect("miss")
+                .is_none()
+        );
+        write_atomic(&state, b"0x00").expect("write state");
+        assert!(
+            load_cached_deployment(&state, &manifest)
+                .expect("half-written miss")
+                .is_none(),
+            "manifest is the commit marker; state alone is not a hit"
+        );
+
+        // Both present is a hit that surfaces the parsed addresses.
+        write_json(&manifest, &sample_manifest_json());
+        let hit = load_cached_deployment(&state, &manifest)
+            .expect("hit")
+            .expect("some");
+        assert_eq!(hit.usdc, Address::with_last_byte(0xff));
+        assert_eq!(hit.state_path, state);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn artifact_cache_key_invalidates_on_bytecode_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let contracts = dir.path();
+        let usdc = contracts.join("out/MintableUSDC.sol/MintableUSDC.json");
+        let deploy = contracts.join("out/DeployProtocol.s.sol/DeployProtocol.json");
+        write_json(&usdc, r#"{ "bytecode": { "object": "0x6001" } }"#);
+        write_json(&deploy, r#"{ "bytecode": { "object": "0x6002" } }"#);
+
+        let key1 = artifact_cache_key(contracts).expect("key1");
+        assert_eq!(
+            key1,
+            artifact_cache_key(contracts).expect("key1 again"),
+            "deterministic"
+        );
+
+        // A recompiled deploy script (embeds every `new`d contract) rekeys the cache.
+        write_json(&deploy, r#"{ "bytecode": { "object": "0x6003" } }"#);
+        assert_ne!(key1, artifact_cache_key(contracts).expect("key2"));
+    }
+
+    #[test]
+    fn cache_dir_is_per_checkout() {
+        assert_ne!(
+            cache_dir(Path::new("/a/contracts")),
+            cache_dir(Path::new("/b/contracts"))
+        );
+    }
+
     /// Regression test for the deploy-retry death spiral (#785).
     ///
     /// Models the state a SIGKILLed `forge script` leaves behind: a transaction
