@@ -385,6 +385,10 @@ pub struct NodeOriginDeps {
     /// Per-region byte accountant; the inbound (`bytes_in`) counterpart of the
     /// serve path's `record_served`. Fed on each delivered pull (#858).
     pub region_accountant: Arc<crate::region_accounting::RegionAccountant>,
+    /// The `CapacityBond` registry's `NodeId → regionHint` projection (ADR 030),
+    /// read on the selection/pull path to apply the region-latency penalty to a
+    /// same-region peer that answers slower than the ceiling.
+    pub registry_regions: Arc<std::sync::RwLock<HashMap<DhtNodeId, String>>>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
     /// The live voucher ledger of each provider's current channel, shared by every
@@ -1335,11 +1339,11 @@ async fn probe_candidate(
     // Peer's self-attested region (ADR 030), resolved from the on-chain
     // `CapacityBond` registry projection; empty when the registry has no
     // region hint for this peer.
-    let region = deps
-        .region_accountant
-        .region_of(peer.as_bytes())
-        .await
-        .unwrap_or_default();
+    let region = crate::dht::capacity_bond_registry::region_of(
+        &deps.registry_regions,
+        DhtNodeId::from_bytes(*peer.as_bytes()),
+    )
+    .unwrap_or_default();
     // ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
     // node's own region yet answers slower than the latency ceiling is spoofing
     // its region. A local-only signal — folded straight into the local EWMA — so
@@ -1430,11 +1434,9 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             // upstream state corruption — skip rather than panic.
             continue;
         };
-        let region = deps
-            .region_accountant
-            .region_of(provider.node_id.as_bytes())
-            .await
-            .unwrap_or_default();
+        let region =
+            crate::dht::capacity_bond_registry::region_of(&deps.registry_regions, provider.node_id)
+                .unwrap_or_default();
         // Deliberately NOT re-running the ADR 030 region-latency penalty here,
         // unlike `probe_candidate`. That penalty reads a probe's `rtt` as EVIDENCE
         // against a self-attested region claim, and we already scored this rtt

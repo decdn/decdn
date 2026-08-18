@@ -602,6 +602,18 @@ where
     })
 }
 
+/// Read a node's operator-attested region (ADR 030) straight from the registry's
+/// `NodeId → regionHint` projection, or `None` when the registry holds no region
+/// for it. A poisoned lock resolves to `None` (a missing region, so no same-region
+/// latency penalty applies) rather than propagating — the projection is the sole
+/// reader path for the ADR-030 selection penalty.
+pub(crate) fn region_of(
+    regions: &Arc<RwLock<HashMap<NodeId, String>>>,
+    id: NodeId,
+) -> Option<String> {
+    regions.read().ok().and_then(|g| g.get(&id).cloned())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -722,10 +734,6 @@ mod tests {
         id: NodeId,
     ) -> Option<Address> {
         bindings.and_then(|b| b.read().ok().and_then(|g| g.get(&id).copied()))
-    }
-
-    fn region_of(regions: &Arc<RwLock<HashMap<NodeId, String>>>, id: NodeId) -> Option<String> {
-        regions.read().ok().and_then(|g| g.get(&id).cloned())
     }
 
     fn reverse_of(

@@ -851,6 +851,7 @@ async fn build_origin_with_probe_caches(
         probe_cache,
         metrics: Arc::clone(metrics),
         region_accountant: Arc::clone(region_accountant),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
@@ -995,6 +996,7 @@ async fn build_origin_multi_hash(
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(metrics),
         region_accountant: Arc::clone(region_accountant),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
@@ -1559,6 +1561,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
         region_accountant: empty_region_accountant(),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
@@ -9799,6 +9802,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
         region_accountant: empty_region_accountant(),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
@@ -12280,6 +12284,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
         region_accountant: empty_region_accountant(),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),

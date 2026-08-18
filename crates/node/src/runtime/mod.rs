@@ -730,6 +730,9 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
     region_accountant: Arc<crate::region_accounting::RegionAccountant>,
+    /// The `CapacityBond` registry's `NodeId → regionHint` projection (ADR 030),
+    /// threaded to the node-origin pull path for the region-latency penalty.
+    registry_regions: Arc<std::sync::RwLock<std::collections::HashMap<crate::dht::NodeId, String>>>,
     client_handler: Arc<ClientHandler>,
     payment_service: PoolSettlementService<P>,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -1059,7 +1062,7 @@ async fn build_chain_and_handlers(
     // CapacityBond registry projection; shared (via Arc) with the client handler
     // (records served bytes) and the admin surface (admin_v1_regionStats).
     let region_accountant = Arc::new(crate::region_accounting::RegionAccountant::new(Arc::new(
-        crate::region_accounting::RegistryRegionResolver::new(registry_regions),
+        crate::region_accounting::RegistryRegionResolver::new(Arc::clone(&registry_regions)),
     )));
 
     // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
@@ -1316,6 +1319,7 @@ async fn build_chain_and_handlers(
         dht_handler,
         dht_routing,
         region_accountant,
+        registry_regions,
         client_handler,
         payment_service,
         blacklist_watcher,
@@ -1810,6 +1814,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let origin_directory_c = Arc::clone(&ch.origin_directory);
     let local_reputation_c = Arc::clone(&local_reputation);
     let region_accountant_c = Arc::clone(&ch.region_accountant);
+    let registry_regions_c = Arc::clone(&ch.registry_regions);
     let node_metrics_for_buyer = Arc::clone(&infra.node_metrics);
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
     let node_origin_engine = infra.cache.clone();
@@ -1882,6 +1887,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     probe_cache: crate::dht::PositiveProbeCache::new(),
                     metrics: node_metrics_for_origin,
                     region_accountant: region_accountant_c,
+                    registry_regions: registry_regions_c,
                     config: node_origin_config,
                     // One voucher ledger per provider channel, shared by every concurrent
                     // pull on it (#1145 review). Built here, at the single place the pull
