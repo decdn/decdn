@@ -13,6 +13,7 @@ pub mod config_cmd;
 pub mod fetch;
 pub mod key_gen;
 pub mod node;
+pub mod origin;
 pub mod pool;
 pub mod probe;
 pub mod publish;
@@ -33,6 +34,7 @@ pub use node::{
     NodeArgs, NodeCommand, RegionStatsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs,
     RotateKeyTarget, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
 };
+pub use origin::{OriginArgs, OriginCommand, OriginIndexArgs};
 pub use pool::{
     PoolArgs, PoolAssignArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs,
     PoolOpenArgs, PoolReclaimArgs, PoolTopUpArgs,
@@ -113,6 +115,8 @@ pub enum Command {
     Publish(PublishArgs),
     /// File a slash appeal, posting the appeal bond (ADR 028).
     Appeal(AppealArgs),
+    /// Generate `.obao4` outboards for configured filesystem origins.
+    Origin(OriginArgs),
 }
 
 #[cfg(test)]

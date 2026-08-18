@@ -55,6 +55,12 @@ walkdir = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# `decdn origin index` (#1511) computes the `{hex}.obao4` pre-order outboard
+# sibling the node's zero-copy fs-origin serve path reads. `bao-range` is a
+# leaf crate (bao-tree, NOT iroh-blobs), so the CLI's iroh-blobs-free
+# invariant (#578) holds — verify with
+# `cargo tree -p decdn-cli -e normal -i iroh-blobs` (must be empty).
+decdn-bao-range = { workspace = true }
 # `decdn fetch` (#1118) renders a delivery progress bar to stderr. TTY-aware, so
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.

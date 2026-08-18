@@ -16,6 +16,7 @@ pub mod fetch;
 pub mod key_gen;
 pub mod node;
 pub mod node_top;
+pub mod origin;
 pub mod pool;
 pub mod probe;
 pub mod publish;

@@ -56,5 +56,6 @@ async fn run() -> anyhow::Result<()> {
                 commands::appeal::run(&slash, config_path.as_deref()).await
             }
         },
+        Command::Origin(args) => commands::origin::origin_dispatch(&args, config_path.as_deref()),
     }
 }
