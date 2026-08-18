@@ -465,34 +465,6 @@ pub struct SlashesResponse {
     pub slashes: Vec<SlashRecordDto>,
 }
 
-/// Region-bucket key for traffic whose counterparty has no known region (#750).
-pub const UNKNOWN_REGION: &str = "UNKNOWN";
-
-/// One region's cumulative byte counters (issue #750). `region` is an
-/// ISO 3166-1 alpha-2 code (the peer's self-attested on-chain region hint,
-/// ADR 030) or the [`UNKNOWN_REGION`] bucket for traffic whose counterparty
-/// has no known region (a non-peer end-client, or a peer not in the table).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegionBytes {
-    /// ISO 3166-1 alpha-2 region code, or [`UNKNOWN_REGION`].
-    pub region: String,
-    /// Cumulative bytes this node has *pulled from* counterparties in this
-    /// region since process start. Reads `0` until node-to-node pull-through
-    /// is orchestrated (#750).
-    pub bytes_in: u64,
-    /// Cumulative bytes this node has *served to* counterparties in this
-    /// region since process start.
-    pub bytes_out: u64,
-}
-
-/// Response for `admin_v1_regionStats` (issue #750): per-region cumulative
-/// bytes-in / bytes-out, region-sorted. Empty when no accountant is wired.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegionStatsResponse {
-    /// One entry per region observed since process start, sorted by region code.
-    pub regions: Vec<RegionBytes>,
-}
-
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -642,15 +614,6 @@ pub trait AdminRpc {
     /// be read.
     #[method(name = "lanes")]
     async fn lanes(&self) -> RpcResult<LanesResponse>;
-
-    /// Return cumulative per-region bandwidth (issue #750): bytes served to
-    /// and pulled from each region, keyed by the counterparty peer's
-    /// self-attested on-chain region hint (ADR 030), with a `"UNKNOWN"`
-    /// bucket for unattributable traffic. Totals are cumulative since process
-    /// start. Backs `decdn node region-stats`. Returns an empty list (not an
-    /// error) on a node with no accounting wired.
-    #[method(name = "regionStats")]
-    async fn region_stats(&self) -> RpcResult<RegionStatsResponse>;
 
     /// Return every slash the node's watcher has detected against its own
     /// operator (#1032, G-NODE-05): per slash the `slashId`, offense type,
@@ -815,31 +778,5 @@ mod tests {
         let second = back.lanes.get(1).expect("second lane");
         assert_eq!(second.seconds_since_last_voucher, None);
         assert!(!second.settlement_eligible);
-    }
-
-    #[test]
-    fn region_stats_response_round_trips() {
-        let resp = RegionStatsResponse {
-            regions: vec![
-                RegionBytes {
-                    region: "DE".to_string(),
-                    bytes_in: 1_048_576,
-                    bytes_out: 5_242_880,
-                },
-                RegionBytes {
-                    region: "UNKNOWN".to_string(),
-                    bytes_in: 0,
-                    bytes_out: 2_097_152,
-                },
-            ],
-        };
-        let json = serde_json::to_string(&resp).expect("serialize RegionStatsResponse");
-        let back: RegionStatsResponse =
-            serde_json::from_str(&json).expect("deserialize RegionStatsResponse");
-        assert_eq!(back.regions.len(), 2);
-        let first = back.regions.first().expect("first region");
-        assert_eq!(first.region, "DE");
-        assert_eq!(first.bytes_in, 1_048_576);
-        assert_eq!(first.bytes_out, 5_242_880);
     }
 }

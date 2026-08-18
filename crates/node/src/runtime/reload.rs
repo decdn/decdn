@@ -795,8 +795,6 @@ impl RuntimeReloadState {
                 metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 admin_port: Some(9191),
                 otlp_endpoint: None,
-                region_accounting_interval_sec:
-                    decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
@@ -1036,7 +1034,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
     {
         warn_ignored(
             "observability.* (log_format, metrics_port, metrics_bind, otlp_endpoint, \
-             admin_port, region_accounting_interval_sec)",
+             admin_port)",
         );
     }
     if file.dht.is_some() {
@@ -1140,14 +1138,12 @@ const fn observability_has_restart_required_field(
         metrics_bind,
         admin_port,
         otlp_endpoint,
-        region_accounting_interval_sec,
     } = o;
     log_format.is_some()
         || metrics_port.is_some()
         || metrics_bind.is_some()
         || admin_port.is_some()
         || otlp_endpoint.is_some()
-        || region_accounting_interval_sec.is_some()
 }
 
 #[cfg(test)]
@@ -1260,8 +1256,6 @@ mod tests {
                 metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 admin_port: Some(9191),
                 otlp_endpoint: None,
-                region_accounting_interval_sec:
-                    decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

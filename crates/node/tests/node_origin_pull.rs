@@ -30,7 +30,6 @@ use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
 use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
-use decdn_common::admin::RegionBytes;
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolOpenFailureReason,
     PoolStateStore, ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain,
@@ -46,7 +45,6 @@ use decdn_node::dht::{
 };
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, TeeVerdict};
-use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
 use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
@@ -467,26 +465,6 @@ fn spawn_a_probe_counting_server(
     })
 }
 
-/// Static node-id → region map for the region accountant (#858), mirroring the
-/// in-crate `StubResolver` so a test can drive `record_pulled` into an
-/// assertable region bucket.
-struct StubRegionResolver(HashMap<[u8; 32], String>);
-
-#[async_trait]
-impl RegionResolver for StubRegionResolver {
-    async fn region_of(&self, node_id: &[u8; 32]) -> Option<String> {
-        self.0.get(node_id).cloned()
-    }
-}
-
-/// A region accountant resolving nothing — every pull buckets into
-/// `UNKNOWN_REGION`. Used by the tests that don't assert region totals.
-fn empty_region_accountant() -> Arc<RegionAccountant> {
-    Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
-        HashMap::new(),
-    ))))
-}
-
 /// Build B's `NodeOrigin` with stubbed discovery (`providers` for `hash` via the
 /// origin directory), a static `addr_map` resolver, a fixed-channel opener, and
 /// real reputation/metrics handles. Tests vary `providers`/`addr_map` to drive
@@ -512,41 +490,6 @@ async fn provisioned_origin(
     Arc<Mutex<Vec<ProgressEntry>>>,
     tempfile::TempDir,
 ) {
-    provisioned_origin_with_accountant(
-        ep_b,
-        b_dht,
-        hash,
-        pool_id,
-        buyer_signer,
-        local_rep,
-        metrics,
-        &empty_region_accountant(),
-        providers,
-        addr_map,
-    )
-    .await
-}
-
-/// Like [`provisioned_origin`], but with a caller-supplied region accountant so a
-/// test can assert that a delivered pull feeds `bytes_in` (#858).
-#[allow(clippy::too_many_arguments)]
-async fn provisioned_origin_with_accountant(
-    ep_b: &iroh::Endpoint,
-    b_dht: DhtNodeId,
-    hash: Hash,
-    pool_id: B256,
-    buyer_signer: &Arc<PrivateKeySigner>,
-    local_rep: &Arc<LocalReputation>,
-    metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
-    providers: Vec<DhtNodeId>,
-    addr_map: HashMap<DhtNodeId, Address>,
-) -> (
-    NodeOrigin,
-    CacheEngine,
-    Arc<Mutex<Vec<ProgressEntry>>>,
-    tempfile::TempDir,
-) {
     provisioned_origin_with_deadlines(
         ep_b,
         b_dht,
@@ -555,7 +498,6 @@ async fn provisioned_origin_with_accountant(
         buyer_signer,
         local_rep,
         metrics,
-        region_accountant,
         providers,
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES,
@@ -568,7 +510,7 @@ async fn provisioned_origin_with_accountant(
 const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
     (Duration::from_secs(20), Duration::from_secs(20));
 
-/// Like [`provisioned_origin_with_accountant`], but the caller picks the node-origin
+/// Like [`provisioned_origin`], but the caller picks the node-origin
 /// deadline budgets.
 ///
 /// The interesting value is a ZERO one. `NodeOriginConfig::deadlines()` refuses it and marks
@@ -592,7 +534,6 @@ async fn provisioned_origin_with_deadlines(
     buyer_signer: &Arc<PrivateKeySigner>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     (pull_timeout, stall_timeout): (Duration, Duration),
@@ -618,7 +559,6 @@ async fn provisioned_origin_with_deadlines(
         buyer,
         local_rep,
         metrics,
-        region_accountant,
         providers,
         addr_map,
         pull_timeout,
@@ -661,7 +601,6 @@ async fn provisioned_origin_with_ceiling(
         buyer,
         local_rep,
         metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -682,7 +621,6 @@ async fn build_origin(
     buyer: Arc<dyn PoolOpener>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
@@ -693,7 +631,6 @@ async fn build_origin(
         buyer,
         local_rep,
         metrics,
-        region_accountant,
         providers,
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES.0,
@@ -714,7 +651,6 @@ async fn build_origin_with_timeout(
     buyer: Arc<dyn PoolOpener>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
@@ -728,7 +664,6 @@ async fn build_origin_with_timeout(
         buyer,
         local_rep,
         metrics,
-        region_accountant,
         providers,
         addr_map,
         pull_timeout,
@@ -756,7 +691,6 @@ async fn build_origin_with_negative_cache(
     buyer: Arc<dyn PoolOpener>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
@@ -771,7 +705,6 @@ async fn build_origin_with_negative_cache(
         buyer,
         local_rep,
         metrics,
-        region_accountant,
         providers,
         addr_map,
         pull_timeout,
@@ -803,7 +736,6 @@ async fn build_origin_with_probe_caches(
     buyer: Arc<dyn PoolOpener>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
@@ -850,7 +782,7 @@ async fn build_origin_with_probe_caches(
         negative_cache,
         probe_cache,
         metrics: Arc::clone(metrics),
-        region_accountant: Arc::clone(region_accountant),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
@@ -906,7 +838,6 @@ async fn build_origin_seeded_ranking(
     buyer: Arc<dyn PoolOpener>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     ranked: &[(DhtNodeId, u64)],
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
@@ -934,7 +865,6 @@ async fn build_origin_seeded_ranking(
         buyer,
         local_rep,
         metrics,
-        region_accountant,
         providers,
         addr_map,
         pull_timeout,
@@ -960,7 +890,6 @@ async fn build_origin_multi_hash(
     buyer: Arc<dyn PoolOpener>,
     local_rep: &Arc<LocalReputation>,
     metrics: &Arc<Metrics>,
-    region_accountant: &Arc<RegionAccountant>,
     providers: &[DhtNodeId],
     addr_map: HashMap<DhtNodeId, Address>,
     pull_timeout: Duration,
@@ -994,7 +923,7 @@ async fn build_origin_multi_hash(
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(metrics),
-        region_accountant: Arc::clone(region_accountant),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout,
@@ -1349,12 +1278,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    // Resolve upstream A to a known region so the delivered pull's inbound bytes
-    // land in an assertable bucket (#858).
-    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
-        HashMap::from([(*a_id.as_bytes(), "DE".to_string())]),
-    ))));
-    let (origin, engine, recorded, _engine_tmp) = provisioned_origin_with_accountant(
+    let (origin, engine, recorded, _engine_tmp) = provisioned_origin(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -1362,7 +1286,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         &b_buyer,
         &local_rep,
         &b_metrics,
-        &region_accountant,
         providers,
         addr_map,
     )
@@ -1406,19 +1329,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
             == vec![(a_eth.address(), U256::from(expected_wire), expected_amount)],
         "expected one persisted progress entry with the final voucher totals, got {:?}",
         progress_log(&recorded)?
-    );
-
-    // #858: the delivered pull fed the region accountant's inbound counter for
-    // upstream A's region — the gap that left `bytes_in` stuck at 0.
-    anyhow::ensure!(
-        region_accountant.snapshot()
-            == vec![RegionBytes {
-                region: "DE".to_string(),
-                bytes_in: total_bytes,
-                bytes_out: 0,
-            }],
-        "expected DE bytes_in == {total_bytes}, got {:?}",
-        region_accountant.snapshot()
     );
 
     shutdown([], [&ep_b, &ep_a]).await;
@@ -1558,7 +1468,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
-        region_accountant: empty_region_accountant(),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
@@ -2406,15 +2316,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    // Map both candidates to distinct regions so the snapshot proves the stalled
-    // candidate (Err arm) records no `bytes_in` while only the delivered honest
-    // fallback (Ok arm) is counted (#858).
-    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
-        HashMap::from([
-            (*s_id.as_bytes(), "XX".to_string()),
-            (*a_id.as_bytes(), "DE".to_string()),
-        ]),
-    ))));
     // The staller quotes the cheaper `STALL_RATE` so it ranks ahead of A (`RATE`).
     // Order is PINNED via a seeded probe cache: RTT is a multiplicative ranker term, so
     // a loaded runner's live-probe jitter could otherwise float A ahead of the staller,
@@ -2427,7 +2328,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &region_accountant,
         &[(s_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
         // Short per-candidate budget so the stall is abandoned quickly. With the
@@ -2480,21 +2380,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     // return, so it must not also land in any sibling buyer-side bucket.
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
-
-    // #858: the stalled candidate S (Err arm) records no `bytes_in`; only the
-    // delivered honest fallback A (Ok arm, region "DE") is counted — no "XX"
-    // bucket appears. Guards the "failed pulls are not counted" contract and
-    // multi-candidate attribution in one assertion.
-    anyhow::ensure!(
-        region_accountant.snapshot()
-            == vec![RegionBytes {
-                region: "DE".to_string(),
-                bytes_in: total_bytes,
-                bytes_out: 0,
-            }],
-        "expected only DE bytes_in == {total_bytes} (S exonerated, not counted), got {:?}",
-        region_accountant.snapshot()
-    );
 
     shutdown([], [&ep_b, &ep_a, &ep_s]).await;
     task_a.await?;
@@ -2651,13 +2536,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         attempted: Arc::clone(&attempted),
         stall,
     }) as Arc<dyn PoolOpener>;
-    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
-        HashMap::from([
-            (*w_id.as_bytes(), "XX".to_string()),
-            (*w2_id.as_bytes(), "XX".to_string()),
-            (*a_id.as_bytes(), "DE".to_string()),
-        ]),
-    ))));
     // Generous: this fixture wedges at the CHANNEL-OPEN stage, so the streaming
     // inactivity bound must never be what ends a candidate here. It still has to be a
     // real value — it is a term of the outer deadline.
@@ -2670,7 +2548,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         buyer,
         &local_rep,
         &b_metrics,
-        &region_accountant,
         vec![w_dht, w2_dht, a_dht],
         addr_map,
         per_candidate,
@@ -2898,13 +2775,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
-    let region_accountant = Arc::new(RegionAccountant::new(Arc::new(StubRegionResolver(
-        HashMap::from([
-            (*s1_id.as_bytes(), "XX".to_string()),
-            (*s2_id.as_bytes(), "XX".to_string()),
-            (*a_id.as_bytes(), "DE".to_string()),
-        ]),
-    ))));
     // 3s per candidate. Deliberately not 1s: this budget now bounds EVERY candidate
     // open, including the honest one, and A's open is a real QUIC handshake +
     // `open_or_reuse_pool` + verified-header exchange. At 1s a loaded CI runner
@@ -2922,7 +2792,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         buyer,
         &local_rep,
         &b_metrics,
-        &region_accountant,
         &[(s1_dht, STALL_RATE), (s2_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
         per_candidate,
@@ -2977,9 +2846,8 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
 
     // The abandoned opens forfeited nothing: no voucher was signed for either staller
-    // (the open dies before the first chunk), and no bytes were attributed to their
-    // region. Guards the resource half of #1141 — a per-candidate timeout that leaked
-    // spend on every stall would be a poor trade.
+    // (the open dies before the first chunk). Guards the resource half of #1141 — a
+    // per-candidate timeout that leaked spend on every stall would be a poor trade.
     let ledger_len = {
         let ledger = recorded.lock().expect("progress ledger not poisoned");
         ledger.len()
@@ -2987,11 +2855,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     anyhow::ensure!(
         ledger_len == 0,
         "a stalled open must record no voucher progress, got {ledger_len} entries"
-    );
-    anyhow::ensure!(
-        region_accountant.snapshot().is_empty(),
-        "nothing was delivered, so no region should have bytes_in; got {:?}",
-        region_accountant.snapshot()
     );
 
     shutdown([], [&ep_b, &ep_a, &ep_s1, &ep_s2]).await;
@@ -3400,7 +3263,6 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -3558,7 +3420,6 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         &ranked,
         addr_map,
         Duration::from_secs(20),
@@ -3710,7 +3571,6 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
             Arc::new(FailingOpener { shape }) as Arc<dyn PoolOpener>,
             &local_rep,
             &b_metrics,
-            &empty_region_accountant(),
             &ranked,
             addr_map,
             DEFAULT_TEST_PULL_DEADLINES.0,
@@ -3822,7 +3682,6 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         &ranked,
         addr_map,
         Duration::from_secs(20),
@@ -4071,7 +3930,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         &[(f_dht, CHEAP_RATE), (a_dht, RATE)],
         addr_map,
         Duration::from_secs(20),
@@ -4675,7 +4533,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -5061,7 +4918,6 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(10),
@@ -5157,7 +5013,6 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(10),
@@ -5278,7 +5133,6 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         // A GENEROUS open budget against a SHORT stall budget — the reverse of the
@@ -5399,7 +5253,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         // A generous OPEN budget, so the open stage is provably not what ends this: the peer
@@ -5526,7 +5379,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         // Both budgets generous: the error must be what ends this pull, not a deadline.
@@ -5642,7 +5494,6 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         // Generous budgets: the refusal must end this pull, not a deadline.
@@ -5753,7 +5604,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         &[a_dht],
         addr_map,
         Duration::from_secs(20),
@@ -5876,7 +5726,6 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         // Generous, as above: the rejection must be what ends this pull, not a deadline.
@@ -6093,7 +5942,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![s1_dht, s2_dht, a_dht],
         addr_map,
         per_candidate,
@@ -6225,7 +6073,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         SLOW_PULL_OPEN_BUDGET,
@@ -6425,7 +6272,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![n_dht, a_dht],
         addr_map,
         Duration::from_secs(20),
@@ -6578,7 +6424,6 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -6721,7 +6566,6 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -7203,7 +7047,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         &[a_dht],
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES.0,
@@ -7364,7 +7207,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
     )
@@ -7702,7 +7544,6 @@ async fn build_node_b_with_leaves(
         b_buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         node_pull_deadlines,
@@ -9798,7 +9639,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
-        region_accountant: empty_region_accountant(),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
@@ -10118,7 +9959,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -10272,7 +10112,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -10444,7 +10283,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![n0_dht, n1_dht, n2_dht],
         addr_map,
         Duration::from_secs(20),
@@ -10630,7 +10468,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![n_dht, h_dht],
         addr_map,
         Duration::from_secs(20),
@@ -10904,7 +10741,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![n_dht, a_dht],
         addr_map,
         Duration::from_secs(20),
@@ -11230,7 +11066,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![n_dht, h_dht],
         addr_map,
         Duration::from_secs(20),
@@ -11511,7 +11346,6 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         vec![n0_dht, n1_dht, n2_dht],
         addr_map,
         Duration::from_secs(20),
@@ -11700,7 +11534,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         Duration::from_secs(20),
@@ -11915,7 +11748,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         buyer,
         &local_rep,
         &b_metrics,
-        &empty_region_accountant(),
         &[a_dht, h_dht],
         addr_map,
         // Short pull/stall deadlines: fetch #3 dials the offline H at an address
@@ -12279,7 +12111,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
-        region_accountant: empty_region_accountant(),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         config: NodeOriginConfig {
             probe_fanout: 5,
             pull_timeout: Duration::from_secs(20),
@@ -12901,7 +12733,6 @@ async fn top_up_fixture_multi_rep(
         Arc::clone(&opener) as Arc<dyn PoolOpener>,
         &local_rep,
         &metrics,
-        &empty_region_accountant(),
         providers,
         addr_map,
         DEFAULT_TEST_PULL_DEADLINES.0,

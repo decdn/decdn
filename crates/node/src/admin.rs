@@ -21,7 +21,7 @@ use decdn_common::admin::{
     AdminRpcServer, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE,
     DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
     HealthResponse, LaneSnapshot, LanesResponse, POOL_STORE_ERROR_CODE, RELOAD_ERROR_CODE,
-    RecordStoreHealth, RegionStatsResponse, ReloadResponse, RepublishHealth, RoutingHealth,
+    RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth,
     SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
     parse_hash_arg,
 };
@@ -37,7 +37,6 @@ use tokio::sync::{Notify, oneshot};
 use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
-use crate::region_accounting::RegionAccountant;
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -105,10 +104,6 @@ pub struct AdminState {
     /// payment surface legitimately has zero lanes to report, and the
     /// CLI's empty-table sentinel covers it.
     lanes: Option<LaneStatusHandles>,
-    /// Per-region bandwidth accountant (issue #750), attached via
-    /// [`AdminState::with_region_accountant`]. `None` → `region_stats` returns
-    /// an empty list (a node with no accounting wired has nothing to report).
-    region_accountant: Option<Arc<RegionAccountant>>,
     /// Slash-detection handles backing `admin_v1_slashes` (#1032), attached via
     /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
     /// wired / unit tests) → `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
@@ -322,7 +317,6 @@ impl AdminState {
             metrics,
             dht: None,
             lanes: None,
-            region_accountant: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
         }
@@ -356,15 +350,6 @@ impl AdminState {
     #[must_use]
     pub fn with_lanes(mut self, lanes: LaneStatusHandles) -> Self {
         self.lanes = Some(lanes);
-        self
-    }
-
-    /// Attach the per-region bandwidth accountant so `admin_v1_regionStats`
-    /// can report its snapshot (issue #750). The production runtime calls this
-    /// once after `new`; without it, `region_stats` returns an empty list.
-    #[must_use]
-    pub fn with_region_accountant(mut self, accountant: Arc<RegionAccountant>) -> Self {
-        self.region_accountant = Some(accountant);
         self
     }
 
@@ -697,21 +682,6 @@ impl AdminRpcServer for AdminRpcImpl {
         Ok(LanesResponse {
             lanes,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
-        })
-    }
-
-    /// Return cumulative per-region bandwidth counters (issue #750).
-    async fn region_stats(&self) -> RpcResult<RegionStatsResponse> {
-        // No accountant wired (unit tests / a node with no accounting surface):
-        // report an empty list, not an error — zero regions is legitimate and
-        // the CLI renders an empty-table sentinel for it.
-        let Some(acc) = self.state.region_accountant.as_ref() else {
-            return Ok(RegionStatsResponse {
-                regions: Vec::new(),
-            });
-        };
-        Ok(RegionStatsResponse {
-            regions: acc.snapshot(),
         })
     }
 
@@ -1952,42 +1922,6 @@ mod tests {
         let resp = rpc.lanes().await.expect("lanes ok");
         assert!(resp.lanes.is_empty());
         assert_eq!(resp.redeem_threshold_micro_usdc, 0);
-    }
-
-    #[tokio::test]
-    async fn region_stats_without_accountant_returns_empty() {
-        let (state, _tmp) = state_with().await;
-        let rpc = AdminRpcImpl::new(state);
-        let resp = rpc.region_stats().await.expect("region_stats ok");
-        assert!(resp.regions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn region_stats_reports_attached_accountant_snapshot() {
-        use crate::region_accounting::{RegionAccountant, RegionResolver};
-
-        struct Fixed(String);
-        #[async_trait]
-        impl RegionResolver for Fixed {
-            async fn region_of(&self, _node_id: &[u8; 32]) -> Option<String> {
-                Some(self.0.clone())
-            }
-        }
-
-        let accountant = Arc::new(RegionAccountant::new(Arc::new(Fixed("DE".to_string()))));
-        accountant.record_served(&[1u8; 32], 4096).await;
-
-        let (state, _tmp) = state_with().await;
-        let state = state.with_region_accountant(Arc::clone(&accountant));
-        let rpc = AdminRpcImpl::new(state);
-
-        let resp = rpc.region_stats().await.expect("region_stats ok");
-        let de = resp
-            .regions
-            .iter()
-            .find(|r| r.region == "DE")
-            .expect("DE bucket present");
-        assert_eq!(de.bytes_out, 4096);
     }
 
     /// End-to-end through the RPC method: a store seeded with two lanes

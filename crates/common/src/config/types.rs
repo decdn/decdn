@@ -978,10 +978,6 @@ pub struct ObservabilityConfig {
     pub admin_port: Option<u16>,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,
-    /// Interval in seconds between per-region bandwidth accounting log lines
-    /// (issue #750). `0` disables the periodic log. Absent → default
-    /// `DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC` (3600).
-    pub region_accounting_interval_sec: Option<u64>,
 }
 
 /// Download-receipt audit-log retention section of the config file (#802).

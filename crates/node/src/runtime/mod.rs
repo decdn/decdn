@@ -310,29 +310,6 @@ fn log_keyspace_gc(kind: &'static str, layer: &'static str, sweep: Option<(usize
     }
 }
 
-/// Emit one structured log line per region in the accountant's snapshot.
-/// On an empty snapshot, emits a single `trace` heartbeat so a scraper can
-/// distinguish an idle node (no traffic yet) from a dead log task.
-fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) {
-    let snapshot = accountant.snapshot();
-    if snapshot.is_empty() {
-        tracing::trace!(
-            event = "region_bandwidth_idle",
-            "per-region bandwidth: no traffic recorded yet"
-        );
-        return;
-    }
-    for r in snapshot {
-        tracing::info!(
-            event = "region_bandwidth",
-            region = %r.region,
-            bytes_in = r.bytes_in,
-            bytes_out = r.bytes_out,
-            "per-region bandwidth (cumulative since start)"
-        );
-    }
-}
-
 /// Runtime infrastructure built during the front bring-up phase of [`run`].
 ///
 /// A plain by-value bundle of the long-lived handles the rest of `run` (and the
@@ -729,7 +706,9 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     origin_directory: Arc<dyn crate::dht::origin::OriginDirectory>,
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
-    region_accountant: Arc<crate::region_accounting::RegionAccountant>,
+    /// The `CapacityBond` registry's `NodeId → regionHint` projection (ADR 030),
+    /// threaded to the node-origin pull path for the region-latency penalty.
+    registry_regions: Arc<std::sync::RwLock<std::collections::HashMap<crate::dht::NodeId, String>>>,
     client_handler: Arc<ClientHandler>,
     payment_service: PoolSettlementService<P>,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -1055,13 +1034,6 @@ async fn build_chain_and_handlers(
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
 
-    // Per-region bandwidth accountant (#750). Resolves regions from the on-chain
-    // CapacityBond registry projection; shared (via Arc) with the client handler
-    // (records served bytes) and the admin surface (admin_v1_regionStats).
-    let region_accountant = Arc::new(crate::region_accounting::RegionAccountant::new(Arc::new(
-        crate::region_accounting::RegistryRegionResolver::new(registry_regions),
-    )));
-
     // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
     // serve-miss path whenever the operator configured any origin (`[cache.origin]`),
     // INDEPENDENT of `node_to_node_pull_through_enabled`: a cache-only operator must
@@ -1170,7 +1142,6 @@ async fn build_chain_and_handlers(
     let pool_view = crate::pool_view::PoolProjection::new();
     client_deps.pool_view =
         Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>);
-    client_deps.region_accountant = Some(Arc::clone(&region_accountant));
     client_deps.local_populate = local_populate;
     client_deps.pull_through = pull_through;
     client_deps.pull_through_origin = pull_through_origin;
@@ -1315,7 +1286,7 @@ async fn build_chain_and_handlers(
         origin_directory,
         dht_handler,
         dht_routing,
-        region_accountant,
+        registry_regions,
         client_handler,
         payment_service,
         blacklist_watcher,
@@ -1334,7 +1305,6 @@ async fn build_chain_and_handlers(
 struct Background {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
-    region_log_stop_tx: Option<oneshot::Sender<()>>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
     origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
@@ -1448,23 +1418,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 );
             }
         })
-    };
-
-    // Periodic per-region bandwidth log (#750). `interval == 0` disables it,
-    // mirroring the RPC watchdog's opt-out. Same oneshot-stop shape as the GCs.
-    let region_log_stop_tx = if cfg.observability.region_accounting_interval_sec > 0 {
-        let accountant = Arc::clone(&ch.region_accountant);
-        Some(spawn_periodic(
-            &mut tasks,
-            "region_accounting_log",
-            Duration::from_secs(cfg.observability.region_accounting_interval_sec),
-            move || log_region_snapshot(&accountant),
-        ))
-    } else {
-        tracing::info!(
-            "region accounting log disabled (observability.region_accounting_interval_sec = 0)"
-        );
-        None
     };
 
     // Periodic DHT record-store GC (ADR 022 §Content Records and TTL).
@@ -1809,7 +1762,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let staker_set_c = Arc::clone(&ch.staker_set);
     let origin_directory_c = Arc::clone(&ch.origin_directory);
     let local_reputation_c = Arc::clone(&local_reputation);
-    let region_accountant_c = Arc::clone(&ch.region_accountant);
+    let registry_regions_c = Arc::clone(&ch.registry_regions);
     let node_metrics_for_buyer = Arc::clone(&infra.node_metrics);
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
     let node_origin_engine = infra.cache.clone();
@@ -1881,7 +1834,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     negative_cache: crate::dht::NegativeProbeCache::new(),
                     probe_cache: crate::dht::PositiveProbeCache::new(),
                     metrics: node_metrics_for_origin,
-                    region_accountant: region_accountant_c,
+                    registry_regions: registry_regions_c,
                     config: node_origin_config,
                     // One voucher ledger per provider channel, shared by every concurrent
                     // pull on it (#1145 review). Built here, at the single place the pull
@@ -1965,7 +1918,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
-        .with_region_accountant(Arc::clone(&ch.region_accountant))
         // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {
@@ -2009,7 +1961,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     Ok(Background {
         metrics_stop_tx,
         dispatch_gc_stop_tx,
-        region_log_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
         eviction_stop_tx,
@@ -2087,7 +2038,6 @@ pub async fn run(
         metrics_stop_tx: bg.metrics_stop_tx,
         dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
-        region_log_stop_tx: bg.region_log_stop_tx,
         origin_rescan_stop_tx: bg.origin_rescan_stop_tx,
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
         eviction_stop_tx: bg.eviction_stop_tx,
@@ -2122,7 +2072,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
-    region_log_stop_tx: Option<oneshot::Sender<()>>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
     origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
@@ -2167,7 +2116,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         metrics_stop_tx,
         dispatch_gc_stop_tx,
         buyer_bootstrap_stop_tx,
-        region_log_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
         eviction_stop_tx,
@@ -2215,10 +2163,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // bootstrap-failed path the task already returned and dropped the receiver,
     // so this send errors harmlessly.
     let _ = buyer_bootstrap_stop_tx.send(());
-    // region bandwidth accounting log (#750)
-    if let Some(tx) = region_log_stop_tx {
-        let _ = tx.send(());
-    }
     // origin-held-index periodic rescan (#1130)
     if let Some(tx) = origin_rescan_stop_tx {
         let _ = tx.send(());
@@ -3589,8 +3533,6 @@ mod tests {
                 metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 admin_port: Some(9191),
                 otlp_endpoint: None,
-                region_accounting_interval_sec:
-                    decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

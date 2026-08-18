@@ -58,7 +58,6 @@ use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
 use crate::receipt_log::{DownloadReceipt, ReceiptSink};
-use crate::region_accounting::RegionAccountant;
 
 // The paid-delivery methods are split across concern-focused submodules, each
 // a bare `impl ClientHandler` block over the fields defined here. Support
@@ -763,7 +762,6 @@ pub struct ClientHandlerDeps {
     pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
     pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
-    pub region_accountant: Option<Arc<RegionAccountant>>,
     pub pull_through: Option<Duration>,
     pub local_populate: Option<Duration>,
     pub pull_through_origin: Option<Arc<NodeOrigin>>,
@@ -846,7 +844,6 @@ impl ClientHandlerDeps {
             max_concurrent_streams,
             content_deny,
             redeem_hint: None,
-            region_accountant: None,
             pull_through: None,
             local_populate: None,
             pull_through_origin: None,
@@ -921,10 +918,6 @@ pub struct ClientHandler {
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
     /// full channel just skips it. Keyed by [`LaneKey`]: redemption is per-lane.
     redeem_hint: Option<mpsc::Sender<LaneKey>>,
-    /// Per-region bandwidth accountant (issue #750), set at construction via
-    /// [`ClientHandlerDeps`]. `None` when no admin surface is wired (tests) —
-    /// recording is best-effort, so the handler simply skips it.
-    region_accountant: Option<Arc<RegionAccountant>>,
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
     /// tests) keeps the pre-#831 behaviour: a cache miss returns `NotFound`. When
@@ -1092,7 +1085,6 @@ impl ClientHandler {
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
             redeem_hint: deps.redeem_hint,
-            region_accountant: deps.region_accountant,
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,

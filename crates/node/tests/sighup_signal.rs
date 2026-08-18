@@ -122,8 +122,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             admin_port: Some(9191),
             otlp_endpoint: None,
-            region_accounting_interval_sec:
-                decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,

@@ -190,9 +190,6 @@ impl ClientHandler {
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
         self.record_receipt(hash, delta_bytes, client_node_id, verified.amount);
-        if let Some(acc) = self.region_accountant.as_ref() {
-            acc.record_served(&client_node_id.0, delta_bytes).await;
-        }
         // Hint the settlement service that this lane's accrued claim advanced
         // (#749/#327). Best-effort: an absent sender or a full channel just skips.
         if let Some(tx) = self.redeem_hint.as_ref()

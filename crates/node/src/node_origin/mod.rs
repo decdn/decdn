@@ -382,9 +382,10 @@ pub struct NodeOriginDeps {
     pub probe_cache: PositiveProbeCache,
     /// Node metrics for the paid-pull observability counters (#831).
     pub metrics: Arc<Metrics>,
-    /// Per-region byte accountant; the inbound (`bytes_in`) counterpart of the
-    /// serve path's `record_served`. Fed on each delivered pull (#858).
-    pub region_accountant: Arc<crate::region_accounting::RegionAccountant>,
+    /// The `CapacityBond` registry's `NodeId → regionHint` projection (ADR 030),
+    /// read on the selection/pull path to apply the region-latency penalty to a
+    /// same-region peer that answers slower than the ceiling.
+    pub registry_regions: Arc<std::sync::RwLock<HashMap<DhtNodeId, String>>>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
     /// The live voucher ledger of each provider's current channel, shared by every
@@ -749,7 +750,6 @@ impl NodeOrigin {
                     pool_id: ctx.pool_id,
                     started: Instant::now(),
                     delivered: 0,
-                    node_id: candidate.node_id,
                     hash_bytes,
                     settle: SettleOnDrop {
                         deps: Arc::clone(&self.deps),
@@ -797,9 +797,9 @@ pub enum TeeVerdict {
 
 /// A live window-paced node→node pull (#856) handed to the `cdn/client/v1`
 /// serve path. Wraps the [`UpstreamPull`] transport with the node-origin
-/// bookkeeping (buyer-watermark persistence #852, reputation scoring, region
-/// accounting) so the serve handler only has to pump chunks and call one
-/// terminal method. Obtain via [`NodeOrigin::open_progressive_pull`].
+/// bookkeeping (buyer-watermark persistence #852, reputation scoring) so the
+/// serve handler only has to pump chunks and call one terminal method. Obtain
+/// via [`NodeOrigin::open_progressive_pull`].
 ///
 /// # No reactive top-up here, deliberately (#1530)
 ///
@@ -826,10 +826,8 @@ pub struct NodeProgressivePull {
     provider_addr: Address,
     pool_id: B256,
     started: Instant,
-    /// Bytes pulled (and forwarded) on this stream — the region/reputation count.
+    /// Bytes pulled (and forwarded) on this stream — the reputation count.
     delivered: u64,
-    /// Candidate node id, for region accounting.
-    node_id: [u8; 32],
     /// Blob hash, for failure classification and provider scoring.
     hash_bytes: [u8; 32],
     /// Settles the voucher watermark on EVERY exit, including a drop.
@@ -859,7 +857,7 @@ impl NodeProgressivePull {
 
     /// Read and forward the next upstream chunk, paying the upstream per voucher
     /// interval. `Ok(None)` signals the upstream `StreamEnd`. Tracks delivered
-    /// bytes for the success-path region/reputation accounting.
+    /// bytes for the success-path reputation scoring.
     ///
     /// # Errors
     ///
@@ -878,9 +876,8 @@ impl NodeProgressivePull {
     /// provider. Under ADR 038 the wire `finish` carries no content
     /// verification — the CACHE TEE's bao decoder is the integrity detector —
     /// so the caller passes the tee's verdict in and the score reflects it:
-    /// `Delivered` + region accounting for a verified fill, `Corruption` for a
-    /// wire-complete stream whose bytes failed bao verification (the
-    /// paid-but-corrupt case).
+    /// `Delivered` for a verified fill, `Corruption` for a wire-complete stream
+    /// whose bytes failed bao verification (the paid-but-corrupt case).
     ///
     /// # Errors
     ///
@@ -900,7 +897,6 @@ impl NodeProgressivePull {
             pool_id,
             started,
             delivered,
-            node_id,
             hash_bytes,
             settle,
             stream_guard,
@@ -932,9 +928,6 @@ impl NodeProgressivePull {
                                 elapsed,
                             },
                         );
-                        deps.region_accountant
-                            .record_pulled(&node_id, delivered)
-                            .await;
                     }
                     TeeVerdict::Corrupt => {
                         // Paid-but-corrupt: the upstream delivered the promised
@@ -1335,11 +1328,11 @@ async fn probe_candidate(
     // Peer's self-attested region (ADR 030), resolved from the on-chain
     // `CapacityBond` registry projection; empty when the registry has no
     // region hint for this peer.
-    let region = deps
-        .region_accountant
-        .region_of(peer.as_bytes())
-        .await
-        .unwrap_or_default();
+    let region = crate::dht::capacity_bond_registry::region_of(
+        &deps.registry_regions,
+        DhtNodeId::from_bytes(*peer.as_bytes()),
+    )
+    .unwrap_or_default();
     // ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
     // node's own region yet answers slower than the latency ceiling is spoofing
     // its region. A local-only signal — folded straight into the local EWMA — so
@@ -1430,11 +1423,9 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             // upstream state corruption — skip rather than panic.
             continue;
         };
-        let region = deps
-            .region_accountant
-            .region_of(provider.node_id.as_bytes())
-            .await
-            .unwrap_or_default();
+        let region =
+            crate::dht::capacity_bond_registry::region_of(&deps.registry_regions, provider.node_id)
+                .unwrap_or_default();
         // Deliberately NOT re-running the ADR 030 region-latency penalty here,
         // unlike `probe_candidate`. That penalty reads a probe's `rtt` as EVIDENCE
         // against a self-attested region claim, and we already scored this rtt
@@ -2005,10 +1996,6 @@ async fn pull_from_candidate(
                     elapsed,
                 },
             );
-            // Inbound counterpart of the serve path's `record_served` (#858).
-            deps.region_accountant
-                .record_pulled(&candidate.node_id, total_bytes)
-                .await;
             Ok(())
         }
         Err(err) => {

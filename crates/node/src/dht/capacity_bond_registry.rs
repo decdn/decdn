@@ -11,9 +11,9 @@
 //! Bindings is gated on `cache.node_to_node_pull_through_enabled`: when
 //! pull-through is off, the bindings projection is not built at all. Regions
 //! and the operator reverse map are always built, regardless of pull-through —
-//! region byte-accounting and the ADR-030 selection penalty need the region
-//! map unconditionally, and the chain-backed origin directory needs the
-//! reverse map to resolve operators locally with no `nodeIdOf` RPC.
+//! the ADR-030 selection penalty needs the region map unconditionally, and the
+//! chain-backed origin directory needs the reverse map to resolve operators
+//! locally with no `nodeIdOf` RPC.
 //!
 //! # What actually differs between the projections
 //!
@@ -62,7 +62,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
-use crate::dht::chain_projection::with_write;
+use crate::dht::chain_projection::{with_read, with_write};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
@@ -93,8 +93,8 @@ const PAGE_SIZE: u64 = 100;
 pub struct RegistryHandles {
     pub staker_set: Arc<dyn StakerSet>,
     pub node_addresses: Option<Arc<dyn NodeAddressResolver>>,
-    /// `NodeId → regionHint` (non-empty only). Feeds the region resolver behind
-    /// `RegionAccountant`. Always present, unlike `node_addresses`.
+    /// `NodeId → regionHint` (non-empty only). Read by the ADR-030 region-latency
+    /// penalty on the selection/pull path. Always present, unlike `node_addresses`.
     pub regions: Arc<RwLock<HashMap<NodeId, String>>>,
     /// `operator address → bound NodeId`, always built (like `regions`, unlike
     /// the pull-through-gated `bindings`) so the chain-backed origin directory
@@ -193,8 +193,8 @@ pub(crate) struct RegistrySink<R> {
     /// `None` when pull-through is off — see [`RegistryHandles::node_addresses`].
     pub(crate) bindings: Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
     /// `NodeId → regionHint`. Non-empty only; empty `regionHint` is absence.
-    /// Always built (not gated on pull-through): region byte-accounting and the
-    /// ADR-030 selection penalty read it whether or not node-to-node pull is on.
+    /// Always built (not gated on pull-through): the ADR-030 selection penalty
+    /// reads it whether or not node-to-node pull is on.
     pub(crate) regions: Arc<RwLock<HashMap<NodeId, String>>>,
     /// `operator address → bound NodeId`. Always built (not gated on
     /// pull-through, like `regions`) and unfiltered: an ejected or unbonding
@@ -602,6 +602,18 @@ where
     })
 }
 
+/// Read a node's operator-attested region (ADR 030) straight from the registry's
+/// `NodeId → regionHint` projection, or `None` when the registry holds no region
+/// for it. Poison-tolerant via [`with_read`]: a writer that panicked left the map
+/// structurally intact, so recover it and log once rather than let a prior panic
+/// permanently suppress region reads (and with them the ADR-030 selection penalty).
+pub(crate) fn region_of(
+    regions: &Arc<RwLock<HashMap<NodeId, String>>>,
+    id: NodeId,
+) -> Option<String> {
+    with_read(regions, "registry regions", |m| m.get(&id).cloned())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -722,10 +734,6 @@ mod tests {
         id: NodeId,
     ) -> Option<Address> {
         bindings.and_then(|b| b.read().ok().and_then(|g| g.get(&id).copied()))
-    }
-
-    fn region_of(regions: &Arc<RwLock<HashMap<NodeId, String>>>, id: NodeId) -> Option<String> {
-        regions.read().ok().and_then(|g| g.get(&id).cloned())
     }
 
     fn reverse_of(
