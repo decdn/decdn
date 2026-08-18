@@ -150,6 +150,42 @@ struct FundingHandles<P: Provider + Clone + 'static> {
     metrics: Arc<Metrics>,
 }
 
+/// Run `attempt` (a `topUp`), and only if it fails with an
+/// [`AllowanceShortfall`](crate::client_requester::buyer_pool::AllowanceShortfall)
+/// run `recover_allowance` (a just-in-time `approve`) and retry `attempt`
+/// exactly once. Any other error — and any error from the recovery or the
+/// retry — returns as-is. Generic over the two async effects so the retry
+/// control flow is unit-testable with plain closures and counters, no RPC
+/// (matches the repo's extracted-control-flow posture; see the `Asserter`
+/// note in `swap_uniswap.rs`). On the happy path `attempt` runs once and
+/// `recover_allowance` never runs, so the node issues zero allowance reads
+/// per top-up.
+async fn top_up_recovering_allowance<A, AFut, R, RFut>(
+    attempt: A,
+    recover_allowance: R,
+) -> Result<U256>
+where
+    A: Fn() -> AFut,
+    AFut: std::future::Future<Output = Result<U256>>,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<()>>,
+{
+    match attempt().await {
+        Ok(credited) => Ok(credited),
+        Err(err)
+            if err
+                .downcast_ref::<crate::client_requester::buyer_pool::AllowanceShortfall>()
+                .is_some() =>
+        {
+            // The standing approval was revoked or never granted; do the
+            // just-in-time `approve`, then retry the transfer exactly once.
+            recover_allowance().await?;
+            attempt().await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain, then credit the
 /// returned amount into the persisted [`BuyerPoolState`]. The shared funding
 /// kernel behind both the proactive low-water refill and the reactive mid-pull
@@ -160,29 +196,25 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     pool_id: PoolId,
     additional: U256,
 ) -> Result<DepositOutcome> {
-    // Daemon posture: ensure the standing unlimited allowance (idempotent — skips
-    // when already granted) so `topUp`'s `transferFrom` can pull the funds even if
-    // the standing approval was revoked. Mirrors bootstrap.
-    if let Err(err) = ensure_allowance(
-        &handles.rpc,
-        handles.token,
-        handles.owner,
-        handles.payment_pool_addr,
-        None,
+    // Daemon posture: attempt the transfer directly against the standing
+    // unlimited allowance granted at bootstrap. Only when `topUp` reverts with
+    // an allowance shortfall (the approval was revoked or never granted) do a
+    // just-in-time `approve` and retry once — so the happy path issues zero
+    // allowance reads per top-up.
+    let credited = match top_up_recovering_allowance(
+        || pool_top_up(&handles.contract, pool_id, additional),
+        || {
+            ensure_allowance(
+                &handles.rpc,
+                handles.token,
+                handles.owner,
+                handles.payment_pool_addr,
+                None,
+            )
+        },
     )
     .await
     {
-        warn!(
-            %pool_id,
-            %additional,
-            error = %format!("{err:#}"),
-            "buyer top-up: ensure_allowance failed; pool not topped up"
-        );
-        handles.metrics.buyer_topup_failure();
-        return Err(err);
-    }
-
-    let credited = match pool_top_up(&handles.contract, pool_id, additional).await {
         Ok(credited) => credited,
         Err(err) => {
             warn!(
@@ -1188,5 +1220,114 @@ mod tests {
         assert_eq!(ctx.provider, provider);
         assert_eq!(ctx.prior_bytes_delivered, U256::ZERO);
         assert_eq!(ctx.prior_amount, U256::ZERO);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn happy_path_attempts_topup_once_and_never_reads_allowance() {
+        let attempts = AtomicUsize::new(0);
+        let recovers = AtomicUsize::new(0);
+        let out = top_up_recovering_allowance(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Ok(U256::from(500u64)) }
+            },
+            || {
+                recovers.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), U256::from(500u64));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "one topUp");
+        assert_eq!(
+            recovers.load(Ordering::SeqCst),
+            0,
+            "zero allowance reads on the happy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_path_approves_then_retries_topup_once() {
+        let attempts = AtomicUsize::new(0);
+        let recovers = AtomicUsize::new(0);
+        let out = top_up_recovering_allowance(
+            || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(anyhow::Error::new(
+                            crate::client_requester::buyer_pool::AllowanceShortfall,
+                        ))
+                    } else {
+                        Ok(U256::from(700u64))
+                    }
+                }
+            },
+            || {
+                recovers.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), U256::from(700u64));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "topUp, then retry after approve"
+        );
+        assert_eq!(recovers.load(Ordering::SeqCst), 1, "exactly one approve");
+    }
+
+    #[tokio::test]
+    async fn terminal_non_allowance_revert_is_not_retried() {
+        let attempts = AtomicUsize::new(0);
+        let recovers = AtomicUsize::new(0);
+        let out = top_up_recovering_allowance(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(anyhow::anyhow!("topUp reverted for pool: paused")) }
+            },
+            || {
+                recovers.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert!(out.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no retry for a non-allowance revert"
+        );
+        assert_eq!(
+            recovers.load(Ordering::SeqCst),
+            0,
+            "no approve for a non-allowance revert"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_still_shortfall_stops_after_one_retry() {
+        let attempts = AtomicUsize::new(0);
+        let out = top_up_recovering_allowance(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(anyhow::Error::new(
+                        crate::client_requester::buyer_pool::AllowanceShortfall,
+                    ))
+                }
+            },
+            || async { Ok(()) },
+        )
+        .await;
+        assert!(out.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one retry only, then give up"
+        );
     }
 }
