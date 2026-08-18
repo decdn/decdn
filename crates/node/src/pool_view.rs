@@ -95,12 +95,18 @@ impl<P: Provider + Clone + 'static> ChainPoolView<P> {
 
     /// Publish an updated entry. Read-modify-write, because [`ArcSwap`] has no
     /// in-place mutation: clone the current map, insert, and swap the new map in.
-    /// Writes are rare (one per pool per TTL) so the clone is irrelevant next to
-    /// keeping the per-voucher-boundary read a lock-free atomic load.
+    /// Uses `rcu` so its compare-and-swap retries the clone if a concurrent
+    /// writer (a miss on another pool) published between the load and the store —
+    /// otherwise the later plain store would clobber the other pool's fresh entry.
+    /// Writes are rare (one per pool per TTL) so the clone, and any retry, is
+    /// irrelevant next to keeping the per-voucher-boundary read a lock-free
+    /// atomic load.
     fn store(&self, pool_id: B256, status: PoolStatus) {
-        let mut next = HashMap::clone(&self.cache.load());
-        next.insert(pool_id, (Instant::now(), status));
-        self.cache.store(Arc::new(next));
+        self.cache.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            next.insert(pool_id, (Instant::now(), status));
+            next
+        });
     }
 }
 
