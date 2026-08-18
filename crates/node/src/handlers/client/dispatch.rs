@@ -12,6 +12,8 @@ use super::{
 use futures_util::StreamExt as _;
 use std::sync::atomic::Ordering;
 
+use super::delivery;
+
 impl ClientHandler {
     /// Accept the connection-level rate-limit permit, then serve each inbound
     /// bidi stream concurrently under a per-connection stream cap.
@@ -980,6 +982,7 @@ impl ClientHandler {
             client_node_id,
             rate_per_mb,
             floor_reservation,
+            delivery::ServeSource::Store,
         )
         .await
     }

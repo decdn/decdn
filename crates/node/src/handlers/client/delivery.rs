@@ -17,6 +17,18 @@ use super::{
 /// [`CacheEngine::export_bao_range_stream`]: decdn_cache::CacheEngine::export_bao_range_stream
 type BaoExportStream = Pin<Box<dyn Stream<Item = CacheResult<Bytes>> + Send>>;
 
+/// Which byte source `deliver` streams from. `Store` reads the iroh-blobs store
+/// (cache hit / filled miss); `OriginZeroCopy` streams straight from a local fs
+/// origin file + `.obao4`, no store import (#1511). Both yield the same
+/// header-less bao wire form, so everything downstream is identical.
+pub(super) enum ServeSource {
+    Store,
+    // Not yet constructed anywhere: the dispatch caller always passes `Store`
+    // until it gains the fs-origin zero-copy decision (#1511).
+    #[allow(dead_code)]
+    OriginZeroCopy,
+}
+
 /// Re-frame the cache's bao export stream into `cdn/client/v1` wire frames
 /// (#1132).
 ///
@@ -145,6 +157,7 @@ impl ClientHandler {
         client_node_id: B256,
         rate_per_mb: u64,
         floor_reservation: Option<FloorReservation>,
+        serve_source: ServeSource,
     ) -> anyhow::Result<()> {
         // Owned here so the pool floor reservation reconciles at every exit —
         // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
@@ -180,11 +193,18 @@ impl ClientHandler {
         // range pull reported). The export needs it to build the BaoTree;
         // the store cannot be relied on for it because an origin-tier range pull
         // imports a *partial* blob whose `status()` size is `None` (#823).
-        let data = self
-            .cache
-            .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
-            .await
-            .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
+        let data = match serve_source {
+            ServeSource::Store => self
+                .cache
+                .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
+                .await
+                .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?,
+            ServeSource::OriginZeroCopy => self
+                .cache
+                .export_bao_range_stream_from_origin(hash, byte_offset, byte_len, total_bytes)
+                .await
+                .map_err(|e| anyhow::anyhow!("origin zero-copy export failed: {e}"))?,
+        };
 
         let interval_bytes = VOUCHER_INTERVAL_BYTES;
 
