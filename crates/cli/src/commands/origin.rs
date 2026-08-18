@@ -91,10 +91,19 @@ pub fn index_fs_origin(base: &Path, force: bool) -> anyhow::Result<IndexStats> {
             stats.mismatched += 1;
             continue;
         }
-        // Write to a temp sibling then rename, so a crash never leaves a partial .obao4.
-        let tmp = obao4_path.with_extension("obao4.tmp");
-        std::fs::write(&tmp, &outboard)?;
-        std::fs::rename(&tmp, &obao4_path)?;
+        // Write to a same-directory NamedTempFile then persist (atomic rename), so
+        // a crash never leaves a partial .obao4 and concurrent `index` runs over
+        // the same shard dir never collide on a shared temp name.
+        let Some(shard_dir) = obao4_path.parent() else {
+            anyhow::bail!(
+                "obao4 path {} has no parent directory",
+                obao4_path.display()
+            );
+        };
+        let mut tmp = tempfile::NamedTempFile::new_in(shard_dir)?;
+        std::io::Write::write_all(&mut tmp, &outboard)?;
+        tmp.persist(&obao4_path)
+            .map_err(|e| anyhow::anyhow!("failed to persist {}: {e}", obao4_path.display()))?;
         stats.written += 1;
     }
     Ok(stats)

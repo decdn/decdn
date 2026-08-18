@@ -575,7 +575,7 @@ impl ClientHandler {
                         Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
                         Err(e) => {
                             tracing::debug!(%hash, error = %e, "origin zero-copy probe failed; falling through");
-                            fault_seen |= true; // a real origin/store fault, matching the other tiers
+                            fault_seen = true; // a real origin/store fault, matching the other tiers
                         }
                     }
                 }

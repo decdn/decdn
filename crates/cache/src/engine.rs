@@ -3303,6 +3303,12 @@ impl CacheEngine {
     /// starve that pool), pushing wire frames through a bounded channel that the
     /// returned stream drains.
     ///
+    /// Each concurrent zero-copy serve holds one such thread for the duration of
+    /// the stream, since `blocking_send` parks it under backpressure instead of
+    /// yielding it back to a pool; the count of live encoder threads is therefore
+    /// bounded by the node's concurrent-stream ceiling, not by the runtime's
+    /// blocking-pool size.
+    ///
     /// # Errors
     ///
     /// [`CacheError::Store`] if the range fails to align against `blob_size`, or
