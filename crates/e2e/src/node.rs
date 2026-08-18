@@ -284,6 +284,45 @@ impl NodeFixture {
         self.origin_dir.path()
     }
 
+    /// Kill the daemon and reopen its on-disk cache store directly to check
+    /// whether `hash` ever landed in it, proving (or disproving) that a serve
+    /// path imported bytes into the local store rather than serving them
+    /// zero-copy straight from the origin.
+    ///
+    /// Killing first is required, not incidental: the running daemon's own
+    /// `FsStore::load_with_opts` holds the store's on-disk lock, so a second
+    /// `CacheEngine::open` against the same `cache_dir` while the daemon is
+    /// alive would contend with it. This mirrors [`Self::restart`]'s
+    /// kill-then-reopen shape, except nothing is respawned afterward.
+    ///
+    /// **Consuming in effect, though not in signature.** No fetch will
+    /// succeed against this node again once its process is dead. Call this
+    /// only as the LAST step of a journey, exactly like
+    /// [`crate::client::ClientFixture::capture_delivery_wire`]'s
+    /// last-operation-on-session contract.
+    pub async fn store_blob_present(&self, hash: Hash) -> anyhow::Result<bool> {
+        {
+            let mut child = self
+                .child
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let cache_dir = self.data_dir.path().join("cache");
+        let origins: Vec<Arc<dyn Origin>> = Vec::new();
+        let store = CacheEngine::open(&cache_dir, origins, 1024)
+            .await
+            .context("reopen node cache store to inspect")?;
+        let present = store.has(hash).await.context("query store for hash")?;
+        store
+            .shutdown()
+            .await
+            .context("shutdown inspection store")?;
+        Ok(present)
+    }
+
     /// Poll `admin_v1_lanes` until the daemon reports a lane on `pool_id` (or
     /// `timeout` elapses). The admin surface keys each snapshot by the lane's
     /// `pool_id`, so a matching entry means the node has accepted at least one
