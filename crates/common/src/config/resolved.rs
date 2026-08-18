@@ -130,8 +130,8 @@ pub struct ResolvedBlockchain {
     pub rpc_watchdog_interval_sec: u64,
     /// Milliseconds between chain-event poll ticks (#1011, #1106). Two unrelated
     /// consumers read this one value:
-    /// - `resumable_watcher`'s `WatcherConfig::poll_interval` — the `eth_getLogs`
-    ///   tick cadence of every chain watcher.
+    /// - the `MultiplexedPoller`'s `poll_interval` — the `eth_getLogs` tick
+    ///   cadence shared by every chain watcher's `Route`.
     /// - alloy's pending-transaction receipt heartbeat, applied to every provider
     ///   via the node's `with_poll_interval` (`client().set_poll_interval`) and
     ///   consumed by `PendingTransactionBuilder::get_receipt` when the node awaits

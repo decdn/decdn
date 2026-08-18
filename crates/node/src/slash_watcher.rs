@@ -294,18 +294,8 @@ pub async fn bootstrap<P: Provider + Clone + 'static>(
     };
     let route = Route {
         addresses: vec![capacity_bond_addr],
-        // `SlashRecorded` indexes `operator` as `topic2`, but the merged poller
-        // filter cannot scope `topic2` to only this event (it ORs many events
-        // across contracts), so this route receives EVERY operator's
-        // `SlashRecorded`. `decode_recorded`'s `operator == self` guard filters
-        // them, which is what makes dropping the wire-level `topic2` safe.
-        topic0s: vec![CapacityBond::SlashRecorded::SIGNATURE_HASH],
-        // The enumeration rebuilt the store from all of history, so seed the tail
-        // at that snapshot head — no durable cursor, no historical scan.
-        start: CursorStart::Seeded {
-            at: snapshot_block,
-            persist: None,
-        },
+        topic0s: slash_route_topic0s(),
+        start: slash_cursor_start(snapshot_block),
         sink: SinkSource::Ready(Box::new(sink)),
         label: "slash",
         on_established: Some(metric_hook(
@@ -320,6 +310,29 @@ pub async fn bootstrap<P: Provider + Clone + 'static>(
         on_task_panic: Some(metric_hook(&metrics, Metrics::slash_watcher_task_panicked)),
     };
     Ok((store, route))
+}
+
+/// The slash route's demux key: `SlashRecorded` only.
+///
+/// `SlashRecorded` indexes `operator` as `topic2`, but the merged poller filter
+/// cannot scope `topic2` to only this event (it ORs many events across
+/// contracts), so this route receives EVERY operator's `SlashRecorded`.
+/// [`decode_recorded`]'s `operator == self` guard filters them, which is what
+/// makes dropping the wire-level `topic2` safe. Split out from [`bootstrap`] so
+/// the exact topic0 set is unit-testable without a provider.
+fn slash_route_topic0s() -> Vec<B256> {
+    vec![CapacityBond::SlashRecorded::SIGNATURE_HASH]
+}
+
+/// The slash route's cursor start: seed the tail at the enumeration snapshot
+/// head. The enumeration rebuilt the store from all of history, so there is no
+/// durable cursor and no historical scan. Split out from [`bootstrap`] so the
+/// cursor shape is unit-testable without a provider.
+const fn slash_cursor_start(snapshot_block: u64) -> CursorStart {
+    CursorStart::Seeded {
+        at: snapshot_block,
+        persist: None,
+    }
 }
 
 /// Applies operator-filtered `SlashRecorded` logs to the in-memory store and
@@ -504,6 +517,30 @@ fn record_slash(store: &SlashStore, metrics: &Arc<Metrics>, slash: DetectedSlash
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// The slash route watches exactly `SlashRecorded` — no more, no fewer —
+    /// and there is deliberately no `topic2` (operator) constraint on the route
+    /// (see [`slash_route_topic0s`]'s doc for why filtering happens in
+    /// [`decode_recorded`] instead).
+    #[test]
+    fn route_topic0s_is_exactly_slash_recorded() {
+        assert_eq!(
+            slash_route_topic0s(),
+            vec![CapacityBond::SlashRecorded::SIGNATURE_HASH]
+        );
+    }
+
+    /// The slash route seeds its cursor at the enumeration snapshot head, with
+    /// no durable persistence (the store is rebuilt from enumeration each boot).
+    #[test]
+    fn cursor_start_seeds_at_snapshot_with_no_persistence() {
+        let start = slash_cursor_start(12_345);
+        assert_eq!(start.seed(), Some(12_345));
+        assert!(
+            matches!(start, CursorStart::Seeded { persist: None, .. }),
+            "must not carry a durable checkpoint"
+        );
+    }
 
     /// A `DetectedSlash` distinguished only by `slash_id` (the dedup key).
     fn slash(id: u64) -> DetectedSlash {

@@ -187,3 +187,46 @@ where
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy::providers::ProviderBuilder;
+
+    use super::*;
+    use crate::metrics::Metrics;
+
+    /// `route()` never calls the chain (it only constructs a contract handle),
+    /// so a mocked client with no scripted responses is sufficient here.
+    fn mock_provider() -> impl Provider + Clone + 'static {
+        ProviderBuilder::new().connect_mocked_client(alloy::providers::mock::Asserter::new())
+    }
+
+    /// The rate-bounds watcher's `Route` must carry exactly the
+    /// `RateBoundsUpdated` topic0 and start at head (`HeadMinusWindow { 0 }`) —
+    /// this fails if the topic0 were ever dropped or swapped for another event.
+    #[test]
+    fn route_watches_rate_bounds_updated_from_head() {
+        let metrics = Arc::new(Metrics::new());
+        let route = route(
+            mock_provider(),
+            Address::repeat_byte(0x11),
+            RateBounds::new(0),
+            Duration::from_hours(1),
+            &metrics,
+        );
+
+        assert_eq!(route.addresses, vec![Address::repeat_byte(0x11)]);
+        assert_eq!(
+            route.topic0s,
+            vec![PaymentPool::RateBoundsUpdated::SIGNATURE_HASH],
+            "must watch exactly RateBoundsUpdated — no more, no fewer"
+        );
+        assert!(
+            matches!(
+                route.start,
+                CursorStart::HeadMinusWindow { window_blocks: 0 }
+            ),
+            "must start at head with no lookback window (HeadMinusWindow{{ 0 }})"
+        );
+    }
+}

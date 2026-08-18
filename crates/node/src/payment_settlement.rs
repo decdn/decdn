@@ -294,13 +294,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
-            topic0s: vec![
-                PaymentPool::PoolOpened::SIGNATURE_HASH,
-                PaymentPool::PoolRedeemed::SIGNATURE_HASH,
-                PaymentPool::PoolToppedUp::SIGNATURE_HASH,
-                PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
-                PaymentPool::PoolReclaimed::SIGNATURE_HASH,
-            ],
+            topic0s: settlement_route_topic0s(),
             // The durable `PoolOpened` checkpoint resumes across restarts; a
             // first-ever boot (cold store) anchors at head. The poller flushes
             // this checkpoint on shutdown (via `CursorStart::flush`), the same
@@ -371,10 +365,13 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// so there is nothing to close here — only redeem.
     ///
     /// The paid-watermark watcher is now the shared multiplexed poller's route,
-    /// not a service-owned task: the runtime cancels the poller (which flushes
-    /// this route's `PoolOpened` scan checkpoint via `CursorStart::flush`) before
-    /// calling this, so the tail is already stopped and the checkpoint already
-    /// flushed when the final sweep runs.
+    /// not a service-owned task: the runtime cancels the poller (which triggers an
+    /// async, best-effort flush of this route's `PoolOpened` scan checkpoint via
+    /// `CursorStart::flush`) before calling this, but only cancels the token — it
+    /// does not await the poller's exit — so that flush is not guaranteed to
+    /// complete before the final sweep below runs. This is fine: the scan
+    /// checkpoint is independent of the lane-state redeem sweep and idempotent to
+    /// re-scan, so the two can race without a correctness impact.
     pub async fn shutdown(&self, deadline: Duration) {
         self.quiesce_redeemer().await;
         if tokio::time::timeout(deadline, self.final_redeem_sweep())
@@ -501,6 +498,21 @@ fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
         reorg_margin: REORG_MARGIN_BLOCKS,
         cold_start: ColdStart::Head,
     }
+}
+
+/// The settlement route's demux key: every `PaymentPool` lifecycle event the
+/// paid-watermark cache and close monitor need. Split out from
+/// [`PoolSettlementService::bootstrap`] so the exact topic0 set is
+/// unit-testable without a provider — dropping `PoolOpened` here, for example,
+/// would silently blind the close monitor to newly opened pools.
+fn settlement_route_topic0s() -> Vec<B256> {
+    vec![
+        PaymentPool::PoolOpened::SIGNATURE_HASH,
+        PaymentPool::PoolRedeemed::SIGNATURE_HASH,
+        PaymentPool::PoolToppedUp::SIGNATURE_HASH,
+        PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
+        PaymentPool::PoolReclaimed::SIGNATURE_HASH,
+    ]
 }
 
 /// Applies `PaymentPool` settlement logs to the paid-watermark cache and drives
@@ -1775,6 +1787,61 @@ mod tests {
     fn is_oversize_send_err_ignores_unrelated_errors() {
         for m in ["nonce too low", "connection refused", "execution reverted"] {
             assert!(!is_oversize_send_err(m), "should not flag: {m}");
+        }
+    }
+
+    /// The settlement route watches exactly the five `PaymentPool` lifecycle
+    /// events — no more, no fewer. `PoolOpened` in particular must never be
+    /// dropped: it is the close monitor's only signal that a pool exists.
+    #[test]
+    fn route_topic0s_covers_every_pool_lifecycle_event() {
+        assert_eq!(
+            settlement_route_topic0s(),
+            vec![
+                PaymentPool::PoolOpened::SIGNATURE_HASH,
+                PaymentPool::PoolRedeemed::SIGNATURE_HASH,
+                PaymentPool::PoolToppedUp::SIGNATURE_HASH,
+                PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
+                PaymentPool::PoolReclaimed::SIGNATURE_HASH,
+            ]
+        );
+    }
+
+    /// The settlement route resumes from the durable `PoolOpened` checkpoint,
+    /// rewound by the reorg margin, and anchors a cold (first-ever) boot at
+    /// head rather than replaying all of history.
+    #[test]
+    fn cursor_start_resumes_from_pool_opened_checkpoint() {
+        #[derive(Default)]
+        struct NoopCk;
+        impl KeyedCheckpointStore for NoopCk {
+            fn load_checkpoint(&self, _key: CheckpointKey) -> Result<Option<u64>, StoreError> {
+                Ok(None)
+            }
+            fn record_checkpoint(
+                &self,
+                _key: CheckpointKey,
+                _block: u64,
+            ) -> Result<(), StoreError> {
+                Ok(())
+            }
+        }
+        let store: Arc<dyn KeyedCheckpointStore> = Arc::new(NoopCk);
+        let start = cursor_start(store);
+        match start {
+            CursorStart::FromCheckpoint {
+                checkpoint,
+                reorg_margin,
+                cold_start,
+            } => {
+                assert_eq!(checkpoint.key, CheckpointKey::PoolOpened);
+                assert_eq!(reorg_margin, REORG_MARGIN_BLOCKS);
+                assert_eq!(cold_start, ColdStart::Head);
+            }
+            CursorStart::Seeded { .. } => unreachable!("expected FromCheckpoint, got Seeded"),
+            CursorStart::HeadMinusWindow { .. } => {
+                unreachable!("expected FromCheckpoint, got HeadMinusWindow")
+            }
         }
     }
 

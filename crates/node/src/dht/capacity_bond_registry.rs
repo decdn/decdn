@@ -50,7 +50,7 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -542,20 +542,8 @@ where
     };
     let route = Route {
         addresses: vec![registry_addr],
-        topic0s: vec![
-            CapacityBond::NodeRegistered::SIGNATURE_HASH,
-            CapacityBond::NodeDeregistered::SIGNATURE_HASH,
-            CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
-            CapacityBond::Reinstated::SIGNATURE_HASH,
-            CapacityBond::UnbondingRequested::SIGNATURE_HASH,
-        ],
-        // Seed the live tail from the enumeration snapshot head; the staker set
-        // is rebuilt from that enumeration each boot, so there is no durable
-        // cursor to persist.
-        start: CursorStart::Seeded {
-            at: snapshot_block,
-            persist: None,
-        },
+        topic0s: registry_route_topic0s(),
+        start: registry_cursor_start(snapshot_block),
         // This sink observes no shutdown token, so it registers a `Ready` sink.
         sink: SinkSource::Ready(Box::new(sink)),
         label: "capacity-bond",
@@ -602,6 +590,30 @@ pub(crate) fn region_of(
     with_read(regions, "registry regions", |m| m.get(&id).cloned())
 }
 
+/// The registry route's demux key: every `CapacityBond` staker-membership
+/// event. Split out from [`bootstrap`] so the exact topic0 set is unit-testable
+/// without a provider.
+fn registry_route_topic0s() -> Vec<B256> {
+    vec![
+        CapacityBond::NodeRegistered::SIGNATURE_HASH,
+        CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+        CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
+        CapacityBond::Reinstated::SIGNATURE_HASH,
+        CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+    ]
+}
+
+/// The registry route's cursor start: seed the live tail from the enumeration
+/// snapshot head. The staker set is rebuilt from that enumeration each boot, so
+/// there is no durable cursor to persist. Split out from [`bootstrap`] so the
+/// cursor shape is unit-testable without a provider.
+const fn registry_cursor_start(snapshot_block: u64) -> CursorStart {
+    CursorStart::Seeded {
+        at: snapshot_block,
+        persist: None,
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -611,7 +623,36 @@ pub(crate) fn region_of(
 )]
 mod tests {
     use super::*;
-    use alloy::primitives::{B256, Bytes, LogData};
+    use alloy::primitives::{Bytes, LogData};
+
+    /// The registry route watches exactly the five `CapacityBond`
+    /// staker-membership events — no more, no fewer.
+    #[test]
+    fn route_topic0s_covers_every_staker_membership_event() {
+        assert_eq!(
+            registry_route_topic0s(),
+            vec![
+                CapacityBond::NodeRegistered::SIGNATURE_HASH,
+                CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+                CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
+                CapacityBond::Reinstated::SIGNATURE_HASH,
+                CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+            ]
+        );
+    }
+
+    /// The registry route seeds its cursor at the enumeration snapshot head,
+    /// with no durable persistence (the staker set is rebuilt from enumeration
+    /// each boot).
+    #[test]
+    fn cursor_start_seeds_at_snapshot_with_no_persistence() {
+        let start = registry_cursor_start(54_321);
+        assert_eq!(start.seed(), Some(54_321));
+        assert!(
+            matches!(start, CursorStart::Seeded { persist: None, .. }),
+            "must not carry a durable checkpoint"
+        );
+    }
 
     fn nid(byte: u8) -> NodeId {
         NodeId::from_bytes([byte; 32])

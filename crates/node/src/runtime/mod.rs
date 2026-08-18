@@ -2251,8 +2251,11 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // exactly the requests still in flight. This binding constraint forces the
     // single stop late; the other four routes (slash, settlement, blacklist,
     // rate-bounds) are not drain-consulted and could stop earlier, but one shared
-    // token means they stop here too — settlement's checkpoint flush lands before
-    // its redeem sweep runs just below.
+    // token means they stop here too. `shutdown` only cancels the token — it is
+    // not awaited — so settlement's checkpoint flush races the redeem sweep just
+    // below rather than completing before it; that is fine because the flush is
+    // best-effort and the checkpoint is independent of, and idempotent with
+    // respect to, the redeem sweep.
     poller.shutdown();
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
@@ -2263,9 +2266,12 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers arrive and the persisted lane state is final. A pool is
     // owner-closed only, so there is nothing to close here. The poller cancel
-    // above already stopped settlement's tail and flushed its scan checkpoint, so
-    // this only quiesces the redeemer and runs one final best-effort redeem sweep
-    // so an above-threshold lane is not left un-redeemed. Bounded by the deadline
+    // above triggers settlement's tail stop and checkpoint flush asynchronously
+    // (best-effort, not awaited before this point), so this quiesces the redeemer
+    // and runs one final best-effort redeem sweep so an above-threshold lane is
+    // not left un-redeemed. The redeem sweep does not depend on the checkpoint
+    // flush having completed — the scan checkpoint is independent lane state and
+    // idempotent to re-scan. Bounded by the deadline
     // so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
 

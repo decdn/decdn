@@ -1090,28 +1090,8 @@ where
 
     Ok(Route {
         addresses: vec![contract_addr],
-        topic0s: vec![
-            HashBlacklisted::SIGNATURE_HASH,
-            HashRemoved::SIGNATURE_HASH,
-            // Origin blacklisting rides the same scan (ADR 011 § Hash Evasion). It
-            // is deliberately outside the `getBlacklistVersion()` mechanism, so
-            // unlike the hash events there is no counter to detect a missed one —
-            // the re-enumeration is the backstop.
-            OriginBlacklistUpdated::SIGNATURE_HASH,
-            // `addOperator` is the PRIMARY governance origin-blacklist path — it
-            // writes a SEPARATE mapping and emits these two events, never
-            // `OriginBlacklistUpdated`. `OriginAssignment` unions the two mappings
-            // on-chain; watching only the first would leave the delivery gate
-            // enforcing the softer list and missing the voted one.
-            OperatorBlacklisted::SIGNATURE_HASH,
-            OperatorBlacklistCleared::SIGNATURE_HASH,
-        ],
-        // No durable cursor and no historical replay: the boot enumeration rebuilt
-        // the whole deny-set, so the tail only follows forward from the snapshot.
-        start: CursorStart::Seeded {
-            at: snapshot_block,
-            persist: None,
-        },
+        topic0s: blacklist_route_topic0s(),
+        start: blacklist_cursor_start(snapshot_block),
         sink: sink_factory,
         label: "blacklist",
         on_established: Some(metric_hook(
@@ -1130,6 +1110,41 @@ where
     })
 }
 
+/// The blacklist route's demux key: hash takedowns plus both origin-blacklist
+/// paths. Split out from [`bootstrap`] so the exact topic0 set is
+/// unit-testable without a provider.
+///
+/// Origin blacklisting rides the same scan (ADR 011 § Hash Evasion). It is
+/// deliberately outside the `getBlacklistVersion()` mechanism, so unlike the
+/// hash events there is no counter to detect a missed one — the
+/// re-enumeration is the backstop. `addOperator` is the PRIMARY governance
+/// origin-blacklist path — it writes a SEPARATE mapping and emits
+/// `OperatorBlacklisted`/`OperatorBlacklistCleared`, never
+/// `OriginBlacklistUpdated`. `OriginAssignment` unions the two mappings
+/// on-chain; watching only the first would leave the delivery gate enforcing
+/// the softer list and missing the voted one.
+fn blacklist_route_topic0s() -> Vec<B256> {
+    vec![
+        HashBlacklisted::SIGNATURE_HASH,
+        HashRemoved::SIGNATURE_HASH,
+        OriginBlacklistUpdated::SIGNATURE_HASH,
+        OperatorBlacklisted::SIGNATURE_HASH,
+        OperatorBlacklistCleared::SIGNATURE_HASH,
+    ]
+}
+
+/// The blacklist route's cursor start: seed the tail at the enumeration
+/// snapshot head. No durable cursor and no historical replay — the boot
+/// enumeration rebuilt the whole deny-set, so the tail only follows forward
+/// from the snapshot. Split out from [`bootstrap`] so the cursor shape is
+/// unit-testable without a provider.
+const fn blacklist_cursor_start(snapshot_block: u64) -> CursorStart {
+    CursorStart::Seeded {
+        at: snapshot_block,
+        persist: None,
+    }
+}
+
 #[cfg(test)]
 // Test-only: the assertion style below intentionally panics on the negative
 // branch, and unwraps/expects on results the fixtures guarantee. Matches the
@@ -1146,6 +1161,35 @@ mod tests {
 
     const US: B256 = B256::repeat_byte(0x01);
     const FR: B256 = B256::repeat_byte(0x02);
+
+    /// The blacklist route watches exactly the five hash + origin blacklist
+    /// events — no more, no fewer.
+    #[test]
+    fn route_topic0s_covers_hash_and_origin_events() {
+        assert_eq!(
+            blacklist_route_topic0s(),
+            vec![
+                HashBlacklisted::SIGNATURE_HASH,
+                HashRemoved::SIGNATURE_HASH,
+                OriginBlacklistUpdated::SIGNATURE_HASH,
+                OperatorBlacklisted::SIGNATURE_HASH,
+                OperatorBlacklistCleared::SIGNATURE_HASH,
+            ]
+        );
+    }
+
+    /// The blacklist route seeds its cursor at the enumeration snapshot head,
+    /// with no durable persistence (the deny-set is rebuilt from enumeration
+    /// each boot).
+    #[test]
+    fn cursor_start_seeds_at_snapshot_with_no_persistence() {
+        let start = blacklist_cursor_start(99_999);
+        assert_eq!(start.seed(), Some(99_999));
+        assert!(
+            matches!(start, CursorStart::Seeded { persist: None, .. }),
+            "must not carry a durable checkpoint"
+        );
+    }
 
     /// A provider that answers nothing. The pure-helper tests never reach an RPC
     /// through `WatcherState`; erasing to `DynProvider` keeps the fixture's type

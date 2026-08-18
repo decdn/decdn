@@ -436,9 +436,23 @@ async fn demux_window_logs(poller: &mut MultiplexedPoller, logs: Vec<Log>) {
         }
         // The sink borrow is confined to this match so `route.errored` can be
         // set afterward without aliasing it.
-        let applied = match route.sink.as_erased_mut() {
-            Some(sink) => sink.apply(log).await,
-            None => continue, // unresolved factory (never in production; see `SinkSource`)
+        let applied = if let Some(sink) = route.sink.as_erased_mut() {
+            sink.apply(log).await
+        } else {
+            // Unreachable in production: `spawn` always resolves every
+            // `SinkSource::Factory` before handing the poller to `run` (see
+            // `SinkSource::as_erased_mut`'s doc). Silently `continue`ing here
+            // would advance this route's cursor past a log it never applied —
+            // a future wiring bug that skips factory resolution would drop
+            // data with no signal, so fail loudly in debug/test builds and
+            // hold the release-build fallback of skipping the log.
+            debug_assert!(
+                false,
+                "route {} has an unresolved SinkSource::Factory at demux time; \
+                 spawn() must resolve every factory before run()",
+                route.label
+            );
+            continue;
         };
         if let Err(err) = applied {
             // Retryable sink error: isolate this route. It holds its cursor
@@ -472,9 +486,19 @@ async fn reconcile_routes(poller: &mut MultiplexedPoller) {
         if r.errored {
             continue;
         }
-        let reconciled = match r.sink.as_erased_mut() {
-            Some(sink) => sink.on_tick_complete().await,
-            None => continue, // unresolved factory (never in production; see `SinkSource`)
+        let reconciled = if let Some(sink) = r.sink.as_erased_mut() {
+            sink.on_tick_complete().await
+        } else {
+            // Unreachable in production; see the matching branch in
+            // `demux_window_logs` for why this asserts instead of silently
+            // skipping the reconcile.
+            debug_assert!(
+                false,
+                "route {} has an unresolved SinkSource::Factory at reconcile time; \
+                 spawn() must resolve every factory before run()",
+                r.label
+            );
+            continue;
         };
         if let Err(err) = reconciled {
             r.errored = true;
