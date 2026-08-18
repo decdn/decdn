@@ -39,6 +39,8 @@ use decdn_protocol::{
 };
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
+mod support;
+use support::shutdown;
 
 fn fresh_key() -> SecretKey {
     SecretKey::generate()
@@ -252,11 +254,11 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
     }
 
     conn.close(0u32.into(), b"bye");
-    client_ep.close().await;
+    shutdown([], [&client_ep]).await;
     accept_task
         .await
         .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     Ok(())
 }
 
@@ -345,11 +347,11 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
     );
 
     conn.close(0u32.into(), b"bye");
-    client_ep.close().await;
+    shutdown([], [&client_ep]).await;
     accept_task
         .await
         .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     Ok(())
 }
 
@@ -424,11 +426,11 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
     let (_msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
 
     conn.close(0u32.into(), b"bye");
-    client_ep.close().await;
+    shutdown([], [&client_ep]).await;
     accept_task
         .await
         .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
 
     let t = routing.lock().expect("routing lock poisoned");
     assert!(
@@ -554,10 +556,10 @@ mod adr_013_error_codes {
         let r = recv.read_to_end(64).await;
         assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         // The server task is expected to surface the rejection as an Err.
         let _ = accept_task.await;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -586,9 +588,9 @@ mod adr_013_error_codes {
         let r = recv.read_to_end(64).await;
         assert_close_code(r, APP_ERR_UNSUPPORTED_MESSAGE);
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         let _ = accept_task.await;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -617,9 +619,9 @@ mod adr_013_error_codes {
         let r = recv.read_to_end(64).await;
         assert_close_code(r, APP_ERR_UNSUPPORTED_MESSAGE);
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         let _ = accept_task.await;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -660,9 +662,9 @@ mod adr_013_error_codes {
         let r = recv.read_to_end(64).await;
         assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         let _ = accept_task.await;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -700,9 +702,9 @@ mod adr_013_error_codes {
         let r = recv.read_to_end(64).await;
         assert_close_code(r, APP_ERR_MALFORMED_MESSAGE);
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         let _ = accept_task.await;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -791,9 +793,9 @@ mod adr_013_error_codes {
         let rr = r2.read_to_end(2048).await;
         assert_close_code(rr, APP_ERR_RATE_LIMITED);
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         let _ = accept_task.await;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 }
@@ -921,11 +923,11 @@ mod store_admission {
         }
 
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         accept_task
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -1007,11 +1009,11 @@ mod store_admission {
         assert!(records.lock().expect("records lock").is_empty());
 
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         accept_task
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -1102,11 +1104,11 @@ mod store_admission {
         assert!(records.lock().expect("records lock").is_empty());
 
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         accept_task
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 }
@@ -1197,11 +1199,11 @@ mod batch_store_admission {
         };
 
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         accept_task
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok((ack, records, metrics_handle))
     }
 
@@ -1332,11 +1334,11 @@ mod batch_store_admission {
         // about the exact shape here, only the resulting metrics).
         let _ = r.read_to_end(64).await;
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         accept_task
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
 
         let text = metrics.encode().unwrap();
         assert!(
@@ -1430,11 +1432,11 @@ mod batch_store_admission {
         );
         assert!(records.lock().expect("records lock").is_empty());
         conn.close(0u32.into(), b"bye");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
         accept_task
             .await
             .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-        server_ep.close().await;
+        shutdown([], [&server_ep]).await;
         Ok(())
     }
 
@@ -1582,9 +1584,7 @@ mod batch_store_client {
         )
         .await?;
         assert_eq!(ack.results, vec![true; 4]);
-        client_ep.close().await;
-        server_ep.close().await;
-        accept_task.abort();
+        shutdown([accept_task.abort_handle()], [&client_ep, &server_ep]).await;
         Ok(())
     }
 
@@ -1621,9 +1621,7 @@ mod batch_store_client {
             text.contains("decdn_dht_batch_store_received_total 1"),
             "exactly one BatchStore must have reached the handler:\n{text}"
         );
-        client_ep.close().await;
-        server_ep.close().await;
-        accept_task.abort();
+        shutdown([accept_task.abort_handle()], [&client_ep, &server_ep]).await;
         Ok(())
     }
 
@@ -1666,9 +1664,7 @@ mod batch_store_client {
             text.contains("decdn_dht_store_accepted_total 3"),
             "three per-hash Stores must have been accepted:\n{text}"
         );
-        client_ep.close().await;
-        server_ep.close().await;
-        accept_task.abort();
+        shutdown([accept_task.abort_handle()], [&client_ep, &server_ep]).await;
         Ok(())
     }
 }
@@ -1826,9 +1822,7 @@ mod batch_store_fallback_negotiation {
             "three more per-hash stores on the second publish"
         );
 
-        client_ep.close().await;
-        server_ep.close().await;
-        accept_task.abort();
+        shutdown([accept_task.abort_handle()], [&client_ep, &server_ep]).await;
         Ok(())
     }
 }
@@ -1922,9 +1916,7 @@ mod per_hash_fallback_timeout_bail {
             "loop must abandon the set after K consecutive timeouts, not attempt all 8"
         );
 
-        client_ep.close().await;
-        server_ep.close().await;
-        accept_task.abort();
+        shutdown([accept_task.abort_handle()], [&client_ep, &server_ep]).await;
         Ok(())
     }
 }

@@ -1,0 +1,21 @@
+# cargo-nextest configuration.
+#
+# The backstop below bounds any wedged test. `iroh`'s `Endpoint::close().await`
+# can deadlock under heavy CPU contention (a lost wakeup that parks every runtime
+# thread), and a test that hangs in teardown has no timeout of its own — so it
+# runs until the CI job itself times out, burning a whole runner for hours. A cap
+# turns that into a bounded, reported failure within minutes.
+#
+# The cap sits well above the slowest legitimate test — the ~168s outer pull
+# deadline (`selection::outer_pull_deadline` at defaults) — and far below the
+# multi-hour wedge it replaces.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The anvil-backed e2e journeys boot anvil, deploy the full protocol, and drive
+# daemon subprocesses, so they are legitimately slower than an in-process unit
+# test. Give the package more headroom before the same backstop applies.
+[[profile.default.overrides]]
+filter = 'package(decdn-e2e)'
+slow-timeout = { period = "120s", terminate-after = 5 }
