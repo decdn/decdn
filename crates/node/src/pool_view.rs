@@ -38,18 +38,17 @@ pub struct PoolStatus {
 /// `Arc<dyn PoolView>` and tests pass a fake (or `None`) without a chain.
 #[async_trait::async_trait]
 pub trait PoolView: Send + Sync + std::fmt::Debug {
-    /// The pool's projected status, or `None` if the pool is unknown (callers fail
-    /// open). MAY trigger an on-chain fetch on a cache miss — use only where
-    /// blocking on an RPC is acceptable (e.g. stream admission).
+    /// The pool's status, or `None` if the pool is unknown (callers fail open).
+    /// The stream-admission read: a caller here may tolerate a blocking source,
+    /// so an implementation MAY do slow work. The production implementation
+    /// ([`PoolProjection`]) reads from memory and never blocks.
     async fn status(&self, pool_id: B256) -> Option<PoolStatus>;
 
-    /// A CACHE-ONLY status read: returns a fresh cached [`PoolStatus`] if one is
-    /// held, and NEVER triggers an on-chain fetch — `None` when nothing fresh is
-    /// cached. The mid-stream serve re-check uses this so a per-voucher-boundary
-    /// solvency check never blocks the serve loop on a `getPool` `eth_call`, which on
-    /// a slow RPC would stall delivery. The default delegates to [`Self::status`]
-    /// for in-memory test doubles; [`PoolProjection`] serves both from the same
-    /// in-memory map, so neither ever touches the network.
+    /// A read that MUST NOT block: it returns `None` rather than doing any slow or
+    /// remote work. The mid-stream serve re-check calls it at each voucher
+    /// boundary, where a blocking read would stall delivery. The default delegates
+    /// to [`Self::status`] for in-memory test doubles; [`PoolProjection`] serves
+    /// both from the same in-memory map, so neither ever touches the network.
     async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
         self.status(pool_id).await
     }
