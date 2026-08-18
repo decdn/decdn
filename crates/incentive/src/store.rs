@@ -93,6 +93,21 @@ pub trait PoolStateStore: Send + Sync {
     fn flush(&self) -> Result<(), StoreError> {
         Ok(())
     }
+
+    /// Raise this lane's observed on-chain registration expiry
+    /// (`LaneState::registered_until`) to `registered_until`, monotonically — a
+    /// lower or equal value is a no-op, and `0` (unknown) never lowers a known
+    /// value. Touches ONLY that field, never the replay-critical `last_*` tuple,
+    /// so the seller redeemer can record a fresh registration without racing a
+    /// concurrent voucher advance into a lost update. A no-op for a lane with no
+    /// record. Buffered like `record`; durability is the next `flush`'s job.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backing store is unwritable.
+    fn set_registered_until(&self, key: LaneKey, registered_until: u64) -> Result<(), StoreError> {
+        let _ = (key, registered_until);
+        Ok(())
+    }
 }
 
 /// A pool this node closed on-chain (graceful shutdown or grace-window sweep)
@@ -346,7 +361,22 @@ impl PoolStateStore for MemoryPoolStateStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.insert(state.key(), state.clone());
+        let mut next = state.clone();
+        if let Some(existing) = guard.get(&next.key()) {
+            next.registered_until = next.registered_until.max(existing.registered_until);
+        }
+        guard.insert(next.key(), next);
+        Ok(())
+    }
+
+    fn set_registered_until(&self, key: LaneKey, registered_until: u64) -> Result<(), StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        if let Some(state) = guard.get_mut(&key) {
+            state.registered_until = state.registered_until.max(registered_until);
+        }
         Ok(())
     }
 
@@ -438,6 +468,41 @@ mod tests {
             U256::from(4_096u64),
             Some([0xABu8; 65]),
         )
+    }
+
+    #[test]
+    fn record_does_not_regress_registered_until() -> Result<(), StoreError> {
+        let store = MemoryPoolStateStore::new();
+        let mut st = sample(1, 2);
+        st.registered_until = 0;
+        store.record(&st)?; // voucher-path shape: unknown
+        store.set_registered_until(st.key(), 1_800_000_000)?; // redeemer learns expiry
+        // A later voucher record carries registered_until 0 again.
+        store.record(&st)?;
+        let got = store.get(st.key())?.ok_or(StoreError::Corrupt {
+            pool_id: None,
+            detail: "missing".into(),
+        })?;
+        assert_eq!(
+            got.registered_until, 1_800_000_000,
+            "record must not clobber to 0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_registered_until_is_monotone() -> Result<(), StoreError> {
+        let store = MemoryPoolStateStore::new();
+        let st = sample(3, 4);
+        store.record(&st)?;
+        store.set_registered_until(st.key(), 100)?;
+        store.set_registered_until(st.key(), 50)?; // lower: no-op
+        let got = store.get(st.key())?.ok_or(StoreError::Corrupt {
+            pool_id: None,
+            detail: "x".into(),
+        })?;
+        assert_eq!(got.registered_until, 100);
+        Ok(())
     }
 
     #[test]

@@ -610,9 +610,30 @@ impl PoolStateStore for PersistentPoolStateStore {
     fn record(&self, state: &LaneState) -> Result<(), StoreError> {
         let key = state.key();
         let mut buf = self.lock_buffer()?;
-        buf.lanes.insert(key, state.clone());
+        let mut next = state.clone();
+        if let Some(existing) = buf.lanes.get(&key) {
+            next.registered_until = next.registered_until.max(existing.registered_until);
+        }
+        buf.lanes.insert(key, next);
         buf.tombstones.remove(&key);
         buf.dirty.insert(key);
+        Ok(())
+    }
+
+    /// Raise this lane's observed on-chain registration expiry, monotonically —
+    /// touches ONLY `registered_until`, never the replay-critical `last_*`
+    /// tuple, so it cannot race a concurrent voucher `record` into a lost
+    /// update. A no-op for a lane with no record. Buffered like `record`;
+    /// durability is the next `flush`'s job.
+    fn set_registered_until(&self, key: LaneKey, registered_until: u64) -> Result<(), StoreError> {
+        let mut buf = self.lock_buffer()?;
+        let Some(state) = buf.lanes.get_mut(&key) else {
+            return Ok(());
+        };
+        if registered_until > state.registered_until {
+            state.registered_until = registered_until;
+            buf.dirty.insert(key);
+        }
         Ok(())
     }
 

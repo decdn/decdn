@@ -234,6 +234,62 @@ fn registered_until_round_trips_across_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `set_registered_until` writes must survive a `flush` → reopen round trip
+/// like `record` does, and once persisted, a later voucher-path `record`
+/// carrying `registered_until: 0` (the shape `apply_voucher` produces for a
+/// lane it has not yet observed a registration for) must not regress the
+/// persisted value after reopen — the clobber-safety guarantee this store
+/// exists to provide.
+#[test]
+fn set_registered_until_survives_restart_and_resists_regression() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let signer = PrivateKeySigner::random();
+
+    {
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let state = make_state(POOL_ID, &signer);
+        store.record(&state)?;
+        store.set_registered_until(state.key(), 1_800_000_000)?;
+        store.flush()?;
+    }
+
+    let key = LaneKey {
+        pool_id: POOL_ID,
+        signer: signer.address(),
+        provider: PROVIDER,
+    };
+
+    {
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let found = store
+            .get(key)?
+            .ok_or_else(|| anyhow::anyhow!("lane not found after reopen"))?;
+        anyhow::ensure!(
+            found.registered_until == 1_800_000_000,
+            "set_registered_until did not survive persistence round trip, got {}",
+            found.registered_until,
+        );
+
+        // Simulate a subsequent voucher acceptance, whose `record` carries the
+        // voucher path's unknown-registration shape (registered_until: 0).
+        let mut regressed = found.clone();
+        regressed.registered_until = 0;
+        store.record(&regressed)?;
+        store.flush()?;
+    }
+
+    let store = PersistentPoolStateStore::open(dir.path())?;
+    let found = store
+        .get(key)?
+        .ok_or_else(|| anyhow::anyhow!("lane not found after second reopen"))?;
+    anyhow::ensure!(
+        found.registered_until == 1_800_000_000,
+        "a later record with registered_until=0 regressed the persisted value after restart, got {}",
+        found.registered_until,
+    );
+    Ok(())
+}
+
 /// Two distinct lanes with interleaved monotonic voucher progressions must both
 /// reach their expected terminal state — verifies the store does not
 /// cross-contaminate entries across lane keys. Same-lane concurrent acceptance
