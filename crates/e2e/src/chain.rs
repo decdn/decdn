@@ -1,14 +1,23 @@
-//! Chain fixture: spin up `anvil`, deploy the full protocol via the production
-//! `DeployProtocol` forge script, and expose typed `alloy` handles + the helper
-//! verbs (fund gas, mint USDC/TOKEN, onboard an operator, read served bytes)
-//! the cross-layer journeys need.
+//! Chain fixture: spin up `anvil`, load a pre-deployed protocol state snapshot,
+//! and expose typed `alloy` handles + the helper verbs (fund gas, mint
+//! USDC/TOKEN, onboard an operator, read served bytes) the cross-layer journeys
+//! need.
+//!
+//! The `DeployProtocol` forge script runs **once per test run**, not once per
+//! journey. The first fixture to launch wins an advisory file lock, deploys the
+//! full protocol into a throwaway anvil, and dumps the resulting chain state to
+//! a cache file (see `ensure_shared_deployment`); every other fixture blocks
+//! on the lock, then boots its own isolated anvil and replays that snapshot with
+//! `anvil_loadState`. Each journey still gets a private chain — the win is that
+//! the slow, contention-sensitive deploy leaves the per-journey hot path.
 //!
 //! Generalizes the self-contained bring-up in
 //! `crates/node/tests/anvil_settlement_e2e.rs` into a reusable fixture. Like
-//! that test it shells out to `forge`/`anvil` (no extra crate deps) and so
-//! requires both on `PATH`; the fixture is only reached behind the harness's
-//! `anvil-e2e` gate.
+//! that test it shells out to `forge`/`anvil` (no extra crate deps beyond the
+//! advisory-lock helper) and so requires both on `PATH`; the fixture is only
+//! reached behind the harness's `anvil-e2e` gate.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -34,17 +43,22 @@ use crate::bindings::{
     TimelockController,
 };
 
-/// Base for the per-fixture chain id. Each `ChainFixture` derives its chain id
-/// as `CHAIN_BASE + port` (the full ephemeral port), so concurrent fixtures (and
-/// the node crate's `anvil_settlement_e2e.rs`) never share — and thus never race
-/// on — the `deployments/<chain_id>.json` manifest. Because the OS never hands
-/// the same port to two live listeners, a chain-id collision can only coincide
-/// with a port collision, which already fails the anvil bind; folding the port
-/// modulo a range (as an earlier revision did) instead *added* collisions. The
-/// resulting `31_337_691_024..=31_337_755_535` range matches the
-/// `deployments/31337[67]*.json` gitignore glob (`contracts/.gitignore`), so a
-/// crashed run's leftover manifest stays untracked.
-const CHAIN_BASE: u64 = 31_337_690_000;
+/// The single chain id every anvil-e2e chain runs on: the one-time protocol
+/// deploy and every per-journey fixture that loads its state snapshot.
+///
+/// A fixed value is what makes the state snapshot reusable. EIP-712 domain
+/// separators bind to `block.chainid`, so the fixture that loads the snapshot
+/// must run the same chain id the snapshot was deployed under, or every signed
+/// voucher / node-id bind / slash attestation the journeys build would verify
+/// against a different domain. It is also the chain id every Rust-side signer
+/// derives its domain from (see [`ChainFixture::chain_id`]).
+///
+/// The value sits in the test-only band that `contracts/.gitignore` masks
+/// (`deployments/31337[67]*.json`), so the `deployments/31337690000.json`
+/// manifest the one-time deploy writes stays untracked, and it is deliberately
+/// distinct from `31337` (the local `dev-deploy.sh` manifest) so an e2e run and
+/// a dev deploy never clobber each other's manifest.
+const E2E_CHAIN_ID: u64 = 31_337_690_000;
 
 /// Anvil dev account #0 — funded at genesis, broadcasts the deploy script.
 const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -83,21 +97,20 @@ const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
 // ladder still guards local runs, which have no such job step.
 const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const BUILD_ATTEMPTS: usize = 3;
-// The deploy script broadcasts against a live anvil while the runner is running
-// two journeys at once (`--test-threads 2` on a 4-core box), so give each attempt
-// generous wall-clock headroom. `run_deploy_script` reverts anvil to a pre-deploy
-// snapshot between attempts, so a widened budget buys real recovery chances rather
-// than doomed nonce-colliding retries (#785). The base budget is comfortable
-// locally; on a contended CI runner it is scaled up via `ci_scaled` because the
-// failure mode is CPU starvation, not slowness (#1384).
+// The deploy runs once per test run, serialized by the bootstrap lock, so no
+// two forge scripts ever broadcast at the same time — the `--test-threads 2`
+// CPU starvation that made a per-journey deploy flaky (#1384) cannot occur here.
+// `run_deploy_script` still reverts anvil to a pre-deploy snapshot between its
+// own retry attempts (#785), and the budget is still scaled up under `ci_scaled`
+// for a slow shared runner, but the base is the pre-#1384 value again: one
+// uncontended deploy is comfortably fast.
 //
-// The deploy ladder runs *inside* every journey's fixture and cannot be hoisted
-// (it needs the test's own live anvil), so it is the binding in-test retry ladder
-// the per-test ceilings must contain (see `crate::timeout` and #1620). Two
-// attempts cap the CI worst case at `2 * ci_scaled(60s) = 240s`, which fits under
-// the 300s standard tier while still absorbing one snapshot-reverted transient at
-// full per-attempt margin — the #1384 starvation fix is per-attempt time, not
-// attempt count, so it stays intact.
+// The deploy ladder is still the binding in-test retry ladder the per-journey
+// ceilings must contain (see `crate::timeout` and #1620): whichever journeys
+// race the first `launch()` either run the deploy (the lock winner) or block on
+// the lock for its duration, and both waits sit inside that journey's
+// `OVERALL_TIMEOUT`. Two attempts cap the CI worst case at
+// `2 * ci_scaled(60s) = 240s`, which fits under the 300s standard tier.
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
 const DEPLOY_ATTEMPTS: usize = 2;
 // The anvil-e2e deploy flakiness (#1384) is starvation, not slowness: under
@@ -197,19 +210,108 @@ pub struct ContractAddrs {
     pub content_blacklist: Address,
 }
 
-/// Kills the spawned `anvil` on drop and removes the (gitignored) manifest so
-/// re-runs start clean — a panicking assertion never leaks the process.
+/// Kills the spawned `anvil` on drop — a panicking assertion never leaks the
+/// process. `manifest` is `Some` only for the throwaway anvil the one-time
+/// deploy runs in: dropping it removes the (gitignored) `deployments/*.json` the
+/// forge script wrote. Per-journey anvils load a state snapshot instead of
+/// deploying, so they write no manifest and carry `None`.
 #[derive(Debug)]
 struct AnvilGuard {
     child: Child,
-    manifest: PathBuf,
+    manifest: Option<PathBuf>,
 }
 
 impl Drop for AnvilGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.manifest);
+        if let Some(manifest) = &self.manifest {
+            let _ = std::fs::remove_file(manifest);
+        }
+    }
+}
+
+/// A live anvil process at [`E2E_CHAIN_ID`] with the handles a caller needs:
+/// the drop guard, the endpoint (both string and parsed forms), and an
+/// admin-signed provider.
+struct AnvilProcess {
+    guard: AnvilGuard,
+    rpc_url: String,
+    url: reqwest::Url,
+    admin: DynProvider,
+}
+
+/// Bring up an `anvil` on a fresh ephemeral port at [`E2E_CHAIN_ID`] and wait
+/// for its RPC, retrying the `free_port` TOCTOU (another process claims the port
+/// in the gap before anvil binds, so anvil exits at startup — re-pick and retry
+/// rather than fail the fixture).
+///
+/// `manifest` is the `deployments/*.json` path whose cleanup the guard owns —
+/// `Some` for the throwaway anvil the one-time deploy writes a manifest into,
+/// `None` for a per-journey anvil that loads a snapshot and writes none.
+async fn spawn_anvil(manifest: Option<PathBuf>) -> anyhow::Result<AnvilProcess> {
+    let admin_signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let port = crate::free_port()?;
+        let rpc_url = format!("http://127.0.0.1:{port}");
+        let child = Command::new("anvil")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                &E2E_CHAIN_ID.to_string(),
+                "--silent",
+            ])
+            .spawn()
+            .context("spawn anvil (is foundry installed?)")?;
+        let mut guard = AnvilGuard {
+            child,
+            manifest: manifest.clone(),
+        };
+
+        let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
+        let admin: DynProvider = ProviderBuilder::new()
+            .with_simple_nonce_management()
+            .wallet(EthereumWallet::from(admin_signer.clone()))
+            .connect_http(url.clone())
+            .erased();
+
+        // Wait for the RPC to accept requests. A premature anvil exit is almost
+        // always the port clash above (retryable); a genuine timeout is a hard
+        // failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let up = loop {
+            if admin.get_chain_id().await.is_ok() {
+                break true;
+            }
+            if let Ok(Some(status)) = guard.child.try_wait() {
+                tracing::warn!(
+                    "anvil exited before its RPC came up (status {status}) on attempt \
+                     {attempt}/{ANVIL_ATTEMPTS}; retrying on a fresh port"
+                );
+                break false;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("anvil RPC never came up within 20s");
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        };
+        if up {
+            return Ok(AnvilProcess {
+                guard,
+                rpc_url,
+                url,
+                admin,
+            });
+        }
+        // `guard` drops here: kills the dead child before the next attempt.
+        if attempt >= ANVIL_ATTEMPTS {
+            anyhow::bail!(
+                "anvil never became ready after {ANVIL_ATTEMPTS} attempts (exited before its RPC came up each time)"
+            );
+        }
     }
 }
 
@@ -235,96 +337,29 @@ pub struct ChainFixture {
 }
 
 impl ChainFixture {
-    /// Build contracts, spawn anvil, deploy mock USDC + the full protocol, and
-    /// return the fixture with typed handles. Requires `anvil` + `forge` on
-    /// `PATH`.
+    /// Spawn an isolated anvil and replay the shared post-deploy state snapshot
+    /// into it, returning the fixture with typed handles. The first caller in a
+    /// test run also builds contracts and runs the one-time protocol deploy that
+    /// produces the snapshot (see `ensure_shared_deployment`). Requires `anvil`
+    /// + `forge` on `PATH`.
     pub async fn launch() -> anyhow::Result<Self> {
         let contracts = contracts_dir()?;
-        forge_build(&contracts).await?;
 
-        let admin_signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
-        let admin_addr = admin_signer.address();
+        // Deploy once per test run (behind a cross-process lock); every journey
+        // replays the resulting state snapshot into its own isolated anvil.
+        let shared = ensure_shared_deployment(&contracts).await?;
 
-        // Pick an ephemeral port and bring anvil up on it, re-picking on a
-        // collision. `free_port` releases the port before anvil binds it, so
-        // another process can take it in the gap (a TOCTOU that also seeds
-        // `chain_id`); the collision makes anvil exit at startup, so re-pick and
-        // retry rather than failing the whole fixture. The port is unique across
-        // live listeners once claimed, so the deploy manifest path never
-        // collides with a concurrent fixture's (see `CHAIN_BASE`).
-        let mut attempt = 0;
-        let (anvil, chain_id, rpc_url, url, admin) = loop {
-            attempt += 1;
-            let port = crate::free_port()?;
-            let chain_id = CHAIN_BASE + u64::from(port);
-            let rpc_url = format!("http://127.0.0.1:{port}");
-            let child = Command::new("anvil")
-                .args([
-                    "--port",
-                    &port.to_string(),
-                    "--chain-id",
-                    &chain_id.to_string(),
-                    "--silent",
-                ])
-                .spawn()
-                .context("spawn anvil (is foundry installed?)")?;
-            let manifest = contracts.join(format!("deployments/{chain_id}.json"));
-            let mut anvil = AnvilGuard { child, manifest };
+        let anvil = spawn_anvil(None).await?;
+        load_state_snapshot(&anvil.admin, &shared.state_path).await?;
 
-            let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
-            let admin: DynProvider = ProviderBuilder::new()
-                .with_simple_nonce_management()
-                .wallet(EthereumWallet::from(admin_signer.clone()))
-                .connect_http(url.clone())
-                .erased();
-
-            // Wait for the RPC to accept requests. A premature anvil exit is
-            // almost always the port clash above (retryable); a genuine timeout
-            // is a hard failure.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-            let up = loop {
-                if admin.get_chain_id().await.is_ok() {
-                    break true;
-                }
-                if let Ok(Some(status)) = anvil.child.try_wait() {
-                    tracing::warn!(
-                        "anvil exited before its RPC came up (status {status}) on attempt \
-                         {attempt}/{ANVIL_ATTEMPTS}; retrying on a fresh port"
-                    );
-                    break false;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!("anvil RPC never came up within 20s");
-                }
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            };
-            if up {
-                break (anvil, chain_id, rpc_url, url, admin);
-            }
-            // `anvil` (AnvilGuard) drops here: kills the dead child and removes
-            // its manifest before the next attempt.
-            if attempt >= ANVIL_ATTEMPTS {
-                anyhow::bail!(
-                    "anvil never became ready after {ANVIL_ATTEMPTS} attempts (exited before its RPC came up each time)"
-                );
-            }
-        };
-        let manifest = contracts.join(format!("deployments/{chain_id}.json"));
-
-        // Deploy mock USDC, then the protocol with the initial TOKEN supply held
-        // by the admin EOA so it can distribute bond stake to N operators.
-        let usdc = deploy_mock_usdc(&admin, &contracts).await?;
-        let admin_token_holder: Address = ADMIN_ADDR.parse().context("parse admin addr")?;
-        run_deploy_script(&admin, &contracts, &rpc_url, usdc, admin_token_holder).await?;
-        let addrs = read_manifest(&manifest)?;
-
+        let admin_addr: Address = ADMIN_ADDR.parse().context("parse admin addr")?;
         Ok(Self {
-            _anvil: anvil,
-            url,
-            chain_id,
-            addrs,
-            usdc,
-            admin,
+            _anvil: anvil.guard,
+            url: anvil.url,
+            chain_id: E2E_CHAIN_ID,
+            addrs: shared.addrs,
+            usdc: shared.usdc,
+            admin: anvil.admin,
             admin_addr,
         })
     }
@@ -1845,17 +1880,21 @@ async fn forge_build(contracts: &Path) -> anyhow::Result<()> {
     anyhow::bail!("BUILD_ATTEMPTS must be >= 1 (was {BUILD_ATTEMPTS})")
 }
 
-/// Deploy the mintable mock USDC from its compiled artifact bytecode.
-async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow::Result<Address> {
-    let artifact = contracts.join("out/MintableUSDC.sol/MintableUSDC.json");
-    let bytes = std::fs::read(&artifact)
-        .with_context(|| format!("read MintableUSDC artifact at {}", artifact.display()))?;
+/// Read the `bytecode.object` creation code from a compiled forge artifact.
+fn artifact_bytecode(artifact: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(artifact)
+        .with_context(|| format!("read forge artifact at {}", artifact.display()))?;
     let json: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let code_hex = json
-        .get("bytecode")
+    json.get("bytecode")
         .and_then(|b| b.get("object"))
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("MintableUSDC artifact missing bytecode.object"))?;
+        .map(str::to_owned)
+        .with_context(|| format!("artifact {} missing bytecode.object", artifact.display()))
+}
+
+/// Deploy the mintable mock USDC from its compiled artifact bytecode.
+async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow::Result<Address> {
+    let code_hex = artifact_bytecode(&contracts.join("out/MintableUSDC.sol/MintableUSDC.json"))?;
     let code: Bytes = code_hex.parse().context("parse MintableUSDC bytecode")?;
     let receipt = provider
         .send_transaction(TransactionRequest::default().with_deploy_code(code))
@@ -1867,6 +1906,197 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
     receipt
         .contract_address
         .ok_or_else(|| anyhow::anyhow!("MintableUSDC deploy produced no contract address"))
+}
+
+/// A one-time protocol deployment shared by every journey in a test run: the
+/// path to the anvil state snapshot to replay, plus the addresses read back from
+/// the deploy manifest. Produced by [`ensure_shared_deployment`].
+struct SharedDeployment {
+    state_path: PathBuf,
+    addrs: ContractAddrs,
+    usdc: Address,
+}
+
+/// Deploy the protocol once per test run and return handles to the snapshot the
+/// per-journey fixtures replay.
+///
+/// nextest runs each journey in its own process, so this coordinates *across
+/// processes*: an advisory file lock elects one deployer while its siblings
+/// block, and the cache files it commits are how the result crosses the process
+/// boundary. A warm cache (this run or a prior one with identical artifacts)
+/// short-circuits before the lock.
+async fn ensure_shared_deployment(contracts: &Path) -> anyhow::Result<SharedDeployment> {
+    // Every process builds contracts: the cache key is computed from the
+    // compiled artifacts, and a cache miss needs them to deploy. Warm builds are
+    // a sub-second no-op (CI hoists a cold build into a one-time job step).
+    forge_build(contracts).await?;
+
+    let key = artifact_cache_key(contracts)?;
+    let dir = cache_dir(contracts);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create e2e chain cache dir {}", dir.display()))?;
+    let state_path = dir.join(format!("state-{key}.json"));
+    let manifest_path = dir.join(format!("manifest-{key}.json"));
+
+    if let Some(shared) = load_cached_deployment(&state_path, &manifest_path)? {
+        return Ok(shared);
+    }
+
+    // Elect a single deployer. `File::lock` is a blocking flock/LockFileEx held
+    // for the whole deploy and released when the file drops (including on a crash
+    // or SIGKILL), so a dead winner never wedges the siblings. Take it off the
+    // async runtime.
+    let lock_path = dir.join(format!("bootstrap-{key}.lock"));
+    let lock = tokio::task::spawn_blocking(move || -> anyhow::Result<File> {
+        let file = File::create(&lock_path)
+            .with_context(|| format!("create bootstrap lock {}", lock_path.display()))?;
+        file.lock().context("acquire bootstrap deploy lock")?;
+        Ok(file)
+    })
+    .await
+    .context("join bootstrap lock task")??;
+
+    // Re-check under the lock: a sibling that held it before us has already
+    // populated the cache, so we load rather than redeploy.
+    let shared = match load_cached_deployment(&state_path, &manifest_path)? {
+        Some(shared) => shared,
+        None => deploy_and_snapshot(contracts, &state_path, &manifest_path).await?,
+    };
+    drop(lock);
+    Ok(shared)
+}
+
+/// Run the one-time deploy in a throwaway anvil and commit its state snapshot +
+/// manifest to the cache. The caller holds the bootstrap lock for the duration.
+async fn deploy_and_snapshot(
+    contracts: &Path,
+    state_path: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<SharedDeployment> {
+    let forge_manifest = contracts.join(format!("deployments/{E2E_CHAIN_ID}.json"));
+    // The guard removes the forge manifest on drop; the cache keeps its own copy.
+    let anvil = spawn_anvil(Some(forge_manifest.clone())).await?;
+
+    // Mock USDC first, then the protocol with the initial TOKEN supply held by
+    // the admin EOA so it can distribute bond stake to N operators.
+    let usdc = deploy_mock_usdc(&anvil.admin, contracts).await?;
+    let token_holder: Address = ADMIN_ADDR.parse().context("parse admin addr")?;
+    run_deploy_script(&anvil.admin, contracts, &anvil.rpc_url, usdc, token_holder).await?;
+
+    let (addrs, manifest_usdc) = read_manifest(&forge_manifest)?;
+    anyhow::ensure!(
+        manifest_usdc == usdc,
+        "manifest externalDeps.usdc {manifest_usdc} disagrees with deployed mock USDC {usdc}"
+    );
+
+    // Snapshot the fully-deployed chain. `anvil_dumpState` returns a gzip-hex
+    // blob that `anvil_loadState` replays verbatim (the CLI `--dump-state` /
+    // `--load-state` files use a different, incompatible encoding).
+    let state_hex: String = anvil
+        .admin
+        .raw_request("anvil_dumpState".into(), ())
+        .await
+        .context("anvil_dumpState")?;
+
+    // Order matters: the state snapshot is written first and the manifest last,
+    // so any reader that observes the manifest is guaranteed a complete snapshot
+    // beside it. Each write is an atomic rename, so neither file is ever seen
+    // half-written.
+    write_atomic(state_path, state_hex.as_bytes())?;
+    let manifest_bytes = std::fs::read(&forge_manifest)
+        .with_context(|| format!("re-read forge manifest {}", forge_manifest.display()))?;
+    write_atomic(manifest_path, &manifest_bytes)?;
+
+    Ok(SharedDeployment {
+        state_path: state_path.to_path_buf(),
+        addrs,
+        usdc,
+    })
+}
+
+/// Load a previously committed deployment, or `None` if the cache is absent or
+/// incomplete (the manifest is the commit marker, but require both files so a
+/// torn write is never mistaken for a hit).
+fn load_cached_deployment(
+    state_path: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<Option<SharedDeployment>> {
+    if !nonempty_file(state_path) || !nonempty_file(manifest_path) {
+        return Ok(None);
+    }
+    let (addrs, usdc) = read_manifest(manifest_path)?;
+    Ok(Some(SharedDeployment {
+        state_path: state_path.to_path_buf(),
+        addrs,
+        usdc,
+    }))
+}
+
+/// Replay a dumped chain state into a fresh anvil via `anvil_loadState`.
+async fn load_state_snapshot(provider: &DynProvider, state_path: &Path) -> anyhow::Result<()> {
+    let state_hex = std::fs::read_to_string(state_path)
+        .with_context(|| format!("read chain state snapshot {}", state_path.display()))?;
+    let loaded: bool = provider
+        .raw_request("anvil_loadState".into(), (state_hex.trim(),))
+        .await
+        .context("anvil_loadState")?;
+    anyhow::ensure!(loaded, "anvil_loadState returned false");
+    Ok(())
+}
+
+/// `true` when `path` exists and is non-empty. An atomic-rename commit means a
+/// present-and-non-empty file is also a complete one.
+fn nonempty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > 0)
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, then rename
+/// over `path`. A reader therefore sees either the old file or the whole new
+/// one, never a partial write.
+fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, bytes).with_context(|| format!("write temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// The per-checkout cache directory for shared chain state, under the system
+/// temp dir. Keyed by a hash of the contracts path so sibling worktrees (and
+/// unrelated checkouts) never share a cache.
+fn cache_dir(contracts: &Path) -> PathBuf {
+    let path_key = short_hash(contracts.to_string_lossy().as_bytes());
+    std::env::temp_dir()
+        .join("decdn-e2e-chaincache")
+        .join(path_key)
+}
+
+/// A cache key that changes whenever the deployed state would: the compiled
+/// creation code of the mock USDC and the deploy script (which embeds every
+/// contract it `new`s), plus the deploy inputs the script reads from the
+/// environment. `SCHEMA` is bumped by hand when the snapshot encoding or this
+/// fixture's deploy wiring changes in a way the bytecode alone does not capture.
+fn artifact_cache_key(contracts: &Path) -> anyhow::Result<String> {
+    const SCHEMA: &str = "v1";
+    let usdc_bc = artifact_bytecode(&contracts.join("out/MintableUSDC.sol/MintableUSDC.json"))?;
+    let deploy_bc =
+        artifact_bytecode(&contracts.join("out/DeployProtocol.s.sol/DeployProtocol.json"))?;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(SCHEMA.as_bytes());
+    buf.extend_from_slice(&E2E_CHAIN_ID.to_le_bytes());
+    buf.extend_from_slice(usdc_bc.as_bytes());
+    buf.extend_from_slice(deploy_bc.as_bytes());
+    buf.extend_from_slice(terms_hash().as_slice());
+    buf.extend_from_slice(ADMIN_ADDR.as_bytes());
+    buf.extend_from_slice(DEPLOYER_ADDR.as_bytes());
+    Ok(short_hash(&buf))
+}
+
+/// First 8 bytes of `keccak256(bytes)` as lowercase hex — a short, collision-
+/// resistant-enough filename component for cache keying.
+fn short_hash(bytes: &[u8]) -> String {
+    let digest = keccak256(bytes);
+    alloy::hex::encode(digest.get(..8).unwrap_or(digest.as_slice()))
 }
 
 /// Run `forge script DeployProtocol.s.sol` against the anvil RPC, retrying the
@@ -2108,8 +2338,10 @@ fn emergency_multisig_role() -> B256 {
     keccak256(b"EMERGENCY_MULTISIG_ROLE")
 }
 
-/// Read the protocol contract addresses from the deploy manifest.
-fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
+/// Read the protocol contract addresses and the settlement USDC from the deploy
+/// manifest. The mock USDC is recorded under `externalDeps.usdc` — the same
+/// address the fixture deployed and fed to the script as `USDC_ADDRESS`.
+fn read_manifest(path: &Path) -> anyhow::Result<(ContractAddrs, Address)> {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let contracts = json
         .get("contracts")
@@ -2122,7 +2354,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
             .parse()
             .with_context(|| format!("parse manifest address contracts.{k}"))
     };
-    Ok(ContractAddrs {
+    let addrs = ContractAddrs {
         capacity_bond: get("CapacityBond")?,
         payment_pool: get("PaymentPool")?,
         fee_router: get("FeeRouter")?,
@@ -2135,7 +2367,15 @@ fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
         origin_assignment: get("OriginAssignment")?,
         manual_vetting_policy: get("ManualVettingPolicy")?,
         content_blacklist: get("ContentBlacklist")?,
-    })
+    };
+    let usdc: Address = json
+        .get("externalDeps")
+        .and_then(|d| d.get("usdc"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("manifest missing externalDeps.usdc"))?
+        .parse()
+        .context("parse manifest externalDeps.usdc")?;
+    Ok((addrs, usdc))
 }
 
 #[cfg(test)]
