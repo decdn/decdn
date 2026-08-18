@@ -477,7 +477,7 @@ mod tests {
     /// the production impl bounds anything: a stub-level test here would look
     /// like a wiring test while asserting nothing about the wiring.
     #[tokio::test(start_paused = true)]
-    async fn hanging_get_origins_fails_the_tick_rather_than_wedging() {
+    async fn hanging_get_origins_fails_the_lookup_rather_than_wedging() {
         use crate::chain_events::test_support::{bounded, hanging_provider};
         let provider = hanging_provider();
         let contracts = Contracts {

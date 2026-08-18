@@ -1,37 +1,49 @@
-//! One `CapacityBond` watcher feeding both registry projections (#1110).
+//! One `CapacityBond` watcher feeding four registry projections.
 //!
-//! [`ChainStakerSet`] (membership: `NodeId → active?`) and
-//! [`ChainNodeAddressDirectory`] (bindings: `NodeId → operator address`) are both
-//! derived from the same `CapacityBond` contract. This module runs one
-//! enumeration and one `eth_getLogs` loop over the shared `CapacityBond`
-//! address, demuxing to both projections; node-address's two topics are a
-//! strict *subset* of staker-set's five.
+//! [`ChainStakerSet`] (membership: `NodeId → active?`), [`ChainNodeAddressDirectory`]
+//! (bindings: `NodeId → operator address`), the region map (`NodeId → regionHint`),
+//! and the operator reverse map (`operator address → NodeId`) are all derived
+//! from the same `CapacityBond` contract. This module runs one enumeration and
+//! one `eth_getLogs` loop over the shared `CapacityBond` address, demuxing to
+//! all four projections; node-address's two topics are a strict *subset* of
+//! staker-set's five.
 //!
-//! # What actually differs between them
+//! Bindings is gated on `cache.node_to_node_pull_through_enabled`: when
+//! pull-through is off, the bindings projection is not built at all. Regions
+//! and the operator reverse map are always built, regardless of pull-through —
+//! region byte-accounting and the ADR-030 selection penalty need the region
+//! map unconditionally, and the chain-backed origin directory needs the
+//! reverse map to resolve operators locally with no `nodeIdOf` RPC.
 //!
-//! Only the **enumeration**. The live event arms are a clean union:
-//! `NodeRegistered` inserts into *both* projections unfiltered — staker-set's
-//! live arm applies no `isActive` check either (its filter is bootstrap-only). It
-//! is tempting to read "staker-set is the filtered view, node-address is the
-//! unfiltered one" as a live-path difference and encode it in the sink; that
+//! # What actually differs between the projections
+//!
+//! Mostly the **enumeration**. The live event arms are close to a clean union:
+//! `NodeRegistered` inserts into active, bindings (if built), regions (if
+//! non-empty), and the reverse map, all unfiltered — staker-set's live arm
+//! applies no `isActive` check either (its filter is bootstrap-only). It is
+//! tempting to read "staker-set is the filtered view, the rest are the
+//! unfiltered ones" as a live-path difference and encode it in the sink; that
 //! would be wrong, and would drop registrations from the active set.
 //!
-//! At bootstrap they genuinely diverge:
+//! At bootstrap `active` and `bindings` genuinely diverge:
 //!
 //! - `active` takes the per-entry `active[i]` that `getRegisteredNodes` computes
 //!   on-chain (`isActive(operator)`: registered AND bond ≥ minBond AND no
 //!   unbonding AND not ejected) alongside the `_registeredAddrs` page.
 //! - `bindings` applies no filter: an operator mid-unbonding has `isActive =
 //!   false` but is still payable, so its binding must survive.
+//! - `regions` and the reverse map are likewise unfiltered: liveness is applied
+//!   separately at read time via the shared `StakerSet`.
 //!
 //! # Fatality
 //!
 //! The single `getRegisteredNodes` bootstrap is fatal: staker-set requires it,
 //! and its failure propagates. The bindings projection (pull-through is
 //! opportunistic, so it would otherwise be non-fatal) has **no RPC of its own**:
-//! it is derived from page data already in hand and cannot fail independently. A
-//! node either boots with both projections or fails at the one shared read, so
-//! pull-through is never lost on its own.
+//! it is derived from page data already in hand and cannot fail independently.
+//! The same is true of regions and the reverse map. A node either boots with
+//! all four projections or fails at the one shared read, so pull-through is
+//! never lost on its own.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

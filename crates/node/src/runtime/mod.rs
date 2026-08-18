@@ -953,19 +953,17 @@ async fn build_chain_and_handlers(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Origin directory shared by two consumers so "authorized origin" means
-    // the same thing everywhere: the reactive pull-through authorized-origin
-    // gate (#821, ADR 037), and the node-origin FIND_VALUE last-resort fallback
-    // used when the DHT returns no providers (ADR 022 §FIND_VALUE Flow; #912).
-    // Both consume one `Arc` so the chain directory backs the fallback for every
-    // node. When the operator configures the OriginAssignment + PublisherRegistry
-    // addresses, use the chain-backed `ChainOriginDirectory` — a lazy TTL cache
-    // resolving hash → namespace → authorized origin → active NodeId on demand,
-    // reusing the already-bootstrapped `staker_set` and `operator_to_node`
-    // reverse projection for operator liveness and binding. No bootstrap RPC:
-    // the cache populates on the first lookup miss per namespace.
-    // Without those addresses this is an `EmptyOriginDirectory`: the gate rejects
-    // every hash and the FIND_VALUE fallback resolves nothing (same prior behavior).
+    // Origin directory with a single consumer: the node-origin FIND_VALUE
+    // last-resort fallback used when the DHT returns no providers (ADR 022
+    // §FIND_VALUE Flow; #912). When the operator configures the
+    // OriginAssignment + PublisherRegistry addresses, use the chain-backed
+    // `ChainOriginDirectory` — a lazy TTL cache resolving hash → namespace →
+    // authorized origin → active NodeId on demand, reusing the
+    // already-bootstrapped `staker_set` and `operator_to_node` reverse
+    // projection for operator liveness and binding. No bootstrap RPC: the
+    // cache populates on the first lookup miss per namespace.
+    // Without those addresses this is an `EmptyOriginDirectory`: the FIND_VALUE
+    // fallback resolves nothing.
     let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> =
         if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
             let origin_assignment_addr =
