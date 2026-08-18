@@ -319,6 +319,16 @@ impl MultiplexedPollerBuilder {
             all_addresses.extend(route.addresses.iter().copied());
             all_topic0s.extend(route.topic0s.iter().copied());
         }
+        // Routes commonly share a contract address (settlement + rate-bounds on
+        // PaymentPool; capacity-bond + slash on CapacityBond), so the merged
+        // filter would otherwise carry duplicate addresses/topic0s — bloating the
+        // `eth_getLogs` request for no benefit. Dedup before building it; the
+        // per-route `key_index` above is what preserves demux correctness, not
+        // the filter's multiplicity. Order is irrelevant to `eth_getLogs`.
+        all_addresses.sort_unstable();
+        all_addresses.dedup();
+        all_topic0s.sort_unstable();
+        all_topic0s.dedup();
         let base_filter = Filter::new()
             .address(all_addresses)
             .event_signature(all_topic0s);

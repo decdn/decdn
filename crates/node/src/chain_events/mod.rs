@@ -56,6 +56,11 @@ pub(crate) mod resumable_watcher;
 // external integration tests (`tests/anvil_settlement_e2e.rs`) call.
 pub mod shared_head;
 
+// `resumable_watcher` is crate-private, but `WatcherHandle` is the return type of
+// the `pub multiplexed_poller::spawn`, so external callers must be able to name
+// it. Re-export it on a public path rather than widen the whole module.
+pub use resumable_watcher::WatcherHandle;
+
 pub(crate) use backfill::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows};
 
 use std::future::IntoFuture;

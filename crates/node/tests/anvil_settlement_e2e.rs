@@ -676,11 +676,11 @@ async fn run_e2e() -> anyhow::Result<()> {
     // test's duration; dropping it aborts the poller.
     let settlement_poller = {
         use decdn_node::chain_events::multiplexed_poller::{MultiplexedPollerBuilder, spawn};
-        let built =
+        let poller =
             MultiplexedPollerBuilder::new(e2e_head(&node_provider), Duration::from_millis(250))
                 .route(settlement_route)
                 .build()?;
-        spawn(node_provider.clone(), built)
+        spawn(node_provider.clone(), poller)
     };
 
     let (server_ep, server_addr) = local_endpoint(node_iroh_sk, vec![ALPN_CLIENT.to_vec()]).await?;

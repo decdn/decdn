@@ -278,8 +278,8 @@ pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64
 /// through [`shutdown`], so no call site can conjure or drop an inert token — the
 /// mistake #1230 fixed by convention, made unrepresentable (#1236). [`shutdown`]
 /// is the graceful path (the loop flushes every route's cursor and returns); the
-/// wrapped [`AbortOnDrop`] is the hard safety net when the handle drops without a
-/// prior `shutdown`.
+/// wrapped `AbortOnDrop` guard is the hard safety net when the handle drops
+/// without a prior `shutdown`.
 ///
 /// [`shutdown`]: WatcherHandle::shutdown
 ///
