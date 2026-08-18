@@ -1,12 +1,22 @@
 //! DHT republish scheduler (ADR 022 §STORE Flow & §Bootstrap).
 //!
 //! On every successful blob commit ([`decdn_cache::CacheEngine::subscribe_inserts`])
-//! and on a periodic per-record jittered timer the scheduler:
+//! the scheduler eagerly publishes the single new hash to its K+3
+//! closest peers with per-hash `StoreRequest`s (a size-1 batch buys
+//! nothing), then schedules its next republish.
 //!
-//!  1. Computes the K+3 closest peers to the blob's hash from the
-//!     local routing table.
-//!  2. Sends `StoreRequest { hash, holder: self }` to each in
-//!     parallel.
+//! On a periodic per-record jittered timer the scheduler:
+//!
+//!  1. Drains every record whose republish window has come due and
+//!     keeps those still held in the cache.
+//!  2. Groups the due hashes by receiver — each hash's K+3 closest
+//!     peers — so all hashes bound for one receiver ride a single
+//!     `BatchStoreRequest { hashes, holder: self }`, split at the
+//!     [`MAX_BATCH_STORE_HASHES`] wire cap. This collapses the
+//!     concentration of overlapping republish windows into one RPC per
+//!     publisher-receiver pair (ADR 022 §STORE Flow Batched STORE &
+//!     §DHT Bandwidth Analysis). Every DHT node implements `BatchStore`,
+//!     so there is no per-hash fallback.
 //!  3. Schedules the next republish at `now + uniform(30 min, 50 min)`
 //!     per ADR 022 §STORE Flow step 3. Jitter is drawn independently
 //!     per record so the next republish window for a given hash is
@@ -29,7 +39,7 @@
 //! so a slow receiver doesn't stall the rest of the schedule.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,6 +50,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
 use decdn_protocol::ContentHash;
+use decdn_protocol::dht::MAX_BATCH_STORE_HASHES;
 
 /// Number of receivers per republish (ADR 022 §STORE Flow step 1:
 /// "K+3 closest nodes to H"). Three slots beyond `K=20` give the
@@ -320,21 +331,31 @@ pub async fn run_republish(
             }
             _ = ticker.tick() => {
                 let due = scheduler.drain_due(now_us());
+                // ADR 022 §Content Records and TTL line 122: "A node
+                // stops re-publishing when it evicts the blob." Keep only
+                // the still-held hashes; drop evicted ones from the
+                // scheduler instead of re-adding them.
+                let mut held = Vec::with_capacity(due.len());
                 for hash in due {
-                    // ADR 022 §Content Records and TTL line 122: "A
-                    // node stops re-publishing when it evicts the
-                    // blob." Verify the blob is still held before
-                    // each republish; if it's been evicted, drop the
-                    // scheduler entry instead of re-adding it.
-                    if !cache_still_holds(&cache, &hash).await {
+                    if cache_still_holds(&cache, &hash).await {
+                        held.push(hash);
+                    } else {
                         scheduler.unschedule(&hash);
-                        continue;
                     }
-                    publish_hash(&endpoint, self_node_id, &routing, hash).await;
+                }
+                if !held.is_empty() {
+                    // One BatchStore per receiver (ADR 022 §STORE Flow
+                    // Batched STORE) rather than a per-hash fan-out — the
+                    // overlapping republish windows concentrate on shared
+                    // receiver sets, which is exactly what batching folds
+                    // into a single RPC.
+                    publish_batch(&endpoint, self_node_id, &routing, &held).await;
                     // Re-schedule with the steady-state jitter window;
                     // ADR 022 line 130 — fresh jitter draw per record
                     // per cycle.
-                    scheduler.schedule_steady(hash);
+                    for hash in held {
+                        scheduler.schedule_steady(hash);
+                    }
                 }
             }
         }
@@ -421,6 +442,98 @@ async fn publish_hash(
     }
 }
 
+/// Group `hashes` by receiver: for each hash, its K+3 closest peers
+/// (ADR 022 §STORE Flow line 128), inverted into `receiver → hashes`.
+/// A pure function over a locked snapshot of the routing table so the
+/// receiver-grouping logic is unit-testable without a network. Returns
+/// an empty map when the table has no peers (e.g. boot before
+/// bootstrap) — the caller then publishes nothing this cycle.
+fn group_by_receiver(
+    table: &RoutingTable,
+    hashes: &[ContentHash],
+) -> HashMap<NodeId, Vec<ContentHash>> {
+    let mut groups: HashMap<NodeId, Vec<ContentHash>> = HashMap::new();
+    for &hash in hashes {
+        for peer in table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT) {
+            groups.entry(peer).or_default().push(hash);
+        }
+    }
+    groups
+}
+
+/// Publish a set of due hashes as one `BatchStore` per receiver, split
+/// at the [`MAX_BATCH_STORE_HASHES`] wire cap (ADR 022 §STORE Flow
+/// Batched STORE). Each receiver's batches run in their own task so a
+/// slow peer doesn't stall the rest of the sweep. A rejected hash (peer
+/// not staked, over quota) or a failed exchange is logged at debug — the
+/// record retries on the next cycle. Every DHT node implements
+/// `BatchStore`, so there is no per-hash fallback.
+async fn publish_batch(
+    endpoint: &Endpoint,
+    self_node_id: NodeId,
+    routing: &Arc<Mutex<RoutingTable>>,
+    hashes: &[ContentHash],
+) {
+    let groups = {
+        let Ok(table) = routing.lock() else {
+            tracing::error!("dht republish: routing-table mutex poisoned");
+            return;
+        };
+        group_by_receiver(&table, hashes)
+    };
+    if groups.is_empty() {
+        // No routing-table entries yet (e.g. boot before bootstrap).
+        // Nothing to do this cycle; the scheduler will retry.
+        return;
+    }
+    let mut handles = Vec::with_capacity(groups.len());
+    for (peer, peer_hashes) in groups {
+        let endpoint_cloned = endpoint.clone();
+        handles.push(tokio::spawn(async move {
+            let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(
+                        peer = ?peer,
+                        error = %e,
+                        "dht republish: routing-table peer not a valid public key"
+                    );
+                    return;
+                }
+            };
+            let addr = EndpointAddr::new(target_pk);
+            for chunk in peer_hashes.chunks(MAX_BATCH_STORE_HASHES) {
+                match client::batch_store(&endpoint_cloned, addr.clone(), chunk.to_vec(), self_node_id)
+                    .await
+                {
+                    Ok(ack) => {
+                        let rejected = ack.results.iter().filter(|accepted| !**accepted).count();
+                        if rejected > 0 {
+                            tracing::debug!(
+                                peer = ?peer,
+                                rejected,
+                                batch = chunk.len(),
+                                "dht republish: peer rejected some batched Stores (not staked, over quota, etc)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            peer = ?peer,
+                            batch = chunk.len(),
+                            error = %e,
+                            "dht republish: BatchStore request failed"
+                        );
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -433,6 +546,46 @@ mod tests {
 
     fn h(b: u8) -> ContentHash {
         ContentHash::from_bytes([b; 32])
+    }
+
+    fn nid(b: u8) -> NodeId {
+        NodeId::from_bytes([b; 32])
+    }
+
+    #[test]
+    fn group_by_receiver_sends_every_due_hash_to_each_of_its_closest_peers() {
+        // A table with fewer than REPUBLISH_FANOUT (23) peers means every
+        // peer is within the K+3 closest set of every hash, so each peer's
+        // batch must carry all due hashes exactly once.
+        let mut table = RoutingTable::new(nid(0x01));
+        for b in [0x10, 0x20, 0x30] {
+            table.insert(nid(b));
+        }
+        let hashes = [h(0xA0), h(0xB0)];
+        let groups = group_by_receiver(&table, &hashes);
+        assert_eq!(
+            groups.len(),
+            3,
+            "all three peers are closest to both hashes"
+        );
+        for b in [0x10, 0x20, 0x30] {
+            let mut got = groups
+                .get(&nid(b))
+                .cloned()
+                .unwrap_or_else(|| panic!("peer {b:#x} missing a batch"));
+            got.sort();
+            let mut want = hashes.to_vec();
+            want.sort();
+            assert_eq!(got, want, "peer {b:#x} must receive every due hash once");
+        }
+    }
+
+    #[test]
+    fn group_by_receiver_empty_table_yields_no_batches() {
+        // No routing-table peers (e.g. boot before bootstrap): nothing to
+        // publish, so the grouping is empty rather than a panic.
+        let table = RoutingTable::new(nid(0x01));
+        assert!(group_by_receiver(&table, &[h(0xA0)]).is_empty());
     }
 
     #[test]
