@@ -7559,7 +7559,7 @@ async fn leaf_paced_pull(
                     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
                     write_client(
                         &mut send,
-                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
+                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
                     )
                     .await?;
                     // Acceptance is implicit (ADR 005): no ack is read; a rejection
@@ -9475,7 +9475,7 @@ async fn leaf_underpays_first_voucher(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client(
         &mut send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
+        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
     )
     .await?;
 
@@ -12703,7 +12703,7 @@ async fn settle_voucher(
     let ClientMessage::Voucher(v) = msg else {
         anyhow::bail!("deposit-capped upstream: expected a Voucher");
     };
-    if U256::from_be_bytes(v.amount) > read_deposit(deposit)? {
+    if U256::from(v.amount) > read_deposit(deposit)? {
         write_frame(
             send,
             &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {

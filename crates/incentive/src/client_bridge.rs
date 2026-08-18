@@ -2,15 +2,18 @@
 //! state machine.
 //!
 //! The protocol crate ([`decdn_protocol::Voucher`]) is crypto-free: a wire
-//! voucher carries `{signature, amount, bytes_delivered}` as raw bytes.
-//! Validating it against a lane requires the full EIP-712 typed data
-//! `{pool_id, signer, provider, amount, bytes_delivered}` — and `pool_id`,
-//! `signer`, and `provider` are **not** on the wire (ADR 005 §Voucher wire
-//! format). They come from stream context: `pool_id` from the signed
-//! `StreamRequest`, `signer` the capability key, and `provider` this node.
-//! [`wire_voucher_to_signed`] reconstructs the [`SignedVoucher`] from a wire
-//! voucher plus that context; [`signed_to_wire_voucher`] is the requester-side
-//! inverse.
+//! voucher carries `{signature, amount, bytes_delivered}`, with `amount` and
+//! `bytes_delivered` as `u64` cumulative totals matching the contract's
+//! on-chain `uint64` storage. Validating it against a lane requires the full
+//! EIP-712 typed data `{pool_id, signer, provider, amount, bytes_delivered}`
+//! — and `pool_id`, `signer`, and `provider` are **not** on the wire (ADR 005
+//! §Voucher wire format). They come from stream context: `pool_id` from the
+//! signed `StreamRequest`, `signer` the capability key, and `provider` this
+//! node. [`wire_voucher_to_signed`] reconstructs the [`SignedVoucher`] from a
+//! wire voucher plus that context, widening `u64 → U256` (infallible);
+//! [`signed_to_wire_voucher`] is the requester-side inverse, narrowing
+//! `U256 → u64` (fallible — a value above the on-chain `uint64` cap is
+//! refused, never truncated).
 //!
 //! [`voucher_reject_reason`] maps an off-chain [`PoolError`] to the wire
 //! [`VoucherRejectReason`] a node returns mid-stream. It is exhaustive with no
@@ -52,8 +55,8 @@ pub fn wire_voucher_to_signed(
             pool_id,
             signer,
             provider,
-            amount: U256::from_be_bytes(wire.amount),
-            bytes_delivered: U256::from_be_bytes(wire.bytes_delivered),
+            amount: U256::from(wire.amount),
+            bytes_delivered: U256::from(wire.bytes_delivered),
         },
         signature,
     })
@@ -62,13 +65,23 @@ pub fn wire_voucher_to_signed(
 /// Encode a [`SignedVoucher`] to its wire form (requester side). The
 /// lane-context fields (`pool_id`, `signer`, `provider`) are dropped — the
 /// receiver reconstructs them.
-#[must_use]
-pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> WireVoucher {
-    WireVoucher {
+///
+/// # Errors
+///
+/// Returns [`WireVoucherError::ValueExceedsWireWidth`] if `amount` or
+/// `bytes_delivered` exceeds `u64::MAX` — the on-chain pool caps both at
+/// `uint64`, so such a voucher is unredeemable; it is refused rather than
+/// truncated.
+pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, WireVoucherError> {
+    let amount = u64::try_from(signed.voucher.amount)
+        .map_err(|_| WireVoucherError::ValueExceedsWireWidth)?;
+    let bytes_delivered = u64::try_from(signed.voucher.bytes_delivered)
+        .map_err(|_| WireVoucherError::ValueExceedsWireWidth)?;
+    Ok(WireVoucher {
         signature: signed.signature.as_bytes().to_vec(),
-        amount: signed.voucher.amount.to_be_bytes::<32>(),
-        bytes_delivered: signed.voucher.bytes_delivered.to_be_bytes::<32>(),
-    }
+        amount,
+        bytes_delivered,
+    })
 }
 
 /// Map an off-chain [`PoolError`] to the wire [`VoucherRejectReason`] a node
@@ -110,6 +123,11 @@ pub enum WireVoucherError {
     /// `wire.signature` is not a well-formed 65-byte secp256k1 signature.
     #[error("wire voucher signature is malformed or wrong length")]
     BadSignature,
+    /// A cumulative amount or byte count exceeds the `u64` wire width. The
+    /// on-chain pool caps both at `uint64`, so such a voucher is unredeemable;
+    /// it is refused rather than truncated.
+    #[error("voucher amount or bytes_delivered exceeds the u64 wire width")]
+    ValueExceedsWireWidth,
 }
 
 /// Signals that a [`PoolError`] was transient ([`PoolError::Store`]): in-memory
@@ -150,7 +168,7 @@ mod tests {
         }
         .sign(&signer, &domain)?;
 
-        let wire = signed_to_wire_voucher(&signed);
+        let wire = signed_to_wire_voucher(&signed)?;
         anyhow::ensure!(wire.signature.len() == decdn_protocol::VOUCHER_SIG_LEN);
 
         let rebuilt = wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER)?;
@@ -163,8 +181,8 @@ mod tests {
     fn bad_signature_length_rejected() -> anyhow::Result<()> {
         let wire = WireVoucher {
             signature: vec![0u8; 10],
-            amount: [0u8; 32],
-            bytes_delivered: [0u8; 32],
+            amount: 0u64,
+            bytes_delivered: 0u64,
         };
         let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
             .err()
@@ -184,8 +202,8 @@ mod tests {
         }
         let wire = WireVoucher {
             signature,
-            amount: [0u8; 32],
-            bytes_delivered: [0u8; 32],
+            amount: 0u64,
+            bytes_delivered: 0u64,
         };
         let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
             .err()
@@ -195,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn amount_big_endian_preserved() -> anyhow::Result<()> {
+    fn amount_narrows_to_u64() -> anyhow::Result<()> {
         let signer = PrivateKeySigner::random();
         let domain = voucher_domain(421_614, VERIFYING);
         let signed = Voucher {
@@ -207,11 +225,32 @@ mod tests {
         }
         .sign(&signer, &domain)?;
 
-        let wire = signed_to_wire_voucher(&signed);
-        // Big-endian: most-significant byte first, low byte last.
-        anyhow::ensure!(wire.amount[31] == 0x04);
-        anyhow::ensure!(wire.amount[30] == 0x03);
-        anyhow::ensure!(wire.amount[0] == 0x00);
+        let wire = signed_to_wire_voucher(&signed)?;
+        anyhow::ensure!(wire.amount == 0x0102_0304u64);
+        anyhow::ensure!(wire.bytes_delivered == 0u64);
+        Ok(())
+    }
+
+    /// A cumulative amount above `u64::MAX` — the on-chain pool caps at
+    /// `uint64`, so such a voucher can never be redeemed — is refused rather
+    /// than truncated.
+    #[test]
+    fn amount_above_u64_max_is_refused() -> anyhow::Result<()> {
+        let signer = PrivateKeySigner::random();
+        let domain = voucher_domain(421_614, VERIFYING);
+        let signed = Voucher {
+            pool_id: B256::ZERO,
+            signer: signer.address(),
+            provider: PROVIDER,
+            amount: U256::from(u64::MAX) + U256::from(1u64),
+            bytes_delivered: U256::ZERO,
+        }
+        .sign(&signer, &domain)?;
+
+        let err = signed_to_wire_voucher(&signed)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected ValueExceedsWireWidth, got Ok"))?;
+        anyhow::ensure!(matches!(err, WireVoucherError::ValueExceedsWireWidth));
         Ok(())
     }
 
@@ -280,11 +319,11 @@ mod tests {
 }
 
 /// Property-based tests for the wire bridge (#740). The bridge is where the
-/// `U256` money field crosses to the fixed 32-byte big-endian wire form and
-/// back — the exact spot a truncation would corrupt a payment. These sweep the
-/// full keyspace (boundaries `0`, `u64::MAX`, `U256::MAX` heavily over-sampled,
-/// see [`any_u256`]) and confirm the round-trip is lossless and that malformed
-/// wire input never panics.
+/// `U256` money field crosses to the `u64` wire form and back — the exact
+/// spot a truncation would corrupt a payment. These sweep the full `u64`
+/// keyspace and confirm the round-trip is lossless and that malformed wire
+/// input never panics. The narrowing failure path (`U256` above `u64::MAX`)
+/// is covered separately by `amount_above_u64_max_is_refused`.
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -302,18 +341,6 @@ mod prop_tests {
     const PROVIDER: Address = address!("00000000000000000000000000000000000000b2");
     const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
 
-    /// `U256` sweep with the truncation-prone boundaries heavily over-sampled
-    /// (weight 1 each against the random arm's 8).
-    fn any_u256() -> impl Strategy<Value = U256> {
-        prop_oneof![
-            8 => proptest::array::uniform32(any::<u8>()).prop_map(U256::from_be_bytes),
-            1 => Just(U256::ZERO),
-            1 => Just(U256::from(1u64)),
-            1 => Just(U256::from(u64::MAX)),
-            1 => Just(U256::MAX),
-        ]
-    }
-
     fn any_signer() -> impl Strategy<Value = PrivateKeySigner> {
         proptest::array::uniform32(any::<u8>())
             .prop_filter_map("scalar must be a valid, non-zero secp256k1 key", |bytes| {
@@ -324,13 +351,13 @@ mod prop_tests {
     proptest! {
         /// `signed → wire → signed` reproduces the signed voucher exactly when
         /// the off-wire context (`pool_id`, `signer`, `provider`,
-        /// `bytes_delivered`) is re-supplied — proving the big-endian
-        /// `U256 ↔ [u8; 32]` encoding is lossless across the whole range.
+        /// `bytes_delivered`) is re-supplied — proving the `U256 ↔ u64`
+        /// narrowing/widening is lossless across the whole `u64` range.
         #[test]
         fn wire_round_trip_is_lossless(
             pool_id in proptest::array::uniform32(any::<u8>()).prop_map(B256::from),
-            amount in any_u256(),
-            bytes_delivered in any_u256(),
+            amount in any::<u64>().prop_map(U256::from),
+            bytes_delivered in any::<u64>().prop_map(U256::from),
             signer in any_signer(),
         ) {
             let domain = voucher_domain(421_614, VERIFYING);
@@ -344,9 +371,9 @@ mod prop_tests {
                 .sign(&signer, &domain)
                 .unwrap();
 
-            let wire = signed_to_wire_voucher(&signed);
-            prop_assert_eq!(wire.amount, amount.to_be_bytes::<32>());
-            prop_assert_eq!(wire.bytes_delivered, bytes_delivered.to_be_bytes::<32>());
+            let wire = signed_to_wire_voucher(&signed).unwrap();
+            prop_assert_eq!(wire.amount, u64::try_from(amount).unwrap());
+            prop_assert_eq!(wire.bytes_delivered, u64::try_from(bytes_delivered).unwrap());
 
             let rebuilt =
                 wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER)
@@ -361,12 +388,12 @@ mod prop_tests {
         #[test]
         fn malformed_wire_signature_is_rejected_not_panicked(
             signature in prop::collection::vec(any::<u8>(), 0..200),
-            amount in proptest::array::uniform32(any::<u8>()),
+            amount in any::<u64>(),
         ) {
             let wire = WireVoucher {
                 signature: signature.clone(),
                 amount,
-                bytes_delivered: [0u8; 32],
+                bytes_delivered: 0u64,
             };
             let result = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER);
             if signature.len() != decdn_protocol::VOUCHER_SIG_LEN {

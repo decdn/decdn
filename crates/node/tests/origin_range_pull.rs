@@ -268,7 +268,7 @@ async fn ranged_paid_pull(
                     // mid-stream `StreamError` and is caught by the loop's arm below.
                     write_client_msg(
                         &mut send,
-                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
+                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
                     )
                     .await?;
                     unvouchered = 0;

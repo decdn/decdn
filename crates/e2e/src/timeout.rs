@@ -12,7 +12,11 @@
 //!
 //! The binding ladder is the deploy retry ladder in [`crate::chain`]: CI worst
 //! case `DEPLOY_ATTEMPTS * ci_scaled(DEPLOY_TIMEOUT)` = `2 * 120s = 240s`, so
-//! every tier here clears 240s.
+//! every tier here clears 240s. The deploy runs once per test run, not per
+//! journey (see `ensure_shared_deployment` in [`crate::chain`]), but a journey that races
+//! that one deploy still pays the ladder inside its own ceiling — either as the
+//! lock winner running it or as a sibling blocked on the lock for its duration —
+//! so the containment requirement is unchanged.
 //!
 //! `forge build` is NOT part of that binding ladder *under CI*. Every journey's
 //! [`crate::chain::ChainFixture::launch`] still calls `forge_build`, but the

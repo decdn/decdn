@@ -1699,8 +1699,8 @@ pub fn resumable_watermark<'a>(
         pool_id: ctx.pool_id,
         signer: ctx.client_signer.address(),
         provider: ctx.provider,
-        amount: U256::from_be_bytes(bundle.amount),
-        bytes_delivered: U256::from_be_bytes(bundle.bytes_delivered),
+        amount: U256::from(bundle.amount),
+        bytes_delivered: U256::from(bundle.bytes_delivered),
     };
     voucher_signed_by(
         &claimed,
@@ -2664,11 +2664,10 @@ async fn send_voucher(
             }
             .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
             .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault))?;
-            write_message(
-                send,
-                &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
-            )
-            .await
+            let wire_voucher = signed_to_wire_voucher(&signed).map_err(|e| {
+                anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault)
+            })?;
+            write_message(send, &ClientMessage::Voucher(wire_voucher)).await
         })
         .await
         .map(|_sent| ())
@@ -3044,8 +3043,8 @@ mod tests {
         .sign(signer, domain)
         .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}"))?;
         Ok(WatermarkBundle {
-            amount: amount.to_be_bytes(),
-            bytes_delivered: bytes_delivered.to_be_bytes(),
+            amount: u64::try_from(amount)?,
+            bytes_delivered: u64::try_from(bytes_delivered)?,
             last_signature: voucher_signature.signature.as_bytes().to_vec(),
         })
     }
@@ -3118,7 +3117,7 @@ mod tests {
             U256::from(100u64),
             U256::from(4096u64),
         )?;
-        bundle.amount = U256::from(1_000_000u64).to_be_bytes();
+        bundle.amount = 1_000_000u64;
         let err = anyhow::Error::new(UpstreamVoucherRejected {
             reason: VoucherRejectReason::AmountRegression,
             bundle: Some(bundle),
