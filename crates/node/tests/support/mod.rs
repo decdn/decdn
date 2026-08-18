@@ -16,6 +16,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::signers::local::PrivateKeySigner;
@@ -135,6 +136,47 @@ pub async fn local_endpoint(
         other => other,
     };
     Ok((ep, addr))
+}
+
+/// How long teardown waits for every endpoint to drain before it gives up.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Abort `tasks`, then close `endpoints` under one shared deadline.
+///
+/// The abort comes first because [`Endpoint::close`] waits for in-flight
+/// connections to drain, and a handler task parked mid-stream holds one open.
+/// Closing an endpoint whose accept loop still runs is what wedges teardown.
+///
+/// The deadline is shared across the whole call rather than applied per
+/// endpoint, so a wedge costs [`SHUTDOWN_TIMEOUT`] once instead of once per
+/// endpoint. The `drained/total` count in the warning names the position that
+/// stalled, and nextest attributes the line to the test that printed it.
+///
+/// A timeout warns and returns instead of failing: teardown runs after every
+/// assertion, so the test's real verdict is already decided by the time this
+/// is reached. `.config/nextest.toml` is the hard backstop for a wedge that
+/// outlives even this.
+pub async fn shutdown<const N: usize, const M: usize>(
+    tasks: [tokio::task::AbortHandle; N],
+    endpoints: [&Endpoint; M],
+) {
+    for task in &tasks {
+        task.abort();
+    }
+    let mut drained = 0usize;
+    let closed = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        for ep in endpoints {
+            ep.close().await;
+            drained += 1;
+        }
+    })
+    .await;
+    if closed.is_err() {
+        eprintln!(
+            "shutdown: endpoint close timed out after {SHUTDOWN_TIMEOUT:?} \
+             ({drained}/{M} drained)"
+        );
+    }
 }
 
 /// EIP-712 domains a [`ClientHandler`] needs: slash-receipt, voucher, and
