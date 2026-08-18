@@ -543,7 +543,7 @@ pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -
 /// Returned (not a bare string) so the pull orchestrator can `downcast_ref` and
 /// recognize that the timeout is OUR local deadline — a possibly mis-sized
 /// configuration value — not evidence the provider is unreachable, and so must
-/// not tar the provider's reputation locally or over gossip. `Display` keeps the
+/// not tar the provider's local reputation score. `Display` keeps the
 /// stable `timed out` text for logs (and for the `!contains("timed out")`
 /// negative assertion in `node_to_node_pull_through`'s deadline test).
 ///
@@ -831,12 +831,12 @@ impl std::error::Error for UpstreamRefused {}
 /// "this link is slow", so `PullTimeout` must NOT tar the provider — it fires on perfectly
 /// healthy transfers. A stall deadline resets on every byte received, so it fires ONLY when
 /// a provider stops delivering while we wait. That IS evidence the peer is unreachable, and
-/// `classify_pull_failure` scores it as such — a local EWMA hit AND a gossiped observation.
+/// `classify_pull_failure` scores it as such in the local per-peer EWMA (ADR 008).
 ///
 /// # What the bound rests on
 ///
 /// Two things, and it is worth being precise about both, because scoring a peer on a bound
-/// that does not hold is how an honest node gets defamed network-wide.
+/// that does not hold is how an honest node's local reputation gets unfairly defamed.
 ///
 /// **The non-empty-`ChunkData` invariant (#1088), on BOTH pull paths.** With empty frames
 /// banned, "a frame arrived" and "bytes made progress" are the same statement, so a peer
@@ -855,7 +855,7 @@ impl std::error::Error for UpstreamRefused {}
 /// (the serve path materialises the whole bao wire via `export_bao_range` before it can emit
 /// chunk #1). Both loops therefore raise [`PullTimeout`] — exonerating — when the budget
 /// elapses at `cumulative == 0`, and this sentinel only once bytes have flowed (#1145
-/// review). Without that split, a 1 GiB blob off a cold disk gossiped an honest server as
+/// review). Without that split, a 1 GiB blob off a cold disk would score an honest server as
 /// unreachable for the crime of being big.
 #[derive(Debug)]
 pub struct PullStalled {
@@ -1017,12 +1017,12 @@ impl PullDeadlines {
     /// A zero `open` or `stall` must fail here, not pass. One might argue it is a bound that
     /// fires too EAGERLY — loud, immediately obvious — rather than one that silently never
     /// fires. That is exactly backwards: `config` says so, a zero stall "trips
-    /// `PullStalled` on the first poll of every streaming read … it would broadcast false
-    /// `Unreachable` observations about every honest peer it touches."
+    /// `PullStalled` on the first poll of every streaming read … it would score every
+    /// honest peer it touches as `Unreachable`."
     ///
-    /// A zero stall is not loud. It is a node quietly gossiping defamation of the whole
-    /// network, at full speed. The only thing standing between config and that state was a
-    /// `> 0` check in a resolver in another crate — the same advisory-invariant shape
+    /// A zero stall is not loud. It is a node quietly scoring every peer it touches as
+    /// unreachable, at full speed. The only thing standing between config and that state was
+    /// a `> 0` check in a resolver in another crate — the same advisory-invariant shape
     /// `ChunkData` had before #1088, and the reason this type owns its bounds at all.
     pub const fn new(open: Duration, stall: Duration) -> Result<Self, DeadlineError> {
         if open.is_zero() || stall.is_zero() {
@@ -1984,8 +1984,8 @@ async fn receive_and_pay(
             .await
             // Which fault this is depends on whether a byte has EVER arrived (#1145 review).
             //
-            // `PullStalled` scores the peer `Unreachable` — a local EWMA hit and a GOSSIPED
-            // observation — and it earns that right from the reset above: a clock that
+            // `PullStalled` scores the peer `Unreachable` in the local per-peer EWMA (ADR 008)
+            // — and it earns that right from the reset above: a clock that
             // resets on every byte can only fire on a peer that stopped delivering. That
             // reasoning holds for every chunk but the first, where no byte has reset it yet
             // and the clock is measuring something else entirely.
@@ -1994,7 +1994,7 @@ async fn receive_and_pay(
             // and that scales with BLOB SIZE: the serve path writes the `StreamResponse`
             // first, then materialises the whole bao wire encoding via `export_bao_range`
             // before it can emit chunk #1. A 1 GiB blob off a cold disk can exceed the 20 s
-            // default — so an honest server, doing exactly what it was asked, got gossiped as
+            // default — so an honest server, doing exactly what it was asked, would be scored
             // unreachable for being big.
             //
             // A wait on bounded-but-unpredictable server work is what the OPEN stage already
@@ -2010,7 +2010,7 @@ async fn receive_and_pay(
             // from "dead peer" when the honest case is unbounded in blob size.
             //
             // But be precise about what this does and does not fix (#1145 review). It fixes
-            // the ATTRIBUTION: an honest server with a slow first byte is not gossiped
+            // the ATTRIBUTION: an honest server with a slow first byte is not scored
             // as unreachable. It does NOT make that blob fetchable. The pull still fails —
             // a blob whose server-side materialisation exceeds the stall window is
             // unfetchable on this path. The real repair is on the SERVE side:
@@ -2782,7 +2782,7 @@ mod tests {
     ///
     /// The stakes, and why an unguarded marker here is not cosmetic: every arm BELOW
     /// `LocalPullFault` in the ladder blames the peer to some degree, and the catch-all
-    /// scores `Unreachable` — a local EWMA hit AND a gossiped observation. A fault in this
+    /// scores `Unreachable` in the local per-peer EWMA (ADR 008). A fault in this
     /// node is not evidence about a provider, and a node in this state meets every candidate
     /// in turn, so losing the marker does not mis-score one peer: it defames the whole
     /// candidate list on the strength of our own defect.
@@ -2838,7 +2838,7 @@ mod tests {
     /// It was infallible, on the reasoning that a zero bound "fires too EAGERLY — loud, and
     /// immediately obvious". It is the opposite of loud. A zero `stall` trips `PullStalled`
     /// on the first poll of every streaming read, and `PullStalled` is the verdict that
-    /// scores a peer `Unreachable` — locally AND over gossip. So the failure mode is not a
+    /// scores a peer `Unreachable` in the local per-peer EWMA. So the failure mode is not a
     /// node that visibly stops working; it is a node that quietly defames every honest peer
     /// it touches, as fast as it can dial them.
     ///
@@ -2861,7 +2861,7 @@ mod tests {
                 PullDeadlines::new(Duration::from_secs(20), Duration::ZERO),
                 Err(DeadlineError::ZeroBudget)
             ),
-            "a zero stall bound gossips `Unreachable` about every honest peer it touches"
+            "a zero stall bound scores `Unreachable` about every honest peer it touches"
         );
         assert!(PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20)).is_ok());
     }
@@ -2905,7 +2905,7 @@ mod tests {
                 .is_some_and(|e| e.downcast_ref::<LocalPullFault>().is_some()),
             "aligned_wire_len must reject an out-of-range offset and mark it OUR fault; \
              without the marker it falls through every downcast to the catch-all and \
-             gossips the peer as unreachable. Got: {aligned:?}"
+             scores the peer as unreachable. Got: {aligned:?}"
         );
 
         let decoded = decode_verified_range([0u8; 32], 4096, 8192, 0, &[]).err();

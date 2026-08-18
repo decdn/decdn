@@ -12,8 +12,8 @@
 //! - [`pack_multiaddrs`] builds the on-chain `multiaddrs` `bytes` field:
 //!   a sequence of `(uint16 length, bytes data)` entries (ADR 019 §
 //!   Multiaddr encoding). The length prefix is big-endian, matching the
-//!   `uint16` reading of the ADR. Nodes learn addresses via gossip / iroh
-//!   discovery rather than from this field, so the ADR — not a consumer —
+//!   `uint16` reading of the ADR. Nodes learn addresses via `cdn/dht/v1`
+//!   discovery (ADR 022) rather than from this field, so the ADR — not a consumer —
 //!   is the authority for the format. [`unpack_multiaddrs`] is its inverse,
 //!   read back only by `decdn node rotate-key --key eth` when it re-registers
 //!   an operator's existing addresses from a new Ethereum address.
@@ -50,7 +50,7 @@ pub fn ownership_message_digest(
 /// Pack QUIC multiaddr strings into the on-chain `multiaddrs` `bytes` field:
 /// a sequence of `(uint16 length, bytes data)` entries with big-endian length
 /// prefixes (ADR 019 § Multiaddr encoding). An empty slice yields empty bytes,
-/// which the contract accepts (a node may rely on the iroh relay / gossip
+/// which the contract accepts (a node may rely on the iroh relay / `cdn/dht/v1`
 /// discovery for reachability until it promotes direct addresses via
 /// `updateMultiaddrs`).
 ///
@@ -85,8 +85,8 @@ pub fn pack_multiaddrs(addrs: &[String]) -> anyhow::Result<Vec<u8>> {
 /// Needed by `decdn node rotate-key --key eth`, which re-registers an operator's
 /// existing multiaddrs from a new Ethereum address. Without this the migration
 /// would either silently drop them — leaving the node reachable only through
-/// relay/gossip discovery — or force the operator to retype a set the chain
-/// already holds.
+/// relay / `cdn/dht/v1` discovery — or force the operator to retype a set the
+/// chain already holds.
 ///
 /// # Errors
 ///

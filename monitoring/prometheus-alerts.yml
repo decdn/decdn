@@ -192,21 +192,6 @@ groups:
             accepting connections. The sum-without(direction) aggregation
             avoids false alerts when only one direction is idle.
 
-      - alert: DecdnPeerTableThin
-        # `decdn_gossip_peer_table_size`, not `decdn_peer_table_size` (#1513).
-        # The exporter field is `gossip_peer_table_size`, so the ADR-registry
-        # name this rule used to carry has never existed and the alert could
-        # never fire.
-        expr: decdn_gossip_peer_table_size < 3
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Peer table thin on {{ $labels.instance }} ({{ $value }} peers)"
-          description: |
-            Fewer than 3 peers known via gossip for 10 minutes. Check gossip
-            connectivity; client selection will be impaired.
-
       # Chain-event watcher liveness (#1316): the *_last_tick_timestamp_seconds
       # gauge advances only while the watcher actually completes ticks, so
       # staleness catches a panicked/wedged/exited task the error-triggered

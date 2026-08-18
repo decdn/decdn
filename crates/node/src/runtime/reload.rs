@@ -14,8 +14,7 @@
 //! Any non-reloadable field the file carries gets a "requires restart"
 //! message (logged on presence, not on change) — the runtime would
 //! otherwise need to tear down the iroh endpoint, the metrics listener,
-//! the gossip subscriptions, etc., which is far beyond the scope of a
-//! quick reload.
+//! etc., which is far beyond the scope of a quick reload.
 //!
 //! The reload entry point ([`RuntimeReloadState::reload`]) is also
 //! called directly by tests, so its only side effects are mutating
@@ -710,8 +709,8 @@ impl RuntimeReloadState {
         use std::path::PathBuf;
 
         use decdn_common::config::{
-            ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-            ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+            ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
+            ResolvedObservability, ResolvedPayment, ResolvedSecurity,
         };
 
         let cfg = ResolvedConfig {
@@ -793,12 +792,6 @@ impl RuntimeReloadState {
                 otlp_endpoint: None,
                 region_accounting_interval_sec:
                     decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
-            },
-            gossip: ResolvedGossip {
-                announce_interval_sec: 60,
-                peer_ttl_sec: 600,
-                subscribe_global: false,
-                max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,
@@ -1031,9 +1024,6 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
              credit_ramp_divisor, voucher_commit_interval_ms)",
         );
     }
-    if file.gossip.is_some() {
-        warn_ignored("gossip.* (announce_interval, peer_ttl, subscribe_global)");
-    }
     if file
         .observability
         .as_ref()
@@ -1165,8 +1155,8 @@ mod tests {
     use super::*;
     use decdn_common::cli::common::LogLevel;
     use decdn_common::config::{
-        ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-        ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+        ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
+        ResolvedObservability, ResolvedPayment, ResolvedSecurity,
     };
 
     /// Build a no-op log-level setter that records the most recent level.
@@ -1262,12 +1252,6 @@ mod tests {
                 otlp_endpoint: None,
                 region_accounting_interval_sec:
                     decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
-            },
-            gossip: ResolvedGossip {
-                announce_interval_sec: 60,
-                peer_ttl_sec: 600,
-                subscribe_global: false,
-                max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
                 max_concurrent_handlers: 256,

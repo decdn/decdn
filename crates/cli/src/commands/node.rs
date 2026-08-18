@@ -19,9 +19,9 @@ use decdn_client_pull::discovery::{self, NodeCandidate, SELECT_K, select_candida
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_common::admin::{
-    AdminRpcClient, AnnounceResponse, BindingStatus, DrainRequest, DrainResponse, EvictRequest,
-    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, PeerView, PeersResponse,
-    RegionStatsResponse, ReloadResponse, StatusResponse,
+    AdminRpcClient, BindingStatus, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
+    HealthResponse, LaneSnapshot, LanesResponse, RegionStatsResponse, ReloadResponse,
+    StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -32,10 +32,11 @@ use decdn_protocol::Region;
 use crate::commands::chain_ctx;
 
 /// Partial deserializer for the TOML config — only the path
-/// `observability.admin_port` is interesting to `decdn node peers`.
-/// Kept private here (rather than reusing `decdn_common::config::FileConfig`)
-/// so an operator's typo in an unrelated section can't make peer
-/// listing unusable. `serde(default)` and serde-toml's default
+/// `observability.admin_port` is interesting to the `node` admin
+/// subcommands. Kept private here (rather than reusing
+/// `decdn_common::config::FileConfig`) so an operator's typo in an
+/// unrelated section can't make these commands unusable. `serde(default)`
+/// and serde-toml's default
 /// "ignore unknown fields" together guarantee that any other valid
 /// TOML — including missing tables — round-trips through with no
 /// effect.
@@ -54,19 +55,17 @@ struct AdminPortObservability {
 /// `global_config` is the path (if any) from the top-level `decdn
 /// --config` flag. It's consulted as a fallback when the subcommand
 /// didn't set its own `--config`, so `decdn --config foo.toml node
-/// peers` works the way the help text implies.
+/// health` works the way the help text implies.
 pub async fn node_dispatch(
     args: &cli::NodeArgs,
     global_config: Option<&Path>,
 ) -> anyhow::Result<()> {
     match &args.cmd {
-        cli::NodeCommand::Peers(p) => peers(p, global_config).await,
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
         cli::NodeCommand::RegionStats(r) => region_stats(r, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
-        cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
         cli::NodeCommand::Drain(d) => drain(d, global_config).await,
         cli::NodeCommand::Top(t) => crate::commands::node_top::run(t, global_config).await,
@@ -201,7 +200,7 @@ pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyho
 /// Format the dry-run preview as a multi-line plain-text block. Pure
 /// function (takes `&mut impl Write`) so unit tests can assert exact
 /// output without an HTTP round-trip — same pattern as
-/// [`write_peers_table`].
+/// [`write_status`].
 fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse) -> io::Result<()> {
     writeln!(w, "hash={hash}")?;
     writeln!(w, "dry_run=true")?;
@@ -241,64 +240,6 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
             .join(",");
         writeln!(w, "origin_kinds={joined}")?;
     }
-    Ok(())
-}
-
-/// `decdn node announce`: call `admin_v1_announce` on the running node to
-/// publish a one-shot `NodeAnnounce` outside the periodic interval (issue
-/// #280).
-pub async fn announce(
-    args: &cli::AnnounceArgs,
-    global_config: Option<&Path>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
-
-    let resp: AnnounceResponse = client
-        .announce()
-        .await
-        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
-
-    // `triggered` is `true` on every well-formed non-error response — the
-    // publisher-disabled case returns a distinct error code, not `false`. A
-    // `false` therefore means the node accepted the RPC but reported the
-    // announce was *not* queued; treat that as a failure (stderr + non-zero
-    // exit) instead of silently exiting 0 with `announce_queued=false` (#845).
-    // Checked *before* any stdout emission so a failing run never prints a
-    // contradictory `announce_queued=false` / `"triggered": false` line —
-    // stdout carries only the success result.
-    anyhow::ensure!(
-        resp.triggered,
-        "node accepted the request but reported the announce was not queued \
-         (triggered=false)"
-    );
-
-    if args.json {
-        let pretty =
-            serde_json::to_string_pretty(&resp).context("failed to encode announce response")?;
-        println!("{pretty}");
-    } else {
-        // The trigger is fire-and-forget on the publisher side, so this
-        // confirms only that the node accepted the request — `queued`
-        // rather than `triggered` so a script reader can't mistake this
-        // for "broadcast hit the wire". Actual peer delivery is
-        // observable via `decdn node peers` on a peer; broadcast failures
-        // (no neighbors, transport error) surface as `warn!` lines in the
-        // node's own log.
-        println!("announce_queued={}", resp.triggered);
-    }
-
     Ok(())
 }
 
@@ -556,7 +497,7 @@ async fn sleep_or_ctrl_c(dur: Duration) -> anyhow::Result<()> {
 /// share the same `{drain_complete, in_flight_streams, admin_closed}`
 /// shape so machine consumers don't have to parse two unrelated
 /// schemas depending on which path fired (#662 review). Same
-/// `&mut impl io::Write` pattern as [`write_peers_table`] so tests
+/// `&mut impl io::Write` pattern as [`write_status`] so tests
 /// can assert exact bytes without a stdout capture.
 fn emit_drain_complete(w: &mut impl io::Write, json: bool, admin_closed: bool) -> io::Result<()> {
     if json {
@@ -572,42 +513,6 @@ fn emit_drain_complete(w: &mut impl io::Write, json: bool, admin_closed: bool) -
             "drain_complete=true in_flight_streams=0 admin_closed={admin_closed}"
         )
     }
-}
-
-/// `decdn node peers`: call `admin_v1_peersList` on the running node and
-/// print the result.
-pub async fn peers(args: &cli::PeersArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
-
-    let parsed: PeersResponse = client
-        .peers_list()
-        .await
-        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
-
-    let filtered = filter_peers(parsed.peers, args.region.as_deref());
-
-    if args.json {
-        let pretty = render_json(&filtered).context("failed to encode filtered peers as JSON")?;
-        println!("{pretty}");
-    } else {
-        let mut stdout = io::stdout().lock();
-        write_peers_table(&mut stdout, &filtered, wall_clock_us())
-            .context("failed to write peers table")?;
-    }
-
-    Ok(())
 }
 
 /// `decdn node status`: call `admin_v1_status` on the running node and
@@ -681,7 +586,7 @@ pub async fn lanes(args: &cli::LanesArgs, global_config: Option<&Path>) -> anyho
 
 /// Write the lane table to `w`. Pure function (takes `&mut impl
 /// Write`) so the formatting is unit-testable without an HTTP hop,
-/// mirroring [`write_peers_table`] / [`write_status`]. A summary line
+/// mirroring [`write_status`]. A summary line
 /// carries the redemption threshold as a stable `key=value` token; the
 /// per-lane table follows. USDC amounts are rendered from micro-USDC.
 fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result<()> {
@@ -967,13 +872,14 @@ fn port_from_config_file(
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
             // Deliberately a partial deserializer: parsing the full
-            // `FileConfig` would couple `decdn node peers` to every
+            // `FileConfig` would couple these commands to every
             // unrelated field's well-formedness. An operator with a
             // typo'd `[payments]` table shouldn't lose the ability to
-            // list peers. Serde's TOML mode ignores unknown fields by
-            // default, so this only fails on (a) genuinely malformed
-            // TOML or (b) a wrong type for `observability.admin_port`
-            // itself — both of which we genuinely want to surface.
+            // resolve the admin port. Serde's TOML mode ignores unknown
+            // fields by default, so this only fails on (a) genuinely
+            // malformed TOML or (b) a wrong type for
+            // `observability.admin_port` itself — both of which we
+            // genuinely want to surface.
             let parsed: AdminPortConfig = toml::from_str(&contents)
                 .with_context(|| format!("failed to parse config file {}", path.display()))?;
             match parsed.observability.and_then(|o| o.admin_port) {
@@ -1003,47 +909,6 @@ fn port_from_config_file(
     }
 }
 
-fn filter_peers(peers: Vec<PeerView>, region: Option<&str>) -> Vec<PeerView> {
-    match region {
-        None => peers,
-        Some(want) => peers
-            .into_iter()
-            .filter(|p| p.region.eq_ignore_ascii_case(want))
-            .collect(),
-    }
-}
-
-/// Render the (possibly filtered) peer list as pretty JSON.
-///
-/// Kept as a pure function so tests can round-trip filter-then-render
-/// without an HTTP hop; the filter's effect on the `--json` output is
-/// otherwise only observable at the shell level.
-fn render_json(peers: &[PeerView]) -> anyhow::Result<String> {
-    let out = PeersResponse {
-        peers: peers.to_vec(),
-    };
-    serde_json::to_string_pretty(&out).context("encode peers as JSON")
-}
-
-/// Write the peer table to `w`. Taking `&mut impl Write` instead of
-/// writing directly to `stdout` makes the formatter testable and makes
-/// it a straightforward component for future TUI consumers.
-fn write_peers_table(w: &mut impl io::Write, peers: &[PeerView], now_us: u64) -> io::Result<()> {
-    if peers.is_empty() {
-        return writeln!(w, "(no peers known)");
-    }
-    // Fixed-column layout: 14 (node_id preview) | 8 (region) | rest (last_seen).
-    let (node_hdr, region_hdr, last_hdr) = ("NODE_ID", "REGION", "LAST_SEEN");
-    writeln!(w, "{node_hdr:<14} {region_hdr:<8} {last_hdr}")?;
-    for p in peers {
-        let preview = short_node_id(&p.node_id);
-        let age = relative_age(now_us, p.last_seen_us);
-        let region = truncate(&p.region, 8);
-        writeln!(w, "{preview:<14} {region:<8} {age}")?;
-    }
-    Ok(())
-}
-
 fn short_node_id(hex: &str) -> String {
     // Unicode '…' (U+2026) rather than "..." so a pasted preview is
     // unambiguously a preview and never parses as hex.
@@ -1054,15 +919,6 @@ fn short_node_id(hex: &str) -> String {
     } else {
         prefix
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let mut chars = s.chars();
-    let mut out: String = chars.by_ref().take(max).collect();
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
 }
 
 fn wall_clock_us() -> u64 {
@@ -1109,7 +965,7 @@ fn format_age(delta_us: u64) -> String {
 
 /// Write the DHT status report to `w`. Pure function (takes `&mut impl
 /// Write`) so the formatting is unit-testable without an HTTP hop,
-/// mirroring [`write_peers_table`]. The summary block uses stable
+/// mirroring [`write_lanes_table`]. The summary block uses stable
 /// `key=value` tokens so operator scripts can `grep` them without
 /// `--json`; the per-non-empty-bucket fill table follows.
 fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::Result<()> {
@@ -1371,7 +1227,7 @@ fn node_id_hex(node_id: &PublicKey) -> String {
 
 /// Write the `decdn node lookup` result as a human table. Pure (`&mut impl
 /// Write`) so the layout is unit-testable without a chain or network,
-/// mirroring [`write_peers_table`] / [`write_lanes_table`]. The RTT column
+/// mirroring [`write_lanes_table`]. The RTT column
 /// is only rendered when at least one row was probed, so the unprobed listing
 /// path doesn't show a column of nothing.
 fn write_lookup_table(w: &mut impl io::Write, rows: &[LookupRow]) -> io::Result<()> {
@@ -1631,81 +1487,6 @@ mod tests {
         assert!(!is_connection_refused(reset.as_ref()));
     }
 
-    fn mk_peer(node_id: &str, region: &str, last_seen_us: u64) -> PeerView {
-        PeerView {
-            node_id: node_id.to_string(),
-            region: region.to_string(),
-            first_seen_us: last_seen_us,
-            last_seen_us,
-            announced_at_us: last_seen_us,
-        }
-    }
-
-    #[test]
-    fn filter_by_region_is_case_insensitive() {
-        let peers = vec![
-            mk_peer("aa", "US", 10),
-            mk_peer("bb", "us", 20),
-            mk_peer("cc", "EU", 30),
-        ];
-        let filtered = filter_peers(peers, Some("US"));
-        // Assert exact surviving ids so a regression that filtered on the
-        // wrong field (e.g. node_id vs region) can't produce a matching
-        // count by accident.
-        let ids: Vec<&str> = filtered.iter().map(|p| p.node_id.as_str()).collect();
-        assert_eq!(ids, vec!["aa", "bb"]);
-    }
-
-    #[test]
-    fn filter_none_is_passthrough() {
-        let peers = vec![mk_peer("aa", "US", 10)];
-        assert_eq!(filter_peers(peers.clone(), None).len(), peers.len());
-    }
-
-    #[test]
-    fn render_json_roundtrips_through_filter() -> anyhow::Result<()> {
-        let peers = vec![
-            mk_peer("aa", "US", 10),
-            mk_peer("bb", "EU", 20),
-            mk_peer("cc", "US", 30),
-        ];
-        let filtered = filter_peers(peers, Some("US"));
-        let pretty = render_json(&filtered)?;
-        let value: serde_json::Value = serde_json::from_str(&pretty)?;
-        let out_peers = value["peers"].as_array().expect("peers array");
-        assert_eq!(out_peers.len(), 2);
-        let out_ids: Vec<&str> = out_peers
-            .iter()
-            .map(|p| p["node_id"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(out_ids, vec!["aa", "cc"]);
-        Ok(())
-    }
-
-    #[test]
-    fn write_peers_table_empty_emits_sentinel() -> anyhow::Result<()> {
-        let mut buf = Vec::<u8>::new();
-        write_peers_table(&mut buf, &[], 1_000)?;
-        let s = String::from_utf8(buf)?;
-        assert_eq!(s, "(no peers known)\n");
-        Ok(())
-    }
-
-    #[test]
-    fn write_peers_table_renders_header_and_row() -> anyhow::Result<()> {
-        let peer = mk_peer(&"a".repeat(64), "US", 1_000_000); // last_seen = 1s past epoch
-        let now_us = 2_000_000; // 1s after last_seen → "1s ago"
-        let mut buf = Vec::<u8>::new();
-        write_peers_table(&mut buf, &[peer], now_us)?;
-        let s = String::from_utf8(buf)?;
-        assert!(s.contains("NODE_ID"), "header missing: {s}");
-        assert!(s.contains("LAST_SEEN"), "header missing: {s}");
-        assert!(s.contains("aaaaaaaaaaaa…"), "node_id preview missing: {s}");
-        assert!(s.contains("US"), "region missing: {s}");
-        assert!(s.contains("1s ago"), "relative age missing: {s}");
-        Ok(())
-    }
-
     fn mk_status(last_refresh_us: Option<u64>) -> StatusResponse {
         use decdn_common::admin::{BucketStat, RecordStoreHealth, RepublishHealth, RoutingHealth};
         StatusResponse {
@@ -1939,8 +1720,8 @@ mod tests {
 
     // Locks in the partial-deserializer choice: a wrong type in some
     // unrelated section (here, a malformed `[network]` field that the
-    // full FileConfig would reject) must not stop `decdn node peers`
-    // from resolving the admin port. If a future refactor reverts to
+    // full FileConfig would reject) must not stop these commands from
+    // resolving the admin port. If a future refactor reverts to
     // parsing FileConfig, this test fails.
     #[test]
     fn port_from_config_file_ignores_unrelated_field_errors() -> anyhow::Result<()> {
@@ -2190,9 +1971,8 @@ mod tests {
     /// round-trips back to the same value and (b) carries every
     /// load-bearing field with its wire key, so a rename or a
     /// skipped-field regression on the DTO breaks here rather than only
-    /// at the shell. Mirrors `render_json_roundtrips_through_filter` for
-    /// the peers `--json` path. The counterparty is a real EIP-55
-    /// checksummed address so the JSON reflects production output.
+    /// at the shell. The counterparty is a real EIP-55 checksummed
+    /// address so the JSON reflects production output.
     #[test]
     fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
         let counterparty =

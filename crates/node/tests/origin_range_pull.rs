@@ -47,7 +47,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 mod support;
 use support::{
     HandlerDomains, build_handler_full_configured, fresh_key, local_endpoint, permissive_limiter,
-    read_client_msg, spawn_server, write_client_msg,
+    read_client_msg, shutdown, spawn_server, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -467,8 +467,7 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
         "a range pull must leave the blob partial, not a full holder"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -578,8 +577,7 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
         "the fallback must fetch the whole blob with an un-ranged GET"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -677,8 +675,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         "no blob should have been cached for an unauthorized request"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -776,8 +773,7 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
         "a tail range pull leaves the blob partial"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -870,8 +866,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
         "the out-of-bounds reject must increment the range-not-satisfiable counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -988,8 +983,7 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         "the own-origin two-leg serve tier must fire once"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1197,8 +1191,7 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         "the own-origin two-leg serve tier must fire once"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1308,8 +1301,7 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
         "the own-origin two-leg serve tier must have been selected before the origin fault"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1577,7 +1569,7 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
         "blob must be present after coalesced serve"
     );
 
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1768,7 +1760,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
         "both blobs must be present after their serves"
     );
 
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     server_task.await?;
     Ok(())
 }

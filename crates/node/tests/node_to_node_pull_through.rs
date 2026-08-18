@@ -54,7 +54,7 @@ use iroh::{Endpoint, EndpointAddr};
 mod support;
 use support::{
     HandlerDomains, accept_one, build_handler_full, cache_with_blob, fresh_key, local_endpoint,
-    permissive_limiter, read_client_msg, spawn_server, write_client_msg,
+    permissive_limiter, read_client_msg, shutdown, spawn_server, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -352,9 +352,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     // A<->B lane. Re-assert A's lane is unchanged at hop-1's accounting.
     assert_channel_advanced(&store_a, "A<->B after hop 2", a_lane, RATE_A)?;
 
-    client_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&client_ep, &ep_b, &ep_a]).await;
     // Propagate JoinResult so a panic in either accept loop fails the test
     // rather than being silently swallowed. After `close()` the loops exit
     // cleanly, so this only surfaces genuine background-task panics.
@@ -444,8 +442,8 @@ async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()
         "pull should fail fast on the collapsed channel, not hang to the deadline: {err}"
     );
 
-    ep_b.close().await;
-    ep_a.close().await; // ends the refuser's accept loop (its next accept yields None)
+    // Closing `ep_a` ends the refuser's accept loop: its next accept yields None.
+    shutdown([], [&ep_b, &ep_a]).await;
     // Join rather than abort, so a panic inside the fake upstream surfaces here
     // instead of being silently dropped — matching how the happy path joins its
     // server tasks.
@@ -555,7 +553,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
             _ => anyhow::bail!("expected a ChunkData mid-stream"),
         }
         conn.close(0u32.into(), b"client-abort");
-        client_ep.close().await;
+        shutdown([], [&client_ep]).await;
     }
 
     // Property 1: no voucher accepted — the lane never advanced.
@@ -600,8 +598,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
     );
     assert_channel_advanced(&store, "reused after abort", lane, RATE_B)?;
 
-    honest_ep.close().await;
-    ep_b.close().await;
+    shutdown([], [&honest_ep, &ep_b]).await;
     task_b.await?;
     Ok(())
 }
@@ -749,7 +746,7 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
         "error should be the integrity check, got: {err}"
     );
 
-    ep_b.close().await;
+    shutdown([], [&ep_b]).await;
     // The liar reached `StreamEnd` before the requester bailed; surface any panic
     // or protocol error it hit, bounded so a hang fails loudly rather than stalls.
     match tokio::time::timeout(Duration::from_secs(5), liar).await {
@@ -758,6 +755,6 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
         }
         Err(_) => anyhow::bail!("lying upstream did not finish in time"),
     }
-    ep_up.close().await;
+    shutdown([], [&ep_up]).await;
     Ok(())
 }

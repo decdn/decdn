@@ -31,9 +31,8 @@ use decdn_incentive::{Erc20, price_impact_bps, swap_top_up, swap_venue};
 use crate::commands::{bond, chain_ctx, key_gen, register, terms};
 
 /// Clock synchronization (ADR 019): the local clock should be within
-/// 10 s of UTC before onboarding. Gossip messages are silently rejected by
-/// peers once skew reaches 60 s (ADR 001 § Clock synchronization), so this 10 s
-/// onboarding ceiling leaves margin.
+/// 10 s of UTC before onboarding, catching a misconfigured host clock before
+/// it affects time-sensitive on-chain interactions.
 const CLOCK_SKEW_LIMIT_SECS: i64 = 10;
 
 /// Conservative upper bound on the total gas for the on-chain onboarding transactions
