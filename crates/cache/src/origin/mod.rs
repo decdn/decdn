@@ -335,6 +335,16 @@ impl std::fmt::Debug for OutboardFetch {
     }
 }
 
+/// A seekable handle on a blob that lives as a local file, for the zero-copy
+/// fs serve path (#1511). `file` reads at absolute blob offsets (`positioned_io`
+/// implements `ReadAt for File`); `size` is the stat length used as the
+/// authoritative total only after it is checked against the signed `total_bytes`.
+#[derive(Debug)]
+pub struct LocalBlob {
+    pub file: std::fs::File,
+    pub size: u64,
+}
+
 /// An origin backend. Implementors fetch a blob identified by its BLAKE3 hash.
 ///
 /// The origin is **not** responsible for verifying the hash — the cache engine
@@ -466,6 +476,17 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, OriginPullError>> + Send + '_>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Open a seekable reader over `hash` **if this origin holds it as a local
+    /// file**. Remote origins (http/s3) return `Ok(None)` — their bytes are not
+    /// local, so there is nothing to serve zero-copy. Used by the fs zero-copy
+    /// serve path; the caller pairs it with [`Self::fetch_outboard`].
+    fn open_local_reader(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LocalBlob>, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Tag identifying the backend type. Surfaced through

@@ -20,7 +20,9 @@ use iroh_blobs::Hash;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
+use super::{
+    LocalBlob, Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
+};
 use crate::error::OriginPullError;
 
 /// Sibling-key suffix for the published pre-order bao outboard
@@ -486,6 +488,55 @@ impl Origin for FilesystemOrigin {
                         "cache.origin.path metadata failed for {}",
                         canonical.display()
                     );
+                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+                }
+            }
+        })
+    }
+
+    fn open_local_reader(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LocalBlob>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let path = self.path_for(hash);
+            // Same symlink-containment guard as `fetch`/`fetch_range`/`size`: a
+            // resolved path outside `base` is a deterministic permanent
+            // failure, never a silent serve of an escaped file.
+            let canonical = match tokio::fs::canonicalize(&path).await {
+                Ok(p) => p,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path canonicalize failed for {}",
+                        path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            if !canonical.starts_with(&self.base) {
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "cache.origin.path entry {} resolves to {} which is outside base {}",
+                    path.display(),
+                    canonical.display(),
+                    self.base.display()
+                )));
+            }
+            // Open on a blocking thread — File open + stat are blocking syscalls.
+            let opened = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&canonical)?;
+                let size = file.metadata()?.len();
+                std::io::Result::Ok(LocalBlob { file, size })
+            })
+            .await
+            .map_err(|e| {
+                OriginPullError::Transient(anyhow::anyhow!("open_local_reader join: {e}"))
+            })?;
+            match opened {
+                Ok(local) => Ok(Some(local)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => {
+                    let msg = "cache.origin.path open failed";
                     Err(classify_io_error(err).map_inner(|e| e.context(msg)))
                 }
             }
@@ -1135,6 +1186,44 @@ mod tests {
                 OriginRangeFetch::Unsupported
             ),
             "multi-MiB outboard must degrade without buffering",
+        );
+        Ok(())
+    }
+
+    /// A contained, existing data file opens as a [`LocalBlob`] with a
+    /// matching stat length and readable bytes.
+    #[tokio::test]
+    async fn open_local_reader_returns_contained_file() -> anyhow::Result<()> {
+        use std::io::Read;
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        let payload = vec![7u8; 4096];
+        let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+
+        let opened = origin.open_local_reader(hash).await?;
+        let mut local = opened.ok_or_else(|| anyhow::anyhow!("expected file present"))?;
+        anyhow::ensure!(
+            local.size == payload.len() as u64,
+            "size mismatch: {} vs {}",
+            local.size,
+            payload.len()
+        );
+        let mut buf = Vec::new();
+        local.file.read_to_end(&mut buf)?;
+        anyhow::ensure!(buf == payload, "byte mismatch");
+        Ok(())
+    }
+
+    /// A hash with no backing file resolves to `Ok(None)`, not an error.
+    #[tokio::test]
+    async fn open_local_reader_absent_is_none() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let absent = Hash::from_bytes([9u8; 32]);
+        anyhow::ensure!(
+            origin.open_local_reader(absent).await?.is_none(),
+            "expected None for absent blob"
         );
         Ok(())
     }
