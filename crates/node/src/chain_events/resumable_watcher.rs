@@ -105,7 +105,7 @@ impl CursorStart {
     /// The explicit starting cursor, if this is a [`Self::Seeded`] start. `Some`
     /// pre-sets `run`'s cursor so the first tick scans from here and never
     /// resolves a floor.
-    const fn seed(&self) -> Option<u64> {
+    pub(crate) const fn seed(&self) -> Option<u64> {
         match self {
             Self::Seeded { at, .. } => Some(*at),
             Self::FromCheckpoint { .. } | Self::HeadMinusWindow { .. } => None,
@@ -132,7 +132,7 @@ impl CursorStart {
     /// stored floor, permanently discarding the downtime gap the checkpoint
     /// exists to cover (#751/#762) — so the tick fails into backoff and
     /// re-resolves next tick rather than degrading to a silent rescan.
-    fn initial_from(&self, from_block: u64, head: u64) -> Result<u64> {
+    pub(crate) fn initial_from(&self, from_block: u64, head: u64) -> Result<u64> {
         match self {
             Self::FromCheckpoint {
                 checkpoint,
@@ -181,7 +181,7 @@ impl CursorStart {
     /// [`Self::HeadMinusWindow`] and unpersisted [`Self::Seeded`] starts).
     /// Best-effort: a lost write only widens the next rescan (see the store's
     /// monotonic-floor contract).
-    fn persist(&self, block: u64) {
+    pub(crate) fn persist(&self, block: u64) {
         if let Some(cp) = self.checkpoint()
             && let Err(err) = cp.store.record_checkpoint(cp.key, block)
         {
@@ -190,7 +190,7 @@ impl CursorStart {
     }
 
     /// Force any buffered checkpoint out on graceful shutdown.
-    fn flush(&self) {
+    pub(crate) fn flush(&self) {
         if let Some(cp) = self.checkpoint()
             && let Err(err) = cp.store.flush_checkpoint(cp.key)
         {

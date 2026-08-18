@@ -46,6 +46,7 @@
 //! rather than the wiring.
 
 pub(crate) mod backfill;
+pub(crate) mod multiplexed_poller;
 pub(crate) mod resumable_watcher;
 // Public because it appears in the `pub` watcher `bootstrap` signatures, which
 // external integration tests (`tests/anvil_settlement_e2e.rs`) call.
