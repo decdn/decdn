@@ -2037,6 +2037,43 @@ contract PaymentPoolTest is Test {
         assertEq(lane.bytesDelivered, 30_000_000);
     }
 
+    function test_getAuthorizations_batchesRegisteredAndUnregistered() public {
+        bytes32 id0 = _open();
+        vm.prank(provider);
+        _redeemOne(
+            id0, signer, provider, 300e6, 30_000_000, _voucher(id0, 300e6, 30_000_000), _cap(id0, SPENDING_CAP, expiry)
+        );
+        bytes32 id1 = _open(); // signer never registered here
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = id0;
+        ids[1] = id1;
+        address[] memory signers = new address[](2);
+        signers[0] = signer;
+        signers[1] = signer;
+
+        PaymentPool.Authorization[] memory auths = pool.getAuthorizations(ids, signers);
+        assertEq(auths.length, 2);
+        // Registered lane: identical to the single-read view.
+        assertEq(auths[0].cap, SPENDING_CAP);
+        assertEq(uint256(auths[0].expiry), uint256(expiry));
+        assertEq(auths[0].spent, 300e6);
+        // Unregistered lane: zero cap (the redeemer's "attach a CapabilityReg" signal).
+        assertEq(auths[1].cap, 0);
+        assertEq(uint256(auths[1].expiry), 0);
+        assertEq(auths[1].spent, 0);
+        // Each entry equals the single-read view for the same pair.
+        assertEq(auths[0].cap, pool.getAuthorization(id0, signer).cap);
+        assertEq(auths[1].cap, pool.getAuthorization(id1, signer).cap);
+    }
+
+    function test_getAuthorizations_revertsOnLengthMismatch() public {
+        bytes32[] memory ids = new bytes32[](2);
+        address[] memory signers = new address[](1);
+        vm.expectRevert(PaymentPool.LengthMismatch.selector);
+        pool.getAuthorizations(ids, signers);
+    }
+
     // -----------------------------------------------------------------
     // getRateBounds
     // -----------------------------------------------------------------

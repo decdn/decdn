@@ -144,6 +144,18 @@ fn is_insufficient_deposit_selector(revert_data: &[u8]) -> bool {
         || selector == ERC20InsufficientAllowance::SELECTOR
 }
 
+/// Whether an ERC-20 revert is specifically an *allowance* shortfall
+/// (`ERC20InsufficientAllowance`) — the one class a just-in-time `approve`
+/// can fix. An insufficient-balance revert, a zero-amount revert, or any
+/// other selector returns `false`: an `approve` cannot recover those, so the
+/// caller must treat them as terminal. Pass alloy's `Error::as_revert_data()`.
+#[must_use]
+pub fn is_erc20_allowance_shortfall(revert_data: Option<&Bytes>) -> bool {
+    revert_data
+        .and_then(|data| data.get(..4))
+        .is_some_and(|selector| selector == ERC20InsufficientAllowance::SELECTOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +230,37 @@ mod tests {
             PoolOpenFailureReason::classify_revert_data(Some(&data)),
             PoolOpenFailureReason::ContractRevert
         );
+    }
+
+    #[test]
+    fn allowance_shortfall_true_only_for_allowance_error() {
+        let allowance = Bytes::from(
+            ERC20InsufficientAllowance {
+                spender: Address::repeat_byte(0x22),
+                allowance: U256::ZERO,
+                needed: U256::from(10_000_000u64),
+            }
+            .abi_encode(),
+        );
+        assert!(is_erc20_allowance_shortfall(Some(&allowance)));
+
+        let balance = Bytes::from(
+            ERC20InsufficientBalance {
+                sender: Address::repeat_byte(0x11),
+                balance: U256::ZERO,
+                needed: U256::from(10_000_000u64),
+            }
+            .abi_encode(),
+        );
+        assert!(!is_erc20_allowance_shortfall(Some(&balance)));
+        assert!(!is_erc20_allowance_shortfall(Some(&Bytes::from(
+            ZeroAmount {}.abi_encode()
+        ))));
+        assert!(!is_erc20_allowance_shortfall(None));
+        // Truncated (< 4 bytes) must not panic on the slice and returns false.
+        assert!(!is_erc20_allowance_shortfall(Some(&Bytes::from(vec![
+            0x01, 0x02
+        ]))));
     }
 
     #[test]

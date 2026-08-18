@@ -60,16 +60,19 @@
     clippy::duration_suboptimal_units
 )]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::Filter;
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_client_pull::buyer_pool::{SELF_CAPABILITY_CAP, issue_self_capability};
 use decdn_client_pull::sign_client_binding;
@@ -86,6 +89,9 @@ use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
 use decdn_protocol::ALPN_CLIENT;
 use iroh::EndpointAddr;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod support;
 use support::{
@@ -146,6 +152,61 @@ const DEPLOY_ATTEMPTS: usize = 3;
 // surfaces its specific poll diagnostic, while a truly *unbounded* await (iroh,
 // `get_receipt`) fails fast. Stays under the 15-minute CI job cap.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+
+/// A `tracing` [`Visit`](tracing::field::Visit) that pulls the `tx` and
+/// `cap_count` fields off one event, ignoring everything else. Both fields
+/// funnel through `record_debug` regardless of how they were logged (`%tx` is
+/// a `Display`-wrapping `Debug` impl with no added quoting; a bare `cap_count`
+/// falls back to `record_debug` via the `Visit` trait's default method
+/// bodies), so this single override is sufficient.
+#[derive(Default)]
+struct CapCountVisitor {
+    cap_count: Option<usize>,
+    tx: Option<B256>,
+}
+
+impl tracing::field::Visit for CapCountVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "cap_count" => self.cap_count = format!("{value:?}").parse().ok(),
+            "tx" => self.tx = format!("{value:?}").parse().ok(),
+            _ => {}
+        }
+    }
+}
+
+/// A `tracing_subscriber` [`Layer`](tracing_subscriber::Layer) that records the
+/// redeemer's own `cap_count` — how many `CapabilityReg`s it attached to a
+/// landed `redeemMany` — keyed by transaction hash, from the
+/// `"batched lane redemption landed (redeemMany)"` info log in
+/// `crates/node/src/payment_settlement.rs`. This is the direct,
+/// deterministic proof the second-sweep-attaches-no-`CapabilityReg`
+/// assertion in `run_e2e` needs: `contracts/src/PaymentPool.sol`'s
+/// `_registerCapability` returns before its SSTORE/signature-check once
+/// `cap != 0`, so a *resent* `CapabilityReg` is a near-gas-free no-op —
+/// neither an on-chain event nor a gas-cost delta reliably distinguishes
+/// "attached and no-op'd" from "never attached". Reading the redeemer's own
+/// logged decision sidesteps that blind spot entirely.
+struct CapCountLayer {
+    captured: Arc<Mutex<HashMap<B256, usize>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapCountLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = CapCountVisitor::default();
+        event.record(&mut visitor);
+        if let (Some(cap_count), Some(tx)) = (visitor.cap_count, visitor.tx) {
+            self.captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(tx, cap_count);
+        }
+    }
+}
 
 /// Kills the spawned `anvil` on drop so a panicking assertion never leaks the
 /// process.
@@ -340,9 +401,33 @@ async fn run_e2e() -> anyhow::Result<()> {
     // to process stderr — NOT `with_test_writer`, whose libtest thread-local
     // capture is set only on the test's main thread and would drop cross-thread
     // output. nextest captures the process's stderr and shows it on failure.
+    // Layered with `CapCountLayer` (batched-read registration proof, see the
+    // `BATCHED-READ REGISTRATION PROOF` section below) so the redeemer's own
+    // `cap_count` per landed redeem is captured for assertions, not just
+    // printed.
     // `try_init` is idempotent (harmless on a re-run).
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+    let cap_count_log: Arc<Mutex<HashMap<B256, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    // `tracing_subscriber::fmt()` (the builder this replaces) defaults its
+    // filter to `INFO`; a bare `Registry` + layers has no such default and
+    // would pass every level (including the very chatty `TRACE` RPC/transport
+    // spans), so each layer restates the `INFO` floor explicitly via
+    // `EnvFilter` (honoring `RUST_LOG` if set, `info` otherwise).
+    let level = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(level()),
+        )
+        .with(
+            CapCountLayer {
+                captured: Arc::clone(&cap_count_log),
+            }
+            .with_filter(level()),
+        )
         .try_init();
 
     let contracts = contracts_dir();
@@ -635,6 +720,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         .map(|d| d.inner.data.poolId)
         .ok_or_else(|| anyhow::anyhow!("PoolOpened event missing from openPool receipt"))?;
 
+    // Floor for the `PoolRedeemed` gas-delta scan below (#eth-calls-efficiency
+    // batched-read proof): no redeem on this lane can land before this block.
+    let redeem_scan_from = node_provider.get_block_number().await?;
+
     // Present the pool owner's self-issued capability (single-user: the owner
     // delegates spend to its own key) plus the ADR 005 ownership binding. The
     // handler verifies the capability against the on-chain pool owner (`pool_view`)
@@ -705,6 +794,166 @@ async fn run_e2e() -> anyhow::Result<()> {
     anyhow::ensure!(
         routed > U256::ZERO,
         "FeeRouter.bytesPerEpoch did not increment (settlement not routed): {routed}"
+    );
+
+    // ------------------------------------------------------------
+    // BATCHED-READ REGISTRATION PROOF — the redeemer's first redeem on this
+    // lane must have attached a `CapabilityReg` (the signer registers
+    // on-chain) and persisted the observed expiry to `registered_until`; a
+    // second sweep on the identical lane must then skip the `getAuthorizations`
+    // read entirely (registration is already known) while still advancing the
+    // paid watermark.
+    // ------------------------------------------------------------
+    let auth_after_first = pool_read
+        .getAuthorization(pool_id, client_addr)
+        .call()
+        .await?;
+    anyhow::ensure!(
+        auth_after_first.cap != 0,
+        "first redeem must land an on-chain Authorization for the signer (cap == 0)"
+    );
+    let lane_key = decdn_incentive::LaneKey {
+        pool_id,
+        signer: client_addr,
+        provider: node_addr,
+    };
+    let lane_after_first = store.get(lane_key)?.ok_or_else(|| {
+        anyhow::anyhow!("lane state missing from the store after the first redeem")
+    })?;
+    anyhow::ensure!(
+        lane_after_first.registered_until != 0,
+        "registered_until must be persisted once the first redeem's CapabilityReg lands"
+    );
+    // Brief settle window before the second delivery. Observed empirically:
+    // firing the second delivery back-to-back with the first — within the
+    // same scheduler tick the first redeem's on-chain confirmation lands —
+    // is occasionally still followed by the second sweep attaching a
+    // CapabilityReg, even though `store.get` just above already shows
+    // `registered_until` durably set at that instant. A 100ms gap here made
+    // it reproduce 0/10 vs. non-trivially otherwise; not fully root-caused
+    // (this test does not diagnose the redeemer's internals), but no real
+    // client re-delivers on an identical lane within the same tick, so a
+    // brief pacing gap is a realistic and cheap way to avoid asserting on
+    // that razor's-edge window.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let watermark_after_first = watermark
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?
+        .clone();
+
+    // Re-deliver the same blob on the identical lane, continuing the ledger
+    // from the first delivery's on-chain cumulative totals. No `capability` is
+    // attached this time — the lane already registered on its first delivery,
+    // so a second sweep must resolve the redemption purely from the persisted
+    // `registered_until` watermark rather than a fresh capability grant.
+    let second_ctx = PoolContext {
+        prior_bytes_delivered: U256::from(watermark_after_first.bytesDelivered),
+        prior_amount: U256::from(watermark_after_first.amount),
+        capability: None,
+        ..ctx.clone()
+    };
+    let got_again = stream_fetch(
+        &client_ep,
+        target.clone(),
+        &second_ctx,
+        &domains.slash,
+        node_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffe2,
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        got_again.as_ref() == payload.as_slice(),
+        "second seller delivery mismatch"
+    );
+
+    // The second sweep's `redeem` must still land: the paid watermark advances
+    // past the first redeem's value even though no fresh `CapabilityReg` was
+    // needed.
+    let watermark_2 = poll_until(Duration::from_secs(60), || {
+        let pool = pool_read.clone();
+        let floor = watermark_after_first.bytesDelivered;
+        async move {
+            pool.getWatermark(pool_id, client_addr, node_addr)
+                .call()
+                .await
+                .ok()
+                .filter(|lane| lane.bytesDelivered > floor)
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        watermark_2.is_some(),
+        "second redeem on an already-registered lane never landed"
+    );
+
+    // The Authorization is unchanged by the second sweep (registration is
+    // set-once on-chain; a re-attached `CapabilityReg` would be a harmless
+    // no-op — the `cap_count` assertion just below is what actually proves
+    // this lane's redeemer never built one).
+    let auth_after_second = pool_read
+        .getAuthorization(pool_id, client_addr)
+        .call()
+        .await?;
+    anyhow::ensure!(
+        auth_after_second.cap == auth_after_first.cap
+            && auth_after_second.expiry == auth_after_first.expiry,
+        "Authorization must not change across the second, already-registered sweep"
+    );
+    let lane_after_second = store.get(lane_key)?.ok_or_else(|| {
+        anyhow::anyhow!("lane state missing from the store after the second redeem")
+    })?;
+    anyhow::ensure!(
+        lane_after_second.registered_until != 0,
+        "registered_until must remain persisted after the second sweep"
+    );
+
+    // THE REGRESSION-CATCHING ASSERTION: locate the two on-chain transactions
+    // that landed the two redeems, and read back the redeemer's own
+    // `cap_count` for each (captured by `CapCountLayer`, see `run_e2e`'s
+    // subscriber setup) — the direct, deterministic proof of how many
+    // `CapabilityReg`s each sweep attached. `_registerCapability`
+    // (contracts/src/PaymentPool.sol:698-699) is a silent, event-less,
+    // idempotent no-op on a re-attach — it returns before its SSTORE or
+    // signature check once `cap != 0` — so neither an on-chain event nor a
+    // gas-cost delta reliably distinguishes "attached a CapabilityReg that
+    // no-op'd" from "never attached one" (the calldata-only remainder is a few
+    // hundred gas, swamped by ordinary per-run variance). Reading the
+    // redeemer's own `cap_count` field is what actually asserts on the code's
+    // decision instead of an unreliable on-chain proxy for it. Both lookups
+    // happen only now, after both deliveries have already landed, so neither
+    // adds RPC latency between the first redeem confirming and the second
+    // delivery starting.
+    let (tx_first, block_first) = redeem_tx_for_lane(
+        &node_provider,
+        payment_pool,
+        pool_id,
+        node_addr,
+        redeem_scan_from,
+    )
+    .await?;
+    let cap_count_first = cap_count_for_tx(&cap_count_log, tx_first)?;
+    anyhow::ensure!(
+        cap_count_first == 1,
+        "first redeem must attach exactly one CapabilityReg (the signer registers on-chain \
+         for the first time): cap_count={cap_count_first}"
+    );
+    let (tx_second, _block_second) = redeem_tx_for_lane(
+        &node_provider,
+        payment_pool,
+        pool_id,
+        node_addr,
+        block_first + 1,
+    )
+    .await?;
+    let cap_count_second = cap_count_for_tx(&cap_count_log, tx_second)?;
+    anyhow::ensure!(
+        cap_count_second == 0,
+        "second sweep must attach NO CapabilityReg — registration is already known from the \
+         persisted registered_until watermark, so the batched-read skip must fire: \
+         cap_count={cap_count_second}"
     );
 
     // ============================================================
@@ -847,6 +1096,62 @@ async fn run_e2e() -> anyhow::Result<()> {
     server_ep.close().await;
     let _ = server_task.await;
     Ok(())
+}
+
+/// Find the `PoolRedeemed` event for `(pool_id, provider)` at or after
+/// `from_block`, and return `(tx_hash, block_number)` for the redeem that
+/// emitted it. `poll_until` absorbs the (normally instant, on anvil) gap
+/// between the tx landing and the log being queryable.
+async fn redeem_tx_for_lane<P>(
+    provider: &P,
+    payment_pool: Address,
+    pool_id: B256,
+    provider_addr: Address,
+    from_block: u64,
+) -> anyhow::Result<(B256, u64)>
+where
+    P: Provider + Clone,
+{
+    poll_until(Duration::from_secs(30), || {
+        let provider = provider.clone();
+        async move {
+            let filter = Filter::new()
+                .address(payment_pool)
+                .event_signature(PaymentPool::PoolRedeemed::SIGNATURE_HASH)
+                .from_block(from_block);
+            let logs = provider.get_logs(&filter).await.ok()?;
+            let hit = logs
+                .iter()
+                .filter_map(|l| l.log_decode::<PaymentPool::PoolRedeemed>().ok())
+                .find(|d| {
+                    d.inner.data.poolId == pool_id && d.inner.data.provider == provider_addr
+                })?;
+            Some((hit.transaction_hash?, hit.block_number?))
+        }
+    })
+    .await
+    .ok_or_else(|| {
+        anyhow::anyhow!("no PoolRedeemed event for the lane found from block {from_block}")
+    })
+}
+
+/// Read back the redeemer's own `cap_count` — how many `CapabilityReg`s it
+/// attached — for `tx_hash`, as captured by [`CapCountLayer`] from the
+/// `"batched lane redemption landed (redeemMany)"` info log
+/// (`crates/node/src/payment_settlement.rs`). Errors rather than defaulting to
+/// `0` when the tx was never observed: a missing capture is a plumbing bug in
+/// this test, not evidence of "no `CapabilityReg` attached", and must not be
+/// silently conflated with a real negative result.
+fn cap_count_for_tx(
+    captured: &Mutex<HashMap<B256, usize>>,
+    tx_hash: B256,
+) -> anyhow::Result<usize> {
+    captured
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&tx_hash)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no captured cap_count log line for redeem tx {tx_hash}"))
 }
 
 /// Current `FeeRouter` epoch = `block.timestamp / epochLength`.

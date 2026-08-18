@@ -239,6 +239,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error PoolNotClosing();
     error GraceWindowActive();
     error RouterUnchanged();
+    error LengthMismatch();
 
     // -----------------------------------------------------------------
     // Constructor
@@ -544,6 +545,25 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     function getAuthorization(bytes32 poolId, address signer) external view returns (Authorization memory) {
         return authorized[poolId][signer];
+    }
+
+    /// @notice Batch companion to `getAuthorization`: one `authorized[poolId][signer]`
+    ///         read per `(poolIds[i], signers[i])` pair, in input order. The redeemer
+    ///         reads every lane whose registration it does not already know in one
+    ///         call instead of one `eth_call` per lane.
+    /// @dev    Reverts `LengthMismatch` when the two arrays differ in length. A pure
+    ///         loop over the existing mapping — no storage is written and no pair is
+    ///         deduplicated (the caller's lanes are already distinct).
+    function getAuthorizations(bytes32[] calldata poolIds, address[] calldata signers)
+        external
+        view
+        returns (Authorization[] memory auths)
+    {
+        if (poolIds.length != signers.length) revert LengthMismatch();
+        auths = new Authorization[](poolIds.length);
+        for (uint256 i = 0; i < poolIds.length; i++) {
+            auths[i] = authorized[poolIds[i]][signers[i]];
+        }
     }
 
     function getWatermark(bytes32 poolId, address signer, address provider) external view returns (Lane memory) {

@@ -218,6 +218,14 @@ fn lane_key_parts(bytes: &[u8; LANE_KEY_LEN]) -> (B256, Address, Address) {
 /// [`LaneState`] carries the stronger `Option<[u8; 65]>`, and the narrowing
 /// (empty → `None`, 65 → `Some`, anything else → corrupt) lives in
 /// [`StoredLaneState::into_state`].
+///
+/// `registered_until` is a required field after `expiry`: the observed on-chain
+/// capability expiry for this lane's signer. Adding it is a breaking on-disk
+/// change — a record written before it fails to decode here (the trailing `u64`
+/// is absent, so `take_from_bytes` hits `DeserializeUnexpectedEnd`), it is not
+/// silently defaulted. That break is deliberate and unversioned: deCDN is
+/// pre-launch with no deployed store to stay compatible with, so
+/// [`SUPPORTED_SCHEMA_VERSION`] does not bump.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredLaneState {
     schema_version: u32,
@@ -226,6 +234,7 @@ struct StoredLaneState {
     signature: Vec<u8>,
     cap: [u8; 32],
     expiry: u64,
+    registered_until: u64,
 }
 
 impl From<&LaneState> for StoredLaneState {
@@ -237,6 +246,7 @@ impl From<&LaneState> for StoredLaneState {
             signature: state.last_signature().map_or_else(Vec::new, |s| s.to_vec()),
             cap: state.cap.to_be_bytes(),
             expiry: state.expiry,
+            registered_until: state.registered_until,
         }
     }
 }
@@ -272,7 +282,7 @@ impl StoredLaneState {
                 })?,
             )
         };
-        Ok(LaneState::hydrate(
+        let mut state = LaneState::hydrate(
             pool_id,
             signer,
             provider,
@@ -281,7 +291,9 @@ impl StoredLaneState {
             U256::from_be_bytes(self.last_amount),
             U256::from_be_bytes(self.last_bytes_delivered),
             last_signature,
-        ))
+        );
+        state.registered_until = self.registered_until;
+        Ok(state)
     }
 }
 
@@ -614,9 +626,30 @@ impl PoolStateStore for PersistentPoolStateStore {
     fn record(&self, state: &LaneState) -> Result<(), StoreError> {
         let key = state.key();
         let mut buf = self.lock_buffer()?;
-        buf.lanes.insert(key, state.clone());
+        let mut next = state.clone();
+        if let Some(existing) = buf.lanes.get(&key) {
+            next.registered_until = next.registered_until.max(existing.registered_until);
+        }
+        buf.lanes.insert(key, next);
         buf.tombstones.remove(&key);
         buf.dirty.insert(key);
+        Ok(())
+    }
+
+    /// Raise this lane's observed on-chain registration expiry, monotonically —
+    /// touches ONLY `registered_until`, never the replay-critical `last_*`
+    /// tuple, so it cannot race a concurrent voucher `record` into a lost
+    /// update. A no-op for a lane with no record. Buffered like `record`;
+    /// durability is the next `flush`'s job.
+    fn set_registered_until(&self, key: LaneKey, registered_until: u64) -> Result<(), StoreError> {
+        let mut buf = self.lock_buffer()?;
+        let Some(state) = buf.lanes.get_mut(&key) else {
+            return Ok(());
+        };
+        if registered_until > state.registered_until {
+            state.registered_until = registered_until;
+            buf.dirty.insert(key);
+        }
         Ok(())
     }
 
@@ -1590,6 +1623,7 @@ mod tests {
             signature: s.last_signature().map_or_else(Vec::new, |x| x.to_vec()),
             cap: s.cap.to_be_bytes(),
             expiry: s.expiry,
+            registered_until: s.registered_until,
         };
         let encoded = postcard::to_allocvec(&forward)?;
         {

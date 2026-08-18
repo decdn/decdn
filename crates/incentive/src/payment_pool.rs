@@ -17,7 +17,9 @@
 //! - reads: `usdc()` and `feeRouter()` (immutables/governable addresses),
 //!   `getPool(poolId)` (owner, status, deposit, dispute deadline,
 //!   totalRedeemed), `getAuthorization(poolId, signer)` (spending cap,
-//!   expiry, spent), `getWatermark(poolId, signer, provider)` (the
+//!   expiry, spent), `getAuthorizations(poolIds, signers)` (the batch
+//!   companion to `getAuthorization`, one read per pair in input order),
+//!   `getWatermark(poolId, signer, provider)` (the
 //!   cumulative-paid lane a redeemer advances), `ownerPoolNonce(owner)` (next
 //!   nonce used to derive a pool id), `getPools(owner, offset, limit)` (page
 //!   of an owner's pool ids), and `getRateBounds()` (the governable per-MB
@@ -166,6 +168,17 @@ mod sol_types {
             /// pool. Zero cap and zero expiry means the signer is not yet
             /// registered.
             function getAuthorization(bytes32 poolId, address signer) external view returns (Authorization memory);
+
+            /// Batch companion to `getAuthorization`: one
+            /// `authorized[poolId][signer]` read per `(poolIds[i],
+            /// signers[i])` pair, in input order. Reverts on a length
+            /// mismatch. The redeemer reads every lane whose registration it
+            /// does not already know in one call instead of one `eth_call`
+            /// per lane.
+            function getAuthorizations(bytes32[] calldata poolIds, address[] calldata signers)
+                external
+                view
+                returns (Authorization[] memory);
 
             /// A `(signer, provider)` lane's cumulative-paid amount and
             /// cumulative paid-proportional bytes delivered.
@@ -490,6 +503,17 @@ mod tests {
         assert_eq!(
             PaymentPool::RateBoundsUpdated::SIGNATURE,
             "RateBoundsUpdated(uint256)"
+        );
+    }
+
+    /// Batch companion selector for `getAuthorization` (ADR 003 § redeemer
+    /// batching).
+    #[test]
+    fn get_authorizations_signature_matches_contract() {
+        use alloy::sol_types::SolCall;
+        assert_eq!(
+            PaymentPool::getAuthorizationsCall::SIGNATURE,
+            "getAuthorizations(bytes32[],address[])"
         );
     }
 }
