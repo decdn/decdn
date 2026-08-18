@@ -29,9 +29,9 @@ On a cache miss for hash `H`, the client discovers holders via `cdn/dht/v1` FIND
 - **Ranking key is measured RTT only.** Self-attested `region` ([ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)) is not consulted. Round-trip time is ground truth and cannot be forged: a node that misreports its region to appear local simply exhibits a high measured RTT and is never selected as a proxy. The region-spoofing surface is therefore irrelevant to this mechanism by construction.
 - **RTT source.** The client's per-peer RTT map (§ [Client RTT map and latency discovery](#client-rtt-map-and-latency-discovery)). A warming request itself yields a fresh RTT sample for the chosen proxy, refining future selection.
 - **One proxy, not a fan-out.** The client routes the request to the single best candidate. Only one regional copy is needed; fanning out across several near nodes multiplies the cold-pull cost without improving the outcome.
-- **Fallback.** If the chosen proxy declines or fails to make progress within `proxy_warming.max_wait_ms`, the client falls back to the next-best candidate and then to the direct holder. The fallback is transparent to the caller — no error is surfaced for a proxy that declines.
+- **Fallback.** If the chosen proxy declines, stalls, or fails, the client fails over to the next-best candidate and finally to the direct holder. The progress deadline is the client's ordinary pull stall budget (the same budget that bounds any node that accepts a request and then makes no progress), so a stalled proxy needs no proxy-specific timer. The fallback is transparent to the caller — no error is surfaced while a candidate remains. All candidates draw on the one shared payment pool ([ADR 003 § Decision](003-payments.md#decision)), where each provider is a distinct lane and a lane for a not-yet-paid provider opens nothing on-chain, so failing over escrows no new deposit; the client resumes the partial it already holds, so it re-pays nothing already delivered.
 
-Proxy warming defaults on (`proxy_warming.enabled = true`) and is fully disableable. The only client-observable cost is a bounded one-request latency premium the first time a locale warms a given blob.
+Proxy warming defaults on (`proxy_warming.enabled = true`) and is fully disableable. Because a declining or stalled proxy fails over transparently to the direct holder, defaulting on cannot regress a fetch. The only client-observable cost is a bounded one-request latency premium the first time a locale warms a given blob.
 
 ### Client RTT map and latency discovery
 
@@ -100,14 +100,13 @@ A node publishes a DHT STORE for `H` only when it holds the blob in full. Discov
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
 | `proxy_warming.enabled` | `true` | Master switch for the client-side proxy preference. |
-| `proxy_warming.rtt_threshold_ms` | operator/client-set | A best-holder RTT above this marks the holders as distant enough to warrant warming. |
-| `proxy_warming.margin_ms` | operator/client-set | A candidate proxy must beat the best holder's RTT by at least this margin to be chosen. |
-| `proxy_warming.max_wait_ms` | operator/client-set | Progress deadline before falling back from a proxy to the next candidate or the direct holder. |
+| `proxy_warming.rtt_threshold_ms` | `150` | A best-holder RTT above this marks the holders as distant enough to warrant warming. |
+| `proxy_warming.margin_ms` | `30` | A candidate proxy must beat the best holder's RTT by at least this margin to be chosen. |
 | `rtt_map.staleness_secs` | client-set | Age past which a per-peer RTT entry is re-sampled or evicted. |
 | `pull_chunk_bytes` | ~1 MB | Chunk transfer/verification granularity (bao verified streaming). |
 | `credit_max`, `credit_ramp_divisor` | operator-set, finite ([ADR 003 § Credit window](003-payments.md#credit-window)) | The ramped credit window: max `pulled − paid` bytes for a single stream, floored at one voucher interval and ramping toward `credit_max` as the stream pays. Bounds per-request abandonment loss while keeping the upstream pull pipelined — decouples the loss bound from throughput. |
 
-Concrete defaults for the latency parameters are modeled before locking; the load-bearing commitment for the credit window is that its floor is finite (so per-request loss is bounded) yet large enough to keep the upstream pull pipelined, and that `credit_max` is finite.
+The progress deadline for the fallback is the client's ordinary pull stall budget, not a proxy-specific timer. The load-bearing commitment for the credit window is that its floor is finite (so per-request loss is bounded) yet large enough to keep the upstream pull pipelined, and that `credit_max` is finite.
 
 ### Implementation status
 
@@ -135,7 +134,7 @@ The window-paced handler introduces no wire-format change: its `StreamRequest` /
 
 ### Negative
 
-- The first client to warm a locale for a given blob pays a latency premium (one extra hop plus the cold upstream pull's start-up latency) relative to going direct. The premium is bounded by `proxy_warming.max_wait_ms` and the fallback path.
+- The first client to warm a locale for a given blob pays a latency premium (one extra hop plus the cold upstream pull's start-up latency) relative to going direct. The premium is bounded by the client's pull stall budget and the fallback path.
 - A warmed node may hold `H` only partially under range-access patterns and never publish a whole-blob STORE, so such copies are discoverable only via RTT routing, not via the normal FIND_VALUE path. Range-addressed discovery is deferred.
 - The per-peer RTT map and background latency sweep are new always-on client state and traffic. The sweep is bounded by the existing probe rate budget, but it is a real cost a warming-capable client pays continuously, and a client that never runs long enough to populate the map never warms anything (it falls back to direct delivery).
 - Speculative pull-through that the pre-flight deposit guard refuses, because the requesting pool cannot cover even the ramp floor, leaves that warming opportunity unserved; this is the intended trade against operator loss.
@@ -161,7 +160,7 @@ The window-paced handler introduces no wire-format change: its `StreamRequest` /
 3. A node filling a request for an unheld blob pulls ahead of cleared payment in a pipeline, pausing when `pulled − paid` for the request reaches the ramped credit window; on client abandonment its unrecouped speculative spend is at most that window, and the upstream pull is not serialized to one round-trip per chunk.
 4. The ramped credit window widens only as the request's own stream pays: a non-paying stream stays pinned at the one-voucher-interval floor, and a paying stream ramps toward `credit_max` in proportion to `paid`, while continuing to serve ranges already held.
 5. After a warming serve completes the blob, the node publishes a DHT STORE for `H`, and a subsequent regional FIND_VALUE returns the node as a holder.
-6. A proxy that declines or misses `proxy_warming.max_wait_ms` causes the client to fall back to the next candidate and then the direct holder, with no error surfaced to the caller; the client records the observed RTT regardless of outcome.
+6. A proxy that declines or stalls past the client's pull stall budget causes the client to fail over to the next candidate and then the direct holder, with no error surfaced to the caller; the client records the observed RTT regardless of outcome.
 7. A node's upstream pull for a warming request targets actual holders via the normal `cdn/dht/v1` path and is not itself routed through another non-holding proxy.
 8. The client maintains a per-peer `NodeId → RTT` map distinct from the hash-keyed probe cache, populated by passive sampling on every QUIC interaction and by a bounded background latency sweep that stays within the probe rate budget.
 9. Latency-discovery probes carry a reserved sentinel hash (or equivalent flag) and are not counted toward any node's demand metrics.
