@@ -401,6 +401,13 @@ impl ClientHandler {
             }
         }
 
+        // Clean completion: the whole request delivered and every interval paid. Only
+        // reached here — every abnormal exit returns earlier — so mark the reservation
+        // settled, making its drop fold the proportional unpaid tail (0 for a fully
+        // paid stream) rather than the conservative full `reserved` (ADR 003 §Pool solvency).
+        if let Some(res) = floor_reservation.as_ref() {
+            res.mark_settled();
+        }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         Ok(())

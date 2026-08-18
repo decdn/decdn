@@ -200,6 +200,14 @@ pub(super) struct FloorReservation {
     /// Set by [`Self::release_live_repaid`]; makes drop a no-op (live already freed,
     /// no dead charge). Idempotent.
     repaid: AtomicBool,
+    /// Set by [`Self::mark_settled`] at a stream's CLEAN completion. On drop it
+    /// selects the fold size: a settled stream folds only its proportional unpaid
+    /// tail; an abnormal exit that was never marked settled folds the full `reserved`
+    /// — the safe, conservative direction for a solvency guard. Without this, an abort before
+    /// any byte is delivered would drop with `unpaid == 0` and fold nothing, so a
+    /// cache-miss stream that fronted upstream USDC could be repeated sequentially
+    /// forever, never charging `dead_charge` (ADR 003 §Pool solvency).
+    settled: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -246,7 +254,18 @@ impl FloorReservation {
             reserved,
             unpaid: AtomicU64::new(0),
             repaid: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
         }
+    }
+
+    /// Mark the stream cleanly completed, so drop folds only the proportional unpaid
+    /// tail (`min(reserved, unpaid)`) rather than the full `reserved`. Called at the
+    /// serve loop's clean-completion point — the whole request delivered and every
+    /// interval paid. Any exit that does NOT call this (client disconnect, `?`, a
+    /// voucher rejection, a mid-stream stop) is treated as abnormal and folds the
+    /// full reservation. Idempotent.
+    fn mark_settled(&self) {
+        self.settled.store(true, Ordering::Relaxed);
     }
 
     /// Record the stream's current unpaid `µUSDC`, read at drop to size the
@@ -278,11 +297,23 @@ impl Drop for FloorReservation {
         if self.repaid.load(Ordering::Relaxed) {
             return; // repaid: live already released, no dead charge
         }
-        // Not repaid: release the live reservation and fold the unpaid tail (capped
-        // at one floor) into the durable dead charge. All under the sync lock, all
-        // saturating — an O(1) update that never blocks the reactor.
-        let unpaid = U256::from(self.unpaid.load(Ordering::Relaxed));
-        let dead_add = self.reserved.min(unpaid);
+        // Not repaid: release the live reservation and fold a dead charge. A CLEANLY
+        // completed stream ([`Self::mark_settled`]) folds only its proportional unpaid
+        // tail (`min(reserved, unpaid)`, `== 0` for a fully-paid small blob). An
+        // ABNORMAL exit — client disconnect, `?`, a voucher rejection, a mid-stream
+        // stop — folds the FULL `reserved`: the conservative, safe direction for a
+        // solvency guard. This is what bounds sequential abuse where a client aborts a
+        // cache-miss fill before any byte is delivered (`unpaid == 0`) yet the node has
+        // already fronted upstream USDC — without it the pool's budget would be
+        // restored in full and the pattern could repeat forever (ADR 003 §Pool solvency).
+        // All under the sync lock, all saturating — an O(1) update that never blocks
+        // the reactor.
+        let dead_add = if self.settled.load(Ordering::Relaxed) {
+            self.reserved
+                .min(U256::from(self.unpaid.load(Ordering::Relaxed)))
+        } else {
+            self.reserved
+        };
         let snapshot = {
             let mut guard = self
                 .map
@@ -2249,8 +2280,9 @@ mod tests {
                 live == Some(floor),
                 "live reservation is held while the guard lives"
             );
-            // Stream delivered a partial (unpaid) floor.
+            // Stream delivered a partial (unpaid) floor, then completed cleanly.
             res.note_unpaid(quarter);
+            res.mark_settled();
         } // drop → reconcile: live released, dead_charge = min(floor, unpaid) = floor/4
         let st = lock_floor(&map)?.get(&pool).copied().unwrap_or_default();
         anyhow::ensure!(
@@ -2259,7 +2291,7 @@ mod tests {
         );
         anyhow::ensure!(
             st.dead_charge == quarter,
-            "dead_charge folds in the unpaid tail (min of floor and unpaid)"
+            "a settled stream folds the proportional unpaid tail (min of floor and unpaid)"
         );
         let persisted = store
             .load_losses()
@@ -2269,6 +2301,35 @@ mod tests {
         anyhow::ensure!(
             persisted == Some(quarter.to::<u128>()),
             "the new dead total is persisted best-effort on drop"
+        );
+        Ok(())
+    }
+
+    /// An ABNORMAL exit — the guard drops without [`FloorReservation::mark_settled`],
+    /// as on a client disconnect or abort before delivery — folds the FULL `reserved`
+    /// into `dead_charge`, not the (here zero) unpaid tail. This is what bounds
+    /// sequential abuse where a cache-miss fill is aborted before any byte is
+    /// delivered yet the node already fronted upstream USDC (C3, ADR 003 §Pool solvency).
+    #[test]
+    fn floor_reservation_abnormal_exit_folds_full_reserved() -> anyhow::Result<()> {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pool = B256::repeat_byte(0x5B);
+        let floor = decdn_incentive::floor_micro(1000);
+        {
+            let res = FloorReservation::reserve(map.clone(), None, pool, floor);
+            // Aborted before delivering/paying anything: unpaid stays 0, and the guard
+            // is never marked settled.
+            res.note_unpaid(U256::ZERO);
+        } // drop → conservative: dead_charge = full reserved despite unpaid == 0
+        let st = lock_floor(&map)?.get(&pool).copied().unwrap_or_default();
+        anyhow::ensure!(
+            st.live_reservation == U256::ZERO,
+            "live reservation is released even on an abnormal exit"
+        );
+        anyhow::ensure!(
+            st.dead_charge == floor,
+            "an unsettled (abnormal) exit folds the full reserved floor, not the zero unpaid tail"
         );
         Ok(())
     }

@@ -393,7 +393,13 @@ impl ClientHandler {
 
         // Fully delivered and fully paid: signal clean completion. Every byte was
         // bao-verified into the cache by the pull leg's admit before this leg read
-        // it, so the served bytes are sound.
+        // it, so the served bytes are sound. Only reached on clean completion — every
+        // abnormal exit returns earlier — so mark the reservation settled, so its drop
+        // folds the proportional unpaid tail rather than the conservative full
+        // `reserved` (ADR 003 §Pool solvency).
+        if let Some(res) = floor_reservation {
+            res.mark_settled();
+        }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         Ok(())
