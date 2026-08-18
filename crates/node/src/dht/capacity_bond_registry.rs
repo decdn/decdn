@@ -11,9 +11,9 @@
 //! Bindings is gated on `cache.node_to_node_pull_through_enabled`: when
 //! pull-through is off, the bindings projection is not built at all. Regions
 //! and the operator reverse map are always built, regardless of pull-through —
-//! region byte-accounting and the ADR-030 selection penalty need the region
-//! map unconditionally, and the chain-backed origin directory needs the
-//! reverse map to resolve operators locally with no `nodeIdOf` RPC.
+//! the ADR-030 selection penalty needs the region map unconditionally, and the
+//! chain-backed origin directory needs the reverse map to resolve operators
+//! locally with no `nodeIdOf` RPC.
 //!
 //! # What actually differs between the projections
 //!
@@ -93,8 +93,8 @@ const PAGE_SIZE: u64 = 100;
 pub struct RegistryHandles {
     pub staker_set: Arc<dyn StakerSet>,
     pub node_addresses: Option<Arc<dyn NodeAddressResolver>>,
-    /// `NodeId → regionHint` (non-empty only). Feeds the region resolver behind
-    /// `RegionAccountant`. Always present, unlike `node_addresses`.
+    /// `NodeId → regionHint` (non-empty only). Read by the ADR-030 region-latency
+    /// penalty on the selection/pull path. Always present, unlike `node_addresses`.
     pub regions: Arc<RwLock<HashMap<NodeId, String>>>,
     /// `operator address → bound NodeId`, always built (like `regions`, unlike
     /// the pull-through-gated `bindings`) so the chain-backed origin directory
@@ -193,8 +193,8 @@ pub(crate) struct RegistrySink<R> {
     /// `None` when pull-through is off — see [`RegistryHandles::node_addresses`].
     pub(crate) bindings: Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
     /// `NodeId → regionHint`. Non-empty only; empty `regionHint` is absence.
-    /// Always built (not gated on pull-through): region byte-accounting and the
-    /// ADR-030 selection penalty read it whether or not node-to-node pull is on.
+    /// Always built (not gated on pull-through): the ADR-030 selection penalty
+    /// reads it whether or not node-to-node pull is on.
     pub(crate) regions: Arc<RwLock<HashMap<NodeId, String>>>,
     /// `operator address → bound NodeId`. Always built (not gated on
     /// pull-through, like `regions`) and unfiltered: an ejected or unbonding

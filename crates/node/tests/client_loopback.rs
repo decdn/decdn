@@ -57,7 +57,6 @@ use decdn_node::client_requester::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
-use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VOUCHER_INTERVAL_BYTES,
     VoucherRejectReason,
@@ -2408,120 +2407,6 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
             .await
             .contains_key(&lane_key(client_signer.address())),
         "an accepted voucher must advance the lane's last-voucher clock"
-    );
-
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
-    Ok(())
-}
-
-/// Wiring guard for per-region accounting (#750): a real signed-voucher accept
-/// through the live `ClientHandler` must record the served bytes against the
-/// resolving region. The `record_served` call site (`handlers/client.rs`) has
-/// no other test caller — a dropped or mis-placed call would silently leave
-/// every region at zero. We attach an accountant whose stub resolver maps the
-/// *client's* node id to "DE", drive one successful delivery, and assert "DE"
-/// now carries the delivered bytes as `bytes_out`.
-#[tokio::test(flavor = "multi_thread")]
-async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()> {
-    /// Stub resolver: client node id -> fixed region.
-    struct OneRegion {
-        node_id: [u8; 32],
-        region: String,
-    }
-    #[async_trait]
-    impl RegionResolver for OneRegion {
-        async fn region_of(&self, node_id: &[u8; 32]) -> Option<String> {
-            (node_id == &self.node_id).then(|| self.region.clone())
-        }
-    }
-
-    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB -> crosses a voucher interval
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-
-    let client_signer = Arc::new(PrivateKeySigner::random());
-    let deposit = U256::from(10_000_000u64);
-    let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&LaneState::hydrate(
-        pool_id(),
-        client_signer.address(),
-        operator_addr(),
-        deposit,
-        0,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-    ))?;
-
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-
-    // The client endpoint's key is what the handler sees as `client_node_id`.
-    let client_sk = fresh_key();
-    let client_id = client_sk.public();
-    let accountant = Arc::new(RegionAccountant::new(Arc::new(OneRegion {
-        node_id: *client_id.as_bytes(),
-        region: "DE".to_string(),
-    })));
-    let handler = build_handler_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store_dyn,
-        RATE_PER_MB,
-        |deps| deps.region_accountant = Some(Arc::clone(&accountant)),
-    )?;
-    assert!(
-        accountant.snapshot().is_empty(),
-        "no delivery yet -> no region buckets"
-    );
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
-
-    let got = stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth.address(),
-        *hash.as_bytes(),
-        0,
-        0x00c0_ffee,
-        Duration::from_secs(20),
-    )
-    .await?;
-    anyhow::ensure!(
-        got.as_ref() == payload.as_slice(),
-        "delivered bytes mismatch"
-    );
-
-    let snap = accountant.snapshot();
-    let de = snap
-        .iter()
-        .find(|r| r.region == "DE")
-        .ok_or_else(|| anyhow::anyhow!("expected a DE bucket, got {snap:?}"))?;
-    // ADR 038: metered quantity is bao wire bytes
-    let wire = support::bao_wire_len_whole(payload.len() as u64);
-    anyhow::ensure!(
-        de.bytes_out == wire,
-        "DE bytes_out = {}, expected {wire}",
-        de.bytes_out
-    );
-    anyhow::ensure!(de.bytes_in == 0, "bytes_in must stay 0 (no pull path)");
-    anyhow::ensure!(
-        snap.iter().all(|r| r.region != UNKNOWN_REGION),
-        "resolved client must not fall through to UNKNOWN"
     );
 
     shutdown([], [&client_ep, &server_ep]).await;

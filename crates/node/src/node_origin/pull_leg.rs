@@ -23,11 +23,11 @@
 //!   watermark (#852) on EVERY exit — including a mid-drive cancellation when the
 //!   serve leg finishes first and drops this future (client disconnect / shutdown).
 //!
-//! # Reputation, region accounting, watermark
+//! # Reputation, watermark
 //!
-//! The pull leg handles three concerns explicitly around the `drive`: the
-//! [`SettleOnDrop`] guard for #852, a post-drive `record_outcome` scoring the
-//! discovered provider, and `region_accountant.record_pulled` on the clean path.
+//! The pull leg handles two concerns explicitly around the `drive`: the
+//! [`SettleOnDrop`] guard for #852, and a post-drive `record_outcome` scoring
+//! the discovered provider on the clean path.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -107,8 +107,6 @@ pub(crate) struct PullLegTarget {
     ledger: Arc<PoolLedger>,
     /// The upstream-claimed content length, from the header handshake.
     pub(crate) total_bytes: u64,
-    /// The candidate's DHT id, for region accounting on the clean path.
-    node_id: [u8; 32],
     /// The served client's namespace, threaded onto the pull (ADR 005), big-endian.
     namespace_id: [u8; 32],
     /// The effective per-MB rate ceiling (lower of the probe rate and the config
@@ -163,7 +161,7 @@ impl PacingWait for ServedPaidWait {
 /// A boundary with no matching close is an OPEN-ENDED run `[a, ∞)`: a fully-present
 /// blob observes as `ChunkRanges{0..}` (a single unpaired boundary). Pairing `(a, b)`
 /// alone would drop that final run and undercount a complete blob to 0, skewing
-/// provider scoring and region accounting. Clamp the open end to `total`.
+/// provider scoring. Clamp the open end to `total`.
 fn content_len(ranges: &ChunkRanges, total: u64) -> u64 {
     let boundaries = ranges.boundaries();
     let mut it = boundaries.iter();
@@ -417,7 +415,6 @@ impl NodeOrigin {
             ctx: Arc::new(std::sync::Mutex::new(ctx)),
             ledger,
             total_bytes,
-            node_id: candidate.node_id,
             namespace_id: namespace_bytes,
             rate_ceiling,
             deadlines,
@@ -477,7 +474,6 @@ pub(crate) async fn run_pull_leg(
         ctx,
         ledger,
         total_bytes,
-        node_id,
         namespace_id,
         rate_ceiling,
         deadlines,
@@ -621,10 +617,10 @@ pub(crate) async fn run_pull_leg(
         tokio::time::sleep(ABANDON_DRAIN).await;
     }
 
-    // Reputation + region accounting, skipped on cancel — an abandoned pull is
-    // neither a clean delivery nor a provider fault. A ramp `Wait` never reaches
-    // here as a terminal state: `drive` only returns once the fetch completes,
-    // errors, or is cancelled, so a pacer pause is not a fault to skip scoring for.
+    // Reputation scoring, skipped on cancel — an abandoned pull is neither a
+    // clean delivery nor a provider fault. A ramp `Wait` never reaches here as a
+    // terminal state: `drive` only returns once the fetch completes, errors, or
+    // is cancelled, so a pacer pause is not a fault to skip scoring for.
     if !cancelled {
         match &result {
             Ok(()) => {
@@ -636,9 +632,6 @@ pub(crate) async fn run_pull_leg(
                         elapsed,
                     },
                 );
-                deps.region_accountant
-                    .record_pulled(&node_id, gap_bytes)
-                    .await;
             }
             Err(err) => {
                 if is_bao_corruption(err) {
@@ -747,10 +740,10 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// - **No discovery / channel open / [`PeerSource`] / [`NodeFunder`].** The bytes
 ///   are already reachable locally, so there is nothing to dial, no channel to open,
 ///   and nothing to pay. The source is handed in by the orchestration, already built.
-/// - **No provider scoring, no region accounting.** There is no provider and no
-///   remote region: a fault here is OUR own origin, never a peer to score or a
-///   region to credit. On a [`drive`] error we meter it as a LOCAL fault
-///   ([`crate::metrics::Metrics::node_pull_local_fault`]) and NEVER touch reputation.
+/// - **No provider scoring.** There is no provider: a fault here is OUR own
+///   origin, never a peer to score. On a [`drive`] error we meter it as a LOCAL
+///   fault ([`crate::metrics::Metrics::node_pull_local_fault`]) and NEVER touch
+///   reputation.
 /// - **No [`SettleOnDrop`].** That guard persists a BUYER voucher watermark (#852);
 ///   this leg issues no vouchers, so there is nothing to settle.
 ///

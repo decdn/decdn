@@ -34,7 +34,6 @@ pub mod rate_bounds;
 pub mod rate_bounds_watcher;
 pub mod rate_limit;
 pub mod receipt_log;
-pub mod region_accounting;
 pub mod runtime;
 pub mod selection;
 pub mod slash_watcher;

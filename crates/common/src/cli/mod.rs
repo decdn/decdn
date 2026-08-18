@@ -30,8 +30,8 @@ pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs, LookupArgs,
-    NodeArgs, NodeCommand, RegionStatsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs,
-    RotateKeyTarget, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
+    NodeArgs, NodeCommand, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget, StatusArgs,
+    SwapVenueArg, TopArgs, UnbondArgs,
 };
 pub use pool::{
     PoolArgs, PoolAssignArgs, PoolChainArgs, PoolCloseArgs, PoolCommand, PoolListArgs,

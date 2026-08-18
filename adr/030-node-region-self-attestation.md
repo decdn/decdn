@@ -6,10 +6,9 @@
 
 ## Context
 
-Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration as `regionHint` on `CapacityBond` (see [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata)). The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map. The declared region is load-bearing in three places:
+Each node declares a region — an ISO 3166-1 alpha-2 country code — at registration as `regionHint` on `CapacityBond` (see [ADR 001 § Node Region Metadata](001-network.md#node-region-metadata)). The `CapacityBond` registry watcher resolves the active set into a `NodeId → region` map. The declared region is load-bearing in two places:
 
 - **Regional blacklist enforcement.** A node applies only blacklist entries that are global or match its declared region ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)), and is slashable only for serving a hash blacklisted in its declared scope ([ADR 011 § Slashing](011-content-takedown.md#slashing)).
-- **Region byte-accounting.** Served-byte accounting aggregates delivery by the node's declared region, read from the same registry-resolved `NodeId → region` map.
 - **Peer-selection penalty.** A client applies the RTT-vs-claim reputation penalty against a node whose measured latency contradicts its declared region ([ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm), implemented in `crates/node/src/selection.rs`).
 
 Three ADRs ([001 § Consequences](001-network.md#consequences), [011 § Regional Scope](011-content-takedown.md#regional-scope), [019 § Deferred & Open](019-node-onboarding.md#deferred--open)) name "a decentralized oracle or third-party attestation service" as the production mitigation against region misreporting, but specify no design — oracle choice, IP→region resolution, mismatch handling, slashing implications, and operator UX are all open. This gap is production-blocking: without a decision, regional compliance under [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) is structurally fragile, and the reactive blacklist-scope flip ([ADR 011 § Regional Scope](011-content-takedown.md#regional-scope)) remains open.
