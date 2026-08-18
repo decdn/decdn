@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::state::AppState;
 
-use super::{err_json, parse_client};
+use super::{err_json, now_unix, parse_client};
 
 #[derive(Debug, Deserialize)]
 pub struct CapabilityQuery {
@@ -24,6 +24,10 @@ pub async fn get(State(state): State<AppState>, Query(q): Query<CapabilityQuery>
         Err(resp) => return *resp,
     };
     match state.store.get_grant(client) {
+        // An expired grant is treated as absent so the polling wrapper
+        // re-triggers the browser fund flow instead of latching onto a
+        // token it can never redeem.
+        Ok(Some(rec)) if now_unix() >= rec.expiry => StatusCode::NO_CONTENT.into_response(),
         Ok(Some(rec)) => Json(json!({ "token": rec.token })).into_response(),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),

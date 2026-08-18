@@ -55,14 +55,28 @@ pub async fn submit(State(state): State<AppState>, Json(req): Json<FundRequest>)
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 
-    // Idempotent: a signer that already holds a capability gets the same token.
+    let now = now_unix();
+
+    // Idempotent: a signer that already holds a still-valid capability gets
+    // the same token back. If the stored grant has expired, fall through
+    // and re-issue — an un-redeemed capability is not frozen on-chain, so
+    // this is safe, and it's the only way a signer who never fetched within
+    // the TTL can get unstuck (`/fund` and `/capability` would otherwise
+    // keep handing back a token the wrapper can never use again).
+    //
+    // Note: two concurrent `POST /fund` for the same signer can both miss
+    // this lookup and both sign below. That's benign — both tokens are
+    // validly signed for the same signer+pool, `put_grant` is
+    // last-writer-wins, and the client just reads back whatever
+    // `GET /capability` returns.
     match state.store.get_grant(client) {
-        Ok(Some(rec)) => return Json(json!({ "token": rec.token })).into_response(),
-        Ok(None) => {}
+        Ok(Some(rec)) if now < rec.expiry => {
+            return Json(json!({ "token": rec.token })).into_response();
+        }
+        Ok(_) => {}
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 
-    let now = now_unix();
     let (token, expiry) = match state.issuer.issue(client, now) {
         Ok(v) => v,
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),

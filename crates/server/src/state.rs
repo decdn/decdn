@@ -29,15 +29,16 @@ pub async fn build(cfg: ServerConfig) -> anyhow::Result<AppState> {
     let issuer = Arc::new(cfg.build_issuer(signer.clone()));
     let treasury: Arc<dyn Treasury> = Arc::from(cfg.build_treasury(signer).await?);
 
-    // Boot check: the hot wallet must own the configured pool, else every
-    // capability we sign is worthless (the node recovers a non-owner).
+    // Boot check: the capability-signing key (issuer) must own the
+    // configured pool, else every capability we sign is worthless (the node
+    // recovers a non-owner).
     let owner = treasury.pool_owner(cfg.pool_id).await?;
     anyhow::ensure!(
-        owner == treasury.owner_address(),
-        "configured SPONSOR_POOL_ID {} is owned on-chain by {owner}, not the treasury wallet {} \
-         — wrong pool id, keystore, or contract",
+        owner == issuer.owner_address(),
+        "configured SPONSOR_POOL_ID {} is owned on-chain by {owner}, not the capability-signing \
+         wallet {} — wrong pool id, keystore, or contract",
         cfg.pool_id,
-        treasury.owner_address()
+        issuer.owner_address()
     );
 
     Ok(AppState {

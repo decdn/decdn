@@ -166,6 +166,59 @@ async fn fund_page_embeds_sitekey_and_client_and_rejects_non_hex() {
 }
 
 #[tokio::test]
+async fn expired_grant_is_treated_as_absent_and_reissued() {
+    use alloy::primitives::Address;
+    use sponsord::money::MicroUsdc;
+    use sponsord::store::GrantRecord;
+    use std::str::FromStr;
+
+    let state = test_support::app_state_with_fakes();
+
+    // Pre-seed the store with an already-expired grant (fixed past unix
+    // timestamp), bypassing the issuer entirely.
+    let signer = Address::from_str(CLIENT).expect("addr");
+    let stale = GrantRecord {
+        spending_cap: MicroUsdc(10_000_000).0,
+        expiry: 1_000_000,
+        issued_unix: 0,
+        token: "dcap1:STALE".to_string(),
+    };
+    state.store.put_grant(signer, &stale).expect("seed grant");
+
+    let app = sponsord::http::router(state);
+
+    // GET /capability treats the expired grant as absent.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/capability?client={CLIENT}"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // POST /fund re-issues a fresh token rather than returning the stale one.
+    let resp = app
+        .oneshot(
+            Request::post("/fund")
+                .header("content-type", "application/json")
+                .body(Body::from(fund_body()))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let token = json_body(resp).await["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+    assert_ne!(token, "dcap1:STALE");
+    assert!(token.starts_with("dcap1:"));
+}
+
+#[tokio::test]
 async fn decdn_sh_templated_with_payment_pool() {
     let state = test_support::app_state_with_fakes();
     let app = sponsord::http::router(state);

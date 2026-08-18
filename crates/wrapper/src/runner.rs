@@ -71,9 +71,10 @@ pub struct FetchArgs {
     /// `--payment-pool-address`: `PaymentPool` contract address backing the
     /// capability.
     pub payment_pool_address: String,
-    /// `--capacity-bond-address`: `CapacityBond` contract address. Unused on
-    /// this explicit-node path but accepted so callers can pass through the
-    /// same chain-coordinate bundle used elsewhere.
+    /// `--capacity-bond-address`: `CapacityBond` contract address. Used by
+    /// node auto-discovery under `--capability`: the fetch has no explicit
+    /// node argument, so it reads `CapacityBond` to find nodes to fetch
+    /// from.
     pub capacity_bond_address: Option<String>,
     /// `--slash-judge-address`: `SlashJudge` contract address.
     pub slash_judge_address: Option<String>,
