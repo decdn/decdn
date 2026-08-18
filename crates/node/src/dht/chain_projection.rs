@@ -33,7 +33,7 @@ use crate::chain_events::resumable_watcher::WatcherHandle;
 /// propagate a panic into the read hot path. Log on the recovery arm so the
 /// original panic surfaces somewhere, matching the precedent in
 /// `cache/src/engine.rs`.
-pub(super) fn with_read<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&T) -> R) -> R {
+pub(crate) fn with_read<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&T) -> R) -> R {
     match state.read() {
         Ok(guard) => f(&guard),
         Err(poisoned) => {
