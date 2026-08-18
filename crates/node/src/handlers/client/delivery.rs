@@ -319,15 +319,13 @@ impl ClientHandler {
             // µUSDC, so every byte quantity crosses over through `min_payment` —
             // the two units are never compared directly.
             if let Some(res) = floor_reservation.as_ref() {
-                // Once cumulative payment covers one voucher interval the reserved
-                // floor is repaid: free the pool's live reservation now, since
-                // everything above the floor is self-funded (bounded by the credit
-                // window). `floor_micro(rate) == min_payment(VOUCHER_INTERVAL_BYTES,
-                // rate)`, so `paid >= VOUCHER_INTERVAL_BYTES` is exactly "one floor
-                // repaid" expressed in bytes.
-                if paid >= VOUCHER_INTERVAL_BYTES {
-                    res.release_live_repaid();
-                }
+                // Free the pool's live reservation once cumulative payment reaches the
+                // amount that was reserved (the ramp-floor credit this stream fronts).
+                // Everything above it is self-funded. Matching release to the reserved
+                // µUSDC keeps it correct at any `credit_ramp_divisor` — with the ramp
+                // disabled the reservation is the full `credit_max`, so release waits
+                // for that much paid, not a single interval.
+                res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
                 // Keep the drop-time reconcile honest with the CURRENT unpaid
                 // balance: on an un-repaid stream `Drop` folds `min(reserved, this)`
                 // (the span-capped reservation) into `dead_charge`. A fully-settled

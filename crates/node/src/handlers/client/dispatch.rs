@@ -508,17 +508,17 @@ impl ClientHandler {
                 if known_lane.is_some()
                     && let Some(status) = pool_status
                 {
-                    // The reservation is one voucher-interval FLOOR (the un-self-funded
-                    // credit), span-capped for a bounded request — NOT the ramp window.
-                    // `release_live_repaid` frees it once cumulative payment reaches one
-                    // interval, so sizing it at `VOUCHER_INTERVAL_BYTES` keeps release
-                    // matched to what was reserved even at `credit_ramp_divisor == 0`,
-                    // where `credit_window(interval, 0)` would return the full `credit_max`.
+                    // Reserve the un-self-funded credit this stream fronts before it
+                    // pays: the ramp floor at `paid = 0` (one interval normally, the
+                    // full `credit_max` when `credit_ramp_divisor == 0`), span-capped
+                    // for a bounded request. `release_live_repaid` frees it once
+                    // cumulative payment REACHES this reserved amount (see the serve
+                    // loop), so release stays matched to what was reserved at any divisor.
+                    let window = self.credit_window(VOUCHER_INTERVAL_BYTES, 0);
                     let reserved_bytes = if req.byte_len > 0 {
-                        aligned_span(req.byte_offset, req.byte_len, u64::MAX)
-                            .min(VOUCHER_INTERVAL_BYTES)
+                        aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
-                        VOUCHER_INTERVAL_BYTES
+                        window
                     };
                     let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
                     let pool_id = B256::from(req.pool_id);
@@ -909,11 +909,12 @@ impl ClientHandler {
         // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
         // `InsufficientDeposit` when the pool can no longer cover the span-capped
         // floor.
-        // Span-cap the reservation at one voucher-interval FLOOR (not the ramp
-        // window), so `release_live_repaid` at one interval matches the reserved
-        // amount even at `credit_ramp_divisor == 0`.
-        let guard_bytes =
-            aligned_span(req.byte_offset, req.byte_len, total_bytes).min(VOUCHER_INTERVAL_BYTES);
+        // Reserve the ramp-floor credit exposure (`credit_window` at `paid = 0`),
+        // span-capped by the request. `release_live_repaid` frees it once payment
+        // reaches this reserved amount, so release matches reserved at any divisor.
+        let interval_bytes = VOUCHER_INTERVAL_BYTES;
+        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
+            .min(self.credit_window(interval_bytes, 0));
         if let Some(status) = pool_status {
             let refused = if floor_reservation.is_none() {
                 let reserved = decdn_incentive::min_payment(guard_bytes, rate_per_mb);

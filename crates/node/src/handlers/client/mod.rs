@@ -290,6 +290,17 @@ impl FloorReservation {
         let entry = guard.entry(self.pool_id).or_default();
         entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
     }
+
+    /// Release the live reservation once cumulative payment (`paid_micro`) reaches
+    /// the amount that was reserved. Matches release to the reserved size at any
+    /// `credit_ramp_divisor`: with the ramp disabled the reservation is the full
+    /// `credit_max`, so release must wait for that much to be paid rather than a
+    /// single voucher interval. Idempotent (delegates to [`Self::release_live_repaid`]).
+    fn release_if_repaid(&self, paid_micro: U256) {
+        if paid_micro >= self.reserved {
+            self.release_live_repaid();
+        }
+    }
 }
 
 impl Drop for FloorReservation {
@@ -2384,11 +2395,17 @@ mod tests {
             handler.try_reserve_floor(pool, floor, floor).is_none(),
             "a second reserve over the same budget is refused"
         );
-        // Dropping the first guard frees its live reservation, reopening the budget.
+        // A CLEANLY completed stream (marked settled, nothing unpaid) frees its live
+        // reservation on drop and folds no dead charge, reopening the budget. (An
+        // abnormal exit would instead fold the full reserved into `dead_charge` and
+        // keep the budget spent — see `floor_reservation_abnormal_exit_folds_full_reserved`.)
+        if let Some(g) = first.as_ref() {
+            g.mark_settled();
+        }
         drop(first);
         anyhow::ensure!(
             handler.try_reserve_floor(pool, floor, floor).is_some(),
-            "budget reopens once the live reservation is released"
+            "budget reopens once a cleanly-settled reservation is released"
         );
         Ok(())
     }
