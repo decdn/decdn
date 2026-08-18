@@ -2318,7 +2318,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wiring guard for `decdn node channels` (issue #1733): a real signed-voucher
+/// Wiring guard for `decdn node lanes` (issue #1733): a real signed-voucher
 /// accept through the live `ClientHandler` must advance the last-voucher clock
 /// the admin surface reads off the lane registry.
 ///
