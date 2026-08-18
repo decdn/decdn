@@ -1001,8 +1001,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         buyer_store_dyn,
         Arc::clone(&buyer_signer),
         voucher_dom.clone(),
-        U256::from(DEPOSIT_MICRO_USDC), // initial_deposit
-        U256::from(DEPOSIT_MICRO_USDC), // working_deposit (graduation not under test here)
+        U256::from(DEPOSIT_MICRO_USDC), // working_deposit
         true, // fresh buyer identity → issue the one-time max USDC approval
         Arc::new(Metrics::new()),
     )
@@ -1013,7 +1012,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // buyer's self-issued capability; attach an ownership binding so the serve
     // gate registers the lane.
     let buyer_ctx = buyer_service
-        .open_or_reuse_pool(node_addr, U256::from(DEPOSIT_MICRO_USDC), OPEN_BUDGET)
+        .open_or_reuse_pool(node_addr, OPEN_BUDGET)
         .await?;
     let buyer_pool_id = buyer_ctx.pool_id;
     let on_chain = buyer_pool.getPool(buyer_pool_id).call().await?;

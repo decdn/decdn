@@ -165,15 +165,10 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// Deposit (`µUSDC`) to escrow when OPENING a new pool (ignored on reuse).
-    /// Overrides `blockchain.buyer_initial_deposit_micro_usdc`; default 0.5 USDC.
-    /// Escrowed as configured (no on-chain floor; only a non-zero requirement).
-    #[arg(long, value_name = "MICRO_USDC")]
-    pub initial_deposit_micro_usdc: Option<u64>,
-
-    /// Deposit (`µUSDC`) each top-up refills the pool toward once it has served
-    /// verified bytes. Overrides `blockchain.buyer_working_deposit_micro_usdc`;
-    /// default 10 USDC. `0` disables top-up.
+    /// Deposit (`µUSDC`) to escrow when OPENING a pool, and the target each
+    /// top-up refills the pool toward once it has served verified bytes.
+    /// Overrides `blockchain.buyer_working_deposit_micro_usdc`; default
+    /// 10 USDC. Must be nonzero (openPool reverts on a zero deposit).
     #[arg(long, value_name = "MICRO_USDC")]
     pub working_deposit_micro_usdc: Option<u64>,
 

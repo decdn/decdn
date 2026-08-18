@@ -1013,9 +1013,9 @@ pub struct DecdnMetrics {
     /// resumed at the paid frontier.
     ///
     /// Expected to be RARE once `buyer_working_deposit_micro_usdc` is sized for the
-    /// blobs this node pulls — the proactive low-water refill should graduate a
+    /// blobs this node pulls — the proactive low-water refill should refill a
     /// channel long before a single pull outruns it. A sustained rate means the
-    /// initial deposit is too small for the blob sizes in play, and every tick is a
+    /// working deposit is too small for the blob sizes in play, and every tick is a
     /// transaction plus a settlement wait a client sat through.
     ///
     /// Distinct from `decdn_buyer_topup_ok_total`, which counts on-chain top-ups from

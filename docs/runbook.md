@@ -413,10 +413,10 @@ apart — this is why the log line exists:
 
 A third, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
-rate, in which case this node is the one being refused. (Note the node opens
-node-to-node channels at the smaller `buyer_initial_deposit_micro_usdc` by design
-and graduates them to the working target on reuse, so a first-contact channel
-running short is expected, not a misconfiguration — see
+rate, in which case this node is the one being refused. (The node opens
+node-to-node channels at the working deposit and the proactive low-water refill
+tops them back up on reuse, so a channel that runs short mid-pull reactively
+tops up — see
 [ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics).) Look for
 `decdn_node_pull_refused_unattributable_total` climbing toward
 `decdn_node_pull_refused_total` instead.

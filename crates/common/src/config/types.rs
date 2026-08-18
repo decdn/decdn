@@ -213,23 +213,18 @@ pub struct BlockchainConfig {
     /// config resolution.
     pub redeem_interval_secs: Option<u64>,
     /// Deposit (base units, `µUSDC`) the buyer path escrows when it **opens** a
-    /// new payment pool against a provider (the first-contact lock). Kept
-    /// small so an untried node holds little of the buyer's capital on first
-    /// contact. Absent => default (0.5 USDC = `500_000`).
-    /// Escrowed as configured at open time (no on-chain floor; only a
-    /// non-zero requirement).
-    pub buyer_initial_deposit_micro_usdc: Option<u64>,
-    /// Deposit (base units, `µUSDC`) every top-up refills the pool balance
-    /// toward once it is reused or runs short mid-transfer. Both refill legs
-    /// target this: the proactive low-water refill, which both binaries run on
-    /// pool reuse, and the reactive mid-transfer top-up, which the `decdn fetch`
+    /// payment pool, and the target every top-up refills the pool balance
+    /// toward once it is reused or runs short mid-transfer. The shared pool is
+    /// fully withdrawable, so the buyer opens at this amount directly rather
+    /// than escrowing a smaller first-contact lock. Both refill legs target
+    /// it: the proactive low-water refill, which both binaries run on pool
+    /// reuse, and the reactive mid-transfer top-up, which the `decdn fetch`
     /// streaming path and the daemon's node-to-node cache-miss pull both run
     /// (#1530). `decdn bundle pull` is the one remaining fetch path with the
-    /// proactive leg only. Larger values amortize gas
-    /// across more delivery at the cost of more capital locked. Absent =>
-    /// default (10 USDC = `10_000_000`). `0` disables top-up entirely (a
-    /// spent-down deposit errors instead of refilling). Must be
-    /// `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    /// proactive leg only. Larger values amortize gas across more delivery at
+    /// the cost of more capital locked. Absent => default (10 USDC =
+    /// `10_000_000`). Must be nonzero (the pool's `openPool` reverts on a zero
+    /// deposit).
     pub buyer_working_deposit_micro_usdc: Option<u64>,
     /// Whether to issue an unlimited (max) USDC approval for the
     /// `PaymentPool` contract so the buyer path can join a pool (#744).

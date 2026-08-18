@@ -203,11 +203,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  buyer_initial_deposit_micro_usdc: {}",
-        resolved.blockchain.buyer_initial_deposit_micro_usdc
-    )?;
-    writeln!(
-        w,
         "  buyer_working_deposit_micro_usdc: {}",
         resolved.blockchain.buyer_working_deposit_micro_usdc
     )?;
@@ -572,8 +567,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
-# buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a pool (first-contact lock); default 0.5 USDC
-# buyer_working_deposit_micro_usdc = 10000000    # refill target on reuse or mid-transfer shortfall; 0 disables top-up; default 10 USDC
+# buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
 # CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
@@ -803,7 +797,6 @@ mod tests {
             redeem_threshold_micro_usdc,
             redeem_max_vouchers_per_tx,
             redeem_interval_secs,
-            buyer_initial_deposit_micro_usdc,
             buyer_working_deposit_micro_usdc,
             buyer_max_approve,
             pool_min_remaining_deposit_micro_usdc,
@@ -857,10 +850,6 @@ mod tests {
                 redeem_max_vouchers_per_tx.is_none(),
             ),
             ("redeem_interval_secs =", redeem_interval_secs.is_none()),
-            (
-                "buyer_initial_deposit_micro_usdc =",
-                buyer_initial_deposit_micro_usdc.is_none(),
-            ),
             (
                 "buyer_working_deposit_micro_usdc =",
                 buyer_working_deposit_micro_usdc.is_none(),

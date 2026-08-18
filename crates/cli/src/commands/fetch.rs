@@ -141,10 +141,8 @@ pub(crate) struct ResolvedChain {
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
     pub(crate) region: Option<String>,
-    /// Deposit to escrow when OPENING a new pool (ignored on reuse).
-    pub(crate) initial_deposit: U256,
-    /// Deposit a reused pool's proactive refill targets once it has served
-    /// verified bytes. `0` disables top-up.
+    /// Deposit to escrow when OPENING a pool, and the target a reused pool's
+    /// proactive refill restores toward once it has served verified bytes.
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
 }
@@ -227,35 +225,23 @@ pub(crate) fn resolve_chain(
             |p| expand_tilde(&p),
         );
 
-    // The two deposit knobs carry the same invariants the daemon resolver
-    // (`resolve_blockchain_into`) enforces, and they must be checked HERE too: this
+    // The deposit knob carries the same invariant the daemon resolver
+    // (`resolve_blockchain_into`) enforces, and it must be checked HERE too: this
     // path resolves the raw `[blockchain]` table plus the CLI flags without going
-    // through that resolver, so without these the client would accept a config file
-    // `decdn config validate` rejects, and `--initial-deposit-micro-usdc 0` would
+    // through that resolver, so without this the client would accept a config file
+    // `decdn config validate` rejects, and `--working-deposit-micro-usdc 0` would
     // surface as an opaque `openPool` `ZeroAmount` revert instead of a load-time
     // message. Keep the wording in step with `resolve_blockchain_into`.
-    let initial_deposit_micro_usdc = args
-        .initial_deposit_micro_usdc
-        .or_else(|| bc.and_then(|b| b.buyer_initial_deposit_micro_usdc))
-        .unwrap_or(decdn_common::config::DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
-    anyhow::ensure!(
-        initial_deposit_micro_usdc > 0,
-        "buyer_initial_deposit_micro_usdc must be > 0 (openPool reverts ZeroAmount on a \
-         zero deposit) — set --initial-deposit-micro-usdc or \
-         blockchain.buyer_initial_deposit_micro_usdc"
-    );
     let working_deposit_micro_usdc = args
         .working_deposit_micro_usdc
         .or_else(|| bc.and_then(|b| b.buyer_working_deposit_micro_usdc))
         .unwrap_or(decdn_common::config::DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC);
     anyhow::ensure!(
-        working_deposit_micro_usdc == 0 || working_deposit_micro_usdc >= initial_deposit_micro_usdc,
-        "buyer_working_deposit_micro_usdc must be 0 (disable top-up) or >= \
-         buyer_initial_deposit_micro_usdc (the refill target cannot be smaller than the \
-         initial open deposit) — got {working_deposit_micro_usdc} vs \
-         {initial_deposit_micro_usdc}"
+        working_deposit_micro_usdc > 0,
+        "buyer_working_deposit_micro_usdc must be > 0 (openPool reverts ZeroAmount on a \
+         zero deposit) — set --working-deposit-micro-usdc or \
+         blockchain.buyer_working_deposit_micro_usdc"
     );
-    let initial_deposit = U256::from(initial_deposit_micro_usdc);
     let working_deposit = U256::from(working_deposit_micro_usdc);
     // Client default: exact (deposit-sized) USDC approval, not an unlimited
     // standing allowance. `buyer_max_approve = true` opts a power user back into
@@ -271,7 +257,6 @@ pub(crate) fn resolve_chain(
         keystore,
         data_dir,
         region,
-        initial_deposit,
         working_deposit,
         max_approve,
     })
@@ -1378,7 +1363,6 @@ where
         provider,
         self_address,
         chain.payment_pool,
-        chain.initial_deposit,
         chain.working_deposit,
         chain.max_approve,
     )
@@ -1520,7 +1504,6 @@ pub(crate) async fn open_or_reuse_pool<P>(
     provider: Address,
     self_address: Address,
     payment_pool_addr: Address,
-    initial_deposit: U256,
     working_deposit: U256,
     max_approve: bool,
 ) -> anyhow::Result<PoolContext>
@@ -1539,13 +1522,8 @@ where
 
         // Auto-refill a live pool whose remaining deposit has run low, so a
         // sustained series of fetches isn't stranded by a spent-down deposit.
-        // `working_deposit == 0` disables top-up: leave the pool as-is.
-        let additional = if working_deposit.is_zero() {
-            U256::ZERO
-        } else {
-            let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
-            refill_amount(state.deposit, prior_amount, working_deposit, low_water)
-        };
+        let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
+        let additional = refill_amount(state.deposit, prior_amount, working_deposit, low_water);
         let state = if additional.is_zero() {
             state
         } else {
@@ -1610,8 +1588,10 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
     // Escrowed as configured — there is no on-chain floor to clamp up to,
-    // only a non-zero requirement (`openPool` reverts `ZeroAmount`).
-    let deposit = initial_deposit;
+    // only a non-zero requirement (`openPool` reverts `ZeroAmount`). The shared
+    // pool is fully withdrawable, so the buyer opens at the working deposit
+    // directly rather than a smaller first-contact lock.
+    let deposit = working_deposit;
     // `max_approve` opts into an unlimited standing allowance; otherwise approve
     // exactly the deposit being escrowed.
     let approve_amount = if max_approve { None } else { Some(deposit) };
@@ -1677,7 +1657,6 @@ mod tests {
             chain_id: None,
             keystore: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
-            initial_deposit_micro_usdc: None,
             working_deposit_micro_usdc: None,
             max_blob_mb: 1024,
             max_rate_per_mb: 0,
@@ -2019,13 +1998,12 @@ mod tests {
     #[test]
     fn config_fills_unset_flags_and_defaults() {
         let file = config(
-            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_initial_deposit_micro_usdc = 500000\nbuyer_working_deposit_micro_usdc = 5000000\n",
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
         );
         let r = resolve_chain(&common(), &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");
         // chain_id absent everywhere → default.
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
-        assert_eq!(r.initial_deposit, U256::from(500_000u64));
         assert_eq!(r.working_deposit, U256::from(5_000_000u64));
         // keystore defaults under the data dir.
         assert_eq!(
@@ -2034,52 +2012,27 @@ mod tests {
         );
     }
 
-    /// `resolve_chain` must enforce the same two deposit invariants the daemon
+    /// `resolve_chain` must enforce the same deposit invariant the daemon
     /// resolver does. It reads the raw `[blockchain]` table plus the
     /// CLI flags rather than going through `resolve_blockchain_into`, so without
-    /// its own checks `decdn fetch` would accept a config file that
+    /// its own check `decdn fetch` would accept a config file that
     /// `decdn config validate` rejects — a validator that does not validate what
-    /// actually runs — and `--initial-deposit-micro-usdc 0` would reach the chain
+    /// actually runs — and `--working-deposit-micro-usdc 0` would reach the chain
     /// and surface as an opaque `openPool` `ZeroAmount` revert.
     #[test]
     fn resolve_chain_rejects_deposits_the_daemon_resolver_would_reject() {
         let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_pool_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
 
-        // A zero initial deposit can never open a pool.
+        // A zero working deposit can never open a pool.
         let err = resolve_chain(
             &common(),
-            &config(&format!("{base}buyer_initial_deposit_micro_usdc = 0\n")),
+            &config(&format!("{base}buyer_working_deposit_micro_usdc = 0\n")),
         )
-        .expect_err("a zero initial deposit must be refused at resolve time");
-        assert!(
-            err.to_string().contains("buyer_initial_deposit_micro_usdc"),
-            "the error must name the offending field; got: {err}"
-        );
-
-        // A nonzero working target below the initial open size would make the very
-        // first refill shrink the pool.
-        let err = resolve_chain(
-            &common(),
-            &config(&format!(
-                "{base}buyer_initial_deposit_micro_usdc = 10000000\nbuyer_working_deposit_micro_usdc = 1000000\n"
-            )),
-        )
-        .expect_err("a working target below the initial deposit must be refused");
+        .expect_err("a zero working deposit must be refused at resolve time");
         assert!(
             err.to_string().contains("buyer_working_deposit_micro_usdc"),
             "the error must name the offending field; got: {err}"
         );
-
-        // `0` is the explicit disable sentinel, not a too-small target: it must
-        // still resolve however large the initial deposit is.
-        let r = resolve_chain(
-            &common(),
-            &config(&format!(
-                "{base}buyer_initial_deposit_micro_usdc = 10000000\nbuyer_working_deposit_micro_usdc = 0\n"
-            )),
-        )
-        .expect("0 disables top-up and must not be rejected as too small");
-        assert_eq!(r.working_deposit, U256::ZERO);
     }
 
     #[test]
