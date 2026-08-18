@@ -241,7 +241,17 @@ async fn run() -> anyhow::Result<()> {
 // the top-up).
 
 const INITIAL_DEPOSIT_MICRO_USDC: u64 = 1_000_000; // 1 USDC initial deposit
-const WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC — plenty to finish the blob
+// The working target must clear the node's #1697 concurrent-lane admission gate
+// even while a prior fetch attempt's QUIC stream still lingers as one active
+// same-lane stream. That gate reserves `credit_window(VOUCHER_INTERVAL_BYTES) *
+// (n_active + 1)` and refuses unless `remaining − M` covers it. With one lingering
+// stream (`n_active == 1`) at `HIGH_RATE_PER_MB` the reserve is
+// `2 * 4 MiB * 2 USDC/MB = 16 USDC`, and `M` defaults to 1 USDC, so the topped-up
+// deposit must clear `16 + 1 = 17 USDC` for the retry to be admitted rather than
+// stranded until the stale stream drains (which slips past the retry deadline
+// under CI load). 20 USDC clears it with room to spare while staying well above
+// the blob's ~4 USDC total cost.
+const WORKING_DEPOSIT_MICRO_USDC: u64 = 20_000_000; // 20 USDC — clears the 2× concurrent-lane gate
 const HIGH_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB — exceeds the initial deposit in <1 MB
 const TOPUP_KEYSTORE_PASSWORD: &str = "topup-e2e-password";
 
