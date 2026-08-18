@@ -17,11 +17,12 @@
 //! hash gates still protect revenue and compliance.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use arc_swap::ArcSwap;
 use decdn_incentive::payment_pool::PaymentPool;
 
 /// The per-pool chain quantities the serve gates read.
@@ -59,7 +60,11 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
 pub struct ChainPoolView<P: Provider + Clone + 'static> {
     contract: PaymentPool::PaymentPoolInstance<P>,
     ttl: Duration,
-    cache: Mutex<HashMap<B256, (Instant, PoolStatus)>>,
+    /// The TTL cache, published as a whole map through [`ArcSwap`] so the
+    /// per-voucher-boundary read (`cached`) is a single atomic load — no store,
+    /// no read-modify-write — and never contends with a concurrent reader. The
+    /// TTL refresh (`store`) is the only writer and clones-then-publishes.
+    cache: ArcSwap<HashMap<B256, (Instant, PoolStatus)>>,
 }
 
 impl<P: Provider + Clone + 'static> std::fmt::Debug for ChainPoolView<P> {
@@ -77,25 +82,25 @@ impl<P: Provider + Clone + 'static> ChainPoolView<P> {
         Self {
             contract: PaymentPool::new(payment_pool_addr, provider),
             ttl,
-            cache: Mutex::new(HashMap::new()),
+            cache: ArcSwap::from(Arc::new(HashMap::new())),
         }
     }
 
     fn cached(&self, pool_id: B256) -> Option<PoolStatus> {
-        let guard = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
+        self.cache
+            .load()
             .get(&pool_id)
             .and_then(|(at, status)| (at.elapsed() < self.ttl).then_some(*status))
     }
 
+    /// Publish an updated entry. Read-modify-write, because [`ArcSwap`] has no
+    /// in-place mutation: clone the current map, insert, and swap the new map in.
+    /// Writes are rare (one per pool per TTL) so the clone is irrelevant next to
+    /// keeping the per-voucher-boundary read a lock-free atomic load.
     fn store(&self, pool_id: B256, status: PoolStatus) {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(pool_id, (Instant::now(), status));
+        let mut next = HashMap::clone(&self.cache.load());
+        next.insert(pool_id, (Instant::now(), status));
+        self.cache.store(Arc::new(next));
     }
 }
 
@@ -130,5 +135,82 @@ impl<P: Provider + Clone + 'static> PoolView for ChainPoolView<P> {
         };
         self.store(pool_id, status);
         Some(status)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use alloy::providers::ProviderBuilder;
+
+    use super::*;
+
+    /// A real [`ChainPoolView`] whose provider is never called — the `cached`/`store`
+    /// pair under test touch only the arc-swapped map, never the contract. The HTTP
+    /// transport is constructed lazily and points at an unroutable address, so any
+    /// accidental RPC would fail loudly rather than pass silently.
+    fn view(ttl: Duration) -> ChainPoolView<impl Provider + Clone + 'static> {
+        let url: reqwest::Url = "http://127.0.0.1:1".parse().expect("static url parses");
+        let provider = ProviderBuilder::new().connect_http(url);
+        ChainPoolView::new(provider, Address::ZERO, ttl)
+    }
+
+    fn status(remaining: u64) -> PoolStatus {
+        PoolStatus {
+            owner: Address::from([7u8; 20]),
+            remaining: U256::from(remaining),
+        }
+    }
+
+    #[test]
+    fn store_then_read_hits() {
+        let view = view(Duration::from_mins(1));
+        let pool = B256::from([1u8; 32]);
+        view.store(pool, status(100));
+
+        let got = view.cached(pool).expect("fresh entry is a hit");
+        assert_eq!(got.remaining, U256::from(100u64));
+    }
+
+    #[test]
+    fn unknown_pool_misses() {
+        let view = view(Duration::from_mins(1));
+        view.store(B256::from([1u8; 32]), status(100));
+
+        assert!(view.cached(B256::from([2u8; 32])).is_none());
+    }
+
+    #[test]
+    fn expired_entry_misses() {
+        // A zero TTL makes `at.elapsed() < ttl` never hold, so any stored entry
+        // reads back as expired — the expiry branch without a real sleep.
+        let view = view(Duration::ZERO);
+        let pool = B256::from([1u8; 32]);
+        view.store(pool, status(100));
+
+        assert!(view.cached(pool).is_none());
+    }
+
+    #[test]
+    fn store_preserves_other_entries() {
+        let view = view(Duration::from_mins(1));
+        let a = B256::from([1u8; 32]);
+        let b = B256::from([2u8; 32]);
+        view.store(a, status(10));
+        view.store(b, status(20));
+
+        // The read-modify-write publish must not drop the earlier entry.
+        assert_eq!(view.cached(a).unwrap().remaining, U256::from(10u64));
+        assert_eq!(view.cached(b).unwrap().remaining, U256::from(20u64));
+    }
+
+    #[test]
+    fn store_overwrites_same_pool() {
+        let view = view(Duration::from_mins(1));
+        let pool = B256::from([1u8; 32]);
+        view.store(pool, status(10));
+        view.store(pool, status(99));
+
+        assert_eq!(view.cached(pool).unwrap().remaining, U256::from(99u64));
     }
 }
