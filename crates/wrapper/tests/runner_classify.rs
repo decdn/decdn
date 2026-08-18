@@ -6,12 +6,12 @@ fn exit(code: i32) -> std::process::ExitStatus {
 }
 
 #[test]
-fn drain_marker_classifies_as_drained() {
+fn exhausted_marker_classifies_as_exhausted() {
     let out = classify_exit(
         exit(1),
-        "error: channel exhausted mid-fetch: this key 0x.. is not the channel's funder ..",
+        "error: capability exhausted: ask the sponsor for a higher-cap capability or to refill the pool",
     );
-    assert!(matches!(out, FetchOutcome::Drained));
+    assert!(matches!(out, FetchOutcome::Exhausted));
 }
 
 #[test]
