@@ -355,7 +355,7 @@ After all contracts are deployed, the deployer must execute these transactions b
    originAssignment.setContentBlacklist(address(contentBlacklist));
    ```
 
-   This authorizes `OriginAssignment.pruneBlacklistedOrigin` to query `ContentBlacklist.isOriginBlacklisted` for permissionless storage cleanup, and turns on the same guard inside `addOrigin`. Until this call is made, prune calls revert; runtime authorization checks (probe, peer table) consult both contracts directly via the off-chain RPC path and are unaffected.
+   This authorizes `OriginAssignment.pruneBlacklistedOrigin` to query `ContentBlacklist.isOriginBlacklisted` for permissionless storage cleanup, and turns on the same guard inside `addOrigin`. Until this call is made, prune calls revert; runtime authorization checks (probe, registry-derived node view) consult both contracts directly via the off-chain RPC path and are unaffected.
 
 3. **Grant `SLASH_ROLE`** on CapacityBond to SlashJudge:
 
@@ -513,7 +513,7 @@ Enumerable state carries a `count()` + paged `getter(offset, limit)` pair so a c
 
 (per [ADR 012 § Bootstrap](012-client.md#bootstrap-procedure)): paginated `getRegisteredNodes(offset, 100)` calls until a page returns fewer than `limit` results. For PoC scale (tens of nodes) a single call suffices; the pagination pattern is preserved so the same code works at production scale.
 
-**Liveness caveat:** the registry is a cold-start *seed list*, not a liveness oracle. The chain has no liveness signal, so returned operators include staked-but-offline nodes. Clients filter to live peers via gossip (`NodeAnnounce` TTL) and probe RTT after bootstrap.
+**Liveness caveat:** the registry is a cold-start *seed list*, not a liveness oracle. The chain has no liveness signal, so returned operators include staked-but-offline nodes. Clients filter to live peers via probe RTT after bootstrap.
 
 ##### Bootstrap Ranking
 
@@ -806,7 +806,7 @@ The contract surface is identical at launch and at steady state — every contra
 ### Negative
 
 - Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 011, 014, or 026 requires updating this document
-- Does not cover off-chain interaction patterns (voucher exchange, gossip, probing) — those remain in their respective ADRs
+- Does not cover off-chain interaction patterns (voucher exchange, probing, DHT discovery) — those remain in their respective ADRs
 - Five contracts custody funds — `CapacityBond` (operator bonds + slash escrow), `PaymentPool` (USDC channel deposits), `SlashAppeal` (slash-appeal bonds), `SlashJudge` (challenge bonds), and `BuybackBurner` (USDC held between buybacks) — alongside the transient-only `FeeRouter` and the treasury-custodian `TimelockController`, so the audit must cover value flow across the whole surface rather than one or two escrow contracts
 
 ## References

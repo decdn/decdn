@@ -9,7 +9,7 @@ A deCDN node has two observation points today:
 - A loopback-only `/metrics` HTTP endpoint (hyper on `observability.metrics_port`, default `9090`) emitting OpenMetrics text — text-only, aggregate, read-only by design.
 - The `cdn/probe/v1` ALPN, hittable by any remote iroh peer for latency/availability checks — not a local control channel, no auth beyond "anyone with an iroh connection".
 
-Neither fits when a same-host operator must **read live internal state** (gossip peer table) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this appendix pins its shape so the first method (`admin_v1_peersList`) and future ones (drain, health, config reload, …) share a common transport.
+Neither fits when a same-host operator must **read live internal state** (readiness, lane state) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this appendix pins its shape so the first method (`admin_v1_health`) and future ones (drain, region-stats, config reload, …) share a common transport.
 
 ## Decision
 
@@ -19,14 +19,14 @@ The surface version lives in the namespace prefix (`admin_v1_...`), not a URL pa
 
 Initial method set:
 
-| Method                 | Params | Result                         |
-| ---------------------- | ------ | ------------------------------ |
-| `admin_v1_peersList`   | none   | `{ peers: PeerView[] }`        |
+| Method              | Params | Result             |
+| ------------------- | ------ | ------------------ |
+| `admin_v1_health`   | none   | `HealthResponse`   |
 
 Future methods **expected** to use this surface (not designed here):
 
 - `admin_v1_drain` — graceful drain.
-- `admin_v1_health` — readiness/liveness probe.
+- `admin_v1_regionStats` — served-byte totals by region.
 - `admin_v1_configReload` — reload mutable config sections.
 
 Response format:
@@ -46,7 +46,7 @@ Config shape:
 
 CLI shape:
 
-- New subcommand group `decdn node` whose children talk to the admin server: initially `decdn node peers`, with `decdn node drain` to follow.
+- New subcommand group `decdn node` whose children talk to the admin server: initially `decdn node health`, with `decdn node drain` to follow.
 - Admin URL resolution (`decdn node ...`) precedence:
   1. `--admin-url` flag, or `DECDN_ADMIN_URL` env (folded into the flag by clap's `env =`).
   2. `observability.admin_port` from the TOML config file — subcommand-level `--config`, then top-level `decdn --config`, then default `~/.decdn/node.toml`. An explicit path that doesn't exist errors; the default path missing falls through. `admin_port = 0` in the file errors rather than silently probing the default port.
@@ -86,6 +86,6 @@ CLI shape:
 ## Implementation Notes
 
 - `crates/common/src/admin.rs` defines the `AdminRpc` trait with `#[rpc(server, client, namespace = "admin_v1")]`, the JSON DTOs, error code constants, and the `parse_hash_arg` helper; both binaries import from there.
-- `crates/node/src/admin.rs` carries the daemon-side server impl: `AdminState` (`Arc<RwLock<PeerTable>>` plus the cache, announce trigger, reload hook, drain trigger), `AdminRpcImpl`, and the `bind` / `serve` helpers.
-- JSON DTOs (`PeerView`, `PeersResponse`, `HealthResponse`, etc.) live in the shared crate rather than derived from internal types, so the wire format stays stable when internal structs change.
-- `decdn node peers` lives in `crates/cli/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP on the client side.
+- `crates/node/src/admin.rs` carries the daemon-side server impl: `AdminState` (the cache, reload hook, drain trigger), `AdminRpcImpl`, and the `bind` / `serve` helpers.
+- JSON DTOs (`HealthResponse`, `DrainResponse`, `RegionStatsResponse`, etc.) live in the shared crate rather than derived from internal types, so the wire format stays stable when internal structs change.
+- `decdn node health` lives in `crates/cli/src/commands/node.rs` and uses `jsonrpsee::http_client::HttpClient` with the generated `AdminRpcClient` trait — no hand-rolled JSON or HTTP on the client side.

@@ -1,11 +1,10 @@
 //! Integration tests for the loopback admin JSON-RPC surface (ADR 025).
 //!
-//! Spawns the admin server directly against a seeded `PeerTable` and
-//! verifies `admin_v1_peersList` round-trips through real HTTP via
-//! jsonrpsee's generated client bindings. Unit tests for the
-//! peers-list shape itself (sort, hex encoding, field mapping) live
-//! next to the server impl in `admin.rs`; this file owns the wire-
-//! level checks only.
+//! Spawns the admin server directly and verifies each RPC method round-
+//! trips through real HTTP via jsonrpsee's generated client bindings.
+//! Unit tests for individual response shapes live next to the server
+//! impl in `admin.rs`; this file owns the wire-level checks and the
+//! CLI-side error-classification paths.
 
 #![allow(
     clippy::unwrap_used,
@@ -31,10 +30,7 @@ const fn nz(v: u64) -> NonZeroU64 {
 use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
-use decdn_common::cli::{
-    AnnounceArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs, PeersArgs, ReloadArgs, StatusArgs,
-};
-use decdn_gossip::PeerTable;
+use decdn_common::cli::{DrainArgs, EvictArgs, HealthArgs, LanesArgs, ReloadArgs, StatusArgs};
 use decdn_incentive::{LaneState, MemoryPoolStateStore, PoolStateStore, VoucherActivity};
 use decdn_node::admin::{self, AdminState, DhtStatusHandles, DrainTrigger, LaneStatusHandles};
 use decdn_node::dht::routing::NodeId;
@@ -42,7 +38,7 @@ use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
 };
 use decdn_node::metrics::Metrics;
-use decdn_protocol::{ContentHash, NodeAnnounce, NodeAnnounceBody};
+use decdn_protocol::ContentHash;
 use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
 use jsonrpsee::core::client::ClientT;
@@ -50,18 +46,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 use jsonrpsee::server::{Server, ServerConfig};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, oneshot};
-
-fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
-    NodeAnnounce {
-        body: NodeAnnounceBody {
-            node_id,
-            region: region.to_string(),
-            timestamp_us: ts_us,
-        },
-        signature: vec![0u8; 64],
-    }
-}
+use tokio::sync::oneshot;
 
 async fn bind_loopback() -> anyhow::Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await?;
@@ -70,8 +55,8 @@ async fn bind_loopback() -> anyhow::Result<(TcpListener, SocketAddr)> {
 }
 
 /// Build a throwaway cache engine for tests that don't exercise cache
-/// behavior — `AdminState::new` requires one and these tests only check
-/// peers / health round-tripping. The returned `TempDir` must outlive the
+/// behavior — `AdminState::new` requires one and most of these tests only
+/// check other RPC methods. The returned `TempDir` must outlive the
 /// engine; callers bind it with `_tmp` to keep RAII in scope.
 async fn test_cache() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
@@ -132,97 +117,13 @@ async fn spawn_admin(
 }
 
 #[tokio::test]
-async fn peers_list_empty_peer_table() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
-    let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(
-        peer_table,
-        [0u8; 32],
-        Instant::now(),
-        cache,
-        None,
-        None,
-        Arc::new(DrainTrigger::new()),
-        Arc::new(Metrics::new()),
-    );
-    let (url, stop_tx, join) = spawn_admin(state).await?;
-
-    let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.peers_list().await?;
-    assert!(resp.peers.is_empty());
-
-    let _ = stop_tx.send(());
-    join.await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn peers_list_seeded_entries_sorted_desc() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
-    {
-        let mut guard = peer_table.write().await;
-        // (id, region, announce_ts_us, now_us)
-        guard
-            .insert_or_refresh(mk_announce([1u8; 32], "US", 1), 500)
-            .ok();
-        guard
-            .insert_or_refresh(mk_announce([2u8; 32], "EU", 2), 700)
-            .ok();
-        guard
-            .insert_or_refresh(mk_announce([3u8; 32], "AP", 3), 600)
-            .ok();
-    }
-    let (cache, _tmp) = test_cache().await?;
-    let state = AdminState::new(
-        Arc::clone(&peer_table),
-        [0u8; 32],
-        Instant::now(),
-        cache,
-        None,
-        None,
-        Arc::new(DrainTrigger::new()),
-        Arc::new(Metrics::new()),
-    );
-    let (url, stop_tx, join) = spawn_admin(state).await?;
-
-    let client = HttpClientBuilder::default().build(&url)?;
-    let resp = client.peers_list().await?;
-    assert_eq!(resp.peers.len(), 3);
-
-    // Sorted by last_seen_us descending (700, 600, 500).
-    let last_seens: Vec<u64> = resp.peers.iter().map(|p| p.last_seen_us).collect();
-    assert_eq!(last_seens, vec![700, 600, 500]);
-
-    // Regions follow the same order.
-    let regions: Vec<&str> = resp.peers.iter().map(|p| p.region.as_str()).collect();
-    assert_eq!(regions, vec!["EU", "AP", "US"]);
-
-    // Node IDs are lowercase hex, 64 chars each.
-    for p in &resp.peers {
-        assert_eq!(p.node_id.len(), 64);
-        assert!(
-            p.node_id
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-    }
-
-    let _ = stop_tx.send(());
-    join.await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let id = [0xABu8; 32];
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
-        peer_table,
         id,
         Instant::now(),
         cache,
-        None,
         None,
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
@@ -251,14 +152,11 @@ async fn health_returns_hex_node_id_and_uptime() -> anyhow::Result<()> {
 /// a method name outside the `admin_v1_` namespace.
 #[tokio::test]
 async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
@@ -316,14 +214,11 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     store.record(&mk(1, 0xAA, 2_000_000))?;
     store.record(&mk(2, 0xBB, 100_000))?;
 
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
@@ -373,14 +268,11 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
 /// `with_lanes`-absent path end-to-end.
 #[tokio::test]
 async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
@@ -398,7 +290,7 @@ async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
 }
 
 /// CLI `lanes` against a dropped listener surfaces the
-/// connection-refused hint, same as the peers path.
+/// connection-refused hint, same as the other admin subcommands.
 #[tokio::test]
 async fn cli_lanes_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
@@ -424,36 +316,9 @@ async fn cli_lanes_surfaces_connection_refused() -> anyhow::Result<()> {
 
 /// The CLI's connection-refused branch is the single most operator-
 /// visible error path (mistyped `--admin-url`, node not running). Bind
-/// a loopback socket, drop it, and call `commands::peers` against its
+/// a loopback socket, drop it, and call `commands::health` against its
 /// address: the kernel will return `ECONNREFUSED` and the CLI should
 /// surface that with the "is the node running?" hint.
-#[tokio::test]
-async fn cli_peers_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = PeersArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        region: None,
-        json: false,
-        timeout_ms: 2_000,
-    };
-    let err = commands::peers(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
-/// Mirror the connection-refused / zero-timeout coverage on the
-/// `decdn node health` path so the new CLI surface fails the same
-/// way operators already expect for `node peers`.
 #[tokio::test]
 async fn cli_health_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
@@ -497,37 +362,11 @@ async fn cli_health_rejects_zero_timeout() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--timeout-ms 0` must be rejected up front — jsonrpsee interprets
-/// `Duration::ZERO` as "never time out" rather than "sub-millisecond
-/// deadline", which would hang an operator script that meant to cap
-/// the wait. The guard in `commands::peers` fires before the client
-/// is built, so any URL works here.
-#[tokio::test]
-async fn cli_peers_rejects_zero_timeout() -> anyhow::Result<()> {
-    let args = PeersArgs {
-        admin_url: Some("http://127.0.0.1:1".to_string()),
-        config: None,
-        region: None,
-        json: false,
-        timeout_ms: 0,
-    };
-    let err = commands::peers(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
-        .to_string();
-    assert!(
-        err.contains("--timeout-ms"),
-        "error should mention the flag, got: {err}"
-    );
-    Ok(())
-}
-
 /// Mirror the connection-refused coverage onto `decdn node evict`. The
-/// new CLI subcommand routes through the same `classify_client_error`
-/// path as `peers` / `health`, but a regression that swallowed the
-/// classification (or printed a misleading "evicted" line on failure)
-/// would not be caught by the admin-RPC unit tests alone.
+/// CLI subcommand routes through the same `classify_client_error`
+/// path as `health` and the other admin subcommands, but a regression
+/// that swallowed the classification (or printed a misleading "evicted"
+/// line on failure) would not be caught by the admin-RPC unit tests alone.
 #[tokio::test]
 async fn cli_evict_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
@@ -564,125 +403,6 @@ async fn cli_evict_rejects_zero_timeout() -> anyhow::Result<()> {
         timeout_ms: 0,
     };
     let err = commands::evict(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
-        .to_string();
-    assert!(
-        err.contains("--timeout-ms"),
-        "error should mention the flag, got: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn cli_announce_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = AnnounceArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 2_000,
-    };
-    let err = commands::announce(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
-/// #845: a server that reports `triggered=false` (the announce was accepted
-/// but not queued) must surface as a non-zero exit, not a silent `Ok(())` with
-/// `announce_queued=false` on stdout. Well-formed nodes never return this shape
-/// (publisher-disabled is a distinct error code), so it is treated as failure.
-#[tokio::test]
-async fn cli_announce_reports_untriggered_as_error() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    let std_listener = listener.into_std()?;
-    let config = ServerConfig::builder().http_only().build();
-    let server = Server::builder()
-        .set_config(config)
-        .build_from_tcp(std_listener)
-        .map_err(|e| anyhow::anyhow!("build fake admin: {e}"))?;
-    let mut module = RpcModule::new(());
-    module.register_async_method("admin_v1_announce", |_p, _c, _e| async move {
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "triggered": false,
-        }))
-    })?;
-    let handle = server.start(module);
-
-    let args = AnnounceArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 5_000,
-    };
-    let err = commands::announce(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected untriggered-announce error"))?
-        .to_string();
-    assert!(
-        err.contains("not queued") && err.contains("triggered=false"),
-        "error should explain the announce was not queued, got: {err}"
-    );
-
-    handle.stop().ok();
-    handle.stopped().await;
-    Ok(())
-}
-
-/// Counterpart to the above: `triggered=true` is the normal acceptance and
-/// must return `Ok(())` (exit 0).
-#[tokio::test]
-async fn cli_announce_triggered_is_ok() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    let std_listener = listener.into_std()?;
-    let config = ServerConfig::builder().http_only().build();
-    let server = Server::builder()
-        .set_config(config)
-        .build_from_tcp(std_listener)
-        .map_err(|e| anyhow::anyhow!("build fake admin: {e}"))?;
-    let mut module = RpcModule::new(());
-    module.register_async_method("admin_v1_announce", |_p, _c, _e| async move {
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "triggered": true,
-        }))
-    })?;
-    let handle = server.start(module);
-
-    let args = AnnounceArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 5_000,
-    };
-    commands::announce(&args, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("triggered=true should succeed, got: {e}"))?;
-
-    handle.stop().ok();
-    handle.stopped().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn cli_announce_rejects_zero_timeout() -> anyhow::Result<()> {
-    let args = AnnounceArgs {
-        admin_url: Some("http://127.0.0.1:1".to_string()),
-        config: None,
-        json: false,
-        timeout_ms: 0,
-    };
-    let err = commands::announce(&args, None)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
@@ -751,15 +471,12 @@ async fn cli_reload_rejects_zero_timeout() -> anyhow::Result<()> {
 /// prove the trigger fires; this test proves the RPC path reaches it.
 #[tokio::test]
 async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let drain_trigger = Arc::new(DrainTrigger::new());
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::clone(&drain_trigger),
         Arc::new(Metrics::new()),
@@ -850,15 +567,12 @@ async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
 /// with `rpc_params![]` to reproduce the parameter-less wire shape.
 #[tokio::test]
 async fn admin_v1_drain_with_empty_params_still_triggers() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let drain_trigger = Arc::new(DrainTrigger::new());
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::clone(&drain_trigger),
         Arc::new(Metrics::new()),
@@ -898,15 +612,12 @@ async fn admin_v1_drain_with_empty_params_still_triggers() -> anyhow::Result<()>
 /// returns on the first `health()` tick.
 #[tokio::test]
 async fn cli_drain_wait_returns_immediately_when_idle() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let drain_trigger = Arc::new(DrainTrigger::new());
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::clone(&drain_trigger),
         Arc::new(Metrics::new()),
@@ -1090,16 +801,13 @@ async fn cli_drain_wait_treats_econnrefused_as_complete() -> anyhow::Result<()> 
 async fn cli_drain_wait_times_out_on_stuck_stream() -> anyhow::Result<()> {
     use decdn_common::config::ResolvedSecurity;
 
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let drain_trigger = Arc::new(DrainTrigger::new());
     let metrics = Arc::new(Metrics::new());
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::clone(&drain_trigger),
         Arc::clone(&metrics),
@@ -1154,14 +862,11 @@ async fn cli_drain_wait_times_out_on_stuck_stream() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
-        peer_table,
         [0u8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),
@@ -1170,7 +875,7 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
 
     // Baseline: server is up.
     let client = HttpClientBuilder::default().build(&url)?;
-    client.peers_list().await?;
+    client.health().await?;
 
     let _ = stop_tx.send(());
     join.await?;
@@ -1180,7 +885,7 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
     // uses a connection pool that might otherwise retry silently.
     // Bound the wait so a stuck test fails instead of hanging.
     let client2 = HttpClientBuilder::default().build(&url)?;
-    let res = tokio::time::timeout(std::time::Duration::from_secs(2), client2.peers_list()).await;
+    let res = tokio::time::timeout(std::time::Duration::from_secs(2), client2.health()).await;
     match res {
         Ok(Ok(_)) => panic!("admin server still responding after shutdown"),
         // Either a jsonrpsee error or the outer timeout are acceptable
@@ -1195,14 +900,11 @@ async fn admin_shutdown_closes_listener() -> anyhow::Result<()> {
 /// client bindings unchanged (issue #741).
 #[tokio::test]
 async fn status_round_trips_dht_health() -> anyhow::Result<()> {
-    let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
-        peer_table,
         [0xABu8; 32],
         Instant::now(),
         cache,
-        None,
         None,
         Arc::new(DrainTrigger::new()),
         Arc::new(Metrics::new()),

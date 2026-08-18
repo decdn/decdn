@@ -4,9 +4,9 @@
 //! in [`decdn_common::admin`] so the user-facing `decdn` CLI can speak the
 //! generated client without dragging in the daemon's runtime
 //! dependencies. This module keeps the server-side implementation:
-//! [`AdminState`], the [`AdminRpcImpl`] that backs the trait against a
-//! live cache + peer table, and the bind/serve helpers the runtime calls
-//! during start-up and graceful shutdown.
+//! [`AdminState`], the [`AdminRpcImpl`] that backs the trait against the
+//! live cache and runtime handles, and the bind/serve helpers the runtime
+//! calls during start-up and graceful shutdown.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,21 +17,19 @@ use std::time::{Duration, Instant};
 use alloy::primitives::U256;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
-    AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE,
-    DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview,
-    EvictRequest, EvictResponse, HealthResponse, LaneSnapshot, LanesResponse,
-    POOL_STORE_ERROR_CODE, PUBLISHER_DISABLED_CODE, PeerView, PeersResponse, RELOAD_ERROR_CODE,
+    AdminRpcServer, BucketStat, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE,
+    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EvictPreview, EvictRequest, EvictResponse,
+    HealthResponse, LaneSnapshot, LanesResponse, POOL_STORE_ERROR_CODE, RELOAD_ERROR_CODE,
     RecordStoreHealth, RegionStatsResponse, ReloadResponse, RepublishHealth, RoutingHealth,
     SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
     parse_hash_arg,
 };
-use decdn_gossip::{AnnounceTrigger, PeerEntry, PeerTable};
 use decdn_incentive::{LaneState, PoolStateStore, VoucherActivity};
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock, oneshot};
+use tokio::sync::{Notify, oneshot};
 
 use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
@@ -54,10 +52,8 @@ const MAX_ADMIN_CONNECTIONS: u32 = 16;
 /// Shared state for admin RPC handlers.
 #[derive(Debug, Clone)]
 pub struct AdminState {
-    peer_table: Arc<RwLock<PeerTable>>,
     /// Raw bytes of this node's iroh `PublicKey`. Hex-encoded on the
-    /// wire by `admin_v1_health`, matching the encoding `PeerView`
-    /// already uses for peer node ids on `admin_v1_peersList`.
+    /// wire by `admin_v1_health`.
     node_id: [u8; 32],
     /// Process-start `Instant`, captured by the runtime at the top of
     /// `run()` before any `await` or I/O. Used as the origin of the
@@ -71,11 +67,6 @@ pub struct AdminState {
     /// is `Clone` (its `Arc<Inner>` is shared), so cloning into
     /// `AdminState` is cheap.
     cache: CacheEngine,
-    /// One-shot announce trigger for `admin_v1_announce` (issue #280).
-    /// `None` when the publisher is disabled (no region configured); the
-    /// RPC method translates that into a "publisher disabled" error so the
-    /// operator gets a specific message rather than a generic failure.
-    announce_trigger: Option<Arc<AnnounceTrigger>>,
     /// Hot-reload hook for `admin_v1_reload` (issue #373). `None` when
     /// the node was started without a config file path (CLI-only flag
     /// invocation), in which case there's nothing on disk for reload to
@@ -84,10 +75,9 @@ pub struct AdminState {
     /// silently no-op'ing.
     reload_hook: Option<ReloadHook>,
     /// Drain trigger for `admin_v1_drain` (issue #244). Always present —
-    /// drain has no preconditions analogous to "publisher disabled" or
-    /// "no config path", so this field is `Arc<DrainTrigger>` (not
-    /// `Option<…>` like `announce_trigger` / `reload_hook`) and the
-    /// runtime wires it unconditionally.
+    /// drain has no preconditions analogous to "no config path", so this
+    /// field is `Arc<DrainTrigger>` (not `Option<…>` like `reload_hook`)
+    /// and the runtime wires it unconditionally.
     drain_trigger: Arc<DrainTrigger>,
     /// Live process metrics handle, used by `admin_v1_health` to read
     /// the current `dispatch_in_flight` gauge for the
@@ -98,15 +88,15 @@ pub struct AdminState {
     metrics: Arc<Metrics>,
     /// DHT introspection handles backing `admin_v1_status` (issue #741).
     /// `None` when the DHT subsystem isn't wired (the unit tests that
-    /// exercise the cache/peer-table methods build `AdminState` without
-    /// it; the production runtime always attaches it via
+    /// exercise the cache methods build `AdminState` without it; the
+    /// production runtime always attaches it via
     /// [`AdminState::with_dht`]). The `status` RPC returns
     /// [`DHT_UNAVAILABLE_CODE`] when this is `None`.
     dht: Option<DhtStatusHandles>,
     /// Lane introspection handles backing `admin_v1_lanes`
     /// (issue #749). `None` when the lane subsystem isn't wired (the
-    /// unit tests that exercise the cache/peer-table methods build
-    /// `AdminState` without it; the production runtime always attaches it
+    /// unit tests that exercise the cache methods build `AdminState`
+    /// without it; the production runtime always attaches it
     /// via [`AdminState::with_lanes`]). The `lanes` RPC returns an
     /// empty list (not an error) when this is `None` — a node with no
     /// payment surface legitimately has zero lanes to report, and the
@@ -310,26 +300,21 @@ impl AdminState {
     //
     // The DHT introspection handles (issue #741) are attached via the
     // separate [`with_dht`](Self::with_dht) builder rather than as another
-    // positional argument: `new` has ~15 call sites (mostly unit tests of
-    // the cache/peer-table methods that don't need a DHT), and `with_dht`
+    // positional argument: `new` has several call sites (mostly unit
+    // tests of the cache methods that don't need a DHT), and `with_dht`
     // lets the production runtime opt in without touching any of them.
-    #[allow(clippy::too_many_arguments)]
     pub const fn new(
-        peer_table: Arc<RwLock<PeerTable>>,
         node_id: [u8; 32],
         started_at: Instant,
         cache: CacheEngine,
-        announce_trigger: Option<Arc<AnnounceTrigger>>,
         reload_hook: Option<ReloadHook>,
         drain_trigger: Arc<DrainTrigger>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            peer_table,
             node_id,
             started_at,
             cache,
-            announce_trigger,
             reload_hook,
             drain_trigger,
             metrics,
@@ -392,42 +377,6 @@ impl AdminState {
     }
 }
 
-/// Owned snapshot of one [`PeerEntry`]'s fields-of-interest, captured
-/// under the read lock so the lock can be dropped before hex encoding
-/// and final DTO assembly run. Hex-encoding the node id and allocating
-/// the wire-format `node_id` string don't need to see live state, so
-/// keeping them inside the locked region would block concurrent
-/// announce-writers for no benefit.
-struct RawPeer {
-    node_id: [u8; 32],
-    region: String,
-    first_seen_us: u64,
-    last_seen_us: u64,
-    announced_at_us: u64,
-}
-
-impl RawPeer {
-    fn from_entry(node_id: &[u8; 32], entry: &PeerEntry) -> Self {
-        Self {
-            node_id: *node_id,
-            region: entry.announce.body.region.clone(),
-            first_seen_us: entry.first_seen_us,
-            last_seen_us: entry.last_seen_us,
-            announced_at_us: entry.announce.body.timestamp_us,
-        }
-    }
-
-    fn into_view(self) -> PeerView {
-        PeerView {
-            node_id: alloy::primitives::hex::encode(self.node_id),
-            region: self.region,
-            first_seen_us: self.first_seen_us,
-            last_seen_us: self.last_seen_us,
-            announced_at_us: self.announced_at_us,
-        }
-    }
-}
-
 /// Convert a [`CacheError`] into a JSON-RPC error suitable for
 /// `admin_v1_evict`. Distinguished mainly so the operator-facing message
 /// can name the underlying failure mode (`NotFound`, `OriginError`, etc.)
@@ -465,7 +414,7 @@ fn lock_or_rpc_err<'a, T>(
     })
 }
 
-/// Concrete server implementation backed by the live gossip peer table.
+/// Concrete server implementation backed by the live [`AdminState`].
 #[derive(Debug, Clone)]
 pub struct AdminRpcImpl {
     state: AdminState,
@@ -544,19 +493,6 @@ impl AdminRpcServer for AdminRpcImpl {
         })
     }
 
-    async fn announce(&self) -> RpcResult<AnnounceResponse> {
-        let trigger = self.state.announce_trigger.as_ref().ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                PUBLISHER_DISABLED_CODE,
-                "gossip publisher is disabled (no identity.region configured); \
-                 set a region in the node config and restart to enable announces",
-                None::<()>,
-            )
-        })?;
-        trigger.announce_now();
-        Ok(AnnounceResponse { triggered: true })
-    }
-
     async fn reload(&self) -> RpcResult<ReloadResponse> {
         let hook = self.state.reload_hook.as_ref().ok_or_else(|| {
             ErrorObjectOwned::owned(
@@ -616,26 +552,6 @@ impl AdminRpcServer for AdminRpcImpl {
             initiated: true,
             wait_admin_honored: honored,
         })
-    }
-
-    async fn peers_list(&self) -> RpcResult<PeersResponse> {
-        // Two-pass snapshot: under the read lock we copy only the
-        // owned data needed to build a PeerView (raw node_id bytes,
-        // region clone, scalar fields). Hex encoding of node_id and
-        // final DTO assembly run *after* the lock is released, along
-        // with sorting. Lock hold time stays proportional to peer
-        // count and to the per-entry data extraction, no further.
-        let raw: Vec<RawPeer> = {
-            let guard = self.state.peer_table.read().await;
-            guard
-                .iter()
-                .map(|(id, entry)| RawPeer::from_entry(id, entry))
-                .collect()
-        };
-        let mut snapshot: Vec<PeerView> = raw.into_iter().map(RawPeer::into_view).collect();
-        // Most recently seen first — on-call use case is "is gossip alive?".
-        snapshot.sort_by_key(|v| std::cmp::Reverse(v.last_seen_us));
-        Ok(PeersResponse { peers: snapshot })
     }
 
     async fn status(&self) -> RpcResult<StatusResponse> {
@@ -988,22 +904,10 @@ pub async fn serve(
 mod tests {
     use super::*;
     use decdn_cache::{Hash, Origin};
-    use decdn_protocol::{NodeAnnounce, NodeAnnounceBody};
 
-    fn mk_announce(node_id: [u8; 32], region: &str, ts_us: u64) -> NodeAnnounce {
-        NodeAnnounce {
-            body: NodeAnnounceBody {
-                node_id,
-                region: region.to_string(),
-                timestamp_us: ts_us,
-            },
-            signature: vec![0u8; 64],
-        }
-    }
-
-    /// Build a throwaway tempdir-backed cache for tests. The peers /
-    /// health methods don't touch it, but `AdminState::new` requires one
-    /// — wrapping the engine over a `tempfile::TempDir` keeps each test
+    /// Build a throwaway tempdir-backed cache for tests. The health
+    /// method doesn't touch it, but `AdminState::new` requires one —
+    /// wrapping the engine over a `tempfile::TempDir` keeps each test
     /// self-contained, and the returned `TempDir` must outlive the engine
     /// (callers bind it with `_tmp` so RAII handles cleanup at end of test).
     async fn test_cache() -> (CacheEngine, tempfile::TempDir) {
@@ -1014,20 +918,12 @@ mod tests {
         (cache, tmp)
     }
 
-    async fn state_with(peers: Vec<([u8; 32], &str, u64, u64)>) -> (AdminState, tempfile::TempDir) {
-        let mut table = PeerTable::new(0, 0);
-        for (id, region, ts_us, now_us) in peers {
-            table
-                .insert_or_refresh(mk_announce(id, region, ts_us), now_us)
-                .expect("seed insert succeeds");
-        }
+    async fn state_with() -> (AdminState, tempfile::TempDir) {
         let (cache, tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(table)),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1037,7 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn slashes_unavailable_without_handle() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state);
         let err = rpc.slashes().await.expect_err("no slash handle wired");
         assert_eq!(err.code(), SLASH_DETECTION_UNAVAILABLE_CODE);
@@ -1064,7 +960,7 @@ mod tests {
                 appeal_window_close: None,
             },
         ]));
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state.with_slash_detection(SlashStatusHandles { store }));
         let resp = rpc.slashes().await.expect("slashes ok");
         assert_eq!(resp.slashes.len(), 2);
@@ -1080,61 +976,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_peer_table_returns_empty_vec() {
-        let (state, _tmp) = state_with(vec![]).await;
-        let rpc = AdminRpcImpl::new(state);
-        let resp = rpc.peers_list().await.expect("peers_list ok");
-        assert!(resp.peers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn single_peer_serializes_with_hex_node_id() {
-        let id = [0xABu8; 32];
-        // Seed once at now_us=100, then refresh at now_us=300 so
-        // first_seen_us and last_seen_us differ. Distinct values catch a
-        // field-swap regression (first↔last) that identical seeds would
-        // not.
-        let mut table = PeerTable::new(0, 0);
-        table
-            .insert_or_refresh(mk_announce(id, "US", 10), 100)
-            .expect("seed insert");
-        table
-            .insert_or_refresh(mk_announce(id, "US", 20), 300)
-            .expect("refresh insert");
-        let (cache, _tmp) = test_cache().await;
-        let state = AdminState::new(
-            Arc::new(RwLock::new(table)),
-            [0u8; 32],
-            Instant::now(),
-            cache,
-            None,
-            None,
-            Arc::new(DrainTrigger::new()),
-            Arc::new(crate::metrics::Metrics::new()),
-        );
-        let rpc = AdminRpcImpl::new(state);
-
-        let resp = rpc.peers_list().await.expect("peers_list ok");
-        assert_eq!(resp.peers.len(), 1);
-        let p = &resp.peers[0];
-        assert_eq!(p.node_id, "ab".repeat(32));
-        assert_eq!(p.region, "US");
-        assert_eq!(p.first_seen_us, 100);
-        assert_eq!(p.last_seen_us, 300);
-        assert_eq!(p.announced_at_us, 20);
-    }
-
-    #[tokio::test]
     async fn health_returns_hex_node_id_and_nondecreasing_uptime() {
         let id = [0xCDu8; 32];
         let started = Instant::now();
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             id,
             started,
             cache,
-            None,
             None,
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1154,24 +1003,6 @@ mod tests {
             first.uptime_s,
             second.uptime_s,
         );
-    }
-
-    #[tokio::test]
-    async fn peers_sorted_by_last_seen_descending() {
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let c = [3u8; 32];
-        // (id, region, announce ts, now_us) — `now_us` becomes last_seen_us.
-        let (state, _tmp) = state_with(vec![
-            (a, "US", 1, 500),
-            (b, "EU", 1, 700),
-            (c, "AP", 1, 600),
-        ])
-        .await;
-        let rpc = AdminRpcImpl::new(state);
-        let resp = rpc.peers_list().await.expect("peers_list ok");
-        let order: Vec<u64> = resp.peers.iter().map(|p| p.last_seen_us).collect();
-        assert_eq!(order, vec![700, 600, 500]);
     }
 
     /// Evict round-trip: `admin_v1_evict` of a hex hash that's been pulled
@@ -1230,11 +1061,9 @@ mod tests {
         let _ = cache.get(hash).await?;
 
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache.clone(),
-            None,
             None,
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1261,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_evict_rejects_bad_hex() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state);
         let err = rpc
             .evict(EvictRequest {
@@ -1282,11 +1111,9 @@ mod tests {
         // flagged in PR review.
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1364,11 +1191,9 @@ mod tests {
         let _ = cache.get(hash).await?;
 
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache.clone(),
-            None,
             None,
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1480,11 +1305,9 @@ mod tests {
         cache.evict(hash).await?;
 
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1514,66 +1337,13 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn admin_announce_without_publisher_returns_publisher_disabled() {
-        // No region configured → AnnounceTrigger absent → method must
-        // return PUBLISHER_DISABLED rather than silently succeeding.
-        let (state, _tmp) = state_with(vec![]).await;
-        let rpc = AdminRpcImpl::new(state);
-        let err = rpc.announce().await.expect_err("expected error");
-        assert_eq!(err.code(), -32_001);
-    }
-
-    #[tokio::test]
-    async fn admin_announce_fires_trigger_when_publisher_present() {
-        use tokio::sync::Notify;
-
-        // `AnnounceTrigger::announce_now` is a thin wrapper that calls
-        // `notify_one` on the inner `Arc<Notify>`. We construct the
-        // trigger with a `Notify` we own (via the `for_test` seam, which
-        // is `#[doc(hidden)]` and exists for exactly this assertion path)
-        // so we can `.notified()` after the RPC fires and observe that
-        // the permit landed. This proves the admin handler -> trigger ->
-        // notify chain end-to-end without spinning up a real publisher
-        // task; the publisher's own `select!` arm is exercised by
-        // `service::tests::publisher_publishes_on_announce_trigger`.
-        let notify = Arc::new(Notify::new());
-        let trigger = Arc::new(decdn_gossip::AnnounceTrigger::for_test(Arc::clone(&notify)));
-        let (cache, _tmp) = test_cache().await;
-        let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
-            [0u8; 32],
-            Instant::now(),
-            cache,
-            Some(trigger),
-            None,
-            Arc::new(DrainTrigger::new()),
-            Arc::new(crate::metrics::Metrics::new()),
-        );
-        let rpc = AdminRpcImpl::new(state);
-
-        let resp = rpc.announce().await.expect("announce ok");
-        assert!(resp.triggered);
-
-        // `Notify::notify_one` stores a permit if no waiter is pending;
-        // calling `notified()` after the RPC claims that permit
-        // immediately. A short timeout makes a regression that lost the
-        // notify fail fast rather than hanging the test runner.
-        let waited =
-            tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
-        assert!(
-            waited.is_ok(),
-            "announce_now did not fire the underlying Notify"
-        );
-    }
-
     /// `admin_v1_reload` on a node with no `ReloadHook` (started without
     /// `--config`) must surface `CONFIG_PATH_UNSET_CODE` rather than a
     /// generic failure, so an operator script can tell "no path on disk
     /// to re-read" from "reload tried and failed".
     #[tokio::test]
     async fn admin_reload_without_hook_returns_config_path_unset() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state);
         let err = rpc.reload().await.expect_err("expected error");
         assert_eq!(err.code(), -32_003);
@@ -1604,11 +1374,9 @@ mod tests {
         };
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             Some(hook),
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1686,19 +1454,16 @@ mod tests {
     }
 
     /// `admin_v1_drain` fires the trigger and returns `initiated: true`.
-    /// Mirrors the `admin_announce_fires_trigger_when_publisher_present`
-    /// test — we verify the RPC handler -> trigger -> Notify chain end-to-end
+    /// Verifies the RPC handler -> trigger -> Notify chain end-to-end
     /// without spinning up a full runtime.
     #[tokio::test]
     async fn admin_drain_fires_trigger_and_returns_initiated() {
         let trigger = Arc::new(DrainTrigger::new());
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::clone(&trigger),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1743,11 +1508,9 @@ mod tests {
         let trigger = Arc::new(DrainTrigger::new());
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::clone(&trigger),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1800,11 +1563,9 @@ mod tests {
         let trigger = Arc::new(DrainTrigger::new());
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::clone(&trigger),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1843,11 +1604,9 @@ mod tests {
         let (cache, _tmp) = test_cache().await;
         let metrics = Arc::new(crate::metrics::Metrics::new());
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             None,
             Arc::clone(&trigger),
             Arc::clone(&metrics),
@@ -1915,11 +1674,9 @@ mod tests {
         };
         let (cache, _tmp) = test_cache().await;
         let state = AdminState::new(
-            Arc::new(RwLock::new(PeerTable::new(0, 0))),
             [0u8; 32],
             Instant::now(),
             cache,
-            None,
             Some(hook),
             Arc::new(DrainTrigger::new()),
             Arc::new(crate::metrics::Metrics::new()),
@@ -1981,7 +1738,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_routing_and_dht_health() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let state = state.with_dht(seeded_dht_handles());
         let rpc = AdminRpcImpl::new(state);
 
@@ -2008,7 +1765,7 @@ mod tests {
     /// must surface as `last_refresh_us: None`, not `Some(0)`.
     #[tokio::test]
     async fn status_never_refreshed_reports_none() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let mut handles = seeded_dht_handles();
         handles.refresh_clock = Arc::new(AtomicU64::new(0));
         let rpc = AdminRpcImpl::new(state.with_dht(handles));
@@ -2022,7 +1779,7 @@ mod tests {
     /// than panicking or returning a misleading empty snapshot.
     #[tokio::test]
     async fn status_without_dht_returns_unavailable_error() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state);
 
         let err = rpc
@@ -2038,7 +1795,7 @@ mod tests {
     /// the `lock_or_rpc_err` anti-panic net.
     #[tokio::test]
     async fn status_poisoned_routing_mutex_returns_poisoned_error() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let handles = seeded_dht_handles();
         // Poison the routing-table mutex by panicking while holding it.
         let routing = Arc::clone(&handles.routing);
@@ -2061,7 +1818,7 @@ mod tests {
     /// anti-panic net.
     #[tokio::test]
     async fn status_poisoned_record_store_mutex_returns_poisoned_error() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let handles = seeded_dht_handles();
         // Poison the record-store mutex by panicking while holding it.
         let record_store = Arc::clone(&handles.record_store);
@@ -2183,7 +1940,7 @@ mod tests {
     /// surface legitimately has nothing to report.
     #[tokio::test]
     async fn lanes_without_handles_returns_empty() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state);
         let resp = rpc.lanes().await.expect("lanes ok");
         assert!(resp.lanes.is_empty());
@@ -2192,7 +1949,7 @@ mod tests {
 
     #[tokio::test]
     async fn region_stats_without_accountant_returns_empty() {
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let rpc = AdminRpcImpl::new(state);
         let resp = rpc.region_stats().await.expect("region_stats ok");
         assert!(resp.regions.is_empty());
@@ -2213,7 +1970,7 @@ mod tests {
         let accountant = Arc::new(RegionAccountant::new(Arc::new(Fixed("DE".to_string()))));
         accountant.record_served(&[1u8; 32], 4096).await;
 
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let state = state.with_region_accountant(Arc::clone(&accountant));
         let rpc = AdminRpcImpl::new(state);
 
@@ -2235,7 +1992,7 @@ mod tests {
         store.record(&mk_lane(1, 0xAA, 2_000_000))?;
         store.record(&mk_lane(2, 0xBB, 100_000))?;
 
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let handles = LaneStatusHandles {
             pool_store: store as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::new(VoucherActivity::new()),
@@ -2283,7 +2040,7 @@ mod tests {
         let activity = Arc::new(VoucherActivity::new());
         activity.touch(active_id);
 
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let handles = LaneStatusHandles {
             pool_store: store as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::clone(&activity),
@@ -2332,7 +2089,7 @@ mod tests {
             }
         }
 
-        let (state, _tmp) = state_with(vec![]).await;
+        let (state, _tmp) = state_with().await;
         let handles = LaneStatusHandles {
             pool_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
             voucher_activity: Arc::new(VoucherActivity::new()),

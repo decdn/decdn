@@ -65,8 +65,8 @@ use decdn_common::admin::{AdminRpcClient, DrainRequest, HealthResponse};
 use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
-    ResolvedGossip, ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment,
-    ResolvedProbe, ResolvedReceipts, ResolvedSecurity,
+    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedProbe,
+    ResolvedReceipts, ResolvedSecurity,
 };
 use decdn_incentive::eth_identity;
 use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
@@ -393,12 +393,6 @@ fn build_config(
             otlp_endpoint: None,
             region_accounting_interval_sec:
                 decdn_common::config::DEFAULT_REGION_ACCOUNTING_INTERVAL_SEC,
-        },
-        gossip: ResolvedGossip {
-            announce_interval_sec: 60,
-            peer_ttl_sec: 600,
-            subscribe_global: false,
-            max_peer_entries: Some(100_000),
         },
         security: ResolvedSecurity {
             max_concurrent_handlers: 256,

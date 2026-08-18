@@ -175,36 +175,6 @@ pub struct DecdnMetrics {
     pub client_idle_close: Counter,
     /// Seconds since node start.
     pub node_uptime_seconds: Gauge,
-    /// `NodeAnnounce` messages published to any gossip topic.
-    pub gossip_announces_published_total: Counter,
-    /// `NodeAnnounce`-bearing gossip envelopes received on any topic.
-    pub gossip_announces_received_total: Counter,
-    /// Incoming gossip envelopes rejected by validation (any reason).
-    pub gossip_announces_rejected_total: Counter,
-    /// Incoming gossip envelopes rejected specifically for clock skew
-    /// (ADR 001 § Clock synchronization). A sibling of the generic
-    /// `gossip_announces_rejected_total`: the ADR-named `reason=clock_skew`
-    /// breakdown is realized as this distinct counter rather than a label,
-    /// matching the `dispatch_rejected_{global,per_source}` convention. That
-    /// is a choice, not a backend limit — `iroh_metrics` does support labels
-    /// via `Family<L, M>`, which [`Metrics::probe_hold_unavailable`] uses. #1475
-    /// settled that fork in favour of sibling counters; the labeled probe-hold
-    /// family is the documented exception, so **do not** "unify" this onto a
-    /// `reason` label. Field has no `_total`
-    /// suffix because the `OpenMetrics` encoder appends it; operator-visible
-    /// name: `decdn_gossip_messages_rejected_clock_skew_total`. Lets
-    /// operators alert on NTP-drift-induced peer invisibility without it
-    /// being buried in the aggregate rejection count.
-    pub gossip_messages_rejected_clock_skew: Counter,
-    /// Current peer-table size.
-    pub gossip_peer_table_size: Gauge,
-    /// Peer-table entries removed by the TTL sweeper
-    /// (appendix-peer-table-eviction § Observability). Field has no `_total`
-    /// suffix because the `OpenMetrics` encoder appends it; operator-visible
-    /// name: `decdn_peer_table_evicted_ttl_total`.
-    pub peer_table_evicted_ttl: Counter,
-    /// Successful subscriber reconnections after a stream drop.
-    pub gossip_subscriber_reconnections_total: Counter,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
     /// reachable, `0` = unreachable. ADR 020 names operational gauges in
     /// the `decdn_*` family; this is the per-tick mirror of the startup
@@ -252,12 +222,11 @@ pub struct DecdnMetrics {
     ///
     /// **This is the documented exception, not the convention** (#1475) — the
     /// one labeled *reason split*, which is not the same as the crate's only
-    /// `Family` — `streams_active` is another. Every
-    /// other reason-style split in this crate — `dispatch_rejected_*`,
-    /// `probe_rate_limit_rejected_*`, `pool_open_failures_*`, and gossip's
-    /// `gossip_messages_rejected_clock_skew` — fans out to sibling unlabeled
-    /// counters, and that stays the default for a new split: sibling counters
-    /// need no `EncodeLabelSet` type, no pre-materialization to keep a series
+    /// `Family` — `streams_active` is another. Every other reason-style split
+    /// in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
+    /// and `pool_open_failures_*` — fans out to sibling unlabeled counters,
+    /// and that stays the default for a new split: sibling counters need no
+    /// `EncodeLabelSet` type, no pre-materialization to keep a series
     /// exporting at zero, and no alert rewrite when a reason is added.
     ///
     /// The exception is earned because the three values share one *aggregate*
@@ -892,8 +861,8 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
     /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
     /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
-    /// the provider's reputation locally or over gossip. Distinct from
-    /// `node_pull_through_timeouts` (the delivery handler's own serving deadline).
+    /// the provider's local reputation. Distinct from `node_pull_through_timeouts` (the
+    /// delivery handler's own serving deadline).
     ///
     /// It fires on **two** budgets, and they have different remedies (#1145 review):
     ///
@@ -1585,19 +1554,6 @@ impl Metrics {
         };
     }
 
-    pub fn gossip_rejected(&self, reason: &'static str) {
-        self.decdn.gossip_announces_rejected_total.inc();
-        // Break out the clock-skew signal into its own counter (ADR 001
-        // § Clock synchronization). Compare against the canonical
-        // `AnnounceReject::ClockSkew.label()` rather than a bare literal so
-        // a label rename in the gossip crate can't silently desync this
-        // branch. The aggregate above still counts every rejection, so this
-        // is purely additive.
-        if reason == decdn_gossip::AnnounceReject::ClockSkew.label() {
-            self.decdn.gossip_messages_rejected_clock_skew.inc();
-        }
-    }
-
     /// Current value of the `dispatch_in_flight` gauge as a `u64`. Read
     /// by `admin_v1_health.in_flight_streams` (issue #604) so the
     /// `decdn node drain --wait` client can observe in-flight client
@@ -2232,14 +2188,6 @@ recorders! {
     /// closer (ADR 005 §Connection lifetime).
     client_idle_close => client_idle_close.inc();
 
-    gossip_published(_topic: &str) => gossip_announces_published_total.inc();
-    gossip_received(_topic: &str) => gossip_announces_received_total.inc();
-    gossip_peer_table_size(n: i64) => gossip_peer_table_size.set(n);
-
-    /// Increment the TTL-eviction counter by the sweeper's evicted count.
-    peer_table_evicted_ttl(n: u64) => peer_table_evicted_ttl.inc_by(n);
-    gossip_reconnected(_topic: &str) => gossip_subscriber_reconnections_total.inc();
-
     /// Set the RPC health gauge. `true` -> 1 (reachable), `false` -> 0
     /// (unreachable). Driven by the watchdog task spawned in
     /// `runtime::run`.
@@ -2465,9 +2413,8 @@ watcher_downtime_recorders! {
 /// if the port is unavailable. The returned listener is consumed by [`serve`].
 ///
 /// Emits a `WARN` if `addr` is non-loopback (#579). The `OpenMetrics`
-/// surface exposes peer-table size, gossip rejection reasons,
-/// pull-through byte volumes, GC/connection stats — useful
-/// reconnaissance for anyone who can reach it. The default config
+/// surface exposes pull-through byte volumes and GC/connection stats —
+/// useful reconnaissance for anyone who can reach it. The default config
 /// binds loopback (`appendix-local-admin-http` calls metrics
 /// "loopback-only"), but `observability.metrics_bind` is operator-
 /// settable to `0.0.0.0` for containerised deployments
@@ -2498,17 +2445,16 @@ pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
             tracing::warn!(
                 %addr,
                 "metrics server is binding all interfaces (non-loopback); the OpenMetrics \
-                 endpoint exposes peer-table size, gossip rejection reasons, pull-through \
-                 byte volumes, and GC/connection stats — gate it behind a private network \
-                 or reverse proxy if reachable from outside the host"
+                 endpoint exposes pull-through byte volumes and GC/connection stats — gate \
+                 it behind a private network or reverse proxy if reachable from outside the \
+                 host"
             );
         } else {
             tracing::warn!(
                 %addr,
                 "metrics server is binding a non-loopback address; the OpenMetrics \
-                 endpoint exposes peer-table size, gossip rejection reasons, pull-through \
-                 byte volumes, and GC/connection stats — restrict reachability to trusted \
-                 scrapers"
+                 endpoint exposes pull-through byte volumes and GC/connection stats — \
+                 restrict reachability to trusted scrapers"
             );
         }
     }
@@ -2753,8 +2699,8 @@ mod tests {
     /// 0` — so parsing TYPE would blind the gate to the `_total` suffix, which
     /// is the single most common way a documented name goes wrong here. (The
     /// convention is that a counter field omits `_total` and lets the encoder
-    /// append it; the encoder only appends when it is absent, so the four
-    /// `gossip_*_total` fields that do spell it export correctly. Follow the
+    /// append it; the encoder only appends when it is absent, so a field that
+    /// spells it out explicitly still exports correctly. Follow the
     /// convention in new code, but it is not a hard rule.)
     ///
     /// Truncating at the first `{` folds labelled families down to their base
@@ -2811,10 +2757,9 @@ mod tests {
 
     /// Every `decdn_*` name in `monitoring/` must resolve to a real exported
     /// series. This is the blanket assertion the single-selector test below
-    /// could not carry until #1513: `DecdnPeerTableThin` queried
-    /// `decdn_peer_table_size` (the exporter emits `decdn_gossip_peer_table_size`)
-    /// and `DecdnHighStreamErrorRate` divided by `decdn_streams_completed_total`,
-    /// which no field produces — both shipped as rules that could never fire.
+    /// could not carry until #1513: `DecdnHighStreamErrorRate` divided by
+    /// `decdn_streams_completed_total`, which no field produces, shipped as a
+    /// rule that could never fire.
     ///
     /// **What this does not prove.** A name that resolves may still sit at a
     /// permanent zero because nothing increments it; the gate is about the
@@ -2884,9 +2829,8 @@ mod tests {
     /// Every `live` row in the ADR metric registry must resolve to an exported
     /// series. `adr/appendix-observability.md` calls itself the canonical
     /// registry, so a row naming a series the node never emits sends operators
-    /// off to build a dashboard that renders `(no data)` — which is what
-    /// `decdn_peer_table_size` and `decdn_gossip_announces_sent_total` did
-    /// until #1513.
+    /// off to build a dashboard that renders `(no data)` — which is what a
+    /// stale registry row did until #1513.
     ///
     /// Rows whose Status column says `planned` are skipped: the registry is
     /// allowed to record design intent, it is just not allowed to do so
@@ -3251,50 +3195,6 @@ mod tests {
                 2
             ),
             "expected the per-load skipped count (2) to increment the counter:\n{text}"
-        );
-    }
-
-    #[test]
-    fn gossip_clock_skew_and_ttl_eviction_counters_start_at_zero_and_increment() {
-        // #1191 / #1192. Both fields omit the `_total` suffix; the
-        // OpenMetrics encoder appends it, so the operator-visible names are
-        // `decdn_gossip_messages_rejected_clock_skew_total` and
-        // `decdn_peer_table_evicted_ttl_total`. Pin the suffixed forms so a
-        // rename that re-added `_total` (emitting `..._total_total`) or the
-        // canonical name drifting from the ADR fails here.
-        let metrics = Metrics::new();
-        let text = metrics.encode().unwrap();
-        for name in [
-            "decdn_gossip_messages_rejected_clock_skew_total",
-            "decdn_peer_table_evicted_ttl_total",
-        ] {
-            assert!(
-                has_metric_line(&text, name, 0),
-                "counter {name} should be exposed at zero on a fresh registry:\n{text}"
-            );
-        }
-
-        // A non-clock-skew rejection bumps only the aggregate, not the
-        // clock-skew sibling.
-        metrics.gossip_rejected("invalid_signature");
-        // Two clock-skew rejections bump both the aggregate and the sibling.
-        metrics.gossip_rejected("clock_skew");
-        metrics.gossip_rejected("clock_skew");
-        // TTL sweeper reports its evicted count in one weighted bump.
-        metrics.peer_table_evicted_ttl(5);
-
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_gossip_messages_rejected_clock_skew_total", 2),
-            "clock-skew counter should count only clock_skew rejections:\n{text}"
-        );
-        assert!(
-            has_metric_line(&text, "decdn_gossip_announces_rejected_total", 3),
-            "aggregate rejection counter still counts every rejection:\n{text}"
-        );
-        assert!(
-            has_metric_line(&text, "decdn_peer_table_evicted_ttl_total", 5),
-            "TTL-eviction counter is weighted by the evicted count:\n{text}"
         );
     }
 
