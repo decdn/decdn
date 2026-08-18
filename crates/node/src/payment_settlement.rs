@@ -1021,18 +1021,16 @@ async fn plan_lanes<P: Provider + Clone>(
         }
     };
     // Persist observed expiry for signers already registered on-chain, so a
-    // restart or later sweep skips their read.
-    for (&(pool_id, signer), auth) in &auth_map {
-        if auth.cap != 0 {
-            for st in &states {
-                if st.pool_id == pool_id
-                    && st.signer == signer
-                    && st.provider == self_address
-                    && let Err(err) = store.set_registered_until(st.key(), auth.expiry)
-                {
-                    warn!(%err, %pool_id, %signer, "failed to persist observed registration expiry");
-                }
-            }
+    // restart or later sweep skips their read. `read_keys` already holds exactly
+    // the lanes queried (each a unique `(pool_id, signer)` at `provider ==
+    // self`), so walk it directly rather than rescanning `states` per auth.
+    for key in &read_keys {
+        if let Some(auth) = auth_map.get(&(key.pool_id, key.signer))
+            && auth.cap != 0
+            && let Err(err) = store.set_registered_until(*key, auth.expiry)
+        {
+            warn!(%err, pool_id = %key.pool_id, signer = %key.signer,
+                "failed to persist observed registration expiry");
         }
     }
     let mut plans: Vec<PlannedLane> = Vec::new();

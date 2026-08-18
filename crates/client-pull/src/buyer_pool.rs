@@ -461,8 +461,8 @@ pub fn refill_amount(
 )]
 mod tests {
     use super::{
-        LOW_WATER_DIVISOR, approval_floor, approve_decision, issue_self_capability, open_pool,
-        refill_amount, top_up,
+        AllowanceShortfall, LOW_WATER_DIVISOR, approval_floor, approve_decision,
+        issue_self_capability, open_pool, refill_amount, top_up,
     };
     use alloy::dyn_abi::Eip712Domain;
     use alloy::primitives::{Address, B256, U256};
@@ -668,5 +668,33 @@ mod tests {
         let low_water = working / U256::from(LOW_WATER_DIVISOR);
         let add = refill_amount(deposit, prior, working, low_water);
         assert_eq!(add, working - (deposit - prior));
+    }
+
+    /// Pins the wire between `top_up`'s error tagging and the node's
+    /// `top_up_recovering_allowance` downcast: the marker is attached with
+    /// `.context(AllowanceShortfall)` on top of an already-wrapped
+    /// `anyhow::Error` (the `submit topUp` context over the concrete submit
+    /// error), exactly as `top_up` does. `anyhow::Error::downcast_ref` searches
+    /// the context chain, so a context-attached marker is still recoverable —
+    /// without this the whole daemon approve-and-retry path is silently dead.
+    #[test]
+    fn allowance_shortfall_context_is_downcastable_through_the_wrapping() {
+        // Stand-in for the concrete `alloy` submit error `top_up` wraps first.
+        #[derive(Debug)]
+        struct SubmitError;
+        impl std::fmt::Display for SubmitError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "rpc submit failed")
+            }
+        }
+        impl std::error::Error for SubmitError {}
+
+        let submit_err = anyhow::Error::new(SubmitError).context("submit topUp");
+        let tagged = submit_err.context(AllowanceShortfall);
+        assert!(
+            tagged.downcast_ref::<AllowanceShortfall>().is_some(),
+            "the daemon retry gate downcasts on this marker; it must survive the \
+             `.context()` wrapping `top_up` applies"
+        );
     }
 }

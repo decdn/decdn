@@ -206,10 +206,13 @@ fn lane_key_parts(bytes: &[u8; LANE_KEY_LEN]) -> (B256, Address, Address) {
 /// (empty → `None`, 65 → `Some`, anything else → corrupt) lives in
 /// [`StoredLaneState::into_state`].
 ///
-/// `registered_until` is appended after `expiry`: the observed on-chain
-/// capability expiry for this lane's signer. It is append-only —
-/// [`SUPPORTED_SCHEMA_VERSION`] does not bump for it, since no prior on-disk
-/// record shape exists to stay compatible with.
+/// `registered_until` is a required field after `expiry`: the observed on-chain
+/// capability expiry for this lane's signer. Adding it is a breaking on-disk
+/// change — a record written before it fails to decode here (the trailing `u64`
+/// is absent, so `take_from_bytes` hits `DeserializeUnexpectedEnd`), it is not
+/// silently defaulted. That break is deliberate and unversioned: deCDN is
+/// pre-launch with no deployed store to stay compatible with, so
+/// [`SUPPORTED_SCHEMA_VERSION`] does not bump.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredLaneState {
     schema_version: u32,
