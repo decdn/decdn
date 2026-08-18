@@ -95,6 +95,19 @@ pub struct ResolvedBlockchain {
     /// into the chain-backed origin directory; `None` => empty directory, so
     /// the `FIND_VALUE` routing fallback (ADR 022) resolves nothing.
     pub origin_assignment_address: Option<String>,
+    /// Positive-hit TTL for the lazy origin directory cache, in seconds: how
+    /// long a resolved, non-empty `getOrigins(namespaceId)` set is served
+    /// before a re-read. Defaults to
+    /// [`super::DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC`].
+    pub origin_directory_positive_ttl_sec: u64,
+    /// Negative-hit TTL for the lazy origin directory cache, in seconds: how
+    /// long "this namespace has no origins / does not exist" is cached.
+    /// Defaults to [`super::DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC`].
+    pub origin_directory_negative_ttl_sec: u64,
+    /// Max distinct namespaces held in the lazy origin directory cache (LRU
+    /// eviction). Defaults to
+    /// [`super::DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY`].
+    pub origin_directory_cache_capacity: usize,
     /// `PublisherRegistry` contract address. Independent of the origin directory
     /// (the publish CLI's `namespace create` target); not consumed by the node.
     pub publisher_registry_address: Option<String>,
@@ -149,14 +162,10 @@ pub struct ResolvedBlockchain {
     /// hints. Defaults to 300s
     /// (`DEFAULT_REDEEM_INTERVAL_SECS`); the resolver rejects `0`.
     pub redeem_interval_secs: u64,
-    /// First-contact pool-open deposit (base units, `µUSDC`). Defaults to
-    /// 0.5 USDC (`500_000`); escrowed as configured at open time (no on-chain
-    /// floor; only a non-zero requirement). See
-    /// `ResolvedBlockchain::buyer_working_deposit_micro_usdc`.
-    pub buyer_initial_deposit_micro_usdc: u64,
-    /// Refill target (base units, `µUSDC`) every top-up restores the pool
-    /// balance toward. Defaults to 10 USDC (`10_000_000`). `0` disables
-    /// top-up. Guaranteed `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    /// Deposit (base units, `µUSDC`) the buyer path escrows when it opens a
+    /// pool, and the target every top-up restores the pool balance toward.
+    /// Defaults to 10 USDC (`10_000_000`). Guaranteed nonzero (the resolver
+    /// rejects `0`; the pool's `openPool` reverts on a zero deposit).
     pub buyer_working_deposit_micro_usdc: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
     /// `PaymentPool` contract at startup (#744, ADR 003 § Deposit

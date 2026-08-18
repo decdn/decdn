@@ -12,10 +12,10 @@
 //!    `ManualVettingPolicy` vets the wallet out-of-band (the fixture drives it
 //!    via `ManualVettingPolicy.setVetted`), after which the wallet may seat origins.
 //! 4. `publish assign <id> <operator>` now seats the origin **instantly** —
-//!    `getOrigins` reflects it with no further governance action, and the node's
-//!    origin directory consumes the `OriginAdded` log (asserted through the
-//!    watcher's metrics, since an undecodable log is swallowed by design) — and
-//!    `publish revoke` unseats it just as immediately.
+//!    `getOrigins` reflects it with no further governance action — and
+//!    `publish revoke` unseats it just as immediately. The node's origin
+//!    directory does not watch these events: it resolves each namespace lazily,
+//!    on demand, so this suite verifies the on-chain effect only.
 //! 5. A multi-operator `assign` is N transactions, so it can land half-way:
 //!    one good, one unbonded, and one the loop never reaches. The good seat
 //!    stays live on-chain and the `status=partial` receipt names all three with
@@ -275,19 +275,10 @@ async fn seat_then_unseat<P: alloy::providers::Provider>(
         "the seated operator must be an authorized origin",
     );
 
-    // The node must actually CONSUME the seating event, not merely coexist with
-    // it. `OriginAdded` carries three indexed fields and an empty data section
-    // (its predecessor carried one indexed field plus an ABI-encoded array), so
-    // a `sol!` binding that drifted on arity would decode to nothing — and the
-    // watcher swallows an undecodable log by design, bumping a counter and
-    // continuing. Nothing else in the suite looks at the node side of this.
-    wait_for_metric(node, "decdn_origin_directory_operator_count", 1).await?;
-    assert_eq!(
-        node.scrape_metric("decdn_origin_directory_watcher_resolve_failures_total")
-            .await?,
-        0,
-        "a decode failure would be swallowed as a warn + counter bump, so assert the counter",
-    );
+    // The node's origin directory does not watch `OriginAdded`/`OriginRemoved`
+    // — it resolves each namespace lazily, on the first `getOrigins` lookup a
+    // request actually triggers, and this suite drives no such request. The
+    // on-chain assertions above and below are the full verification here.
 
     // `publish revoke` unseats it, just as immediately.
     run_publish(
@@ -307,26 +298,8 @@ async fn seat_then_unseat<P: alloy::providers::Provider>(
             .is_empty(),
         "removeOrigin must unseat the operator in the same tx",
     );
-    // And the removal reaches the node too, closing the authorized-origin gate.
-    wait_for_metric(node, "decdn_origin_directory_operator_count", 0).await?;
 
     Ok(())
-}
-
-/// Poll a node metric until it reads `want`, so the watcher's poll cadence does
-/// not race the assertion. Fails with the last value seen rather than hanging.
-async fn wait_for_metric(node: &NodeFixture, name: &str, want: u64) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut last = None;
-    while std::time::Instant::now() < deadline {
-        let got = node.scrape_metric(name).await?;
-        if got == want {
-            return Ok(());
-        }
-        last = Some(got);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    anyhow::bail!("{name} never reached {want} (last saw {last:?})")
 }
 
 /// Run `decdn publish <args…> --config <config>` against the node fixture's

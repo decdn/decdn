@@ -96,20 +96,14 @@ const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
 const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
-/// Default first-contact pool-open deposit: 0.5 USDC (`500_000` `µUSDC`).
-/// Kept small so an untried node holds little of the buyer's capital on first
-/// contact.
+/// Default pool-open and refill-target deposit every top-up restores the pool
+/// balance toward: 10 USDC (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics
+/// recommends a 10 USDC practical minimum (gas overhead ~2.3%); it is a
+/// client-side recommendation, not an on-chain floor, so the resolved value is
+/// escrowed as configured (#744).
 ///
-/// `pub` so `decdn-cli`'s `--initial-deposit-micro-usdc` resolution shares this
+/// `pub` so `decdn-cli`'s `--working-deposit-micro-usdc` resolution shares this
 /// single source of truth with the config resolver rather than duplicating it.
-pub const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
-/// Default refill target every top-up restores the pool balance toward:
-/// 10 USDC (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics recommends a
-/// 10 USDC practical minimum (gas overhead ~2.3%); it is a client-side
-/// recommendation, not an on-chain floor, so the resolved value is escrowed
-/// as configured (#744).
-///
-/// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
 pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Default refundable floor `M`: 1 USDC (`1_000_000` `µUSDC`). ADR 003 §
 /// Sizing defines `M = k·ρ·B·Δ` (redeem cadence × rate × credit window ×
@@ -202,6 +196,23 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
 /// Default cap on distinct hashes in the live-origin probe memo (#1130 pt3).
 /// Bounds memo memory under a random-hash probe flood.
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
+
+/// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
+/// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
+/// origin-set staleness (there is no event tail); 5 min matches the negative
+/// probe cache order of magnitude.
+pub const DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC: u64 = 300;
+/// Negative-hit TTL: how long "this namespace has no origins / does not
+/// exist" is cached. Shorter than the positive TTL so a namespace that later
+/// gains an origin becomes reachable within one short window — and long
+/// enough that a flood of bogus/attacker-chosen request namespaces cannot
+/// force a `getOrigins` RPC per request. Namespace creation is permissionless
+/// and free (`PublisherRegistry.createNamespace`), so this is the `DoS` bound.
+pub const DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC: u64 = 30;
+/// Max distinct namespaces held in the lazy origin cache (LRU eviction).
+/// Bounds memory against the permissionless global namespace count — the
+/// cache only ever holds namespaces this node was actually asked to resolve.
+pub const DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY: usize = 4096;
 
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
@@ -1299,6 +1310,20 @@ fn resolve_blockchain_into(
          for the default (3600s)",
     );
 
+    let origin_directory_positive_ttl_sec = file
+        .and_then(|b| b.origin_directory_positive_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC);
+    let origin_directory_negative_ttl_sec = file
+        .and_then(|b| b.origin_directory_negative_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC);
+    let origin_directory_cache_capacity = file
+        .and_then(|b| b.origin_directory_cache_capacity)
+        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY);
+    // No `!= 0` rejection: a `0` TTL is a valid "disable caching" choice
+    // (every entry reads as already-expired, matching `probe_cache`'s
+    // documented zero-TTL behavior), and the cache clamps capacity to `>= 1`
+    // itself.
+
     let chain_id = cli
         .chain_id
         .or_else(|| file.and_then(|b| b.chain_id))
@@ -1395,37 +1420,20 @@ fn resolve_blockchain_into(
         },
     );
 
-    let buyer_initial_deposit_micro_usdc = file
-        .and_then(|b| b.buyer_initial_deposit_micro_usdc)
-        .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
-    // `openPool` reverts `ZeroAmount` on a zero deposit, so a configured 0
-    // can never open a pool at all. Reject it here too: the contract is the
-    // authority, but catching it at load time beats surfacing it as a failed
-    // transaction on the first cache-miss pull.
-    bag.check_with(
-        buyer_initial_deposit_micro_usdc > 0,
-        "blockchain.buyer_initial_deposit_micro_usdc",
-        || {
-            "blockchain.buyer_initial_deposit_micro_usdc must be > 0 (openPool reverts \
-             ZeroAmount on a zero deposit)"
-                .to_string()
-        },
-    );
     let buyer_working_deposit_micro_usdc = file
         .and_then(|b| b.buyer_working_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC);
-    // `0` is the explicit "never top up" sentinel (a spent channel errors rather
-    // than refilling). Any nonzero working target below the initial deposit is an
-    // operator mistake: the refill target must not be smaller than what a fresh
-    // open already escrows, or the very first refill would shrink the channel.
+    // The buyer opens the pool at this deposit, and `openPool` reverts
+    // `ZeroAmount` on a zero deposit, so a configured 0 can never open a pool.
+    // Reject it here too: the contract is the authority, but catching it at
+    // load time beats surfacing it as a failed transaction on the first
+    // cache-miss pull.
     bag.check_with(
-        buyer_working_deposit_micro_usdc == 0
-            || buyer_working_deposit_micro_usdc >= buyer_initial_deposit_micro_usdc,
+        buyer_working_deposit_micro_usdc > 0,
         "blockchain.buyer_working_deposit_micro_usdc",
         || {
-            "blockchain.buyer_working_deposit_micro_usdc must be 0 (disable top-up) or \
-             >= blockchain.buyer_initial_deposit_micro_usdc (the refill target cannot be \
-             smaller than the initial open deposit)"
+            "blockchain.buyer_working_deposit_micro_usdc must be > 0 (openPool reverts \
+             ZeroAmount on a zero deposit)"
                 .to_string()
         },
     );
@@ -1453,6 +1461,9 @@ fn resolve_blockchain_into(
         payment_pool_address,
         capacity_bond_address,
         origin_assignment_address,
+        origin_directory_positive_ttl_sec,
+        origin_directory_negative_ttl_sec,
+        origin_directory_cache_capacity,
         publisher_registry_address,
         slash_judge_address,
         content_blacklist_address,
@@ -1464,7 +1475,6 @@ fn resolve_blockchain_into(
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,
-        buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
@@ -7137,6 +7147,58 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
+    fn resolve_blockchain_origin_directory_ttls_default_when_unset() -> anyhow::Result<()> {
+        // Absent origin-directory knobs resolve to the DEFAULT_ORIGIN_DIRECTORY_*
+        // consts.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            origin_directory_positive_ttl_sec: None,
+            origin_directory_negative_ttl_sec: None,
+            origin_directory_cache_capacity: None,
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(
+            resolved.origin_directory_positive_ttl_sec,
+            DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC
+        );
+        assert_eq!(
+            resolved.origin_directory_negative_ttl_sec,
+            DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC
+        );
+        assert_eq!(
+            resolved.origin_directory_cache_capacity,
+            DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_ttls_pass_through() -> anyhow::Result<()> {
+        // Explicit values survive resolution unchanged.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            origin_directory_positive_ttl_sec: Some(600),
+            origin_directory_negative_ttl_sec: Some(5),
+            origin_directory_cache_capacity: Some(128),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.origin_directory_positive_ttl_sec, 600);
+        assert_eq!(resolved.origin_directory_negative_ttl_sec, 5);
+        assert_eq!(resolved.origin_directory_cache_capacity, 128);
+        Ok(())
+    }
+
+    #[test]
     fn resolve_blockchain_fails_when_keystore_missing() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let cli = BlockchainArgs {
@@ -7915,7 +7977,6 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
@@ -7953,7 +8014,6 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
@@ -8386,7 +8446,6 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
@@ -8435,7 +8494,6 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: Some(0),
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
@@ -8639,7 +8697,6 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
@@ -8681,7 +8738,6 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
@@ -8725,7 +8781,7 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn buyer_initial_deposit_zero_is_rejected() -> anyhow::Result<()> {
+    fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -8752,8 +8808,7 @@ swap_pool_address = \"0xPool\"
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: Some(0),
-            buyer_working_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: Some(0),
             buyer_max_approve: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_appeal_address: None,
@@ -8762,55 +8817,7 @@ swap_pool_address = \"0xPool\"
             ..Default::default()
         };
         let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-            anyhow::bail!("expected error when buyer initial deposit is 0");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("blockchain.buyer_initial_deposit_micro_usdc"),
-            "error should name the field: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn buyer_working_deposit_below_initial_is_rejected() -> anyhow::Result<()> {
-        let dir = data_dir_with_keystore()?;
-        let cli = BlockchainArgs {
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: Some("https://example/rpc".to_string()),
-            eth_keystore: None,
-            keystore_password_file: None,
-            payment_pool_address: Some(GOOD_ADDR.to_string()),
-            capacity_bond_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
-            chain_id: None,
-        };
-        let file = types::BlockchainConfig {
-            content_blacklist_poll_interval_sec: None,
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: None,
-            eth_keystore: None,
-            payment_pool_address: None,
-            capacity_bond_address: None,
-            rpc_watchdog_interval_sec: None,
-            event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
-            redeem_threshold_micro_usdc: None,
-            redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: Some(2_000_000),
-            buyer_working_deposit_micro_usdc: Some(1_000_000),
-            buyer_max_approve: None,
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
-            content_blacklist_address: None,
-            chain_id: None,
-            ..Default::default()
-        };
-        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-            anyhow::bail!("expected error when working deposit is below initial deposit");
+            anyhow::bail!("expected error when buyer working deposit is 0");
         };
         let msg = format!("{err:#}");
         assert!(
@@ -8821,50 +8828,7 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn buyer_working_deposit_zero_disables_topup_and_resolves() -> anyhow::Result<()> {
-        let dir = data_dir_with_keystore()?;
-        let cli = BlockchainArgs {
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: Some("https://example/rpc".to_string()),
-            eth_keystore: None,
-            keystore_password_file: None,
-            payment_pool_address: Some(GOOD_ADDR.to_string()),
-            capacity_bond_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: Some(GOOD_ADDR.to_string()),
-            chain_id: None,
-        };
-        let file = types::BlockchainConfig {
-            content_blacklist_poll_interval_sec: None,
-            origin_assignment_address: None,
-            publisher_registry_address: None,
-            rpc_url: None,
-            eth_keystore: None,
-            payment_pool_address: None,
-            capacity_bond_address: None,
-            rpc_watchdog_interval_sec: None,
-            event_poll_interval_ms: None,
-            rate_bounds_poll_interval_sec: None,
-            redeem_threshold_micro_usdc: None,
-            redeem_interval_secs: None,
-            buyer_initial_deposit_micro_usdc: Some(500_000),
-            buyer_working_deposit_micro_usdc: Some(0),
-            buyer_max_approve: None,
-            slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_appeal_address: None,
-            content_blacklist_address: None,
-            chain_id: None,
-            ..Default::default()
-        };
-        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
-        assert_eq!(resolved.buyer_initial_deposit_micro_usdc, 500_000);
-        assert_eq!(resolved.buyer_working_deposit_micro_usdc, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn buyer_deposits_default_when_absent() -> anyhow::Result<()> {
+    fn buyer_working_deposit_defaults_when_absent() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -8879,7 +8843,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
-        assert_eq!(resolved.buyer_initial_deposit_micro_usdc, 500_000);
         assert_eq!(resolved.buyer_working_deposit_micro_usdc, 10_000_000);
         Ok(())
     }

@@ -203,11 +203,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  buyer_initial_deposit_micro_usdc: {}",
-        resolved.blockchain.buyer_initial_deposit_micro_usdc
-    )?;
-    writeln!(
-        w,
         "  buyer_working_deposit_micro_usdc: {}",
         resolved.blockchain.buyer_working_deposit_micro_usdc
     )?;
@@ -561,6 +556,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # payment_pool_address = ""          # REQUIRED: 0x-prefixed hex
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
 # origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
+# origin_directory_positive_ttl_sec = 300  # lazy origin directory: how long a resolved, non-empty getOrigins() set is served before a re-read; only consulted when origin_assignment_address is set; 0 disables caching; default 300s
+# origin_directory_negative_ttl_sec = 30   # lazy origin directory: how long "namespace has no origins" is cached — the DoS bound against permissionless/free namespace creation; only consulted when origin_assignment_address is set; 0 disables caching; default 30s
+# origin_directory_cache_capacity = 4096   # lazy origin directory: max distinct namespaces held (LRU eviction); only consulted when origin_assignment_address is set; default 4096
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # content_blacklist_address = ""     # REQUIRED: 0x-prefixed hex; deployed ContentBlacklist (ADR 011/031). Absent => startup fails before any ALPN accepts; the zero address is rejected (it is a fail-open compliance trap).
@@ -572,8 +570,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
-# buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a pool (first-contact lock); default 0.5 USDC
-# buyer_working_deposit_micro_usdc = 10000000    # refill target on reuse or mid-transfer shortfall; 0 disables top-up; default 10 USDC
+# buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
 # CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
@@ -791,6 +788,9 @@ mod tests {
             payment_pool_address,
             capacity_bond_address,
             origin_assignment_address,
+            origin_directory_positive_ttl_sec,
+            origin_directory_negative_ttl_sec,
+            origin_directory_cache_capacity,
             publisher_registry_address,
             slash_judge_address,
             slash_appeal_address,
@@ -803,7 +803,6 @@ mod tests {
             redeem_threshold_micro_usdc,
             redeem_max_vouchers_per_tx,
             redeem_interval_secs,
-            buyer_initial_deposit_micro_usdc,
             buyer_working_deposit_micro_usdc,
             buyer_max_approve,
             pool_min_remaining_deposit_micro_usdc,
@@ -823,6 +822,18 @@ mod tests {
             (
                 "origin_assignment_address =",
                 origin_assignment_address.is_none(),
+            ),
+            (
+                "origin_directory_positive_ttl_sec =",
+                origin_directory_positive_ttl_sec.is_none(),
+            ),
+            (
+                "origin_directory_negative_ttl_sec =",
+                origin_directory_negative_ttl_sec.is_none(),
+            ),
+            (
+                "origin_directory_cache_capacity =",
+                origin_directory_cache_capacity.is_none(),
             ),
             (
                 "publisher_registry_address =",
@@ -857,10 +868,6 @@ mod tests {
                 redeem_max_vouchers_per_tx.is_none(),
             ),
             ("redeem_interval_secs =", redeem_interval_secs.is_none()),
-            (
-                "buyer_initial_deposit_micro_usdc =",
-                buyer_initial_deposit_micro_usdc.is_none(),
-            ),
             (
                 "buyer_working_deposit_micro_usdc =",
                 buyer_working_deposit_micro_usdc.is_none(),

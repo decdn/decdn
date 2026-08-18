@@ -1,37 +1,49 @@
-//! One `CapacityBond` watcher feeding both registry projections (#1110).
+//! One `CapacityBond` watcher feeding four registry projections.
 //!
-//! [`ChainStakerSet`] (membership: `NodeId → active?`) and
-//! [`ChainNodeAddressDirectory`] (bindings: `NodeId → operator address`) are both
-//! derived from the same `CapacityBond` contract. This module runs one
-//! enumeration and one `eth_getLogs` loop over the shared `CapacityBond`
-//! address, demuxing to both projections; node-address's two topics are a
-//! strict *subset* of staker-set's five.
+//! [`ChainStakerSet`] (membership: `NodeId → active?`), [`ChainNodeAddressDirectory`]
+//! (bindings: `NodeId → operator address`), the region map (`NodeId → regionHint`),
+//! and the operator reverse map (`operator address → NodeId`) are all derived
+//! from the same `CapacityBond` contract. This module runs one enumeration and
+//! one `eth_getLogs` loop over the shared `CapacityBond` address, demuxing to
+//! all four projections; node-address's two topics are a strict *subset* of
+//! staker-set's five.
 //!
-//! # What actually differs between them
+//! Bindings is gated on `cache.node_to_node_pull_through_enabled`: when
+//! pull-through is off, the bindings projection is not built at all. Regions
+//! and the operator reverse map are always built, regardless of pull-through —
+//! region byte-accounting and the ADR-030 selection penalty need the region
+//! map unconditionally, and the chain-backed origin directory needs the
+//! reverse map to resolve operators locally with no `nodeIdOf` RPC.
 //!
-//! Only the **enumeration**. The live event arms are a clean union:
-//! `NodeRegistered` inserts into *both* projections unfiltered — staker-set's
-//! live arm applies no `isActive` check either (its filter is bootstrap-only). It
-//! is tempting to read "staker-set is the filtered view, node-address is the
-//! unfiltered one" as a live-path difference and encode it in the sink; that
+//! # What actually differs between the projections
+//!
+//! Mostly the **enumeration**. The live event arms are close to a clean union:
+//! `NodeRegistered` inserts into active, bindings (if built), regions (if
+//! non-empty), and the reverse map, all unfiltered — staker-set's live arm
+//! applies no `isActive` check either (its filter is bootstrap-only). It is
+//! tempting to read "staker-set is the filtered view, the rest are the
+//! unfiltered ones" as a live-path difference and encode it in the sink; that
 //! would be wrong, and would drop registrations from the active set.
 //!
-//! At bootstrap they genuinely diverge:
+//! At bootstrap `active` and `bindings` genuinely diverge:
 //!
 //! - `active` takes the per-entry `active[i]` that `getRegisteredNodes` computes
 //!   on-chain (`isActive(operator)`: registered AND bond ≥ minBond AND no
 //!   unbonding AND not ejected) alongside the `_registeredAddrs` page.
 //! - `bindings` applies no filter: an operator mid-unbonding has `isActive =
 //!   false` but is still payable, so its binding must survive.
+//! - `regions` and the reverse map are likewise unfiltered: liveness is applied
+//!   separately at read time via the shared `StakerSet`.
 //!
 //! # Fatality
 //!
 //! The single `getRegisteredNodes` bootstrap is fatal: staker-set requires it,
 //! and its failure propagates. The bindings projection (pull-through is
 //! opportunistic, so it would otherwise be non-fatal) has **no RPC of its own**:
-//! it is derived from page data already in hand and cannot fail independently. A
-//! node either boots with both projections or fails at the one shared read, so
-//! pull-through is never lost on its own.
+//! it is derived from page data already in hand and cannot fail independently.
+//! The same is true of regions and the reverse map. A node either boots with
+//! all four projections or fails at the one shared read, so pull-through is
+//! never lost on its own.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -84,6 +96,10 @@ pub struct RegistryHandles {
     /// `NodeId → regionHint` (non-empty only). Feeds the region resolver behind
     /// `RegionAccountant`. Always present, unlike `node_addresses`.
     pub regions: Arc<RwLock<HashMap<NodeId, String>>>,
+    /// `operator address → bound NodeId`, always built (like `regions`, unlike
+    /// the pull-through-gated `bindings`) so the chain-backed origin directory
+    /// can resolve operators locally with no `nodeIdOf` RPC.
+    pub operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
     /// The shared watcher, exposed so the runtime can drive graceful shutdown in
     /// its deliberate order (this loop stops *after* `router.shutdown` because
     /// its staker-set projection gates DHT admission during drain). Also held
@@ -117,13 +133,14 @@ pub(crate) trait RegistryChainReads: Send + Sync {
     /// tick lost to RPC backoff advances nothing but is not replayed. Neither
     /// shows up as an error, so without a periodic authoritative re-read the
     /// only repair for a drifted set is a process restart.
-    #[allow(clippy::type_complexity)] // (active set, bindings, regions) — the three projections
+    #[allow(clippy::type_complexity)] // (active set, bindings, reverse map, regions) — the four projections
     fn full_snapshot(
         &self,
     ) -> impl Future<
         Output = Result<(
             HashSet<NodeId>,
             HashMap<NodeId, Address>,
+            HashMap<Address, NodeId>,
             HashMap<NodeId, String>,
         )>,
     > + Send;
@@ -140,6 +157,7 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
     ) -> Result<(
         HashSet<NodeId>,
         HashMap<NodeId, Address>,
+        HashMap<Address, NodeId>,
         HashMap<NodeId, String>,
     )> {
         bootstrap_registry(&self.registry).await
@@ -178,6 +196,11 @@ pub(crate) struct RegistrySink<R> {
     /// Always built (not gated on pull-through): region byte-accounting and the
     /// ADR-030 selection penalty read it whether or not node-to-node pull is on.
     pub(crate) regions: Arc<RwLock<HashMap<NodeId, String>>>,
+    /// `operator address → bound NodeId`. Always built (not gated on
+    /// pull-through, like `regions`) and unfiltered: an ejected or unbonding
+    /// operator keeps its reverse entry, since liveness is applied separately
+    /// at read time via the shared `StakerSet`.
+    pub(crate) operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
     pub(crate) metrics: Arc<Metrics>,
     /// How often [`RegistryChainReads::full_snapshot`] re-derives both
     /// projections. Deliberately a constant rather than a config knob: it is a
@@ -197,6 +220,9 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         if let Some(bindings) = &self.bindings {
             set_binding(bindings, &self.metrics, node_id, eth_address);
         }
+        with_write(&self.operator_to_node, "chain operator reverse map", |m| {
+            m.insert(eth_address, node_id);
+        });
         if !region.is_empty() {
             with_write(&self.regions, "chain region directory", |m| {
                 m.insert(node_id, region);
@@ -213,6 +239,12 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         if let Some(bindings) = &self.bindings {
             remove_binding(bindings, &self.metrics, &node_id);
         }
+        // No address is carried on this event, so remove by value: the reverse
+        // map is always-on (unlike `bindings`), so it cannot be sourced from
+        // `bindings` to find the address first.
+        with_write(&self.operator_to_node, "chain operator reverse map", |m| {
+            m.retain(|_addr, nid| *nid != node_id);
+        });
         with_write(&self.regions, "chain region directory", |m| {
             m.remove(&node_id);
         });
@@ -339,7 +371,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         // read retries on the resync cadence rather than on every watcher tick.
         self.last_resync = Some(now);
 
-        let (active, bindings, regions) = match self.reads.full_snapshot().await {
+        let (active, bindings, operator_to_node, regions) = match self.reads.full_snapshot().await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 warn!(%err, "capacity-bond registry resync failed; keeping current projections");
@@ -355,6 +387,9 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
             with_write(slot, "chain node-address directory", |map| *map = bindings);
             self.metrics.node_address_directory_size(binding_len);
         }
+        with_write(&self.operator_to_node, "chain operator reverse map", |m| {
+            *m = operator_to_node;
+        });
         with_write(&self.regions, "chain region directory", |map| {
             *map = regions;
         });
@@ -377,19 +412,23 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
 /// lose the only repair for a drifted set short of a process restart.
 const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 
-/// One paginated `getRegisteredNodes` read feeding both projections.
+/// One paginated `getRegisteredNodes` read feeding all four projections.
 ///
-/// Always returns both maps and lets the caller drop the unwanted one — a
+/// Always returns all four maps and lets the caller drop the unwanted one — a
 /// `want_bindings: bool` parameter would be a boolean trap, and building the map
 /// is free while already iterating the page. See the module doc for why `active`
 /// is `isActive`-filtered and `bindings` is not: `getRegisteredNodes` computes
 /// `isActive` per entry on-chain and returns it as a parallel `active[]`, so a
-/// single call per page derives both projections with no per-entry round-trip.
+/// single call per page derives `active` and `bindings` with no per-entry
+/// round-trip. `operator_to_node` is the inverse of `bindings`, built from the
+/// same page with no chain call of its own; like `regions` it is unfiltered and
+/// always built.
 async fn bootstrap_registry<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
 ) -> Result<(
     HashSet<NodeId>,
     HashMap<NodeId, Address>,
+    HashMap<Address, NodeId>,
     HashMap<NodeId, String>,
 )>
 where
@@ -397,6 +436,7 @@ where
 {
     let mut active = HashSet::new();
     let mut bindings = HashMap::new();
+    let mut operator_to_node = HashMap::new();
     let mut regions = HashMap::new();
     let mut offset = 0u64;
     loop {
@@ -425,6 +465,7 @@ where
         for (node, &is_active) in resp.page.iter().zip(resp.active.iter()) {
             let node_id = NodeId::from_bytes(node.nodeId.0);
             bindings.insert(node_id, node.ethAddress);
+            operator_to_node.insert(node.ethAddress, node_id);
             if !node.regionHint.is_empty() {
                 regions.insert(node_id, node.regionHint.clone());
             }
@@ -434,7 +475,7 @@ where
         }
         offset = offset.saturating_add(page_len);
     }
-    Ok((active, bindings, regions))
+    Ok((active, bindings, operator_to_node, regions))
 }
 
 /// Enumerate `CapacityBond` once, then spawn the single watcher that keeps both
@@ -464,7 +505,7 @@ where
         .head()
         .await
         .context("read head block for CapacityBond registry snapshot")?;
-    let (initial_active, initial_bindings, initial_regions) =
+    let (initial_active, initial_bindings, initial_operator_to_node, initial_regions) =
         bootstrap_registry(&registry).await.with_context(|| {
             format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
         })?;
@@ -485,6 +526,7 @@ where
 
     let active = Arc::new(RwLock::new(initial_active));
     let bindings = track_node_addresses.then(|| Arc::new(RwLock::new(initial_bindings)));
+    let operator_to_node = Arc::new(RwLock::new(initial_operator_to_node));
     let regions = Arc::new(RwLock::new(initial_regions));
 
     let sink = RegistrySink {
@@ -493,6 +535,7 @@ where
         },
         active: Arc::clone(&active),
         bindings: bindings.clone(),
+        operator_to_node: Arc::clone(&operator_to_node),
         regions: Arc::clone(&regions),
         metrics: Arc::clone(&metrics),
         resync_interval: REGISTRY_RESYNC_INTERVAL,
@@ -554,6 +597,7 @@ where
         staker_set,
         node_addresses,
         regions,
+        operator_to_node,
         watcher,
     })
 }
@@ -577,10 +621,11 @@ mod tests {
         Address::from([byte; 20])
     }
 
-    /// The three registry projections, as `full_snapshot` returns them.
+    /// The four registry projections, as `full_snapshot` returns them.
     type Snapshot = (
         HashSet<NodeId>,
         HashMap<NodeId, Address>,
+        HashMap<Address, NodeId>,
         HashMap<NodeId, String>,
     );
 
@@ -595,7 +640,12 @@ mod tests {
         fn new(node_id: std::result::Result<Option<(NodeId, bool)>, &'static str>) -> Self {
             Self {
                 node_id,
-                snapshot: Ok((HashSet::new(), HashMap::new(), HashMap::new())),
+                snapshot: Ok((
+                    HashSet::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                )),
             }
         }
 
@@ -618,6 +668,7 @@ mod tests {
         ) -> Result<(
             HashSet<NodeId>,
             HashMap<NodeId, Address>,
+            HashMap<Address, NodeId>,
             HashMap<NodeId, String>,
         )> {
             match &self.snapshot {
@@ -632,6 +683,7 @@ mod tests {
         RegistrySink<StubReads>,
         Arc<RwLock<HashSet<NodeId>>>,
         Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
+        Arc<RwLock<HashMap<Address, NodeId>>>,
         Arc<RwLock<HashMap<NodeId, String>>>,
         Arc<Metrics>,
     );
@@ -641,18 +693,20 @@ mod tests {
     fn sink(reads: StubReads, bindings_on: bool) -> Fixture {
         let active = Arc::new(RwLock::new(HashSet::new()));
         let bindings = bindings_on.then(|| Arc::new(RwLock::new(HashMap::new())));
+        let operator_to_node = Arc::new(RwLock::new(HashMap::new()));
         let regions = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::new());
         let s = RegistrySink {
             reads,
             active: Arc::clone(&active),
             bindings: bindings.clone(),
+            operator_to_node: Arc::clone(&operator_to_node),
             regions: Arc::clone(&regions),
             metrics: Arc::clone(&metrics),
             resync_interval: REGISTRY_RESYNC_INTERVAL,
             last_resync: Some(Instant::now()),
         };
-        (s, active, bindings, regions, metrics)
+        (s, active, bindings, operator_to_node, regions, metrics)
     }
 
     fn ok_reads() -> StubReads {
@@ -672,6 +726,16 @@ mod tests {
 
     fn region_of(regions: &Arc<RwLock<HashMap<NodeId, String>>>, id: NodeId) -> Option<String> {
         regions.read().ok().and_then(|g| g.get(&id).cloned())
+    }
+
+    fn reverse_of(
+        operator_to_node: &Arc<RwLock<HashMap<Address, NodeId>>>,
+        operator: Address,
+    ) -> Option<NodeId> {
+        operator_to_node
+            .read()
+            .ok()
+            .and_then(|g| g.get(&operator).copied())
     }
 
     /// `NodeRegistered(nodeId indexed, ethAddress indexed, ...)`.
@@ -732,7 +796,7 @@ mod tests {
     /// The core of the merge: one log, one decode, both projections updated.
     #[tokio::test]
     async fn node_registered_updates_both_projections_from_one_decode() {
-        let (mut s, active, bindings, _regions, _m) = sink(ok_reads(), true);
+        let (mut s, active, bindings, _op, _regions, _m) = sink(ok_reads(), true);
         let r = s.apply(registered_log(nid(1), addr(9))).await;
 
         assert!(r.is_ok());
@@ -744,7 +808,7 @@ mod tests {
     /// staker set still updates and nothing touches (or publishes) bindings.
     #[tokio::test]
     async fn node_registered_with_bindings_off_updates_only_the_staker_set() {
-        let (mut s, active, bindings, _regions, _m) = sink(ok_reads(), false);
+        let (mut s, active, bindings, _op, _regions, _m) = sink(ok_reads(), false);
         let r = s.apply(registered_log(nid(1), addr(9))).await;
 
         assert!(r.is_ok());
@@ -755,7 +819,7 @@ mod tests {
     /// `deregisterNode` is the ONLY event that clears a binding.
     #[tokio::test]
     async fn node_deregistered_removes_from_both() {
-        let (mut s, active, bindings, _regions, _m) = sink(ok_reads(), true);
+        let (mut s, active, bindings, _op, _regions, _m) = sink(ok_reads(), true);
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
 
         let r = s.apply(deregistered_log(nid(1))).await;
@@ -770,7 +834,7 @@ mod tests {
     /// on an open channel. A reflexive "union the arms" merge would drop it here.
     #[tokio::test]
     async fn node_auto_ejected_deactivates_but_keeps_the_binding() {
-        let (mut s, active, bindings, _regions, _m) = sink(ok_reads(), true);
+        let (mut s, active, bindings, _op, _regions, _m) = sink(ok_reads(), true);
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
 
         let r = s.apply(auto_ejected_log(nid(1))).await;
@@ -784,11 +848,69 @@ mod tests {
         );
     }
 
+    /// `NodeRegistered` populates the reverse map alongside the forward binding.
+    #[tokio::test]
+    async fn node_registered_populates_reverse_map() {
+        let (mut s, _active, _bindings, operator_to_node, _regions, _m) = sink(ok_reads(), true);
+        let r = s.apply(registered_log(nid(1), addr(9))).await;
+
+        assert!(r.is_ok());
+        assert_eq!(reverse_of(&operator_to_node, addr(9)), Some(nid(1)));
+    }
+
+    /// `NodeDeregistered` removes the reverse entry, the same lifecycle as the
+    /// forward binding.
+    #[tokio::test]
+    async fn node_deregistered_removes_from_reverse_map() {
+        let (mut s, _active, _bindings, operator_to_node, _regions, _m) = sink(ok_reads(), true);
+        let _ = s.apply(registered_log(nid(1), addr(9))).await;
+
+        let r = s.apply(deregistered_log(nid(1))).await;
+
+        assert!(r.is_ok());
+        assert_eq!(reverse_of(&operator_to_node, addr(9)), None);
+    }
+
+    /// Ejection must NOT drop the reverse entry: the map is unfiltered, and the
+    /// origin directory resolves an authorized operator's `NodeId` regardless of
+    /// current liveness — the `StakerSet` applies the liveness filter separately
+    /// at read time.
+    #[tokio::test]
+    async fn node_auto_ejected_keeps_reverse_binding() {
+        let (mut s, _active, _bindings, operator_to_node, _regions, _m) = sink(ok_reads(), true);
+        let _ = s.apply(registered_log(nid(1), addr(9))).await;
+
+        let r = s.apply(auto_ejected_log(nid(1))).await;
+
+        assert!(r.is_ok());
+        assert_eq!(
+            reverse_of(&operator_to_node, addr(9)),
+            Some(nid(1)),
+            "ejection must NOT clear the reverse binding"
+        );
+    }
+
+    /// The reverse map is always built, unlike the pull-through-gated
+    /// `bindings` projection.
+    #[tokio::test]
+    async fn reverse_map_built_even_with_pull_through_off() {
+        let (mut s, _active, bindings, operator_to_node, _regions, _m) = sink(ok_reads(), false);
+        let r = s.apply(registered_log(nid(1), addr(9))).await;
+
+        assert!(r.is_ok());
+        assert!(bindings.is_none(), "bindings is gated off");
+        assert_eq!(
+            reverse_of(&operator_to_node, addr(9)),
+            Some(nid(1)),
+            "the reverse map is always-on"
+        );
+    }
+
     /// The region projection mirrors binding lifecycle: set on registration,
     /// cleared on deregistration.
     #[tokio::test]
     async fn node_registered_captures_region_and_deregister_clears_it() {
-        let (mut s, _active, _bindings, regions, _m) = sink(ok_reads(), true);
+        let (mut s, _active, _bindings, _op, regions, _m) = sink(ok_reads(), true);
 
         let _ = s.apply(registered_log_region(nid(1), addr(9), "DE")).await;
         assert_eq!(region_of(&regions, nid(1)), Some("DE".to_string()));
@@ -805,7 +927,7 @@ mod tests {
     /// entry.
     #[tokio::test]
     async fn empty_region_hint_is_not_stored() {
-        let (mut s, _active, _bindings, regions, _m) = sink(ok_reads(), true);
+        let (mut s, _active, _bindings, _op, regions, _m) = sink(ok_reads(), true);
         // The existing `registered_log` helper sets `regionHint: String::new()`.
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
         assert_eq!(region_of(&regions, nid(1)), None, "empty region is absence");
@@ -815,7 +937,7 @@ mod tests {
     /// binding: the region reflects the payout jurisdiction, not membership.
     #[tokio::test]
     async fn auto_eject_keeps_region() {
-        let (mut s, _active, _bindings, regions, _m) = sink(ok_reads(), true);
+        let (mut s, _active, _bindings, _op, regions, _m) = sink(ok_reads(), true);
         let _ = s.apply(registered_log_region(nid(1), addr(9), "FR")).await;
 
         let _ = s.apply(auto_ejected_log(nid(1))).await;
@@ -831,7 +953,7 @@ mod tests {
     /// binding.
     #[tokio::test]
     async fn reinstated_resolves_via_node_id_of_and_leaves_bindings_untouched() {
-        let (mut s, active, bindings, _regions, _m) =
+        let (mut s, active, bindings, _op, _regions, _m) =
             sink(StubReads::new(Ok(Some((nid(1), true)))), true);
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
         let _ = s.apply(auto_ejected_log(nid(1))).await;
@@ -848,7 +970,7 @@ mod tests {
     #[tokio::test]
     async fn node_id_of_disagreeing_with_the_event_wins() {
         // `Reinstated` implies active, but nodeIdOf says otherwise.
-        let (mut s, active, _b, _regions, _m) =
+        let (mut s, active, _b, _op, _regions, _m) =
             sink(StubReads::new(Ok(Some((nid(1), false)))), true);
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
 
@@ -863,7 +985,7 @@ mod tests {
     /// shared, would stall the bindings projection too).
     #[tokio::test]
     async fn node_id_of_failure_bumps_resolve_failure_and_returns_ok() {
-        let (mut s, _a, _b, _regions, metrics) = sink(StubReads::new(Err("rpc down")), true);
+        let (mut s, _a, _b, _op, _regions, metrics) = sink(StubReads::new(Err("rpc down")), true);
         let r = s.apply(reinstated_log(addr(9))).await;
 
         assert!(r.is_ok(), "a resolve failure must not fail the tick");
@@ -878,7 +1000,7 @@ mod tests {
     /// An unbound operator (`bytes32(0)`) is ignored: binding precedes activation.
     #[tokio::test]
     async fn unbound_operator_event_is_ignored() {
-        let (mut s, active, _b, _regions, _m) = sink(StubReads::new(Ok(None)), true);
+        let (mut s, active, _b, _op, _regions, _m) = sink(StubReads::new(Ok(None)), true);
         let r = s.apply(reinstated_log(addr(9))).await;
 
         assert!(r.is_ok());
@@ -889,7 +1011,7 @@ mod tests {
     /// re-scan of one would otherwise hot-loop the cursor forever.
     #[tokio::test]
     async fn undecodable_log_is_skipped_and_returns_ok() {
-        let (mut s, active, _b, _regions, _m) = sink(ok_reads(), true);
+        let (mut s, active, _b, _op, _regions, _m) = sink(ok_reads(), true);
         let mut log = registered_log(nid(1), addr(9));
         log.inner.data.data = Bytes::from_static(b"garbage");
 
@@ -932,18 +1054,22 @@ mod tests {
     // and a missed or orphaned event never surfaces as an error — so without
     // this, a drifted set is only repaired by restarting the process.
 
+    #[allow(clippy::type_complexity)] // (active set, bindings, reverse map, regions) — the four projections
     fn snapshot_of(
         ids: &[u8],
         addrs: &[u8],
     ) -> (
         HashSet<NodeId>,
         HashMap<NodeId, Address>,
+        HashMap<Address, NodeId>,
         HashMap<NodeId, String>,
     ) {
         let active: HashSet<NodeId> = ids.iter().map(|b| nid(*b)).collect();
         let bindings: HashMap<NodeId, Address> =
             addrs.iter().map(|b| (nid(*b), addr(*b))).collect();
-        (active, bindings, HashMap::new())
+        let operator_to_node: HashMap<Address, NodeId> =
+            addrs.iter().map(|b| (addr(*b), nid(*b))).collect();
+        (active, bindings, operator_to_node, HashMap::new())
     }
 
     /// A due resync replaces both projections wholesale, so an entry the event
@@ -951,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn resync_replaces_both_projections() {
         let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[2, 3], &[2, 3])));
-        let (mut sink, active, bindings, _regions, _m) = sink(reads, true);
+        let (mut sink, active, bindings, operator_to_node, _regions, _m) = sink(reads, true);
         // Seed a stale view: 1 is gone from chain, 2 is missing locally.
         with_write(&active, "t", |set| {
             set.insert(nid(1));
@@ -968,6 +1094,27 @@ mod tests {
         );
         let b = bindings.unwrap();
         assert_eq!(b.read().unwrap().len(), 2, "bindings are replaced too");
+        assert_eq!(
+            operator_to_node.read().unwrap().len(),
+            2,
+            "the reverse map is replaced too"
+        );
+    }
+
+    /// `full_snapshot` derives the reverse map as the inverse of `bindings` for
+    /// every registered operator.
+    #[tokio::test]
+    async fn resync_derives_reverse_map_as_inverse_of_bindings() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[2, 3], &[2, 3])));
+        let (mut sink, _active, _bindings, operator_to_node, _regions, _m) = sink(reads, true);
+        sink.last_resync = None;
+
+        sink.on_tick_complete().await.unwrap();
+
+        let rev = operator_to_node.read().unwrap();
+        assert_eq!(rev.get(&addr(2)).copied(), Some(nid(2)));
+        assert_eq!(rev.get(&addr(3)).copied(), Some(nid(3)));
+        assert_eq!(rev.len(), 2, "one entry per registered operator");
     }
 
     /// A failed read must leave the previous projections intact. Emptying the
@@ -975,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn resync_failure_keeps_the_previous_projections() {
         let reads = StubReads::new(Ok(None)).with_snapshot(Err("rpc down"));
-        let (mut sink, active, _bindings, _regions, _m) = sink(reads, true);
+        let (mut sink, active, _bindings, _op, _regions, _m) = sink(reads, true);
         with_write(&active, "t", |set| {
             set.insert(nid(1));
         });
@@ -994,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn resync_is_cadence_gated() {
         let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
-        let (mut sink, active, _bindings, _regions, _m) = sink(reads, true);
+        let (mut sink, active, _bindings, _op, _regions, _m) = sink(reads, true);
         // `sink()` stamps `last_resync` to now, so nothing is due yet.
         sink.on_tick_complete().await.unwrap();
         assert!(
@@ -1008,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn failed_resync_still_stamps_the_clock() {
         let reads = StubReads::new(Ok(None)).with_snapshot(Err("rpc down"));
-        let (mut sink, _active, _bindings, _regions, _m) = sink(reads, true);
+        let (mut sink, _active, _bindings, _op, _regions, _m) = sink(reads, true);
         sink.last_resync = None;
 
         sink.on_tick_complete().await.unwrap();

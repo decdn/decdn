@@ -328,6 +328,12 @@ fn build_config(
         },
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,
+            origin_directory_positive_ttl_sec:
+                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC,
+            origin_directory_negative_ttl_sec:
+                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC,
+            origin_directory_cache_capacity:
+                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY,
             publisher_registry_address: None,
             rpc_url,
             eth_keystore: keystore_path,
@@ -340,7 +346,6 @@ fn build_config(
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
-            buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
             // No on-chain approval tx at bring-up: keeps the (unregistered,
             // gas-funded-but-otherwise-inert) node's boot path chain-write-free.

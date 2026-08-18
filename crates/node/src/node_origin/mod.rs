@@ -268,17 +268,16 @@ pub struct NodeOriginConfig {
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
-    /// Desired deposit for a freshly-opened buyer channel
-    /// (`blockchain.buyer_initial_deposit_micro_usdc`); opens at the small initial
-    /// deposit rather than the working target. Ignored when a channel is reused.
-    pub deposit_hint: U256,
-    /// The larger graduation target a mid-pull reactive top-up raises an exhausted
-    /// channel toward (`blockchain.buyer_working_deposit_micro_usdc`, #1530).
+    /// The deposit a freshly-opened buyer channel escrows, and the target a
+    /// mid-pull reactive top-up raises an exhausted channel toward
+    /// (`blockchain.buyer_working_deposit_micro_usdc`, #1530). The proactive
+    /// low-water refill (`crate::buyer_channel::refill_decision`) targets the
+    /// same deposit; the two legs differ only in what triggers them.
     ///
-    /// `U256::ZERO` disables the reactive top-up entirely, matching the same
-    /// `0`-disables sentinel the proactive low-water refill uses
-    /// (`crate::buyer_channel::refill_decision`). The two legs graduate to the same
-    /// target; they differ only in what triggers them.
+    /// `U256::ZERO` disables the reactive top-up entirely. Config never resolves
+    /// to zero (the resolver rejects it), but the value flows into the paid leg's
+    /// [`decdn_client_pull::driver::DriveConfig`], where zero switches the
+    /// pacer's reactive arm off.
     pub working_deposit: U256,
     /// How often this node's chain watcher polls for events
     /// (`blockchain.event_poll_interval_ms`), used to size the post-top-up settle
@@ -654,11 +653,7 @@ impl NodeOrigin {
             // channel is reused if it lands. It is deliberately the smaller budget —
             // this stage and the stream open below are sequential, and
             // `outer_pull_deadline` has to cover both for every candidate.
-            .open_or_reuse_pool(
-                provider_addr,
-                deps.config.deposit_hint,
-                crate::selection::CHANNEL_OPEN_CALLER_BUDGET,
-            )
+            .open_or_reuse_pool(provider_addr, crate::selection::CHANNEL_OPEN_CALLER_BUDGET)
             .await
         {
             Ok(ctx) => ctx,
@@ -1206,7 +1201,7 @@ async fn discover(
     )
     .await;
     if providers.is_empty() {
-        deps.origin_directory.lookup_origins(namespace_id)
+        deps.origin_directory.lookup_origins(namespace_id).await
     } else {
         providers
     }
@@ -1726,11 +1721,7 @@ async fn pull_from_candidate(
     let ctx = match deps
         .buyer
         // Same channel-open bound as the window path (#1143) — see there.
-        .open_or_reuse_pool(
-            provider_addr,
-            deps.config.deposit_hint,
-            crate::selection::CHANNEL_OPEN_CALLER_BUDGET,
-        )
+        .open_or_reuse_pool(provider_addr, crate::selection::CHANNEL_OPEN_CALLER_BUDGET)
         .await
     {
         Ok(ctx) => ctx,

@@ -727,7 +727,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     dht_rate_limiter: Arc<DhtRateLimiter>,
     record_store: Arc<std::sync::Mutex<RecordStore>>,
     origin_directory: Arc<dyn crate::dht::origin::OriginDirectory>,
-    origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
     region_accountant: Arc<crate::region_accounting::RegionAccountant>,
@@ -837,6 +836,11 @@ async fn build_chain_and_handlers(
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
     let staker_set: Arc<dyn StakerSet> = registry.staker_set;
     let registry_regions = Arc::clone(&registry.regions);
+    // The shared `operator address → NodeId` reverse projection (#1110), kept
+    // current by the same registry watcher. The lazy `ChainOriginDirectory`
+    // resolves against it directly rather than maintaining its own binding
+    // cache.
+    let operator_to_node = Arc::clone(&registry.operator_to_node);
     // The shared registry watcher, held for the ordered graceful stop below (it
     // cancels *after* `router.shutdown`, as its staker set gates DHT admission
     // during drain). Also held inside both façades' projections.
@@ -949,43 +953,34 @@ async fn build_chain_and_handlers(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Origin directory shared by two consumers so "authorized origin" means
-    // the same thing everywhere: the reactive pull-through authorized-origin
-    // gate (#821, ADR 037), and the node-origin FIND_VALUE last-resort fallback
-    // used when the DHT returns no providers (ADR 022 §FIND_VALUE Flow; #912).
-    // Both consume one `Arc` so the chain directory backs the fallback for every
-    // node. When the operator configures the OriginAssignment + PublisherRegistry
-    // addresses, use the chain-backed `ChainOriginDirectory` — a live, event-fed
-    // cache resolving hash → namespace → authorized origin → active NodeId,
-    // reusing the already-bootstrapped `staker_set` for operator liveness.
-    // Without those addresses this is an `EmptyOriginDirectory`: the gate rejects
-    // every hash and the FIND_VALUE fallback resolves nothing (same prior behavior).
-    // The chain-backed directory's watcher handle, captured before the `Arc<dyn>`
-    // coercion so the ordered graceful stop below can `shutdown()` it. There is
-    // no cursor to flush afterwards — the namespace set is re-read from chain on
-    // every boot. `None` on the config fallback, which has no watcher.
-    let (origin_directory, origin_watcher): (
-        Arc<dyn crate::dht::origin::OriginDirectory>,
-        Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
-    ) = if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
-        let origin_assignment_addr =
-            parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-        let directory = crate::dht::ChainOriginDirectory::bootstrap(
-            ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-            origin_assignment_addr,
-            capacity_bond_addr,
-            event_poll_interval,
-            Arc::clone(&head),
-            Arc::clone(&staker_set),
-            Arc::clone(&infra.node_metrics),
-        )
-        .await
-        .context("ChainOriginDirectory bootstrap")?;
-        let origin_watcher = directory.watcher();
-        (Arc::new(directory), Some(origin_watcher))
-    } else {
-        (Arc::new(crate::dht::origin::EmptyOriginDirectory), None)
-    };
+    // Origin directory with a single consumer: the node-origin FIND_VALUE
+    // last-resort fallback used when the DHT returns no providers (ADR 022
+    // §FIND_VALUE Flow; #912). When the operator configures the
+    // OriginAssignment + PublisherRegistry addresses, use the chain-backed
+    // `ChainOriginDirectory` — a lazy TTL cache resolving hash → namespace →
+    // authorized origin → active NodeId on demand, reusing the
+    // already-bootstrapped `staker_set` and `operator_to_node` reverse
+    // projection for operator liveness and binding. No bootstrap RPC: the
+    // cache populates on the first lookup miss per namespace.
+    // Without those addresses this is an `EmptyOriginDirectory`: the FIND_VALUE
+    // fallback resolves nothing.
+    let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> =
+        if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
+            let origin_assignment_addr =
+                parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
+            Arc::new(crate::dht::ChainOriginDirectory::new(
+                ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+                origin_assignment_addr,
+                Arc::clone(&operator_to_node),
+                Arc::clone(&staker_set),
+                cfg.blockchain.origin_directory_cache_capacity,
+                Duration::from_secs(cfg.blockchain.origin_directory_positive_ttl_sec),
+                Duration::from_secs(cfg.blockchain.origin_directory_negative_ttl_sec),
+                Arc::clone(&infra.node_metrics),
+            ))
+        } else {
+            Arc::new(crate::dht::origin::EmptyOriginDirectory)
+        };
     let dht_handler = Arc::new(DhtHandler::new(
         infra.secret_key.public(),
         Arc::clone(&dht_rate_limiter),
@@ -1175,15 +1170,14 @@ async fn build_chain_and_handlers(
     client_deps.floor_loss_store =
         Some(Arc::clone(&infra.concrete_channel_store)
             as Arc<dyn decdn_incentive::PoolFloorLossStore>);
-    // Cached `getPool` view (owner + remaining) for the floor-`M` solvency gate
-    // and the ADR 011 funder gate. Read-only provider — the serve gates never
-    // write — with a short TTL so a request burst against one pool costs at most
-    // one RPC per interval.
-    client_deps.pool_view = Some(Arc::new(crate::pool_view::ChainPoolView::new(
-        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-        payment_pool_addr,
-        Duration::from_millis(cfg.blockchain.event_poll_interval_ms),
-    )) as Arc<dyn crate::pool_view::PoolView>);
+    // Event-fed pool view (owner + remaining) for the floor-`M` solvency gate and
+    // the ADR 011 funder gate. The settlement watcher below folds every
+    // `PaymentPool` event into this projection, so a serve request reads
+    // `{owner, remaining}` in-memory — no per-serve `getPool` `eth_call`. The same
+    // instance is handed to the settlement service (its watcher is the writer).
+    let pool_view = crate::pool_view::PoolProjection::new();
+    client_deps.pool_view =
+        Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>);
     client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
     client_deps.region_accountant = Some(Arc::clone(&region_accountant));
     client_deps.local_populate = local_populate;
@@ -1241,6 +1235,7 @@ async fn build_chain_and_handlers(
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
+        pool_view,
         redeem_tx,
         redeem_rx,
     )
@@ -1327,7 +1322,6 @@ async fn build_chain_and_handlers(
         dht_rate_limiter,
         record_store,
         origin_directory,
-        origin_watcher,
         dht_handler,
         dht_routing,
         region_accountant,
@@ -1785,7 +1779,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
     let buyer_voucher_domain = ch.voucher_domain.clone();
-    let buyer_initial_deposit = U256::from(cfg.blockchain.buyer_initial_deposit_micro_usdc);
     let buyer_working_deposit = U256::from(cfg.blockchain.buyer_working_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = infra.eth_signer.address();
@@ -1805,12 +1798,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        // Miss pulls open small and graduate on proof (#1497): the
-        // fresh-open deposit is the INITIAL size, not the working target.
-        deposit_hint: buyer_initial_deposit,
-        // ...and graduate to the working target when a single pull outruns that
-        // initial deposit mid-stream (#1530). Same target the proactive low-water
-        // refill uses; `0` disables the reactive leg.
+        // Miss pulls open at the working deposit and graduate to it on a mid-pull
+        // reactive top-up when a single pull outruns the deposit (#1530). The
+        // proactive low-water refill targets the same deposit.
         working_deposit: buyer_working_deposit,
         event_poll_interval: std::time::Duration::from_millis(
             cfg.blockchain.event_poll_interval_ms,
@@ -1847,7 +1837,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 buyer_channel_store,
                 eth_signer_for_buyer,
                 buyer_voucher_domain,
-                buyer_initial_deposit,
                 buyer_working_deposit,
                 buyer_ensure_max_approval,
                 node_metrics_for_buyer,
@@ -2118,7 +2107,6 @@ pub async fn run(
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
         blacklist_watcher: ch.blacklist_watcher,
         rate_bounds_watcher: ch.rate_bounds_watcher,
-        origin_watcher: ch.origin_watcher,
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
         capacity_bond_watcher: ch.capacity_bond_watcher,
@@ -2156,7 +2144,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
-    origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
     capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
@@ -2200,7 +2187,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         bucket_refresh_stop_tx,
         blacklist_watcher,
         rate_bounds_watcher,
-        origin_watcher,
         mut admin_stop_tx,
         rpc_watchdog,
         capacity_bond_watcher,
@@ -2258,14 +2244,11 @@ async fn shutdown<P: Provider + Clone + 'static>(
     blacklist_watcher.shutdown();
     // Rate-bounds watcher (#1172): read-only, no cursor to flush — just cancel.
     rate_bounds_watcher.shutdown();
-    if let Some(watcher) = &origin_watcher {
-        watcher.shutdown();
-    }
-    // No origin cursor to flush: the directory re-reads its namespace set from
-    // chain on every boot, so there is no scan progress a lost flush could cost.
-    // The blacklist watcher is the same shape — it re-enumerates the deny-set
-    // from chain on every boot and its live tail carries no durable cursor — so
-    // there is nothing to flush here either.
+    // The origin directory has no watcher and no cursor to flush: it is a lazy,
+    // on-demand cache with no background task to stop. The blacklist watcher is
+    // the same shape re its own cursor — it re-enumerates the deny-set from
+    // chain on every boot and its live tail carries no durable cursor — so
+    // there is nothing to flush there either.
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -3547,6 +3530,12 @@ mod tests {
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
+                origin_directory_positive_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC,
+                origin_directory_negative_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC,
+                origin_directory_cache_capacity:
+                    decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY,
                 publisher_registry_address: None,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
@@ -3559,7 +3548,6 @@ mod tests {
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
-                buyer_initial_deposit_micro_usdc: 10_000_000,
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,

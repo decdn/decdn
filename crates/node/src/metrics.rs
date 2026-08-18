@@ -1013,9 +1013,9 @@ pub struct DecdnMetrics {
     /// resumed at the paid frontier.
     ///
     /// Expected to be RARE once `buyer_working_deposit_micro_usdc` is sized for the
-    /// blobs this node pulls — the proactive low-water refill should graduate a
+    /// blobs this node pulls — the proactive low-water refill should refill a
     /// channel long before a single pull outruns it. A sustained rate means the
-    /// initial deposit is too small for the blob sizes in play, and every tick is a
+    /// working deposit is too small for the blob sizes in play, and every tick is a
     /// transaction plus a settlement wait a client sat through.
     ///
     /// Distinct from `decdn_buyer_topup_ok_total`, which counts on-chain top-ups from
@@ -1092,34 +1092,16 @@ pub struct DecdnMetrics {
     /// never bumps this counter, which is what lets a test or dashboard tell
     /// the two fill strategies apart deterministically instead of by timing.
     pub local_outboard_serves: Counter,
-    /// `decdn_origin_directory_watcher_restarts_total` (#651): distinct drift
-    /// windows the [`crate::dht::chain_origin_directory`] watcher has entered.
-    /// Same semantics as `staker_set_watcher_restarts` — bumped once on the
-    /// transition into the error/backoff state, not per backoff iteration.
-    /// During such a window the cached `namespace → operator` directory can
-    /// drift from chain state, and the pull-through authorized-origin gate reads
-    /// that cache, so sustained restarts gate real pull-through demand. The
-    /// `OpenMetrics` encoder appends the `_total` suffix.
-    pub origin_directory_watcher_restarts: Counter,
-    /// `decdn_origin_directory_watcher_resolve_failures_total` (#651): times a
-    /// `getOrigins` for a namespace that just seated an origin OR a `nodeIdOf(operator)`
-    /// binding lookup failed, leaving an operator unmapped (and so unresolvable
-    /// as an origin) until a later event re-surfaces it. Does not trip a
-    /// backoff, so without this counter it would move no metric. Pairs with the
-    /// per-failure `warn!` in `chain_origin_directory`.
-    pub origin_directory_watcher_resolve_failures: Counter,
-    /// `decdn_origin_directory_watcher_down_seconds` (#651): true downtime —
-    /// seconds the origin-directory watcher has been in the error/backoff state,
-    /// i.e. failing its `eth_getLogs` poll tick. Reads `0` for the life of any established
-    /// cycle; recomputed at scrape time from a monotonic `down_since`. A
-    /// poisoned lock reports `i64::MAX` (alerting direction).
-    pub origin_directory_watcher_down_seconds: Gauge,
-    /// `decdn_origin_directory_operator_count` (#651): distinct operator
-    /// addresses currently authorised as origins — the union of every namespace's
-    /// operator set. Recomputed and sampled after every event that
-    /// mutates an authorised set, so it rises on activate and falls on
-    /// revoke/prune/replace (unlike the monotonic binding cache).
-    pub origin_directory_operator_count: Gauge,
+    /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
+    /// lookups that failed on a cold-namespace cache miss. The directory fails
+    /// closed on each (resolves no origins for that request, does not cache
+    /// the failure), so this is the drift signal to alert on — sustained
+    /// failures mean real requests are silently losing their origin fallback.
+    pub origin_directory_get_origins_failures: Counter,
+    /// `decdn_origin_directory_cache_size`: current namespace count held in
+    /// the lazy origin directory cache (positive + negative entries).
+    /// Bounded by the configured cache capacity (LRU eviction).
+    pub origin_directory_cache_size: Gauge,
     /// Paid-delivery (`serve_stream`) requests refused because the blob was
     /// deliberately evicted between probe and stream (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because a plain counter
@@ -1277,9 +1259,6 @@ pub struct DecdnMetrics {
     /// of the staker-set watcher's last successful poll tick. Staleness
     /// semantics as `slash_watcher_last_tick_timestamp_seconds`.
     pub staker_set_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_origin_directory_watcher_last_tick_timestamp_seconds` (#1316): Unix
-    /// time of the origin-directory watcher's last successful poll tick.
-    pub origin_directory_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_blacklist_watcher_last_tick_timestamp_seconds` (#1316, #1320): Unix
     /// time of the blacklist watcher's last successful poll tick. This is the
     /// signal that distinguishes a live blacklist loop from a dead one — a dead
@@ -1306,9 +1285,6 @@ pub struct DecdnMetrics {
     /// `decdn_staker_set_watcher_task_panicked_total` (#1316): the staker-set
     /// watcher task unwound on a panic. See `slash_watcher_task_panicked`.
     pub staker_set_watcher_task_panicked: Counter,
-    /// `decdn_origin_directory_watcher_task_panicked_total` (#1316): the
-    /// origin-directory watcher task unwound on a panic.
-    pub origin_directory_watcher_task_panicked: Counter,
     /// `decdn_blacklist_watcher_task_panicked_total` (#1316, #1283): the
     /// blacklist watcher task unwound on a panic.
     pub blacklist_watcher_task_panicked: Counter,
@@ -1378,11 +1354,6 @@ pub struct Metrics {
     /// `i64::MAX` down-seconds (the conservative, alerting direction for a
     /// downtime gauge — reporting `0` would mask an in-progress outage).
     staker_set_watcher_down_since: Mutex<Option<Instant>>,
-    /// Monotonic instant at which the origin-directory watcher entered its
-    /// current error/backoff window (#651). `None` whenever a cycle is
-    /// established. Backs the `origin_directory_watcher_down_seconds` gauge,
-    /// recomputed at scrape time. Mirrors `staker_set_watcher_down_since`.
-    origin_directory_watcher_down_since: Mutex<Option<Instant>>,
     /// `Instant` the slash-detection watcher entered its current error/backoff
     /// window (#1032). `None` whenever a cycle is established. Backs the
     /// `slash_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
@@ -1480,7 +1451,6 @@ impl Metrics {
             probe_hold_stake_lane_reserved,
             started_at: Instant::now(),
             staker_set_watcher_down_since: Mutex::new(None),
-            origin_directory_watcher_down_since: Mutex::new(None),
             slash_watcher_down_since: Mutex::new(None),
             blacklist_watcher_down_since: Mutex::new(None),
             settlement_watcher_down_since: Mutex::new(None),
@@ -1622,9 +1592,9 @@ impl Metrics {
         self.decdn.node_uptime_seconds.set(uptime);
 
         // Recompute the per-watcher down-seconds gauges from their `down_since`,
-        // mirroring `uptime_seconds` above (staker_set #783, origin_directory
-        // #651, slash #1032). See `refresh_watcher_down_seconds` for the
-        // healthy-vs-outage and poisoned-lock semantics.
+        // mirroring `uptime_seconds` above (staker_set #783, slash #1032). See
+        // `refresh_watcher_down_seconds` for the healthy-vs-outage and
+        // poisoned-lock semantics.
         self.refresh_watcher_down_seconds();
 
         let reg = self
@@ -1685,7 +1655,7 @@ macro_rules! recorders {
 
 /// Generate the per-watcher downtime recorders on [`Metrics`].
 ///
-/// The three chain watchers (`slash`, `staker_set`, `origin_directory`) share
+/// The chain watchers (`slash`, `staker_set`, `blacklist`, `settlement`) share
 /// one downtime state machine: a `*_backoff_started` recorder that, on the
 /// `None -> Some` edge into an error window, stamps the watcher's
 /// `Mutex<Option<Instant>>` `down_since` field and bumps its `*_restarts`
@@ -2168,19 +2138,16 @@ recorders! {
     /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
     node_pull_through_error => node_pull_through_errors.inc();
 
-    /// A `getOrigins` / `nodeIdOf` resolution failed, leaving an operator
-    /// unmapped in the origin directory (#651). Bumps
-    /// `origin_directory_watcher_resolve_failures_total`.
-    origin_directory_watcher_resolve_failure => origin_directory_watcher_resolve_failures.inc();
+    /// A `getOrigins` lookup failed on a cold-namespace cache miss in the lazy
+    /// origin directory. The lookup fails closed (resolves no origins for
+    /// that request) and the failure is not cached, so this is the drift
+    /// signal to alert on.
+    origin_directory_get_origins_failure => origin_directory_get_origins_failures.inc();
 
-
-    /// Publish the count of distinct operator addresses currently authorised as
-    /// origins — the union of every namespace's operator set (#651). Falls on
-    /// revoke/prune/replace, unlike the monotonic `operator → NodeId` binding
-    /// cache. The caller
-    /// recomputes this (`authorized_operator_count`) after each set mutation.
-    origin_directory_operator_count(count: usize)
-        => origin_directory_operator_count.set(sat(count));
+    /// Publish the current namespace count held in the lazy origin directory
+    /// cache (positive + negative entries), after an insert.
+    origin_directory_cache_size(count: usize)
+        => origin_directory_cache_size.set(sat(count));
     connection_opened => active_connections.inc();
     connection_closed => active_connections.dec();
 
@@ -2297,8 +2264,6 @@ recorders! {
     slash_watcher_tick => slash_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
     staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the origin-directory watcher's liveness gauge (#1316).
-    origin_directory_watcher_tick => origin_directory_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the blacklist watcher's liveness gauge (#1316, #1320).
     blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the payment-settlement watcher's liveness gauge (#1316).
@@ -2314,8 +2279,6 @@ recorders! {
     slash_watcher_task_panicked => slash_watcher_task_panicked.inc();
     /// Record that the staker-set watcher task unwound on a panic (#1316).
     staker_set_watcher_task_panicked => staker_set_watcher_task_panicked.inc();
-    /// Record that the origin-directory watcher task unwound on a panic (#1316).
-    origin_directory_watcher_task_panicked => origin_directory_watcher_task_panicked.inc();
     /// Record that the blacklist watcher task unwound on a panic (#1316, #1283).
     blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
     /// Record that the rate-bounds watcher task unwound on a panic (#1172).
@@ -2369,18 +2332,6 @@ watcher_downtime_recorders! {
     down_since: staker_set_watcher_down_since,
     restarts: staker_set_watcher_restarts,
     down_seconds: staker_set_watcher_down_seconds;
-
-    /// An origin-directory watcher poll tick errored and the loop is
-    /// about to back off (#651). Mirrors `staker_set_watcher_backoff_started`:
-    /// stamps `down_since` and counts exactly one restart per drift window.
-    origin_directory_watcher_backoff_started,
-    /// Mark the origin-directory watcher's poll cycle as established
-    /// (#651): clears `down_since` so `origin_directory_watcher_down_seconds`
-    /// reads `0` for the life of this cycle.
-    origin_directory_watcher_cycle_established,
-    down_since: origin_directory_watcher_down_since,
-    restarts: origin_directory_watcher_restarts,
-    down_seconds: origin_directory_watcher_down_seconds;
 
     /// The blacklist watcher's poll tick errored and the loop is about to back
     /// off (#1283). Stamps `blacklist_watcher_down_since` once per drift window so
@@ -3631,54 +3582,11 @@ mod tests {
     }
 
     #[test]
-    fn origin_directory_watcher_down_seconds_tracks_true_downtime() {
-        // Mirrors the staker-set and slash guards for the origin-directory
-        // watcher (#651): the gauge measures downtime, not cycle age, so a long
-        // healthy cycle reads 0, a backoff window climbs, and re-establishing
-        // clears it. Also confirms the shared `refresh_watcher_down_seconds`
-        // recompute fires for the third watcher (#1266).
-        let mut metrics = Metrics::new();
-        metrics.started_at = Instant::now()
-            .checked_sub(Duration::from_hours(1))
-            .unwrap_or_else(Instant::now);
-        metrics.origin_directory_watcher_cycle_established();
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
-            "down-seconds must read 0 across a long healthy cycle:\n{text}"
-        );
-
-        metrics.origin_directory_watcher_backoff_started();
-        if let Ok(mut down_since) = metrics.origin_directory_watcher_down_since.lock() {
-            *down_since = Instant::now().checked_sub(Duration::from_secs(150));
-        }
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 150),
-            "down-seconds should climb to the downtime depth once in backoff:\n{text}"
-        );
-        // The restart counter bumps exactly once per drift window (edge-triggered).
-        metrics.origin_directory_watcher_backoff_started();
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_origin_directory_watcher_restarts_total", 1),
-            "restarts must bump once per drift window, not per call:\n{text}"
-        );
-
-        metrics.origin_directory_watcher_cycle_established();
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
-            "down-seconds should reset to 0 once the cycle re-establishes:\n{text}"
-        );
-    }
-
-    #[test]
     #[allow(clippy::panic)] // deliberately poison the lock, mirroring `dispatch::tests`.
     fn poisoned_down_since_reports_i64_max_not_zero() {
         // The load-bearing invariant of the down-seconds gauges: a poisoned
         // `down_since` must report `i64::MAX`, never `0`, because reporting `0`
-        // would MASK an in-progress outage (#783/#651/#1032). The three watchers'
+        // would MASK an in-progress outage (#783/#1032). The watchers'
         // scrape recompute goes through one shared `refresh_watcher_down_seconds`
         // template, so poisoning any single lock exercises that conservative-alerting
         // fallback for all of them.
@@ -3705,10 +3613,6 @@ mod tests {
             has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
             "a poisoned slash lock must not perturb the staker-set gauge:\n{text}"
         );
-        assert!(
-            has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
-            "a poisoned slash lock must not perturb the origin-directory gauge:\n{text}"
-        );
         // The watchers brought to down-family parity (#1283/#1316) share
         // the same recompute row, so they too read a clean 0 under the poison.
         for name in [
@@ -3733,7 +3637,6 @@ mod tests {
 
         metrics.slash_watcher_tick();
         metrics.staker_set_watcher_tick();
-        metrics.origin_directory_watcher_tick();
         metrics.blacklist_watcher_tick();
         metrics.settlement_watcher_tick();
 
@@ -3741,7 +3644,6 @@ mod tests {
         for name in [
             "decdn_slash_watcher_last_tick_timestamp_seconds",
             "decdn_staker_set_watcher_last_tick_timestamp_seconds",
-            "decdn_origin_directory_watcher_last_tick_timestamp_seconds",
             "decdn_blacklist_watcher_last_tick_timestamp_seconds",
             "decdn_settlement_watcher_last_tick_timestamp_seconds",
         ] {
