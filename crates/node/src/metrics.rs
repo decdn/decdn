@@ -671,7 +671,7 @@ pub struct DecdnMetrics {
     /// reservation (#757) and the DHT `Store` admission path both read that
     /// cached set, sustained restarts are revenue-impacting, not just a
     /// discovery-health blip. The loop-level `tracing::warn!` in
-    /// `resumable_watcher::run` (`"watcher RPC error; restarting after backoff"`)
+    /// `multiplexed_poller::run` (`"watcher RPC error; restarting after backoff"`)
     /// is emitted in the same failed-tick `Err` arm that fires the `on_backoff`
     /// hook this counter hangs off, and carries the underlying error; this
     /// counter is the alertable rate. An idle poll tick (head has not advanced /
@@ -1278,7 +1278,7 @@ pub struct DecdnMetrics {
     /// load-bearing bounds. Alert on this gauge going stale.
     pub rate_bounds_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_slash_watcher_task_panicked_total` (#1316): the slash watcher task
-    /// unwound on a panic. Bumped from a `Drop` guard in `resumable_watcher::run`
+    /// unwound on a panic. Bumped from a `Drop` guard in `multiplexed_poller::run`
     /// — the only thing that still runs on the unwind, since nothing awaits the
     /// detached task. Any non-zero value is a bug in this node.
     pub slash_watcher_task_panicked: Counter,
@@ -1910,7 +1910,7 @@ recorders! {
     /// #751), in `SettlementSink::apply` (`payment_settlement.rs`). Only the
     /// `forget_channel` arm is swallowed, and it carries the sole per-site
     /// `warn!` ("failed to forget settled channel"); the other arms return `Err`,
-    /// so their context surfaces in `resumable_watcher::run`'s loop-level
+    /// so their context surfaces in `multiplexed_poller::run`'s loop-level
     /// `warn!` ("watcher RPC error; restarting after backoff") instead.
     watcher_persist_failure => watcher_persist_failures.inc();
 
@@ -2275,7 +2275,7 @@ recorders! {
     rate_bounds_watcher_tick => rate_bounds_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
 
     /// Record that the slash watcher task unwound on a panic (#1316). Bumped from
-    /// the `Drop` guard in `resumable_watcher::run` via the `on_task_panic` hook.
+    /// the `Drop` guard in `multiplexed_poller::run` via the `on_task_panic` hook.
     slash_watcher_task_panicked => slash_watcher_task_panicked.inc();
     /// Record that the staker-set watcher task unwound on a panic (#1316).
     staker_set_watcher_task_panicked => staker_set_watcher_task_panicked.inc();
@@ -2317,7 +2317,7 @@ watcher_downtime_recorders! {
     /// rather than panicking (anti-panic policy); the gauge's poison fallback
     /// (`i64::MAX`) still keeps the alert tripped. This method is the
     /// `on_backoff` hook wired in [`crate::dht::chain_staker_set`]; it pairs with
-    /// the loop-level `warn!` in `resumable_watcher::run` (`"watcher RPC error;
+    /// the loop-level `warn!` in `multiplexed_poller::run` (`"watcher RPC error;
     /// restarting after backoff"`).
     staker_set_watcher_backoff_started,
     /// Mark the staker-set watcher's poll cycle as established (#783,

@@ -42,10 +42,10 @@
 //!   outstanding vouchers.
 //!
 //! Buyer-side `openPool`/`topUp`/`reclaim` (node→node cache-miss pulls) is out of
-//! scope here. Structurally this mirrors [`crate::dht::chain_staker_set`]: a
-//! generic-over-`Provider` struct owning background tasks with exponential-backoff
-//! poll retry — the paid-watermark watcher via its `WatcherHandle`, the redeemer
-//! via a [`JoinHandle`] aborted on shutdown or drop.
+//! scope here. The paid-watermark watcher is a [`Route`] the runtime registers on
+//! the shared multiplexed poller (which owns the loop, cursor, and shutdown); the
+//! service itself owns only the redeemer [`JoinHandle`], aborted on shutdown or
+//! drop.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Log};
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
@@ -68,10 +68,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::REORG_MARGIN_BLOCKS;
-use crate::chain_events::resumable_watcher::{
-    self, Checkpoint, ColdStart, CursorStart, LogSink, WatcherConfig, WatcherHandle,
-};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::multiplexed_poller::{Route, SinkSource};
+use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart, LogSink};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
@@ -225,22 +223,17 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     redeem_threshold: U256,
     redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
-    /// The paid-watermark watcher, owning both its task and the shutdown token
-    /// that stops it. Held (not `_`-dropped) so graceful `shutdown()` runs before
-    /// the wrapped `AbortOnDrop` hard-stops the task.
-    watcher: WatcherHandle,
     /// The redemption task handle. Held so shutdown can abort+await it before a
     /// final redeem sweep. `take()`n by [`Self::quiesce_redeemer`]; the [`Drop`]
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
     /// is only ever held to `take()` the handle, never across an `.await`.
     redeemer: std::sync::Mutex<Option<JoinHandle<()>>>,
-    /// Held so graceful shutdown can force a final checkpoint flush (#784).
-    checkpoint_store: Arc<dyn KeyedCheckpointStore>,
 }
 
 impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
-    /// Bootstrap the service: self-check the contract, then spawn the
-    /// paid-watermark watcher + redemption task.
+    /// Bootstrap the service: self-check the contract, spawn the redemption
+    /// task, and return the service alongside the paid-watermark [`Route`] the
+    /// runtime registers on the shared multiplexed poller.
     ///
     /// # Errors
     ///
@@ -258,13 +251,11 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         redeem_threshold: U256,
         redeem_max_vouchers_per_tx: usize,
         redeem_interval: Duration,
-        event_poll_interval: Duration,
-        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
         pool_view: PoolProjection,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Route)> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
 
         // Startup self-check: a cheap immutable view confirms the configured
@@ -301,35 +292,39 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             metrics: Arc::clone(&metrics),
             pool_view,
         };
-        let cfg = WatcherConfig::new(
-            head,
-            Filter::new()
-                .address(payment_pool_addr)
-                .event_signature(vec![
-                    PaymentPool::PoolOpened::SIGNATURE_HASH,
-                    PaymentPool::PoolRedeemed::SIGNATURE_HASH,
-                    PaymentPool::PoolToppedUp::SIGNATURE_HASH,
-                    PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
-                    PaymentPool::PoolReclaimed::SIGNATURE_HASH,
-                ]),
-            cursor_start(Arc::clone(&checkpoint_store)),
-            event_poll_interval,
-            "settlement",
-        )
-        .on_established(metric_hook(
-            &metrics,
-            Metrics::settlement_watcher_cycle_established,
-        ))
-        .on_backoff(metric_hook(
-            &metrics,
-            Metrics::settlement_watcher_backoff_started,
-        ))
-        .on_tick_success(metric_hook(&metrics, Metrics::settlement_watcher_tick))
-        .on_task_panic(metric_hook(
-            &metrics,
-            Metrics::settlement_watcher_task_panicked,
-        ));
-        let watcher = resumable_watcher::spawn(contract.provider().clone(), cfg, move |_| sink);
+        let route = Route {
+            addresses: vec![payment_pool_addr],
+            topic0s: vec![
+                PaymentPool::PoolOpened::SIGNATURE_HASH,
+                PaymentPool::PoolRedeemed::SIGNATURE_HASH,
+                PaymentPool::PoolToppedUp::SIGNATURE_HASH,
+                PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
+                PaymentPool::PoolReclaimed::SIGNATURE_HASH,
+            ],
+            // The durable `PoolOpened` checkpoint resumes across restarts; a
+            // first-ever boot (cold store) anchors at head. The poller flushes
+            // this checkpoint on shutdown (via `CursorStart::flush`), the same
+            // flush the service used to perform itself.
+            start: cursor_start(Arc::clone(&checkpoint_store)),
+            // This sink observes no shutdown token, so it registers a `Ready`
+            // sink; its own follow-up reads/writes ride the wallet contract it
+            // holds, independent of the poller's read-only get_logs provider.
+            sink: SinkSource::Ready(Box::new(sink)),
+            label: "settlement",
+            on_established: Some(metric_hook(
+                &metrics,
+                Metrics::settlement_watcher_cycle_established,
+            )),
+            on_backoff: Some(metric_hook(
+                &metrics,
+                Metrics::settlement_watcher_backoff_started,
+            )),
+            on_tick_success: Some(metric_hook(&metrics, Metrics::settlement_watcher_tick)),
+            on_task_panic: Some(metric_hook(
+                &metrics,
+                Metrics::settlement_watcher_task_panicked,
+            )),
+        };
 
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
@@ -344,20 +339,21 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             Arc::clone(&metrics),
         ));
 
-        Ok(Self {
-            contract,
-            redeem_tx,
-            store,
-            capabilities,
-            paid,
-            self_address,
-            redeem_threshold,
-            redeem_max_vouchers_per_tx,
-            metrics,
-            watcher,
-            redeemer: std::sync::Mutex::new(Some(redeemer)),
-            checkpoint_store,
-        })
+        Ok((
+            Self {
+                contract,
+                redeem_tx,
+                store,
+                capabilities,
+                paid,
+                self_address,
+                redeem_threshold,
+                redeem_max_vouchers_per_tx,
+                metrics,
+                redeemer: std::sync::Mutex::new(Some(redeemer)),
+            },
+            route,
+        ))
     }
 
     /// Sender the voucher-accept path uses to hint that a lane's accrued claim
@@ -369,14 +365,17 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         self.redeem_tx.clone()
     }
 
-    /// Graceful shutdown: stop the watcher, flush the scan checkpoint, quiesce the
-    /// redeemer, then run one final best-effort redeem sweep bounded by `deadline`
-    /// so a lane whose chunk has cleared the floor is not left un-redeemed across
-    /// the stop. A pool is owner-closed only, so there is nothing to close here —
-    /// only redeem.
+    /// Graceful shutdown: quiesce the redeemer, then run one final best-effort
+    /// redeem sweep bounded by `deadline` so a lane whose chunk has cleared the
+    /// floor is not left un-redeemed across the stop. A pool is owner-closed only,
+    /// so there is nothing to close here — only redeem.
+    ///
+    /// The paid-watermark watcher is now the shared multiplexed poller's route,
+    /// not a service-owned task: the runtime cancels the poller (which flushes
+    /// this route's `PoolOpened` scan checkpoint via `CursorStart::flush`) before
+    /// calling this, so the tail is already stopped and the checkpoint already
+    /// flushed when the final sweep runs.
     pub async fn shutdown(&self, deadline: Duration) {
-        self.watcher.shutdown();
-        self.flush_checkpoint_on_shutdown();
         self.quiesce_redeemer().await;
         if tokio::time::timeout(deadline, self.final_redeem_sweep())
             .await
@@ -408,26 +407,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             &self.metrics,
         )
         .await;
-    }
-
-    /// Force the debounced `PoolRedeemed` scan checkpoint to durable storage
-    /// (#784). Best-effort: a failed flush only widens the next boot's rescan.
-    fn flush_checkpoint_on_shutdown(&self) {
-        if let Err(err) = self
-            .checkpoint_store
-            .flush_checkpoint(CheckpointKey::PoolOpened)
-        {
-            let pending_block = self
-                .checkpoint_store
-                .load_checkpoint(CheckpointKey::PoolOpened)
-                .ok()
-                .flatten();
-            warn!(
-                %err,
-                ?pending_block,
-                "failed to flush settlement watcher scan checkpoint on shutdown"
-            );
-        }
     }
 
     /// Abort and await the redemption task so it issues no *further* `redeem` into

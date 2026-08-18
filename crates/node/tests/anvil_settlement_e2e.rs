@@ -652,7 +652,7 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     let capability_source: Arc<dyn decdn_node::payment_settlement::CapabilitySource> =
         Arc::new(StoredCapabilitySource::new(Arc::clone(&concrete_store)));
-    let service = PoolSettlementService::bootstrap(
+    let (service, settlement_route) = PoolSettlementService::bootstrap(
         node_provider.clone(),
         payment_pool,
         node_addr,
@@ -663,14 +663,25 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         300,
         Duration::from_secs(300),
-        Duration::from_millis(250),
-        e2e_head(&node_provider),
         Arc::clone(&metrics),
         pool_view.clone(),
         redeem_tx,
         redeem_rx,
     )
     .await?;
+    // The paid-watermark watcher is now a route on the shared multiplexed poller,
+    // not a service-owned task. Spawn a single-route poller so the settlement
+    // watcher actually runs (folds `PoolOpened` / `PoolRedeemed` events, drives
+    // the pool projection) as it does in the runtime. The handle is held for the
+    // test's duration; dropping it aborts the poller.
+    let settlement_poller = {
+        use decdn_node::chain_events::multiplexed_poller::{MultiplexedPollerBuilder, spawn};
+        let built =
+            MultiplexedPollerBuilder::new(e2e_head(&node_provider), Duration::from_millis(250))
+                .route(settlement_route)
+                .build()?;
+        spawn(node_provider.clone(), built)
+    };
 
     let (server_ep, server_addr) = local_endpoint(node_iroh_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), Arc::clone(&handler));
@@ -1121,8 +1132,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         "reclaimed pool must be Closed on-chain"
     );
 
-    // Retire the seller service via its graceful-shutdown path (stop the watcher,
-    // flush the checkpoint, quiesce the redeemer, run a final redeem sweep).
+    // Retire the seller service: stop the shared poller (flushes the settlement
+    // route's scan checkpoint), then the service's graceful-shutdown path
+    // (quiesce the redeemer, run a final redeem sweep).
+    settlement_poller.shutdown();
     service.shutdown(Duration::from_secs(30)).await;
 
     client_ep.close().await;

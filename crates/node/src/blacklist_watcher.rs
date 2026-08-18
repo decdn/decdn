@@ -96,7 +96,7 @@ use std::time::Duration;
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Log};
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context as _, Result};
 use decdn_cache::{CacheEngine, Hash};
@@ -111,9 +111,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
-};
+use crate::chain_events::multiplexed_poller::{Route, SinkSource};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
 use crate::content_deny::ContentDenylist;
@@ -632,7 +631,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
 struct RescanOutcome {
     /// `true` iff every entry was re-verified with no failed re-check. A
     /// shutdown-cancelled pass is unclean (`false`); it is decidedly **not** a
-    /// drift window, but that is enforced in `resumable_watcher::run` (which
+    /// drift window, but that is enforced in `multiplexed_poller::run` (which
     /// suppresses the backoff edge under a cancelled token), not here (#1321).
     clean: bool,
     /// Distinct hashes this pass could not enforce (`Recheck::Failed` — a cache
@@ -975,30 +974,33 @@ async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
     }
 }
 
-/// Spawn the blacklist compliance watcher: enumerate the current on-chain deny-set
-/// at one pinned block, enforce it, then follow the live tail seeded at that block.
+/// Enumerate the current on-chain deny-set at one pinned block, enforce it, then
+/// return the [`Route`] that follows the live tail seeded at that block on the
+/// shared multiplexed poller.
 ///
-/// Returns the handle that owns the tail task and its shutdown token. `initial_sync_tx`
-/// fires once the boot enumeration + enforcement pass either completes cleanly
-/// (`Ok`) or cannot enforce every entry (`Err`), so the runtime can gate the ALPN
-/// router on blacklist enforcement being live. A failure to READ the chain at boot
-/// (block or enumeration RPC error) is fatal — it signals `Err` and returns `Err`,
-/// so the router never opens on an un-vetted deny-set. `event_poll_interval` is the
-/// getLogs poll cadence; `rescan_interval` is the batched re-enumeration + re-scope
-/// cadence.
+/// `initial_sync_tx` fires once the boot enumeration + enforcement pass either
+/// completes cleanly (`Ok`) or cannot enforce every entry (`Err`), so the runtime
+/// can gate the ALPN router on blacklist enforcement being live. A failure to
+/// READ the chain at boot (block or enumeration RPC error) is fatal — it signals
+/// `Err` and returns `Err`, so the router never opens on an un-vetted deny-set.
+/// `rescan_interval` is the batched re-enumeration + re-scope cadence.
+///
+/// The returned route carries a [`SinkSource::Factory`]: the blacklist sink must
+/// observe the poller's own shutdown token (its re-scope polls it between per-hash
+/// `eth_call`s), which the poller mints only at spawn — so the sink is built
+/// inside that spawn from the freshly-minted token.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn spawn<P>(
+pub(crate) async fn bootstrap<P>(
     provider: P,
     contract_addr: Address,
     operator: Address,
     cache: CacheEngine,
-    event_poll_interval: Duration,
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
     metrics: &Arc<Metrics>,
     denylist: Arc<ContentDenylist>,
-) -> Result<WatcherHandle>
+) -> Result<Route>
 where
     P: Provider + Clone + 'static,
 {
@@ -1064,9 +1066,31 @@ where
         "blacklist compliance watcher enumerated its boot snapshot"
     );
 
-    let cfg = WatcherConfig::new(
-        head,
-        Filter::new().address(contract_addr).event_signature(vec![
+    let sink_metrics = Arc::clone(metrics);
+    // Unlike the flush-only sinks, `BlacklistSink` must observe the *same* token
+    // the poller cancels: `rescan` polls it between per-hash `eth_call`s so a
+    // large deny-set re-scope yields promptly to shutdown. The poller mints one
+    // token at spawn and hands it to this factory, so sink and loop share it
+    // (#1236).
+    let sink_factory: SinkSource = SinkSource::Factory(Box::new(move |shutdown| {
+        Box::new(BlacklistSink {
+            contract,
+            reads,
+            operator,
+            cache,
+            state,
+            shutdown: shutdown.clone(),
+            rescan_interval: rescan_interval.max(Duration::from_secs(1)),
+            // Boot enumeration + enforcement just ran; first backstop is one
+            // interval out.
+            last_rescan: Some(Instant::now()),
+            metrics: sink_metrics,
+        }) as Box<dyn crate::chain_events::multiplexed_poller::ErasedSink>
+    }));
+
+    Ok(Route {
+        addresses: vec![contract_addr],
+        topic0s: vec![
             HashBlacklisted::SIGNATURE_HASH,
             HashRemoved::SIGNATURE_HASH,
             // Origin blacklisting rides the same scan (ADR 011 § Hash Evasion). It
@@ -1081,50 +1105,29 @@ where
             // enforcing the softer list and missing the voted one.
             OperatorBlacklisted::SIGNATURE_HASH,
             OperatorBlacklistCleared::SIGNATURE_HASH,
-        ]),
+        ],
         // No durable cursor and no historical replay: the boot enumeration rebuilt
         // the whole deny-set, so the tail only follows forward from the snapshot.
-        CursorStart::Seeded {
+        start: CursorStart::Seeded {
             at: snapshot_block,
             persist: None,
         },
-        event_poll_interval.max(Duration::from_secs(1)),
-        "blacklist",
-    )
-    .on_established(metric_hook(
-        metrics,
-        Metrics::blacklist_watcher_cycle_established,
-    ))
-    .on_backoff(metric_hook(
-        metrics,
-        Metrics::blacklist_watcher_backoff_started,
-    ))
-    .on_tick_success(metric_hook(metrics, Metrics::blacklist_watcher_tick))
-    .on_task_panic(metric_hook(
-        metrics,
-        Metrics::blacklist_watcher_task_panicked,
-    ));
-
-    let sink_metrics = Arc::clone(metrics);
-    // Unlike the flush-only sinks, `BlacklistSink` must observe the *same* token the
-    // loop cancels: `rescan` polls it between per-hash `eth_call`s so a large
-    // deny-set re-scope yields promptly to shutdown. `spawn` mints one token and
-    // hands it to the factory, so sink and loop share it (#1236).
-    Ok(resumable_watcher::spawn(provider, cfg, move |shutdown| {
-        BlacklistSink {
-            contract,
-            reads,
-            operator,
-            cache,
-            state,
-            shutdown: shutdown.clone(),
-            rescan_interval: rescan_interval.max(Duration::from_secs(1)),
-            // Boot enumeration + enforcement just ran; first backstop is one
-            // interval out.
-            last_rescan: Some(Instant::now()),
-            metrics: sink_metrics,
-        }
-    }))
+        sink: sink_factory,
+        label: "blacklist",
+        on_established: Some(metric_hook(
+            metrics,
+            Metrics::blacklist_watcher_cycle_established,
+        )),
+        on_backoff: Some(metric_hook(
+            metrics,
+            Metrics::blacklist_watcher_backoff_started,
+        )),
+        on_tick_success: Some(metric_hook(metrics, Metrics::blacklist_watcher_tick)),
+        on_task_panic: Some(metric_hook(
+            metrics,
+            Metrics::blacklist_watcher_task_panicked,
+        )),
+    })
 }
 
 #[cfg(test)]

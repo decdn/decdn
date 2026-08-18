@@ -20,15 +20,13 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::eth::{Filter, Log};
+use alloy::rpc::types::eth::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use decdn_incentive::payment_pool::PaymentPool;
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
-};
-use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::multiplexed_poller::{Route, SinkSource};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
 use crate::rate_bounds::RateBounds;
 
 /// Projection sink for `RateBoundsUpdated`: decodes each event into the shared
@@ -136,22 +134,21 @@ impl<P: Provider + Clone + 'static> LogSink for RateBoundsSink<P> {
     }
 }
 
-/// Spawn the rate-bounds watcher. `event_poll_interval` is the shared getLogs
-/// cadence (events picked up promptly); `poll_interval` is the slower
-/// authoritative-re-read safety net (`rate_bounds_poll_interval`, default 1h).
-pub(crate) fn spawn<P>(
+/// Build the rate-bounds [`Route`] for the shared multiplexed poller.
+/// `poll_interval` is the slower authoritative-re-read safety net
+/// (`rate_bounds_poll_interval`, default 1h) that rides the sink's
+/// `on_tick_complete`; the merged getLogs cadence is the poller's.
+pub(crate) fn route<P>(
     provider: P,
     payment_pool_addr: Address,
     bounds: RateBounds,
-    event_poll_interval: Duration,
     poll_interval: Duration,
-    head: Arc<dyn HeadSource>,
     metrics: &Arc<crate::metrics::Metrics>,
-) -> WatcherHandle
+) -> Route
 where
     P: Provider + Clone + 'static,
 {
-    let contract = PaymentPool::new(payment_pool_addr, provider.clone());
+    let contract = PaymentPool::new(payment_pool_addr, provider);
     let sink = RateBoundsSink {
         contract,
         bounds,
@@ -162,34 +159,31 @@ where
         // safety-net poll is due one `poll_interval` from now.
         last_poll: Some(Instant::now()),
     };
-    let cfg = WatcherConfig::new(
-        head,
-        Filter::new()
-            .address(payment_pool_addr)
-            .event_signature(PaymentPool::RateBoundsUpdated::SIGNATURE_HASH),
+    Route {
+        addresses: vec![payment_pool_addr],
+        topic0s: vec![PaymentPool::RateBoundsUpdated::SIGNATURE_HASH],
         // Start the tail at head — no historical scan at all. `window_blocks: 0`
         // resolves to head exactly. The startup `getRateBounds()` read is the
         // authoritative baseline and already folds in every past event, so a
         // lookback would re-derive a value the node holds; the hourly re-read is
         // the backstop for anything the tail drops. No durable cursor needed.
-        CursorStart::HeadMinusWindow { window_blocks: 0 },
-        event_poll_interval.max(Duration::from_secs(1)),
-        "rate-bounds",
-    )
-    // Liveness + panic signals. Load-bearing here more than for most watchers:
-    // this sink's poll-failure and undecodable-log paths both return `Ok` by
-    // design, so without these a watcher wedged in RPC backoff (or dead) looks
-    // identical to a healthy one while the node signs quotes against stale
-    // bounds.
-    .on_tick_success(crate::metrics::metric_hook(
-        metrics,
-        crate::metrics::Metrics::rate_bounds_watcher_tick,
-    ))
-    .on_task_panic(crate::metrics::metric_hook(
-        metrics,
-        crate::metrics::Metrics::rate_bounds_watcher_task_panicked,
-    ));
-    // The sink observes no shutdown token; the runtime drives graceful stop via
-    // the returned handle's `shutdown()`.
-    resumable_watcher::spawn(provider, cfg, move |_| sink)
+        start: CursorStart::HeadMinusWindow { window_blocks: 0 },
+        sink: SinkSource::Ready(Box::new(sink)),
+        label: "rate-bounds",
+        on_established: None,
+        on_backoff: None,
+        // Liveness + panic signals. Load-bearing here more than for most
+        // watchers: this sink's poll-failure and undecodable-log paths both
+        // return `Ok` by design, so without these a route wedged in RPC backoff
+        // (or dead) looks identical to a healthy one while the node signs quotes
+        // against stale bounds.
+        on_tick_success: Some(crate::metrics::metric_hook(
+            metrics,
+            crate::metrics::Metrics::rate_bounds_watcher_tick,
+        )),
+        on_task_panic: Some(crate::metrics::metric_hook(
+            metrics,
+            crate::metrics::Metrics::rate_bounds_watcher_task_panicked,
+        )),
+    }
 }

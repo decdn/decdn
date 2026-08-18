@@ -30,31 +30,35 @@
 //!   that is not — but that backoff never discards a healthy sibling's
 //!   progress.
 //!
-//! # Hook firing differs from `resumable_watcher`
+//! # Hooks fire per route, not per loop
 //!
-//! In `resumable_watcher::run` the *loop* fires `on_backoff`/`on_established`
-//! once per tick, because there is exactly one sink. Here the *tick* fires each
-//! route's hooks independently (routes fail independently), and the loop's
-//! `Err` arm only sleeps the backoff — it never fires a hook itself. The one
-//! exception is a failure in the shared, pre-route-loop work (the head read, or
-//! a route's checkpoint-load floor derivation, or the merged `get_logs` call):
-//! those fail the *whole* tick before any route-specific step runs, so
-//! [`fail_whole_tick`] fires `on_backoff` for every route directly at the
-//! failure site — mirroring what happened before the merge, when every watcher
-//! read its own head and they all convoyed into backoff together through
+//! A single-sink loop would fire `on_backoff`/`on_established` once per tick,
+//! because there is exactly one sink. Here the *tick* fires each route's hooks
+//! independently (routes fail independently), and the loop's `Err` arm only
+//! sleeps the backoff — it never fires a hook itself. The one exception is a
+//! failure in the shared, pre-route-loop work (the head read, or a route's
+//! checkpoint-load floor derivation, or the merged `get_logs` call): those fail
+//! the *whole* tick before any route-specific step runs, so [`fail_whole_tick`]
+//! fires `on_backoff` for every route directly at the failure site — every route
+//! is equally down, just as five independent watchers all convoyed into backoff
+//! together when every one read the shared head through
 //! [`super::shared_head::SharedHead`].
 //!
-//! As in `resumable_watcher`, the `on_established`/`on_backoff` *edges* are
-//! suppressed once `shutdown` is cancelled (a tick that only "succeeded"
-//! because a sink observed the cancel token must not flip a readiness gate
-//! open), while `on_tick_success` keeps stamping unconditionally.
+//! The `on_established`/`on_backoff` *edges* are suppressed once `shutdown` is
+//! cancelled (a tick that only "succeeded" because a sink observed the cancel
+//! token must not flip a readiness gate open), while `on_tick_success` keeps
+//! stamping unconditionally.
 //!
-//! No watcher constructs a [`Route`] yet — this driver is unit-tested here
-//! against a mocked provider on its own, ahead of the migration that points
-//! the five `eth_getLogs` watchers at it in place of their own
-//! `resumable_watcher::run` loops. `dead_code` is allowed at the module level
-//! until that wiring lands.
-#![allow(dead_code)]
+//! The runtime registers all five `eth_getLogs` watchers' [`Route`]s on one
+//! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
+//! place of five independent per-watcher loops.
+//!
+//! This module is `pub` only so `Route` can appear in the `pub` watcher
+//! `bootstrap` signatures and the external settlement e2e can drive `spawn`; its
+//! docs still reference the crate-internal collaborators (`ErasedSink`,
+//! `CursorStart`, the `resumable_watcher` cursor vocabulary), so intra-doc links
+//! to those private items are allowed here rather than downgraded to prose.
+#![allow(rustdoc::private_intra_doc_links)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,22 +101,75 @@ impl<S: LogSink> ErasedSink for S {
     }
 }
 
+/// A route's sink, resolved to a concrete [`ErasedSink`] inside [`spawn`] once
+/// the poller mints its single shutdown token.
+///
+/// Most routes carry a `Ready` sink built at registration. The blacklist route
+/// is the exception: its sink must observe the poller's own shutdown token (its
+/// re-scope pass polls it between per-hash `eth_call`s so a large deny-set does
+/// not overrun the shutdown deadline), and that token does not exist until
+/// [`spawn`] mints it. Such a route registers a `Factory` that [`spawn`] invokes
+/// with the freshly-minted token — a per-route `make_sink` seam that keeps the
+/// token paired with a live task so it can never be inert (#1236).
+pub(crate) enum SinkSource {
+    Ready(Box<dyn ErasedSink>),
+    Factory(SinkFactory),
+}
+
+/// A per-route sink builder invoked inside [`spawn`] with the poller's
+/// freshly-minted shutdown token — see [`SinkSource::Factory`].
+pub(crate) type SinkFactory = Box<dyn FnOnce(&CancellationToken) -> Box<dyn ErasedSink> + Send>;
+
+impl SinkSource {
+    /// Resolve a `Factory` against the poller's shutdown token; a `Ready` sink
+    /// passes through unchanged. Consumed by value so no placeholder sink is
+    /// needed to swap it out.
+    fn resolved(self, shutdown: &CancellationToken) -> Self {
+        match self {
+            Self::Factory(make) => Self::Ready(make(shutdown)),
+            ready @ Self::Ready(_) => ready,
+        }
+    }
+
+    /// The concrete sink once resolved. `None` for a still-`Factory` source —
+    /// only reachable if [`run`] is driven without going through [`spawn`], as
+    /// the unit tests do, and those always register `Ready` sinks.
+    fn as_erased_mut(&mut self) -> Option<&mut (dyn ErasedSink + 'static)> {
+        match self {
+            Self::Ready(sink) => Some(sink.as_mut()),
+            Self::Factory(_) => None,
+        }
+    }
+}
+
 /// One registered watcher on the multiplexed poller. `addresses`/`topic0s` are
 /// its demux keys; every `(address, topic0)` pair in the cartesian product is a
 /// route key, and every route key must be globally unique across the poller's
 /// routes ([`MultiplexedPollerBuilder::build`] checks this). Each existing
 /// watcher is single-address, so `addresses` is a 1-element vec today, but the
 /// field is a set so a future multi-address watcher needs no reshape.
-pub(crate) struct Route {
+pub struct Route {
     pub(crate) addresses: Vec<Address>,
     pub(crate) topic0s: Vec<B256>,
     pub(crate) start: CursorStart,
-    pub(crate) sink: Box<dyn ErasedSink>,
+    pub(crate) sink: SinkSource,
     pub(crate) label: &'static str,
     pub(crate) on_established: Option<WatcherHook>,
     pub(crate) on_backoff: Option<WatcherHook>,
     pub(crate) on_tick_success: Option<WatcherHook>,
     pub(crate) on_task_panic: Option<WatcherHook>,
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The sink and hooks are opaque closures/trait objects; the demux keys
+        // and label are what identify a route in a log line.
+        f.debug_struct("Route")
+            .field("label", &self.label)
+            .field("addresses", &self.addresses)
+            .field("topic0s", &self.topic0s)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A [`Route`]'s per-tick working state: its cursor machinery and sink, plus
@@ -123,7 +180,7 @@ pub(crate) struct Route {
 /// borrows of `routes` (see that guard's doc for why the split exists).
 struct RouteState {
     start: CursorStart,
-    sink: Box<dyn ErasedSink>,
+    sink: SinkSource,
     label: &'static str,
     on_established: Option<WatcherHook>,
     on_backoff: Option<WatcherHook>,
@@ -139,14 +196,13 @@ struct RouteState {
     /// demux and the advance/persist step so the route holds its cursor and
     /// re-scans next tick instead of racing ahead of a failure.
     errored: bool,
-    /// First-cycle edge tracking for `on_established`, mirroring
-    /// `resumable_watcher::run`'s `established` local.
+    /// First-cycle edge tracking for `on_established`.
     established: bool,
 }
 
 /// Poller configuration, its resolved routes, and the demux index built once
 /// at [`MultiplexedPollerBuilder::build`].
-pub(crate) struct MultiplexedPoller {
+pub struct MultiplexedPoller {
     head: Arc<dyn HeadSource>,
     routes: Vec<RouteState>,
     /// `(address, topic0) -> route index`. Built once at `build()`; a log
@@ -155,8 +211,10 @@ pub(crate) struct MultiplexedPoller {
     /// Merged filter over every route's addresses and topic0s, built once at
     /// `build()`. The block range is set per window in `run_tick`.
     base_filter: Filter,
-    /// Contract deploy floor — mirrors `WatcherConfig::from_block` (always `0`
-    /// today; see that field's doc for why it is retained as a floor anyway).
+    /// Contract deploy floor — the lower clamp on a rewound `FromCheckpoint`
+    /// resume and the floor a `HeadMinusWindow` start derives from. Always `0`
+    /// today (every route either seeds its cursor from an enumeration or clamps a
+    /// persisted resume that never predates deploy), retained as that floor.
     from_block: u64,
     poll_interval: Duration,
     max_backfill_span: u64,
@@ -171,8 +229,17 @@ pub(crate) struct MultiplexedPoller {
     panic_hooks: Vec<(&'static str, Option<WatcherHook>)>,
 }
 
+impl std::fmt::Debug for MultiplexedPoller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiplexedPoller")
+            .field("routes", &self.routes.len())
+            .field("poll_interval", &self.poll_interval)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Accumulates [`Route`]s and builds a [`MultiplexedPoller`].
-pub(crate) struct MultiplexedPollerBuilder {
+pub struct MultiplexedPollerBuilder {
     head: Arc<dyn HeadSource>,
     routes: Vec<Route>,
     from_block: u64,
@@ -183,10 +250,20 @@ pub(crate) struct MultiplexedPollerBuilder {
     rpc_call_timeout: Option<Duration>,
 }
 
+impl std::fmt::Debug for MultiplexedPollerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiplexedPollerBuilder")
+            .field("routes", &self.routes.len())
+            .field("poll_interval", &self.poll_interval)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MultiplexedPollerBuilder {
     /// Construct with the defaults every route shares: the deploy floor (`0`),
     /// [`MAX_BACKFILL_BLOCK_SPAN`], and the default watcher backoff schedule.
-    pub(crate) fn new(head: Arc<dyn HeadSource>, poll_interval: Duration) -> Self {
+    #[must_use]
+    pub fn new(head: Arc<dyn HeadSource>, poll_interval: Duration) -> Self {
         Self {
             head,
             routes: Vec::new(),
@@ -200,7 +277,8 @@ impl MultiplexedPollerBuilder {
     }
 
     /// Register one watcher's route.
-    pub(crate) fn route(mut self, route: Route) -> Self {
+    #[must_use]
+    pub fn route(mut self, route: Route) -> Self {
         self.routes.push(route);
         self
     }
@@ -213,20 +291,13 @@ impl MultiplexedPollerBuilder {
         self
     }
 
-    /// Override the per-call RPC timeout.
-    #[cfg(test)]
-    pub(crate) const fn rpc_call_timeout(mut self, timeout: Duration) -> Self {
-        self.rpc_call_timeout = Some(timeout);
-        self
-    }
-
     /// Build the poller: construct the merged filter and the `(address,
     /// topic0) -> route` demux index. Returns `Err` if two routes claim the
     /// same `(address, topic0)` key — two watchers subscribing to the same
     /// event is a wiring bug, not a runtime condition, so it fails fast at
     /// startup rather than silently routing every such log to whichever route
     /// happened to register first.
-    pub(crate) fn build(self) -> Result<MultiplexedPoller> {
+    pub fn build(self) -> Result<MultiplexedPoller> {
         let mut key_index = HashMap::new();
         let mut all_addresses = Vec::new();
         let mut all_topic0s = Vec::new();
@@ -287,7 +358,7 @@ impl MultiplexedPollerBuilder {
 }
 
 /// Fire `on_backoff` for every route (unless `shutdown` is cancelled — the
-/// same edge suppression `resumable_watcher::run` applies) and clear every
+/// same edge suppression a successful tick applies) and clear every
 /// route's `established` flag, then hand back `err` unchanged. Used only at
 /// the shared, pre-route-loop failure points (head read, a route's floor
 /// derivation, the merged `get_logs` call): a failure there aborts the whole
@@ -363,7 +434,13 @@ async fn demux_window_logs(poller: &mut MultiplexedPoller, logs: Vec<Log>) {
         if log.block_number.is_some_and(|b| b < route.tick_floor) {
             continue;
         }
-        if let Err(err) = route.sink.apply(log).await {
+        // The sink borrow is confined to this match so `route.errored` can be
+        // set afterward without aliasing it.
+        let applied = match route.sink.as_erased_mut() {
+            Some(sink) => sink.apply(log).await,
+            None => continue, // unresolved factory (never in production; see `SinkSource`)
+        };
+        if let Err(err) = applied {
             // Retryable sink error: isolate this route. It holds its cursor
             // and re-scans; sibling routes keep advancing.
             route.errored = true;
@@ -395,7 +472,11 @@ async fn reconcile_routes(poller: &mut MultiplexedPoller) {
         if r.errored {
             continue;
         }
-        if let Err(err) = r.sink.on_tick_complete().await {
+        let reconciled = match r.sink.as_erased_mut() {
+            Some(sink) => sink.on_tick_complete().await,
+            None => continue, // unresolved factory (never in production; see `SinkSource`)
+        };
+        if let Err(err) = reconciled {
             r.errored = true;
             warn!(label = r.label, err = %sanitize_err_chain(&err), "route reconcile error");
         }
@@ -455,7 +536,7 @@ async fn run_tick<P: Provider + Clone>(
     if from <= to {
         for (start, end) in backfill_windows(from, to, poller.max_backfill_span) {
             // Yield between windows so a large merged backfill does not block
-            // graceful shutdown (mirrors `resumable_watcher::run_tick`).
+            // graceful shutdown (mirrors the per-window shutdown check).
             if shutdown.is_cancelled() {
                 return Ok(());
             }
@@ -520,8 +601,7 @@ impl Drop for PanicGuard<'_> {
 }
 
 /// Drive every registered route from one merged `eth_getLogs` polling loop
-/// until `shutdown` is cancelled. Structurally mirrors
-/// `resumable_watcher::run`: `tokio::time::interval` with
+/// until `shutdown` is cancelled. Uses `tokio::time::interval` with
 /// `MissedTickBehavior::Delay`, a `biased` select on `shutdown.cancelled()`
 /// (flush every route's checkpoint and return) vs `ticker.tick()`, backoff
 /// reset on `Ok`, and bounded exponential backoff on `Err`. The `Err` arm
@@ -580,12 +660,24 @@ where
 }
 
 /// Mint the shutdown token, spawn [`run`], and return the owning
-/// [`WatcherHandle`] — mirrors `resumable_watcher::spawn` (#1236).
-pub(crate) fn spawn<P>(provider: P, poller: MultiplexedPoller) -> WatcherHandle
+/// [`WatcherHandle`], the only pairing of a live task with its shutdown token
+/// (#1236).
+pub fn spawn<P>(provider: P, mut poller: MultiplexedPoller) -> WatcherHandle
 where
     P: Provider + Clone + 'static,
 {
     let shutdown = CancellationToken::new();
+    // Resolve each route's sink against the freshly-minted token now that it
+    // exists: a `Factory` (blacklist) is built here so its sink observes the
+    // very token this handle cancels; a `Ready` sink passes through.
+    let routes = std::mem::take(&mut poller.routes);
+    poller.routes = routes
+        .into_iter()
+        .map(|rs| RouteState {
+            sink: rs.sink.resolved(&shutdown),
+            ..rs
+        })
+        .collect();
     let task = AbortOnDrop(tokio::spawn(run(provider, poller, shutdown.clone())));
     WatcherHandle::new(shutdown, task)
 }
@@ -730,7 +822,7 @@ mod tests {
             addresses: vec![addr],
             topic0s: vec![topic0],
             start,
-            sink: Box::new(MutexSink(Arc::clone(&recorded))),
+            sink: SinkSource::Ready(Box::new(MutexSink(Arc::clone(&recorded)))),
             label,
             on_established: None,
             on_backoff: None,
@@ -1360,7 +1452,7 @@ mod tests {
                 addresses: vec![ADDR_A],
                 topic0s: vec![TOPIC_A],
                 start: CursorStart::HeadMinusWindow { window_blocks: 0 },
-                sink: Box::new(PanicOnApply),
+                sink: SinkSource::Ready(Box::new(PanicOnApply)),
                 label: "a",
                 on_established: None,
                 on_backoff: None,
@@ -1533,10 +1625,10 @@ mod tests {
                 addresses: vec![ADDR_A],
                 topic0s: vec![TOPIC_A],
                 start: CursorStart::HeadMinusWindow { window_blocks: 0 },
-                sink: Box::new(CancelInReconcile {
+                sink: SinkSource::Ready(Box::new(CancelInReconcile {
                     shutdown: shutdown.clone(),
                     bail: false,
-                }),
+                })),
                 label: "a",
                 on_established: Some(Box::new(move || {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -1639,10 +1731,10 @@ mod tests {
                 addresses: vec![ADDR_A],
                 topic0s: vec![TOPIC_A],
                 start: CursorStart::HeadMinusWindow { window_blocks: 0 },
-                sink: Box::new(CancelInReconcile {
+                sink: SinkSource::Ready(Box::new(CancelInReconcile {
                     shutdown: shutdown.clone(),
                     bail: true,
-                }),
+                })),
                 label: "a",
                 on_established: None,
                 on_backoff: Some(Box::new(move || {
