@@ -21,6 +21,8 @@
 //! ([`encode_ranges_validated`] checks `ParentHashMismatch`/`LeafHashMismatch`).
 //! There is no trusted-origin assumption — the origin stays a dumb byte store.
 
+use std::io::Write;
+
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bao_tree::io::sync::encode_ranges_validated;
 use bao_tree::{BaoTree, BlockSize, ChunkNum, ChunkRanges};
@@ -375,6 +377,48 @@ pub fn encode_verified_range(
     Ok(Bytes::from(encoded))
 }
 
+/// Write the **header-less** bao interleaved encoding for `aligned.chunk_ranges`
+/// to `out`, validating `data` against `root` via the untrusted pre-order
+/// `outboard` as it streams. Unlike [`encode_verified_range`] there is no 8-byte
+/// LE size prefix (the size travels out-of-band in the signed `StreamResponse`)
+/// and no returned `Bytes` — bytes go straight to the sink in O(chunk-group) RAM.
+///
+/// `data` is a seekable [`ReadAt`] over the **whole blob** (e.g. `std::fs::File`):
+/// the encoder reads at absolute blob offsets, so a ranged serve touches only the
+/// aligned span's pages. The outboard is untrusted; a tampered range, foreign
+/// outboard, or wrong `root` all fail with [`RangeVerifyError::Verification`].
+///
+/// # Errors
+///
+/// - [`RangeVerifyError::OutboardSize`] if `outboard` is the wrong length for
+///   `aligned.blob_size()`.
+/// - [`RangeVerifyError::Verification`] if the range/outboard do not verify.
+pub fn encode_verified_range_headerless<R: ReadAt, W: Write>(
+    root: [u8; 32],
+    aligned: &AlignedRange,
+    outboard: Bytes,
+    data: R,
+    out: &mut W,
+) -> Result<(), RangeVerifyError> {
+    let blob_size = aligned.blob_size();
+    let tree = BaoTree::new(blob_size, IROH_BLOCK_SIZE);
+    let expected = usize::try_from(tree.outboard_size()).unwrap_or(usize::MAX);
+    if outboard.len() != expected {
+        return Err(RangeVerifyError::OutboardSize {
+            expected,
+            got: outboard.len(),
+            blob_size,
+        });
+    }
+    let ob = PreOrderMemOutboard {
+        root: bao_tree::blake3::Hash::from(root),
+        tree,
+        data: outboard,
+    };
+    encode_ranges_validated(&data, &ob, aligned.chunk_ranges().as_ref(), out)
+        .map_err(|source| RangeVerifyError::Verification { source })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
@@ -420,5 +464,82 @@ mod tests {
             RangeVerifyError::RangeDataSize { expected, got, .. }
                 if expected == fetch_len && got == too_short
         ));
+    }
+
+    // A seekable in-memory ReadAt over the whole blob, so the encoder reads at
+    // absolute offsets exactly like a std::fs::File would.
+    struct SliceReadAt(Vec<u8>);
+    impl ReadAt for SliceReadAt {
+        fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Ok(pos) = usize::try_from(pos) else {
+                return Ok(0);
+            };
+            let Some(src) = self.0.get(pos..) else {
+                return Ok(0);
+            };
+            let n = src.len().min(buf.len());
+            let (Some(d), Some(s)) = (buf.get_mut(..n), src.get(..n)) else {
+                return Ok(0);
+            };
+            d.copy_from_slice(s);
+            Ok(n)
+        }
+    }
+
+    // The header-less range encoder yields exactly the reference encoder's output
+    // minus its 8-byte LE size header, for both a whole-blob range and an interior
+    // range. This is the property the serve path depends on: identical wire bytes,
+    // no header, streamed from a seekable reader.
+    #[test]
+    fn headerless_range_matches_reference_minus_header() {
+        let data: Vec<u8> = (0..BLOB_SIZE).map(|i| (i % 251) as u8).collect();
+        let mem = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+        let root = *mem.root.as_bytes();
+        let outboard = Bytes::from(mem.data.clone());
+
+        for (off, len) in [(0u64, 0u64), (CHUNK_GROUP_BYTES, CHUNK_GROUP_BYTES)] {
+            let aligned = align_range(off, len, BLOB_SIZE).expect("align");
+            // Reference: buffered encoder over the aligned window, drop 8-byte header.
+            let base = usize::try_from(aligned.fetch_start()).expect("fits");
+            let flen = usize::try_from(aligned.fetch_len()).expect("fits");
+            let window = data.get(base..base + flen).expect("slice").to_vec();
+            let reference = encode_verified_range(root, &aligned, &window, outboard.clone())
+                .expect("reference encode");
+            let expected = reference.get(8..).expect("has header").to_vec();
+
+            let mut got = Vec::new();
+            encode_verified_range_headerless(
+                root,
+                &aligned,
+                outboard.clone(),
+                SliceReadAt(data.clone()),
+                &mut got,
+            )
+            .expect("headerless encode");
+
+            assert_eq!(got, expected, "range off={off} len={len}");
+        }
+    }
+
+    // A tampered data byte fails verification rather than emitting corrupt bytes.
+    #[test]
+    fn headerless_rejects_tampered_data() {
+        let mut data: Vec<u8> = (0..BLOB_SIZE).map(|i| (i % 251) as u8).collect();
+        let mem = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+        let root = *mem.root.as_bytes();
+        let outboard = Bytes::from(mem.data.clone());
+        *data.get_mut(0).expect("nonempty") ^= 0xFF; // flip a byte after hashing
+
+        let aligned = align_range(0, 0, BLOB_SIZE).expect("align");
+        let mut sink = Vec::new();
+        let err = encode_verified_range_headerless(
+            root,
+            &aligned,
+            outboard,
+            SliceReadAt(data),
+            &mut sink,
+        )
+        .expect_err("tampered data must fail verification");
+        assert!(matches!(err, RangeVerifyError::Verification { .. }));
     }
 }
