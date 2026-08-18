@@ -19,17 +19,14 @@
 //!
 //! # `BatchStore` wire types
 //!
-//! ADR 022 specifies optional `BatchStoreRequest` / `BatchStoreAck` variants
-//! as a bandwidth optimization. We define the wire types here at their
-//! ADR-canonical [`DhtMessage`] discriminants 4 and 5 so the production
-//! ordering of `FindNode` / `FindNodeResponse` at 6 and 7 matches the ADR
-//! and a future `BatchStore` handler doesn't have to do a wire-breaking
-//! discriminant shuffle. The handler-side admission, two-stage rate-limit
-//! accounting, and per-receiver fallback negotiation land in a follow-up
-//! issue — until then the runtime closes inbound `BatchStore` streams
-//! with `APP_ERR_UNSUPPORTED_MESSAGE` (`0x01`), which is the
-//! stream-close-without-ack fallback signal ADR 022 §Schema Evolution
-//! requires to trigger per-hash `Store` from the publisher.
+//! `BatchStoreRequest` / `BatchStoreAck` are part of `cdn/dht/v1` at
+//! [`DhtMessage`] discriminants 4 and 5, ahead of `FindNode` /
+//! `FindNodeResponse` at 6 and 7 to match ADR 022's variant order. They
+//! carry the bandwidth optimization in which one holder publishes many
+//! hashes to one receiver in a single RPC (ADR 022 §STORE Flow Batched
+//! STORE). The receiver-side admission and two-stage rate-limit
+//! accounting live in `decdn-node`; every DHT node implements them, so
+//! there is no per-hash fallback or support negotiation.
 //!
 //! # Bounded-Vec deserialization
 //!
@@ -176,11 +173,10 @@ pub enum DhtMessage {
     /// discriminant 3 — asserted by `dht_message_store_ack_discriminant_is_three`
     StoreAck(StoreAck),
     /// discriminant 4 — asserted by `dht_message_batch_store_discriminant_is_four`.
-    /// Wire type only; handler implementation deferred to a follow-up issue
-    /// (see module docs).
+    /// Batched publish; handled by `decdn-node` (see module docs).
     BatchStore(BatchStoreRequest),
     /// discriminant 5 — asserted by `dht_message_batch_store_ack_discriminant_is_five`.
-    /// Wire type only; see [`Self::BatchStore`].
+    /// Per-hash ack for [`Self::BatchStore`].
     BatchStoreAck(BatchStoreAck),
     /// discriminant 6 — asserted by `dht_message_find_node_discriminant_is_six`
     FindNode(FindNodeRequest),
@@ -300,12 +296,10 @@ pub struct FindNodeResponse {
 }
 
 /// Batched publication of multiple content records from one holder to one
-/// receiver (ADR 022 §STORE Flow). A bandwidth optimization with a per-hash
-/// [`StoreRequest`] fallback — the wire types are defined here at their
-/// ADR-canonical discriminants so a future handler doesn't shuffle wire
-/// positions, but admission, two-stage rate-limit accounting, and
-/// per-receiver fallback negotiation live in the handler that will land in
-/// a follow-up issue.
+/// receiver (ADR 022 §STORE Flow). A bandwidth optimization over `n`
+/// separate [`StoreRequest`]s: the re-publish scheduler groups due hashes
+/// by receiver and sends each its set in one of these. Admission and
+/// two-stage rate-limit accounting live in the `decdn-node` handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchStoreRequest {
     /// Hashes being published in this batch. Capped at

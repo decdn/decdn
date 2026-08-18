@@ -6,7 +6,6 @@
 //! requester-side iterative lookup that surround the handler.
 
 pub mod auth;
-pub mod batch_fallback;
 pub mod bootstrap;
 pub mod bucket_refresh;
 pub mod capacity_bond_registry;
@@ -27,7 +26,6 @@ pub mod routing;
 pub mod staker_set;
 
 pub use auth::AuthenticatedNodeId;
-pub use batch_fallback::{BatchStoreFallback, DEFAULT_BATCH_UNSUPPORTED_TTL};
 pub use bootstrap::{BootstrapOutcome, bootstrap};
 pub use chain_origin_directory::ChainOriginDirectory;
 pub use chain_staker_set::ChainStakerSet;
