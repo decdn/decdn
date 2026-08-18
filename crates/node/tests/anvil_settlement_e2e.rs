@@ -617,10 +617,15 @@ async fn run_e2e() -> anyhow::Result<()> {
     // receiver drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
+    // Event-fed pool view, shared with the settlement service below (its watcher
+    // is the writer). The capability-intake gate reads the on-chain pool owner
+    // from it; without an owner the capability is dropped and no lane registers,
+    // so the test waits for the projection to catch `PoolOpened` before serving.
+    let pool_view = decdn_node::pool_view::PoolProjection::new();
     let handler = {
         let hint = redeem_tx.clone();
         let cap_store = Arc::clone(&concrete_store);
-        let view_provider = node_provider.clone();
+        let pool_view = pool_view.clone();
         build_handler_full_configured(
             node_pub,
             &node_eth,
@@ -639,15 +644,8 @@ async fn run_e2e() -> anyhow::Result<()> {
                 // its first redemption.
                 deps.capability_sink =
                     Some(cap_store as Arc<dyn decdn_node::channel_store::CapabilitySink>);
-                // Cached `getPool` view so the capability-intake gate can confirm
-                // the on-chain pool owner; without it the capability is dropped
-                // and no lane registers.
-                deps.pool_view = Some(Arc::new(decdn_node::pool_view::ChainPoolView::new(
-                    view_provider,
-                    payment_pool,
-                    Duration::from_millis(250),
-                ))
-                    as Arc<dyn decdn_node::pool_view::PoolView>);
+                deps.pool_view =
+                    Some(Arc::new(pool_view) as Arc<dyn decdn_node::pool_view::PoolView>);
             },
         )?
     };
@@ -668,6 +666,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
+        pool_view.clone(),
         redeem_tx,
         redeem_rx,
     )
@@ -723,6 +722,25 @@ async fn run_e2e() -> anyhow::Result<()> {
     // Floor for the `PoolRedeemed` gas-delta scan below (#eth-calls-efficiency
     // batched-read proof): no redeem on this lane can land before this block.
     let redeem_scan_from = node_provider.get_block_number().await?;
+
+    // Wait for the settlement watcher to fold `PoolOpened` into the shared pool
+    // projection: the capability-intake gate reads the owner from it, and drops
+    // the capability if the owner is not yet known. In production a serve request
+    // against a just-opened pool would fail open (serve, defer registration); the
+    // test pins the owner first so the single lane deterministically registers.
+    {
+        use decdn_node::pool_view::PoolView;
+        let view = pool_view.clone();
+        let owner = poll_until(Duration::from_secs(30), || {
+            let view = view.clone();
+            async move { view.status(pool_id).await.map(|s| s.owner) }
+        })
+        .await;
+        anyhow::ensure!(
+            owner == Some(client_addr),
+            "pool projection did not observe PoolOpened owner in time"
+        );
+    }
 
     // Present the pool owner's self-issued capability (single-user: the owner
     // delegates spend to its own key) plus the ADR 005 ownership binding. The
@@ -1030,6 +1048,22 @@ async fn run_e2e() -> anyhow::Result<()> {
     // requester endpoint (`client_ep` here) to the serve gate.
     let buyer_binding = sign_client_binding(buyer_signer.as_ref(), client_node_id, &bind_domain)?;
     let buyer_ctx = buyer_ctx.with_client_binding(buyer_binding);
+    // As with the seller pool: wait for the settlement watcher to fold this
+    // freshly-opened pool's `PoolOpened` into the shared projection, so the
+    // capability-intake gate can confirm the owner and register the lane.
+    {
+        use decdn_node::pool_view::PoolView;
+        let view = pool_view.clone();
+        let owner = poll_until(Duration::from_secs(30), || {
+            let view = view.clone();
+            async move { view.status(buyer_pool_id).await.map(|s| s.owner) }
+        })
+        .await;
+        anyhow::ensure!(
+            owner == Some(buyer_addr),
+            "pool projection did not observe the buyer pool's PoolOpened owner in time"
+        );
+    }
     let suffix = stream_fetch(
         &client_ep,
         target.clone(),
