@@ -91,7 +91,7 @@ pub use client_bridge::{
 pub use credit::ramped_credit_window;
 pub use erc20::Erc20;
 pub use lane::{LaneKey, LaneState, PoolError, PoolId, VoucherApplied};
-pub use pool_open_error::PoolOpenFailureReason;
+pub use pool_open_error::{PoolOpenFailureReason, is_erc20_allowance_shortfall};
 pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
     slash_judge_domain,

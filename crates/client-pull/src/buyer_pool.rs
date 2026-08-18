@@ -334,6 +334,25 @@ const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 /// contract can never reconstruct.
 pub const SELF_CAPABILITY_CAP: U256 = U256::from_limbs([u64::MAX, 0, 0, 0]);
 
+/// Typed marker attached to a `top_up` submit error whose revert is an
+/// `ERC20InsufficientAllowance` shortfall: the `PaymentPool`'s standing USDC
+/// allowance is below the transfer amount. The node's `fund_pool` downcasts
+/// on it to run a just-in-time `approve` and retry once; every other revert
+/// stays terminal. CLI callers never downcast it, so it is invisible to them.
+#[derive(Debug, Clone, Copy)]
+pub struct AllowanceShortfall;
+
+impl std::fmt::Display for AllowanceShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "topUp reverted: PaymentPool USDC allowance is below the transfer amount"
+        )
+    }
+}
+
+impl std::error::Error for AllowanceShortfall {}
+
 /// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
 /// credited amount read back from the `PoolToppedUp` event — the shared mechanism
 /// behind the node's cache-miss buyer (#744) and the CLI fetch buyer's auto-refill
@@ -354,14 +373,29 @@ pub async fn top_up<P: Provider + Clone>(
     pool_id: B256,
     additional: U256,
 ) -> Result<U256> {
-    let receipt = contract
+    let pending = match contract
         .topUp(pool_id, to_pool_u64(additional, "top-up")?)
         .send()
         .await
-        .context("submit topUp")?
-        .get_receipt()
-        .await
-        .context("await topUp receipt")?;
+    {
+        Ok(pending) => pending,
+        Err(err) => {
+            // A deterministic allowance shortfall is caught at gas estimation
+            // and surfaces here with ABI revert data attached. Match it so the
+            // node can re-`approve` and retry once; every other revert stays
+            // terminal (an `approve` cannot fix a balance shortfall or a paused
+            // pool).
+            let allowance_short =
+                decdn_incentive::is_erc20_allowance_shortfall(err.as_revert_data().as_ref());
+            let submit_err = anyhow::Error::new(err).context("submit topUp");
+            return Err(if allowance_short {
+                submit_err.context(AllowanceShortfall)
+            } else {
+                submit_err
+            });
+        }
+    };
+    let receipt = pending.get_receipt().await.context("await topUp receipt")?;
     if !receipt.status() {
         anyhow::bail!("topUp reverted for pool {pool_id}");
     }
