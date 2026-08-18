@@ -2318,20 +2318,19 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wiring guard for `decdn node channels` (#749 review, crit 7): a real
-/// signed-voucher accept through the live `ClientHandler` must advance the
-/// shared in-memory [`VoucherActivity`] clock the admin surface reports.
+/// Wiring guard for `decdn node lanes` (issue #1733): a real signed-voucher
+/// accept through the live `ClientHandler` must advance the last-voucher clock
+/// the admin surface reads off the lane registry.
 ///
-/// The `touch` call site (`handlers/client.rs`) has no other test caller — a
-/// dropped or mis-placed stamp would silently leave `seconds_since` at `None`
-/// ("never") forever. Here we attach a clock to the handler, drive one
-/// successful delivery (which accepts vouchers), and assert the channel now
-/// reports `Some(age)`. An untouched channel reports `None`, so `Some` proves
-/// the accept path stamped through the attached `Arc`.
+/// The stamp call site (`handlers/client/voucher.rs`) has no other test caller —
+/// a dropped or mis-placed stamp would silently leave `seconds_since_last_voucher`
+/// at `None` ("never") forever. Here we take a `LaneActivityClock` over the
+/// handler's registry, drive one successful delivery (which accepts vouchers),
+/// and assert the lane now reports `Some(age)`. Before the accept the lane's
+/// stamp is `0`, so it is absent from `ages`; a present age proves the accept
+/// path stamped the lane state.
 #[tokio::test(flavor = "multi_thread")]
-async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()> {
-    use decdn_incentive::VoucherActivity;
-
+async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → crosses a voucher interval
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -2355,10 +2354,6 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    // Share one `Arc<VoucherActivity>` with the handler — the same wiring
-    // `runtime::run` performs (one Arc cloned into the handler and the admin
-    // surface). Before any accept the channel is unknown to the clock.
-    let activity = Arc::new(VoucherActivity::new());
     let handler = build_handler_configured(
         server_id,
         &server_eth,
@@ -2367,12 +2362,18 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
         cache,
         store_dyn,
         RATE_PER_MB,
-        |deps| deps.voucher_activity = Some(Arc::clone(&activity)),
+        |_deps| {},
     )?;
-    assert_eq!(
-        activity.seconds_since(lane_key(client_signer.address())),
-        None,
-        "no voucher accepted yet → clock must report None"
+    // A read handle over the handler's live registry — the same wiring
+    // `runtime::run` performs for the admin surface. Before any accept the
+    // lane's stamp is 0, so it is absent from `ages`.
+    let activity = handler.lane_activity_clock();
+    assert!(
+        !activity
+            .ages()
+            .await
+            .contains_key(&lane_key(client_signer.address())),
+        "no voucher accepted yet → clock must report the lane as absent (never)"
     );
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -2399,13 +2400,14 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
         "delivered bytes mismatch"
     );
 
-    // The accept path stamped the channel through the shared Arc: the admin
-    // surface reading the SAME Arc would now report an age rather than "never".
+    // The accept path stamped the lane state: the admin surface reading the
+    // same registry would now report an age rather than "never".
     assert!(
         activity
-            .seconds_since(lane_key(client_signer.address()))
-            .is_some(),
-        "an accepted voucher must advance the shared VoucherActivity clock"
+            .ages()
+            .await
+            .contains_key(&lane_key(client_signer.address())),
+        "an accepted voucher must advance the lane's last-voucher clock"
     );
 
     shutdown([], [&client_ep, &server_ep]).await;

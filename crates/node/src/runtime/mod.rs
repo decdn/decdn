@@ -732,7 +732,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     client_handler: Arc<ClientHandler>,
     payment_service: PoolSettlementService<P>,
-    voucher_activity: Arc<decdn_incentive::VoucherActivity>,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -1063,13 +1062,6 @@ async fn build_chain_and_handlers(
         crate::region_accounting::RegistryRegionResolver::new(registry_regions),
     )));
 
-    // In-memory last-voucher clock shared between the client handler (writer:
-    // stamps on each accepted voucher) and `admin_v1_channels` (reader:
-    // reports "time since last voucher"), issue #749. Non-durable by design —
-    // a restart resets it and channels report "no activity yet" until their
-    // next voucher (see `decdn_incentive::VoucherActivity`).
-    let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
-
     // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
     // serve-miss path whenever the operator configured any origin (`[cache.origin]`),
     // INDEPENDENT of `node_to_node_pull_through_enabled`: a cache-only operator must
@@ -1178,7 +1170,6 @@ async fn build_chain_and_handlers(
     let pool_view = crate::pool_view::PoolProjection::new();
     client_deps.pool_view =
         Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>);
-    client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
     client_deps.region_accountant = Some(Arc::clone(&region_accountant));
     client_deps.local_populate = local_populate;
     client_deps.pull_through = pull_through;
@@ -1327,7 +1318,6 @@ async fn build_chain_and_handlers(
         region_accountant,
         client_handler,
         payment_service,
-        voucher_activity,
         blacklist_watcher,
         blacklist_ready_rx,
         rate_bounds_watcher,
@@ -1967,12 +1957,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             refresh_interval: crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
         })
         // Lane introspection for `admin_v1_lanes` (issue #749). Shares the
-        // same persistent lane-state store the client handler and
-        // settlement service use, plus the in-memory voucher-activity
-        // clock — read-only here.
+        // same persistent lane-state store the client handler and settlement
+        // service use, plus a read handle over the handler's live lane
+        // registry for the last-voucher clock (issue #1733) — read-only here.
         .with_lanes(admin::LaneStatusHandles {
             pool_store: Arc::clone(&infra.channel_state_store),
-            voucher_activity: Arc::clone(&ch.voucher_activity),
+            lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
         .with_region_accountant(Arc::clone(&ch.region_accountant))

@@ -8,6 +8,7 @@
 //! live cache and runtime handles, and the bind/serve helpers the runtime
 //! calls during start-up and graceful shutdown.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +25,9 @@ use decdn_common::admin::{
     SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
     parse_hash_arg,
 };
-use decdn_incentive::{LaneState, PoolStateStore, VoucherActivity};
+use decdn_incentive::{LaneKey, LaneState, PoolStateStore};
+
+pub use crate::handlers::client::LaneActivityClock;
 use jsonrpsee::core::{RpcResult, async_trait};
 use jsonrpsee::server::{Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
@@ -129,11 +132,10 @@ pub struct LaneStatusHandles {
     /// commits accepted vouchers to). Read via `load_all` to build the
     /// snapshot — the freshest committed `last_*` per lane.
     pub pool_store: Arc<dyn PoolStateStore>,
-    /// In-memory last-voucher clock (same handle the client handler
-    /// stamps on each accepted voucher). Read for
-    /// `seconds_since_last_voucher`; `None` per lane until this process
-    /// sees a voucher for it.
-    pub voucher_activity: Arc<VoucherActivity>,
+    /// Read handle over the client handler's live lane registry (issue #1733).
+    /// Read for `seconds_since_last_voucher`; a lane reads back `None` until
+    /// this process accepts a voucher for it.
+    pub lane_activity: LaneActivityClock,
     /// Configured redemption threshold in micro-USDC
     /// (`blockchain.redeem_threshold_micro_usdc`). A lane whose accrued
     /// claim has reached this is reported `settlement_eligible`.
@@ -687,7 +689,11 @@ impl AdminRpcServer for AdminRpcImpl {
             })?;
 
         let threshold = U256::from(ch.redeem_threshold_micro_usdc);
-        let lanes = build_lane_snapshots(&states, threshold, &ch.voucher_activity);
+        // Read each live lane's last-voucher age off the handler's registry
+        // (issue #1733); lanes with no voucher since restart are absent from the
+        // map and read back as `None`.
+        let ages = ch.lane_activity.ages().await;
+        let lanes = build_lane_snapshots(&states, threshold, &ages);
         Ok(LanesResponse {
             lanes,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
@@ -741,9 +747,10 @@ impl AdminRpcServer for AdminRpcImpl {
 }
 
 /// Build the wire `LaneSnapshot` list from loaded lane states, the
-/// redemption `threshold` (in micro-USDC as a `U256`), and the in-memory
-/// voucher-activity clock. Pure (no I/O, no locks beyond the activity
-/// read) so it's unit-testable without a store or an async runtime.
+/// redemption `threshold` (in micro-USDC as a `U256`), and each live lane's
+/// whole-seconds last-voucher age (`ages`, keyed by [`LaneKey`]; absent ⇒
+/// `None`). Pure (no I/O, no locks) so it's unit-testable without a store, an
+/// async runtime, or a live lane registry.
 ///
 /// Ordering: lanes with a known last-voucher age first (most recently
 /// active ahead of those with `None`), then by descending outstanding
@@ -754,7 +761,7 @@ impl AdminRpcServer for AdminRpcImpl {
 fn build_lane_snapshots(
     states: &[LaneState],
     threshold: U256,
-    activity: &VoucherActivity,
+    ages: &HashMap<LaneKey, u64>,
 ) -> Vec<LaneSnapshot> {
     let mut snapshots: Vec<LaneSnapshot> = states
         .iter()
@@ -774,7 +781,7 @@ fn build_lane_snapshots(
                 last_nonce: 0,
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
                 deposit_micro_usdc: 0,
-                seconds_since_last_voucher: activity.seconds_since(state.key()),
+                seconds_since_last_voucher: ages.get(&state.key()).copied(),
                 // Upper-bound eligibility: the admin surface doesn't read
                 // the on-chain `withdrawnAmount`, so it compares the full
                 // accrued claim against the threshold (documented on the
@@ -1869,9 +1876,9 @@ mod tests {
     #[test]
     fn build_lane_snapshots_maps_fields_and_eligibility() {
         let states = vec![mk_lane(1, 0xAA, 2_500_000), mk_lane(2, 0xBB, 500_000)];
-        let activity = VoucherActivity::new();
+        let ages = HashMap::new();
         let threshold = U256::from(1_000_000u64);
-        let snaps = build_lane_snapshots(&states, threshold, &activity);
+        let snaps = build_lane_snapshots(&states, threshold, &ages);
         assert_eq!(snaps.len(), 2);
         // No activity recorded → both have `None`; within the `None`
         // group ordering is by descending outstanding, so the
@@ -1908,8 +1915,8 @@ mod tests {
     #[test]
     fn build_lane_snapshots_threshold_is_inclusive() {
         let states = vec![mk_lane(1, 0xAA, 1_000_000)];
-        let activity = VoucherActivity::new();
-        let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &activity);
+        let ages = HashMap::new();
+        let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &ages);
         assert!(
             snaps.first().expect("snapshot").settlement_eligible,
             "outstanding == threshold must be eligible (>=)"
@@ -1922,11 +1929,11 @@ mod tests {
     fn build_lane_snapshots_orders_active_lanes_first() {
         let active = mk_lane(1, 0xAA, 100);
         let idle = mk_lane(2, 0xBB, 9_000_000);
-        let activity = VoucherActivity::new();
-        activity.touch(active.key());
-        // `idle` has a much larger outstanding, but no activity — the
-        // active lane must still sort first (recency beats size).
-        let snaps = build_lane_snapshots(&[idle, active], U256::from(1_000_000u64), &activity);
+        // `active` has a known age; `idle` is absent from the map (→ `None`).
+        // `idle` has a much larger outstanding, but no activity — the active
+        // lane must still sort first (recency beats size).
+        let ages = HashMap::from([(active.key(), 3u64)]);
+        let snaps = build_lane_snapshots(&[idle, active], U256::from(1_000_000u64), &ages);
         let first = snaps.first().expect("first snapshot");
         assert!(
             first.seconds_since_last_voucher.is_some(),
@@ -1995,7 +2002,7 @@ mod tests {
         let (state, _tmp) = state_with().await;
         let handles = LaneStatusHandles {
             pool_store: store as Arc<dyn PoolStateStore>,
-            voucher_activity: Arc::new(VoucherActivity::new()),
+            lane_activity: LaneActivityClock::empty(),
             redeem_threshold_micro_usdc: 1_000_000,
         };
         let rpc = AdminRpcImpl::new(state.with_lanes(handles));
@@ -2012,38 +2019,28 @@ mod tests {
         Ok(())
     }
 
-    /// Shared-`Arc` wiring guard (#749 review, crit 6): the writer (the
-    /// client handler's voucher-accept path) and the reader (this RPC) must
-    /// hold the SAME `Arc<VoucherActivity>`. If they were handed different
-    /// `Arc`s, the RPC would report `seconds_since_last_voucher: None`
-    /// ("never") forever with no failing test.
-    ///
-    /// Here the handler side is represented by a `touch` on the shared `Arc`
-    /// (the exact operation the accept path performs — `client_loopback`'s
-    /// `accepted_voucher_advances_shared_activity_clock` proves the handler
-    /// actually invokes it). We build the `lanes()` reader from that SAME
-    /// `Arc` and assert it now reports `Some(age)` for the touched lane,
-    /// and that the active lane sorts ahead of the idle one (recency).
+    /// Reader wiring guard (issue #1733): the RPC reads last-voucher ages off
+    /// the client handler's live lane registry via [`LaneActivityClock`]. A
+    /// stamped lane must report `Some(age)` and sort ahead of an idle lane with
+    /// a larger claim (recency beats size); an unstamped lane still reads
+    /// `None`. The stamp-under-the-accept-lock end-to-end path is covered by
+    /// `client_loopback`'s `accepted_voucher_advances_lane_activity_clock`.
     #[tokio::test]
-    async fn lanes_rpc_reflects_touch_through_shared_activity_arc() -> anyhow::Result<()> {
+    async fn lanes_rpc_reflects_stamped_lane_through_activity_clock() -> anyhow::Result<()> {
         let store = Arc::new(MemoryPoolStateStore::new());
-        // `active` has the smaller claim; `idle` the larger. Without a touch,
-        // `idle` would sort first (descending outstanding). A touch on
-        // `active` must flip that — proving the reader sees the write.
+        // `active` has the smaller claim; `idle` the larger. Without a stamp,
+        // `idle` would sort first (descending outstanding). A stamp on `active`
+        // must flip that — proving the reader sees the lane's stamp.
         let active = mk_lane(1, 0xAA, 100);
         let idle = mk_lane(2, 0xBB, 9_000_000);
         let active_id = active.key();
         store.record(&active)?;
         store.record(&idle)?;
 
-        // ONE Arc, shared between the (simulated) writer and the reader.
-        let activity = Arc::new(VoucherActivity::new());
-        activity.touch(active_id);
-
         let (state, _tmp) = state_with().await;
         let handles = LaneStatusHandles {
             pool_store: store as Arc<dyn PoolStateStore>,
-            voucher_activity: Arc::clone(&activity),
+            lane_activity: LaneActivityClock::with_stamped_lanes(&[active_id]),
             redeem_threshold_micro_usdc: 1_000_000,
         };
         let rpc = AdminRpcImpl::new(state.with_lanes(handles));
@@ -2053,14 +2050,13 @@ mod tests {
         let first = resp.lanes.first().expect("first");
         assert!(
             first.seconds_since_last_voucher.is_some(),
-            "the touched lane must report Some(age) through the shared Arc, \
-             not None — a different Arc would read None"
+            "the stamped lane must report Some(age), not None"
         );
         assert_eq!(
             first.outstanding_micro_usdc, 100,
-            "the touched (active) lane must sort first despite the smaller claim"
+            "the stamped (active) lane must sort first despite the smaller claim"
         );
-        // The untouched lane still reads None through the same reader.
+        // The unstamped lane still reads None through the same reader.
         let second = resp.lanes.get(1).expect("second");
         assert_eq!(second.seconds_since_last_voucher, None);
         Ok(())
@@ -2092,7 +2088,7 @@ mod tests {
         let (state, _tmp) = state_with().await;
         let handles = LaneStatusHandles {
             pool_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
-            voucher_activity: Arc::new(VoucherActivity::new()),
+            lane_activity: LaneActivityClock::empty(),
             redeem_threshold_micro_usdc: 1_000_000,
         };
         let rpc = AdminRpcImpl::new(state.with_lanes(handles));

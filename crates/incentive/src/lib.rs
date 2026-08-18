@@ -72,7 +72,6 @@ pub mod swap_uniswap;
 pub mod swap_venue;
 pub mod tx;
 pub mod voucher;
-pub mod voucher_activity;
 
 pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
@@ -113,4 +112,3 @@ pub use swap_venue::{Quote, ResolvedSwap, SwapVenue, from_config};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };
-pub use voucher_activity::VoucherActivity;
