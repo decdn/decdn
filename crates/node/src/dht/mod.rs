@@ -14,6 +14,7 @@ pub mod chain_origin_directory;
 mod chain_projection;
 pub mod chain_staker_set;
 pub mod client;
+pub mod lazy_origin_cache;
 pub mod lookup;
 pub mod negative_cache;
 pub mod node_address;

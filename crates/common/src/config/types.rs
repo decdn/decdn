@@ -135,6 +135,18 @@ pub struct BlockchainConfig {
     /// `FIND_VALUE` fallback. Unset => the origin directory is empty, so that
     /// fallback resolves nothing.
     pub origin_assignment_address: Option<String>,
+    /// Positive-hit TTL for the lazy origin directory cache, in seconds. Only
+    /// consulted when `origin_assignment_address` is set. Absent =>
+    /// `DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC`.
+    pub origin_directory_positive_ttl_sec: Option<u64>,
+    /// Negative-hit TTL for the lazy origin directory cache, in seconds. Only
+    /// consulted when `origin_assignment_address` is set. Absent =>
+    /// `DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC`.
+    pub origin_directory_negative_ttl_sec: Option<u64>,
+    /// Max distinct namespaces held in the lazy origin directory cache (LRU
+    /// eviction). Only consulted when `origin_assignment_address` is set.
+    /// Absent => `DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY`.
+    pub origin_directory_cache_capacity: Option<usize>,
     /// `PublisherRegistry` contract address. Independent of the origin directory:
     /// it is the publish CLI's `namespace create` target and is not consumed by
     /// the node runtime.

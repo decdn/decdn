@@ -12091,8 +12091,9 @@ impl MutableOriginDirectory {
     }
 }
 
+#[async_trait]
 impl OriginDirectory for MutableOriginDirectory {
-    fn lookup_origins(&self, namespace_id: U256) -> Vec<DhtNodeId> {
+    async fn lookup_origins(&self, namespace_id: U256) -> Vec<DhtNodeId> {
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

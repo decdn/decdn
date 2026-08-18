@@ -56,6 +56,12 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         },
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,
+            origin_directory_positive_ttl_sec:
+                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC,
+            origin_directory_negative_ttl_sec:
+                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC,
+            origin_directory_cache_capacity:
+                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY,
             publisher_registry_address: None,
             rpc_url: "http://localhost:8545".into(),
             eth_keystore: PathBuf::from("/tmp/keystore.json"),

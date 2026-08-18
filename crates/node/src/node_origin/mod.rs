@@ -1201,7 +1201,7 @@ async fn discover(
     )
     .await;
     if providers.is_empty() {
-        deps.origin_directory.lookup_origins(namespace_id)
+        deps.origin_directory.lookup_origins(namespace_id).await
     } else {
         providers
     }
