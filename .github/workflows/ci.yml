@@ -382,6 +382,11 @@ jobs:
       # mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
         uses: rui314/setup-mold@v1
+        # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
+        # so mold only needs to be on PATH — don't rewire the system `ld`
+        # symlink (the action's default) and perturb unrelated C/C++ links.
+        with:
+          make-default: false
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: coverage
@@ -656,6 +661,11 @@ jobs:
       # dpkg-lock / mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
         uses: rui314/setup-mold@v1
+        # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
+        # so mold only needs to be on PATH — don't rewire the system `ld`
+        # symlink (the action's default) and perturb unrelated C/C++ links.
+        with:
+          make-default: false
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
       # cache. cache-profile: none — the contract build is the hoisted step below.
       - uses: ./.github/actions/foundry-setup
@@ -748,6 +758,11 @@ jobs:
       # dpkg-lock / mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
         uses: rui314/setup-mold@v1
+        # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
+        # so mold only needs to be on PATH — don't rewire the system `ld`
+        # symlink (the action's default) and perturb unrelated C/C++ links.
+        with:
+          make-default: false
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
       # cache. cache-profile: none — the contract build is the hoisted step below
       # (a `ci`-profile cache would need the fixtures on that same forge profile,
