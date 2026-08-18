@@ -51,17 +51,6 @@ use decdn_client_pull::provider;
 
 type FetchTarget = (PublicKey, Address);
 
-/// Remove the node that just refused delivery before probing fallback holders.
-/// The node id is the delivery endpoint identity; excluding it also protects
-/// against a stale duplicate registry row carrying a different provider address.
-fn fallback_candidates(candidates: &[NodeCandidate], refusing: FetchTarget) -> Vec<NodeCandidate> {
-    candidates
-        .iter()
-        .filter(|candidate| candidate.node_id != refusing.0)
-        .cloned()
-        .collect()
-}
-
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
 /// across groups and within each group. Entries that name the same blob (one
 /// file published at two paths) land in one group so it is fetched once (#1306).
@@ -528,28 +517,27 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         )
     }
 
-    /// Select the node to fetch `hash` from: the pinned explicit node, or
-    /// per-entry discovery over the shared candidate list.
-    async fn pick(&self, hash: [u8; 32]) -> anyhow::Result<FetchTarget> {
+    /// Fetch one blob after explicit selection or discovery, streaming it into
+    /// `staging` (#1497: the same [`fetch::drive_fetch`] gap-driven core `decdn
+    /// fetch` uses, so bundle pull gets reactive top-up too), failing over across
+    /// candidates on a retryable delivery failure (#1174, ADR 037 § Fallback).
+    ///
+    /// A pinned explicit node is its own only candidate — nothing to fail over
+    /// to. Under discovery the entry is probed into the ordered failover list
+    /// (proxy-warming non-holders first when they help, then holders nearest-RTT
+    /// first) and walked in turn: a retryable failure advances to the next
+    /// candidate, a terminal one stops, and the last error surfaces once the list
+    /// is exhausted. Every attempt draws on the ONE shared pool and resumes the
+    /// entry's `.partial` beside `staging`, so a fail-over re-pays nothing.
+    async fn fetch_to_staging(&self, hash: [u8; 32], staging: &Path) -> anyhow::Result<()> {
         if let Some(pinned) = self.explicit {
-            return Ok(pinned);
+            return self.fetch_to_staging_from(hash, pinned, staging).await;
         }
-        self.pick_excluding(hash, None).await
-    }
-
-    /// Select a target while omitting a node that already refused this hash.
-    async fn pick_excluding(
-        &self,
-        hash: [u8; 32],
-        excluded: Option<FetchTarget>,
-    ) -> anyhow::Result<FetchTarget> {
         let candidates = self
             .candidates
             .as_deref()
             .ok_or_else(|| anyhow!("no discovery candidates available"))?;
-        let filtered = excluded.map(|target| fallback_candidates(candidates, target));
-        let candidates = filtered.as_deref().unwrap_or(candidates);
-        let picked = fetch::probe_and_rank(
+        let order = fetch::probe_and_order(
             self.endpoint,
             candidates,
             self.relays.first(),
@@ -557,15 +545,27 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             fetch::ProxyWarmingParams::from_args(self.common),
         )
         .await?;
-        Ok((picked.node_id, picked.eth_address))
-    }
 
-    /// Fetch one blob after normal explicit selection or discovery, streaming it
-    /// into `staging` (#1497: the same [`fetch::drive_fetch`] gap-driven core
-    /// `decdn fetch` uses, so bundle pull gets reactive top-up too).
-    async fn fetch_to_staging(&self, hash: [u8; 32], staging: &Path) -> anyhow::Result<()> {
-        let target = self.pick(hash).await?;
-        self.fetch_to_staging_from(hash, target, staging).await
+        let mut last_err: Option<anyhow::Error> = None;
+        for (attempt, cand) in order.iter().enumerate() {
+            let target = (cand.node_id, cand.eth_address);
+            let err = match self.fetch_to_staging_from(hash, target, staging).await {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            };
+            let more = attempt + 1 < order.len();
+            if fetch::retry_disposition(&err) == fetch::RetryDisposition::Terminal || !more {
+                return Err(err);
+            }
+            eprintln!(
+                "bundle pull: provider {} could not deliver an entry ({err:#}); failing over to \
+                 the next of {} candidate(s)",
+                cand.eth_address,
+                order.len(),
+            );
+            last_err = Some(err);
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no candidate node could deliver the entry")))
     }
 
     /// Fetch directly from `node_id`/`provider`, bypassing discovery, streaming
@@ -1100,33 +1100,7 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
     clippy::panic
 )]
 mod tests {
-    use decdn_protocol::Region;
-
     use super::*;
-
-    #[test]
-    fn fallback_candidates_omit_the_refusing_node() {
-        let refusing = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let alternative = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let refusing_provider = Address::repeat_byte(1);
-        let candidates = vec![
-            NodeCandidate {
-                node_id: refusing,
-                eth_address: refusing_provider,
-                region_hint: Region::parse("TR"),
-            },
-            NodeCandidate {
-                node_id: alternative,
-                eth_address: Address::repeat_byte(2),
-                region_hint: Region::parse("TR"),
-            },
-        ];
-
-        let filtered = fallback_candidates(&candidates, (refusing, refusing_provider));
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].node_id, alternative);
-    }
 
     #[test]
     fn safe_join_builds_nested_path_under_root() {

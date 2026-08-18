@@ -39,9 +39,9 @@ use decdn_client_pull::buyer_pool::{
 use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
-    BudgetPacer, ClientRangedStore, Cumulative, PeerSource, PoolContext, PoolLedger,
-    ProgressCallback, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull, sign_client_binding,
+    BlobTooLargeClaim, BudgetPacer, ClientRangedStore, Cumulative, PeerSource, PoolContext,
+    PoolLedger, ProgressCallback, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, open_progressive_pull, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -300,11 +300,11 @@ impl ProxyWarmingParams {
     }
 }
 
-/// Probe `candidates` for `hash` over `endpoint` and pick the best holder.
-/// Shared by `fetch`'s one-shot discovery and `bundle pull`'s per-entry
-/// discovery (which reads the active set once, then re-probes this list per
-/// entry). `slash_sig`/correlation are NOT validated here — selection only
-/// needs `has_blob` + RTT; the chosen node's delivery is fully verified
+/// Probe `candidates` for `hash` over `endpoint` and return the ordered
+/// provider-failover list (#1174, ADR 037 § Fallback): the sequence `fetch`
+/// tries in turn, each entry a fallback for the one before it, until one
+/// delivers the blob. `slash_sig`/correlation are NOT validated here — selection
+/// only needs `has_blob` + RTT; the chosen node's delivery is fully verified
 /// downstream. Errors if none of the probed candidates hold it.
 ///
 /// Every candidate is probed on equal footing: opening cost is
@@ -312,16 +312,19 @@ impl ProxyWarmingParams {
 /// every provider (ADR 003), so there is no per-provider "already funded"
 /// distinction to prefer.
 ///
-/// When `warming` is enabled (opt-in, #1174/ADR 037) and the best holder is
-/// distant, this may instead return a probed **non-holder** that is measurably
-/// nearer, so it serves via window-paced pull-through and seeds a regional copy.
-pub(crate) async fn probe_and_rank(
+/// The order is proxy-warming candidates first (nearest RTT first, ADR 037 §
+/// Client selection policy) when warming is enabled and engages, then the
+/// holders nearest RTT first. A caller that walks it therefore gets ADR 037's
+/// exact fallback shape: the chosen proxy, then the next candidate, and finally
+/// the direct holder — routing around a proxy that declines or stalls without
+/// ever surfacing an error while a holder remains.
+pub(crate) async fn probe_and_order(
     endpoint: &Endpoint,
     candidates: &[NodeCandidate],
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
     warming: ProxyWarmingParams,
-) -> anyhow::Result<NodeCandidate> {
+) -> anyhow::Result<Vec<NodeCandidate>> {
     let timestamp_us = micros_now();
     // Probe concurrently in one task. `probe_once`'s future is `Send`, so
     // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
@@ -372,50 +375,91 @@ pub(crate) async fn probe_and_rank(
         }
     }
 
-    // Proxy-warming pre-step (ADR 037 § Client selection policy): if the best
-    // holder is distant and a probed non-holder beats it by the margin, route the
-    // paid request through that nearer non-holder — it serves via window-paced
-    // pull-through and becomes the first regional copy. RTT-only ranking; never a
-    // gamble (empty order ⇒ fall through to the direct holder).
-    if warming.enabled && !holders.is_empty() {
-        let best_holder_rtt = holders
-            .iter()
-            .map(|h| h.rtt_ms)
-            .fold(f64::INFINITY, f64::min);
-        let order = discovery::proxy_warming_order(
+    if holders.is_empty() {
+        anyhow::bail!("none of the {probe_count} probed node(s) hold the requested blob");
+    }
+
+    let ordered = failover_order(holders, &warming_pool, warming);
+    if let Some((node_id, proxy_rtt, best_holder_rtt)) = ordered.warming_lead {
+        eprintln!(
+            "proxy-warming: routing through nearer non-holder {node_id} ({proxy_rtt:.1}ms) \
+             instead of the best holder ({best_holder_rtt:.1}ms) to seed a regional copy, \
+             falling back to the holder if it declines (ADR 037)",
+        );
+    }
+    Ok(ordered.order)
+}
+
+/// The ordered provider-failover list plus, when a proxy leads it, that proxy's
+/// identity for the operator log line. Split from [`probe_and_order`] as a pure
+/// function so the ordering is unit-tested without live probing.
+struct FailoverOrder {
+    /// The candidates to try in turn: proxy-warming non-holders first (nearest
+    /// RTT first) when warming engages, then the holders nearest RTT first.
+    order: Vec<NodeCandidate>,
+    /// `Some((proxy_node_id, proxy_rtt_ms, best_holder_rtt_ms))` when a warming
+    /// proxy is prepended; `None` when the list is just the holders.
+    warming_lead: Option<(PublicKey, f64, f64)>,
+}
+
+/// Assemble the failover order (#1174, ADR 037 § Client selection policy) from
+/// the probed `holders` and the `warming_pool` of probed non-holders.
+///
+/// The holders form the backbone, nearest RTT first — and, absent proxy warming,
+/// the whole list. When warming is enabled and the best holder is distant, the
+/// non-holders that beat it by the margin are PREPENDED nearest first, so the
+/// request routes through the nearest one (it serves via window-paced
+/// pull-through and becomes the first regional copy) and falls over through the
+/// remaining proxies to the direct holder. RTT-only ranking; never a gamble (an
+/// empty proxy order leaves the list as just the holders). `has_live_channel` is
+/// uniformly `false` in the pool model, so the RTT sort matches
+/// `discovery::rank`'s single pick at its head.
+fn failover_order(
+    mut holders: Vec<discovery::Probed>,
+    warming_pool: &[discovery::WarmingCandidate],
+    warming: ProxyWarmingParams,
+) -> FailoverOrder {
+    holders.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
+    let best_holder_rtt = holders
+        .iter()
+        .map(|h| h.rtt_ms)
+        .fold(f64::INFINITY, f64::min);
+    let proxy_order = if warming.enabled {
+        discovery::proxy_warming_order(
             best_holder_rtt,
             warming.rtt_threshold_ms,
             warming.margin_ms,
-            &warming_pool,
-        );
-        if let Some(proxy) = order.first() {
-            eprintln!(
-                "proxy-warming: routing through nearer non-holder {} ({:.1}ms) instead of the \
-                 best holder ({:.1}ms) to seed a regional copy (ADR 037)",
-                proxy.node_id, proxy.rtt_ms, best_holder_rtt
-            );
-            return Ok(NodeCandidate {
-                node_id: proxy.node_id,
-                eth_address: proxy.eth_address,
-                // Region deliberately dropped rather than carried over: ADR 037
-                // §"Ranking key is measured RTT only" forbids region from
-                // influencing warming, and `region_hint` is only ever read by
-                // `select_candidates`' pre-probe shortlist and operator logging.
-                // Leaving it unset keeps a spoofed region from riding along.
-                region_hint: None,
-            });
-        }
+            warming_pool,
+        )
+    } else {
+        Vec::new()
+    };
+    let warming_lead = proxy_order
+        .first()
+        .map(|nearest| (nearest.node_id, nearest.rtt_ms, best_holder_rtt));
+    let proxies = proxy_order.iter().map(|proxy| NodeCandidate {
+        node_id: proxy.node_id,
+        eth_address: proxy.eth_address,
+        // Region deliberately dropped rather than carried over: ADR 037
+        // §"Ranking key is measured RTT only" forbids region from influencing
+        // warming, and `region_hint` is only ever read by `select_candidates`'
+        // pre-probe shortlist and operator logging. Leaving it unset keeps a
+        // spoofed region from riding along.
+        region_hint: None,
+    });
+    let order = proxies
+        .chain(holders.iter().map(|h| h.candidate.clone()))
+        .collect();
+    FailoverOrder {
+        order,
+        warming_lead,
     }
-
-    let pick = discovery::rank(&holders).ok_or_else(|| {
-        anyhow::anyhow!("none of the {probe_count} probed node(s) hold the requested blob")
-    })?;
-    Ok(pick.candidate.clone())
 }
 
-/// Auto-discover a node to fetch `hash` from (#936): read the active set
-/// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
-/// candidates, and [`probe_and_rank`] them. Returns the chosen candidate.
+/// Auto-discover the failover order to fetch `hash` from (#936): read the
+/// active set from `CapacityBond`, take the region-nearest
+/// [`discovery::SELECT_K`] candidates, and [`probe_and_order`] them. Returns the
+/// ordered candidate list `fetch` tries in turn (#1174).
 /// Callers must have already unwrapped `chain.capacity_bond` into the
 /// "auto-discovery needs `capacity_bond_address`" error, which is why the
 /// address is a separate parameter rather than read back off `chain`.
@@ -429,7 +473,7 @@ async fn discover_provider(
     // same `args`, so they travel as `args` rather than as two more positional
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
-) -> anyhow::Result<NodeCandidate> {
+) -> anyhow::Result<Vec<NodeCandidate>> {
     let bootstrap = discovery::bootstrap_nodes(
         &chain.rpc_url,
         capacity_bond,
@@ -449,25 +493,28 @@ async fn discover_provider(
     }
     let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
     let warming = ProxyWarmingParams::from_args(args);
-    probe_and_rank(endpoint, &selected, relay_hint, hash, warming).await
+    probe_and_order(endpoint, &selected, relay_hint, hash, warming).await
 }
 
-/// Resolve the node to fetch from: the explicit `--node-id` (requiring
-/// `--provider-address`), or auto-discovery (#936) when `--node-id` is omitted
-/// (deriving the provider from the chosen node's registry entry). Returns
-/// `(node_id_to_dial, provider)`.
+/// Resolve the ordered failover list of nodes to fetch from (#1174): the
+/// explicit `--node-id` (requiring `--provider-address`) as a single-element
+/// list, or auto-discovery (#936) when `--node-id` is omitted (deriving each
+/// provider from the chosen node's registry entry). The caller tries the entries
+/// in turn, failing over on a retryable delivery failure (ADR 037 § Fallback).
 pub(crate) async fn resolve_target_node(
     args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     hash: [u8; 32],
-) -> anyhow::Result<(PublicKey, Address)> {
+) -> anyhow::Result<Vec<NodeCandidate>> {
     if let Some(raw) = &args.node_id {
         // No reachability pre-check: the endpoint is discovery-enabled, so a
         // node-id resolves via `[network.discovery]` / `presets::N0` (plus its
         // default relays) even without `--addr` or configured relays. `clap`
         // guarantees `--provider-address` is present alongside `--node-id`.
+        // A pinned node is its own only candidate: there is nothing to fail over
+        // to, so the list has one entry and the retry loop runs it once.
         let node_id = PublicKey::from_str(raw)
             .map_err(|e| anyhow::anyhow!("invalid --node-id {raw:?}: {e}"))?;
         let provider_raw = args
@@ -475,7 +522,11 @@ pub(crate) async fn resolve_target_node(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--provider-address is required with --node-id"))?;
         let provider = super::chain_ctx::parse_address(provider_raw, "--provider-address")?;
-        return Ok((node_id, provider));
+        return Ok(vec![NodeCandidate {
+            node_id,
+            eth_address: provider,
+            region_hint: None,
+        }]);
     }
 
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
@@ -493,13 +544,18 @@ pub(crate) async fn resolve_target_node(
     // here also cancels the ADR 012 § Bootstrap step 4 cache fallback, so a
     // client holding a usable `peers.json` would be handed a hard failure
     // instead of the degraded-but-working fetch the cache exists to provide.
-    let picked =
+    let order =
         discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
-    eprintln!(
-        "discovered node {} (provider {}, region {:?})",
-        picked.node_id, picked.eth_address, picked.region_hint
-    );
-    Ok((picked.node_id, picked.eth_address))
+    if let Some(primary) = order.first() {
+        eprintln!(
+            "discovered {} candidate node(s); primary {} (provider {}, region {:?})",
+            order.len(),
+            primary.node_id,
+            primary.eth_address,
+            primary.region_hint
+        );
+    }
+    Ok(order)
 }
 
 /// Reconnect an opaque `delivery refused: NotFound` to its likely cause(s).
@@ -623,8 +679,11 @@ fn persist_watermark(
 ///
 /// With `--node-id` the node is dialed explicitly. Without it, `fetch`
 /// auto-discovers (#936): read the active set from `CapacityBond`, probe the
-/// region-nearest candidates, pick a holder, and derive `--provider-address`
-/// from its registry entry.
+/// region-nearest candidates, and derive `--provider-address` from each
+/// candidate's registry entry, failing over across them (#1174).
+// Linear provider-failover loop over the resolved candidates plus the one-time
+// provider-independent setup — long but flat, not complex.
+#[allow(clippy::too_many_lines)]
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
@@ -655,8 +714,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
-    // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
-    let (node_id, provider) = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
+    // Resolve the ordered failover list: explicit `--node-id`, or auto-discover.
+    let candidates = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -681,40 +740,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentPool.usdc(): {e}"))?;
 
-    // Delegated (`--capability`): adopt the named pool + owner capability, no
-    // open. Self-owned: reuse the caller's live pool (resuming this provider's
-    // lane watermark) or open and persist a new one. Both attach the ADR 005
-    // client binding.
-    let ctx = build_ctx_for_fetch(
-        grant.as_ref(),
-        &store,
-        &contract,
-        &rpc,
-        &signer,
-        &voucher_dom,
-        provider,
-        self_address,
-        &chain,
-        &endpoint,
-    )
-    .await?;
-
-    let mut target = EndpointAddr::new(node_id);
-    // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
-    // path; a discovered node is reached via its resolved address + relay hint.
-    if let Some(addr) = common.addr {
-        target = target.with_ip_addr(addr);
-    }
-    if let Some(url) = relays.first() {
-        target = target.with_relay_url(url.clone());
-    }
-
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
-    // Delivery progress bar (#1118). `indicatif` draws to stderr and hides
-    // itself automatically when stderr is not a terminal, so a piped/redirected
-    // fetch stays silent. The bar starts length-less; the first callback (which
-    // fires once the signed `StreamResponse` fixes the total) sets its length.
-    let (bar, on_progress) = delivery_progress();
     // The namespace routing hint (ADR 005 § Namespace routing): `--namespace <id>`
     // → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort cache/DHT).
     let namespace_id = args
@@ -726,17 +752,18 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
     // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
     // said so in the user's own flags, so this `?` is the belt to those braces.
+    // This same stall budget is the ADR 037 § Fallback progress deadline: a proxy
+    // (or holder) that makes no progress within it trips the stall, and the
+    // failover loop below routes to the next candidate.
     let deadlines = PullDeadlines::capped(
         common.stall_timeout(),
         common.stall_timeout(),
         common.hard_cap(),
     )?;
 
-    // Immutable pool fact captured before `ctx` moves into `drive_fetch` (which
-    // wraps it behind the shared, interior-mutable handle).
-    let pool_id = ctx.pool_id;
-
     // The shared pull/funding deps the driver core borrows for the whole fetch.
+    // Every field is provider-independent, so it is built once and reused across
+    // every failover candidate (the provider is passed to `drive_fetch` per-try).
     let deps = DriveFetchDeps {
         endpoint: &endpoint,
         store: &store,
@@ -752,41 +779,108 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         deadlines,
     };
 
-    // Run the gap-driven driver core (header-probe -> ClientRangedStore ->
-    // PeerSource -> drive -> watermark). The `indicatif` bar and its `on_progress`
-    // closure stay here — `drive_fetch` reports only through the callback. Clear
-    // the bar around the call so it never overwrites the terminal outcome (success
-    // line or error), on either path.
-    let result = drive_fetch(
-        &deps,
-        ctx,
-        target,
-        provider,
-        pool_id,
-        hash,
-        &args.output,
-        Some(&on_progress),
-        || bar.finish_and_clear(),
-    )
-    .await;
-    // Safety net for the header-probe-failure early-return path inside
-    // `drive_fetch` (before `drive()` ever runs, so `finish_progress` above is
-    // never invoked on that path). `finish_and_clear` is idempotent, so this is
-    // a harmless no-op on the success/drive-error paths where the hook already
-    // cleared the bar before `persist_watermark` ran.
-    bar.finish_and_clear();
-    // On the delegated path `SpendingCapExhausted`, `CapabilityExpired`, and
-    // `PoolExhausted` are all terminal — the delegate cannot top up an owner's
-    // pool or raise/re-mint its own capability — so reconnect them to the
-    // owner-side remedy rather than leaving a bare "voucher rejected: ...".
-    let total_bytes = match (result, grant.is_some()) {
-        (Ok(bytes), _) => bytes,
-        (Err(err), true) => return Err(annotate_delegated_exhaustion(err)),
-        (Err(err), false) => return Err(err),
-    };
+    // Provider failover (#1174, ADR 037 § Fallback): try each resolved candidate
+    // in turn until one delivers the blob. All candidates draw on the ONE shared
+    // pool (ADR 003) — each provider is a distinct lane, and a lane for a
+    // not-yet-paid provider opens nothing on-chain — and the `ClientRangedStore`
+    // beside `--output` is keyed on `(hash, total_bytes)`, so a fail-over resumes
+    // the partial and re-pays nothing already delivered. A retryable failure
+    // (a cache-miss `NotFound`, a stall, a transport fault) advances to the next
+    // candidate; a terminal one (pool/funder exhausted, blob over the cap) stops
+    // immediately; the last error is returned when the list is exhausted.
+    let mut last_err: Option<anyhow::Error> = None;
+    for (attempt, candidate) in candidates.iter().enumerate() {
+        let provider = candidate.eth_address;
 
-    println!("fetched {total_bytes} bytes -> {}", args.output.display());
-    Ok(())
+        // Delegated (`--capability`): adopt the named pool + owner capability, no
+        // open. Self-owned: reuse the caller's live pool (resuming this provider's
+        // lane watermark) or open and persist a new one. Both attach the ADR 005
+        // client binding. Rebuilt per candidate because the lane is per-provider.
+        let ctx = build_ctx_for_fetch(
+            grant.as_ref(),
+            &store,
+            &contract,
+            &rpc,
+            &signer,
+            &voucher_dom,
+            provider,
+            self_address,
+            &chain,
+            &endpoint,
+        )
+        .await?;
+
+        let mut target = EndpointAddr::new(candidate.node_id);
+        // `--addr` requires `--node-id` (clap), so it only pins the single
+        // explicit-node candidate; a discovered node is reached via its resolved
+        // address + relay hint.
+        if let Some(addr) = common.addr {
+            target = target.with_ip_addr(addr);
+        }
+        if let Some(url) = relays.first() {
+            target = target.with_relay_url(url.clone());
+        }
+
+        // Immutable pool fact captured before `ctx` moves into `drive_fetch`.
+        let pool_id = ctx.pool_id;
+
+        // A fresh delivery progress bar per attempt (#1118). `indicatif` draws to
+        // stderr and hides itself when stderr is not a terminal. On a resumed
+        // fail-over it counts only the remaining transfer — the ranged store
+        // re-pulls only the missing ranges.
+        let (bar, on_progress) = delivery_progress();
+        let result = drive_fetch(
+            &deps,
+            ctx,
+            target,
+            provider,
+            pool_id,
+            hash,
+            &args.output,
+            Some(&on_progress),
+            || bar.finish_and_clear(),
+        )
+        .await;
+        // Safety net for the header-probe-failure early-return path inside
+        // `drive_fetch` (before `drive()` ever runs). `finish_and_clear` is
+        // idempotent, so this is a harmless no-op on paths where the hook already
+        // cleared the bar.
+        bar.finish_and_clear();
+
+        // On the delegated path `SpendingCapExhausted`, `CapabilityExpired`, and
+        // `PoolExhausted` are all terminal — the delegate cannot top up an owner's
+        // pool or raise/re-mint its own capability — so reconnect them to the
+        // owner-side remedy rather than leaving a bare "voucher rejected: ...".
+        let err = match result {
+            Ok(bytes) => {
+                println!("fetched {bytes} bytes -> {}", args.output.display());
+                return Ok(());
+            }
+            Err(err) if grant.is_some() => annotate_delegated_exhaustion(err),
+            Err(err) => err,
+        };
+
+        // Stop on a terminal failure, or on a retryable one with nothing left to
+        // fail over to (the last error is what the caller sees). Otherwise route
+        // to the next candidate.
+        let more_candidates = attempt + 1 < candidates.len();
+        if retry_disposition(&err) == RetryDisposition::Terminal || !more_candidates {
+            return Err(err);
+        }
+        eprintln!(
+            "fetch: provider {provider} could not deliver ({err:#}); failing over to the next of \
+             {} candidate(s)",
+            candidates.len(),
+        );
+        last_err = Some(err);
+    }
+
+    // The list is empty only if `resolve_target_node` returned no candidates,
+    // which it never does (discovery errors on an empty holder set, and the
+    // explicit path yields one). `last_err` is therefore set whenever the loop
+    // falls through; keep a defensive error for the unreachable empty case.
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("no candidate node could deliver the requested blob")))
 }
 
 /// Reconnect a delegated fetch's terminal owner-remedy voucher rejection
@@ -817,6 +911,57 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     } else {
         err
     }
+}
+
+/// Whether a failed delivery attempt should fall over to the next candidate
+/// provider (#1174, ADR 037 § Fallback), or end the fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryDisposition {
+    /// The failure is a property of THIS provider or its delivery — not of the
+    /// content or the caller's pool — so the next candidate is worth trying.
+    RetryElsewhere,
+    /// Another provider cannot fix this: the shared pool or funder is refused
+    /// everywhere, or the blob is unservable to this client whoever holds it.
+    Terminal,
+}
+
+/// Classify a [`drive_fetch`] failure for provider failover (#1174, ADR 037 §
+/// Fallback): decide whether continuing to the next candidate can succeed.
+///
+/// The classification follows the retry disposition each [`StreamError`] variant
+/// already documents, plus the pool model's global facts:
+///
+/// - A payment-layer rejection ([`UpstreamVoucherRejected`], or a mid-stream
+///   [`StreamError::VoucherRejected`]) is **terminal**. One pool fans out to
+///   every provider (ADR 003), so its remaining deposit, its capability cap, and
+///   the on-chain delivery floor are the same against any provider, and
+///   `drive_fetch` has already exhausted any wallet-less watermark self-heal.
+/// - [`StreamError::OriginBlacklisted`] is **terminal** — the pool's funder is
+///   refused under this address everywhere.
+/// - A [`BlobTooLargeClaim`] is **terminal** — the blob is BLAKE3-addressed, so
+///   its size is identical whoever serves it, and it stays over the client's cap.
+/// - Every other refusal ([`StreamError::NotFound`], `Overloaded`,
+///   `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`, `HashBlacklisted`)
+///   and every non-refusal error — a stall (the progress deadline tripped), a
+///   transport fault, or a bao/hash verification failure on the bytes this node
+///   served — is a property of this provider's delivery, so the fetch **fails
+///   over**. When every candidate is exhausted the caller returns the last such
+///   error, so a genuinely absent or wrong hash still surfaces its refusal.
+pub(crate) fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
+    use RetryDisposition::{RetryElsewhere, Terminal};
+
+    if err.downcast_ref::<UpstreamVoucherRejected>().is_some()
+        || err.downcast_ref::<BlobTooLargeClaim>().is_some()
+    {
+        return Terminal;
+    }
+    if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
+        return match refused.error() {
+            StreamError::OriginBlacklisted | StreamError::VoucherRejected { .. } => Terminal,
+            _ => RetryElsewhere,
+        };
+    }
+    RetryElsewhere
 }
 
 /// Shared pull/funding deps [`drive_fetch`] borrows for the lifetime of one
@@ -1567,6 +1712,165 @@ mod tests {
     /// would exercise nothing and pass against a hint that never fires in production.
     fn refusal(error: StreamError) -> anyhow::Error {
         anyhow::Error::new(UpstreamRefused::mid_stream(error))
+    }
+
+    /// A payment-layer voucher rejection is terminal for failover: the shared
+    /// pool's cap/deposit/floor are global, so the next provider fails the same.
+    #[test]
+    fn voucher_rejection_is_terminal() {
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
+            bundle: None,
+        });
+        assert_eq!(super::retry_disposition(&err), RetryDisposition::Terminal);
+    }
+
+    /// A refused `OriginBlacklisted` is terminal — the pool's funder is refused
+    /// under this address everywhere, so no other provider can serve it.
+    #[test]
+    fn origin_blacklisted_refusal_is_terminal() {
+        let err = refusal(StreamError::OriginBlacklisted);
+        assert_eq!(super::retry_disposition(&err), RetryDisposition::Terminal);
+    }
+
+    /// The client's own size cap, tripped by the server-signed `total_bytes`, is
+    /// terminal — the blob is content-addressed, so its size is the same anywhere.
+    #[test]
+    fn blob_too_large_claim_is_terminal() {
+        let err = anyhow::Error::new(BlobTooLargeClaim {
+            claimed: 1 << 40,
+            ceiling: 1 << 20,
+        });
+        assert_eq!(super::retry_disposition(&err), RetryDisposition::Terminal);
+    }
+
+    /// Every "try another node" refusal fails over to the next candidate.
+    #[test]
+    fn node_specific_refusals_fail_over() {
+        for error in [
+            StreamError::NotFound,
+            StreamError::Overloaded,
+            StreamError::BlobTooLarge,
+            StreamError::InternalError,
+            StreamError::EvictedSinceProbe,
+            StreamError::HashBlacklisted,
+        ] {
+            assert_eq!(
+                super::retry_disposition(&refusal(error.clone())),
+                RetryDisposition::RetryElsewhere,
+                "{error:?} must fail over to the next candidate"
+            );
+        }
+    }
+
+    /// A stall, transport fault, or bao/hash verification failure carries no
+    /// typed sentinel; it is specific to this provider's delivery, so fail over.
+    #[test]
+    fn untyped_delivery_failures_fail_over() {
+        let err = anyhow::anyhow!("connect failed: timed out");
+        assert_eq!(
+            super::retry_disposition(&err),
+            RetryDisposition::RetryElsewhere,
+        );
+    }
+
+    fn node_key(seed: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
+        discovery::Probed {
+            candidate: NodeCandidate {
+                node_id: node_key(seed),
+                eth_address: Address::repeat_byte(seed),
+                region_hint: None,
+            },
+            rtt_ms,
+            has_live_channel: false,
+        }
+    }
+
+    fn warming_params(enabled: bool) -> ProxyWarmingParams {
+        ProxyWarmingParams {
+            enabled,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        }
+    }
+
+    /// With warming off, the failover order is exactly the holders, nearest RTT
+    /// first, and no proxy leads.
+    #[test]
+    fn failover_order_is_holders_by_rtt_when_warming_off() {
+        let holders = vec![holder(3, 300.0), holder(1, 100.0), holder(2, 200.0)];
+        let out = super::failover_order(holders, &[], warming_params(false));
+        assert!(out.warming_lead.is_none());
+        let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
+        assert_eq!(ids, vec![node_key(1), node_key(2), node_key(3)]);
+    }
+
+    /// When warming engages, a nearer non-holder leads the list, the rest of the
+    /// proxies follow nearest first, and the holders form the tail — so a walker
+    /// gets proxy → … → direct holder (ADR 037 § Fallback).
+    #[test]
+    fn failover_order_prepends_proxies_then_holders() {
+        // Holders are all distant (>150ms threshold); two proxies beat the best
+        // holder (200ms) by ≥30ms, one (190ms) does not.
+        let holders = vec![holder(10, 200.0), holder(11, 250.0)];
+        let warming_pool = vec![
+            discovery::WarmingCandidate {
+                node_id: node_key(21),
+                eth_address: Address::repeat_byte(21),
+                rtt_ms: 90.0,
+            },
+            discovery::WarmingCandidate {
+                node_id: node_key(22),
+                eth_address: Address::repeat_byte(22),
+                rtt_ms: 150.0,
+            },
+            discovery::WarmingCandidate {
+                node_id: node_key(23),
+                eth_address: Address::repeat_byte(23),
+                rtt_ms: 190.0,
+            },
+        ];
+        let out = super::failover_order(holders, &warming_pool, warming_params(true));
+
+        // The nearest qualifying proxy (90ms) leads and is reported for the log.
+        let lead = out.warming_lead.expect("a proxy should lead");
+        assert_eq!(lead.0, node_key(21));
+        assert!((lead.2 - 200.0).abs() < f64::EPSILON, "best holder rtt");
+
+        let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                node_key(21), // proxy 90ms
+                node_key(22), // proxy 150ms (beats 200 by 50 ≥ 30)
+                node_key(10), // holder 200ms
+                node_key(11), // holder 250ms
+            ],
+            "proxy 23 (190ms) misses the 30ms margin and is dropped; holders tail the list",
+        );
+        // The prepended proxy carries no region hint (spoof-proofing, ADR 037).
+        assert!(out.order[0].region_hint.is_none());
+    }
+
+    /// Warming that does not engage — no proxy clears the margin — leaves the
+    /// list as just the holders, with no lead.
+    #[test]
+    fn failover_order_no_qualifying_proxy_is_holders_only() {
+        let holders = vec![holder(10, 200.0)];
+        // A proxy only 10ms nearer misses the 30ms margin.
+        let warming_pool = vec![discovery::WarmingCandidate {
+            node_id: node_key(21),
+            eth_address: Address::repeat_byte(21),
+            rtt_ms: 190.0,
+        }];
+        let out = super::failover_order(holders, &warming_pool, warming_params(true));
+        assert!(out.warming_lead.is_none());
+        let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
+        assert_eq!(ids, vec![node_key(10)]);
     }
 
     /// The delegated signer gate accepts the authorized key and rejects any
