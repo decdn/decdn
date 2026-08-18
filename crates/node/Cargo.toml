@@ -54,6 +54,7 @@ decdn-reputation = { workspace = true }
 decdn-common = { workspace = true }
 alloy = { workspace = true }
 async-trait = { workspace = true }
+dashmap = { workspace = true }
 futures-util = { workspace = true }
 iroh = { workspace = true }
 iroh-blobs = { workspace = true }

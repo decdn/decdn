@@ -2874,6 +2874,7 @@ dependencies = [
  "bao-tree",
  "bytes",
  "clap",
+ "dashmap",
  "decdn-bao-range",
  "decdn-cache",
  "decdn-client-pull",

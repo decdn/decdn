@@ -74,6 +74,9 @@ iroh-io = { version = "0.6", default-features = false }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
+# Sharded concurrent map: the client handler's lane registry (#1731) so
+# independent lanes look up on different shards instead of one global mutex.
+dashmap = "6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
