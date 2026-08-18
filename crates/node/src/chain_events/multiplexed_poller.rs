@@ -1055,8 +1055,14 @@ mod tests {
             let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
             let result = match body.get("method").and_then(serde_json::Value::as_str) {
                 Some("eth_blockNumber") => {
-                    self.head_hits.fetch_add(1, Ordering::SeqCst);
-                    serde_json::json!("0x64")
+                    // Strictly increasing head: every real RPC (i.e. every
+                    // TTL window, not every tick) advances the chain by one
+                    // block, so — unlike a static head, which idles after
+                    // tick 1 and would pass even an unmerged N-loop
+                    // regression — every poller tick has a non-empty merged
+                    // range and must issue a `get_logs`.
+                    let n = self.head_hits.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!(format!("0x{:x}", 100 + n))
                 }
                 Some("eth_getLogs") => {
                     self.getlogs_hits.fetch_add(1, Ordering::SeqCst);
@@ -1129,12 +1135,22 @@ mod tests {
         let _ = handle.await;
 
         let getlogs = getlogs_hits.load(Ordering::SeqCst);
+        let heads = head_hits.load(Ordering::SeqCst);
         let per_ms = |d: Duration| d.as_millis().max(1);
         let ticks = (per_ms(RUN_FOR) / per_ms(INTERVAL)) as usize + 2;
+        // The head advances by one block on every real `eth_blockNumber` RPC
+        // (see `CountingRpc`), so — unlike a static head, under which every
+        // tick after the first is idle and issues no `get_logs` at all, and
+        // the old `< ROUTES * ticks` bound would pass even an unmerged
+        // 4-loop regression — every tick here has a non-empty merged range
+        // and must issue exactly one `get_logs`. A regression back to one
+        // loop per route would issue up to `ROUTES` times as many; bounding
+        // close to the tick count (rather than the much looser `ROUTES *
+        // ticks`) is what actually discriminates merged from unmerged.
         assert!(
-            getlogs < ROUTES * ticks,
-            "merged polling must beat one get_logs per route per tick \
-             (getlogs={getlogs}, unmerged would approach {})",
+            getlogs <= ticks + 2,
+            "merged polling must track ~1 get_logs per tick, not ROUTES per tick \
+             (getlogs={getlogs}, ticks~={ticks}, heads={heads}, unmerged would approach {})",
             ROUTES * ticks
         );
         assert!(
@@ -1389,6 +1405,257 @@ mod tests {
             panicked_b.load(Ordering::SeqCst),
             1,
             "a sibling route's on_task_panic must ALSO fire — the whole task died"
+        );
+    }
+
+    // --- Coverage: shutdown suppresses the established/backoff edges, not liveness ---
+
+    /// Pins `fire_route_hooks`'s `!shutdown.is_cancelled()` guard on both
+    /// edges (mirrors `resumable_watcher`'s `shutdown_suppresses_the_*_edge`
+    /// tests). Tick 1 (not cancelled) fires the first-cycle `on_established`
+    /// edge alongside the per-tick `on_tick_success` liveness stamp; tick 2
+    /// (shutdown cancelled, but the tick still succeeds) must NOT fire a new
+    /// `on_established` edge and must NOT fire `on_backoff`, while
+    /// `on_tick_success` keeps incrementing regardless — the node is
+    /// stopping, but a still-successful tick is still proof of life.
+    #[tokio::test]
+    async fn shutdown_suppresses_established_and_backoff_edges_but_not_tick_success() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let established = Arc::new(AtomicUsize::new(0));
+        let backoff = Arc::new(AtomicUsize::new(0));
+        let tick_success = Arc::new(AtomicUsize::new(0));
+        let (mut route_a, _) = head_route("a", ADDR_A, TOPIC_A);
+        {
+            let counter = Arc::clone(&established);
+            route_a.on_established = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        {
+            let counter = Arc::clone(&backoff);
+            route_a.on_backoff = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        {
+            let counter = Arc::clone(&tick_success);
+            route_a.on_tick_success = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // Tick 1 (shutdown NOT cancelled): head=1, one empty window ->
+        // succeeds. The first healthy tick fires both the liveness stamp and
+        // the established edge.
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&Vec::<Log>::new());
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "tick 1 must succeed: {result:?}");
+        assert_eq!(
+            tick_success.load(Ordering::SeqCst),
+            1,
+            "on_tick_success must fire on tick 1"
+        );
+        assert_eq!(
+            established.load(Ordering::SeqCst),
+            1,
+            "on_established must fire once on the first healthy tick"
+        );
+        assert_eq!(
+            backoff.load(Ordering::SeqCst),
+            0,
+            "on_backoff must not fire on a healthy tick"
+        );
+
+        // Tick 2: shutdown is cancelled but the tick still succeeds (idle —
+        // the cursor is already past head, so no get_logs is needed).
+        // Liveness keeps stamping; the established/backoff edges are
+        // suppressed under a cancelled shutdown (fail-open guard).
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        asserter.push_success(&U64::from(1)); // cursor(2) > head(1): idle tick
+        let result = run_tick(&provider, &mut poller, &shutdown).await;
+        assert!(result.is_ok(), "tick 2 must succeed: {result:?}");
+        assert_eq!(
+            tick_success.load(Ordering::SeqCst),
+            2,
+            "on_tick_success must still increment under a cancelled shutdown"
+        );
+        assert_eq!(
+            established.load(Ordering::SeqCst),
+            1,
+            "on_established must NOT fire a new edge under a cancelled shutdown"
+        );
+        assert_eq!(
+            backoff.load(Ordering::SeqCst),
+            0,
+            "on_backoff must not fire on a still-successful tick"
+        );
+    }
+
+    // --- Coverage: a None block_number applies rather than being gated ---------
+
+    /// The floor gate is `log.block_number.is_some_and(|b| b < tick_floor)`:
+    /// a `None` block makes `is_some_and` false, so the log proceeds to
+    /// `apply` rather than being silently dropped. `log_at` always sets
+    /// `Some`, so this builds the log directly to exercise the `None` arm.
+    #[tokio::test]
+    async fn none_block_number_log_is_applied_not_gated() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let (route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        let mut log = log_at(ADDR_A, TOPIC_A, 1);
+        log.block_number = None; // e.g. a pending-tag response shape
+
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&vec![log]);
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "tick must succeed: {result:?}");
+
+        let a = sink_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            a.applied,
+            vec![(ADDR_A, TOPIC_A, None)],
+            "a log with no block_number must be applied, not silently dropped by the floor gate"
+        );
+    }
+
+    // --- Coverage: a later-window error holds the cursor at that window's start ---
+
+    /// Minimal in-memory durable store for this test — mirrors
+    /// `resumable_watcher.rs`'s test-only `MemoryCheckpointStore` (private to
+    /// that module, so duplicated here rather than reused).
+    #[derive(Default)]
+    struct MemoryCheckpointStore {
+        stored: std::sync::Mutex<std::collections::HashMap<CheckpointKey, u64>>,
+    }
+
+    impl KeyedCheckpointStore for MemoryCheckpointStore {
+        fn load_checkpoint(
+            &self,
+            key: CheckpointKey,
+        ) -> std::result::Result<Option<u64>, StoreError> {
+            Ok(self
+                .stored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .copied())
+        }
+
+        fn record_checkpoint(
+            &self,
+            key: CheckpointKey,
+            block: u64,
+        ) -> std::result::Result<(), StoreError> {
+            self.stored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, block);
+            Ok(())
+        }
+    }
+
+    /// A route whose floor sits several windows behind head must, on a
+    /// mid-backfill sink error, hold its cursor at the *failed* window's
+    /// start — not the original floor, and not an un-scanned later window —
+    /// while the windows that already completed stay advanced and persisted.
+    /// Mirrors `resumable_watcher.rs`'s
+    /// `sink_error_leaves_cursor_and_checkpoint_at_last_completed_window`,
+    /// carried over to the per-route `tick_floor`/`errored` machinery.
+    #[tokio::test]
+    async fn multi_window_error_holds_cursor_at_failed_windows_start() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let store = Arc::new(MemoryCheckpointStore::default());
+
+        let (route_a, sink_a) = seeded_route(
+            "a",
+            ADDR_A,
+            TOPIC_A,
+            CursorStart::Seeded {
+                at: 1,
+                persist: Some(Checkpoint {
+                    store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
+                    key: CheckpointKey::PoolOpened,
+                }),
+            },
+        );
+        // Fail on the 2nd apply (0-indexed): window [1,1] succeeds, window
+        // [2,2] fails, window [3,3] is never applied (route already errored).
+        sink_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_apply_on = Some(1);
+
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(1)
+                .route(route_a)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // floor=1, head=3, span=1 -> three windows: [1,1], [2,2], [3,3]. All
+        // three windows are scanned in this one tick (the window set is fixed
+        // from the tick's start floor before any route errors), so all three
+        // `get_logs` responses are queued regardless of the mid-tick error.
+        asserter.push_success(&U64::from(3));
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 1)]);
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 2)]);
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 3)]);
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_err(), "the failed window must fail the tick");
+
+        assert_eq!(
+            poller.routes.first().and_then(|r| r.cursor),
+            Some(2),
+            "cursor holds at the failed window's start (2): past the completed \
+             window [1,1] but not into the un-scanned window [3,3]"
+        );
+        let persisted = store
+            .load_checkpoint(CheckpointKey::PoolOpened)
+            .ok()
+            .flatten();
+        assert_eq!(
+            persisted,
+            Some(1),
+            "only the completed window [1,1] is durably persisted"
+        );
+        let applied = sink_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .applied
+            .len();
+        assert_eq!(
+            applied, 1,
+            "only window [1,1]'s log applied; the failed and un-scanned windows did not"
         );
     }
 }
