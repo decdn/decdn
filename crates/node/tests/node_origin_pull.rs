@@ -12678,6 +12678,7 @@ impl PoolOpener for FundingOpener {
 /// resumed. Here the buyer is paid for what it received, told it cannot afford the
 /// next interval, and — once the deposit rises — served the remainder from wherever
 /// it asks to resume.
+#[allow(clippy::too_many_arguments)]
 async fn serve_with_deposit_ceiling(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
@@ -12686,6 +12687,7 @@ async fn serve_with_deposit_ceiling(
     rate: u64,
     deposit: &SharedDeposit,
     resume_delay: Duration,
+    initial_ceiling: U256,
 ) -> Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -12708,12 +12710,21 @@ async fn serve_with_deposit_ceiling(
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
-    // Serve the RESUME leg (`byte_offset > 0`) slowly, AFTER the response is on the
-    // wire so the delay lands in the chunk stream (`pull_to_sink`), not the open. The
+    // Serve the completing POST-TOP-UP leg slowly, AFTER the response is on the wire
+    // so the delay lands in the chunk stream (`pull_to_sink`), not the open. The
     // paid-wait accounting must count this as the upstream serving bytes, not as our
     // funding wait — it must not be charged against the delivery-speed elapsed clock
     // (#1602). Zero for every test but the delivery-speed regression.
-    if req.byte_offset > 0 && !resume_delay.is_zero() {
+    //
+    // The completing leg is the one served once a top-up has raised the shared escrow
+    // above its initial ceiling (`top_up_pool` raises `deposit` here). Keying on the
+    // raised ceiling — not on `req.byte_offset` — is deliberate: the buyer re-requests
+    // the whole blob at `byte_offset == 0` and lets its ranged store dedupe the prefix,
+    // so a `byte_offset > 0` gate never fires on this path and the throttle would be
+    // inert.
+    // `resume_delay.is_zero()` first so the common (un-throttled) case short-circuits
+    // before taking the ceiling lock.
+    if !resume_delay.is_zero() && read_deposit(deposit)? > initial_ceiling {
         tokio::time::sleep(resume_delay).await;
     }
 
@@ -12792,6 +12803,7 @@ async fn settle_voucher(
 
 /// Spawn a provider that answers probes truthfully and serves under a live deposit
 /// ceiling (see [`serve_with_deposit_ceiling`]).
+#[allow(clippy::too_many_arguments)]
 fn spawn_deposit_capped_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
@@ -12800,6 +12812,7 @@ fn spawn_deposit_capped_server(
     rate: u64,
     deposit: SharedDeposit,
     resume_delay: Duration,
+    initial_ceiling: U256,
 ) -> tokio::task::JoinHandle<()> {
     // Same-length blobs only, so the probe's single quoted `total_bytes` is honest
     // for all of them (`two_concurrent_pulls_...` makes the same choice for the
@@ -12832,6 +12845,7 @@ fn spawn_deposit_capped_server(
                         rate,
                         &deposit,
                         resume_delay,
+                        initial_ceiling,
                     )
                     .await;
                 });
@@ -12948,6 +12962,7 @@ async fn top_up_fixture_multi_rep(
         RATE,
         Arc::clone(&ceiling),
         setup.resume_delay,
+        U256::from(setup.ceiling_micro_usdc.unwrap_or(setup.initial_micro_usdc)),
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
