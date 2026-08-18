@@ -3232,10 +3232,16 @@ impl CacheEngine {
 
     /// First configured origin that holds `hash` as a local file, or `None` if no
     /// origin has it locally (or none is a local-file-backed origin at all).
+    ///
+    /// Mirrors [`Self::origin_fetch_outboard_bytes`]'s fallback discipline: a
+    /// transient error from one origin does not fail the whole lookup while a
+    /// later origin might still serve it. A `last_err` is remembered and only
+    /// surfaced once every origin has declined or errored.
     async fn open_local_origin_reader(
         &self,
         hash: Hash,
     ) -> CacheResult<Option<crate::origin::LocalBlob>> {
+        let mut last_err: Option<CacheError> = None;
         for origin in &self.inner.origins {
             match origin.open_local_reader(hash).await {
                 Ok(Some(local)) => return Ok(Some(local)),
@@ -3247,14 +3253,17 @@ impl CacheEngine {
                         error = %e,
                         "origin local-reader open failed; trying next origin",
                     );
-                    return Err(CacheError::OriginError {
+                    last_err = Some(CacheError::OriginError {
                         hash,
                         source: e.into_inner(),
                     });
                 }
             }
         }
-        Ok(None)
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// `Some(total)` iff `hash` can be served zero-copy straight from a local fs
@@ -3298,9 +3307,14 @@ impl CacheEngine {
     ///
     /// [`CacheError::Store`] if the range fails to align against `blob_size`, or
     /// if the local reader / outboard vanish between the caller's
-    /// [`Self::origin_zero_copy_total`] check and this call (a benign race: the
-    /// caller degrades to the ordinary path on error). Faults discovered while
-    /// encoding arrive as `Err` items in the stream.
+    /// [`Self::origin_zero_copy_total`] check and this call. By the time this is
+    /// called the caller has already committed to the zero-copy serve (the signed
+    /// `StreamResponse` is out), so this is NOT a benign race the caller can
+    /// silently degrade from — an `Err` here is a delivery fault: the serve path
+    /// must abort the stream with no `StreamEnd`, exactly like a mid-encode fault.
+    /// Faults discovered while encoding arrive as `Err` items in the stream
+    /// instead, for the same reason [`Self::export_bao_range_stream`]'s do: the
+    /// failure is discovered only after earlier bytes are already on the wire.
     pub async fn export_bao_range_stream_from_origin(
         &self,
         hash: Hash,
