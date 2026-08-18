@@ -20,9 +20,10 @@
 //! still protect revenue and compliance.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use alloy::primitives::{Address, B256, U256};
+use arc_swap::ArcSwap;
 use decdn_incentive::payment_pool::PaymentPool;
 
 /// The per-pool chain quantities the serve gates read.
@@ -55,7 +56,7 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
 }
 
 /// Per-pool state the projection folds from the `PaymentPool` event log.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct PoolEntry {
     /// The pool owner, from `PoolOpened`.
     owner: Address,
@@ -85,22 +86,25 @@ impl PoolEntry {
 /// in-memory projection the settlement watcher folds from the `PaymentPool` event
 /// log, so no serve request costs a `getPool` `eth_call`.
 ///
-/// Cheaply cloneable (an `Arc` around the map). The settlement watcher's sink
-/// holds one clone to WRITE the projection from each `PaymentPool` log; the serve
-/// handler holds another as an `Arc<dyn PoolView>` to READ it.
+/// The map is published through an [`ArcSwap`] so a read (`status` at admission,
+/// `cached_status` at every voucher boundary) is a single atomic load — no lock,
+/// no read-modify-write — and never contends with a concurrent reader on the serve
+/// hot path. The settlement watcher's sink is the projection's single writer and
+/// each fold clones-then-publishes the whole map; writes are rare (one per
+/// `PaymentPool` event) next to the per-voucher-boundary reads.
+///
+/// Cheaply cloneable (an `Arc` around the cell). The settlement watcher's sink
+/// holds one clone to WRITE the projection; the serve handler holds another as an
+/// `Arc<dyn PoolView>` to READ it, both sharing the one `ArcSwap`.
 #[derive(Clone, Default)]
 pub struct PoolProjection {
-    pools: Arc<Mutex<HashMap<B256, PoolEntry>>>,
+    pools: Arc<ArcSwap<HashMap<B256, PoolEntry>>>,
 }
 
 impl std::fmt::Debug for PoolProjection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self
-            .pools
-            .lock()
-            .map_or_else(|p| p.into_inner().len(), |m| m.len());
         f.debug_struct("PoolProjection")
-            .field("pools", &len)
+            .field("pools", &self.pools.load().len())
             .finish()
     }
 }
@@ -112,32 +116,43 @@ impl PoolProjection {
         Self::default()
     }
 
+    /// Clone the current map, let `mutate` fold one event into it, and publish the
+    /// result. `rcu` retries `mutate` under a compare-and-swap so an update is never
+    /// lost — the projection has one writer today, but this keeps the fold correct
+    /// without banking on that invariant.
+    fn update(&self, mutate: impl Fn(&mut HashMap<B256, PoolEntry>)) {
+        self.pools.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            mutate(&mut next);
+            next
+        });
+    }
+
     /// Apply a `PoolOpened(poolId, owner, deposit)`: record the owner and the
     /// initial deposit. Absolute, so a re-delivered log is idempotent. The deposit
     /// is a `uint256` on the wire but a `uint64` on-chain; an out-of-range value
     /// (impossible by construction) saturates to `u64::MAX`, which over-states
     /// remaining and so fails toward serving — the fail-open direction.
     pub fn record_opened(&self, pool_id: B256, owner: Address, deposit: U256) {
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = pools.entry(pool_id).or_default();
-        entry.owner = owner;
-        entry.deposit = u64::try_from(deposit).unwrap_or(u64::MAX);
+        self.update(|pools| {
+            let entry = pools.entry(pool_id).or_default();
+            entry.owner = owner;
+            entry.deposit = u64::try_from(deposit).unwrap_or(u64::MAX);
+        });
     }
 
     /// Apply a `PoolToppedUp(poolId, _, newDeposit)`: `deposit = newDeposit`.
     /// Absolute, so idempotent. Skipped for a pool never opened in the projection's
     /// scan window — there is no owner to serve, and the serve gate fails open.
     pub fn record_topup(&self, pool_id: B256, new_deposit: U256) {
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = pools.get_mut(&pool_id) {
-            entry.deposit = u64::try_from(new_deposit).unwrap_or(u64::MAX);
+        if !self.pools.load().contains_key(&pool_id) {
+            return;
         }
+        self.update(|pools| {
+            if let Some(entry) = pools.get_mut(&pool_id) {
+                entry.deposit = u64::try_from(new_deposit).unwrap_or(u64::MAX);
+            }
+        });
     }
 
     /// Apply a `PoolRedeemed(poolId, provider, lanes)` for ANY provider: fold each
@@ -152,23 +167,24 @@ impl PoolProjection {
         provider: Address,
         lanes: &[PaymentPool::LaneSettled],
     ) {
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(entry) = pools.get_mut(&pool_id) else {
+        if !self.pools.load().contains_key(&pool_id) {
             return;
-        };
-        for lane in lanes {
-            let key = (lane.signer, provider);
-            let prev = entry.lanes.get(&key).copied().unwrap_or(0);
-            if lane.newPaidCumulative > prev {
-                entry.total_redeemed = entry
-                    .total_redeemed
-                    .saturating_add(lane.newPaidCumulative - prev);
-                entry.lanes.insert(key, lane.newPaidCumulative);
-            }
         }
+        self.update(|pools| {
+            let Some(entry) = pools.get_mut(&pool_id) else {
+                return;
+            };
+            for lane in lanes {
+                let key = (lane.signer, provider);
+                let prev = entry.lanes.get(&key).copied().unwrap_or(0);
+                if lane.newPaidCumulative > prev {
+                    entry.total_redeemed = entry
+                        .total_redeemed
+                        .saturating_add(lane.newPaidCumulative - prev);
+                    entry.lanes.insert(key, lane.newPaidCumulative);
+                }
+            }
+        });
     }
 
     /// Apply a `PoolReclaimed(poolId, ..)`: the pool is `Closed` and its remainder
@@ -179,21 +195,19 @@ impl PoolProjection {
     /// real `deposit − totalRedeemed`, so the projection keeps serving that pool
     /// until the reclaim actually lands.
     pub fn forget(&self, pool_id: B256) {
-        self.pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&pool_id);
+        if !self.pools.load().contains_key(&pool_id) {
+            return;
+        }
+        self.update(|pools| {
+            pools.remove(&pool_id);
+        });
     }
 }
 
 #[async_trait::async_trait]
 impl PoolView for PoolProjection {
     async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
-        self.pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&pool_id)
-            .map(PoolEntry::status)
+        self.pools.load().get(&pool_id).map(PoolEntry::status)
     }
 }
 
