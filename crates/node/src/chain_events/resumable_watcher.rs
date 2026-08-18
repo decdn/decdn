@@ -348,7 +348,7 @@ impl WatcherConfig {
 /// backstop; the other hooks fire on normal paths and are not guarded.
 pub(crate) type WatcherHook = Box<dyn Fn() + Send + Sync>;
 
-fn fire(hook: Option<&WatcherHook>) {
+pub(crate) fn fire(hook: Option<&WatcherHook>) {
     if let Some(hook) = hook {
         hook();
     }
@@ -597,6 +597,20 @@ pub(crate) struct WatcherHandle {
 }
 
 impl WatcherHandle {
+    /// Wrap an already-minted shutdown token and its owning task. Lets a
+    /// sibling driver that spawns its own task ([`super::multiplexed_poller`])
+    /// reuse this handle type instead of duplicating it; `spawn` above is the
+    /// in-module constructor for this loop's own token. `multiplexed_poller`
+    /// has no caller yet (see that module's doc), so this has none either
+    /// until that wiring lands.
+    #[allow(dead_code)]
+    pub(crate) const fn new(shutdown: CancellationToken, task: AbortOnDrop) -> Self {
+        Self {
+            shutdown,
+            _task: task,
+        }
+    }
+
     /// Signal the loop to flush its cursor and return. Idempotent; the owner
     /// calls it at whatever point in graceful shutdown its ordering demands
     /// (settlement, for one, cancels before its channel-close deadline).
