@@ -657,6 +657,11 @@ pub struct ClientHandlerDeps {
     /// immediately.
     pub credit_ramp_divisor: u64,
     pub idle_timeout: Option<Duration>,
+    /// Wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003
+    /// §Pool solvency). `None` (the default and production path) reads as
+    /// [`crate::pool_view::POOL_RECHECK_INTERVAL`]; a shorter value is set at
+    /// construction only by tests, so a drain case need not wait a real interval.
+    pub pool_recheck_interval: Option<Duration>,
     /// Durable mirror of each pool's `dead_charge` (ADR 003 §Pool solvency). The
     /// constructor hydrates the in-memory floor accumulator from it, and each
     /// per-stream floor reservation persists a new dead total to it best-effort on
@@ -724,6 +729,7 @@ impl ClientHandlerDeps {
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
             idle_timeout: None,
+            pool_recheck_interval: None,
             floor_loss_store: None,
         }
     }
@@ -876,6 +882,12 @@ pub struct ClientHandler {
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
     /// only by tests, so an idle-close case need not wait a real 30s.
     idle_timeout: Option<Duration>,
+    /// Wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003
+    /// §Pool solvency), read through [`Self::pool_recheck_interval`]. `None` (the
+    /// default and production path) reads as
+    /// [`crate::pool_view::POOL_RECHECK_INTERVAL`]; a shorter value is set at
+    /// construction via [`ClientHandlerDeps`] only by tests.
+    pool_recheck_interval: Option<Duration>,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -976,7 +988,16 @@ impl ClientHandler {
             deposit_refusal_last_warn_ms: AtomicU64::new(0),
             deposit_refusal_suppressed: AtomicU64::new(0),
             idle_timeout: deps.idle_timeout,
+            pool_recheck_interval: deps.pool_recheck_interval,
         })
+    }
+
+    /// The wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003
+    /// §Pool solvency): the configured test override, else
+    /// [`crate::pool_view::POOL_RECHECK_INTERVAL`].
+    pub(super) fn pool_recheck_interval(&self) -> Duration {
+        self.pool_recheck_interval
+            .unwrap_or(crate::pool_view::POOL_RECHECK_INTERVAL)
     }
 
     /// The pool's cached `getPool` status (owner + `remaining`), or `None` when no

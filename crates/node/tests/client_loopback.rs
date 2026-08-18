@@ -4139,6 +4139,7 @@ async fn spawn_handler_server_with_draining_pool(
     high: U256,
     low: U256,
     drained: Arc<std::sync::atomic::AtomicBool>,
+    recheck_interval: Duration,
 ) -> anyhow::Result<(EndpointAddr, Endpoint, tokio::task::JoinHandle<()>)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -4161,6 +4162,7 @@ async fn spawn_handler_server_with_draining_pool(
                 low,
                 drained,
             }));
+            deps.pool_recheck_interval = Some(recheck_interval);
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -4181,6 +4183,12 @@ async fn spawn_handler_server_with_draining_pool(
 /// covers it (`HARNESS_FLOOR_COST = 40`, `M = 0`), so B's boundary re-check emits
 /// a clean `PoolExhausted` and finishes the stream — not a QUIC reset. Per the
 /// loopback close-code caveat we assert the received reason, never an app code.
+///
+/// The handler runs with a ZERO recheck interval so the mid-stream re-check
+/// fires at every voucher boundary — this test isolates the drain→`PoolExhausted`
+/// path itself; the wall-clock cadence gating is covered separately by
+/// [`pool_recheck_gated_by_interval_lets_drained_stream_continue`] and
+/// [`pool_recheck_fires_after_interval_on_drained_pool`].
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()> {
     // A is > one interval so it parks (never finishes) holding its reservation; B
@@ -4216,6 +4224,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
         U256::from(10_000u64),
         U256::from(10u64),
         Arc::clone(&drained),
+        Duration::ZERO,
     )
     .await?;
 
@@ -4283,6 +4292,261 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     client_ep.close().await;
     server_ep.close().await;
     server_task.await?;
+    Ok(())
+}
+
+/// Live handles for the wall-clock recheck-cadence tests, produced by
+/// [`setup_recheck_holder_and_driven`]. `_send_a`/`_recv_a` keep the holder lane
+/// (A) open so it stays PARKED holding its floor reservation while a test drives B.
+struct RecheckFixture {
+    conn: Connection,
+    client_ep: Endpoint,
+    server_ep: Endpoint,
+    server_task: tokio::task::JoinHandle<()>,
+    _send_a: SendStream,
+    _recv_a: RecvStream,
+    send_b: SendStream,
+    recv_b: RecvStream,
+    signer_b: Arc<PrivateKeySigner>,
+    drained: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Shared fixture for the wall-clock recheck-cadence tests. Two DISTINCT lanes (A
+/// the holder, B the driven) on one pool served by a [`DrainingPoolView`] with the
+/// given `recheck_interval`. Admits both, delivers each its first interval, and
+/// leaves A PARKED holding its floor reservation — so once the pool is drained and
+/// B releases its own floor, A's floor is the pool's committed credit that the
+/// drained `remaining` (`low = 10`) cannot cover (`HARNESS_FLOOR_COST = 40`,
+/// `M = 0`). B is 16 MiB (4 intervals), so its first boundary is `!done`.
+async fn setup_recheck_holder_and_driven(
+    recheck_interval: Duration,
+) -> anyhow::Result<RecheckFixture> {
+    let payload_a = vec![0xA1u8; 6 * 1024 * 1024];
+    let payload_b = vec![0xB2u8; 16 * 1024 * 1024];
+    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
+
+    let signer_a = Arc::new(PrivateKeySigner::random());
+    let signer_b = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    for signer in [&signer_a, &signer_b] {
+        store.record(&LaneState::hydrate(
+            pool_id(),
+            signer.address(),
+            operator_addr(),
+            U256::from(10_000_000u64),
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        ))?;
+    }
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (target, server_ep, server_task) = spawn_handler_server_with_draining_pool(
+        cache,
+        store_dyn,
+        U256::from(10_000u64),
+        U256::from(10u64),
+        Arc::clone(&drained),
+        recheck_interval,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let ext_a = binding_ext(&signer_a, client_node_id)?;
+    let ext_b = binding_ext(&signer_b, client_node_id)?;
+
+    // A: admit (reserves one floor), deliver its first interval, then park reading a
+    // voucher we never send — it holds its live floor reservation for the whole test.
+    let (send_a, mut recv_a) = open_paid_stream(&conn, *hash_a.as_bytes(), Some(&ext_a)).await?;
+    read_exact_chunks(&mut recv_a, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_a).await?;
+
+    // B: admit (a second floor — `high` covers both), deliver its first interval, park.
+    let (send_b, mut recv_b) = open_paid_stream(&conn, *hash_b.as_bytes(), Some(&ext_b)).await?;
+    read_exact_chunks(&mut recv_b, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv_b).await?;
+
+    Ok(RecheckFixture {
+        conn,
+        client_ep,
+        server_ep,
+        server_task,
+        _send_a: send_a,
+        _recv_a: recv_a,
+        send_b,
+        recv_b,
+        signer_b,
+        drained,
+    })
+}
+
+/// Drive a paid stream to completion from the fixture's parked state and return the
+/// total WIRE bytes received (bao content + proof, so `> ` the blob's content size).
+///
+/// Delivery frames are `CHUNK_SIZE` (1 KiB), so a per-frame voucher would sign
+/// thousands of times; instead this pays one cumulative voucher per accumulated
+/// voucher-interval (the efficient cadence the other loopback tests use). The
+/// window ramp can leave a final sub-interval remainder the server parks on
+/// awaiting payment — a read timeout is the park signal, so on a stall this settles
+/// the outstanding remainder to unblock the server, then reads its `StreamEnd`.
+async fn pay_and_read_to_end(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    signer: &PrivateKeySigner,
+) -> anyhow::Result<u64> {
+    // The fixture already delivered interval 1 and parked; pay it upfront so the
+    // first loop read is not spent waiting out a park.
+    let mut received = HARNESS_INTERVAL_BYTES;
+    pay_cumulative(send, signer, received).await?;
+    let mut paid = received;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), read_client_msg(recv)).await {
+            Ok(msg) => match msg? {
+                ClientMessage::ChunkData(chunk) => {
+                    received = received.saturating_add(chunk.bytes().len() as u64);
+                    if received.saturating_sub(paid) >= HARNESS_INTERVAL_BYTES {
+                        pay_cumulative(send, signer, received).await?;
+                        paid = received;
+                    }
+                }
+                ClientMessage::StreamEnd => return Ok(received),
+                other => {
+                    anyhow::bail!("expected ChunkData or StreamEnd while draining, got {other:?}")
+                }
+            },
+            // Read timed out: the server has parked. If a sub-interval remainder is
+            // outstanding, settle it so `done` can fire; otherwise nothing we can pay
+            // would advance the stream, so it is genuinely stuck.
+            Err(_elapsed) => {
+                anyhow::ensure!(
+                    received > paid,
+                    "stream stalled with nothing left to pay ({received} wire bytes received)"
+                );
+                pay_cumulative(send, signer, received).await?;
+                paid = received;
+            }
+        }
+    }
+}
+
+/// Wall-clock cadence, suppression half (ADR 003 §Pool solvency): with a re-check
+/// interval far longer than the whole stream, the mid-stream re-check never comes
+/// due, so a pool that drains mid-flight is NOT caught and B streams to completion.
+/// A per-voucher-boundary check would trip `PoolExhausted` at B's first boundary
+/// after the drain (that is exactly what
+/// [`mid_stream_pool_drain_stops_with_pool_exhausted`] pins with a ZERO interval),
+/// so B reaching `StreamEnd` across four boundaries proves the check fires at most
+/// once per interval — here zero times.
+#[tokio::test(flavor = "multi_thread")]
+async fn pool_recheck_gated_by_interval_lets_drained_stream_continue() -> anyhow::Result<()> {
+    // Longer than the whole (millisecond-scale) stream, so the re-check is never due.
+    let mut fx = setup_recheck_holder_and_driven(Duration::from_secs(30)).await?;
+
+    // Drain: every subsequent `status()` reports `low`, below A's committed floor.
+    fx.drained.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Drive B to completion. With a per-boundary check the first payment after the
+    // drain would trip `PoolExhausted`; the 30 s cadence gate suppresses every
+    // check, so B receives the whole blob and ends with a clean `StreamEnd`.
+    let received = pay_and_read_to_end(&mut fx.send_b, &mut fx.recv_b, &fx.signer_b).await?;
+    anyhow::ensure!(
+        received >= 16 * 1024 * 1024,
+        "expected at least the full 16 MiB blob (wire = content + bao proof), received {received} bytes"
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    fx.client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
+/// Wall-clock cadence, firing half (ADR 003 §Pool solvency): once the re-check
+/// interval has elapsed, the NEXT voucher boundary on a drained pool trips
+/// `PoolExhausted`. We drain, wait past a short interval while B is parked (the
+/// serve loop is blocked in the voucher read, so no check runs during the wait),
+/// then pay B's first interval — by which point `last_pool_check.elapsed()` far
+/// exceeds the interval, so the re-check runs and stops the stream in-band.
+#[tokio::test(flavor = "multi_thread")]
+async fn pool_recheck_fires_after_interval_on_drained_pool() -> anyhow::Result<()> {
+    let interval = Duration::from_millis(300);
+    let mut fx = setup_recheck_holder_and_driven(interval).await?;
+
+    fx.drained.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Sleep past the interval so the next boundary is due. The wait only ever
+    // lengthens `elapsed`, so the re-check is guaranteed due regardless of load.
+    tokio::time::sleep(interval + Duration::from_millis(200)).await;
+
+    // Pay B's first interval: the server commits it, releases B's own floor, then
+    // runs the now-due re-check — A's still-held floor is the pool's committed
+    // credit and the drained `remaining` cannot cover it, so B stops in-band.
+    pay_cumulative(&mut fx.send_b, &fx.signer_b, HARNESS_INTERVAL_BYTES).await?;
+
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut fx.recv_b)).await?? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+            bundle,
+        }) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::PoolExhausted,
+                "expected PoolExhausted, got {reason:?}"
+            );
+            anyhow::ensure!(bundle.is_none(), "PoolExhausted attaches no bundle");
+        }
+        other => anyhow::bail!("expected VoucherRejected {{ PoolExhausted }}, got {other:?}"),
+    }
+
+    // Clean in-band stop, not a QUIC reset: the next read hits the FIN.
+    anyhow::ensure!(
+        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut fx.recv_b))
+            .await?
+            .is_err(),
+        "after PoolExhausted the server finishes the stream; no further frame is sent"
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    fx.client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
+/// Wall-clock cadence, solvent half (ADR 003 §Pool solvency): a re-check that
+/// comes due on a still-SOLVENT pool does not stop the stream. With a short
+/// interval and no drain, the re-check fires mid-stream, reads `remaining = high`
+/// (which covers the committed floor), and B streams to a clean `StreamEnd`.
+#[tokio::test(flavor = "multi_thread")]
+async fn solvent_pool_stream_completes_across_recheck_interval() -> anyhow::Result<()> {
+    let interval = Duration::from_millis(300);
+    // No drain: `remaining` stays `high` for the whole stream.
+    let mut fx = setup_recheck_holder_and_driven(interval).await?;
+
+    // Cross an interval boundary in wall-clock time before the next payment, so at
+    // least one re-check is guaranteed due while the pool is solvent.
+    tokio::time::sleep(interval + Duration::from_millis(200)).await;
+
+    // The re-check fires mid-stream, reads `remaining = high` (which covers the
+    // committed floor), and lets B stream to a clean `StreamEnd`.
+    let received = pay_and_read_to_end(&mut fx.send_b, &mut fx.recv_b, &fx.signer_b).await?;
+    anyhow::ensure!(
+        received >= 16 * 1024 * 1024,
+        "expected at least the full 16 MiB blob (wire = content + bao proof), received {received} bytes"
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    fx.client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
     Ok(())
 }
 

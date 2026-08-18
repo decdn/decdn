@@ -21,10 +21,31 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
 use arc_swap::ArcSwap;
 use decdn_incentive::payment_pool::PaymentPool;
+
+/// Wall-clock cadence for the serve loops' mid-stream pool-solvency re-check
+/// (ADR 003 §Pool solvency policy).
+///
+/// The re-check re-reads this projection to catch a pool other lanes drain
+/// `remaining` down on mid-stream. Two facts make a wall-clock cadence — not a
+/// per-voucher-boundary one — the right frequency:
+///
+/// - The projection only advances as the settlement watcher folds
+///   `PoolRedeemed` logs (roughly the event-poll cadence), so re-reading it
+///   faster than that returns the same value — wasted work on exactly the fast
+///   streams that cross voucher boundaries most often.
+/// - Per-stream throughput is bounded (credit window + voucher pacing), so a
+///   wall-clock interval `T` bounds worst-case over-delivery on a drained pool
+///   to `T × per-stream-rate` — an explicit, bounded exposure. The on-chain
+///   `redeem` (`min(desired, remaining)`, partial-on-drain) remains the backstop.
+///
+/// At ~2 s a ~1 Gbps stream over-delivers at most ~250 MB before it stops —
+/// sub-percent of a multi-GB blob, the core large-file workload.
+pub const POOL_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The per-pool chain quantities the serve gates read.
 #[derive(Clone, Copy, Debug)]
