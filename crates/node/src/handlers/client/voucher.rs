@@ -9,9 +9,9 @@
 
 use super::{
     Arc, B256, BufferedVoucherReader, ClientHandler, DEFAULT_TOLERANCE_BPS, Hash,
-    LaneDeliveryState, LaneKey, LaneState, Mutex, RateError, RecvStream, RetrySignal, SendStream,
-    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop, WatermarkBundle,
-    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    LaneDeliveryState, LaneKey, LaneState, Mutex, Ordering, RateError, RecvStream, RetrySignal,
+    SendStream, SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop,
+    WatermarkBundle, unix_millis, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::PoolError;
 
@@ -147,15 +147,20 @@ impl ClientHandler {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
+        // Stamp the lane's last-voucher liveness clock (issue #1733) while the
+        // per-lane guard is STILL held — a plain field write on the lane state,
+        // no separate global lock. Best-effort diagnostic (drives the admin
+        // "seconds since last voucher" readout); it gates nothing, so the
+        // relaxed store needs no ordering against the record above.
+        guard
+            .last_voucher_at
+            .store(unix_millis(), Ordering::Relaxed);
         drop(guard);
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
         self.record_receipt(hash, delta_bytes, client_node_id, verified.amount);
         if let Some(acc) = self.region_accountant.as_ref() {
             acc.record_served(&client_node_id.0, delta_bytes).await;
-        }
-        if let Some(activity) = self.voucher_activity.as_ref() {
-            activity.touch(lane_key);
         }
         // Hint the settlement service that this lane's accrued claim advanced
         // (#749/#327). Best-effort: an absent sender or a full channel just skips.
@@ -340,7 +345,7 @@ impl ClientHandler {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     use alloy::primitives::{Address, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
@@ -392,6 +397,7 @@ mod tests {
             bytes_delivered_cumulative: U256::ZERO,
             paid_credited: U256::ZERO,
             active_streams: Arc::new(AtomicU32::new(0)),
+            last_voucher_at: AtomicU64::new(0),
         }));
         handler.lanes.insert(lane_key, Arc::clone(&lane));
 

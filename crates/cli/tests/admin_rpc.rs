@@ -31,8 +31,10 @@ use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
 use decdn_common::cli::{DrainArgs, EvictArgs, HealthArgs, LanesArgs, ReloadArgs, StatusArgs};
-use decdn_incentive::{LaneState, MemoryPoolStateStore, PoolStateStore, VoucherActivity};
-use decdn_node::admin::{self, AdminState, DhtStatusHandles, DrainTrigger, LaneStatusHandles};
+use decdn_incentive::{LaneState, MemoryPoolStateStore, PoolStateStore};
+use decdn_node::admin::{
+    self, AdminState, DhtStatusHandles, DrainTrigger, LaneActivityClock, LaneStatusHandles,
+};
 use decdn_node::dht::routing::NodeId;
 use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
@@ -225,7 +227,7 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     )
     .with_lanes(LaneStatusHandles {
         pool_store: store as Arc<dyn PoolStateStore>,
-        voucher_activity: Arc::new(VoucherActivity::new()),
+        lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;

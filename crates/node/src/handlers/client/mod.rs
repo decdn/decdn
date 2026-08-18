@@ -38,7 +38,7 @@ use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verif
 use decdn_incentive::store::{PoolStateStore, StoreError};
 use decdn_incentive::{
     Capability, LaneKey, LaneState, RetrySignal, SignedCapability, SignedVoucher, StreamSlashData,
-    VoucherActivity, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ChunkData, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
@@ -128,6 +128,132 @@ struct LaneDeliveryState {
     /// pool headroom; a [`LaneSlot`] decrements this on every serve exit path. Shared
     /// as an `Arc` so the guard releases lock-free without re-taking the lane mutex.
     active_streams: Arc<AtomicU32>,
+    /// Wall-clock (Unix milliseconds) of the last accepted voucher on this lane,
+    /// or `0` when this process has accepted none since it hydrated the lane
+    /// (issue #1733). Stamped by [`ClientHandler::commit_one_voucher`] under the
+    /// per-lane lock it already holds — a field write, not a separate global
+    /// mutex — and read back by [`LaneActivityClock::ages`] for the admin
+    /// "seconds since last voucher" readout. Best-effort liveness bookkeeping:
+    /// it gates nothing, and the stamp lifecycle follows the lane row (a
+    /// forgotten lane drops it automatically).
+    last_voucher_at: AtomicU64,
+}
+
+/// Read handle over the client handler's live lane registry, exposing each
+/// lane's whole-seconds age since its last accepted voucher for the admin
+/// `lanes` surface (issue #1733). Cloning shares the same registry `Arc`, so
+/// the admin surface and the handler observe one set of lanes. The timestamp
+/// lives on the lane's own delivery state, stamped under the per-lane lock the
+/// voucher-accept path already holds, so reading liveness needs no separate
+/// global lock.
+#[derive(Clone)]
+pub struct LaneActivityClock {
+    lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
+}
+
+impl std::fmt::Debug for LaneActivityClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaneActivityClock").finish_non_exhaustive()
+    }
+}
+
+impl LaneActivityClock {
+    /// An activity clock over an empty registry — reports "never" for every
+    /// lane. Used where no client handler is wired (a node with no payment
+    /// surface, and admin unit tests).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            lanes: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Whole seconds since each live lane last accepted a voucher, keyed by
+    /// [`LaneKey`]. A lane whose stamp is `0` (none accepted since this process
+    /// hydrated it) is omitted, so a caller reads it back as "never" rather than
+    /// a bogus zero age. Best-effort: `Instant`-free wall-clock arithmetic, so a
+    /// clock that stepped backwards can only under-report the age — the safe
+    /// direction for a diagnostic.
+    pub async fn ages(&self) -> HashMap<LaneKey, u64> {
+        let now_ms = unix_millis();
+        // Snapshot the live lane handles first (cloning the per-lane `Arc`s
+        // releases the registry's shard guards), then read each stamp with only
+        // its own (brief) lane lock held — never a shard guard across an await.
+        let handles: Vec<(LaneKey, Arc<Mutex<LaneDeliveryState>>)> = self
+            .lanes
+            .iter()
+            .map(|e| (*e.key(), Arc::clone(e.value())))
+            .collect();
+        let mut out = HashMap::with_capacity(handles.len());
+        for (key, lane) in handles {
+            let stamped = lane.lock().await.last_voucher_at.load(Ordering::Relaxed);
+            if stamped != 0 {
+                out.insert(key, now_ms.saturating_sub(stamped) / 1000);
+            }
+        }
+        out
+    }
+
+    /// Test-only: a clock whose registry holds each `lane` already stamped
+    /// "now", so [`ages`](Self::ages) reports a near-zero age for it. Mirrors
+    /// what the voucher-accept path does to a live lane, without a running
+    /// handler. Used to drive the admin `lanes` ordering test.
+    #[cfg(test)]
+    pub(crate) fn with_stamped_lanes(lanes: &[LaneKey]) -> Self {
+        let now = unix_millis();
+        let map = DashMap::new();
+        for &key in lanes {
+            let state = LaneState::hydrate(
+                key.pool_id,
+                key.signer,
+                key.provider,
+                U256::MAX,
+                0,
+                U256::ZERO,
+                U256::ZERO,
+                None,
+            );
+            map.insert(
+                key,
+                Arc::new(Mutex::new(LaneDeliveryState {
+                    state,
+                    bytes_delivered_cumulative: U256::ZERO,
+                    paid_credited: U256::ZERO,
+                    active_streams: Arc::new(AtomicU32::new(0)),
+                    last_voucher_at: AtomicU64::new(now),
+                })),
+            );
+        }
+        Self {
+            lanes: Arc::new(map),
+        }
+    }
+}
+
+/// Wall-clock now in milliseconds since the Unix epoch, or `0` if the system
+/// clock is before the epoch. Stamps [`LaneDeliveryState::last_voucher_at`] on
+/// each accepted voucher and is read back by [`LaneActivityClock::ages`] (issue
+/// #1733). The `0` fallback doubles as the "never stamped" sentinel and only
+/// makes a lane look staler than it is — the safe direction for a best-effort
+/// diagnostic.
+pub(super) fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+impl ClientHandler {
+    /// A read handle over this handler's live lane registry for the admin
+    /// `lanes` surface (issue #1733): the last-voucher clock the operator's
+    /// "seconds since last voucher" readout reads. Shares the registry `Arc`, so
+    /// it observes every stamp the voucher-accept path writes without a separate
+    /// shared structure.
+    #[must_use]
+    pub fn lane_activity_clock(&self) -> LaneActivityClock {
+        LaneActivityClock {
+            lanes: Arc::clone(&self.lanes),
+        }
+    }
 }
 
 /// RAII slot for one admitted same-lane stream. Created under the lane lock after
@@ -637,7 +763,6 @@ pub struct ClientHandlerDeps {
     pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
     pub redeem_hint: Option<mpsc::Sender<LaneKey>>,
-    pub voucher_activity: Option<Arc<VoucherActivity>>,
     pub region_accountant: Option<Arc<RegionAccountant>>,
     pub pull_through: Option<Duration>,
     pub local_populate: Option<Duration>,
@@ -721,7 +846,6 @@ impl ClientHandlerDeps {
             max_concurrent_streams,
             content_deny,
             redeem_hint: None,
-            voucher_activity: None,
             region_accountant: None,
             pull_through: None,
             local_populate: None,
@@ -797,12 +921,6 @@ pub struct ClientHandler {
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
     /// full channel just skips it. Keyed by [`LaneKey`]: redemption is per-lane.
     redeem_hint: Option<mpsc::Sender<LaneKey>>,
-    /// In-memory last-voucher clock shared with `admin_v1_channels`
-    /// (issue #749), set at construction via [`ClientHandlerDeps`]. `None` when
-    /// no admin surface is wired (e.g. tests) — stamping is best-effort, so the
-    /// handler just skips it and the channel reports "no activity since restart"
-    /// to the operator.
-    voucher_activity: Option<Arc<VoucherActivity>>,
     /// Per-region bandwidth accountant (issue #750), set at construction via
     /// [`ClientHandlerDeps`]. `None` when no admin surface is wired (tests) —
     /// recording is best-effort, so the handler simply skips it.
@@ -927,6 +1045,7 @@ impl ClientHandler {
                     bytes_delivered_cumulative: bytes,
                     paid_credited: bytes,
                     active_streams: Arc::new(AtomicU32::new(0)),
+                    last_voucher_at: AtomicU64::new(0),
                 })),
             );
         }
@@ -973,7 +1092,6 @@ impl ClientHandler {
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
             redeem_hint: deps.redeem_hint,
-            voucher_activity: deps.voucher_activity,
             region_accountant: deps.region_accountant,
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
@@ -1181,6 +1299,7 @@ impl ClientHandler {
                 bytes_delivered_cumulative: bytes,
                 paid_credited: bytes,
                 active_streams: Arc::new(AtomicU32::new(0)),
+                last_voucher_at: AtomicU64::new(0),
             }))
         });
         self.refresh_lane_metrics().await;
@@ -1194,15 +1313,12 @@ impl ClientHandler {
     ///
     /// Propagates a [`StoreError`] if the durable delete fails.
     pub async fn forget_lane(&self, key: LaneKey) -> Result<(), StoreError> {
+        // Removing the lane row drops its `last_voucher_at` stamp with it (issue
+        // #1733): the timestamp lives on the lane's delivery state, so its
+        // lifecycle follows the lane automatically — no separate activity-map
+        // eviction.
         self.lanes.remove(&key);
         self.refresh_lane_metrics().await;
-        // Drop the in-memory last-voucher stamp too (issue #749 review):
-        // `touch` inserts per-lane with no eviction, so without this a settled
-        // lane's `Instant` would linger for the whole process lifetime — a slow
-        // leak on a high-churn node. Best-effort, mirroring the live-map removal.
-        if let Some(activity) = self.voucher_activity.as_ref() {
-            activity.forget(key);
-        }
         let store = Arc::clone(&self.channel_state_store);
         tokio::task::spawn_blocking(move || store.forget(key))
             .await
@@ -1943,6 +2059,7 @@ mod tests {
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,
                 active_streams: Arc::new(AtomicU32::new(0)),
+                last_voucher_at: AtomicU64::new(0),
             })),
         );
         handler.refresh_lane_metrics().await;
@@ -2546,5 +2663,58 @@ mod tests {
             "a repaid reservation folds no dead charge"
         );
         Ok(())
+    }
+
+    /// `LaneActivityClock::ages` reports a near-zero whole-seconds age for a
+    /// stamped lane and OMITS an unstamped (`last_voucher_at == 0`) one, so the
+    /// admin surface reads the latter back as "never" rather than a bogus `0`
+    /// age (issue #1733).
+    #[tokio::test]
+    async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
+        let stamped = LaneKey {
+            pool_id: B256::repeat_byte(0x11),
+            signer: Address::repeat_byte(0x22),
+            provider: Address::repeat_byte(0x33),
+        };
+        let unstamped = LaneKey {
+            pool_id: B256::repeat_byte(0x44),
+            signer: Address::repeat_byte(0x55),
+            provider: Address::repeat_byte(0x66),
+        };
+        let mk = |key: LaneKey, stamp: u64| {
+            Arc::new(Mutex::new(LaneDeliveryState {
+                state: LaneState::hydrate(
+                    key.pool_id,
+                    key.signer,
+                    key.provider,
+                    U256::MAX,
+                    0,
+                    U256::ZERO,
+                    U256::ZERO,
+                    None,
+                ),
+                bytes_delivered_cumulative: U256::ZERO,
+                paid_credited: U256::ZERO,
+                active_streams: Arc::new(AtomicU32::new(0)),
+                last_voucher_at: AtomicU64::new(stamp),
+            }))
+        };
+        let map = DashMap::new();
+        map.insert(stamped, mk(stamped, unix_millis()));
+        map.insert(unstamped, mk(unstamped, 0));
+        let clock = LaneActivityClock {
+            lanes: Arc::new(map),
+        };
+
+        let ages = clock.ages().await;
+        assert!(
+            ages.get(&stamped).is_some_and(|age| *age < 5),
+            "a freshly stamped lane reports a near-zero age, got {:?}",
+            ages.get(&stamped)
+        );
+        assert!(
+            !ages.contains_key(&unstamped),
+            "an unstamped lane (stamp == 0) must be omitted, read back as never"
+        );
     }
 }
