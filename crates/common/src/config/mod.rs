@@ -203,6 +203,23 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
 /// Bounds memo memory under a random-hash probe flood.
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
 
+/// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
+/// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
+/// origin-set staleness (there is no event tail); 5 min matches the negative
+/// probe cache order of magnitude.
+pub const DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC: u64 = 300;
+/// Negative-hit TTL: how long "this namespace has no origins / does not
+/// exist" is cached. Shorter than the positive TTL so a namespace that later
+/// gains an origin becomes reachable within one short window — and long
+/// enough that a flood of bogus/attacker-chosen request namespaces cannot
+/// force a `getOrigins` RPC per request. Namespace creation is permissionless
+/// and free (`PublisherRegistry.createNamespace`), so this is the `DoS` bound.
+pub const DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC: u64 = 30;
+/// Max distinct namespaces held in the lazy origin cache (LRU eviction).
+/// Bounds memory against the permissionless global namespace count — the
+/// cache only ever holds namespaces this node was actually asked to resolve.
+pub const DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY: usize = 4096;
+
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
 /// fraction the driver actively evicts.
@@ -1299,6 +1316,20 @@ fn resolve_blockchain_into(
          for the default (3600s)",
     );
 
+    let origin_directory_positive_ttl_sec = file
+        .and_then(|b| b.origin_directory_positive_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC);
+    let origin_directory_negative_ttl_sec = file
+        .and_then(|b| b.origin_directory_negative_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC);
+    let origin_directory_cache_capacity = file
+        .and_then(|b| b.origin_directory_cache_capacity)
+        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY);
+    // No `!= 0` rejection: a `0` TTL is a valid "disable caching" choice
+    // (every entry reads as already-expired, matching `probe_cache`'s
+    // documented zero-TTL behavior), and the cache clamps capacity to `>= 1`
+    // itself.
+
     let chain_id = cli
         .chain_id
         .or_else(|| file.and_then(|b| b.chain_id))
@@ -1453,6 +1484,9 @@ fn resolve_blockchain_into(
         payment_pool_address,
         capacity_bond_address,
         origin_assignment_address,
+        origin_directory_positive_ttl_sec,
+        origin_directory_negative_ttl_sec,
+        origin_directory_cache_capacity,
         publisher_registry_address,
         slash_judge_address,
         content_blacklist_address,
@@ -7133,6 +7167,58 @@ swap_pool_address = \"0xPool\"
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert!(resolved.origin_assignment_address.is_none());
         assert!(resolved.publisher_registry_address.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_ttls_default_when_unset() -> anyhow::Result<()> {
+        // Absent origin-directory knobs resolve to the DEFAULT_ORIGIN_DIRECTORY_*
+        // consts.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            origin_directory_positive_ttl_sec: None,
+            origin_directory_negative_ttl_sec: None,
+            origin_directory_cache_capacity: None,
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(
+            resolved.origin_directory_positive_ttl_sec,
+            DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC
+        );
+        assert_eq!(
+            resolved.origin_directory_negative_ttl_sec,
+            DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC
+        );
+        assert_eq!(
+            resolved.origin_directory_cache_capacity,
+            DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_origin_directory_ttls_pass_through() -> anyhow::Result<()> {
+        // Explicit values survive resolution unchanged.
+        let dir = data_dir_with_keystore()?;
+        let cli = empty_blockchain_args();
+        let file = types::BlockchainConfig {
+            rpc_url: Some("https://example/rpc".to_string()),
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            origin_directory_positive_ttl_sec: Some(600),
+            origin_directory_negative_ttl_sec: Some(5),
+            origin_directory_cache_capacity: Some(128),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.origin_directory_positive_ttl_sec, 600);
+        assert_eq!(resolved.origin_directory_negative_ttl_sec, 5);
+        assert_eq!(resolved.origin_directory_cache_capacity, 128);
         Ok(())
     }
 

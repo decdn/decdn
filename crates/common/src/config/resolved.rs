@@ -95,6 +95,19 @@ pub struct ResolvedBlockchain {
     /// into the chain-backed origin directory; `None` => empty directory, so
     /// the `FIND_VALUE` routing fallback (ADR 022) resolves nothing.
     pub origin_assignment_address: Option<String>,
+    /// Positive-hit TTL for the lazy origin directory cache, in seconds: how
+    /// long a resolved, non-empty `getOrigins(namespaceId)` set is served
+    /// before a re-read. Defaults to
+    /// [`super::DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC`].
+    pub origin_directory_positive_ttl_sec: u64,
+    /// Negative-hit TTL for the lazy origin directory cache, in seconds: how
+    /// long "this namespace has no origins / does not exist" is cached.
+    /// Defaults to [`super::DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC`].
+    pub origin_directory_negative_ttl_sec: u64,
+    /// Max distinct namespaces held in the lazy origin directory cache (LRU
+    /// eviction). Defaults to
+    /// [`super::DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY`].
+    pub origin_directory_cache_capacity: usize,
     /// `PublisherRegistry` contract address. Independent of the origin directory
     /// (the publish CLI's `namespace create` target); not consumed by the node.
     pub publisher_registry_address: Option<String>,
