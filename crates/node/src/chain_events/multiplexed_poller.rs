@@ -1409,33 +1409,36 @@ mod tests {
     }
 
     // --- Coverage: shutdown suppresses the established/backoff edges, not liveness ---
+    //
+    // Each pair below mirrors `resumable_watcher`'s
+    // `shutdown_suppresses_the_established_edge` /
+    // `shutdown_suppresses_the_backoff_edge`: a positive case that proves the
+    // hook *can* fire, and a negative case that isolates the
+    // `!shutdown.is_cancelled()` guard as the ONLY thing standing between an
+    // otherwise-identical tick and that hook firing. A test that cancels
+    // shutdown only on a SECOND tick (after the route is already established)
+    // is vacuous for the established edge — `!r.established` is already false
+    // by then, so the guard is never reached — and a test whose tick
+    // succeeds is vacuous for the backoff edge, since that hook only fires
+    // from the `errored` branch. Both negative cases below avoid that: the
+    // established case cancels before the route's very first tick (so
+    // `!r.established` is still true and only the shutdown guard withholds
+    // the fire), and the backoff case drives a genuinely failing tick (so
+    // `r.errored` is true and only the shutdown guard withholds the fire).
 
-    /// Pins `fire_route_hooks`'s `!shutdown.is_cancelled()` guard on both
-    /// edges (mirrors `resumable_watcher`'s `shutdown_suppresses_the_*_edge`
-    /// tests). Tick 1 (not cancelled) fires the first-cycle `on_established`
-    /// edge alongside the per-tick `on_tick_success` liveness stamp; tick 2
-    /// (shutdown cancelled, but the tick still succeeds) must NOT fire a new
-    /// `on_established` edge and must NOT fire `on_backoff`, while
-    /// `on_tick_success` keeps incrementing regardless — the node is
-    /// stopping, but a still-successful tick is still proof of life.
+    /// Positive case: an uncancelled first tick fires `on_established` once,
+    /// alongside the per-tick `on_tick_success` liveness stamp.
     #[tokio::test]
-    async fn shutdown_suppresses_established_and_backoff_edges_but_not_tick_success() {
+    async fn established_edge_fires_on_first_healthy_tick_when_not_cancelled() {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
 
         let established = Arc::new(AtomicUsize::new(0));
-        let backoff = Arc::new(AtomicUsize::new(0));
         let tick_success = Arc::new(AtomicUsize::new(0));
         let (mut route_a, _) = head_route("a", ADDR_A, TOPIC_A);
         {
             let counter = Arc::clone(&established);
             route_a.on_established = Some(Box::new(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-            }));
-        }
-        {
-            let counter = Arc::clone(&backoff);
-            route_a.on_backoff = Some(Box::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             }));
         }
@@ -1455,52 +1458,223 @@ mod tests {
             return;
         };
 
-        // Tick 1 (shutdown NOT cancelled): head=1, one empty window ->
-        // succeeds. The first healthy tick fires both the liveness stamp and
-        // the established edge.
         asserter.push_success(&U64::from(1));
         asserter.push_success(&Vec::<Log>::new());
         let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
-        assert!(result.is_ok(), "tick 1 must succeed: {result:?}");
-        assert_eq!(
-            tick_success.load(Ordering::SeqCst),
-            1,
-            "on_tick_success must fire on tick 1"
-        );
+        assert!(result.is_ok(), "tick must succeed: {result:?}");
         assert_eq!(
             established.load(Ordering::SeqCst),
             1,
-            "on_established must fire once on the first healthy tick"
+            "on_established must fire once on an uncancelled first healthy tick"
         );
         assert_eq!(
-            backoff.load(Ordering::SeqCst),
-            0,
-            "on_backoff must not fire on a healthy tick"
+            tick_success.load(Ordering::SeqCst),
+            1,
+            "on_tick_success must fire on the same tick"
         );
+    }
 
-        // Tick 2: shutdown is cancelled but the tick still succeeds (idle —
-        // the cursor is already past head, so no get_logs is needed).
-        // Liveness keeps stamping; the established/backoff edges are
-        // suppressed under a cancelled shutdown (fail-open guard).
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-        asserter.push_success(&U64::from(1)); // cursor(2) > head(1): idle tick
+    /// Cancels a shared shutdown token from inside `on_tick_complete` —
+    /// i.e. strictly *after* the per-window boundary check (`run_tick`'s
+    /// `if shutdown.is_cancelled() { return Ok(()); }`, which only runs
+    /// between windows) but *before* `fire_route_hooks` reads the token.
+    /// Optionally fails that same call, so the cancellation and the route's
+    /// `errored` transition land in the same tick. Mirrors
+    /// `resumable_watcher.rs`'s `CancelOnNthTick` — cancelling *before*
+    /// calling `run_tick` at all would instead trip the window-boundary
+    /// check and return early, short-circuiting the tick before it ever
+    /// reaches reconcile or hook-firing (proven the hard way: an earlier
+    /// draft of these tests cancelled up front and both went vacuous the
+    /// other way, asserting on a tick that never ran far enough to prove
+    /// anything).
+    struct CancelInReconcile {
+        shutdown: CancellationToken,
+        bail: bool,
+    }
+
+    impl LogSink for CancelInReconcile {
+        async fn apply(&mut self, _log: Log) -> Result<()> {
+            Ok(())
+        }
+        async fn on_tick_complete(&mut self) -> Result<()> {
+            self.shutdown.cancel();
+            if self.bail {
+                anyhow::bail!("cancelled mid-tick reconcile");
+            }
+            Ok(())
+        }
+    }
+
+    /// Negative case: shutdown becomes cancelled *during* the route's very
+    /// first tick (from its `on_tick_complete`, run strictly before
+    /// `fire_route_hooks`), so `!r.established` is still `true` and the tick
+    /// itself succeeds — the ONLY thing that can withhold `on_established`
+    /// is the `!shutdown.is_cancelled()` guard. If that guard were deleted
+    /// this assertion would fail (the edge would fire), which is what makes
+    /// this non-vacuous, unlike a cancel-on-the-second-tick construction
+    /// (where the route is already established and the guard is never
+    /// reached) or a cancel-before-calling-`run_tick` construction (where
+    /// the window-boundary check returns early and no hook fires at all —
+    /// see `CancelInReconcile`'s doc). `on_tick_success` still fires — the
+    /// tick itself succeeds; only the edge-triggered readiness signal is
+    /// suppressed (fail-open guard).
+    #[tokio::test]
+    async fn shutdown_during_first_tick_suppresses_established_edge() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let established = Arc::new(AtomicUsize::new(0));
+        let tick_success = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new(); // NOT cancelled yet
+        let route_a = {
+            let counter = Arc::clone(&established);
+            let tick_counter = Arc::clone(&tick_success);
+            Route {
+                addresses: vec![ADDR_A],
+                topic0s: vec![TOPIC_A],
+                start: CursorStart::HeadMinusWindow { window_blocks: 0 },
+                sink: Box::new(CancelInReconcile {
+                    shutdown: shutdown.clone(),
+                    bail: false,
+                }),
+                label: "a",
+                on_established: Some(Box::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })),
+                on_backoff: None,
+                on_tick_success: Some(Box::new(move || {
+                    tick_counter.fetch_add(1, Ordering::SeqCst);
+                })),
+                on_task_panic: None,
+            }
+        };
+
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&Vec::<Log>::new());
         let result = run_tick(&provider, &mut poller, &shutdown).await;
-        assert!(result.is_ok(), "tick 2 must succeed: {result:?}");
-        assert_eq!(
-            tick_success.load(Ordering::SeqCst),
-            2,
-            "on_tick_success must still increment under a cancelled shutdown"
-        );
+        assert!(result.is_ok(), "the tick itself still succeeds: {result:?}");
         assert_eq!(
             established.load(Ordering::SeqCst),
+            0,
+            "on_established must be suppressed once shutdown is cancelled \
+             mid-tick, even though the route was never established before"
+        );
+        assert_eq!(
+            tick_success.load(Ordering::SeqCst),
             1,
-            "on_established must NOT fire a new edge under a cancelled shutdown"
+            "on_tick_success still fires — liveness is unconditional"
+        );
+    }
+
+    /// Positive case: an uncancelled tick whose sink genuinely errors fires
+    /// `on_backoff`.
+    #[tokio::test]
+    async fn backoff_edge_fires_on_a_failing_tick_when_not_cancelled() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let backoff = Arc::new(AtomicUsize::new(0));
+        let (mut route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
+        sink_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_apply_on = Some(0);
+        {
+            let counter = Arc::clone(&backoff);
+            route_a.on_backoff = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&vec![log_at(ADDR_A, TOPIC_A, 1)]);
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_err(), "the route's sink error must fail the tick");
+        assert_eq!(
+            backoff.load(Ordering::SeqCst),
+            1,
+            "on_backoff must fire once on an uncancelled failing tick"
+        );
+    }
+
+    /// Negative case: shutdown becomes cancelled *during* the same tick that
+    /// makes the route error (`CancelInReconcile { bail: true }` cancels the
+    /// token and fails `on_tick_complete` in one call), so `r.errored` is
+    /// genuinely `true` and the backoff branch IS entered — the ONLY thing
+    /// that can withhold `on_backoff` is the `!shutdown.is_cancelled()`
+    /// guard. If that guard were deleted this assertion would fail (the edge
+    /// would fire), unlike a construction whose tick never actually errors
+    /// (where the backoff branch is never reached regardless of the guard)
+    /// or one that cancels before calling `run_tick` (which trips the
+    /// window-boundary check and returns early before the sink — and so the
+    /// error — is ever reached; see `CancelInReconcile`'s doc).
+    #[tokio::test]
+    async fn shutdown_during_failing_tick_suppresses_backoff_edge() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let backoff = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new(); // NOT cancelled yet
+        let route_a = {
+            let counter = Arc::clone(&backoff);
+            Route {
+                addresses: vec![ADDR_A],
+                topic0s: vec![TOPIC_A],
+                start: CursorStart::HeadMinusWindow { window_blocks: 0 },
+                sink: Box::new(CancelInReconcile {
+                    shutdown: shutdown.clone(),
+                    bail: true,
+                }),
+                label: "a",
+                on_established: None,
+                on_backoff: Some(Box::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })),
+                on_tick_success: None,
+                on_task_panic: None,
+            }
+        };
+
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&Vec::<Log>::new());
+        let result = run_tick(&provider, &mut poller, &shutdown).await;
+        assert!(
+            result.is_err(),
+            "the route still errors this tick — shutdown suppresses only the \
+             hook, not the tick's Err outcome: {result:?}"
         );
         assert_eq!(
             backoff.load(Ordering::SeqCst),
             0,
-            "on_backoff must not fire on a still-successful tick"
+            "on_backoff must be suppressed once shutdown is cancelled mid-tick, \
+             even though the route genuinely errored"
         );
     }
 
