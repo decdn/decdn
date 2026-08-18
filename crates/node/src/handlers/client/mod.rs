@@ -1794,8 +1794,8 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let (handler, _dir) = handler_for_tests(&metrics).await;
 
-        // Distinct lanes differ only by signer, so they land on different shards
-        // by hash — the case the single mutex used to serialize.
+        // Distinct lanes differ only by signer — the independent-lane case the
+        // single mutex used to serialize regardless of how they shard.
         let keys: Vec<LaneKey> = (0u8..32)
             .map(|i| LaneKey {
                 pool_id: B256::repeat_byte(0xC0),
@@ -1827,7 +1827,7 @@ mod tests {
         }
         assert_eq!(handler.lanes.len(), keys.len(), "every lane is tracked");
 
-        // Resolve every lane concurrently — each is a point read on its own shard.
+        // Resolve every lane concurrently — each is a point read on the map.
         let mut resolve = Vec::new();
         for key in &keys {
             let handler = Arc::clone(&handler);
