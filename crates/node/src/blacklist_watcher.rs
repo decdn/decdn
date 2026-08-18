@@ -213,16 +213,15 @@ trait BlacklistChainReads: Send + Sync {
 #[derive(Clone)]
 struct ContractReads<P: Provider + Clone> {
     contract: ContentBlacklist::ContentBlacklistInstance<P>,
+    /// The shared, TTL-cached single-flight head source every watcher reads
+    /// through (`chain_events::shared_head`), so the enumeration snapshot's block
+    /// pin does not cost its own per-boot `eth_blockNumber` call.
+    head: Arc<dyn HeadSource>,
 }
 
 impl<P: Provider + Clone> BlacklistChainReads for ContractReads<P> {
     async fn block_number(&self) -> Result<u64> {
-        timed(
-            None,
-            "get_block_number",
-            self.contract.provider().get_block_number(),
-        )
-        .await
+        self.head.head().await
     }
 
     async fn scope_regions(&self, operator: Address, at: u64) -> Result<Vec<B256>> {
@@ -1006,6 +1005,7 @@ where
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     let reads = ContractReads {
         contract: contract.clone(),
+        head: Arc::clone(&head),
     };
     let initial_sync = InitialSyncGate::new(initial_sync_tx);
 
@@ -1384,6 +1384,42 @@ mod tests {
         assert!(format!("{err:#}").contains("read 1 of 3"), "{err:#}");
     }
 
+    /// `ContractReads::block_number` must route through the shared, TTL-cached
+    /// [`SharedHead`] single-flight rather than issue its own `eth_blockNumber` —
+    /// two calls inside the TTL cost exactly one RPC. The unconsumed asserter
+    /// queue is the proof: a second direct read would have popped a response
+    /// that was never pushed.
+    #[tokio::test]
+    async fn contract_reads_block_number_routes_through_shared_head() -> Result<()> {
+        use crate::chain_events::shared_head::SharedHead;
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+
+        const TTL: Duration = Duration::from_secs(4);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::from(100));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(provider.clone(), TTL, None));
+
+        let contract = ContentBlacklist::new(Address::ZERO, provider);
+        let reads = ContractReads { contract, head };
+
+        assert_eq!(reads.block_number().await?, 100);
+        assert_eq!(
+            reads.block_number().await?,
+            100,
+            "second call is TTL-cached via SharedHead"
+        );
+        assert_eq!(
+            asserter.read_q().len(),
+            0,
+            "exactly one eth_blockNumber RPC was issued"
+        );
+        Ok(())
+    }
+
     /// Boot enumeration builds the full `(region, hash)` deny-set from every
     /// in-scope region — the enumeration analogue of "a fresh process rebuilds the
     /// full deny-set".
@@ -1572,6 +1608,11 @@ mod tests {
             contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider),
             reads: ContractReads {
                 contract: ContentBlacklist::new(Address::repeat_byte(0x11), mock_provider()),
+                head: Arc::new(crate::chain_events::shared_head::SharedHead::with_ttl(
+                    mock_provider(),
+                    Duration::from_secs(1),
+                    None,
+                )),
             },
             operator: Address::repeat_byte(0x22),
             cache,
@@ -1602,6 +1643,11 @@ mod tests {
             contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider),
             reads: ContractReads {
                 contract: ContentBlacklist::new(Address::repeat_byte(0x11), mock_provider()),
+                head: Arc::new(crate::chain_events::shared_head::SharedHead::with_ttl(
+                    mock_provider(),
+                    Duration::from_secs(1),
+                    None,
+                )),
             },
             operator: Address::repeat_byte(0x22),
             cache,
