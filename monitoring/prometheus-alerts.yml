@@ -225,6 +225,25 @@ groups:
             longer being refreshed and will drift from chain state. Correlate with
             decdn_staker_set_watcher_down_seconds and check the RPC provider.
 
+      # The origin directory is a lazy on-demand cache, not a watcher, so it has
+      # no last-tick gauge to stale out; alert on its getOrigins failure counter
+      # instead. Each failure means a DHT provider-lookup miss fell back to
+      # resolving no origins (fail-closed), so sustained failures degrade origin
+      # discovery silently. Warning, not critical: normal DHT provider lookup is
+      # the primary path and is unaffected. See adr/appendix-observability.md §3.
+      - alert: DecdnOriginDirectoryLookupFailing
+        expr: rate(decdn_origin_directory_get_origins_failures_total[5m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Origin directory getOrigins lookups failing on {{ $labels.instance }}"
+          description: |
+            The lazy origin directory cannot read getOrigins from chain, so a DHT
+            provider-lookup miss resolves no origins (fail-closed). Sustained
+            failures degrade origin discovery silently. Check the RPC provider and
+            the OriginAssignment contract address.
+
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
       # an alert in your blackbox rules file along the lines of
