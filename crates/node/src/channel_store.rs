@@ -664,13 +664,73 @@ impl PoolStateStore for PersistentPoolStateStore {
     }
 
     /// Write every dirty lane and apply every tombstone in ONE fsynced redb
-    /// transaction, then clear both sets. Idempotent — a no-op when clean. Holds
-    /// the buffer lock across the commit so no `record` interleaves the drain.
+    /// transaction. Idempotent — a no-op when clean.
+    ///
+    /// Double-buffered: the dirty lanes are encoded and the tombstones copied
+    /// out **under the buffer lock**, the snapshotted marks are cleared, and the
+    /// lock is released **before** the fsynced commit. So the ~1–10 ms fsync
+    /// runs with no lock held and a concurrent `record` (a cheap map insert)
+    /// never waits on disk I/O. `postcard` encoding also happens in the snapshot
+    /// step, off the fsync's critical path.
+    ///
+    /// A `record` that lands after the snapshot re-marks its lane dirty and is
+    /// captured by the next flush; the store only needs a monotonic floor, and
+    /// the frontier is documented "safe to lose" on a crash (ADR 003 §Off-chain
+    /// voucher state persistence), so a slightly older value now and a newer one
+    /// one cadence later is correct. Snapshot and clear are one locked critical
+    /// section, so clearing the whole dirty/tombstone sets there drops only the
+    /// snapshotted keys — a re-mark can only happen after the lock is released.
     fn flush(&self) -> Result<(), StoreError> {
-        let mut buf = self.lock_buffer()?;
-        if buf.dirty.is_empty() && buf.tombstones.is_empty() {
-            return Ok(());
+        let snapshot = {
+            let mut buf = self.lock_buffer()?;
+            if buf.dirty.is_empty() && buf.tombstones.is_empty() {
+                return Ok(());
+            }
+            let mut writes: Vec<(LaneKey, Vec<u8>)> = Vec::with_capacity(buf.dirty.len());
+            for key in &buf.dirty {
+                let Some(state) = buf.lanes.get(key) else {
+                    continue;
+                };
+                let encoded = postcard::to_allocvec(&StoredLaneState::from(state))
+                    .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
+                writes.push((*key, encoded));
+            }
+            let tombstones: Vec<LaneKey> = buf.tombstones.iter().copied().collect();
+            buf.dirty.clear();
+            buf.tombstones.clear();
+            FlushSnapshot { writes, tombstones }
+        };
+
+        // Fsynced commit with NO buffer lock held.
+        if let Err(err) = self.commit_snapshot(&snapshot) {
+            // The commit failed after the marks were cleared. Re-mark the
+            // snapshotted keys so the next flush retries them (the background
+            // flusher logs "retrying next tick"). Re-mark only where the buffer
+            // invariant still holds so a concurrent `record`/`forget` that
+            // already superseded a key keeps its newer intent — a best-effort
+            // step, so a poisoned lock here is logged, not allowed to mask the
+            // commit error the caller must see.
+            if let Err(remark_err) = self.remark_after_failed_commit(&snapshot) {
+                tracing::warn!(%remark_err, "re-marking lanes after a failed flush commit failed");
+            }
+            return Err(err);
         }
+        Ok(())
+    }
+}
+
+/// Encoded dirty writes and tombstone keys copied out of the buffer under the
+/// lock, so [`PersistentPoolStateStore::flush`] can run its fsynced commit with
+/// the lock released.
+struct FlushSnapshot {
+    writes: Vec<(LaneKey, Vec<u8>)>,
+    tombstones: Vec<LaneKey>,
+}
+
+impl PersistentPoolStateStore {
+    /// Apply a [`FlushSnapshot`] in ONE fsynced redb transaction. Holds no
+    /// buffer lock — every value was already encoded during the snapshot.
+    fn commit_snapshot(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
         let mut write_txn = self
             .db
             .begin_write()
@@ -682,18 +742,13 @@ impl PoolStateStore for PersistentPoolStateStore {
             let mut table = write_txn
                 .open_table(LANE_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            for key in &buf.dirty {
-                let Some(state) = buf.lanes.get(key) else {
-                    continue;
-                };
-                let encoded = postcard::to_allocvec(&StoredLaneState::from(state))
-                    .map_err(|err| StoreError::Codec(format!("postcard encode failed: {err}")))?;
+            for (key, encoded) in &snapshot.writes {
                 let key_bytes = lane_key_bytes(key);
                 table
                     .insert(&key_bytes, encoded.as_slice())
                     .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
             }
-            for key in &buf.tombstones {
+            for key in &snapshot.tombstones {
                 let key_bytes = lane_key_bytes(key);
                 table
                     .remove(&key_bytes)
@@ -703,8 +758,28 @@ impl PoolStateStore for PersistentPoolStateStore {
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        buf.dirty.clear();
-        buf.tombstones.clear();
+        Ok(())
+    }
+
+    /// Re-mark a failed commit's snapshotted keys so the next flush retries them.
+    /// `lanes` membership is the arbiter of a key's current intent: a snapshotted
+    /// write re-marks dirty only while its lane still exists (a concurrent
+    /// `forget` removed it and owns the newer tombstone), and a snapshotted
+    /// tombstone re-marks only while its lane is still absent (a concurrent
+    /// `record` resurrected it and owns the newer write). This preserves the
+    /// `dirty`/`tombstones` disjointness invariant.
+    fn remark_after_failed_commit(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
+        let mut buf = self.lock_buffer()?;
+        for (key, _) in &snapshot.writes {
+            if buf.lanes.contains_key(key) {
+                buf.dirty.insert(*key);
+            }
+        }
+        for key in &snapshot.tombstones {
+            if !buf.lanes.contains_key(key) {
+                buf.tombstones.insert(*key);
+            }
+        }
         Ok(())
     }
 }
@@ -1888,6 +1963,146 @@ mod tests {
         let dir = data_dir()?;
         let s = PersistentPoolStateStore::open(dir.path())?;
         s.flush()?; // nothing dirty
+        Ok(())
+    }
+
+    /// A lane whose `last_bytes_delivered` watermark is `bytes`, so a test can
+    /// advance one lane across rounds and check which value reached disk.
+    fn lane_at(pool_byte: u8, signer_byte: u8, bytes: u64) -> LaneState {
+        let mut pool = [0u8; 32];
+        pool[31] = pool_byte;
+        let mut signer = [0u8; 20];
+        signer[19] = signer_byte;
+        LaneState::hydrate(
+            B256::from(pool),
+            Address::from(signer),
+            address!("00000000000000000000000000000000000000de"),
+            U256::from(1_000_000u64),
+            1_900_000_000,
+            U256::from(bytes),
+            U256::from(bytes),
+            Some([signer_byte; 65]),
+        )
+    }
+
+    /// One flush persists a mix of dirty writes and tombstones in a single
+    /// commit: the surviving lanes reload, the forgotten one does not.
+    #[test]
+    fn flush_persists_mixed_writes_and_tombstones() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let keep_a = mk_lane(1, 0xA1, 100_000);
+        let keep_b = mk_lane(2, 0xB2, 200_000);
+        let drop_c = mk_lane(3, 0xC3, 300_000);
+        {
+            let s = PersistentPoolStateStore::open(dir.path())?;
+            // Persist drop_c first so the later forget produces a real tombstone
+            // against an on-disk row, not a no-op against an absent key.
+            s.record(&drop_c)?;
+            s.flush()?;
+            s.record(&keep_a)?;
+            s.record(&keep_b)?;
+            s.forget(drop_c.key())?;
+            s.flush()?;
+        }
+        let s = PersistentPoolStateStore::open(dir.path())?;
+        let mut all = s.load_all()?;
+        all.sort_by_key(|l| l.pool_id);
+        anyhow::ensure!(all.len() == 2, "one write forgotten, two survive");
+        anyhow::ensure!(all.first() == Some(&keep_a));
+        anyhow::ensure!(all.get(1) == Some(&keep_b));
+        Ok(())
+    }
+
+    /// The double-buffer only needs a monotonic floor: a record that advances a
+    /// lane after a prior flush is re-marked dirty and the newer value reaches
+    /// disk on the next flush. Models the "record lands after the snapshot"
+    /// case — the mark set after one flush is honored by the next.
+    #[test]
+    fn monotonic_remark_after_flush_reaches_disk() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        {
+            let s = PersistentPoolStateStore::open(dir.path())?;
+            s.record(&lane_at(9, 0x9A, 1_000))?;
+            s.flush()?;
+            // Advance the same lane, then flush again — the re-mark must win.
+            s.record(&lane_at(9, 0x9A, 5_000))?;
+            s.flush()?;
+        }
+        let s = PersistentPoolStateStore::open(dir.path())?;
+        let all = s.load_all()?;
+        anyhow::ensure!(all.len() == 1);
+        let only = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
+        anyhow::ensure!(
+            only.last_bytes_delivered() == U256::from(5_000u64),
+            "the newer watermark, marked after the first flush, must reach disk"
+        );
+        Ok(())
+    }
+
+    /// Records made concurrently with a continuous stream of flushes are never
+    /// blocked into a wedge and never lost: with the fsync no longer holding the
+    /// buffer lock, a `record` that lands mid-commit re-marks its lane and a
+    /// later flush captures it. After the writers finish and one final flush
+    /// runs, every lane's last (highest) watermark is on disk.
+    #[test]
+    fn concurrent_records_during_flush_are_not_lost() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const LANES: u8 = 16;
+        const ROUNDS: u64 = 60;
+
+        let dir = data_dir()?;
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // A flusher hammering the store while the writers advance lanes.
+        let flusher = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = store.flush();
+                }
+            })
+        };
+
+        let mut writers = Vec::new();
+        for lane in 0..LANES {
+            let store = Arc::clone(&store);
+            writers.push(std::thread::spawn(move || -> anyhow::Result<()> {
+                for round in 1..=ROUNDS {
+                    // Watermark strictly increases with the round, so the final
+                    // record for each lane carries the highest value.
+                    store.record(&lane_at(lane, lane, round * 4_096))?;
+                }
+                Ok(())
+            }));
+        }
+        for w in writers {
+            w.join()
+                .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+        }
+        stop.store(true, Ordering::Relaxed);
+        flusher
+            .join()
+            .map_err(|_| anyhow::anyhow!("flusher thread panicked"))?;
+
+        // A final flush drains whatever the last records re-marked, then reopen
+        // and confirm every lane reached its highest watermark on disk.
+        store.flush()?;
+        let store =
+            Arc::try_unwrap(store).map_err(|_| anyhow::anyhow!("outstanding store handles"))?;
+        drop(store);
+
+        let reopened = PersistentPoolStateStore::open(dir.path())?;
+        let all = reopened.load_all()?;
+        anyhow::ensure!(all.len() == usize::from(LANES), "every lane persisted");
+        for lane in all {
+            anyhow::ensure!(
+                lane.last_bytes_delivered() == U256::from(ROUNDS * 4_096),
+                "each lane must hold its final (highest) watermark, none lost"
+            );
+        }
         Ok(())
     }
 }
