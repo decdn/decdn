@@ -6,11 +6,11 @@
 //! - **`InsufficientDeposit`** — a *misconfiguration*: the node's USDC balance
 //!   or standing allowance cannot cover the deposit, or the deposit is zero —
 //!   either as requested, or as the balance delta actually received under a
-//!   fee-on-transfer token. (The node's own path cannot request zero:
-//!   `blockchain.buyer_working_deposit_micro_usdc` is validated `> 0` at config
-//!   load, so the reachable zero here is the received-delta one, or a hand-passed
-//!   CLI `--working-deposit-micro-usdc 0`.) The fix is operator-side (fund the
-//!   the deposit), not infrastructure.
+//!   fee-on-transfer token. (A zero deposit cannot be requested: both the daemon
+//!   and the CLI validate `buyer_working_deposit_micro_usdc` / the
+//!   `--working-deposit-micro-usdc` flag `> 0` at config load, so the reachable
+//!   zero here is the received-delta one.) The fix is operator-side (fund the
+//!   deposit), not infrastructure.
 //! - **`ContractRevert`** — any *other* deterministic on-chain revert (a
 //!   paused contract, a future revert reason). The deposit was not escrowed;
 //!   the cause is on-chain state, not this node's wallet or RPC.
