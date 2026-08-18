@@ -3230,6 +3230,132 @@ impl CacheEngine {
         )))
     }
 
+    /// First configured origin that holds `hash` as a local file, or `None` if no
+    /// origin has it locally (or none is a local-file-backed origin at all).
+    async fn open_local_origin_reader(
+        &self,
+        hash: Hash,
+    ) -> CacheResult<Option<crate::origin::LocalBlob>> {
+        for origin in &self.inner.origins {
+            match origin.open_local_reader(hash).await {
+                Ok(Some(local)) => return Ok(Some(local)),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        %hash,
+                        kind = ?origin.kind(),
+                        error = %e,
+                        "origin local-reader open failed; trying next origin",
+                    );
+                    return Err(CacheError::OriginError {
+                        hash,
+                        source: e.into_inner(),
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// `Some(total)` iff `hash` can be served zero-copy straight from a local fs
+    /// origin: a local reader exists, a sibling `.obao4` outboard exists, and the
+    /// size is known. This is the dispatch zero-copy gate (#1511) — the node
+    /// checks it before choosing between this path and the ordinary store-backed
+    /// serve/pull-through path.
+    pub async fn origin_zero_copy_total(&self, hash: Hash) -> CacheResult<Option<u64>> {
+        let Some(total) = self.origin_size(hash).await? else {
+            return Ok(None);
+        };
+        if self.open_local_origin_reader(hash).await?.is_none() {
+            return Ok(None);
+        }
+        if self
+            .origin_fetch_outboard_bytes(hash, total)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(total))
+    }
+
+    /// Stream the header-less bao wire encoding for `[byte_offset, byte_offset +
+    /// byte_len)` of `hash` **straight from the local origin file + its
+    /// `.obao4`**, with NO store import (#1511). Same stream shape as
+    /// [`Self::export_bao_range_stream`]: `byte_len == 0` exports to the blob end,
+    /// each item is O(chunk-group) so a streaming consumer holds O(chunk-group)
+    /// RAM rather than O(blob), a fault discovered mid-encode surfaces as a
+    /// terminal `Err` item, and `blob_size` is the caller-supplied authoritative
+    /// total (never re-derived from the origin).
+    ///
+    /// The sync `bao-range` encoder ([`decdn_bao_range::encode_verified_range_headerless`])
+    /// runs on a dedicated `std::thread` (not the async runtime, and not the
+    /// `spawn_blocking` pool — its `blocking_send` backpressure would otherwise
+    /// starve that pool), pushing wire frames through a bounded channel that the
+    /// returned stream drains.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] if the range fails to align against `blob_size`, or
+    /// if the local reader / outboard vanish between the caller's
+    /// [`Self::origin_zero_copy_total`] check and this call (a benign race: the
+    /// caller degrades to the ordinary path on error). Faults discovered while
+    /// encoding arrive as `Err` items in the stream.
+    pub async fn export_bao_range_stream_from_origin(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+        blob_size: u64,
+    ) -> CacheResult<Pin<Box<dyn futures_util::Stream<Item = CacheResult<Bytes>> + Send>>> {
+        let aligned = align_range(byte_offset, byte_len, blob_size).map_err(|e| {
+            CacheError::Store(
+                anyhow::Error::from(e).context("export_bao_range_stream_from_origin: alignment"),
+            )
+        })?;
+        let Some(local) = self.open_local_origin_reader(hash).await? else {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "origin zero-copy reader vanished for {hash}"
+            )));
+        };
+        let Some(outboard) = self.origin_fetch_outboard_bytes(hash, blob_size).await? else {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "origin outboard vanished for {hash}"
+            )));
+        };
+        let root = *hash.as_bytes();
+
+        // Bounded channel: the blocking encoder blocks on `send` when the async
+        // consumer is behind, giving the same backpressure the store stream has.
+        let (tx, rx) = tokio::sync::mpsc::channel::<CacheResult<Bytes>>(4);
+        std::thread::Builder::new()
+            .name("origin-bao-encode".into())
+            .spawn(move || {
+                let mut sink = ChannelWrite { tx: tx.clone() };
+                let res = decdn_bao_range::encode_verified_range_headerless(
+                    root,
+                    &aligned,
+                    outboard,
+                    &local.file,
+                    &mut sink,
+                );
+                if let Err(e) = res {
+                    let _ = tx.blocking_send(Err(CacheError::Store(anyhow::anyhow!(
+                        "origin bao encode failed for {hash}: {e}"
+                    ))));
+                }
+            })
+            .map_err(|e| CacheError::Store(anyhow::anyhow!("spawn encode thread: {e}")))?;
+
+        // `tokio-stream` is not a dependency of this crate; `futures_util` already
+        // is (used by `export_bao_range_stream` above), so the channel is drained
+        // via `unfold` rather than adding `ReceiverStream`.
+        Ok(Box::pin(futures_util::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|item| (item, rx)) },
+        )))
+    }
+
     /// Collect the outboard `(node, (left, right))` hash pairs iroh-blobs emits for
     /// `chunk_ranges` of `hash`, straight from the store's outboard — NO re-hashing.
     ///
@@ -4035,6 +4161,32 @@ fn classify_import_bao_reader_error(hash: Hash, e: iroh_blobs::api::RequestError
     }
 }
 
+/// `std::io::Write` sink that forwards each write as a `Bytes` frame into
+/// [`CacheEngine::export_bao_range_stream_from_origin`]'s async serve channel
+/// (#1511). The bao encoder writes proof pairs (64 B) and chunk-group data as
+/// separate `write` calls, so frames arrive pre-sized for the wire, exactly like
+/// the store-backed `export_bao_range_stream`'s per-item frames.
+struct ChannelWrite {
+    tx: tokio::sync::mpsc::Sender<CacheResult<Bytes>>,
+}
+
+impl std::io::Write for ChannelWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // `blocking_send` applies backpressure (blocks this thread when the async
+        // consumer is behind) and propagates a dropped consumer as a write error,
+        // which aborts the encode — the client went away, so there is no reason to
+        // keep encoding.
+        self.tx
+            .blocking_send(Ok(Bytes::copy_from_slice(buf)))
+            .map_err(|_| std::io::Error::other("origin serve consumer dropped"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A [`RecvStream`] backed by the [`CacheEngine::admit_bao_stream`] feeder
 /// channel. The caller pushes the header-less bao interleaved stream it forwards
 /// from the upstream (the content size is supplied out of band as an 8-byte size
@@ -4720,6 +4872,105 @@ mod tests {
         anyhow::ensure!(
             engine.origin_held_size(h2).is_none(),
             "denied hash must not be advertised",
+        );
+        Ok(())
+    }
+
+    /// Build a [`CacheEngine`] fronted by a single [`crate::origin::FilesystemOrigin`]
+    /// so the fs zero-copy tests (#1511) have somewhere to seed blobs. Returns the
+    /// engine, the origin's canonicalized base directory, and the tempdirs (kept
+    /// alive for the caller's scope).
+    async fn test_engine_with_fs_origin()
+    -> anyhow::Result<(CacheEngine, PathBuf, (tempfile::TempDir, tempfile::TempDir))> {
+        use crate::origin::FilesystemOrigin;
+
+        let origin_dir = tempfile::tempdir()?;
+        let base = tokio::fs::canonicalize(origin_dir.path()).await?;
+        let cache_dir = tempfile::tempdir()?;
+        let origin = Arc::new(FilesystemOrigin::new(&base).await?) as Arc<dyn Origin>;
+        let engine = CacheEngine::open(cache_dir.path(), vec![origin], 10).await?;
+        Ok((engine, base, (origin_dir, cache_dir)))
+    }
+
+    /// Seed a sharded data object plus its sibling `{hex}.obao4` outboard under
+    /// `base`, returning the content hash. Mirrors
+    /// `origin::fs::tests::seed_blob_with_outboard`, duplicated here because that
+    /// helper is private to the `origin::fs` test module.
+    async fn seed_fs_origin_blob_with_outboard(
+        base: &Path,
+        payload: &[u8],
+    ) -> anyhow::Result<Hash> {
+        use bao_tree::io::outboard::PreOrderMemOutboard;
+        let ob = PreOrderMemOutboard::create(payload, crate::range_pull::IROH_BLOCK_SIZE);
+        let hash = Hash::from_bytes(*ob.root.as_bytes());
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = base.join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        tokio::fs::write(shard_dir.join(hex.as_str()), payload).await?;
+        tokio::fs::write(shard_dir.join(format!("{}.obao4", hex.as_str())), ob.data).await?;
+        Ok(hash)
+    }
+
+    /// Seed a sharded data object under `base` with **no** sibling `.obao4`, so
+    /// the zero-copy gate sees a local reader but no outboard.
+    async fn seed_fs_origin_blob_data_only(base: &Path, payload: &[u8]) -> anyhow::Result<Hash> {
+        let hash = Hash::new(payload);
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard_dir = base.join(shard);
+        tokio::fs::create_dir_all(&shard_dir).await?;
+        tokio::fs::write(shard_dir.join(hex.as_str()), payload).await?;
+        Ok(hash)
+    }
+
+    /// The fs zero-copy serve path (#1511): a blob backed by a local origin file
+    /// plus its `.obao4` streams a verified header-less bao wire straight off the
+    /// origin file, with NO import into the iroh-blobs store.
+    #[tokio::test]
+    async fn origin_zero_copy_exports_verified_stream_without_store_growth() -> anyhow::Result<()> {
+        let (engine, origin_dir, _tmp) = test_engine_with_fs_origin().await?;
+        let payload = vec![3u8; 5 * 16 * 1024 + 77];
+        let hash = seed_fs_origin_blob_with_outboard(&origin_dir, &payload).await?;
+
+        engine.rescan_origins().await;
+        let total = payload.len() as u64;
+        anyhow::ensure!(
+            engine.origin_zero_copy_total(hash).await? == Some(total),
+            "zero-copy gate must report the blob total when data + outboard are present",
+        );
+
+        let mut stream = engine
+            .export_bao_range_stream_from_origin(hash, 0, 0, total)
+            .await?;
+        let mut wire = Vec::new();
+        while let Some(item) = stream.next().await {
+            wire.extend_from_slice(&item?);
+        }
+        anyhow::ensure!(!wire.is_empty(), "header-less wire must be non-empty");
+
+        anyhow::ensure!(
+            !engine.has(hash).await?,
+            "zero-copy export must not import the blob into the store",
+        );
+        Ok(())
+    }
+
+    /// Without a sibling `.obao4`, the zero-copy gate reports `None` even though
+    /// the data file itself is present and enumerable.
+    #[tokio::test]
+    async fn origin_zero_copy_total_none_without_outboard() -> anyhow::Result<()> {
+        let (engine, origin_dir, _tmp) = test_engine_with_fs_origin().await?;
+        let payload = vec![1u8; 4096];
+        let hash = seed_fs_origin_blob_data_only(&origin_dir, &payload).await?;
+        engine.rescan_origins().await;
+        anyhow::ensure!(
+            engine.origin_zero_copy_total(hash).await?.is_none(),
+            "zero-copy gate must decline when no outboard is present",
         );
         Ok(())
     }
