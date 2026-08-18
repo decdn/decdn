@@ -1175,15 +1175,14 @@ async fn build_chain_and_handlers(
     client_deps.floor_loss_store =
         Some(Arc::clone(&infra.concrete_channel_store)
             as Arc<dyn decdn_incentive::PoolFloorLossStore>);
-    // Cached `getPool` view (owner + remaining) for the floor-`M` solvency gate
-    // and the ADR 011 funder gate. Read-only provider — the serve gates never
-    // write — with a short TTL so a request burst against one pool costs at most
-    // one RPC per interval.
-    client_deps.pool_view = Some(Arc::new(crate::pool_view::ChainPoolView::new(
-        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-        payment_pool_addr,
-        Duration::from_millis(cfg.blockchain.event_poll_interval_ms),
-    )) as Arc<dyn crate::pool_view::PoolView>);
+    // Event-fed pool view (owner + remaining) for the floor-`M` solvency gate and
+    // the ADR 011 funder gate. The settlement watcher below folds every
+    // `PaymentPool` event into this projection, so a serve request reads
+    // `{owner, remaining}` in-memory — no per-serve `getPool` `eth_call`. The same
+    // instance is handed to the settlement service (its watcher is the writer).
+    let pool_view = crate::pool_view::PoolProjection::new();
+    client_deps.pool_view =
+        Some(Arc::new(pool_view.clone()) as Arc<dyn crate::pool_view::PoolView>);
     client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
     client_deps.region_accountant = Some(Arc::clone(&region_accountant));
     client_deps.local_populate = local_populate;
@@ -1241,6 +1240,7 @@ async fn build_chain_and_handlers(
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
+        pool_view,
         redeem_tx,
         redeem_rx,
     )

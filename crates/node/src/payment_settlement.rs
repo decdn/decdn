@@ -15,7 +15,12 @@
 //!   (a dry pool may have left `owed > paid`), and `PoolReclaimed` forgets the
 //!   pool's lanes. The watcher reconciles like every other chain watcher —
 //!   enumerate `PoolRedeemed` from a pinned block, then tail live, resyncing on a
-//!   missed range — so paid is rebuilt from the event log, never guessed.
+//!   missed range — so paid is rebuilt from the event log, never guessed. The same
+//!   scan also folds the serve path's pool solvency/funder projection
+//!   ([`crate::pool_view::PoolProjection`]): `PoolOpened`/`PoolToppedUp` set a
+//!   pool's `{owner, deposit}`, `PoolRedeemed` for every provider draws down its
+//!   pool-wide `totalRedeemed`, and `PoolReclaimed` drops it — so a serve request
+//!   reads `{owner, remaining}` in-memory instead of through a `getPool` `eth_call`.
 //! - **Redemption (per-chunk floor + on-shutdown).** On a redeem hint (a
 //!   [`LaneKey`]) emitted by the voucher-accept path, the node reads the lane's
 //!   owed voucher and its cached paid watermark and plans the lane for
@@ -70,6 +75,7 @@ use crate::chain_events::shared_head::HeadSource;
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
+use crate::pool_view::PoolProjection;
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
 /// delays a redemption until the next voucher or self-tick sweep), so a bounded
@@ -255,6 +261,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
+        pool_view: PoolProjection,
         redeem_tx: mpsc::Sender<LaneKey>,
         redeem_rx: mpsc::Receiver<LaneKey>,
     ) -> Result<Self> {
@@ -292,12 +299,14 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_tx: redeem_tx.clone(),
             redeem_max_vouchers_per_tx,
             metrics: Arc::clone(&metrics),
+            pool_view,
         };
         let cfg = WatcherConfig::new(
             head,
             Filter::new()
                 .address(payment_pool_addr)
                 .event_signature(vec![
+                    PaymentPool::PoolOpened::SIGNATURE_HASH,
                     PaymentPool::PoolRedeemed::SIGNATURE_HASH,
                     PaymentPool::PoolToppedUp::SIGNATURE_HASH,
                     PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
@@ -535,12 +544,33 @@ struct PoolSettlementSink<P: Provider + Clone> {
     redeem_tx: mpsc::Sender<LaneKey>,
     redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
+    /// The serve path's pool solvency/funder view. This sink is its single writer:
+    /// it folds `PoolOpened` (owner + deposit), `PoolToppedUp` (new deposit),
+    /// `PoolRedeemed` for EVERY provider (pool-wide `totalRedeemed`), and
+    /// `PoolReclaimed` (drop) into the projection so a serve request reads
+    /// `{owner, remaining}` in-memory rather than through a `getPool` `eth_call`.
+    pool_view: PoolProjection,
 }
 
 impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
     #[allow(clippy::cognitive_complexity)]
     async fn apply(&mut self, log: Log) -> Result<()> {
         match log.topic0().copied() {
+            Some(sig) if sig == PaymentPool::PoolOpened::SIGNATURE_HASH => {
+                // Projection-only: `PoolOpened` seeds the serve path's owner +
+                // deposit. It carries no settlement effect — this node holds no
+                // lane against a freshly-opened pool until a voucher arrives.
+                let event = match PaymentPool::PoolOpened::decode_log_data(&log.inner.data) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        warn!(%err, "skipping undecodable PoolOpened log");
+                        return Ok(());
+                    }
+                };
+                self.pool_view
+                    .record_opened(event.poolId, event.owner, event.deposit);
+                debug!(pool_id = %event.poolId, owner = %event.owner, "projected PoolOpened");
+            }
             Some(sig) if sig == PaymentPool::PoolRedeemed::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolRedeemed::decode_log_data(&log.inner.data) {
                     Ok(event) => event,
@@ -549,9 +579,15 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                         return Ok(());
                     }
                 };
+                // Pool-wide `totalRedeemed` folds EVERY provider's lanes, so the
+                // solvency projection records this event before the own-provider
+                // filter below — the serve path's `remaining` must reflect other
+                // nodes' redemptions against the same pool, not just this node's.
+                self.pool_view
+                    .record_redeemed(event.poolId, event.provider, &event.lanes);
                 // Not enough to filter on the event signature — `provider` is
                 // an indexed topic but the OR-set filter cannot pin it, so
-                // confirm it names this node before recording anything.
+                // confirm it names this node before recording the paid watermark.
                 if event.provider != self.self_address {
                     return Ok(());
                 }
@@ -580,6 +616,9 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                         return Ok(());
                     }
                 };
+                // Raise the serve path's projected deposit so the solvency gate
+                // reserves against the topped-up balance, not the stale one.
+                self.pool_view.record_topup(event.poolId, event.newDeposit);
                 // A top-up may re-open lanes a dry pool left `owed > paid`.
                 // Re-drive by hinting the redeemer for each of the pool's lanes
                 // this node provides.
@@ -624,6 +663,10 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                         return Ok(());
                     }
                 };
+                // The pool is `Closed` and refunded: drop it from the serve
+                // projection so a later read fails open rather than reserving
+                // against a stale remaining.
+                self.pool_view.forget(event.poolId);
                 self.forget_pool_lanes(event.poolId).await;
             }
             // Unreachable today (the filter's topic0 OR-set bounds the inputs);
