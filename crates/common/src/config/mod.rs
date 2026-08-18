@@ -21,7 +21,7 @@ use crate::redact::redact_userinfo;
 pub use errors::ConfigErrorBag;
 pub use resolved::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent, ResolvedDht,
-    ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
+    ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedNetwork,
     ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe, ResolvedReceipts,
     ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
@@ -119,10 +119,6 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
-/// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
-const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
-/// Default peer-table entry TTL after which a stale entry is evicted.
-const DEFAULT_PEER_TTL_SEC: u64 = 600;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -450,14 +446,12 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let payment = resolve_payment_into(&cli.payment, file.payment.as_ref(), &mut bag);
     let observability =
         resolve_observability_into(&cli.observability, file.observability.as_ref(), &mut bag);
-    let gossip = resolve_gossip_into(file.gossip.as_ref(), &mut bag);
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
     let content = resolve_content_into(file.content.as_ref(), &mut bag);
 
-    ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
     ensure_no_hash_pinned_and_denied_into(&cache, &content, &mut bag);
 
@@ -470,52 +464,12 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         cache,
         payment,
         observability,
-        gossip,
         security,
         dht,
         probe,
         receipts,
         content,
     })
-}
-
-/// Reject configurations that would publish a region-less `NodeAnnounce` on
-/// the global gossip topic — every peer drops those as `BadRegion`.
-///
-/// Region subscription is separately gated on `identity.region.is_some()` in
-/// `GossipService::spawn`, so only the global-topic case needs an interlock:
-/// if global is off and no region is set, the service runs as a no-op.
-// Single-section shim preserving the `anyhow::Result` API the unit tests
-// call directly; `resolve_config` uses the `*_into` worker with the
-// shared bag instead, so this is test-only.
-#[cfg(test)]
-fn ensure_region_when_publishing_global(
-    identity: &ResolvedIdentity,
-    gossip: &ResolvedGossip,
-) -> anyhow::Result<()> {
-    one_section(|bag| ensure_region_when_publishing_global_into(identity, gossip, bag))
-}
-
-fn ensure_region_when_publishing_global_into(
-    identity: &ResolvedIdentity,
-    gossip: &ResolvedGossip,
-    bag: &mut ConfigErrorBag,
-) {
-    // If the operator *did* supply a region but it failed
-    // `normalize_region`, that single problem is already in the bag under
-    // `identity.region`. Reporting "region must be set when subscribe_global
-    // is true" on top of it would be misleading double-counting — they set
-    // it, it was just malformed. Suppress the cascade.
-    if bag.has_field(IDENTITY_REGION) {
-        return;
-    }
-    bag.check(
-        identity.region.is_some() || !gossip.subscribe_global,
-        IDENTITY_REGION,
-        "identity.region must be set when gossip.subscribe_global is true \
-         (it signs every NodeAnnounce); set identity.region or disable the \
-         global topic by setting gossip.subscribe_global = false",
-    );
 }
 
 /// Reject a hash that is simultaneously **pinned** (`cache.pinned_hashes`) and
@@ -728,9 +682,8 @@ fn resolve_identity_into(
 /// against the ISO 3166-1 alpha-2 allowlist in
 /// [`decdn_protocol::is_valid_region`] (assigned codes + the user-reserved
 /// ranges `AA`, `QM`–`QZ`, `XA`–`XZ`, `ZZ`). A bad value here would
-/// otherwise cause the node to publish announces that it and its peers
-/// all reject at validation time, or — worse for unassigned codes that
-/// slipped the bare ASCII check — partition the regional gossip topology.
+/// otherwise reach the ADR 030 region-latency penalty and region-accounting
+/// paths as an unrecognized code peers cannot compare against their own.
 /// Fail loudly at startup.
 fn normalize_region(raw: &str) -> anyhow::Result<String> {
     let upper = raw.to_ascii_uppercase();
@@ -1765,18 +1718,17 @@ fn resolve_cache_into(
     // Rejecting 0 here matters more than it does for most knobs, because #1134 made
     // a stall REPUTATION-AFFECTING. A 0 budget trips `PullStalled` on the first poll
     // of every streaming read, and `classify_pull_failure` scores that `Unreachable`
-    // — folding it into the local EWMA *and* the observation buffer the gossip
-    // publisher drains. So a single fat-fingered value would not merely break this
-    // node: it would broadcast false `Unreachable` observations about every honest
-    // peer it touches. Contrast the sibling knob `node_pull_timeout_sec`: a bad value
+    // into the local per-peer EWMA (ADR 008). So a single fat-fingered value would
+    // not merely break this node: it would score every honest peer it touches as
+    // unreachable. Contrast the sibling knob `node_pull_timeout_sec`: a bad value
     // there trips `PullTimeout`, which is exonerating, so its blast radius stops at the
     // local node.
     bag.check(
         node_pull_stall_timeout_sec > 0,
         "cache.node_pull_stall_timeout_sec",
         "cache.node_pull_stall_timeout_sec must be > 0 (a 0 budget marks every \
-         upstream as stalled on the first read, scoring — and gossiping — every \
-         honest peer as unreachable)",
+         upstream as stalled on the first read, scoring every honest peer as \
+         unreachable)",
     );
     ResolvedCache {
         cache_dir,
@@ -2585,58 +2537,6 @@ pub fn resolve_observability_into(
     }
 }
 
-/// Resolve gossip fields. The ADR 001 rule-2 staked-node check is enforced at
-/// runtime against the live on-chain registry (`decdn_gossip::StakedNodeSet`),
-/// so no static allowlist is resolved here.
-#[cfg(test)]
-fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
-    one_section(|bag| resolve_gossip_into(file, bag))
-}
-
-fn resolve_gossip_into(
-    file: Option<&types::GossipConfig>,
-    bag: &mut ConfigErrorBag,
-) -> ResolvedGossip {
-    let announce_interval_sec = file
-        .and_then(|g| g.announce_interval_sec)
-        .unwrap_or(DEFAULT_ANNOUNCE_INTERVAL_SEC);
-    bag.check(
-        announce_interval_sec > 0,
-        "gossip.announce_interval_sec",
-        "gossip.announce_interval_sec must be > 0",
-    );
-
-    let peer_ttl_sec = file
-        .and_then(|g| g.peer_ttl_sec)
-        .unwrap_or(DEFAULT_PEER_TTL_SEC);
-    bag.check(
-        peer_ttl_sec > 0,
-        "gossip.peer_ttl_sec",
-        "gossip.peer_ttl_sec must be > 0",
-    );
-
-    // Optional ceiling: absent => no cap (unlimited). A `Some(0)` is a
-    // misconfiguration (0 would read as unlimited via the peer table's
-    // sentinel), so reject it rather than silently treating it as "no cap".
-    let max_peer_entries = file.and_then(|g| g.max_peer_entries);
-    if let Some(cap) = max_peer_entries {
-        bag.check(
-            cap > 0,
-            "gossip.max_peer_entries",
-            "gossip.max_peer_entries must be > 0 when set",
-        );
-    }
-
-    let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
-
-    ResolvedGossip {
-        announce_interval_sec,
-        peer_ttl_sec,
-        subscribe_global,
-        max_peer_entries,
-    }
-}
-
 /// Resolve download-receipt audit-log retention fields (#802).
 ///
 /// `max_file_bytes` is clamped to `[MIN_RECEIPT_MAX_FILE_BYTES,
@@ -3408,72 +3308,6 @@ mod tests {
         Ok(())
     }
 
-    fn ident(region: Option<&str>) -> ResolvedIdentity {
-        ResolvedIdentity {
-            data_dir: PathBuf::from("/tmp/unused"),
-            region: region.map(String::from),
-        }
-    }
-
-    fn gossip_cfg(subscribe_global: bool) -> ResolvedGossip {
-        ResolvedGossip {
-            announce_interval_sec: 60,
-            peer_ttl_sec: 600,
-            subscribe_global,
-            max_peer_entries: None,
-        }
-    }
-
-    #[test]
-    fn ensure_region_when_publishing_global_rejects_missing_region() {
-        let err = ensure_region_when_publishing_global(&ident(None), &gossip_cfg(true))
-            .expect_err("expected error when global is on but region is absent")
-            .to_string();
-        assert!(
-            err.contains("identity.region"),
-            "error missing field context: {err}"
-        );
-    }
-
-    #[test]
-    fn ensure_region_when_publishing_global_accepts_region_set() -> anyhow::Result<()> {
-        ensure_region_when_publishing_global(&ident(Some("US")), &gossip_cfg(true))?;
-        Ok(())
-    }
-
-    #[test]
-    fn ensure_region_when_publishing_global_accepts_subscribe_only() -> anyhow::Result<()> {
-        // `subscribe_global = false` + no region = subscribe-only noop; fine.
-        ensure_region_when_publishing_global(&ident(None), &gossip_cfg(false))?;
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_applies_positive_values() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            announce_interval_sec: Some(42),
-            peer_ttl_sec: Some(123),
-            subscribe_global: Some(false),
-            max_peer_entries: Some(7),
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.announce_interval_sec, 42);
-        assert_eq!(g.peer_ttl_sec, 123);
-        assert!(!g.subscribe_global);
-        assert_eq!(g.max_peer_entries, Some(7));
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_applies_defaults_when_absent() -> anyhow::Result<()> {
-        let g = resolve_gossip(None)?;
-        assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
-        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
-        assert!(g.subscribe_global);
-        assert_eq!(g.max_peer_entries, None);
-        Ok(())
-    }
-
     #[test]
     fn resolve_receipts_applies_defaults_when_absent() -> anyhow::Result<()> {
         let r = resolve_receipts(None)?;
@@ -3551,164 +3385,6 @@ mod tests {
             err.contains("receipts.retained_files"),
             "error missing field context: {err}"
         );
-    }
-
-    #[test]
-    fn resolve_gossip_rejects_zero_max_peer_entries() {
-        let cfg = types::GossipConfig {
-            max_peer_entries: Some(0),
-            ..Default::default()
-        };
-        let err = resolve_gossip(Some(&cfg))
-            .expect_err("expected error")
-            .to_string();
-        assert!(
-            err.contains("max_peer_entries"),
-            "error missing field context: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_gossip_max_peer_entries_file_override() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            max_peer_entries: Some(42_000),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.max_peer_entries, Some(42_000));
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_max_peer_entries_unlimited_when_field_absent() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            announce_interval_sec: Some(30),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.max_peer_entries, None);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_rejects_zero_announce_interval() {
-        let cfg = types::GossipConfig {
-            announce_interval_sec: Some(0),
-            ..Default::default()
-        };
-        let err = resolve_gossip(Some(&cfg))
-            .expect_err("expected error")
-            .to_string();
-        assert!(
-            err.contains("announce_interval_sec"),
-            "error missing field context: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_gossip_rejects_zero_peer_ttl() {
-        let cfg = types::GossipConfig {
-            peer_ttl_sec: Some(0),
-            ..Default::default()
-        };
-        let err = resolve_gossip(Some(&cfg))
-            .expect_err("expected error")
-            .to_string();
-        assert!(
-            err.contains("peer_ttl_sec"),
-            "error missing field context: {err}"
-        );
-    }
-
-    // Per-field merge coverage for `[gossip]` (#434). The companion to
-    // `resolve_security` per-field tests above. Each field gets a
-    // file-leg "override" test and a "default when absent" test.
-
-    #[test]
-    fn resolve_gossip_announce_interval_file_override() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            announce_interval_sec: Some(123),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.announce_interval_sec, 123);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_announce_interval_default_when_field_absent() -> anyhow::Result<()> {
-        // Other field populated, this one absent — proves the file
-        // leg's `unwrap_or` arm fires for this field independently.
-        let cfg = types::GossipConfig {
-            peer_ttl_sec: Some(900),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_peer_ttl_file_override() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            peer_ttl_sec: Some(1234),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.peer_ttl_sec, 1234);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_peer_ttl_default_when_field_absent() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            announce_interval_sec: Some(30),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_subscribe_global_file_override_to_false() -> anyhow::Result<()> {
-        // Default is `true` (see `resolve_gossip`); the override path
-        // is the operator-actionable case (turning off global pub/sub).
-        let cfg = types::GossipConfig {
-            subscribe_global: Some(false),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert!(!g.subscribe_global);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_subscribe_global_default_when_field_absent_is_true() -> anyhow::Result<()> {
-        // `None` => `true` per `resolve_gossip`. Distinct from "field
-        // explicitly set to true" (also true), but documents the
-        // omitted-field default for an absent TOML key.
-        let cfg = types::GossipConfig::default();
-        let g = resolve_gossip(Some(&cfg))?;
-        assert!(g.subscribe_global);
-        Ok(())
-    }
-
-    /// Independent gossip field overrides: setting one field to a
-    /// non-default value must leave the others at their defaults.
-    /// Catches a regression that copy-pasted the wrong source field
-    /// into a `unwrap_or(DEFAULT_*)` arm.
-    #[test]
-    fn resolve_gossip_field_overrides_are_independent() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            announce_interval_sec: Some(7),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert_eq!(g.announce_interval_sec, 7);
-        assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
-        assert!(g.subscribe_global);
-        Ok(())
     }
 
     // HOME is guaranteed set in Rust test harness on Linux/macOS and used here
@@ -4287,11 +3963,10 @@ mod tests {
     }
 
     /// A zero stall budget is the most dangerous value in this file (#1134 review).
-    /// `PullStalled` SCORES the peer, and
-    /// `record_outcome` writes both the local EWMA and the observation buffer the
-    /// gossip publisher drains. So a `0` here would not merely break this node: it
-    /// would trip on the first poll of every streaming read and broadcast false
-    /// `Unreachable` observations about every honest peer the node touches.
+    /// `PullStalled` SCORES the peer, and `record_outcome` writes the local
+    /// per-peer EWMA (ADR 008). So a `0` here would not merely break this node: it
+    /// would trip on the first poll of every streaming read and score every
+    /// honest peer the node touches as `Unreachable`.
     #[test]
     fn resolve_cache_rejects_zero_stall_timeout() {
         let cli = empty_cache_args();
@@ -4301,7 +3976,7 @@ mod tests {
         };
         assert!(
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
-            "a 0 stall budget must be rejected: it would gossip every honest peer as unreachable"
+            "a 0 stall budget must be rejected: it would score every honest peer as unreachable"
         );
     }
 
@@ -9027,8 +8702,7 @@ swap_pool_address = \"0xPool\"
     fn resolve_blockchain_applies_default_watchdog_interval_when_absent() -> anyhow::Result<()> {
         // Pins the no-config bootstrap path: if a future change moved
         // DEFAULT below MIN (or to 0), every operator without an explicit
-        // setting would silently lose the watchdog. Mirrors the gossip
-        // analogue at `resolve_gossip_applies_defaults_when_absent`.
+        // setting would silently lose the watchdog.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
@@ -9518,9 +9192,6 @@ swap_pool_address = \"0xPool\"
 rpc_url = "https://example/rpc"
 payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-
-[gossip]
-subscribe_global = false
 "#
     }
 
@@ -9539,9 +9210,7 @@ subscribe_global = false
 rpc_url = "{rpc_url}"
 payment_pool_address = "{payment_pool_address}"
 capacity_bond_address = "{capacity_bond_address}"
-{watchdog}[gossip]
-subscribe_global = false
-"#
+{watchdog}"#
         )
     }
 
@@ -9558,8 +9227,8 @@ subscribe_global = false
     #[test]
     fn resolve_config_end_to_end_three_layer_merge() -> anyhow::Result<()> {
         // CLI > file > default exercised together: TOML supplies blockchain
-        // required fields and disables global gossip; CLI overrides the bind
-        // port; defaults fill metrics_port + admin_port.
+        // required fields; CLI overrides the bind port; defaults fill
+        // metrics_port + admin_port.
         let dir = data_dir_with_keystore()?;
         let path = write_minimal_toml(&dir, complete_toml_body())?;
         let mut args = run_args_with_data_dir(dir.path());
@@ -9581,15 +9250,6 @@ subscribe_global = false
         assert_eq!(resolved.observability.admin_port, Some(DEFAULT_ADMIN_PORT));
         assert_eq!(resolved.cache.cache_size_mb, DEFAULT_CACHE_SIZE_MB);
         assert_eq!(resolved.payment.rate_per_mb, DEFAULT_RATE_PER_MB);
-        assert_eq!(
-            resolved.gossip.announce_interval_sec,
-            DEFAULT_ANNOUNCE_INTERVAL_SEC
-        );
-        assert_eq!(resolved.gossip.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
-        // gossip.subscribe_global = false in the TOML => identity.region is
-        // not required (covers `ensure_region_when_publishing_global` happy
-        // path through resolve_config).
-        assert!(!resolved.gossip.subscribe_global);
         Ok(())
     }
 
@@ -9685,30 +9345,6 @@ subscribe_global = false
         assert!(
             msg.contains("blockchain.rpc_watchdog_interval_sec") && msg.contains(&expected_min),
             "error should mention the watchdog field and floor: {msg}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_config_errors_when_subscribe_global_set_without_region() -> anyhow::Result<()> {
-        // subscribe_global defaults to true; without identity.region the
-        // cross-section invariant fires through resolve_config.
-        let body = r#"
-[blockchain]
-rpc_url = "https://example/rpc"
-payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-"#;
-        let dir = data_dir_with_keystore()?;
-        let path = write_minimal_toml(&dir, body)?;
-        let args = run_args_with_data_dir(dir.path());
-        let Err(err) = resolve_config(Some(&path), &args) else {
-            anyhow::bail!("expected resolve_config to error on missing region");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("identity.region") && msg.contains("gossip.subscribe_global"),
-            "error should reference both fields: {msg}"
         );
         Ok(())
     }
@@ -9815,13 +9451,6 @@ rate_per_mb = 0
                 "aggregated error missing {needle:?}: {msg}"
             );
         }
-        // A present-but-invalid region must not also trigger the
-        // subscribe_global cross-section cascade (only the 4 real
-        // problems, no double-count).
-        assert!(
-            !msg.contains("must be set when gossip.subscribe_global"),
-            "region cascade should be suppressed: {msg}"
-        );
         Ok(())
     }
 
@@ -9840,8 +9469,6 @@ rpc_url = "https://example/rpc"
 payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
-[gossip]
-subscribe_global = false
 "#;
         let dir = data_dir_with_keystore()?;
         let path = write_minimal_toml(&dir, body)?;
@@ -9867,16 +9494,12 @@ subscribe_global = false
         // Cascade guard: a missing `rpc_url` records exactly the
         // "missing required option" problem and skips the URL-parse +
         // scheme checks (a synthesized placeholder must not also emit
-        // "is not a valid URL"). subscribe_global=false keeps region
-        // out of it so this is a single, clean problem.
+        // "is not a valid URL").
         let body = r#"
 [blockchain]
 payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-
-[gossip]
-subscribe_global = false
 "#;
         let dir = data_dir_with_keystore()?;
         let path = write_minimal_toml(&dir, body)?;
@@ -9914,8 +9537,6 @@ rpc_url = "https://example/rpc"
 payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
-[gossip]
-subscribe_global = false
 "#;
         let dir = data_dir_with_keystore()?;
         let path = write_minimal_toml(&dir, body)?;
@@ -9956,9 +9577,6 @@ rpc_url = "https://example/rpc"
 payment_pool_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-
-[gossip]
-subscribe_global = false
 "#;
         let dir = TempDir::new()?;
         let path = write_minimal_toml(&dir, body)?;
@@ -9989,8 +9607,7 @@ subscribe_global = false
     fn resolve_config_aggregates_cross_and_intra_section_problems() -> anyhow::Result<()> {
         // Cross-section + intra-section accumulation compose with a
         // correct count: bad region (1) + two malformed cache.origins
-        // (2) + rate_per_mb=0 (1) = 4. The present-but-invalid region
-        // also suppresses the subscribe_global cascade.
+        // (2) + rate_per_mb=0 (1) = 4.
         let body = r#"
 [identity]
 region = "USA"
@@ -10041,10 +9658,6 @@ rate_per_mb = 0
         assert!(
             !msg.contains("cache.origins[1]"),
             "the valid origin must not be reported: {msg}"
-        );
-        assert!(
-            !msg.contains("must be set when gossip.subscribe_global"),
-            "region cascade should be suppressed: {msg}"
         );
         Ok(())
     }
@@ -10119,7 +9732,6 @@ rate_per_mb = 0
         assert!(cfg.cache.is_none());
         assert!(cfg.payment.is_none());
         assert!(cfg.observability.is_none());
-        assert!(cfg.gossip.is_none());
         Ok(())
     }
 
@@ -10136,7 +9748,6 @@ rate_per_mb = 0
         assert!(cfg.cache.is_none());
         assert!(cfg.payment.is_none());
         assert!(cfg.observability.is_none());
-        assert!(cfg.gossip.is_none());
         Ok(())
     }
 

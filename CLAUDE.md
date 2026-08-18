@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC shared payment pools. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 12 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
+**Status: Early implementation.** Cargo workspace with 11 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {health,region-stats,drain,evict,reload}`, `key-gen`, `config {…}`, `bundle {create}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
 
 **Pre-launch: wire-breaking changes are fine.** Nothing is deployed and there are no live peers. Do not add backward-compatibility shims, version negotiation, dual-format readers, or migration paths for wire, postcard, ABI, config, or storage changes. Change the format, update every side in the same PR, and delete the old shape. Compatibility work only becomes real after the first public deployment.
 
@@ -37,7 +37,7 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 
 ## Architecture
 
-**Language:** Rust (edition 2024, MSRV 1.95). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs, gossip).
+**Language:** Rust (edition 2024, MSRV 1.95). **Networking:** iroh (QUIC transport, NAT traversal, content-addressed blobs).
 
 **Code style:** `rustfmt.toml` sets `max_width = 100`.
 
@@ -55,18 +55,17 @@ crates/
   bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard. Builds on `bao-tree` rather than `iroh-blobs`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   client-pull/  — reusable `cdn/client/v1` paid-pull requester (`stream_fetch`) + buyer-side channel open: signs the request, verifies the signed `StreamResponse`, pays cumulative vouchers at each interval, assembles the blob. Shared by `node` (node-to-node miss pulls, #317) and `cli` (client fetch / bundle pull)
-  gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — shared payment pools, staking, vouchers (alloy for Ethereum)
-  reputation/   — reputation scoring (ADR 008): local per-peer EWMA only; no gossip aggregation
+  reputation/   — reputation scoring (ADR 008): local per-peer EWMA only; no cross-node aggregation
   e2e/          — test-only (`publish = false`) cross-layer Rust↔contract fixtures (#1028): `ChainFixture` (anvil + the production `DeployProtocol` script), `NodeFixture` (daemon subprocess + admin RPC), `ClientFixture` (real paid client path). Test targets are gated behind the `anvil-e2e` feature
 contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, PaymentPool, SlashAppeal, SlashJudge, OriginAssignment, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites, plus Ed25519Verifier + BondMath helpers)
 ```
 
-**Dependency flow** (normal deps; `→` reads "depends on"): `node → cache, client-pull, gossip, incentive, reputation, protocol, common`; `cli → client-pull, incentive, common, protocol`; `client-pull → incentive, common, protocol, bao-range`; `incentive → common, protocol`; `cache → config-types, protocol, bao-range`; `common → config-types, protocol` (no longer `→ cache`, #578); `gossip → protocol`; `reputation → protocol`. Three true leaves — `protocol`, `config-types`, `bao-range` — so the publisher CLI links no blob store / AWS SDK. `e2e` depends on most of the graph and nothing depends on it; likewise nothing depends on `cli`. Both are sinks.
+**Dependency flow** (normal deps; `→` reads "depends on"): `node → cache, client-pull, incentive, reputation, protocol, common`; `cli → client-pull, incentive, common, protocol`; `client-pull → incentive, common, protocol, bao-range`; `incentive → common, protocol`; `cache → config-types, protocol, bao-range`; `common → config-types, protocol` (no longer `→ cache`, #578); `reputation → protocol`. Three true leaves — `protocol`, `config-types`, `bao-range` — so the publisher CLI links no blob store / AWS SDK. `e2e` depends on most of the graph and nothing depends on it; likewise nothing depends on `cli`. Both are sinks.
 
 `client-pull` is the shared paid-fetch requester, and its edge into `node` is the one worth internalizing: **the daemon is itself a paying client on its upstream cache-miss leg**, so `node` takes `decdn-client-pull` as a normal dependency and re-exports it as `client_requester` (`crates/node/src/lib.rs:19`) to preserve pre-split call-site paths.
 
-The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — `cache` works without payment logic (useful for testing/local dev); the paid path lives in `client-pull` instead. The only cycle-shaped edges are dev-only: `cli` dev-depends on `node`, `cache`, `gossip`, and `incentive`, while no library depends on `cli`.
+The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — `cache` works without payment logic (useful for testing/local dev); the paid path lives in `client-pull` instead. The only cycle-shaped edges are dev-only: `cli` dev-depends on `node`, `cache`, and `incentive`, while no library depends on `cli`.
 
 ### Wire Protocols (Core CDN)
 
@@ -75,7 +74,6 @@ The two binaries share `common` for config schema, identity, and admin wire type
 | `cdn/probe/v1` | Latency + availability probing |
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see ADR 022) |
-| iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
 
 ### Key Design Decisions
 
@@ -83,4 +81,4 @@ The two binaries share `common` for config schema, identity, and admin wire type
 - No external origin URLs are ever exposed — origin backends (S3/R2/B2) are opaque per-node config
 - All byte transfers are paid, including node-to-node cache-miss pulls
 - TOKEN for staking/governance, USDC for payments (dual-currency model)
-- Domain crates (`cache`, `gossip`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations. See [adr/appendix-poc-production-seams.md](adr/appendix-poc-production-seams.md) for the full Rust implementation pattern.
+- Domain crates (`cache`, `reputation`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations. See [adr/appendix-poc-production-seams.md](adr/appendix-poc-production-seams.md) for the full Rust implementation pattern.

@@ -508,7 +508,7 @@ impl StreamResponse {
 ///
 /// Both facts are true, both are about unrelated code, and either could change without
 /// anyone noticing which invariant they had just removed — while the reputation system
-/// depends on it, since a false `PullStalled` gossips an honest peer as unreachable. That
+/// depends on it, since a false `PullStalled` scores an honest peer as unreachable. That
 /// is too much weight for a convention, so the type carries the floor instead: the field
 /// is private and both doors reject an empty payload, so it cannot be skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

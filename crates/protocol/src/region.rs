@@ -1,12 +1,10 @@
 //! ISO 3166-1 alpha-2 region-code validation.
 //!
-//! `NodeAnnounce.region` is concatenated into the gossip topic string
-//! (`cdn/region/{region}/v1`), so this allowlist is what stops arbitrary
-//! bytes (slashes, control chars, non-ASCII) from corrupting topic names,
-//! log fields, and metric labels. Both the receive-side validator
-//! (`decdn_gossip::validation`) and the publish-side config resolver
-//! (`decdn_common::config::normalize_region`) call [`is_valid_region`]
-//! so the wire and config layers agree on the acceptable set.
+//! `identity.region` (ADR 030) ends up in log fields and metric labels, so
+//! this allowlist is what stops arbitrary bytes (control chars, non-ASCII,
+//! oversized strings) from corrupting them. The config resolver
+//! (`decdn_common::config::normalize_region`) calls [`is_valid_region`] so
+//! every accepted region code is one of this set.
 //!
 //! Accepted set:
 //! - All currently-assigned ISO 3166-1 alpha-2 codes, plus the
@@ -130,7 +128,7 @@ impl Region {
     /// `None` rather than an error type: for the advisory uses (locality-aware
     /// node ranking) an unrecognized code means "no locality information", not
     /// "reject this node". Callers that need it to be fatal — config
-    /// resolution, gossip envelope validation — say so at their own layer.
+    /// resolution — say so at their own layer.
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let upper = raw.trim().to_ascii_uppercase();

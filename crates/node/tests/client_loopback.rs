@@ -72,7 +72,7 @@ use support::{
     BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
     build_handler_full_configured, build_handler_full_with_receipts, build_handler_full_with_sink,
     cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, read_client_msg,
-    spawn_server, write_client_msg,
+    shutdown, spawn_server, write_client_msg,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -372,8 +372,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -561,8 +560,7 @@ async fn unpaid_stream_is_served_only_the_floor_then_pauses() -> anyhow::Result<
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -612,8 +610,7 @@ async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -647,8 +644,7 @@ async fn divisor_zero_serves_the_full_credit_max_immediately() -> anyhow::Result
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -709,8 +705,7 @@ async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
         "idle-close must bump decdn_client_idle_close_total; got:\n{encoded}"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -805,8 +800,7 @@ async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow
         "post-stream idle-close must bump decdn_client_idle_close_total; got:\n{encoded}"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1277,8 +1271,7 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
     );
 
     drop(conn);
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -1356,8 +1349,7 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
         "the re-armed reap must bump decdn_client_idle_close_total"
     );
 
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -1436,8 +1428,7 @@ async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> 
         "repeated re-arms must end in exactly one metered idle-close"
     );
 
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -1525,8 +1516,7 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
         "the post-concurrency idle reap must be metered exactly once"
     );
 
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -1650,8 +1640,7 @@ async fn concurrent_same_lane_streams_aggregate_across_the_voucher_interval() ->
         after_a.amount,
     );
 
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -1732,8 +1721,7 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
         .pay_and_finish(&signer, VoucherTotals::default())
         .await?;
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1804,8 +1792,7 @@ async fn finished_stream_releases_its_lane_slot() -> anyhow::Result<()> {
         stall_delivery_at_closing_voucher(&conn, *hash_b.as_bytes(), wire_b, Some(&ext)).await?;
     let _ = second.pay_and_finish(&signer, totals).await?;
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1862,8 +1849,7 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
         totals.wire_bytes
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -1924,8 +1910,7 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     // exercises the gate, not delivery — so the server side may still be
     // writing when the endpoints close; that is expected, not an error.
     drop(conn);
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     let _ = server_task.await;
     Ok(())
 }
@@ -2017,8 +2002,7 @@ async fn skip_ahead_voucher_on_a_concurrent_lane_is_accepted() -> anyhow::Result
         only.last_bytes_delivered(),
     );
 
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -2097,8 +2081,7 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
         only.last_bytes_delivered(),
     );
 
-    client_ep.close().await;
-    fx.server_ep.close().await;
+    shutdown([], [&client_ep, &fx.server_ep]).await;
     fx.server_task.await?;
     Ok(())
 }
@@ -2111,7 +2094,7 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
 /// with `RangeOutOfBounds`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivers_empty_blob() -> anyhow::Result<()> {
-    // Empty payload → `hash` is the empty root `blake3::hash(&[])` by construction.
+    // Empty payload → `hash` is the empty root, computed via `bao_tree::blake3`, by construction.
     let payload: Vec<u8> = Vec::new();
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -2178,8 +2161,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
         only.last_bytes_delivered()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -2331,8 +2313,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
          pre-serve deposit gate"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -2427,8 +2408,7 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
         "an accepted voucher must advance the shared VoucherActivity clock"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -2542,8 +2522,7 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
         "resolved client must not fall through to UNKNOWN"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -2662,8 +2641,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
         "expected two receipts with distinct cumulative amounts, got {amounts:?}"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -2770,8 +2748,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
         recorded.len()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     let _ = server_task.await;
     Ok(())
 }
@@ -2857,8 +2834,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
         only.last_bytes_delivered()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -2969,8 +2945,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         s2.last_bytes_delivered()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3066,8 +3041,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
         only.last_bytes_delivered()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3150,8 +3124,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
         only.last_bytes_delivered()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3221,8 +3194,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
         "error should mention the zero rate: {err}"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3292,8 +3264,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
         "unknown-lane refusal must bump its reason counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3391,8 +3362,7 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
         state.last_amount()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3448,8 +3418,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
         "a funded sub-interval request must not trip the deposit gate"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3510,8 +3479,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
         other => anyhow::bail!("expected a pre-serve StreamResponse acceptance, got {other:?}"),
     }
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3579,8 +3547,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         "the credit-window refusal must bump the deposit counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3649,8 +3616,7 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
         "the spent-down refusal must bump the deposit counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3727,8 +3693,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         "the resume must not trip the deposit gate"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3802,8 +3767,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         "an exactly-funded channel must not trip the deposit gate"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3911,8 +3875,7 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
         persisted.last_bytes_delivered()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -3987,8 +3950,7 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
         "error should surface the expired grant as CapabilityExpired: {err}"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -4870,8 +4832,7 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
         "oversized-blob refusal must bump its reason counter (#876)"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -4924,8 +4885,7 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
         progress.advanced()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5002,8 +4962,7 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
         progress.advanced()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5045,8 +5004,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         "exact-ceiling blob must deliver intact"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5089,8 +5047,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
         "a quote exactly at the buyer ceiling must deliver intact"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5174,8 +5131,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         "final progress ({prev}) must reach the expected wire length ({expected})"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5303,8 +5259,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
         "the takedown refusal must bump its own reason counter, not the eviction one"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5376,8 +5331,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
         "...nor land on the eviction counter, which is now non-takedown evictions only"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5454,8 +5408,7 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
          delivery ({err})"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5508,8 +5461,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
         "the compliance gauge must count a miss-path refusal too"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5553,8 +5505,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
         "evicted-since-probe refusal must bump its reason counter (#876)"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5600,8 +5551,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
         "a binding recovering a different address must reset the stream, got {res:?}"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5671,8 +5621,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
         "a bound-but-laneless request must bump the unknown-lane counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5759,8 +5708,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
     }
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5815,8 +5763,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
         "the funder binding must bump the unknown-lane counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5879,8 +5826,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
         "the compliance gauge must count the delegated-channel refusal"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -5942,8 +5888,7 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
         "the delegate is the lane signer across a completed delivery"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6029,8 +5974,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
          delivery ({err})"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6163,8 +6107,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
         total_bytes
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6241,8 +6184,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
         "cache-miss refusal must bump its reason counter"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6409,7 +6351,7 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
         "an unbound request must NOT trigger a paid pull"
     );
-    c1.close().await;
+    shutdown([], [&c1]).await;
 
     // 2) Bound to the WRONG owner: valid signature, but not the channel's client
     //    → not authorized → pull NOT attempted.
@@ -6429,7 +6371,7 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
         "a binding for a non-owner address must NOT trigger a paid pull"
     );
-    c2.close().await;
+    shutdown([], [&c2]).await;
 
     // 3) Bound to the channel OWNER: authorized → the pull IS attempted (the
     //    counting origin is reached exactly once).
@@ -6449,9 +6391,9 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         "the channel owner's bound request MUST trigger the pull exactly once, got {}",
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
-    c3.close().await;
+    shutdown([], [&c3]).await;
 
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6516,7 +6458,7 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
         hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
         "the funder of a delegated channel must NOT trigger a paid pull"
     );
-    c1.close().await;
+    shutdown([], [&c1]).await;
 
     // 2) Bound as the pinned DELEGATE signer: authorized → the pull is attempted.
     let delegate_sk = fresh_key();
@@ -6529,9 +6471,9 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
         "the pinned voucher signer MUST trigger the pull exactly once, got {}",
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
-    c2.close().await;
+    shutdown([], [&c2]).await;
 
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6691,8 +6633,7 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
         "the refusal must come from the floor, not from the fill missing"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6762,8 +6703,7 @@ async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
         "an exactly-funded channel must not trip the deposit floor"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6826,8 +6766,7 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         "the refusal must be attributed to the deposit floor, not to the fill missing"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6905,8 +6844,7 @@ async fn a_refused_request_clamps_the_rate_exactly_once() -> anyhow::Result<()> 
         metrics.encode()?
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -6969,8 +6907,7 @@ async fn a_request_rejected_before_pricing_does_not_clamp_the_rate() -> anyhow::
         metrics.encode()?
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7010,8 +6947,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
         "a blacklisted funder must NOT trigger a paid pull, clean delegate or not"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7060,8 +6996,7 @@ async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> any
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7185,10 +7120,10 @@ async fn pull_through_fills_under_deadline(
     // completes or the outer deadline fires), so the store state is settled by
     // the time this returns.
     let _ = raw_request(&client_ep, target, &req, Some(&ext_owner)).await?;
-    client_ep.close().await;
+    shutdown([], [&client_ep]).await;
 
     let filled = cache_probe.has(want).await?;
-    server_ep.close().await;
+    shutdown([], [&server_ep]).await;
     server_task.await?;
     Ok(filled)
 }
@@ -7347,8 +7282,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         cache_metrics.origin_fetches.get()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7398,8 +7332,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
         cache_metrics.origin_fetches.get()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7478,8 +7411,7 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
         "the refusal must be signed — an unsigned one is unattributable"
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7592,8 +7524,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
         cache_metrics.origin_fetches.get()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7641,8 +7572,7 @@ async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
         cache_metrics.origin_fetches.get()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7690,8 +7620,7 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
         cache_metrics.origin_fetches.get()
     );
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -7772,8 +7701,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     // healthy-but-empty node as broken and steer clients away from it.
     assert_reject_reason(&metrics, 0, 1)?;
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -8010,8 +7938,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
     // dashboard reports an origin outage as an empty cache.
     assert_reject_reason(&metrics, 1, 0)?;
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -8072,8 +7999,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
     );
     assert_reject_reason(&metrics, 1, 0)?;
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }
@@ -8132,8 +8058,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
     );
     assert_reject_reason(&metrics, 1, 0)?;
 
-    client_ep.close().await;
-    server_ep.close().await;
+    shutdown([], [&client_ep, &server_ep]).await;
     server_task.await?;
     Ok(())
 }

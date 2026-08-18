@@ -77,15 +77,13 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
-# Integration tests in `tests/admin_peers.rs` exercise the loopback admin
+# Integration tests in `tests/admin_rpc.rs` exercise the loopback admin
 # RPC end-to-end against a real `AdminState` spawned from the daemon
 # crate, so the daemon's surface is a dev-dependency here. `decdn-cache`
-# and `decdn-gossip` are needed to construct the seeded `PeerTable` and
-# `CacheEngine` the admin server runs against. None of this leaks into
-# the `decdn` binary's release dep tree.
+# is needed to construct the `CacheEngine` the admin server runs against.
+# None of this leaks into the `decdn` binary's release dep tree.
 decdn-node = { workspace = true }
 decdn-cache = { workspace = true }
-decdn-gossip = { workspace = true }
 
 [lints]
 workspace = true

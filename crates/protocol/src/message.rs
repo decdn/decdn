@@ -7,9 +7,9 @@
 //! # Signed-field freezing (ADR 013 §Signed Field Freezing)
 //!
 //! [`ProbeResponse`] is split into a signed [`ProbeResponseBody`] plus the
-//! outer unsigned fields `total_bytes` and `slash_sig`. Unlike
-//! [`crate::gossip::NodeAnnounce`] (Ed25519 over postcard bytes), `slash_sig`
-//! is **not** computed over a postcard serialization: it is an EIP-712
+//! outer unsigned fields `total_bytes` and `slash_sig`. Unlike an Ed25519
+//! signature over postcard bytes, `slash_sig` is **not** computed over a
+//! postcard serialization: it is an EIP-712
 //! secp256k1 signature over the *typed-data hash of the body fields*
 //! `{hash, has_blob, rate_per_mb, timestamp_us}`, exactly as defined in ADR
 //! 014 §EIP-712 Type Definitions and implemented in

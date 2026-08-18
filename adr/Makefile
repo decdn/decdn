@@ -80,7 +80,6 @@ BOOK_SRCS := \
   013-schema-evolution.md 017-privacy.md \
   _build/part-9-appendices.md \
   appendix-bundles.md appendix-observability.md \
-  appendix-peer-table-eviction.md \
   appendix-blob-cache-eviction.md appendix-l2-deployment.md \
   appendix-poc-production-seams.md appendix-binaries.md \
   appendix-local-admin-http.md appendix-operator-key-rotation.md \

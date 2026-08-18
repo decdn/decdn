@@ -18,7 +18,6 @@ pub mod channel_store;
 /// re-exported here as `client_requester` so node call sites and the
 /// integration tests use `client_requester::…` paths.
 pub use decdn_client_pull as client_requester;
-pub mod announce_gate;
 pub mod commands;
 pub mod content_deny;
 pub mod dht;

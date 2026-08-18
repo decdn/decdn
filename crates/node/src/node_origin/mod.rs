@@ -18,9 +18,8 @@
 //!    runs dry mid-blob is topped up and the pull continues at the paid frontier;
 //!    no whole-blob buffer is ever held in RAM), falling back through up to
 //!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
-//! 4. records the per-provider [`Outcome`] into the local reputation score and
-//!    the observation buffer, so the gossip publisher emits reports about the
-//!    upstreams this node pulled from (ADR 008 §Local Score / §Gossip Protocol).
+//! 4. records the per-provider [`Outcome`] into the local reputation score
+//!    (ADR 008 §Local Score Calculation).
 //!
 //! Every chunk group of the bao verified-stream is verified against the content
 //! root as it lands and admitted straight into the cache (ADR 038, via
@@ -946,10 +945,9 @@ impl NodeProgressivePull {
                         // Paid-but-corrupt: the upstream delivered the promised
                         // wire bytes but they failed bao verification. Score the
                         // corruption against the PROVIDER (it is the party that
-                        // served the bytes) so the observation propagates via
-                        // gossip — without this, a lying upstream banks a
-                        // `Delivered` while the downstream client blames US for
-                        // the corrupt forward (#915 review).
+                        // served the bytes), not this node — without this, a lying
+                        // upstream banks a `Delivered` while the downstream client
+                        // blames US for the corrupt forward (#915 review).
                         warn!(
                             provider = %pk, %provider_addr, delivered,
                             "window pull-through upstream served wire-complete but bao-corrupt bytes; scoring Corruption"
@@ -1339,8 +1337,9 @@ async fn probe_candidate(
         return None;
     }
     let rtt = ms_to_u32(rtt_ms);
-    // Peer's self-attested region from its NodeAnnounce (ADR 030); empty when the
-    // peer is not in the gossip peer table.
+    // Peer's self-attested region (ADR 030), resolved from the on-chain
+    // `CapacityBond` registry projection; empty when the registry has no
+    // region hint for this peer.
     let region = deps
         .region_accountant
         .region_of(peer.as_bytes())
@@ -1348,9 +1347,8 @@ async fn probe_candidate(
         .unwrap_or_default();
     // ADR 030 canonical latency-vs-claim penalty: a peer that self-attests THIS
     // node's own region yet answers slower than the latency ceiling is spoofing
-    // its region. A local-only signal — folded straight into the local EWMA, never
-    // the outbound observation buffer / gossip — so it self-corrects as fast as we
-    // probe and needs no new protocol surface.
+    // its region. A local-only signal — folded straight into the local EWMA — so
+    // it self-corrects as fast as we probe and needs no new protocol surface.
     if region_latency_penalty_applies(deps.config.own_region.as_deref(), &region, rtt) {
         // Log with the disambiguating context (the metric alone cannot tell a
         // spoofer from a mis-set local `identity.region`): peer, both regions,
@@ -2485,7 +2483,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // the peer to some degree. A node with a broken buyer key hits this on EVERY candidate,
     // so getting the order wrong here does not mis-score one provider — it tars the whole
     // candidate list with a local `Unreachable` EWMA hit (ADR 008 scoring is local-only,
-    // no gossip tier) on the strength of our own defect.
+    // no cross-node propagation) on the strength of our own defect.
     if err.downcast_ref::<LocalPullFault>().is_some() {
         return PullVerdict::OurLocalFault;
     }
@@ -2600,7 +2598,7 @@ fn classify_pull_failure(
         //
         // Suppression is the instrument that fits: scoped to (peer, hash), TTL'd, and
         // reputation-neutral — so it costs an honest-but-slow peer one TTL and costs a
-        // silent one its permanent free lunch, without gossiping a judgement about either.
+        // silent one its permanent free lunch, without broadcasting a judgement about either.
         // That neutrality is what lets it be applied to a verdict we cannot attribute: we
         // are not saying the peer is bad, only that we will not keep waiting on it.
         PullVerdict::OurDeadline => {
@@ -2711,7 +2709,7 @@ fn classify_pull_failure(
         // A broken signer, a bad encode, a bad range — none of it says anything about the
         // peer, and a node in this state walks the whole candidate list tarring every honest
         // provider it meets with an `Unreachable` (a local EWMA hit; ADR 008 scoring is
-        // local-only, with no gossip tier) on the strength of its own defect. `warn!`, not
+        // local-only, with no cross-node propagation) on the strength of its own defect. `warn!`, not
         // `debug!`: a node that cannot sign cannot pay, so this is operator-actionable —
         // and it is about US.
         PullVerdict::OurLocalFault => {
@@ -2928,8 +2926,8 @@ mod tests {
     /// proof the peer ANSWERED, so only the one code by
     /// which a peer reports its own degradation may score it. The
     /// `NotFound` case is the heart of the issue: a healthy-but-empty node must not take
-    /// an `Unreachable` hit (local EWMA; ADR 008 has no gossip tier) for honestly saying
-    /// so.
+    /// an `Unreachable` hit (local EWMA; ADR 008 has no cross-node propagation) for
+    /// honestly saying so.
     #[test]
     fn only_internal_error_refusals_are_scored() {
         // The exonerated codes: every one is an honest answer from a reachable
@@ -3069,7 +3067,7 @@ mod tests {
         assert_eq!(
             pull_verdict(&err),
             PullVerdict::OurLocalFault,
-            "a local fault must outrank the catch-all — reaching it gossips every honest \
+            "a local fault must outrank the catch-all — reaching it tars every honest \
              provider as unreachable"
         );
 
