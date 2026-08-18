@@ -46,7 +46,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let addr = decdn_incentive::eth_identity::generate_and_persist(dir.path(), "pw", false).unwrap();
+        let addr =
+            decdn_incentive::eth_identity::generate_and_persist(dir.path(), "pw", false).unwrap();
         let ks = decdn_incentive::eth_identity::keystore_path(dir.path());
         assert_eq!(read_address(&ks).unwrap(), addr);
     }

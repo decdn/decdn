@@ -100,7 +100,12 @@ impl Api {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use alloy::primitives::address;
@@ -110,9 +115,15 @@ mod tests {
     #[tokio::test]
     async fn get_capability_maps_204_to_none() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/capability"))
-            .respond_with(ResponseTemplate::new(204)).mount(&server).await;
-        let api = Api { base: server.uri(), http: reqwest::Client::new() };
+        Mock::given(method("GET"))
+            .and(path("/capability"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let api = Api {
+            base: server.uri(),
+            http: reqwest::Client::new(),
+        };
         let c = address!("00000000000000000000000000000000000000aa");
         assert!(api.get_capability(c).await.unwrap().is_none());
     }
@@ -120,11 +131,18 @@ mod tests {
     #[tokio::test]
     async fn get_capability_parses_token() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/capability"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({ "token": "dcap1:AAAA" })))
-            .mount(&server).await;
-        let api = Api { base: server.uri(), http: reqwest::Client::new() };
+        Mock::given(method("GET"))
+            .and(path("/capability"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "token": "dcap1:AAAA" })),
+            )
+            .mount(&server)
+            .await;
+        let api = Api {
+            base: server.uri(),
+            http: reqwest::Client::new(),
+        };
         let c = address!("00000000000000000000000000000000000000aa");
         let info = api.get_capability(c).await.unwrap().unwrap();
         assert_eq!(info.token, "dcap1:AAAA");

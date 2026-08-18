@@ -1,4 +1,4 @@
-use onramp::runner::{classify_exit, FetchOutcome};
+use onramp::runner::{FetchOutcome, classify_exit};
 
 fn exit(code: i32) -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;

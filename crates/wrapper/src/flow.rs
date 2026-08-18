@@ -17,7 +17,10 @@ const CAPABILITY_POLL_TIMEOUT: Duration = Duration::from_secs(300);
 /// timeout, or `decdn fetch` fails (including a terminal cap/pool exhaustion).
 pub async fn get(hash: &str, out: &Path, cfg: &WrapperConfig) -> anyhow::Result<()> {
     let client = crate::keystore::read_address(&cfg.keystore_path)?;
-    let api = Api { base: cfg.gateway_base.clone(), http: reqwest::Client::new() };
+    let api = Api {
+        base: cfg.gateway_base.clone(),
+        http: reqwest::Client::new(),
+    };
 
     let info = match api.get_capability(client).await? {
         Some(info) => info,

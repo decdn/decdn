@@ -72,7 +72,10 @@ async fn fund_issues_token_then_capability_returns_same_token() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(json_body(resp).await["token"].as_str(), Some(token.as_str()));
+    assert_eq!(
+        json_body(resp).await["token"].as_str(),
+        Some(token.as_str())
+    );
 
     // Second /fund is idempotent: identical token, no re-sign.
     let resp = app
@@ -85,7 +88,10 @@ async fn fund_issues_token_then_capability_returns_same_token() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(json_body(resp).await["token"].as_str(), Some(token.as_str()));
+    assert_eq!(
+        json_body(resp).await["token"].as_str(),
+        Some(token.as_str())
+    );
 }
 
 #[tokio::test]
@@ -120,7 +126,10 @@ async fn fund_rejects_bad_captcha_403() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json_body(resp).await["error"].as_str(), Some("captcha_failed"));
+    assert_eq!(
+        json_body(resp).await["error"].as_str(),
+        Some("captcha_failed")
+    );
 }
 
 #[tokio::test]
@@ -170,5 +179,8 @@ async fn decdn_sh_templated_with_payment_pool() {
         .expect("body");
     let body = String::from_utf8(bytes.to_vec()).expect("utf8");
     assert!(!body.contains("{{"), "no placeholder should remain");
-    assert!(body.contains("payment_pool ="), "installer writes payment_pool");
+    assert!(
+        body.contains("payment_pool ="),
+        "installer writes payment_pool"
+    );
 }

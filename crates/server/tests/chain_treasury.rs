@@ -7,7 +7,12 @@
 //!
 //! Requires `anvil` + `forge` on PATH: `cargo test -p sponsord --features anvil-e2e`.
 #![cfg(feature = "anvil-e2e")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::sync::Arc;
 
