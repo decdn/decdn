@@ -419,6 +419,30 @@ pub fn encode_verified_range_headerless<R: ReadAt, W: Write>(
         .map_err(|source| RangeVerifyError::Verification { source })
 }
 
+/// Compute the pre-order outboard and root for a `blob_size`-byte blob by reading
+/// `data` **sequentially once** in bounded memory (`bao_tree` buffers one chunk
+/// group, ~16 KiB; the returned outboard is a fraction of a percent of the blob).
+/// The returned bytes are exactly what belongs at the `{hex}.obao4` sibling.
+///
+/// # Errors
+///
+/// Propagates any read error from `data`.
+pub fn compute_pre_order_outboard<R: std::io::Read>(
+    data: R,
+    blob_size: u64,
+) -> std::io::Result<([u8; 32], Vec<u8>)> {
+    let tree = BaoTree::new(blob_size, IROH_BLOCK_SIZE);
+    let ob_len = usize::try_from(tree.outboard_size())
+        .map_err(|_| std::io::Error::other("outboard size exceeds usize"))?;
+    let mut ob = PreOrderMemOutboard {
+        root: bao_tree::blake3::Hash::from([0u8; 32]),
+        tree,
+        data: vec![0u8; ob_len],
+    };
+    let root = bao_tree::io::sync::outboard(data, tree, &mut ob)?;
+    Ok((*root.as_bytes(), ob.data))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
@@ -541,5 +565,33 @@ mod tests {
         )
         .expect_err("tampered data must fail verification");
         assert!(matches!(err, RangeVerifyError::Verification { .. }));
+    }
+
+    // The computed outboard + root round-trips through the verifying encoder: the
+    // bytes this produces are a valid `.obao4` for the data. Also asserts the root
+    // equals blake3-of-data via PreOrderMemOutboard::create (the in-memory oracle).
+    #[test]
+    fn computed_outboard_matches_mem_and_verifies() {
+        let data: Vec<u8> = (0..BLOB_SIZE).map(|i| (i % 251) as u8).collect();
+        let oracle = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+
+        let (root, outboard) =
+            compute_pre_order_outboard(std::io::Cursor::new(data.clone()), BLOB_SIZE)
+                .expect("compute");
+
+        assert_eq!(root, *oracle.root.as_bytes(), "root mismatch");
+        assert_eq!(outboard, oracle.data, "outboard bytes mismatch");
+
+        // And it verifies through the Task 1 encoder.
+        let aligned = align_range(0, 0, BLOB_SIZE).expect("align");
+        let mut sink = Vec::new();
+        encode_verified_range_headerless(
+            root,
+            &aligned,
+            Bytes::from(outboard),
+            SliceReadAt(data),
+            &mut sink,
+        )
+        .expect("verify roundtrip");
     }
 }
