@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Fund a payment channel</title>
+<title>Get a sponsored allowance</title>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; }
@@ -11,8 +11,8 @@
 </style>
 </head>
 <body>
-<h1>Fund a payment channel</h1>
-<p>Verify you are not a robot to fund a payment channel.</p>
+<h1>Get a sponsored allowance</h1>
+<p>Verify you are not a robot to receive a sponsored allowance.</p>
 
 <div class="cf-turnstile" data-sitekey="{{SITEKEY}}" data-callback="onTurnstileToken"></div>
 
@@ -21,13 +21,12 @@
 
 <script>
   const CLIENT = "{{CLIENT}}";
-  const HASH = "{{HASH}}";
 
   function onTurnstileToken(token) {
     fetch("/fund", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ client: CLIENT, hash: HASH, turnstile_token: token }),
+      body: JSON.stringify({ client: CLIENT, turnstile_token: token }),
     })
       .then((resp) => {
         if (resp.ok) {

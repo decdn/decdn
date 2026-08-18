@@ -7,7 +7,7 @@ set -eu
 
 GATEWAY="{{GATEWAY_BASE}}"
 RPC_URL="{{RPC_URL}}"
-PAYMENT_CHANNEL="{{PAYMENT_CHANNEL}}"
+PAYMENT_POOL="{{PAYMENT_POOL}}"
 CAPACITY_BOND="{{CAPACITY_BOND}}"
 CHAIN_ID="{{CHAIN_ID}}"
 
@@ -40,7 +40,7 @@ keystore_path = "${KEYSTORE}"
 decdn_bin = "${BINDIR}/decdn"
 data_dir = "${CLIENT_DIR}"
 rpc_url = "${RPC_URL}"
-payment_channel = "${PAYMENT_CHANNEL}"
+payment_pool = "${PAYMENT_POOL}"
 capacity_bond = "${CAPACITY_BOND}"
 chain_id = ${CHAIN_ID}
 EOF
