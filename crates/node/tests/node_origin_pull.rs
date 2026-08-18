@@ -65,7 +65,7 @@ use iroh::endpoint::Connection;
 mod support;
 use support::{
     HandlerDomains, build_handler_full, build_handler_full_configured, cache_with_blob,
-    empty_cache, fresh_key, local_endpoint, permissive_limiter, spawn_server,
+    empty_cache, fresh_key, local_endpoint, permissive_limiter, shutdown, spawn_server,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -1272,9 +1272,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         cache_a_metrics.origin_fetches.get()
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -1428,8 +1426,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         region_accountant.snapshot()
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -1595,8 +1592,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     anyhow::ensure!(got.len() as u64 == total_bytes, "full blob length");
     anyhow::ensure!(got.as_ref() == payload.as_slice(), "content matches");
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -2506,9 +2502,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         region_accountant.snapshot()
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    ep_s.close().await;
+    shutdown([], [&ep_b, &ep_a, &ep_s]).await;
     task_a.await?;
     task_s.await?;
     Ok(())
@@ -2758,10 +2752,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     assert_counter(&b_metrics, "node_pull_pool_open_pending_total", 2)?;
     assert_counter(&b_metrics, "node_pull_pool_open_failures_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    ep_w.close().await;
-    ep_w2.close().await;
+    shutdown([], [&ep_b, &ep_a, &ep_w, &ep_w2]).await;
     task_a.await?;
     task_w.await?;
     task_w2.await?;
@@ -3009,10 +3000,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         region_accountant.snapshot()
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    ep_s1.close().await;
-    ep_s2.close().await;
+    shutdown([], [&ep_b, &ep_a, &ep_s1, &ep_s2]).await;
     task_a.await?;
     task_s1.await?;
     task_s2.await?;
@@ -3053,7 +3041,7 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
         "no pull ⇒ no voucher acked ⇒ nothing to persist (#852 guard)"
     );
     assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
-    ep_b.close().await;
+    shutdown([], [&ep_b]).await;
     Ok(())
 }
 
@@ -3125,8 +3113,7 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
         progress_log(&recorded)?.is_empty(),
         "skipped-before-pull ⇒ nothing persisted (#852 guard)"
     );
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -3173,7 +3160,7 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
         "an unprobeable provider is never paid ⇒ nothing persisted (#852 guard)"
     );
     assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
-    ep_b.close().await;
+    shutdown([], [&ep_b]).await;
     Ok(())
 }
 
@@ -3257,8 +3244,7 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         progress_log(&recorded)?
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -3343,8 +3329,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -3461,8 +3446,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         }
     }
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok((retired, b_metrics, local_rep, a_id, pool_id))
 }
@@ -3611,7 +3595,7 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
     // spent on anyone's reputation.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
-    ep_b.close().await;
+    shutdown([], [&ep_b]).await;
     Ok(())
 }
 
@@ -3777,7 +3761,7 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
         // Every provider is exonerated regardless: none of them ever got a request.
         assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
-        ep_b.close().await;
+        shutdown([], [&ep_b]).await;
     }
     Ok(())
 }
@@ -3880,7 +3864,7 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
         u64::try_from(candidates).unwrap_or(u64::MAX),
     )?;
 
-    ep_b.close().await;
+    shutdown([], [&ep_b]).await;
     Ok(())
 }
 
@@ -3956,8 +3940,7 @@ async fn window_open_still_reports_an_honest_refusal_as_a_clean_miss() -> Result
     assert_counter(&b_metrics, "node_pull_local_fault_total", 0)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -4123,9 +4106,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     assert_counter(&b_metrics, "node_pull_local_fault_total", 1)?;
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    ep_f.close().await;
+    shutdown([], [&ep_b, &ep_a, &ep_f]).await;
     task_a.await?;
     task_f.await?;
     Ok(())
@@ -4207,8 +4188,7 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -4769,9 +4749,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         progress_log(&recorded)?
     );
 
-    task_a.abort();
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5122,9 +5100,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
     assert_counter(&b_metrics, "node_pull_success_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5230,9 +5206,7 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         "an empty ChunkData frame must fail the window pull, not be forwarded as progress"
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5351,9 +5325,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         local_rep.score(a_id)
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5489,9 +5461,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         local_rep.score(a_id)
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5604,9 +5574,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         local_rep.score(a_id)
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5716,9 +5684,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         local_rep.score(a_id)
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5831,9 +5797,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     // provider would tick this to 2 — which is exactly what dropping the filter does.
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -5966,9 +5930,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         local_rep.score(a_id)
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -6180,13 +6142,15 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_stalled_total", 2)?;
     assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    ep_s1.close().await;
-    ep_s2.close().await;
-    task_a.abort();
-    task_s1.abort();
-    task_s2.abort();
+    shutdown(
+        [
+            task_a.abort_handle(),
+            task_s1.abort_handle(),
+            task_s2.abort_handle(),
+        ],
+        [&ep_b, &ep_a, &ep_s1, &ep_s2],
+    )
+    .await;
     Ok(())
 }
 
@@ -6308,9 +6272,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -6531,11 +6493,11 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
     assert_counter(&b_metrics, "node_pull_success_total", 2)?;
 
-    ep_b.close().await;
-    ep_n.close().await;
-    ep_a.close().await;
-    task_n.abort();
-    task_a.abort();
+    shutdown(
+        [task_n.abort_handle(), task_a.abort_handle()],
+        [&ep_b, &ep_n, &ep_a],
+    )
+    .await;
     Ok(())
 }
 
@@ -6652,9 +6614,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
     let refused_twice = text.lines().any(|l| l == "decdn_node_pull_refused_total 2");
 
-    task_a.abort();
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(!refused_twice)
 }
 
@@ -6787,9 +6747,7 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
     let count = counter_value(&b_metrics, "probe_post_eviction_failures_total")?;
 
-    task_a.abort();
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(count)
 }
 
@@ -6887,9 +6845,7 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         local_rep.score(a_id)
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -7013,8 +6969,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -7144,8 +7099,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -7322,8 +7276,7 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         "expected two monotonically-advancing progress entries, got {log:?}"
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -7444,8 +7397,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
     assert_counter(&b_metrics, "node_pull_progress_persist_failures_total", 1)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -8016,9 +7968,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         progress_log(&recorded)?
     );
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8128,9 +8078,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
     );
     assert_counter(&b_metrics, "serve_stream_terminated_takedown_total", 1)?;
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8226,9 +8174,7 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
     assert_counter(&b_metrics, "node_pull_local_fault_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8326,9 +8272,7 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
     assert_counter(&b_metrics, "serve_stream_rejected_internal_error_total", 0)?;
     assert_counter(&b_metrics, "node_pull_local_fault_total", 0)?;
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8407,9 +8351,7 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
         progress_log(&recorded)?
     );
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8588,8 +8530,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
         "an honest upstream must not trip the verify-failed counter"
     );
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8757,9 +8698,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
         "leaf 1's fill must promote the blob"
     );
 
-    leaf2_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf2_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8877,9 +8816,7 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
         "B must not have cached anything for a refused resumed request"
     );
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -8977,9 +8914,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     // paid one interval of a 1.5-window blob may still leave B holding the finished
     // fill. No promotion assertion either way — this test polices spend, not caching.
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -9057,9 +8992,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
         1,
     )?;
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -9343,9 +9276,7 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         "a wire-complete corrupt upstream must be scored Corruption (score {a_score_before} -> {a_score_after})"
     );
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -9457,9 +9388,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         "mid-stream corruption must be scored Corruption (score {a_score_before} -> {a_score_after})"
     );
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -9630,9 +9559,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     );
     assert_counter(&b_metrics, "node_pull_through_client_abandoned_total", 1)?;
 
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -9734,10 +9661,7 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     );
     assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 2)?;
 
-    retry_ep.close().await;
-    leaf_ep.close().await;
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&retry_ep, &leaf_ep, &ep_b, &ep_a]).await;
     task_a.await?;
     task_b.await?;
     Ok(())
@@ -9964,7 +9888,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
          {entries:?}"
     );
 
-    ep_a.close().await;
+    shutdown([], [&ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -10096,8 +10020,7 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
     // ONE orchestration per fetch, however many candidate lists it walks.
     assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -10248,8 +10171,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
     assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -10403,8 +10325,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     );
     drop(opened); // no bytes forwarded — nothing to settle on drop.
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -10604,13 +10525,15 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     // Still one orchestration per fetch: cold, hit-exhausted, cold again.
     assert_counter(&b_metrics, "node_pull_attempts_total", 3)?;
 
-    ep_b.close().await;
-    ep_n0.close().await;
-    ep_n1.close().await;
-    ep_n2.close().await;
-    task_n0.abort();
-    task_n1.abort();
-    task_n2.abort();
+    shutdown(
+        [
+            task_n0.abort_handle(),
+            task_n1.abort_handle(),
+            task_n2.abort_handle(),
+        ],
+        [&ep_b, &ep_n0, &ep_n1, &ep_n2],
+    )
+    .await;
     Ok(())
 }
 
@@ -10858,11 +10781,11 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     // #2's cold-path fallthrough and push this to 3.
     assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
 
-    ep_b.close().await;
-    ep_n.close().await;
-    ep_h.close().await;
-    task_n.abort();
-    task_h.abort();
+    shutdown(
+        [task_n.abort_handle(), task_h.abort_handle()],
+        [&ep_b, &ep_n, &ep_h],
+    )
+    .await;
     Ok(())
 }
 
@@ -11048,11 +10971,11 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
 
-    ep_b.close().await;
-    ep_n.close().await;
-    ep_a.close().await;
-    task_n.abort();
-    task_a.abort();
+    shutdown(
+        [task_n.abort_handle(), task_a.abort_handle()],
+        [&ep_b, &ep_n, &ep_a],
+    )
+    .await;
     Ok(())
 }
 
@@ -11212,8 +11135,7 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         .await
         .map_err(|e| anyhow::anyhow!("pull finish: {e}"))?;
 
-    ep_b.close().await;
-    ep_a.close().await;
+    shutdown([], [&ep_b, &ep_a]).await;
     task_a.await?;
     Ok(())
 }
@@ -11455,11 +11377,11 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         .await
         .map_err(|e| anyhow::anyhow!("pull finish: {e}"))?;
 
-    ep_b.close().await;
-    ep_n.close().await;
-    ep_h.close().await;
-    task_n.abort();
-    task_h.abort();
+    shutdown(
+        [task_n.abort_handle(), task_h.abort_handle()],
+        [&ep_b, &ep_n, &ep_h],
+    )
+    .await;
     Ok(())
 }
 
@@ -11691,13 +11613,15 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     // Still one orchestration per call: cold, hit-exhausted, cold again.
     assert_counter(&b_metrics, "node_pull_attempts_total", 3)?;
 
-    ep_b.close().await;
-    ep_n0.close().await;
-    ep_n1.close().await;
-    ep_n2.close().await;
-    task_n0.abort();
-    task_n1.abort();
-    task_n2.abort();
+    shutdown(
+        [
+            task_n0.abort_handle(),
+            task_n1.abort_handle(),
+            task_n2.abort_handle(),
+        ],
+        [&ep_b, &ep_n0, &ep_n1, &ep_n2],
+    )
+    .await;
     Ok(())
 }
 
@@ -11849,9 +11773,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
     assert_counter(&b_metrics, "node_pull_no_providers_total", 0)?;
 
-    ep_b.close().await;
-    ep_n.close().await;
-    task_n.abort();
+    shutdown([task_n.abort_handle()], [&ep_b, &ep_n]).await;
     Ok(())
 }
 
@@ -12062,8 +11984,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     // --- Take H offline: the hash2 entry now reads [H (dead), A (wedged)], and
     //     only the wedged filter keeps fetch #3 from handing A's dead channel
     //     back. ---------------------------------------------------------------------
-    ep_h.close().await;
-    task_h.abort();
+    shutdown([task_h.abort_handle()], [&ep_h]).await;
 
     // Fetch #3 (hash2, inside the entry's TTL): a probe-cache HIT — H survives the
     // filters, is dialled, and fails fast. A must NOT be the fallback: it is
@@ -12104,9 +12025,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -12453,9 +12372,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
     assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
 
-    ep_b.close().await;
-    ep_a.close().await;
-    task_a.abort();
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
     Ok(())
 }
 
@@ -12876,12 +12793,7 @@ struct TopUpFixture {
 
 impl TopUpFixture {
     async fn shutdown(self) {
-        self.task_a.abort();
-        let _ = tokio::time::timeout(Duration::from_secs(10), async {
-            self.ep_b.close().await;
-            self.ep_a.close().await;
-        })
-        .await;
+        shutdown([self.task_a.abort_handle()], [&self.ep_b, &self.ep_a]).await;
     }
 }
 
