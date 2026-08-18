@@ -101,10 +101,19 @@ pub async fn batch_store(
     hashes: Vec<ContentHash>,
     holder: NodeId,
 ) -> anyhow::Result<wire::BatchStoreAck> {
+    let n = hashes.len();
     let request = wire::DhtMessage::BatchStore(wire::BatchStoreRequest { hashes, holder });
     let response = exchange(endpoint, target, &request).await?;
     match response {
-        wire::DhtMessage::BatchStoreAck(a) => Ok(a),
+        // A conformant receiver returns exactly one `bool` per request hash
+        // (`results[i]` ↔ `hashes[i]`); the wire type only caps the max
+        // length. Reject a mis-sized ack as an error rather than hand back a
+        // result vector that silently mis-maps onto the request hashes.
+        wire::DhtMessage::BatchStoreAck(a) if a.results.len() == n => Ok(a),
+        wire::DhtMessage::BatchStoreAck(a) => anyhow::bail!(
+            "dht client: BatchStoreAck has {} results for a {n}-hash request",
+            a.results.len(),
+        ),
         other => anyhow::bail!(
             "dht client: expected BatchStoreAck, got {} variant",
             variant_name(&other)

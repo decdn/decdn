@@ -344,18 +344,29 @@ pub async fn run_republish(
                     }
                 }
                 if !held.is_empty() {
+                    // Re-schedule with the steady-state jitter window first
+                    // (ADR 022 line 130 — fresh jitter draw per record per
+                    // cycle). The reschedule is independent of publish
+                    // outcome, so doing it before the publish lets the
+                    // publish run detached below.
+                    for hash in &held {
+                        scheduler.schedule_steady(*hash);
+                    }
                     // One BatchStore per receiver (ADR 022 §STORE Flow
                     // Batched STORE) rather than a per-hash fan-out — the
                     // overlapping republish windows concentrate on shared
                     // receiver sets, which is exactly what batching folds
-                    // into a single RPC.
-                    publish_batch(&endpoint, self_node_id, &routing, &held).await;
-                    // Re-schedule with the steady-state jitter window;
-                    // ADR 022 line 130 — fresh jitter draw per record
-                    // per cycle.
-                    for hash in held {
-                        scheduler.schedule_steady(hash);
-                    }
+                    // into a single RPC. Fire it off the select loop: a slow
+                    // or unreachable receiver would otherwise hold the loop
+                    // for up to (chunks × DHT_CLIENT_TIMEOUT), delaying the
+                    // shutdown signal and eager cache-insert publishes. The
+                    // sweep is best-effort — abandoned on shutdown, retried
+                    // next cycle.
+                    let ep = endpoint.clone();
+                    let routing = Arc::clone(&routing);
+                    tokio::spawn(async move {
+                        publish_batch(&ep, self_node_id, &routing, &held).await;
+                    });
                 }
             }
         }
