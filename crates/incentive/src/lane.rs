@@ -296,6 +296,18 @@ impl LaneState {
         &self,
         signed: &SignedVoucher,
     ) -> Result<(Self, VoucherApplied), PoolError> {
+        // The caller reconstructs `signed` from this lane's pinned identity, so
+        // `pool_id`/`provider` match by construction and are not re-checked on the
+        // fast path. Guard against a call site that advances a lane with a voucher
+        // built for a DIFFERENT identity (it would silently mutate the watermark).
+        debug_assert_eq!(
+            signed.voucher.pool_id, self.pool_id,
+            "advance_presigned: voucher pool_id must match the lane's"
+        );
+        debug_assert_eq!(
+            signed.voucher.provider, self.provider,
+            "advance_presigned: voucher provider must match the lane's"
+        );
         if signed.voucher.amount <= self.last_amount {
             return Err(PoolError::AmountRegression {
                 last: self.last_amount,

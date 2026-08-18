@@ -226,6 +226,20 @@ impl ClientHandler {
         // same-lane streams settle in.
         let new_bytes = U256::from(wire.bytes_delivered);
 
+        // `signed` is the reconstruction of `wire` (the caller builds it via
+        // `wire_voucher_to_signed`). `advance_presigned` reads `signed.*` while the
+        // rate/floor checks below read `wire.*`, so the two MUST agree — a mismatch
+        // would verify inconsistent values. Cheap invariant guard for tests/debug.
+        debug_assert_eq!(
+            signed.voucher.amount,
+            U256::from(wire.amount),
+            "verify_voucher: signed/wire amount must match"
+        );
+        debug_assert_eq!(
+            signed.voucher.bytes_delivered, new_bytes,
+            "verify_voucher: signed/wire bytes_delivered must match"
+        );
+
         // `advance_presigned` re-checks the amount/bytes monotonicity guards
         // against the LIVE watermark and returns the advanced candidate. It skips
         // the signature (already verified by the caller) and touches no store, so
@@ -319,10 +333,10 @@ impl ClientHandler {
                     }
                 };
                 // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
-                // reason whose rejected voucher recovers to the pinned signer,
-                // attach the node's true watermark so an authorized funder can
-                // re-seed and resume.
-                let bundle = self.watermark_bundle_for_reject(reason, signed, state);
+                // reason, attach the node's true watermark so an authorized funder
+                // can re-seed and resume. The pinned-signer gate is already
+                // enforced by the caller's lock-free `verify_signer` (#1735).
+                let bundle = Self::watermark_bundle_for_reject(reason, state);
                 Err(VerifyStop::Reject(reason, bundle))
             }
         }
@@ -330,29 +344,29 @@ impl ClientHandler {
 
     /// Build the wallet-less-resume [`WatermarkBundle`] for a rejected voucher
     /// (#1481 §5), or `None` when the voucher is not eligible. Returns `Some`
-    /// only when ALL hold:
+    /// only when BOTH hold:
     /// - `reason` is one of the watermark-gated regression/exhaustion reasons
     ///   (`AmountRegression` / `BytesRegression` / `SpendingCapExhausted`);
-    /// - the `rejected` voucher's signature recovers to `state.signer`, the
-    ///   lane's pinned capability signer — otherwise anyone who guessed the
-    ///   chain-derivable `pool_id` could pull a lane's private watermark;
     /// - the lane has a prior accepted voucher (`last_signature` is `Some`) to
     ///   echo back.
+    ///
+    /// The pinned-signer gate — a bundle leaks a lane's private watermark, so
+    /// only a request that recovers to `state.signer` may pull it, otherwise
+    /// anyone who guessed the chain-derivable `pool_id` could — is enforced by
+    /// the caller: [`Self::commit_one_voucher`] recovers and verifies the signer
+    /// against `state.signer` OUTSIDE the per-lane lock before this runs (#1735).
+    /// A voucher that recovers to a different address is rejected as `WrongSigner`
+    /// and never reaches here, so re-recovering under the lock would only re-do
+    /// the `ecrecover` in the critical section this method must stay out of.
     ///
     /// The watermark reported is `state`'s last-accepted amount / bytes, read
     /// while still holding the per-lane guard, before the caller swaps in the
     /// newly verified state.
     fn watermark_bundle_for_reject(
-        &self,
         reason: VoucherRejectReason,
-        rejected: &SignedVoucher,
         state: &LaneState,
     ) -> Option<WatermarkBundle> {
         if !reason.is_watermark_gated() {
-            return None;
-        }
-        let recovered = rejected.recover_signer(&self.voucher_domain).ok()?;
-        if recovered != state.signer {
             return None;
         }
         let last_signature = state.last_signature()?;
