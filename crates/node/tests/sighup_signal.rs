@@ -68,7 +68,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
-            buyer_initial_deposit_micro_usdc: 10_000_000,
             buyer_working_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,
             pool_min_remaining_deposit_micro_usdc: 1_000_000,

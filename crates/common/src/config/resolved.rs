@@ -149,14 +149,10 @@ pub struct ResolvedBlockchain {
     /// hints. Defaults to 300s
     /// (`DEFAULT_REDEEM_INTERVAL_SECS`); the resolver rejects `0`.
     pub redeem_interval_secs: u64,
-    /// First-contact pool-open deposit (base units, `µUSDC`). Defaults to
-    /// 0.5 USDC (`500_000`); escrowed as configured at open time (no on-chain
-    /// floor; only a non-zero requirement). See
-    /// `ResolvedBlockchain::buyer_working_deposit_micro_usdc`.
-    pub buyer_initial_deposit_micro_usdc: u64,
-    /// Refill target (base units, `µUSDC`) every top-up restores the pool
-    /// balance toward. Defaults to 10 USDC (`10_000_000`). `0` disables
-    /// top-up. Guaranteed `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    /// Deposit (base units, `µUSDC`) the buyer path escrows when it opens a
+    /// pool, and the target every top-up restores the pool balance toward.
+    /// Defaults to 10 USDC (`10_000_000`). Guaranteed nonzero (the resolver
+    /// rejects `0`; the pool's `openPool` reverts on a zero deposit).
     pub buyer_working_deposit_micro_usdc: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
     /// `PaymentPool` contract at startup (#744, ADR 003 § Deposit

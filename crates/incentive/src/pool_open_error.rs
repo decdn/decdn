@@ -7,9 +7,9 @@
 //!   or standing allowance cannot cover the deposit, or the deposit is zero —
 //!   either as requested, or as the balance delta actually received under a
 //!   fee-on-transfer token. (The node's own path cannot request zero:
-//!   `blockchain.buyer_initial_deposit_micro_usdc` is validated `> 0` at config
+//!   `blockchain.buyer_working_deposit_micro_usdc` is validated `> 0` at config
 //!   load, so the reachable zero here is the received-delta one, or a hand-passed
-//!   CLI `--initial-deposit-micro-usdc 0`.) The fix is operator-side (fund the
+//!   CLI `--working-deposit-micro-usdc 0`.) The fix is operator-side (fund the
 //!   the deposit), not infrastructure.
 //! - **`ContractRevert`** — any *other* deterministic on-chain revert (a
 //!   paused contract, a future revert reason). The deposit was not escrowed;

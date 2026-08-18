@@ -3704,7 +3704,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
 /// Left uncovered by the four refusal/serve tests — each sits strictly on one
 /// side of the boundary, so flipping `<` to `<=` passes all of them while
 /// refusing every exactly-funded channel with a lossy `NotFound` the CLI renders
-/// as a missing blob. A `decdn fetch --initial-deposit-micro-usdc` funded to the
+/// as a missing blob. A `decdn fetch --working-deposit-micro-usdc` funded to the
 /// computed cost is exactly this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {

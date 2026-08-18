@@ -341,11 +341,7 @@ impl NodeOrigin {
         };
         let ctx = match deps
             .buyer
-            .open_or_reuse_pool(
-                provider_addr,
-                deps.config.deposit_hint,
-                CHANNEL_OPEN_CALLER_BUDGET,
-            )
+            .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
             .await
         {
             Ok(ctx) => ctx,

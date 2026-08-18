@@ -261,7 +261,6 @@ mod tests {
         async fn open_or_reuse_pool(
             &self,
             _provider_addr: Address,
-            _deposit_hint: U256,
             _budget: std::time::Duration,
         ) -> Result<PoolContext> {
             unreachable!("not exercised by NodeFunder tests")

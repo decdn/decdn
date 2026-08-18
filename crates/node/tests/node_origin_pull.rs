@@ -141,7 +141,6 @@ impl PoolOpener for StubOpener {
     async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        _deposit_hint: U256,
         _budget: Duration,
     ) -> Result<PoolContext> {
         // A retired channel is GONE: the store row was dropped, so there is nothing to
@@ -267,7 +266,6 @@ impl PoolOpener for WedgedOpener {
     async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        _deposit_hint: U256,
         budget: Duration,
     ) -> Result<PoolContext> {
         if let Ok(mut attempted) = self.attempted.lock() {
@@ -317,7 +315,6 @@ impl PoolOpener for FailingRecordOpener {
     async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        _deposit_hint: U256,
         _budget: Duration,
     ) -> Result<PoolContext> {
         Ok(PoolContext {
@@ -860,7 +857,6 @@ async fn build_origin_with_probe_caches(
             stall_timeout,
             max_blob_size_bytes,
             max_rate_per_mb: 0,
-            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             working_deposit,
             // A day's margin; the fixtures use never-expiring channels, so the
             // near-expiry guard (#1603) is inert unless a test sets an expiry.
@@ -1005,7 +1001,6 @@ async fn build_origin_multi_hash(
             stall_timeout,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
@@ -1570,7 +1565,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             working_deposit: U256::ZERO,
             event_poll_interval: Duration::from_millis(50),
             lookup: decdn_node::dht::LookupConfig::default(),
@@ -3637,7 +3631,6 @@ impl PoolOpener for FailingOpener {
     async fn open_or_reuse_pool(
         &self,
         _provider_addr: Address,
-        _deposit_hint: U256,
         _budget: Duration,
     ) -> Result<PoolContext> {
         let err = anyhow::anyhow!("stub pool open failed");
@@ -9812,7 +9805,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
@@ -12293,7 +12285,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             // Reactive mid-pull top-up OFF (#1530): this fixture asserts what a pull
             // does when its channel runs dry, which a self-funding one would hide.
             working_deposit: U256::ZERO,
@@ -12505,7 +12496,6 @@ impl PoolOpener for FundingOpener {
     async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        _deposit_hint: U256,
         _budget: Duration,
     ) -> Result<PoolContext> {
         let recorded = self
@@ -12958,16 +12948,16 @@ fn multi_interval_payload() -> Arc<Vec<u8>> {
     )
 }
 
-/// The headline case: a single node→node pull larger than the channel's initial
+/// The headline case: a single node→node pull larger than the channel's working
 /// deposit now completes, by funding the shortfall and resuming — the whole point
 /// of #1530.
 ///
-/// Before this, the pull ended at the first voucher the initial deposit could not
-/// cover, and no retry could help: every candidate opens at the same
-/// `deposit_hint`, and a from-zero retry would re-spend the fresh deposit on bytes
+/// Before this, the pull ended at the first voucher the working deposit could not
+/// cover, and no retry could help: every candidate opens at the same working
+/// deposit, and a from-zero retry would re-spend the fresh deposit on bytes
 /// it had already bought and re-exhaust at the same offset.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pull_larger_than_the_initial_deposit_tops_up_once_and_completes() -> Result<()> {
+async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> Result<()> {
     let payload = multi_interval_payload();
     // One interval's worth of headroom at RATE — enough to be paid for real
     // delivered bytes, nowhere near enough for the whole blob.

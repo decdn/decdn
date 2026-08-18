@@ -575,9 +575,9 @@ impl ChainFixture {
     /// here from the same operator key would race the daemon's approve on that
     /// account's nonce, so minting is the fixture's whole job — the approval is
     /// the node's. `usdc` need only cover the buyer deposit
-    /// (`blockchain.buyer_initial_deposit_micro_usdc`, default 0.5 USDC) plus any
-    /// reactive top-up toward the working deposit (default 10 USDC); mint
-    /// generously so a multi-interval pull never starves the channel.
+    /// (`blockchain.buyer_working_deposit_micro_usdc`, default 10 USDC) plus any
+    /// reactive top-up back toward it; mint generously so a multi-interval pull
+    /// never starves the channel.
     pub async fn fund_node_as_buyer(
         &self,
         operator_addr: Address,

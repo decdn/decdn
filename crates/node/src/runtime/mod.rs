@@ -1785,7 +1785,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
     let buyer_voucher_domain = ch.voucher_domain.clone();
-    let buyer_initial_deposit = U256::from(cfg.blockchain.buyer_initial_deposit_micro_usdc);
     let buyer_working_deposit = U256::from(cfg.blockchain.buyer_working_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = infra.eth_signer.address();
@@ -1805,12 +1804,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        // Miss pulls open small and graduate on proof (#1497): the
-        // fresh-open deposit is the INITIAL size, not the working target.
-        deposit_hint: buyer_initial_deposit,
-        // ...and graduate to the working target when a single pull outruns that
-        // initial deposit mid-stream (#1530). Same target the proactive low-water
-        // refill uses; `0` disables the reactive leg.
+        // Miss pulls open at the working deposit and graduate to it on a mid-pull
+        // reactive top-up when a single pull outruns the deposit (#1530). The
+        // proactive low-water refill targets the same deposit.
         working_deposit: buyer_working_deposit,
         event_poll_interval: std::time::Duration::from_millis(
             cfg.blockchain.event_poll_interval_ms,
@@ -1847,7 +1843,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 buyer_channel_store,
                 eth_signer_for_buyer,
                 buyer_voucher_domain,
-                buyer_initial_deposit,
                 buyer_working_deposit,
                 buyer_ensure_max_approval,
                 node_metrics_for_buyer,
@@ -3559,7 +3554,6 @@ mod tests {
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
-                buyer_initial_deposit_micro_usdc: 10_000_000,
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,

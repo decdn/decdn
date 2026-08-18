@@ -540,7 +540,7 @@ fn fetch_argv(
         data_dir.display().to_string(),
         "--keystore".into(),
         keystore.display().to_string(),
-        "--initial-deposit-micro-usdc".into(),
+        "--working-deposit-micro-usdc".into(),
         DEPOSIT_MICRO_USDC.to_string(),
     ]
 }

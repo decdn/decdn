@@ -227,36 +227,15 @@ async fn fund_pool<P: Provider + Clone + 'static>(
 
 /// The proactive low-water top-up amount for a reused pool (#1146, #1103):
 /// `U256::ZERO` when the remaining deposit still has headroom, else the amount
-/// that restores it to the working `target`. `target = max(deposit_hint,
-/// working_deposit)` — the graduation target a proven-good pool refills toward —
-/// and the trigger is `target / LOW_WATER_DIVISOR` (20% remaining).
-/// `committed` is the pool's cumulative vouchered amount across all its lanes, so
-/// the remaining spendable is `deposit - committed`. Pure so the policy is
-/// unit-testable; the shared [`refill_amount`] kernel is the same one the CLI
-/// fetch auto-refill uses.
-fn refill_decision(
-    deposit: U256,
-    committed: U256,
-    deposit_hint: U256,
-    working_deposit: U256,
-) -> U256 {
-    if working_deposit.is_zero() {
-        // `0` disables top-up entirely (matches the CLI's auto-refill config
-        // semantics) — a reused pool is never proactively refilled.
-        return U256::ZERO;
-    }
-    let target = deposit_hint.max(working_deposit);
-    let low_water = target / U256::from(LOW_WATER_DIVISOR);
-    refill_amount(deposit, committed, target, low_water)
-}
-
-/// The deposit a FRESH open escrows (#1497): "open small, graduate on
-/// proof". `max(deposit_hint, initial_deposit)` — deliberately the small
-/// `initial_deposit`, not the larger `working_deposit` [`refill_decision`]
-/// graduates a proven pool toward. `deposit_hint` still lets a caller ask for
-/// more up front. Pure so the open path's sizing is unit-testable.
-fn open_deposit(deposit_hint: U256, initial_deposit: U256) -> U256 {
-    deposit_hint.max(initial_deposit)
+/// that restores it to the `working_deposit` target — the deposit a proven-good
+/// pool refills toward — with the trigger at `working_deposit / LOW_WATER_DIVISOR`
+/// (20% remaining). `committed` is the pool's cumulative vouchered amount across
+/// all its lanes, so the remaining spendable is `deposit - committed`. Pure so the
+/// policy is unit-testable; the shared [`refill_amount`] kernel is the same one
+/// the CLI fetch auto-refill uses.
+fn refill_decision(deposit: U256, committed: U256, working_deposit: U256) -> U256 {
+    let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
+    refill_amount(deposit, committed, working_deposit, low_water)
 }
 
 /// The pool's cumulative vouchered amount across every `(signer, provider)` lane —
@@ -326,11 +305,9 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     voucher_domain: Eip712Domain,
     token: Address,
     owner: Address,
-    /// The small deposit a fresh `openPool` escrows (#1497): "open small,
-    /// graduate on proof". Consumed by [`open_deposit`].
-    initial_deposit: U256,
-    /// The larger graduation target a reused pool's low-water refill tops up
-    /// toward (see [`refill_decision`]).
+    /// The deposit a fresh `openPool` escrows, and the target a reused pool's
+    /// low-water refill tops up toward (see [`refill_decision`]). The shared pool
+    /// is fully withdrawable, so the open escrows the working deposit directly.
     working_deposit: U256,
     /// The single in-flight `openPool`, if one is running (#1143). A concurrent
     /// [`Self::open_or_reuse_pool`] that arrives mid-open JOINS it rather than
@@ -349,9 +326,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// token, issue the one-time USDC approval if requested, and spawn the
     /// reclaim sweep.
     ///
-    /// `initial_deposit` is the small deposit a fresh open escrows;
-    /// `working_deposit` is the larger target a reused pool's low-water refill
-    /// graduates it toward (#1497).
+    /// `working_deposit` is the deposit a fresh open escrows and the target a
+    /// reused pool's low-water refill tops it up toward.
     ///
     /// # Errors
     ///
@@ -367,7 +343,6 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         store: Arc<dyn BuyerPoolStore>,
         signer: Arc<PrivateKeySigner>,
         voucher_domain: Eip712Domain,
-        initial_deposit: U256,
         working_deposit: U256,
         ensure_max_approval: bool,
         metrics: Arc<Metrics>,
@@ -410,7 +385,6 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             voucher_domain,
             token,
             owner,
-            initial_deposit,
             working_deposit,
             open_in_flight: Arc::new(Mutex::new(None)),
             topup_in_flight: Arc::new(Mutex::new(None)),
@@ -442,9 +416,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// provider and carrying the node's self-issued capability: reuse the single
     /// pool the node owns, or lazily open one.
     ///
-    /// `deposit_hint` sizes a freshly-opened pool (`max(deposit_hint,
-    /// initial_deposit)`); it is ignored on reuse (a low-water refill tops a live
-    /// pool up instead).
+    /// A freshly-opened pool escrows the service's `working_deposit`; on reuse
+    /// that deposit is ignored (a low-water refill tops a live pool up instead).
     ///
     /// # Bounding (#1143)
     ///
@@ -463,7 +436,6 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     pub async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        deposit_hint: U256,
         budget: Duration,
     ) -> Result<PoolContext> {
         // Fast path: reuse the live pool. A below-low-water pool kicks off a
@@ -471,11 +443,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         // immediately — the refill must not sit in the hot path behind an on-chain
         // `topUp`.
         if let Some(state) = self.reuse_or_report()? {
-            self.spawn_refill_if_low(&state, deposit_hint);
+            self.spawn_refill_if_low(&state);
             return pin_ctx(&state, &self.signer, &self.voucher_domain, provider_addr);
         }
 
-        let open = self.join_or_spawn_open(deposit_hint)?;
+        let open = self.join_or_spawn_open()?;
 
         match tokio::time::timeout(budget, open).await {
             // Still running. The task owns the tx; hand the caller a typed "not
@@ -508,13 +480,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// concurrent reuse pulls fire at most one `topUp`. Every leg is advisory: an
     /// in-flight refill, an allowance failure, or a reverted `topUp` all just skip
     /// it (logged / metered), leaving the pool un-topped-up — strictly no worse.
-    fn spawn_refill_if_low(&self, state: &BuyerPoolState, deposit_hint: U256) {
-        let additional = refill_decision(
-            state.deposit,
-            committed_amount(state),
-            deposit_hint,
-            self.working_deposit,
-        );
+    fn spawn_refill_if_low(&self, state: &BuyerPoolState) {
+        let additional =
+            refill_decision(state.deposit, committed_amount(state), self.working_deposit);
         if additional.is_zero() {
             return; // still above the low-water mark
         }
@@ -595,7 +563,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// A poisoned `open_in_flight` lock — reported as this node's fault
     /// ([`OpenReported`] + [`LocalPullFault`]), since every future open would fail.
-    fn join_or_spawn_open(&self, deposit_hint: U256) -> Result<SharedOpen> {
+    fn join_or_spawn_open(&self) -> Result<SharedOpen> {
         let mut slot = self.open_in_flight.lock().map_err(|err| {
             self.metrics.node_pull_pool_open_failure();
             error!(%err, "open_in_flight mutex poisoned; this node must be restarted");
@@ -615,8 +583,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let voucher_domain = self.voucher_domain.clone();
         let token = self.token;
         let owner = self.owner;
-        // Open at the INITIAL deposit — "open small, graduate on proof".
-        let deposit = open_deposit(deposit_hint, self.initial_deposit);
+        // The shared pool is fully withdrawable, so open at the working deposit.
+        let deposit = self.working_deposit;
         let metrics = Arc::clone(&self.metrics);
         let guard = SlotGuard {
             slot: Arc::clone(&self.open_in_flight),
@@ -802,7 +770,6 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        deposit_hint: U256,
         budget: Duration,
     ) -> Result<PoolContext>;
 
@@ -838,10 +805,9 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
     async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
-        deposit_hint: U256,
         budget: Duration,
     ) -> Result<PoolContext> {
-        BuyerPoolService::open_or_reuse_pool(self, provider_addr, deposit_hint, budget).await
+        BuyerPoolService::open_or_reuse_pool(self, provider_addr, budget).await
     }
 
     fn record_progress(
@@ -1074,7 +1040,6 @@ mod tests {
             refill_decision(
                 U256::from(10_000u64),
                 U256::from(100u64),
-                U256::ZERO,
                 U256::from(10_000u64)
             ),
             U256::ZERO
@@ -1089,39 +1054,9 @@ mod tests {
             refill_decision(
                 U256::from(1_000u64),
                 U256::from(900u64),
-                U256::ZERO,
                 U256::from(10_000u64)
             ),
             U256::from(9_900u64)
-        );
-    }
-
-    #[test]
-    fn refill_decision_zero_working_disables_topup() {
-        assert_eq!(
-            refill_decision(
-                U256::from(1u64),
-                U256::from(1u64),
-                U256::from(10_000u64),
-                U256::ZERO
-            ),
-            U256::ZERO
-        );
-    }
-
-    #[test]
-    fn open_deposit_uses_initial_not_working() {
-        assert_eq!(
-            open_deposit(U256::ZERO, U256::from(500u64)),
-            U256::from(500u64)
-        );
-    }
-
-    #[test]
-    fn open_deposit_hint_wins_when_larger() {
-        assert_eq!(
-            open_deposit(U256::from(900u64), U256::from(500u64)),
-            U256::from(900u64)
         );
     }
 

@@ -218,169 +218,7 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- Reactive graduation (#1497): a genuine MID-FETCH `InsufficientDeposit` ----
-//
-// The test above drives the shared `top_up` kernel directly (the auto-refill-at-
-// reuse-time leg, #1103). This one drives the shipped `decdn` binary through a
-// REAL paid pull that outgrows its `initial_deposit` partway through — the
-// reactive leg in the shared `drive` pull core (`crates/client-pull/src/driver.rs`)
-// — and asserts the fetch still SUCCEEDS, having topped the pool up on-chain
-// toward `working_deposit` rather than surfacing the exhaustion as a terminal
-// error.
-//
-// The pool opens at a small configured initial deposit (1 USDC; escrowed as
-// configured — no on-chain floor) and the node's rate is set high enough that
-// the very FIRST voucher interval (1 MB, the protocol default) already costs
-// more than that — so the node rejects the pool's first-ever voucher with
-// `InsufficientDeposit`. A fresh pool has no prior accepted voucher, so the
-// node's reject carries no `WatermarkBundle` (`watermark_bundle_for_reject`
-// requires one to echo back) — exactly the "genuine exhaustion, not a healable
-// desync" case `genuine_exhaustion` exists to recognize. The CLI should top up
-// to `working_deposit` and retry the same blob from scratch, landing a pool
-// deposit of exactly `working_deposit` (no bytes were ever committed before
-// the top-up).
-
-const INITIAL_DEPOSIT_MICRO_USDC: u64 = 1_000_000; // 1 USDC initial deposit
-const WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC — plenty to finish the blob
-const HIGH_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB — exceeds the initial deposit in <1 MB
 const TOPUP_KEYSTORE_PASSWORD: &str = "topup-e2e-password";
-
-#[tokio::test(flavor = "multi_thread")]
-async fn fetch_larger_than_initial_deposit_tops_up_and_completes() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_reactive_topup()))
-        .await
-        .context("reactive top-up e2e exceeded the overall timeout")??;
-    Ok(())
-}
-
-/// A deterministic multi-MB blob — big enough that, at [`HIGH_RATE_PER_MB`], its
-/// total cost spans several 1 MB voucher intervals and comfortably exceeds
-/// [`INITIAL_DEPOSIT_MICRO_USDC`] while staying well under
-/// [`WORKING_DEPOSIT_MICRO_USDC`].
-fn make_blob() -> Vec<u8> {
-    let mut v = vec![0u8; 2 * 1024 * 1024 + 777];
-    let mut x: u32 = 0x2468_ace0;
-    for b in &mut v {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *b = x.to_le_bytes().first().copied().unwrap_or(0);
-    }
-    v
-}
-
-async fn run_reactive_topup() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init();
-
-    ensure_decdn_cli_built()?;
-    let chain = ChainFixture::launch().await?;
-
-    let blob = make_blob();
-    let blob_hash = Hash::new(&blob);
-    let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
-    anyhow::ensure!(
-        hash == blob_hash,
-        "seeded blob hash mismatch: {hash} vs {blob_hash}"
-    );
-    // Bait the very first voucher interval into `InsufficientDeposit`: at the
-    // default cost of 10 µUSDC/MB the 1 USDC initial deposit is plenty, so the
-    // rate must be raised before the buyer ever opens the pool.
-    node.set_rate_per_mb(HIGH_RATE_PER_MB).await?;
-
-    // Funded buyer with an on-disk keystore under a `0o700` client data dir (the
-    // `RedbBuyerPoolStore` the CLI opens enforces the mode; `tempdir` is
-    // `0o755`).
-    let client_dir = tempfile::tempdir().context("client tempdir")?;
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        client_dir.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .context("chmod client dir 0o700")?;
-    eth_identity::generate_and_persist(client_dir.path(), TOPUP_KEYSTORE_PASSWORD, false)
-        .context("generate buyer keystore")?;
-    let keystore = eth_identity::keystore_path(client_dir.path());
-    let buyer =
-        eth_identity::load_signer(&keystore, TOPUP_KEYSTORE_PASSWORD).context("load buyer")?;
-    let buyer_addr = buyer.address();
-    chain.fund_eth(buyer_addr, 100).await?;
-    chain
-        .mint_usdc(
-            buyer_addr,
-            U256::from(WORKING_DEPOSIT_MICRO_USDC) * U256::from(4u64),
-        )
-        .await
-        .context("mint buyer USDC")?;
-
-    let out = client_dir.path().join("blob.bin");
-    let args = topup_fetch_argv(
-        &chain,
-        &node,
-        &blob_hash,
-        client_dir.path(),
-        &keystore,
-        &out,
-    );
-
-    let before = billed_bytes(client_dir.path(), node.operator_addr())?;
-    anyhow::ensure!(
-        before == 0,
-        "no bytes should be billed before the first fetch"
-    );
-
-    run_topup_fetch_until_ready(client_dir.path(), &args).await?;
-
-    let got = std::fs::read(&out).context("read output")?;
-    anyhow::ensure!(
-        got == blob,
-        "the fetch must still complete successfully after the reactive top-up: got {} bytes, \
-         expected {}",
-        got.len(),
-        blob.len()
-    );
-    let partial = client_dir.path().join("blob.bin.partial");
-    anyhow::ensure!(
-        !partial.exists(),
-        "the .partial scratch file must be promoted away, not left beside --output: {}",
-        partial.display()
-    );
-
-    // The graduating assertion: the pool's on-chain deposit must have grown
-    // from the 1 USDC initial open to the full working deposit. No bytes were
-    // ever committed before the reactive top-up fired (the very first voucher
-    // was the one rejected), so the topped-up deposit lands at EXACTLY
-    // `working_deposit` — not merely "more than initial".
-    let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
-    let persisted = store
-        .get_by_owner(buyer_addr)
-        .context("read persisted pool")?
-        .ok_or_else(|| anyhow::anyhow!("buyer pool not recorded after fetch"))?;
-    let pool_id = persisted.pool_id;
-    anyhow::ensure!(
-        persisted.deposit == U256::from(WORKING_DEPOSIT_MICRO_USDC),
-        "the persisted deposit must reflect the graduated top-up: got {}, expected {}",
-        persisted.deposit,
-        WORKING_DEPOSIT_MICRO_USDC
-    );
-
-    let buyer_provider = chain.provider_for(&buyer);
-    let pool = PaymentPool::new(chain.addrs().payment_pool, buyer_provider);
-    let onchain = pool
-        .getPool(pool_id)
-        .call()
-        .await
-        .context("getPool")?
-        .deposit;
-    anyhow::ensure!(
-        onchain == WORKING_DEPOSIT_MICRO_USDC,
-        "the on-chain pool deposit must have grown to the working deposit: got {onchain}, \
-         expected {WORKING_DEPOSIT_MICRO_USDC}"
-    );
-    drop(node);
-    Ok(())
-}
 
 /// Cumulative bytes billed to `provider` on the persisted pool's lane, or `0`
 /// before any pool has been recorded. Mirrors `cli_fetch_resume.rs`'s helper of
@@ -401,69 +239,14 @@ fn billed_bytes(data_dir: &std::path::Path, provider: Address) -> anyhow::Result
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// Run `decdn fetch`, retrying until the node's chain watcher has observed the
-/// freshly-opened pool (`decdn fetch` has no internal retry for that race).
-async fn run_topup_fetch_until_ready(
-    data_dir: &std::path::Path,
-    args: &[String],
-) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let output =
-            tokio::process::Command::from(decdn_command(data_dir, TOPUP_KEYSTORE_PASSWORD)?)
-                .arg("fetch")
-                .args(args)
-                .output()
-                .await
-                .context("spawn decdn fetch")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "decdn fetch never succeeded; last stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tracing::debug!(
-            "fetch not ready; retrying after watcher catch-up:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tokio::time::sleep(Duration::from_millis(750)).await;
-    }
-}
-
-/// The `decdn fetch` argv (after the `fetch` subcommand) for the reactive
-/// top-up journey: a small `--initial-deposit-micro-usdc` (clamped to the
-/// on-chain floor) and a `--working-deposit-micro-usdc` large enough to finish
-/// the blob once the reactive leg tops up. `--capacity-bond-address` is required:
-/// it is the EIP-712 `verifyingContract` the buyer signs its ADR 005 client
-/// identity binding against, and the node refuses to serve a paid request that
-/// carries no verified binding — even for a blob it already holds.
-fn topup_fetch_argv(
-    chain: &ChainFixture,
-    node: &NodeFixture,
-    hash: &Hash,
-    data_dir: &std::path::Path,
-    keystore: &std::path::Path,
-    out: &std::path::Path,
-) -> Vec<String> {
-    topup_fetch_argv_with_deposits(
-        chain,
-        node,
-        hash,
-        data_dir,
-        keystore,
-        out,
-        INITIAL_DEPOSIT_MICRO_USDC,
-        WORKING_DEPOSIT_MICRO_USDC,
-    )
-}
-
-/// Same argv shape as [`topup_fetch_argv`], but with the initial/working deposit
-/// as parameters rather than the single-voucher-exhaustion test's fixed
-/// constants — used by the multi-interval regression below, which needs a
-/// bigger initial deposit so several intervals are delivered before exhaustion.
-#[allow(clippy::too_many_arguments)]
+/// The `decdn fetch` argv (after the `fetch` subcommand) for a reactive top-up
+/// journey, with the pool's single `--working-deposit-micro-usdc` as a parameter.
+/// The pool opens at this deposit and every reactive top-up restores it back
+/// toward it, so a blob whose cost exceeds it exhausts the deposit mid-stream and
+/// the reactive leg tops up. `--capacity-bond-address` is required: it is the
+/// EIP-712 `verifyingContract` the buyer signs its ADR 005 client identity
+/// binding against, and the node refuses to serve a paid request that carries no
+/// verified binding — even for a blob it already holds.
 fn topup_fetch_argv_with_deposits(
     chain: &ChainFixture,
     node: &NodeFixture,
@@ -471,7 +254,6 @@ fn topup_fetch_argv_with_deposits(
     data_dir: &std::path::Path,
     keystore: &std::path::Path,
     out: &std::path::Path,
-    initial_deposit_micro_usdc: u64,
     working_deposit_micro_usdc: u64,
 ) -> Vec<String> {
     vec![
@@ -499,8 +281,6 @@ fn topup_fetch_argv_with_deposits(
         data_dir.display().to_string(),
         "--keystore".into(),
         keystore.display().to_string(),
-        "--initial-deposit-micro-usdc".into(),
-        initial_deposit_micro_usdc.to_string(),
         "--working-deposit-micro-usdc".into(),
         working_deposit_micro_usdc.to_string(),
     ]
@@ -541,15 +321,9 @@ fn topup_fetch_argv_with_deposits(
 // inflates any honest settle above it), which is why the floor below is the
 // whole-blob WIRE cost.
 
-const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish the blob
-// Must be >= working_deposit / LOW_WATER_DIVISOR (8_000_000 at the current
-// divisor of 5): this test pre-opens and pre-records the pool itself, so
-// `open_or_reuse`'s reuse-time auto-refill (#1103) sees an EXISTING pool on
-// the CLI's one and only invocation. Below that threshold, `open_or_reuse`
-// tops it up to the working deposit before the stream even opens — pre-empting
-// the REACTIVE (mid-stream) top-up this test means to exercise.
-//
-// Sized against two competing bounds of the shared-pool serve path:
+// The pool's single working deposit — the amount it opens at and every reactive
+// top-up restores its remaining balance back toward. Sized against two competing
+// bounds of the shared-pool serve path:
 //
 //   * The node's pre-serve floor-M reserve (`pool_remaining_covers_window`,
 //     #1516) refuses to open a stream unless the pool's remaining minus the
@@ -558,16 +332,19 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 //     §Credit window, #1669), which the ramp collapses to its floor — exactly
 //     ONE fixed 4 MiB voucher accounting interval
 //     (`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`); at `MULTI_RATE_PER_MB`
-//     that floor costs 4 * 2_000_000 = 8 USDC, so the initial deposit must clear
-//     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare —
-//     the number is driven by the second bound below, not by this floor.
+//     that floor costs 4 * 2_000_000 = 8 USDC, so the deposit must clear
+//     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
-//     voucher still exhausts it mid-stream and the reactive top-up fires.
+//     voucher exhausts it mid-stream and the reactive top-up fires.
 //
 // 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 8), two whole 4 MiB
 // intervals are delivered and accepted (cumulative 16 USDC ≤ 18), and the
 // partial third — the blob is just over two intervals — is the one that
-// genuinely exhausts the deposit.
+// genuinely exhausts the deposit. It also stays clear of the reuse-time
+// low-water auto-refill (#1103): this test pre-opens and pre-records the pool,
+// and on the CLI's one invocation the pool's full 18 USDC remaining sits above
+// the low-water trigger (working / LOW_WATER_DIVISOR = 3.6 USDC), so no
+// proactive refill pre-empts the REACTIVE (mid-stream) top-up under test.
 //
 // A daemon restart between the pool's on-chain open and this test's later
 // on-chain `topUp` was observed to make the daemon's settlement watcher stop
@@ -575,11 +352,9 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 // kept reporting the pre-top-up deposit indefinitely, well past any poll
 // interval, causing the resumed voucher to be rejected forever. That looks
 // like a real, separate bug in the watcher/restart interaction, out of scope
-// for this fix; avoiding any daemon restart in this test sidesteps it
-// entirely (mirroring the single-voucher test above, which also never
-// restarts the daemon and reliably sees its own top-up applied).
-const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 18_000_000;
-const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
+// for this fix; avoiding any daemon restart in this test sidesteps it entirely.
+const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 18_000_000;
+const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB
 
 // A single-invocation reactive MID-STREAM top-up extends a fetch past its
 // opening deposit: `cli/src/commands/fetch.rs::open_or_reuse_pool` signs the
@@ -601,7 +376,7 @@ async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> 
 /// A deterministic blob spanning just over two whole 4 MiB voucher intervals
 /// (the daemon's default cadence), so two full intervals are delivered and
 /// accepted before a small partial third exhausts
-/// `MULTI_INITIAL_DEPOSIT_MICRO_USDC`.
+/// `MULTI_WORKING_DEPOSIT_MICRO_USDC`.
 fn make_multi_interval_blob() -> Vec<u8> {
     let mut v = vec![0u8; 9 * 1024 * 1024 + 777];
     let mut x: u32 = 0x2468_ac13;
@@ -662,17 +437,16 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    // Pre-open the pool ourselves and wait for the node to observe it,
-    // rather than letting the CLI's own `open_or_reuse` race the node's chain
-    // watcher the way `run_topup_fetch_until_ready` exists to ride out for the
-    // OTHER test in this file. That retry loop re-invokes the WHOLE `decdn
-    // fetch` process on ANY failure, including ones unrelated to the race —
-    // and a second invocation resumes from whatever the first one flushed via
-    // the function-ENTRY `resume_offset(existing_partial_len(...))` path
-    // (unrelated to this fix, and pre-existing), which would corrupt the very
-    // cost measurement this test exists to take. Pre-clearing the race keeps
-    // this test to exactly ONE `decdn fetch` invocation, so the reactive
-    // top-up branch is the only thing that can move the byte offset.
+    // Pre-open the pool ourselves and wait for the node to observe it, rather
+    // than letting the CLI's own `open_or_reuse` race the node's chain watcher.
+    // A blind retry loop that re-invokes the WHOLE `decdn fetch` process on ANY
+    // failure — including ones unrelated to the race — would let a second
+    // invocation resume from whatever the first one flushed via the
+    // function-ENTRY `resume_offset(existing_partial_len(...))` path (unrelated
+    // to this fix, and pre-existing), which would corrupt the very cost
+    // measurement this test exists to take. Pre-clearing the race keeps this
+    // test to exactly ONE `decdn fetch` invocation, so the reactive top-up
+    // branch is the only thing that can move the byte offset.
     let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_pool);
     ensure_allowance(
         &chain.provider_for(&buyer),
@@ -686,14 +460,14 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     let pool = PaymentPool::new(chain.addrs().payment_pool, chain.provider_for(&buyer));
     // Escrowed as configured — no on-chain floor to clamp up to, only a
     // non-zero requirement (`openPool` reverts `ZeroAmount`).
-    let initial_deposit = U256::from(MULTI_INITIAL_DEPOSIT_MICRO_USDC);
+    let working_deposit = U256::from(MULTI_WORKING_DEPOSIT_MICRO_USDC);
     let opened = open_pool(
         &pool,
         Arc::new(buyer.clone()),
         &voucher_dom,
         chain.usdc(),
         buyer_addr,
-        initial_deposit,
+        working_deposit,
     )
     .await
     .context("open buyer pool")?;
@@ -723,7 +497,6 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         client_dir.path(),
         &keystore,
         &out,
-        MULTI_INITIAL_DEPOSIT_MICRO_USDC,
         MULTI_WORKING_DEPOSIT_MICRO_USDC,
     );
 
@@ -734,7 +507,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     );
 
     // Exactly one *delivering* invocation — see the comment above on why this
-    // test avoids `run_topup_fetch_until_ready`'s blind cross-invocation retry.
+    // test avoids a blind cross-invocation retry.
     // The one exception is the node's serve-path readiness race: right after
     // `openPool` mines, the node can still answer `NotFound` for the brief window
     // before its `getPool` view resolves the new pool (there is no pool-open event
@@ -887,19 +660,18 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 //   * The node's pre-serve deposit gate (#1518) refuses to serve unless headroom
 //     covers the reserved credit window. For a cold, unbounded request the ramp
 //     (ADR 003 §Credit window, #1669) prices at `paid = 0`, its floor — one 4 MiB
-//     interval, 4 * 2_000_000 = 8_000_000 µUSDC at the quoted rate. So BOTH the
-//     initial deposit and the working target must clear that floor (plus `M`),
-//     or the resumed open after a top-up is refused instead of served. 16M
-//     clears it with headroom — the number below is driven by the delivery
-//     arithmetic, not by this floor.
+//     interval, 4 * 2_000_000 = 8_000_000 µUSDC at the quoted rate. So the
+//     deposit must clear that floor (plus `M`), or the resumed open after a
+//     top-up is refused instead of served. 16M clears it with headroom — the
+//     number below is driven by the delivery arithmetic, not by this floor.
 //   * Vouchers accumulate 8_000_000 µUSDC per whole 4 MiB interval. Starting at a
 //     16_000_000 deposit: vouchers 1-2 are accepted (cumulative 8M, then exactly
 //     16M — the gate is `>`, so an exact match still clears), and voucher 3 (24M)
 //     exhausts it. Each top-up restores headroom to the full 16_000_000 working
-//     target, buying two more intervals. A ~20 MiB blob costs ~40_300_000 µUSDC of
-//     wire, which lands strictly between `initial + working` (32M — so a second
-//     top-up IS required) and `initial + 2*working` (48M — so two suffice, inside
-//     the `MAX_TOPUP_ATTEMPTS` budget of 3).
+//     deposit, buying two more intervals. A ~20 MiB blob costs ~40_300_000 µUSDC
+//     of wire, which lands strictly between the deposit plus one top-up (32M — so
+//     a second top-up IS required) and the deposit plus two top-ups (48M — so two
+//     suffice, inside the `MAX_TOPUP_ATTEMPTS` budget of 3).
 //
 // The money bound is the same two-sided WIRE band the single-top-up test uses, and
 // it is the point of the test: across two top-ups the blob's wire bytes must be
@@ -909,13 +681,12 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // left-boundary proof hashes.
 
 const TWO_TOPUP_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, as above
-// Both must clear the ramp-floor 4 MiB credit window at the rate above
+// Must clear the ramp-floor 4 MiB credit window at the rate above
 // (8_000_000 µUSDC) — sized well above that floor for the delivery
 // arithmetic explained above.
-const TWO_TOPUP_INITIAL_MICRO_USDC: u64 = 16_000_000;
 const TWO_TOPUP_WORKING_MICRO_USDC: u64 = 16_000_000;
-/// Just over 20 MiB: costs more than `initial + working` (forcing a SECOND
-/// top-up) and less than `initial + 2*working` (so two are enough).
+/// Just over 20 MiB: costs more than the deposit plus one top-up (forcing a
+/// SECOND top-up) and less than the deposit plus two top-ups (so two are enough).
 const TWO_TOPUP_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
 
 /// IGNORED — a live reproducer for a SEPARATE, pre-existing defect, not a
@@ -945,11 +716,11 @@ const TWO_TOPUP_BLOB_BYTES: usize = 20 * 1024 * 1024 + 4113;
 /// per-leg re-anchor, the `reseed` monotonicity guard, or the proof-of-service
 /// refill gate.
 ///
-/// This matters beyond the test: it is exactly the case the two-tier deposit
-/// exists to serve — a single blob far larger than the small initial deposit —
-/// and it also means a SECOND reactive top-up has never been exercised end to
-/// end. Un-ignore once the mid-stream rejection surfaces as a typed rejection;
-/// the sizing below is already correct for driving two top-ups.
+/// This matters beyond the test: it is exactly the case the reactive top-up
+/// exists to serve — a single blob far larger than the working deposit — and it
+/// also means a SECOND reactive top-up has never been exercised end to end.
+/// Un-ignore once the mid-stream rejection surfaces as a typed rejection; the
+/// sizing below is already correct for driving two top-ups.
 #[ignore = "reproduces a pre-existing mid-stream rejection defect; see the doc comment"]
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_across_two_reactive_topups_pays_each_wire_byte_exactly_once() -> anyhow::Result<()> {
@@ -1010,10 +781,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     chain.fund_eth(buyer_addr, 100).await?;
     // Enough for the open plus both top-ups, with headroom.
     chain
-        .mint_usdc(
-            buyer_addr,
-            U256::from(TWO_TOPUP_INITIAL_MICRO_USDC + 4 * TWO_TOPUP_WORKING_MICRO_USDC),
-        )
+        .mint_usdc(buyer_addr, U256::from(5 * TWO_TOPUP_WORKING_MICRO_USDC))
         .await
         .context("mint buyer USDC")?;
 
@@ -1039,7 +807,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         &voucher_dom,
         chain.usdc(),
         buyer_addr,
-        U256::from(TWO_TOPUP_INITIAL_MICRO_USDC),
+        U256::from(TWO_TOPUP_WORKING_MICRO_USDC),
     )
     .await
     .context("open buyer pool")?;
@@ -1067,7 +835,6 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         client_dir.path(),
         &keystore,
         &out,
-        TWO_TOPUP_INITIAL_MICRO_USDC,
         TWO_TOPUP_WORKING_MICRO_USDC,
     );
 
@@ -1151,10 +918,10 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     );
 
     // Both top-ups landed on-chain and are reflected locally. Each one restores
-    // headroom to the working target, so the escrow ends at
-    // `settled + working` — and in particular strictly above what one top-up
-    // alone could have reached (`initial + working`).
-    let one_topup_ceiling = U256::from(TWO_TOPUP_INITIAL_MICRO_USDC + TWO_TOPUP_WORKING_MICRO_USDC);
+    // headroom to the working deposit, so the escrow ends strictly above what one
+    // top-up alone could have reached (open plus one top-up = 2× the working
+    // deposit).
+    let one_topup_ceiling = U256::from(2 * TWO_TOPUP_WORKING_MICRO_USDC);
     anyhow::ensure!(
         persisted.deposit > one_topup_ceiling,
         "two top-ups must escrow more than a single top-up could ({one_topup_ceiling}); got {}",
