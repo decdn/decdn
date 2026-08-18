@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use crate::cap::Cap;
 use crate::captcha::{CaptchaVerifier, Turnstile};
 use crate::config::ServerConfig;
-use crate::discovery::{Discovery, ProviderResolver};
+use crate::issuer::Issuer;
 use crate::store::Store;
 use crate::treasury::Treasury;
 
@@ -11,37 +10,41 @@ use crate::treasury::Treasury;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
-    pub cap: Cap,
     pub treasury: Arc<dyn Treasury>,
+    pub issuer: Arc<Issuer>,
     pub turnstile: Arc<dyn CaptchaVerifier>,
     pub cfg: Arc<ServerConfig>,
-    pub discovery: Arc<dyn ProviderResolver>,
 }
 
-/// Assemble the full `AppState` from a `ServerConfig`: opens the redb store,
-/// builds the monthly cap policy and the Turnstile client, connects the
-/// on-chain treasury via `cfg.build_treasury()`, and wires up hash → node
-/// discovery against the same RPC and `CapacityBond` address.
+/// Assemble `AppState`: open the store, load the hot wallet once, build the
+/// pool treasury + capability issuer from it, and confirm this wallet owns
+/// the configured pool before serving.
 pub async fn build(cfg: ServerConfig) -> anyhow::Result<AppState> {
     let store = Arc::new(Store::open(&cfg.data_dir)?);
-    let cap = Cap {
-        monthly_limit: cfg.monthly_cap,
-    };
     let turnstile: Arc<dyn CaptchaVerifier> = Arc::new(Turnstile::new(
         cfg.turnstile_secret.clone(),
         reqwest::Client::new(),
     ));
-    let treasury: Arc<dyn Treasury> = Arc::from(cfg.build_treasury().await?);
-    let discovery: Arc<dyn ProviderResolver> = Arc::new(Discovery {
-        rpc_url: cfg.rpc_url.clone(),
-        capacity_bond: cfg.capacity_bond,
-    });
+    let signer = cfg.load_treasury_signer().await?;
+    let issuer = Arc::new(cfg.build_issuer(signer.clone()));
+    let treasury: Arc<dyn Treasury> = Arc::from(cfg.build_treasury(signer).await?);
+
+    // Boot check: the hot wallet must own the configured pool, else every
+    // capability we sign is worthless (the node recovers a non-owner).
+    let owner = treasury.pool_owner(cfg.pool_id).await?;
+    anyhow::ensure!(
+        owner == treasury.owner_address(),
+        "configured SPONSOR_POOL_ID {} is owned on-chain by {owner}, not the treasury wallet {} \
+         — wrong pool id, keystore, or contract",
+        cfg.pool_id,
+        treasury.owner_address()
+    );
+
     Ok(AppState {
         store,
-        cap,
         treasury,
+        issuer,
         turnstile,
         cfg: Arc::new(cfg),
-        discovery,
     })
 }

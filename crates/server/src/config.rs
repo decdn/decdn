@@ -1,8 +1,10 @@
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_incentive::voucher_domain;
 
+use crate::issuer::Issuer;
 use crate::money::MicroUsdc;
 use crate::treasury::{self, Treasury, TreasuryConfig};
 
@@ -16,33 +18,23 @@ fn env_u64(k: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
-/// Sponsor server configuration, loaded from `SPONSOR_*` environment
-/// variables. See `from_env` for the exact variable names and defaults.
 pub struct ServerConfig {
     pub bind: SocketAddr,
-    /// The gateway's own public base URL, e.g. `https://up.decdn.org`. Baked
-    /// into the templated `GET /decdn.sh` installer script (`{{GATEWAY_BASE}}`)
-    /// so end users never set an env var for it.
     pub public_url: String,
     pub rpc_url: String,
     pub chain_id: u64,
-    pub payment_channel: Address,
+    pub payment_pool: Address,
+    pub pool_id: B256,
     pub capacity_bond: Address,
     pub treasury_keystore: PathBuf,
-    pub initial_deposit: MicroUsdc,
-    pub working_balance: MicroUsdc,
-    pub monthly_cap: MicroUsdc,
+    pub capability_cap: MicroUsdc,
+    pub capability_ttl_secs: u64,
+    pub pool_low_water: MicroUsdc,
+    pub pool_refill: MicroUsdc,
+    pub pool_watch_interval_secs: u64,
     pub turnstile_secret: String,
     pub turnstile_sitekey: String,
     pub data_dir: PathBuf,
-    pub topup_max_skew_secs: u64,
-    /// Local bookkeeping TTL the expiry-reclaim sweep (`crate::reclaim`)
-    /// uses to pick channels to attempt reclaiming: `opened_unix + ttl <=
-    /// now`. Distinct from (and expected to stay below) the on-chain
-    /// `PaymentChannel.Channel.expiresAt` the contract itself enforces.
-    pub channel_ttl_secs: u64,
-    /// How often `reclaim::run` sweeps the store for expired channels.
-    pub reclaim_interval_secs: u64,
 }
 
 impl ServerConfig {
@@ -55,31 +47,23 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "https://up.decdn.org".into()),
             rpc_url: env("SPONSOR_RPC_URL")?,
             chain_id: env_u64("SPONSOR_CHAIN_ID", 421_614)?,
-            payment_channel: Address::from_str(&env("SPONSOR_PAYMENT_CHANNEL_ADDR")?)?,
+            payment_pool: Address::from_str(&env("SPONSOR_PAYMENT_POOL_ADDR")?)?,
+            pool_id: B256::from_str(&env("SPONSOR_POOL_ID")?)?,
             capacity_bond: Address::from_str(&env("SPONSOR_CAPACITY_BOND_ADDR")?)?,
             treasury_keystore: PathBuf::from(env("SPONSOR_TREASURY_KEYSTORE")?),
-            initial_deposit: MicroUsdc(env_u64("SPONSOR_INITIAL_DEPOSIT_MICRO_USDC", 2_000_000)?),
-            working_balance: MicroUsdc(env_u64("SPONSOR_WORKING_BALANCE_MICRO_USDC", 2_000_000)?),
-            monthly_cap: MicroUsdc(env_u64("SPONSOR_MONTHLY_CAP_MICRO_USDC", 10_000_000)?),
+            capability_cap: MicroUsdc(env_u64("SPONSOR_CAPABILITY_CAP_MICRO_USDC", 10_000_000)?),
+            capability_ttl_secs: env_u64("SPONSOR_CAPABILITY_TTL_SECS", 2_592_000)?,
+            pool_low_water: MicroUsdc(env_u64("SPONSOR_POOL_LOW_WATER_MICRO_USDC", 20_000_000)?),
+            pool_refill: MicroUsdc(env_u64("SPONSOR_POOL_REFILL_MICRO_USDC", 100_000_000)?),
+            pool_watch_interval_secs: env_u64("SPONSOR_POOL_WATCH_INTERVAL_SECS", 3600)?,
             turnstile_secret: env("SPONSOR_TURNSTILE_SECRET")?,
             turnstile_sitekey: env("SPONSOR_TURNSTILE_SITEKEY")?,
             data_dir: PathBuf::from(
                 std::env::var("SPONSOR_DATA_DIR").unwrap_or_else(|_| "./data".into()),
             ),
-            topup_max_skew_secs: env_u64("SPONSOR_TOPUP_MAX_SKEW_SECS", 120)?,
-            // Default matches `MAX_CHANNEL_DURATION_FLOOR` (7 days) in
-            // `contracts/src/PaymentChannel.sol` — the shortest duration
-            // governance can configure a channel's on-chain expiry to, so
-            // the sweep never fires meaningfully ahead of the earliest a
-            // real channel could actually be expired.
-            channel_ttl_secs: env_u64("SPONSOR_CHANNEL_TTL_SECS", 7 * 24 * 60 * 60)?,
-            reclaim_interval_secs: env_u64("SPONSOR_RECLAIM_INTERVAL_SECS", 3600)?,
         })
     }
 
-    /// Load the treasury hot-wallet signer from `treasury_keystore`, with the
-    /// password taken from `SPONSOR_TREASURY_PASSWORD`. Runs the (blocking,
-    /// scrypt-backed) keystore decrypt on the blocking thread pool.
     pub async fn load_treasury_signer(&self) -> anyhow::Result<PrivateKeySigner> {
         let ks = self.treasury_keystore.clone();
         let pw = std::env::var("SPONSOR_TREASURY_PASSWORD")
@@ -88,19 +72,27 @@ impl ServerConfig {
             .await?
     }
 
-    /// Bridge to Task 7's `treasury::connect`: load the signer, assemble a
-    /// `TreasuryConfig`, and connect. Kept as a method here (rather than
-    /// changing `connect`'s signature) so `treasury.rs`'s `Treasury` trait
-    /// and `connect` free function stay exactly as Task 7 built them.
-    pub async fn build_treasury(&self) -> anyhow::Result<Box<dyn Treasury>> {
-        let signer = self.load_treasury_signer().await?;
+    pub async fn build_treasury(
+        &self,
+        signer: PrivateKeySigner,
+    ) -> anyhow::Result<Box<dyn Treasury>> {
         treasury::connect(&TreasuryConfig {
             rpc_url: self.rpc_url.clone(),
-            payment_channel: self.payment_channel,
+            payment_pool: self.payment_pool,
             chain_id: self.chain_id,
             signer,
         })
         .await
+    }
+
+    pub fn build_issuer(&self, signer: PrivateKeySigner) -> Issuer {
+        Issuer::new(
+            signer,
+            voucher_domain(self.chain_id, self.payment_pool),
+            self.pool_id,
+            self.capability_cap.0,
+            self.capability_ttl_secs,
+        )
     }
 }
 
@@ -117,16 +109,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn from_env_reads_required_fields() {
-        // set the minimal env then parse. `set_var`/`remove_var` are unsafe
-        // in edition 2024 (not thread-safe wrt other threads' env reads);
-        // guarded by #[serial] to ensure single-threaded execution.
+    fn from_env_reads_required_and_defaults() {
         unsafe {
             std::env::set_var("SPONSOR_RPC_URL", "http://localhost:8545");
             std::env::set_var(
-                "SPONSOR_PAYMENT_CHANNEL_ADDR",
+                "SPONSOR_PAYMENT_POOL_ADDR",
                 "0x0000000000000000000000000000000000000001",
             );
+            std::env::set_var("SPONSOR_POOL_ID", format!("0x{}", "11".repeat(32)));
             std::env::set_var(
                 "SPONSOR_CAPACITY_BOND_ADDR",
                 "0x0000000000000000000000000000000000000002",
@@ -135,12 +125,13 @@ mod tests {
             std::env::set_var("SPONSOR_TURNSTILE_SECRET", "s");
             std::env::set_var("SPONSOR_TURNSTILE_SITEKEY", "k");
             std::env::remove_var("SPONSOR_CHAIN_ID");
-            std::env::remove_var("SPONSOR_INITIAL_DEPOSIT_MICRO_USDC");
-            std::env::remove_var("SPONSOR_MONTHLY_CAP_MICRO_USDC");
+            std::env::remove_var("SPONSOR_CAPABILITY_CAP_MICRO_USDC");
+            std::env::remove_var("SPONSOR_CAPABILITY_TTL_SECS");
         }
         let cfg = ServerConfig::from_env().unwrap();
-        assert_eq!(cfg.chain_id, 421_614); // default
-        assert_eq!(cfg.initial_deposit.0, 2_000_000); // default
-        assert_eq!(cfg.monthly_cap.0, 10_000_000); // default
+        assert_eq!(cfg.chain_id, 421_614);
+        assert_eq!(cfg.capability_cap.0, 10_000_000);
+        assert_eq!(cfg.capability_ttl_secs, 2_592_000);
+        assert_eq!(cfg.pool_low_water.0, 20_000_000);
     }
 }

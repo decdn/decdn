@@ -1,87 +1,61 @@
-use crate::money::MicroUsdc;
-use alloy::primitives::{Address, B256};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use alloy::primitives::Address;
+use redb::{Database, ReadableDatabase, TableDefinition};
 use std::path::Path;
 
-// value encodings are fixed-width big-endian byte arrays for stable ordering.
-// redb 4.x still has no `Value` impl for `Vec<u8>` (only `&[u8]`, fixed-size
-// arrays, and a handful of primitives), so the channel record table keeps
-// `&[u8]` as its value type — unchanged from the redb 2.x layout.
-const CHANNELS: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("channels_v1");
-const CLIENT_INDEX: TableDefinition<[u8; 52], [u8; 32]> = TableDefinition::new("client_index_v1"); // client(20)|node(32)
-const CAP: TableDefinition<[u8; 24], u64> = TableDefinition::new("cap_v1"); // client(20)|bucket(4)
+// signer(20) -> encoded GrantRecord. `&[u8]` value: redb 4.x has no `Value`
+// impl for `Vec<u8>`, so the variable-length record is stored as a byte slice.
+const GRANTS: TableDefinition<[u8; 20], &[u8]> = TableDefinition::new("grants_v1");
 
+/// A capability issued to `signer`, persisted so `POST /fund` is idempotent
+/// and `GET /capability` can return the exact token the client was given.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelRecord {
-    pub client: Address,
-    pub provider: Address,
-    pub node_id: [u8; 32],
-    pub deposit_micro: u64,
-    pub opened_unix: u64,
+pub struct GrantRecord {
+    pub spending_cap: u64,
+    pub expiry: u64,
+    pub issued_unix: u64,
+    pub token: String,
 }
 
-impl ChannelRecord {
+impl GrantRecord {
     fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(20 + 20 + 32 + 8 + 8);
-        v.extend_from_slice(self.client.as_slice());
-        v.extend_from_slice(self.provider.as_slice());
-        v.extend_from_slice(&self.node_id);
-        v.extend_from_slice(&self.deposit_micro.to_be_bytes());
-        v.extend_from_slice(&self.opened_unix.to_be_bytes());
+        let mut v = Vec::with_capacity(24 + self.token.len());
+        v.extend_from_slice(&self.spending_cap.to_be_bytes());
+        v.extend_from_slice(&self.expiry.to_be_bytes());
+        v.extend_from_slice(&self.issued_unix.to_be_bytes());
+        v.extend_from_slice(self.token.as_bytes());
         v
     }
 
-    fn decode(b: &[u8]) -> anyhow::Result<ChannelRecord> {
-        anyhow::ensure!(b.len() == 88, "bad channel record length {}", b.len());
-        let client = Address::from_slice(b.get(0..20).ok_or_else(|| anyhow::anyhow!("client"))?);
-        let provider =
-            Address::from_slice(b.get(20..40).ok_or_else(|| anyhow::anyhow!("provider"))?);
-        let node_slice = b.get(40..72).ok_or_else(|| anyhow::anyhow!("node"))?;
-        let node_id: [u8; 32] = node_slice
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("node length"))?;
-        let deposit_bytes = b.get(72..80).ok_or_else(|| anyhow::anyhow!("dep"))?;
-        let deposit_micro = u64::from_be_bytes(
-            deposit_bytes
+    fn decode(b: &[u8]) -> anyhow::Result<GrantRecord> {
+        anyhow::ensure!(b.len() >= 24, "bad grant record length {}", b.len());
+        let cap_bytes = b.get(0..8).ok_or_else(|| anyhow::anyhow!("cap"))?;
+        let spending_cap = u64::from_be_bytes(
+            cap_bytes
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("dep length"))?,
+                .map_err(|_| anyhow::anyhow!("cap len"))?,
         );
-        let ts_bytes = b.get(80..88).ok_or_else(|| anyhow::anyhow!("ts"))?;
-        let opened_unix = u64::from_be_bytes(
-            ts_bytes
+        let exp_bytes = b.get(8..16).ok_or_else(|| anyhow::anyhow!("expiry"))?;
+        let expiry = u64::from_be_bytes(
+            exp_bytes
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("ts length"))?,
+                .map_err(|_| anyhow::anyhow!("expiry len"))?,
         );
-        Ok(ChannelRecord {
-            client,
-            provider,
-            node_id,
-            deposit_micro,
-            opened_unix,
+        let iss_bytes = b.get(16..24).ok_or_else(|| anyhow::anyhow!("issued"))?;
+        let issued_unix = u64::from_be_bytes(
+            iss_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("issued len"))?,
+        );
+        let token_bytes = b.get(24..).ok_or_else(|| anyhow::anyhow!("token"))?;
+        let token = String::from_utf8(token_bytes.to_vec())
+            .map_err(|_| anyhow::anyhow!("grant token not utf8"))?;
+        Ok(GrantRecord {
+            spending_cap,
+            expiry,
+            issued_unix,
+            token,
         })
     }
-}
-
-fn client_node_key(client: Address, node_id: [u8; 32]) -> [u8; 52] {
-    let mut k = [0u8; 52];
-    if let Some(dst) = k.get_mut(0..20) {
-        dst.copy_from_slice(client.as_slice());
-    }
-    if let Some(dst) = k.get_mut(20..52) {
-        dst.copy_from_slice(&node_id);
-    }
-    k
-}
-
-fn cap_key(client: Address, bucket: u32) -> [u8; 24] {
-    let mut k = [0u8; 24];
-    if let Some(dst) = k.get_mut(0..20) {
-        dst.copy_from_slice(client.as_slice());
-    }
-    if let Some(dst) = k.get_mut(20..24) {
-        dst.copy_from_slice(&bucket.to_be_bytes());
-    }
-    k
 }
 
 pub struct Store {
@@ -92,142 +66,31 @@ impl Store {
     pub fn open(dir: &Path) -> anyhow::Result<Store> {
         std::fs::create_dir_all(dir)?;
         let db = Database::create(dir.join("sponsor.redb"))?;
-        // create tables up front so read-only transactions don't fail on a
-        // fresh database before any writer has touched them.
         let w = db.begin_write()?;
         {
-            w.open_table(CHANNELS)?;
-            w.open_table(CLIENT_INDEX)?;
-            w.open_table(CAP)?;
+            w.open_table(GRANTS)?;
         }
         w.commit()?;
         Ok(Store { db })
     }
 
-    pub fn insert_channel(&self, id: B256, rec: &ChannelRecord) -> anyhow::Result<()> {
+    pub fn put_grant(&self, signer: Address, rec: &GrantRecord) -> anyhow::Result<()> {
         let w = self.db.begin_write()?;
         {
-            let mut ch = w.open_table(CHANNELS)?;
-            ch.insert(id.0, rec.encode().as_slice())?;
-            let mut idx = w.open_table(CLIENT_INDEX)?;
-            idx.insert(client_node_key(rec.client, rec.node_id), id.0)?;
+            let mut t = w.open_table(GRANTS)?;
+            t.insert(signer.into_array(), rec.encode().as_slice())?;
         }
         w.commit()?;
         Ok(())
     }
 
-    pub fn get_by_client_node(
-        &self,
-        client: Address,
-        node_id: [u8; 32],
-    ) -> anyhow::Result<Option<(B256, ChannelRecord)>> {
+    pub fn get_grant(&self, signer: Address) -> anyhow::Result<Option<GrantRecord>> {
         let r = self.db.begin_read()?;
-        let idx = r.open_table(CLIENT_INDEX)?;
-        let Some(id) = idx.get(client_node_key(client, node_id))? else {
+        let t = r.open_table(GRANTS)?;
+        let Some(raw) = t.get(signer.into_array())? else {
             return Ok(None);
         };
-        let id = B256::from(id.value());
-        let ch = r.open_table(CHANNELS)?;
-        let Some(raw) = ch.get(id.0)? else {
-            return Ok(None);
-        };
-        Ok(Some((id, ChannelRecord::decode(raw.value())?)))
-    }
-
-    pub fn get_by_channel(&self, id: B256) -> anyhow::Result<Option<ChannelRecord>> {
-        let r = self.db.begin_read()?;
-        let ch = r.open_table(CHANNELS)?;
-        let Some(raw) = ch.get(id.0)? else {
-            return Ok(None);
-        };
-        Ok(Some(ChannelRecord::decode(raw.value())?))
-    }
-
-    /// All persisted channel records, for the expiry-reclaim sweep
-    /// (`crate::reclaim`) to scan. Unordered — the sweep filters by
-    /// `opened_unix` itself.
-    pub fn iter_channels(&self) -> anyhow::Result<Vec<(B256, ChannelRecord)>> {
-        let r = self.db.begin_read()?;
-        let ch = r.open_table(CHANNELS)?;
-        let mut out = Vec::new();
-        for entry in ch.iter()? {
-            let (k, v) = entry?;
-            let id = B256::from(k.value());
-            let rec = ChannelRecord::decode(v.value())?;
-            out.push((id, rec));
-        }
-        Ok(out)
-    }
-
-    /// Remove a reclaimed channel from both the `channels` and
-    /// `client_index` tables. `client`/`node_id` must match the record's own
-    /// fields (the caller has just read them off the same record) so the
-    /// `client_index` entry removed is the one that actually points at `id`.
-    pub fn remove_channel(
-        &self,
-        id: B256,
-        client: Address,
-        node_id: [u8; 32],
-    ) -> anyhow::Result<()> {
-        let w = self.db.begin_write()?;
-        {
-            let mut ch = w.open_table(CHANNELS)?;
-            ch.remove(id.0)?;
-            let mut idx = w.open_table(CLIENT_INDEX)?;
-            idx.remove(client_node_key(client, node_id))?;
-        }
-        w.commit()?;
-        Ok(())
-    }
-
-    pub fn cap_spent(&self, client: Address, bucket: u32) -> anyhow::Result<MicroUsdc> {
-        let r = self.db.begin_read()?;
-        let cap = r.open_table(CAP)?;
-        Ok(MicroUsdc(
-            cap.get(cap_key(client, bucket))?
-                .map(|v| v.value())
-                .unwrap_or(0),
-        ))
-    }
-
-    pub fn cap_add(
-        &self,
-        client: Address,
-        bucket: u32,
-        amount: MicroUsdc,
-    ) -> anyhow::Result<MicroUsdc> {
-        let w = self.db.begin_write()?;
-        let new_total;
-        {
-            let mut cap = w.open_table(CAP)?;
-            let prev = cap
-                .get(cap_key(client, bucket))?
-                .map(|v| v.value())
-                .unwrap_or(0);
-            new_total = prev.saturating_add(amount.0);
-            cap.insert(cap_key(client, bucket), new_total)?;
-        }
-        w.commit()?;
-        Ok(MicroUsdc(new_total))
-    }
-
-    pub fn cap_refund(
-        &self,
-        client: Address,
-        bucket: u32,
-        amount: MicroUsdc,
-    ) -> anyhow::Result<()> {
-        let w = self.db.begin_write()?;
-        {
-            let mut cap = w.open_table(CAP)?;
-            let prev = cap
-                .get(cap_key(client, bucket))?
-                .map(|v| v.value())
-                .unwrap_or(0);
-            cap.insert(cap_key(client, bucket), prev.saturating_sub(amount.0))?;
-        }
-        w.commit()?;
-        Ok(())
+        Ok(Some(GrantRecord::decode(raw.value())?))
     }
 }
 
@@ -240,74 +103,28 @@ impl Store {
 )]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::address;
 
     #[test]
-    fn insert_is_idempotent_lookup_and_cap_accumulates() {
+    fn put_then_get_roundtrips_and_overwrites() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        let client = address!("00000000000000000000000000000000000000aa");
-        let id = b256!("11111111111111111111111111111111111111111111111111111111111111ff");
-        let rec = ChannelRecord {
-            client,
-            provider: address!("00000000000000000000000000000000000000bb"),
-            node_id: [7u8; 32],
-            deposit_micro: 2_000_000,
-            opened_unix: 1_769_904_000,
+        let signer = address!("00000000000000000000000000000000000000aa");
+        assert_eq!(s.get_grant(signer).unwrap(), None);
+        let rec = GrantRecord {
+            spending_cap: 10_000_000,
+            expiry: 1_769_904_000,
+            issued_unix: 1_767_312_000,
+            token: "dcap1:AAAA".to_string(),
         };
-        s.insert_channel(id, &rec).unwrap();
-        let (got_id, got) = s.get_by_client_node(client, [7u8; 32]).unwrap().unwrap();
-        assert_eq!(got_id, id);
-        assert_eq!(got.deposit_micro, 2_000_000);
-
-        let bucket = 42;
-        assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(0));
-        let total = s.cap_add(client, bucket, MicroUsdc(2_000_000)).unwrap();
-        assert_eq!(total, MicroUsdc(2_000_000));
-        let total = s.cap_add(client, bucket, MicroUsdc(2_000_000)).unwrap();
-        assert_eq!(total, MicroUsdc(4_000_000));
-        assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(4_000_000));
-    }
-
-    #[test]
-    fn cap_refund_saturates() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        let client = address!("00000000000000000000000000000000000000aa");
-        let bucket = 42;
-
-        // add some cap, then refund part of it
-        let _total = s.cap_add(client, bucket, MicroUsdc(5_000_000)).unwrap();
-        s.cap_refund(client, bucket, MicroUsdc(2_000_000)).unwrap();
-        assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(3_000_000));
-
-        // refund more than exists, should saturate at 0
-        s.cap_refund(client, bucket, MicroUsdc(10_000_000)).unwrap();
-        assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(0));
-    }
-
-    #[test]
-    fn iter_channels_then_remove_channel_drops_both_tables() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path()).unwrap();
-        let client = address!("00000000000000000000000000000000000000aa");
-        let node_id = [7u8; 32];
-        let id = b256!("11111111111111111111111111111111111111111111111111111111111111ff");
-        let rec = ChannelRecord {
-            client,
-            provider: address!("00000000000000000000000000000000000000bb"),
-            node_id,
-            deposit_micro: 2_000_000,
-            opened_unix: 1_769_904_000,
+        s.put_grant(signer, &rec).unwrap();
+        assert_eq!(s.get_grant(signer).unwrap(), Some(rec.clone()));
+        // idempotent re-issue overwrites in place
+        let rec2 = GrantRecord {
+            token: "dcap1:BBBB".to_string(),
+            ..rec
         };
-        s.insert_channel(id, &rec).unwrap();
-
-        let all = s.iter_channels().unwrap();
-        assert_eq!(all, vec![(id, rec)]);
-
-        s.remove_channel(id, client, node_id).unwrap();
-        assert_eq!(s.iter_channels().unwrap(), vec![]);
-        assert_eq!(s.get_by_client_node(client, node_id).unwrap(), None);
-        assert_eq!(s.get_by_channel(id).unwrap(), None);
+        s.put_grant(signer, &rec2).unwrap();
+        assert_eq!(s.get_grant(signer).unwrap(), Some(rec2));
     }
 }

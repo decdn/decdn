@@ -761,7 +761,7 @@ checksum = "3cd5dbd32cae5d1bc3afaf455064ebd9bcce70b57de220468908717c225225dd"
 dependencies = [
  "alloy-json-rpc",
  "auto_impl",
- "base64",
+ "base64 0.22.1",
  "derive_more",
  "futures",
  "futures-utils-wasm",
@@ -1334,7 +1334,7 @@ version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "http 1.5.0",
  "log",
  "url",
@@ -1935,6 +1935,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64-simd"
@@ -2740,7 +2746,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decdn-bao-range"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2750,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2770,6 +2776,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "iroh-blobs",
+ "iroh-io",
  "iroh-metrics",
  "positioned-io",
  "rand 0.10.2",
@@ -2783,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-client-pull"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2805,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2825,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-config-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -2834,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2858,30 +2865,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdn-gossip"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "blake3",
- "bytes",
- "decdn-protocol",
- "iroh",
- "iroh-gossip",
- "postcard",
- "thiserror 2.0.19",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "decdn-incentive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alloy",
  "anyhow",
+ "base64 0.23.1",
  "decdn-common",
  "decdn-protocol",
  "ed25519-dalek 2.2.0",
@@ -2899,19 +2888,19 @@ dependencies = [
 
 [[package]]
 name = "decdn-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alloy",
  "anyhow",
  "arc-swap",
  "async-trait",
- "blake3",
+ "bao-tree",
  "bytes",
  "clap",
+ "decdn-bao-range",
  "decdn-cache",
  "decdn-client-pull",
  "decdn-common",
- "decdn-gossip",
  "decdn-incentive",
  "decdn-protocol",
  "decdn-reputation",
@@ -2924,7 +2913,7 @@ dependencies = [
  "indexmap 2.14.0",
  "iroh",
  "iroh-blobs",
- "iroh-gossip",
+ "iroh-io",
  "iroh-metrics",
  "jsonrpsee",
  "postcard",
@@ -2944,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "postcard",
  "serde",
@@ -2954,12 +2943,11 @@ dependencies = [
 
 [[package]]
 name = "decdn-reputation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "decdn-protocol",
  "iroh",
- "iroh-gossip",
  "serde",
  "thiserror 2.0.19",
  "tokio",
@@ -3538,12 +3526,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fixedbitset"
-version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3637,19 +3619,6 @@ checksum = "262590f4fe6afeb0bc83be1daa64e52657fe185690a958af7f3ad0e92085c5ae"
 dependencies = [
  "futures-core",
  "futures-sink",
-]
-
-[[package]]
-name = "futures-concurrency"
-version = "7.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "175cd8cca9e1d45b87f18ffa75088f2099e3c4fe5e2f83e42de112560bea8ea6"
-dependencies = [
- "fixedbitset",
- "futures-core",
- "futures-lite",
- "pin-project",
- "smallvec",
 ]
 
 [[package]]
@@ -4257,7 +4226,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -4696,33 +4665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh-gossip"
-version = "0.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1dc4b05f73e7a1b9e83b531eb63c3fd671b0af3aeb13b59c546dd7ca747515"
-dependencies = [
- "blake3",
- "bytes",
- "data-encoding",
- "derive_more",
- "futures-concurrency",
- "hex",
- "indexmap 2.14.0",
- "iroh",
- "iroh-base",
- "iroh-metrics",
- "irpc",
- "n0-error",
- "n0-future",
- "postcard",
- "rand 0.10.2",
- "serde",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "iroh-io"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5048,7 +4990,7 @@ version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790bedefcec85321e007ff3af84b4e417540d5c87b3c9779b9e247d1bcc3dab8"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "http-body 1.1.0",
  "hyper",
  "hyper-rustls",
@@ -5382,7 +5324,6 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c37e81176a83a77d2514528b91bdafc70ef88aab428f0e1b91aebb8d99888895"
 dependencies = [
- "anyhow",
  "n0-error-macros",
  "spez",
 ]
@@ -6031,7 +5972,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -6162,7 +6103,7 @@ version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "indexmap 2.14.0",
  "quick-xml",
  "serde",
@@ -6206,7 +6147,7 @@ version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb3713e4977408279158444a18c1a01ac9bf2e7eaf1fbfd1a19ac9cd18d90721"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "derive_more",
  "hyper-util",
@@ -6769,7 +6710,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -6809,7 +6750,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -7423,7 +7364,7 @@ version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bs58",
  "chrono",
  "hex",
@@ -7696,7 +7637,7 @@ version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e859df029d160cb88608f5d7df7fb4753fd20fdfb4de5644f3d8b8440841721"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "http 1.5.0",
@@ -8213,7 +8154,7 @@ version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d52efb639344a7c6adb8e62c6f3d2c19c001ff1b79a5041ba1c6ed42e19c6aa5"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-sink",
@@ -9079,7 +9020,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
 dependencies = [
  "assert-json-diff",
- "base64",
+ "base64 0.22.1",
  "deadpool",
  "futures",
  "http 1.5.0",

@@ -1,11 +1,9 @@
-pub mod cap;
 pub mod captcha;
 pub mod config;
-pub mod discovery;
 pub mod http;
+pub mod issuer;
 pub mod money;
-pub mod reclaim;
+pub mod pool_watch;
 pub mod state;
 pub mod store;
-pub mod topup_auth;
 pub mod treasury;

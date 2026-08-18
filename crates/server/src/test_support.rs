@@ -1,16 +1,3 @@
-//! Fakes for the HTTP contract tests (`tests/http_contract.rs`).
-//!
-//! This file is **not** part of the `sponsord` lib/bin: it is pulled in only
-//! by the integration test binary via
-//! `#[path = "../src/test_support.rs"] mod test_support;` at the top of
-//! `tests/http_contract.rs`. That keeps these fakes (and their `tempfile`
-//! dependency, panicking constructors, etc.) out of the shipped `sponsord`
-//! library and binary entirely — a normal `cargo build -p sponsord` never
-//! compiles this file. All types referenced below are already `pub` in the
-//! lib, so the test binary can build this module against them with no
-//! feature flag. `#[allow(dead_code)]` keeps `cargo clippy --all-targets`
-//! pristine for any fake surface a given test binary doesn't exercise.
-
 #![allow(dead_code)]
 #![allow(
     clippy::unwrap_used,
@@ -19,87 +6,67 @@
     clippy::indexing_slicing
 )]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 
-use sponsord::cap::Cap;
 use sponsord::captcha::CaptchaVerifier;
 use sponsord::config::ServerConfig;
-use sponsord::discovery::{NodePick, ProviderResolver};
+use sponsord::issuer::Issuer;
 use sponsord::money::MicroUsdc;
 use sponsord::state::AppState;
 use sponsord::store::Store;
 use sponsord::treasury::Treasury;
 
-/// In-memory `Treasury`: same fake shape as the `treasury` module's own
-/// unit-test double, made `pub` so the HTTP contract tests can inject it.
-#[derive(Default)]
+/// In-memory pool treasury: fixed owner, a mutable remaining balance.
 pub struct FakeTreasury {
-    deposit: Mutex<HashMap<B256, u64>>,
-    next_id: AtomicU8,
+    owner: Address,
+    remaining: Mutex<u64>,
+}
+
+impl FakeTreasury {
+    #[must_use]
+    pub fn new(owner: Address, remaining: u64) -> Self {
+        Self {
+            owner,
+            remaining: Mutex::new(remaining),
+        }
+    }
 }
 
 #[async_trait]
 impl Treasury for FakeTreasury {
-    async fn open(
-        &self,
-        _provider: Address,
-        _voucher_signer: Address,
-        deposit: MicroUsdc,
-    ) -> anyhow::Result<B256> {
-        let n = self.next_id.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-        let id = B256::repeat_byte(n);
-        let mut d = self
-            .deposit
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fake treasury mutex poisoned"))?;
-        d.insert(id, deposit.0);
-        Ok(id)
+    fn owner_address(&self) -> Address {
+        self.owner
     }
-
-    async fn deposit_of(&self, channel_id: B256) -> anyhow::Result<MicroUsdc> {
-        let d = self
-            .deposit
+    async fn remaining(&self, _pool_id: B256) -> anyhow::Result<MicroUsdc> {
+        let r = self
+            .remaining
             .lock()
-            .map_err(|_| anyhow::anyhow!("fake treasury mutex poisoned"))?;
-        Ok(MicroUsdc(d.get(&channel_id).copied().unwrap_or(0)))
+            .map_err(|_| anyhow::anyhow!("poisoned"))?;
+        Ok(MicroUsdc(*r))
     }
-
-    async fn top_up_to(
-        &self,
-        channel_id: B256,
-        _provider: Address,
-        target: MicroUsdc,
-    ) -> anyhow::Result<MicroUsdc> {
-        let mut d = self
-            .deposit
+    async fn top_up(&self, _pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc> {
+        let mut r = self
+            .remaining
             .lock()
-            .map_err(|_| anyhow::anyhow!("fake treasury mutex poisoned"))?;
-        let cur = d.get(&channel_id).copied().unwrap_or(0);
-        let new = cur.max(target.0);
-        d.insert(channel_id, new);
-        Ok(MicroUsdc(new))
+            .map_err(|_| anyhow::anyhow!("poisoned"))?;
+        *r = r.saturating_add(additional.0);
+        Ok(MicroUsdc(*r))
     }
-
-    async fn reclaim_expired(&self, _channel_id: B256) -> anyhow::Result<bool> {
-        // The HTTP contract tests never exercise the reclaim sweep; keep
-        // this a harmless no-op so it never falsely reports a reclaim.
-        Ok(false)
+    async fn pool_owner(&self, _pool_id: B256) -> anyhow::Result<Address> {
+        Ok(self.owner)
     }
 }
 
-/// Pass-through captcha whose verdict can be flipped after construction —
-/// the 403 test builds one with `pass = false`.
 pub struct FakeCaptcha {
     pass: AtomicBool,
 }
-
 impl FakeCaptcha {
     #[must_use]
     pub fn new(pass: bool) -> Self {
@@ -108,7 +75,6 @@ impl FakeCaptcha {
         }
     }
 }
-
 #[async_trait]
 impl CaptchaVerifier for FakeCaptcha {
     async fn verify(&self, _token: &str, _remote_ip: Option<&str>) -> anyhow::Result<bool> {
@@ -116,119 +82,73 @@ impl CaptchaVerifier for FakeCaptcha {
     }
 }
 
-/// Always resolves to one fixed node/provider pair.
-pub struct FakeResolver {
-    pub pick: NodePick,
-}
-
-#[async_trait]
-impl ProviderResolver for FakeResolver {
-    async fn resolve(&self, _hash: [u8; 32]) -> anyhow::Result<Option<NodePick>> {
-        Ok(Some(self.pick))
-    }
-}
-
-/// A real signer the contract tests can use as a channel's `client` /
-/// voucher-signer address, so `/topup`'s EIP-191 signature-verification path
-/// can be exercised with a signature the recovered address actually matches
-/// — the fixed `CLIENT` test constant has no known private key, so it can
-/// never drive the `/topup` 200 happy path.
-pub struct FakeClient {
-    pub signer: PrivateKeySigner,
-    pub address: Address,
-}
-
-impl FakeClient {
-    /// A fresh random signer/address pair.
-    #[must_use]
-    pub fn random() -> Self {
-        let signer = PrivateKeySigner::random();
-        let address = signer.address();
-        Self { signer, address }
-    }
-}
-
-/// Knobs `app_state_with_options` exposes to the contract tests.
 pub struct FakeOptions {
-    /// Whether the injected `FakeCaptcha` reports success.
     pub captcha_passes: bool,
-    /// The monthly cap the injected `Cap` policy enforces.
-    pub monthly_cap: MicroUsdc,
-    /// `ServerConfig::initial_deposit` — the deposit `/fund` opens a fresh
-    /// channel with.
-    pub initial_deposit: MicroUsdc,
-    /// `ServerConfig::working_balance` — the target `/topup` funds a
-    /// channel back up to. Set this above `initial_deposit` in a test that
-    /// needs to exercise the real `top_up_to` delta path rather than
-    /// `/topup`'s already-at-target short-circuit.
-    pub working_balance: MicroUsdc,
+    pub capability_cap: MicroUsdc,
 }
-
 impl Default for FakeOptions {
     fn default() -> Self {
         Self {
             captcha_passes: true,
-            monthly_cap: MicroUsdc(10_000_000),
-            initial_deposit: MicroUsdc(2_000_000),
-            working_balance: MicroUsdc(2_000_000),
+            capability_cap: MicroUsdc(10_000_000),
         }
     }
 }
 
-/// Build an `AppState` with a real (temp-dir-backed) `Store` — exercising
-/// the same cap/idempotency persistence path production traffic hits — but
-/// fake `Treasury`, `CaptchaVerifier`, and `ProviderResolver`.
-///
-/// The backing temp directory is intentionally leaked (`TempDir::keep`) so
-/// it outlives this function; test binaries are short-lived processes and
-/// the OS reclaims it on exit.
+/// Build an `AppState` with a real temp-dir `Store` and real (offline)
+/// `Issuer`, but fake `Treasury` and captcha. Bypasses `state::build`'s
+/// on-chain owner check (no chain in these tests). The temp dir is leaked so
+/// it outlives this call; test binaries are short-lived.
 #[must_use]
 pub fn app_state_with_options(opts: FakeOptions) -> AppState {
     let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
     let data_dir = dir.keep();
     let store = Arc::new(Store::open(&data_dir).unwrap_or_else(|e| panic!("open store: {e}")));
-    let cap = Cap {
-        monthly_limit: opts.monthly_cap,
-    };
-    let treasury: Arc<dyn Treasury> = Arc::new(FakeTreasury::default());
+
+    let signer = PrivateKeySigner::random();
+    let owner = signer.address();
+    let pool_id = B256::repeat_byte(0x11);
+    let domain = decdn_incentive::voucher_domain(421_614, Address::repeat_byte(0x22));
+    let issuer = Arc::new(Issuer::new(
+        signer,
+        domain,
+        pool_id,
+        opts.capability_cap.0,
+        2_592_000,
+    ));
+
+    let treasury: Arc<dyn Treasury> = Arc::new(FakeTreasury::new(owner, 100_000_000));
     let turnstile: Arc<dyn CaptchaVerifier> = Arc::new(FakeCaptcha::new(opts.captcha_passes));
-    let discovery: Arc<dyn ProviderResolver> = Arc::new(FakeResolver {
-        pick: NodePick {
-            node_id: [7u8; 32],
-            provider: Address::repeat_byte(0xbb),
-        },
-    });
+
     let cfg = ServerConfig {
         bind: "127.0.0.1:0"
             .parse()
-            .unwrap_or_else(|e| panic!("bind addr: {e}")),
+            .unwrap_or_else(|e| panic!("bind: {e}")),
         public_url: "https://up.decdn.org".into(),
         rpc_url: "http://localhost:8545".into(),
         chain_id: 421_614,
-        payment_channel: Address::ZERO,
+        payment_pool: Address::repeat_byte(0x22),
+        pool_id,
         capacity_bond: Address::ZERO,
         treasury_keystore: PathBuf::from("/dev/null"),
-        initial_deposit: opts.initial_deposit,
-        working_balance: opts.working_balance,
-        monthly_cap: opts.monthly_cap,
+        capability_cap: opts.capability_cap,
+        capability_ttl_secs: 2_592_000,
+        pool_low_water: MicroUsdc(20_000_000),
+        pool_refill: MicroUsdc(100_000_000),
+        pool_watch_interval_secs: 3600,
         turnstile_secret: "secret".into(),
         turnstile_sitekey: "TEST_SITEKEY".into(),
         data_dir,
-        topup_max_skew_secs: 120,
-        channel_ttl_secs: 7 * 24 * 60 * 60,
-        reclaim_interval_secs: 3600,
     };
     AppState {
         store,
-        cap,
         treasury,
+        issuer,
         turnstile,
         cfg: Arc::new(cfg),
-        discovery,
     }
 }
 
-/// Default fakes: captcha passes, a generous monthly cap, one fixed node.
 #[must_use]
 pub fn app_state_with_fakes() -> AppState {
     app_state_with_options(FakeOptions::default())

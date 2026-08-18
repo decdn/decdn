@@ -14,16 +14,13 @@ use crate::state::AppState;
 const DECDN_SH_TEMPLATE: &str = include_str!("../../assets/decdn.sh");
 
 /// Renders the installer script with `state.cfg`'s values substituted for
-/// the `{{GATEWAY_BASE}}`, `{{RPC_URL}}`, `{{PAYMENT_CHANNEL}}`,
+/// the `{{GATEWAY_BASE}}`, `{{RPC_URL}}`, `{{PAYMENT_POOL}}`,
 /// `{{CAPACITY_BOND}}`, and `{{CHAIN_ID}}` placeholders.
 pub async fn get(State(state): State<AppState>) -> Response {
     let script = DECDN_SH_TEMPLATE
         .replace("{{GATEWAY_BASE}}", &state.cfg.public_url)
         .replace("{{RPC_URL}}", &state.cfg.rpc_url)
-        .replace(
-            "{{PAYMENT_CHANNEL}}",
-            &state.cfg.payment_channel.to_string(),
-        )
+        .replace("{{PAYMENT_POOL}}", &state.cfg.payment_pool.to_string())
         .replace("{{CAPACITY_BOND}}", &state.cfg.capacity_bond.to_string())
         .replace("{{CHAIN_ID}}", &state.cfg.chain_id.to_string());
 
