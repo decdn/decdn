@@ -40,6 +40,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use bao_tree::io::outboard::PreOrderMemOutboard;
+use bytes::BytesMut;
 use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
@@ -59,8 +61,8 @@ use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
-    ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, VOUCHER_INTERVAL_BYTES,
-    VoucherRejectReason,
+    ClientBinding, ClientMessage, MB_BYTES, StreamRequest, StreamRequestExt,
+    VOUCHER_INTERVAL_BYTES, VoucherRejectReason,
 };
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
@@ -7203,6 +7205,357 @@ async fn empty_cache_with_fs_origin(
     // pull-through fills it, which is what the tests below exercise.
     anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
     Ok((cache, hash, cache_metrics, origin_dir, cache_dir))
+}
+
+/// As [`empty_cache_with_fs_origin`], but the origin ALSO publishes the sibling
+/// `{H}.obao4` outboard next to the data file — the precondition the fs
+/// zero-copy gate (#1511, `CacheEngine::origin_zero_copy_total`) checks for.
+async fn empty_cache_with_fs_origin_and_outboard(
+    payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    Arc<CacheMetrics>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+)> {
+    let ob = PreOrderMemOutboard::create(payload, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+    let hash = decdn_cache::Hash::from_bytes(*ob.root.as_bytes());
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+    std::fs::write(dir.join(format!("{hex}.obao4")), &ob.data)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
+    Ok((cache, hash, cache_metrics, origin_dir, cache_dir))
+}
+
+/// A manual `cdn/client/v1` client that requests the bounded range
+/// `[byte_offset, byte_offset + byte_len)` with an ownership binding, pays the
+/// vouchers the server collects, and returns the assembled range bytes.
+/// `byte_len == 0` is the whole-blob/whole-tail shape. Modeled on
+/// `origin_range_pull::ranged_paid_pull` — duplicated here because that helper
+/// is private to that test binary.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn ranged_paid_pull(
+    client_ep: &Endpoint,
+    target: EndpointAddr,
+    client_node_id: B256,
+    client_eth: &Arc<PrivateKeySigner>,
+    pool_id: B256,
+    provider: Address,
+    hash: Hash,
+    byte_offset: u64,
+    byte_len: u64,
+    rate: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_domain());
+    let binding_signature = client_eth
+        .sign_hash_sync(&binding_hash)?
+        .as_bytes()
+        .to_vec();
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature,
+        }),
+        capability: None,
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id.into(),
+        byte_offset,
+        byte_len,
+        timestamp_us: 0x9001,
+    };
+    let payload =
+        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+
+    let resp = match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamResponse(r) => r,
+        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
+    };
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    if byte_len == 0 {
+        resp.body
+            .total_bytes
+            .checked_sub(byte_offset)
+            .ok_or_else(|| anyhow::anyhow!("response total_bytes is before byte_offset"))?;
+    } else {
+        let end = byte_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| anyhow::anyhow!("requested range overflows"))?;
+        anyhow::ensure!(
+            end <= resp.body.total_bytes,
+            "response total_bytes is smaller than the requested range end"
+        );
+    }
+    // ADR 038: the wire carries the bao verified-stream (content + interleaved
+    // proof) for the group-aligned superset of the request, so the paid/closing
+    // boundary is the bao-encoded WIRE size, not the requested content length.
+    let aligned =
+        decdn_cache::range_pull::align_range(byte_offset, byte_len, resp.body.total_bytes)
+            .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let expected_wire =
+        decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
+    let interval_bytes = VOUCHER_INTERVAL_BYTES;
+
+    let mut buf = BytesMut::new();
+    let mut cumulative: u64 = 0;
+    let mut unvouchered: u64 = 0;
+    loop {
+        match read_client_msg(&mut recv).await? {
+            ClientMessage::ChunkData(chunk) => {
+                buf.extend_from_slice(chunk.bytes());
+                let len = u64::try_from(chunk.bytes().len()).unwrap_or(u64::MAX);
+                cumulative = cumulative.saturating_add(len);
+                unvouchered = unvouchered.saturating_add(len);
+                let boundary = interval_bytes > 0 && unvouchered >= interval_bytes;
+                let closing = cumulative >= expected_wire && unvouchered > 0;
+                if boundary || closing {
+                    let amount = U256::from(cumulative)
+                        .saturating_mul(U256::from(rate))
+                        .div_ceil(U256::from(MB_BYTES));
+                    let signed = Voucher {
+                        pool_id,
+                        signer: client_eth.address(),
+                        provider,
+                        amount,
+                        bytes_delivered: U256::from(cumulative),
+                    }
+                    .sign(client_eth.as_ref(), &payment_domain())
+                    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+                    write_client_msg(
+                        &mut send,
+                        &ClientMessage::Voucher(signed_to_wire_voucher(&signed)?),
+                    )
+                    .await?;
+                    unvouchered = 0;
+                }
+            }
+            ClientMessage::StreamEnd => break,
+            ClientMessage::StreamError(e) => anyhow::bail!("stream error mid-delivery: {e:?}"),
+            other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
+        }
+    }
+    conn.close(0u32.into(), b"done");
+    decode_bao_range(hash, resp.body.total_bytes, byte_offset, byte_len, &buf)
+}
+
+/// Decode the header-less bao verified-stream `wire` for `[byte_offset,
+/// byte_offset+byte_len)` (`byte_len == 0` ⇒ to end), verifying every chunk
+/// group against `hash`, and trim the group-aligned superset back to the exact
+/// requested span. Mirrors the production receiver (`client-pull`); duplicated
+/// from `origin_range_pull::decode_bao_range` for the same reason as
+/// `ranged_paid_pull` above.
+fn decode_bao_range(
+    hash: Hash,
+    total_bytes: u64,
+    byte_offset: u64,
+    byte_len: u64,
+    wire: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use bao_tree::BaoTree;
+    use bao_tree::io::BaoContentItem;
+    use bao_tree::io::sync::DecodeResponseIter;
+
+    let aligned = decdn_cache::range_pull::align_range(byte_offset, byte_len, total_bytes)
+        .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
+    let tree = BaoTree::new(total_bytes, decdn_cache::range_pull::IROH_BLOCK_SIZE);
+    let reader = std::io::Cursor::new(wire);
+    let mut plaintext = Vec::new();
+    for item in DecodeResponseIter::new(hash.into(), tree, reader, aligned.chunk_ranges().as_ref())
+    {
+        match item.map_err(|e| anyhow::anyhow!("bao decode: {e}"))? {
+            BaoContentItem::Leaf(leaf) => plaintext.extend_from_slice(&leaf.data),
+            BaoContentItem::Parent(_) => {}
+        }
+    }
+    let lead = usize::try_from(byte_offset.saturating_sub(aligned.fetch_start()))?;
+    let want = if byte_len == 0 {
+        total_bytes.saturating_sub(byte_offset)
+    } else {
+        byte_len
+    };
+    let want = usize::try_from(want)?;
+    let slice = plaintext
+        .get(lead..lead + want)
+        .ok_or_else(|| anyhow::anyhow!("decoded range shorter than requested span"))?;
+    Ok(slice.to_vec())
+}
+
+/// The fs zero-copy dispatch tier (#1511): a whole-blob paid fetch against a
+/// local fs origin that already publishes its `.obao4` outboard serves
+/// correctly AND imports nothing into the store — the gate elects
+/// `ServeSource::OriginZeroCopy` before any of the store-importing tiers run.
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_origin_whole_blob_serves_zero_copy_no_store_growth() -> anyhow::Result<()> {
+    let payload = vec![0x11u8; 5 * 16 * 1024 + 9];
+    let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache.clone(), Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "zero-copy serve must not import the blob into the store"
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The ranged sibling of [`fs_origin_whole_blob_serves_zero_copy_no_store_growth`]:
+/// a bounded-range paid fetch against the same fs-origin-with-outboard blob also
+/// routes to the zero-copy tier (the gate does not condition on
+/// `byte_offset`/`byte_len`), serves the correct slice, and still imports
+/// nothing into the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_origin_ranged_serves_zero_copy_no_store_growth() -> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..6 * 16 * 1024u32)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache.clone(), Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let (off, len) = (16 * 1024u64, 16 * 1024u64);
+
+    let got = ranged_paid_pull(
+        &client_ep,
+        target,
+        client_node_id,
+        &signer,
+        pool_id(),
+        server_eth.address(),
+        hash,
+        off,
+        len,
+        RATE_PER_MB,
+    )
+    .await?;
+    let off_usize = usize::try_from(off)?;
+    let len_usize = usize::try_from(len)?;
+    let want = payload
+        .get(off_usize..off_usize + len_usize)
+        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds for test payload"))?;
+    anyhow::ensure!(got == want, "ranged delivered bytes mismatch");
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "zero-copy ranged serve must not import the blob into the store"
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The fallback control: without a sibling `.obao4`, the fs zero-copy gate
+/// declines (`origin_zero_copy_total` returns `None`) and dispatch falls
+/// through to today's reactive buffered pull-through, which imports the whole
+/// blob into the store exactly as before #1511.
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_origin_without_outboard_falls_through_to_import() -> anyhow::Result<()> {
+    let payload = vec![0x22u8; 4096];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_pull_through_server(cache.clone(), Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx =
+        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "without an outboard, the fallback path must import into the store as before"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 origin fetch via the buffered fallback, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
 }
 
 /// Spawn a `ClientHandler` server with buffered origin pull-through attached

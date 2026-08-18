@@ -390,6 +390,13 @@ impl ClientHandler {
         // probe) past the size gate, which can't `inspect` a partial blob.
         let mut range_pulled_size: Option<u64> = None;
 
+        // Set by the fs zero-copy eligibility gate below (#1511) when a local fs
+        // origin holds this blob AND its `.obao4` sibling exists. Carries the
+        // authoritative whole-blob size past the size gate exactly like
+        // `range_pulled_size`, and steers both the import-tier guards and the
+        // `deliver` source selection.
+        let mut origin_zero_copy_total: Option<u64> = None;
+
         // Blob availability gate. A store fault is NOT an absence: `Ok(false)`
         // means the node genuinely lacks the blob (NotFound / EvictedSinceProbe),
         // but `Err` is a transient local store failure that must not masquerade
@@ -544,7 +551,37 @@ impl ClientHandler {
                 }
 
                 let mut fault_seen = false;
-                if (req.byte_offset > 0 || req.byte_len > 0)
+
+                // Zero-copy fs serve (#1511): if a local fs origin holds this blob
+                // AND its `.obao4` sibling exists, serve straight from the file —
+                // no store import, whole or ranged. Falls through to the existing
+                // tiers when ineligible.
+                //
+                // Gated on `pull_authorized` exactly like every other origin-probing
+                // tier below: `origin_zero_copy_total` calls `origin_size`, which
+                // probes EVERY configured origin (not just fs-backed ones), so an
+                // unauthorized request against a mixed fs+HTTP/S3 deployment could
+                // otherwise induce real origin egress (a HEAD/range fetch) before
+                // any ownership is proven — exactly the griefing vector the other
+                // tiers close.
+                if self.pull_authorized(&req, verified_client) {
+                    match self.cache.origin_zero_copy_total(hash).await {
+                        Ok(Some(total)) => origin_zero_copy_total = Some(total),
+                        // No origin configured is a clean decline (mirrors the
+                        // whole-blob own-origin tier below), not a fault: every
+                        // loopback/unit test with no origin wired must keep
+                        // reporting a plain cache miss, not a degraded-node
+                        // `InternalError`.
+                        Ok(None) | Err(CacheError::NoOrigin { .. }) => {}
+                        Err(e) => {
+                            tracing::debug!(%hash, error = %e, "origin zero-copy probe failed; falling through");
+                            fault_seen |= true; // a real origin/store fault, matching the other tiers
+                        }
+                    }
+                }
+
+                if origin_zero_copy_total.is_none()
+                    && (req.byte_offset > 0 || req.byte_len > 0)
                     && self.pull_authorized(&req, verified_client)
                 {
                     let (size, range_outcome) = self.try_range_pull_through(hash, &req).await;
@@ -584,7 +621,8 @@ impl ClientHandler {
                 // streams the same filling cache to its own client (no double origin
                 // egress). The registry is range-aware, so this coalescing is not
                 // limited to the whole-blob case.
-                if range_pulled_size.is_none()
+                if origin_zero_copy_total.is_none()
+                    && range_pulled_size.is_none()
                     && !locally_filled
                     && req.byte_offset == 0
                     && req.byte_len == 0
@@ -700,12 +738,14 @@ impl ClientHandler {
                 // simply not yet wired end-to-end, so a bounded or resumed request
                 // falls to the buffered path below, which serves exactly the
                 // requested span via `export_range` (#823).
-                if range_pulled_size.is_some() || locally_filled {
-                    // The requested span/blob is already present — a verified
-                    // partial blob from the range pull, or the whole blob just
-                    // filled from a local origin (#1116). Skip the node→node fill
-                    // and fall through to the size gate + delivery (which serves a
-                    // partial via `export_range`).
+                if origin_zero_copy_total.is_some() || range_pulled_size.is_some() || locally_filled
+                {
+                    // The requested span/blob is already present — elected for
+                    // zero-copy fs serve (#1511), a verified partial blob from the
+                    // range pull, or the whole blob just filled from a local origin
+                    // (#1116). Skip the node→node fill and fall through to the size
+                    // gate + delivery (which serves a partial via `export_range`, or
+                    // streams straight from the origin file for the zero-copy case).
                 } else if let Some(origin) = self.pull_through_origin.as_ref()
                     && req.byte_offset == 0
                     && req.byte_len == 0
@@ -779,7 +819,7 @@ impl ClientHandler {
         // contradicts, and the receiver (expecting 0 bytes) would abort on the
         // first chunk. Surface the fault instead; only a genuinely complete,
         // zero-length blob yields `total_bytes == 0`.
-        let total_bytes = if let Some(total) = range_pulled_size {
+        let total_bytes = if let Some(total) = origin_zero_copy_total.or(range_pulled_size) {
             total
         } else {
             let size = match self.cache.inspect(hash).await {
@@ -970,6 +1010,11 @@ impl ClientHandler {
             .await?;
 
         // Stream the blob, collecting vouchers at each interval boundary.
+        let serve_source = if origin_zero_copy_total.is_some() {
+            delivery::ServeSource::OriginZeroCopy
+        } else {
+            delivery::ServeSource::Store
+        };
         self.deliver(
             &mut send,
             &mut recv,
@@ -982,7 +1027,7 @@ impl ClientHandler {
             client_node_id,
             rate_per_mb,
             floor_reservation,
-            delivery::ServeSource::Store,
+            serve_source,
         )
         .await
     }

@@ -23,9 +23,6 @@ type BaoExportStream = Pin<Box<dyn Stream<Item = CacheResult<Bytes>> + Send>>;
 /// header-less bao wire form, so everything downstream is identical.
 pub(super) enum ServeSource {
     Store,
-    // Not yet constructed anywhere: the dispatch caller always passes `Store`
-    // until it gains the fs-origin zero-copy decision (#1511).
-    #[allow(dead_code)]
     OriginZeroCopy,
 }
 
