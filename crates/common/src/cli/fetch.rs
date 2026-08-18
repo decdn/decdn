@@ -127,17 +127,14 @@ pub struct ClientFetchArgs {
     /// Engages only when it strictly helps (see `--proxy-warming-rtt-threshold-ms`
     /// / `--proxy-warming-margin-ms`); otherwise routes direct.
     ///
-    /// **Opt-in (default off), deliberately diverging from ADR 037's
-    /// "defaults on" until the fallback path lands.** ADR 037 § Fallback
-    /// requires that a proxy which declines or stalls transparently falls back to
-    /// the next candidate and then to the direct holder. That is not yet wired:
-    /// a fallback would have to open a second payment channel (escrowing another
-    /// on-chain deposit) against the fallback provider, so it is a deliberate
-    /// follow-up rather than a retry loop. Until then, enabling this means a
-    /// chosen proxy that cannot serve (for instance a node running the default
-    /// `cache.node_to_node_pull_through_enabled = false`) fails the fetch
-    /// outright, where routing direct would have succeeded.
-    #[arg(long, value_name = "BOOL", default_value_t = false, action = clap::ArgAction::Set)]
+    /// **Defaults on (ADR 037 § Fallback).** A chosen proxy that declines or
+    /// stalls is not a regression: `fetch` fails over to the next candidate and
+    /// finally to the direct holder over the SAME shared pool (each provider is
+    /// its own lane, so no new on-chain deposit is escrowed), resuming the
+    /// partial it already has. The only client-observable cost is a bounded
+    /// one-request latency premium the first time a locale warms a given blob.
+    /// Pass `--proxy-warming false` to route direct and never warm.
+    #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set)]
     pub proxy_warming: bool,
 
     /// Proxy warming engages only when the best holder's RTT exceeds this many
