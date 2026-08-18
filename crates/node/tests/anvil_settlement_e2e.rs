@@ -707,6 +707,107 @@ async fn run_e2e() -> anyhow::Result<()> {
         "FeeRouter.bytesPerEpoch did not increment (settlement not routed): {routed}"
     );
 
+    // ------------------------------------------------------------
+    // BATCHED-READ REGISTRATION PROOF — the redeemer's first redeem on this
+    // lane must have attached a `CapabilityReg` (the signer registers
+    // on-chain) and persisted the observed expiry to `registered_until`; a
+    // second sweep on the identical lane must then skip the `getAuthorizations`
+    // read entirely (registration is already known) while still advancing the
+    // paid watermark.
+    // ------------------------------------------------------------
+    let auth_after_first = pool_read
+        .getAuthorization(pool_id, client_addr)
+        .call()
+        .await?;
+    anyhow::ensure!(
+        auth_after_first.cap != 0,
+        "first redeem must land an on-chain Authorization for the signer (cap == 0)"
+    );
+    let lane_key = decdn_incentive::LaneKey {
+        pool_id,
+        signer: client_addr,
+        provider: node_addr,
+    };
+    let lane_after_first = store.get(lane_key)?.ok_or_else(|| {
+        anyhow::anyhow!("lane state missing from the store after the first redeem")
+    })?;
+    anyhow::ensure!(
+        lane_after_first.registered_until != 0,
+        "registered_until must be persisted once the first redeem's CapabilityReg lands"
+    );
+    let watermark_after_first = watermark
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?
+        .clone();
+
+    // Re-deliver the same blob on the identical lane, continuing the ledger
+    // from the first delivery's on-chain cumulative totals. No `capability` is
+    // attached this time — the lane already registered on its first delivery,
+    // so a second sweep must resolve the redemption purely from the persisted
+    // `registered_until` watermark rather than a fresh capability grant.
+    let second_ctx = PoolContext {
+        prior_bytes_delivered: U256::from(watermark_after_first.bytesDelivered),
+        prior_amount: U256::from(watermark_after_first.amount),
+        capability: None,
+        ..ctx.clone()
+    };
+    let got_again = stream_fetch(
+        &client_ep,
+        target.clone(),
+        &second_ctx,
+        &domains.slash,
+        node_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffe2,
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        got_again.as_ref() == payload.as_slice(),
+        "second seller delivery mismatch"
+    );
+
+    // The second sweep's `redeem` must still land: the paid watermark advances
+    // past the first redeem's value even though no fresh `CapabilityReg` was
+    // needed.
+    let watermark_2 = poll_until(Duration::from_secs(60), || {
+        let pool = pool_read.clone();
+        let floor = watermark_after_first.bytesDelivered;
+        async move {
+            pool.getWatermark(pool_id, client_addr, node_addr)
+                .call()
+                .await
+                .ok()
+                .filter(|lane| lane.bytesDelivered > floor)
+        }
+    })
+    .await;
+    anyhow::ensure!(
+        watermark_2.is_some(),
+        "second redeem on an already-registered lane never landed"
+    );
+
+    // The Authorization is unchanged by the second sweep (registration is
+    // set-once on-chain; a re-attached `CapabilityReg` would be a harmless
+    // no-op, but this lane's redeemer never needed to build one).
+    let auth_after_second = pool_read
+        .getAuthorization(pool_id, client_addr)
+        .call()
+        .await?;
+    anyhow::ensure!(
+        auth_after_second.cap == auth_after_first.cap
+            && auth_after_second.expiry == auth_after_first.expiry,
+        "Authorization must not change across the second, already-registered sweep"
+    );
+    let lane_after_second = store.get(lane_key)?.ok_or_else(|| {
+        anyhow::anyhow!("lane state missing from the store after the second redeem")
+    })?;
+    anyhow::ensure!(
+        lane_after_second.registered_until != 0,
+        "registered_until must remain persisted after the second sweep"
+    );
+
     // ============================================================
     // BUYER PATH — a dedicated `buyer_addr` identity drives a `BuyerPoolService`:
     // open a pool → deliver over the service-produced PoolContext → top up →
