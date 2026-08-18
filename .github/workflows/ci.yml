@@ -377,10 +377,16 @@ jobs:
       # link phase of the workspace's instrumented test binaries. Scoped to
       # the test job because that's where the test binaries get linked —
       # other jobs do link small artifacts (build scripts, proc-macro
-      # dylibs) but the savings would be marginal and wouldn't pay back the
-      # apt-get cost.
+      # dylibs) but the savings would be marginal. setup-mold pulls a
+      # release binary instead of apt, which sidesteps the dpkg-lock and
+      # mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: rui314/setup-mold@v1
+        # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
+        # so mold only needs to be on PATH — don't rewire the system `ld`
+        # symlink (the action's default) and perturb unrelated C/C++ links.
+        with:
+          make-default: false
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: coverage
@@ -651,8 +657,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       # mold shortens the link phase of the workspace's test binaries; installed
       # before rust-cache so `-fuse-ld=mold` in RUSTFLAGS resolves at link time.
+      # setup-mold pulls a release binary rather than apt, avoiding the
+      # dpkg-lock / mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: rui314/setup-mold@v1
+        # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
+        # so mold only needs to be on PATH — don't rewire the system `ld`
+        # symlink (the action's default) and perturb unrelated C/C++ links.
+        with:
+          make-default: false
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
       # cache. cache-profile: none — the contract build is the hoisted step below.
       - uses: ./.github/actions/foundry-setup
@@ -741,8 +754,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       # mold shortens the link phase of the journey + bin binaries; installed
       # before rust-cache so `-fuse-ld=mold` in RUSTFLAGS resolves at link time.
+      # setup-mold pulls a release binary rather than apt, avoiding the
+      # dpkg-lock / mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
+        uses: rui314/setup-mold@v1
+        # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
+        # so mold only needs to be on PATH — don't rewire the system `ld`
+        # symlink (the action's default) and perturb unrelated C/C++ links.
+        with:
+          make-default: false
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
       # cache. cache-profile: none — the contract build is the hoisted step below
       # (a `ci`-profile cache would need the fixtures on that same forge profile,
