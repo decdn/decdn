@@ -62,7 +62,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
-use crate::dht::chain_projection::with_write;
+use crate::dht::chain_projection::{with_read, with_write};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
@@ -604,14 +604,14 @@ where
 
 /// Read a node's operator-attested region (ADR 030) straight from the registry's
 /// `NodeId → regionHint` projection, or `None` when the registry holds no region
-/// for it. A poisoned lock resolves to `None` (a missing region, so no same-region
-/// latency penalty applies) rather than propagating — the projection is the sole
-/// reader path for the ADR-030 selection penalty.
+/// for it. Poison-tolerant via [`with_read`]: a writer that panicked left the map
+/// structurally intact, so recover it and log once rather than let a prior panic
+/// permanently suppress region reads (and with them the ADR-030 selection penalty).
 pub(crate) fn region_of(
     regions: &Arc<RwLock<HashMap<NodeId, String>>>,
     id: NodeId,
 ) -> Option<String> {
-    regions.read().ok().and_then(|g| g.get(&id).cloned())
+    with_read(regions, "registry regions", |m| m.get(&id).cloned())
 }
 
 #[cfg(test)]
