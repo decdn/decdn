@@ -149,6 +149,14 @@ impl ClientHandler {
         // that ends `Err` here fails the serve rather than hanging.
         let mut next_chunk = producer.next_frame().await?;
 
+        // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
+        // 003 §Pool solvency). Start the clock at loop entry — admission already
+        // verified solvency once via `try_reserve_floor`, so the first re-check
+        // falls one interval later, bounding over-delivery from admission to
+        // `interval × per-stream-rate`.
+        let pool_recheck_interval = self.pool_recheck_interval();
+        let mut last_pool_check = std::time::Instant::now();
+
         loop {
             // Progress trackers for the no-progress guard below: an iteration that
             // delivers no new byte AND clears no voucher has stalled — the client
@@ -323,35 +331,51 @@ impl ClientHandler {
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
 
             // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
-            // symmetric with the takedown re-check below and under the same
-            // `collected_any && !done` boundary gate: re-read the cached pool
-            // status after each committed batch. A pool drains mid-flight — other
+            // symmetric with the takedown re-check below: re-read the cached pool
+            // status and stop once `remaining − M` no longer covers the pool's
+            // already-committed floor credit. A pool drains mid-flight — other
             // lanes redeem `remaining` down, or `dead_charge` rises — so a long
-            // stream must stop once `remaining − M` no longer covers the pool's
-            // already-committed floor credit. `new_reserve = ZERO` asks exactly
-            // that: is the total ALREADY committed (this stream included) still
-            // within budget? On `false` the pool can no longer fund further credit,
-            // so stop IN-BAND with a clean `PoolExhausted` (not a QUIC reset, unlike
-            // a takedown) so the owner learns to top up — `PoolExhausted` is
-            // post-auth, so naming the condition leaks nothing an open-time refusal
-            // must hide, and it is not watermark-gated (no bundle). A `None` pool
-            // view fails OPEN (the on-chain redeem is the backstop). The caller
-            // drops the concurrent pull leg when this returns, bounding the upstream
-            // spend just as the takedown and no-progress exits do.
-            if collected_any
-                && !done
-                && let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
-                && !self.pool_budget_covers_reserve(lane_key.pool_id, status.remaining, U256::ZERO)
-            {
-                self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
-                    .await?;
-                // Observable stop (symmetric with the takedown re-check below): this
-                // terminates a paying miss-leg delivery, and `dead_charge` only grows.
-                tracing::warn!(
-                    pool_id = %lane_key.pool_id, %hash,
-                    "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
-                );
-                return Ok(());
+            // stream must catch that; the credit window bounds delivery ahead of
+            // the last COLLECTED voucher, not ahead of the last SOLVENCY-verified
+            // point, so nothing else notices a shared pool going unredeemable.
+            // `new_reserve = ZERO` asks exactly that: is the total ALREADY
+            // committed (this stream included) still within budget? On `false` the
+            // pool can no longer fund further credit, so stop IN-BAND with a clean
+            // `PoolExhausted` (not a QUIC reset, unlike a takedown) so the owner
+            // learns to top up — `PoolExhausted` is post-auth, so naming the
+            // condition leaks nothing an open-time refusal must hide, and it is not
+            // watermark-gated (no bundle). A `None` pool view fails OPEN (the
+            // on-chain redeem is the backstop). The caller drops the concurrent
+            // pull leg when this returns, bounding the upstream spend just as the
+            // takedown and no-progress exits do.
+            //
+            // The check runs on a WALL-CLOCK cadence, not at every 4 MiB voucher
+            // boundary: the projection only advances as the settlement watcher
+            // folds redeem events, so re-reading it faster than that returns the
+            // same value (wasted `pool_floor` lock reads on the fastest streams),
+            // and per-stream throughput is bounded, so the interval bounds
+            // worst-case over-delivery on a drained pool to `interval ×
+            // per-stream-rate`. Only the frequency changes — the reject behavior
+            // and the on-chain redeem backstop are unchanged.
+            if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
+                last_pool_check = std::time::Instant::now();
+                if let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
+                    && !self.pool_budget_covers_reserve(
+                        lane_key.pool_id,
+                        status.remaining,
+                        U256::ZERO,
+                    )
+                {
+                    self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                        .await?;
+                    // Observable stop (symmetric with the takedown re-check below): this
+                    // terminates a paying miss-leg delivery, and `dead_charge` only grows.
+                    tracing::warn!(
+                        pool_id = %lane_key.pool_id, %hash,
+                        "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
+                    );
+                    return Ok(());
+                }
             }
 
             // ADR 011 §On Blacklist Event: terminate an in-flight delivery at the
