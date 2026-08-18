@@ -179,7 +179,7 @@ pub(super) struct PoolFloorState {
 ///
 /// Construction ([`Self::reserve`]) charges the reserved amount to the pool's
 /// `live_reservation`. The serve loop keeps the current unpaid `µUSDC` updated via
-/// [`Self::note_unpaid`], and calls [`Self::release_live_repaid`] once the lane's
+/// [`Self::note_unpaid`], and calls [`Self::release_live_repaid`] once THIS stream's
 /// cumulative payment reaches a floor — which frees the live reservation
 /// immediately. On drop (every exit path — success, `?`, disconnect, panic) the
 /// guard releases the live reservation if it was not already repaid and folds the
@@ -283,53 +283,56 @@ impl Drop for FloorReservation {
         // saturating — an O(1) update that never blocks the reactor.
         let unpaid = U256::from(self.unpaid.load(Ordering::Relaxed));
         let dead_add = self.reserved.min(unpaid);
-        {
+        let snapshot = {
             let mut guard = self
                 .map
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = guard.entry(self.pool_id).or_default();
+            // `get_mut`, not `entry().or_default()`: if the pool was reclaimed
+            // (`forget_pool_floor` removed its entry) there is nothing to release —
+            // the live reservation went with the entry — and re-inserting would
+            // resurrect a row `forget` just deleted. Skip the whole reconcile.
+            let Some(entry) = guard.get_mut(&self.pool_id) else {
+                return;
+            };
             entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
             entry.dead_charge = entry.dead_charge.saturating_add(dead_add);
+            entry.dead_charge
+        };
+        // A fully-repaid or fully-settled stream folds nothing: skip the durable
+        // write entirely so a sub-interval request does not fsync a value already
+        // on disk. `record_loss` commits with `Durability::Immediate` on the same
+        // redb file as the lane table, so an unconditional write here would contend
+        // with the periodic voucher flush on every small paid request.
+        if dead_add.is_zero() {
+            return;
         }
-        // Persist the dead total best-effort. The in-memory `dead_charge` above is
+        // Persist the new total best-effort. The in-memory `dead_charge` above is
         // authoritative for the running process; the durable copy only guards a
         // restart, so a lost persist is the documented small crash-window residual —
-        // logged, never panicked or propagated. The persist re-reads the CURRENT
-        // in-memory `dead_charge` at write time rather than a value captured now:
-        // concurrent drops on the same pool can complete out of order, and writing
-        // the latest authoritative (monotonic) total keeps a late-running write from
-        // regressing the durable row to a smaller value. A pool forgotten in the
-        // meantime (its entry removed by `forget_pool_floor`) has nothing to persist,
-        // so a stale drop cannot resurrect a reclaimed pool's row. `record_loss` may
-        // fsync, so offload it to a blocking task when a runtime is available; a drop
-        // outside any runtime (e.g. a sync test) records inline.
+        // logged, never panicked or propagated. `record_loss` is MONOTONIC (it takes
+        // the max with the on-disk value), so two drops on the same pool completing
+        // out of order cannot regress the row. `record_loss` may fsync, so offload it
+        // to a blocking task when a runtime is available; a drop outside any runtime
+        // (e.g. a sync test) records inline.
         let Some(store) = self.store.clone() else {
             return;
         };
         let pool_id = self.pool_id;
-        let map = Arc::clone(&self.map);
-        let persist = move || {
-            let current = {
-                let guard = map
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard
-                    .get(&pool_id)
-                    .map(|s| s.dead_charge.saturating_to::<u128>())
-            };
-            let Some(micro) = current else {
-                return; // pool forgotten since this drop began — nothing to persist
-            };
-            if let Err(e) = store.record_loss(pool_id, micro) {
-                tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
-            }
-        };
+        let micro = snapshot.saturating_to::<u128>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(persist);
+                handle.spawn_blocking(move || {
+                    if let Err(e) = store.record_loss(pool_id, micro) {
+                        tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
+                    }
+                });
             }
-            Err(_) => persist(),
+            Err(_) => {
+                if let Err(e) = store.record_loss(pool_id, micro) {
+                    tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
+                }
+            }
         }
     }
 }
@@ -878,22 +881,19 @@ impl ClientHandler {
         // carries forward so a restart does not grant a fresh free-floor budget.
         let mut pool_floor: HashMap<B256, PoolFloorState> = HashMap::new();
         if let Some(store) = deps.floor_loss_store.as_ref() {
-            match store.load_losses() {
-                Ok(rows) => {
-                    for (pool_id, micro) in rows {
-                        pool_floor.insert(
-                            pool_id,
-                            PoolFloorState {
-                                live_reservation: U256::ZERO,
-                                dead_charge: U256::from(micro),
-                            },
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "floor-loss store load failed; starting with empty dead-charge"
-                ),
+            // Fail CLOSED, like the lane-state hydration above: genuine first boot
+            // returns `Ok(vec![])` from `load_losses` (the table simply does not
+            // exist yet), so any error reaching here is a real store fault. Starting
+            // empty would silently re-grant every pool its full free-floor budget,
+            // so refuse to come up instead.
+            for (pool_id, micro) in store.load_losses()? {
+                pool_floor.insert(
+                    pool_id,
+                    PoolFloorState {
+                        live_reservation: U256::ZERO,
+                        dead_charge: U256::from(micro),
+                    },
+                );
             }
         }
         Ok(Self {

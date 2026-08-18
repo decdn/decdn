@@ -2426,26 +2426,30 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
             PullVerdict::OurLocalFault
         }
-        // Pool and signer both fine — re-quote at the new floor (`RateFloorRaised`, #1382);
-        // keep the pool and try again.
-        VoucherRejectReason::RateFloorRaised => PullVerdict::OurVoucherRetryable(reason),
+        // Our OWN buyer pool, not the upstream — retry, do not suppress the peer.
+        // `RateFloorRaised` re-quotes at the new floor (#1382). `PoolExhausted` says the
+        // pool WE fund the upstream from can no longer cover further credit; it is a
+        // statement about us, so every upstream returns it and routing it to
+        // `OurDeadLane` would walk the candidate list suppressing each healthy peer for
+        // an hour, outliving any top-up. The remedy is a top-up of our pool (see
+        // `genuine_exhaustion`) and a retry, so keep the peer and try again.
+        VoucherRejectReason::RateFloorRaised | VoucherRejectReason::PoolExhausted => {
+            PullVerdict::OurVoucherRetryable(reason)
+        }
         // Terminal for THIS lane while the pool row is still worth keeping. The signer's
         // cap is spent (`SpendingCapExhausted`) or its capability expired
         // (`CapabilityExpired`), our accounting drifted
-        // (`AmountRegression`/`BytesRegression`), the voucher named the wrong pool or a
-        // different provider (`WrongPool`/`WrongProvider`), or the pool's own deposit can no
-        // longer fund more credit (`PoolExhausted`). None of these has surrendered the pool
-        // row's value outright — a mis-addressed or drifted voucher spends nothing, an
-        // exhausted cap or expired capability means too little for THIS signer right now, and
-        // even a `PoolExhausted` deposit is still owner-recoverable by a top-up — so the
-        // provider is suppressed and the pool row is KEPT.
+        // (`AmountRegression`/`BytesRegression`), or the voucher named the wrong pool or a
+        // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
+        // the pool row's value outright — a mis-addressed or drifted voucher spends
+        // nothing, and an exhausted cap or expired capability means too little for THIS
+        // signer right now — so the provider is suppressed and the pool row is KEPT.
         VoucherRejectReason::WrongPool
         | VoucherRejectReason::WrongProvider
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
         | VoucherRejectReason::SpendingCapExhausted
-        | VoucherRejectReason::CapabilityExpired
-        | VoucherRejectReason::PoolExhausted => PullVerdict::OurDeadLane(reason),
+        | VoucherRejectReason::CapabilityExpired => PullVerdict::OurDeadLane(reason),
     }
 }
 
@@ -3102,7 +3106,7 @@ mod tests {
     /// Known edges, stated precisely because the guarantee is narrower than it looks:
     /// `for_verdict` matches `OurDeadLane(_)` / `OurVoucherRetryable(_)` on their payloads,
     /// so a new `VoucherRejectReason` inherits `Clean` without a build break — acceptable,
-    /// because `voucher_verdict` IS exhaustive over all eleven and already routes the node-wide
+    /// because `voucher_verdict` IS exhaustive over all ten and already routes the node-wide
     /// reasons (`BadSignature`, `WrongSigner`) to `OurLocalFault` before this function sees
     /// them. `RefusalVerdict`'s four discriminants are spelled out so a FIFTH does break the
     /// build; its `DurableMiss(_)` payload is not, so a new `DurableMissCause` still inherits

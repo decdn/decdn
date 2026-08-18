@@ -363,7 +363,7 @@ The node MUST flush the store to disk before every on-chain redemption. This flo
 
 A failed background flush is a metric, not a voucher-acceptance failure. The node keeps the unflushed state buffered and retries the flush on the next tick; it does not reject the voucher that triggered the write and does not stop delivering.
 
-A separate, rarer fault can occur when the node tries to advance the in-memory watermark itself. This fault (a rare internal error) MUST NOT deliver any further bytes for that voucher: the node aborts the stream cleanly instead, with no in-band voucher-rejection reason — the `AmountRegression` / `CapExceeded` codes are NOT appropriate substitutes, since they would tell the signer to refresh state or ask for more headroom when in fact the same voucher should be retried unchanged. The client resends the same voucher on a fresh stream rather than treating the clean abort as a permanent failure.
+A separate, rarer fault can occur when the node tries to advance the in-memory watermark itself. This fault (a rare internal error) MUST NOT deliver any further bytes for that voucher: the node aborts the stream cleanly instead, with no in-band voucher-rejection reason — the `AmountRegression` / `SpendingCapExhausted` codes are NOT appropriate substitutes, since they would tell the signer to refresh state or ask for more headroom when in fact the same voucher should be retried unchanged. The client resends the same voucher on a fresh stream rather than treating the clean abort as a permanent failure.
 
 No positive voucher acknowledgement travels the wire. Voucher acceptance is implicit: the node's continued delivery is the acknowledgement. Only a rejection is signalled.
 

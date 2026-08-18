@@ -1079,8 +1079,17 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
             let mut table = write_txn
                 .open_table(POOL_FLOOR_LOSS_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            // Monotonic write: a pool's `dead_charge` only ever grows. Concurrent
+            // reservation drops on the same pool commit from independent blocking
+            // threads and can land out of order, so take the max with what is
+            // already on disk — a late, smaller write must never regress the row
+            // and re-grant already-consumed free-floor budget.
+            let existing = table
+                .get(&key)
+                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+                .map_or(0u128, |v| v.value());
             table
-                .insert(&key, micro_usdc)
+                .insert(&key, existing.max(micro_usdc))
                 .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
         }
         write_txn

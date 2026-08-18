@@ -819,12 +819,14 @@ pub enum VoucherRejectReason {
     /// this; the `cdn/client/v1` handler emits it directly (ADR 005
     /// §`VoucherRejected` semantics, #1382).
     RateFloorRaised,
-    /// The signer's capability has expired (`block.timestamp ≥ expiry`). The node
-    /// stops serving the lane; already-earned vouchers stay redeemable until
-    /// expiry at settlement. Recovery: the owner mints a **fresh capability** with
-    /// a new expiry — a watermark resync or top-up does not help. Emitted directly
-    /// by the `cdn/client/v1` handler (the node holds the clock), not via the
-    /// `PoolError` bridge.
+    /// The signer's capability has passed its `expiry`. The node's serve-side check
+    /// compares its LOCAL wall clock (`unix_now`, operator-settable) against `expiry`
+    /// and stops serving the lane; on-chain settlement separately gates redemption on
+    /// `block.timestamp`. Already-earned vouchers stay redeemable until expiry at
+    /// settlement. Recovery: the owner mints a **fresh capability** with a new expiry —
+    /// a watermark resync or top-up does not help. Emitted directly by the
+    /// `cdn/client/v1` handler (the node holds the clock), not via the `PoolError`
+    /// bridge.
     CapabilityExpired,
     /// The pool's on-chain remaining deposit, minus the refundable floor `M` and
     /// the pool's already-committed concurrent floor credit, can no longer fund

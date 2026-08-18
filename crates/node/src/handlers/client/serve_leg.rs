@@ -74,7 +74,13 @@ impl ClientHandler {
     /// underpayment bail, an `encode_range` fault, or a gap the pull leg could not
     /// fill. On any error the caller drops the pull leg, which stops the upstream
     /// spend and persists the buyer watermark.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    // One linear, ADR-ordered miss-leg serve loop; splitting it would scatter the
+    // ordering invariants across helpers (same rationale as `deliver`).
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
     pub(super) async fn serve_leg(
         &self,
         send: &mut SendStream,
@@ -341,6 +347,12 @@ impl ClientHandler {
             {
                 self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                     .await?;
+                // Observable stop (symmetric with the takedown re-check below): this
+                // terminates a paying miss-leg delivery, and `dead_charge` only grows.
+                tracing::warn!(
+                    pool_id = %lane_key.pool_id, %hash,
+                    "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
+                );
                 return Ok(());
             }
 

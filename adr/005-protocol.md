@@ -283,7 +283,7 @@ enum VoucherRejectReason {
     BytesRegression,      // PoolError::BytesDecreasing — cumulative bytes_delivered regressed on this lane
     SpendingCapExhausted, // PoolError::CapExceeded — voucher exceeds the signer's remaining spending cap
     RateFloorRaised,      // Live delivery floor (getRateBounds().deliveryFloor) rose above the stream's quoted rate after the signed StreamResponse — voucher unredeemable at the quoted rate (redeem → RateFloorViolation); re-probe/re-quote at the new floor. Handler-emitted; no validation-enum counterpart
-    CapabilityExpired,    // Signer's capability has passed its expiry (block.timestamp >= expiry) — the node holds the clock. Handler-emitted directly; no validation-enum counterpart
+    CapabilityExpired,    // Signer's capability has passed its expiry — the node checks its LOCAL wall clock (unix_now), settlement gates on block.timestamp. Handler-emitted directly; no validation-enum counterpart
     PoolExhausted,        // Pool's remaining deposit, minus the refundable floor M and already-committed concurrent floor credit, can no longer fund further credit for this stream. Handler-emitted mid-stream after capability ownership is proven; no validation-enum counterpart
 }
 ```

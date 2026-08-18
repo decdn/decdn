@@ -125,7 +125,13 @@ impl ClientHandler {
     /// cumulative over bytes already delivered, so it never pays ahead. With the
     /// window at one interval (the unconfigured default) this reduces to the
     /// pre-credit-window stop-and-wait cadence exactly.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    // One linear, ADR-ordered serve loop (deliver → recoup → floor/takedown/pool
+    // re-checks); splitting it would scatter the ordering invariants across helpers.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
     pub(super) async fn deliver(
         &self,
         send: &mut SendStream,
@@ -359,6 +365,14 @@ impl ClientHandler {
             {
                 self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                     .await?;
+                // A paying in-flight download is being terminated, and `dead_charge`
+                // only grows — an accumulator bug here is permanent per pool, so make
+                // the stop observable rather than a silent `Ok(())` (symmetric with the
+                // takedown re-check below, which also logs).
+                tracing::warn!(
+                    pool_id = %lane_key.pool_id, %hash,
+                    "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
+                );
                 return Ok(());
             }
 
