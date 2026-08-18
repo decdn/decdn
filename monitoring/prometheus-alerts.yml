@@ -225,18 +225,6 @@ groups:
             longer being refreshed and will drift from chain state. Correlate with
             decdn_staker_set_watcher_down_seconds and check the RPC provider.
 
-      - alert: DecdnOriginDirectoryWatcherStalled
-        expr: (decdn_origin_directory_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_origin_directory_watcher_last_tick_timestamp_seconds > 180)
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Origin-directory watcher not ticking on {{ $labels.instance }}"
-          description: |
-            The cached namespace → operator directory is no longer refreshed; the
-            pull-through authorized-origin gate reads that cache. Restart and check the
-            RPC provider.
-
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
       # an alert in your blackbox rules file along the lines of

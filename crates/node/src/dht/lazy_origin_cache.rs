@@ -30,12 +30,6 @@
 //! store and the LRU order (index 0 = most-recently-used), the TTL is
 //! anchored on `Instant` at insert and never refreshed on read, and the lock
 //! is poison-tolerant.
-//!
-//! `dead_code` is allowed crate-wide for this module: `LazyOriginCache` and
-//! `resolve_active` are exercised directly by this module's own tests, and
-//! `ChainOriginDirectory` wires them into the live `getOrigins` lookup path
-//! in a follow-on change. Nothing outside tests constructs either yet.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};

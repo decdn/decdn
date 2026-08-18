@@ -26,11 +26,11 @@
 //! - [`crate::dht::ChainOriginDirectory`] — the production path, and the only
 //!   one that can resolve anything. It yields the same candidate set the chain
 //!   above specifies, but does not perform that literal call sequence: the
-//!   `namespace → operators` view is fed from `OriginAssignment` events
-//!   (`OriginAdded` / `OriginRemoved` / `BlacklistedOriginPruned`)
-//!   and the `active` filter is applied from the shared `StakerSet` at lookup
-//!   time rather than taken from the `nodeIdOf` tuple. Lookups are served from an
-//!   event-fed in-memory cache and never hit RPC.
+//!   `namespace → operators` view is fetched lazily on a cold-namespace miss
+//!   and cached with a split TTL, and the `active` filter is applied from the
+//!   shared `StakerSet` at lookup time rather than taken from the `nodeIdOf`
+//!   tuple. A live cache hit resolves with no RPC; a miss issues one
+//!   on-demand `getOrigins` call.
 //! - [`EmptyOriginDirectory`] (this module) — resolves nothing. What the
 //!   runtime installs when the chain contracts aren't configured.
 //! - [`StaticOriginDirectory`] (this module) — a fixed in-memory map, for tests
@@ -57,6 +57,11 @@ use crate::dht::routing::NodeId;
 /// `lookup_origins` on lookup miss (an uncommon path per ADR 022 §FIND\_VALUE
 /// Flow "This fallback is uncommon — under normal operation the DHT contains
 /// entries for every actively-serving authorized origin").
+///
+/// `async` because the chain-backed implementation may issue one on-demand
+/// `getOrigins` RPC on a cold-namespace miss; `Empty`/`Static` resolve
+/// synchronously.
+#[async_trait::async_trait]
 pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     /// Return the operator `NodeId`s authorised as origins for `namespace_id`,
     /// already filtered to only currently-active stakers (the `active == true`
@@ -66,7 +71,7 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     /// Returns an empty vector when the namespace has no authorized origins —
     /// including `namespace_id == 0` (no namespace: cache/DHT-only, no origins
     /// per ADR 002 §Namespace 0).
-    fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId>;
+    async fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId>;
 }
 
 /// [`OriginDirectory`] that resolves nothing.
@@ -84,8 +89,9 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmptyOriginDirectory;
 
+#[async_trait::async_trait]
 impl OriginDirectory for EmptyOriginDirectory {
-    fn lookup_origins(&self, _namespace_id: U256) -> Vec<NodeId> {
+    async fn lookup_origins(&self, _namespace_id: U256) -> Vec<NodeId> {
         Vec::new()
     }
 }
@@ -115,8 +121,9 @@ impl StaticOriginDirectory {
     }
 }
 
+#[async_trait::async_trait]
 impl OriginDirectory for StaticOriginDirectory {
-    fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {
+    async fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {
         self.origins.get(&namespace_id).cloned().unwrap_or_default()
     }
 }
@@ -138,33 +145,33 @@ mod tests {
         NodeId::from_bytes([b; 32])
     }
 
-    #[test]
-    fn empty_directory_returns_empty_for_every_lookup() {
+    #[tokio::test]
+    async fn empty_directory_returns_empty_for_every_lookup() {
         // The runtime's non-chain fallback: nothing resolves for any namespace.
         let dir = EmptyOriginDirectory;
-        assert!(dir.lookup_origins(ns(0)).is_empty());
-        assert!(dir.lookup_origins(ns(7)).is_empty());
+        assert!(dir.lookup_origins(ns(0)).await.is_empty());
+        assert!(dir.lookup_origins(ns(7)).await.is_empty());
     }
 
-    #[test]
-    fn static_directory_with_no_entries_resolves_nothing() {
+    #[tokio::test]
+    async fn static_directory_with_no_entries_resolves_nothing() {
         let dir = StaticOriginDirectory::new(HashMap::new());
-        assert!(dir.lookup_origins(ns(3)).is_empty());
+        assert!(dir.lookup_origins(ns(3)).await.is_empty());
     }
 
-    #[test]
-    fn lookup_returns_configured_origins() {
+    #[tokio::test]
+    async fn lookup_returns_configured_origins() {
         let mut m = HashMap::new();
         m.insert(ns(1), vec![nid(0xA), nid(0xB)]);
         m.insert(ns(2), vec![nid(0xC)]);
         let dir = StaticOriginDirectory::new(m);
-        assert_eq!(dir.lookup_origins(ns(1)), vec![nid(0xA), nid(0xB)]);
-        assert_eq!(dir.lookup_origins(ns(2)), vec![nid(0xC)]);
+        assert_eq!(dir.lookup_origins(ns(1)).await, vec![nid(0xA), nid(0xB)]);
+        assert_eq!(dir.lookup_origins(ns(2)).await, vec![nid(0xC)]);
         // Namespace 0 (no namespace) and any unknown id fall through to an empty
         // vec — the caller distinguishes "directory has nothing for this
         // namespace" from "directory not initialised" via the empty result, NOT
         // via an Option.
-        assert!(dir.lookup_origins(ns(0)).is_empty());
-        assert!(dir.lookup_origins(ns(3)).is_empty());
+        assert!(dir.lookup_origins(ns(0)).await.is_empty());
+        assert!(dir.lookup_origins(ns(3)).await.is_empty());
     }
 }

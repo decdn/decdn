@@ -85,6 +85,11 @@ pub(super) fn mutate_gauged<T, S>(
 pub(super) struct ChainProjection<T> {
     state: Arc<RwLock<T>>,
     label: &'static str,
+    /// Held purely for its `Arc` refcount: as long as a projection built from
+    /// this handle is alive, the shared watcher task it points at is too. No
+    /// accessor reads it back — the runtime drives graceful shutdown through
+    /// the `Arc<WatcherHandle>` it keeps directly from `bootstrap` instead.
+    #[allow(dead_code)]
     watcher: Arc<WatcherHandle>,
 }
 
@@ -106,13 +111,6 @@ impl<T> ChainProjection<T> {
     /// Poison-tolerant read of the cached state.
     pub(super) fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         with_read(&self.state, self.label, f)
-    }
-
-    /// The owned watcher handle, cloned for a caller that must drive graceful
-    /// shutdown in a specific order (the runtime, for the origin directory and
-    /// capacity-bond registry).
-    pub(super) fn watcher(&self) -> Arc<WatcherHandle> {
-        Arc::clone(&self.watcher)
     }
 }
 
