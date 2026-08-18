@@ -725,7 +725,7 @@ pub enum StreamError {
         reason: VoucherRejectReason,
         /// The node's true watermark plus the client's own last-accepted
         /// signature, attached ONLY on the regression/exhaustion reasons
-        /// (`AmountRegression`, `BytesRegression`, `CapExceeded`) and ONLY
+        /// (`AmountRegression`, `BytesRegression`, `SpendingCapExhausted`) and ONLY
         /// when the rejected voucher's signature recovers to the
         /// capability's pinned `voucher_signer` (issue #1481 §5 security
         /// property — otherwise anyone who guessed the chain-derivable
@@ -775,11 +775,13 @@ impl StreamError {
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
 /// matches those exhaustively so a new `PoolError` variant fails to compile
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
-/// variant has no validation-enum counterpart and is emitted directly by the
+/// variants have no validation-enum counterpart and are emitted directly by the
 /// `cdn/client/v1` handler: [`Self::RateFloorRaised`] is the honest-buyer
 /// re-quote signal when the live delivery floor rose above a stream's quoted
-/// rate (#1382). Variant order is frozen — new handler-direct reasons append
-/// at the end.
+/// rate (#1382); [`Self::CapabilityExpired`] fires when the signer's capability
+/// has passed its expiry; and [`Self::PoolExhausted`] fires when the pool's
+/// remaining deposit can no longer fund further credit. Variant order is frozen —
+/// new handler-direct reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -799,9 +801,10 @@ pub enum VoucherRejectReason {
     /// Cumulative bytes delivered regressed. `PoolError::BytesDecreasing`.
     BytesRegression,
     /// The signer's remaining spending cap is exhausted — the voucher amount
-    /// exceeds what the capability has left to spend, or the capability
-    /// itself has expired. `PoolError::CapExceeded`.
-    CapExceeded,
+    /// exceeds what the capability has left to spend (`cap − spent`).
+    /// Recovery: the pool **owner** raises this signer's cap or delegates a new
+    /// capability. `PoolError::CapExceeded`.
+    SpendingCapExhausted,
     /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
     /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
     /// stream was quoted at, after the signed `StreamResponse` but before this
@@ -816,6 +819,23 @@ pub enum VoucherRejectReason {
     /// this; the `cdn/client/v1` handler emits it directly (ADR 005
     /// §`VoucherRejected` semantics, #1382).
     RateFloorRaised,
+    /// The signer's capability has passed its `expiry`. The node's serve-side check
+    /// compares its LOCAL wall clock (`unix_now`, operator-settable) against `expiry`
+    /// and stops serving the lane; on-chain settlement separately gates redemption on
+    /// `block.timestamp`. Already-earned vouchers stay redeemable until expiry at
+    /// settlement. Recovery: the owner mints a **fresh capability** with a new expiry —
+    /// a watermark resync or top-up does not help. Emitted directly by the
+    /// `cdn/client/v1` handler (the node holds the clock), not via the `PoolError`
+    /// bridge.
+    CapabilityExpired,
+    /// The pool's on-chain remaining deposit, minus the refundable floor `M` and
+    /// the pool's already-committed concurrent floor credit, can no longer fund
+    /// further credit for this stream (ADR 003 §Pool solvency). A pool-wide
+    /// condition, not this signer's. Recovery: the pool **owner tops up the
+    /// deposit**. Emitted mid-stream by the serve loop after the client has proved
+    /// capability ownership; the open-time equivalent stays wire-`NotFound`
+    /// (anti-enumeration). Not watermark-gated.
+    PoolExhausted,
 }
 
 impl VoucherRejectReason {
@@ -836,7 +856,7 @@ impl VoucherRejectReason {
     pub const fn is_watermark_gated(self) -> bool {
         matches!(
             self,
-            Self::AmountRegression | Self::BytesRegression | Self::CapExceeded
+            Self::SpendingCapExhausted | Self::AmountRegression | Self::BytesRegression
         )
     }
 }
@@ -1075,7 +1095,7 @@ mod tests {
     #[test]
     fn stream_error_voucher_rejected_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         };
         let bytes = postcard::to_allocvec(&e)?;
@@ -1091,7 +1111,7 @@ mod tests {
     #[test]
     fn stream_error_voucher_rejected_with_bundle_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: Some(WatermarkBundle {
                 amount: 0x1111_1111_1111_1111u64,
                 bytes_delivered: 0x3333_3333_3333_3333u64,
@@ -1173,8 +1193,10 @@ mod tests {
             VoucherRejectReason::WrongProvider,
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
-            VoucherRejectReason::CapExceeded,
+            VoucherRejectReason::SpendingCapExhausted,
             VoucherRejectReason::RateFloorRaised,
+            VoucherRejectReason::CapabilityExpired,
+            VoucherRejectReason::PoolExhausted,
         ]
         .into_iter()
         .enumerate()
@@ -1579,7 +1601,7 @@ mod tests {
                 ..sample_body()
             },
             error: Some(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::CapExceeded,
+                reason: VoucherRejectReason::SpendingCapExhausted,
                 bundle: None,
             }),
             ..sample_response()
@@ -1674,7 +1696,7 @@ mod tests {
             ClientMessage::Voucher(sample_voucher()),
             ClientMessage::StreamEnd,
             ClientMessage::StreamError(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::CapExceeded,
+                reason: VoucherRejectReason::SpendingCapExhausted,
                 bundle: Some(WatermarkBundle {
                     amount: 0x0101_0101_0101_0101u64,
                     bytes_delivered: 0x0303_0303_0303_0303u64,

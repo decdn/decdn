@@ -38,9 +38,9 @@ use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
 
 use super::{
-    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES,
-    VecDeque, VoucherStop,
+    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, FloorReservation,
+    Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256,
+    VOUCHER_INTERVAL_BYTES, VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -74,7 +74,13 @@ impl ClientHandler {
     /// underpayment bail, an `encode_range` fault, or a gap the pull leg could not
     /// fill. On any error the caller drops the pull leg, which stops the upstream
     /// spend and persists the buyer watermark.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    // One linear, ADR-ordered miss-leg serve loop; splitting it would scatter the
+    // ordering invariants across helpers (same rationale as `deliver`).
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
     pub(super) async fn serve_leg(
         &self,
         send: &mut SendStream,
@@ -91,6 +97,7 @@ impl ClientHandler {
         len: u64,
         total_bytes: u64,
         window: u64,
+        floor_reservation: Option<&FloorReservation>,
     ) -> anyhow::Result<()> {
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
         // convention); otherwise clamp to the tree size.
@@ -189,6 +196,25 @@ impl ClientHandler {
                 unvouchered = 0;
             }
 
+            // Reconcile the pool floor reservation the SAME way the hit path does
+            // (`deliver`), so a cache-miss stream — which fronts upstream USDC — folds
+            // proportional `dead_charge` too. Capture this iteration's maximum in-flight
+            // unpaid balance NOW: after the deliver phase advanced `delivered` and
+            // before the recoup phase can advance `paid` or take the `VoucherStop::Rejected`
+            // early return / a `?` fault below. A stream that dies in its first
+            // iteration never reaches the end-of-iteration hook, so without this note its
+            // last-noted unpaid stays 0 and `Drop` would fold nothing — letting "connect,
+            // take one free interval, vanish" escape the `dead_charge` accounting.
+            // `delivered`/`paid` are WIRE BYTES (see their declaration); the reservation
+            // accounts in µUSDC, so the byte quantity crosses over through `min_payment` —
+            // the two units are never compared directly (ADR 003 §Pool solvency).
+            if let Some(res) = floor_reservation {
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
+            }
+
             // --- recoup phase: recoup each completed interval with one voucher.
             // The voucher advances the in-memory lane watermark; the background
             // flush persists it (ADR 003 §Off-chain voucher state persistence). ---
@@ -269,11 +295,64 @@ impl ClientHandler {
                 }
             }
 
+            // Reconcile the floor reservation against this stream's live balance now
+            // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
+            // counters; the reservation accounts in µUSDC, so every byte quantity
+            // crosses over through `min_payment` — never compared directly.
+            if let Some(res) = floor_reservation {
+                // Free the pool's live reservation once cumulative payment reaches the
+                // amount reserved (the ramp-floor credit this stream fronts). Matching
+                // release to the reserved µUSDC keeps it correct at any
+                // `credit_ramp_divisor` — with the ramp disabled the reservation is the
+                // full `credit_max`, so release waits for that much paid, not one interval.
+                res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
+                // Keep the drop-time reconcile honest with the CURRENT unpaid balance: on
+                // an un-repaid stream `Drop` folds `min(reserved, this)` into `dead_charge`.
+                // A fully-settled stream ends `delivered == paid`, so the last note here is
+                // `min_payment(0, rate) == 0` and `Drop` charges nothing.
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
+            }
+
             // Done when the whole range is on the wire and every interval — closing
             // partial included — has been paid. Gating on PAID (not delivered) is
             // what bills the credit-window tail the client received ahead of its
             // voucher.
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
+
+            // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
+            // symmetric with the takedown re-check below and under the same
+            // `collected_any && !done` boundary gate: re-read the cached pool
+            // status after each committed batch. A pool drains mid-flight — other
+            // lanes redeem `remaining` down, or `dead_charge` rises — so a long
+            // stream must stop once `remaining − M` no longer covers the pool's
+            // already-committed floor credit. `new_reserve = ZERO` asks exactly
+            // that: is the total ALREADY committed (this stream included) still
+            // within budget? On `false` the pool can no longer fund further credit,
+            // so stop IN-BAND with a clean `PoolExhausted` (not a QUIC reset, unlike
+            // a takedown) so the owner learns to top up — `PoolExhausted` is
+            // post-auth, so naming the condition leaks nothing an open-time refusal
+            // must hide, and it is not watermark-gated (no bundle). A `None` pool
+            // view fails OPEN (the on-chain redeem is the backstop). The caller
+            // drops the concurrent pull leg when this returns, bounding the upstream
+            // spend just as the takedown and no-progress exits do.
+            if collected_any
+                && !done
+                && let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
+                && !self.pool_budget_covers_reserve(lane_key.pool_id, status.remaining, U256::ZERO)
+            {
+                self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                    .await?;
+                // Observable stop (symmetric with the takedown re-check below): this
+                // terminates a paying miss-leg delivery, and `dead_charge` only grows.
+                tracing::warn!(
+                    pool_id = %lane_key.pool_id, %hash,
+                    "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
+                );
+                return Ok(());
+            }
 
             // ADR 011 §On Blacklist Event: terminate an in-flight delivery at the
             // next voucher boundary once a takedown lands. Gated on `collected_any`
@@ -312,7 +391,13 @@ impl ClientHandler {
 
         // Fully delivered and fully paid: signal clean completion. Every byte was
         // bao-verified into the cache by the pull leg's admit before this leg read
-        // it, so the served bytes are sound.
+        // it, so the served bytes are sound. Only reached on clean completion — every
+        // abnormal exit returns earlier — so mark the reservation settled, so its drop
+        // folds the proportional unpaid tail rather than the conservative full
+        // `reserved` (ADR 003 §Pool solvency).
+        if let Some(res) = floor_reservation {
+            res.mark_settled();
+        }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         Ok(())

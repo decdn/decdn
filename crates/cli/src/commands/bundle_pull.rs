@@ -698,8 +698,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             || {},
         )
         .await;
-        // On the delegated path a terminal `CapExceeded` reconnects to the
-        // owner-side remedy (the delegate cannot top up), the same as `fetch`.
+        // On the delegated path a terminal owner-remedy reason (`SpendingCapExhausted`,
+        // `CapabilityExpired`, `PoolExhausted`) reconnects to the owner-side remedy
+        // (the delegate cannot self-resolve it), the same as `fetch`.
         match (result, self.grant.is_some()) {
             (Ok(_bytes), _) => Ok(()),
             (Err(err), true) => Err(fetch::annotate_delegated_exhaustion(err)),

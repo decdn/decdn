@@ -7,9 +7,9 @@ use alloy::primitives::U256;
 use crate::node_origin::PullLegTarget;
 
 use super::{
-    Arc, B256, ClientHandler, ClientMessage, FillOutcome, Hash, LaneDeliveryState, LaneKey, Mutex,
-    NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamResponseBody,
-    VOUCHER_INTERVAL_BYTES, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, ClientHandler, ClientMessage, FillOutcome, FloorReservation, Hash,
+    LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
+    StreamRequest, StreamResponseBody, VOUCHER_INTERVAL_BYTES, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 impl ClientHandler {
@@ -64,6 +64,7 @@ impl ClientHandler {
         pool_remaining: Option<U256>,
         fault_seen: bool,
         rate_per_mb: u64,
+        floor_reservation: Option<FloorReservation>,
     ) -> anyhow::Result<()> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
@@ -345,6 +346,14 @@ impl ClientHandler {
         // It mints its outboard reader from the shared per-hash outboard and reads the
         // registry-wide fill liveness for the no-hang guarantee, pacing every pull it
         // draws from (its own plus any attached sibling).
+        //
+        // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
+        // here and passed by reference: the serve leg keeps its `note_unpaid` current
+        // and releases it once the stream repays one floor, exactly like the hit path,
+        // so this MISS leg — which fronts upstream USDC — folds proportional
+        // `dead_charge` too. Holding ownership across the `await` keeps the guard alive
+        // for the whole serve; its `Drop` reconciles the residual unpaid loss AFTER
+        // `serve_leg` returns, at this function's scope end.
         let serve_result = self
             .serve_leg(
                 &mut send,
@@ -361,6 +370,7 @@ impl ClientHandler {
                 req.byte_len,
                 total_bytes,
                 credit_floor,
+                floor_reservation.as_ref(),
             )
             .await;
 
@@ -434,6 +444,7 @@ impl ClientHandler {
         total_bytes: u64,
         pool_remaining: Option<U256>,
         rate_per_mb: u64,
+        floor_reservation: Option<FloorReservation>,
     ) -> anyhow::Result<()> {
         // Mark that the own-origin serve-miss tier fired for this request, before
         // any admission guard below — the tier-selection signal (#1130), not a
@@ -629,6 +640,13 @@ impl ClientHandler {
         // Run the serve leg on THIS (accept) task and await it. It owns termination —
         // mid-stream takedown and client-disconnect are both handled inside it — and
         // paces every pull it draws from (its own plus any attached sibling).
+        //
+        // The pool floor reservation (opened at the dispatch pre-spend gate) is OWNED
+        // here and passed by reference so the serve leg reconciles it exactly like the
+        // hit path: delivery here is billed per voucher, so an un-repaid stream must
+        // fold proportional `dead_charge`. Holding ownership across the `await` keeps
+        // the guard alive for the whole serve; its `Drop` fires AFTER `serve_leg`
+        // returns, at this function's scope end.
         let serve_result = self
             .serve_leg(
                 &mut send,
@@ -645,6 +663,7 @@ impl ClientHandler {
                 req.byte_len,
                 total_bytes,
                 credit_floor,
+                floor_reservation.as_ref(),
             )
             .await;
 

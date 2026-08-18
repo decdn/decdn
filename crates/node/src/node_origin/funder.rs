@@ -34,7 +34,7 @@ use decdn_incentive::DepositOutcome;
 use crate::buyer_channel::PoolOpener;
 
 /// How many times ONE call of the node's miss-pull driver answers a genuine
-/// mid-pull `CapExceeded` with an on-chain `topUp` before giving up.
+/// mid-pull `SpendingCapExhausted` with an on-chain `topUp` before giving up.
 ///
 /// Deliberately **1**, where the CLI's [`MAX_TOPUP_ATTEMPTS`] is 3. The node tops
 /// up from the initial deposit straight to the working deposit — 0.5 USDC to 10
@@ -182,7 +182,7 @@ impl Funder for NodeFunder {
                 Ok(new_deposit) if new_deposit > current_deposit => {
                     self.metrics.node_pull_reactive_topup();
                     // Record the headroom-adding success so a later terminal
-                    // `CapExceeded` on this pull is NOT metered as a refusal — a pull
+                    // `SpendingCapExhausted` on this pull is NOT metered as a refusal — a pull
                     // that funded itself is not being extorted.
                     self.funded.store(true, Ordering::Relaxed);
                     Ok(DepositOutcome::Added(new_deposit))

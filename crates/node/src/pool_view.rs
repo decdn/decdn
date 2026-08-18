@@ -38,8 +38,20 @@ pub struct PoolStatus {
 #[async_trait::async_trait]
 pub trait PoolView: Send + Sync + std::fmt::Debug {
     /// The pool's cached `getPool` status, or `None` if the pool is unknown or the
-    /// read faulted (callers fail open).
+    /// read faulted (callers fail open). MAY trigger an on-chain fetch on a cache
+    /// miss — use only where blocking on an RPC is acceptable (e.g. stream admission).
     async fn status(&self, pool_id: B256) -> Option<PoolStatus>;
+
+    /// A CACHE-ONLY status read: returns a fresh cached [`PoolStatus`] if one is
+    /// held, and NEVER triggers an on-chain fetch — `None` when nothing fresh is
+    /// cached. The mid-stream serve re-check uses this so a per-voucher-boundary
+    /// solvency check never blocks the serve loop on a `getPool` `eth_call`, which on
+    /// a slow RPC would stall delivery. The default delegates to [`Self::status`]
+    /// for in-memory test doubles; [`ChainPoolView`] overrides it to read only its
+    /// TTL cache.
+    async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
+        self.status(pool_id).await
+    }
 }
 
 /// [`PoolView`] backed by a live `PaymentPool.getPool` read with a short TTL
@@ -89,6 +101,13 @@ impl<P: Provider + Clone + 'static> ChainPoolView<P> {
 
 #[async_trait::async_trait]
 impl<P: Provider + Clone + 'static> PoolView for ChainPoolView<P> {
+    /// Cache-only: return a fresh cached entry, never an on-chain fetch. Keeps the
+    /// mid-stream serve re-check off the RPC — a stale/absent entry yields `None`
+    /// and the caller fails open.
+    async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
+        self.cached(pool_id)
+    }
+
     async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
         if let Some(hit) = self.cached(pool_id) {
             return Some(hit);

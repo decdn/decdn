@@ -103,7 +103,7 @@ pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReaso
         PoolError::WrongProvider { .. } => Ok(VoucherRejectReason::WrongProvider),
         PoolError::AmountRegression { .. } => Ok(VoucherRejectReason::AmountRegression),
         PoolError::BytesRegression { .. } => Ok(VoucherRejectReason::BytesRegression),
-        PoolError::CapExceeded { .. } => Ok(VoucherRejectReason::CapExceeded),
+        PoolError::CapExceeded { .. } => Ok(VoucherRejectReason::SpendingCapExhausted),
         PoolError::Signature(VoucherError::InvalidSignature) => {
             Ok(VoucherRejectReason::BadSignature)
         }
@@ -294,7 +294,7 @@ mod tests {
                     cap: U256::ZERO,
                     got: U256::ZERO,
                 },
-                Ok(VoucherRejectReason::CapExceeded),
+                Ok(VoucherRejectReason::SpendingCapExhausted),
             ),
             (
                 PoolError::Signature(VoucherError::InvalidSignature),

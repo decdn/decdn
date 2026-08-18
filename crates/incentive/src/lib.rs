@@ -96,10 +96,14 @@ pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,
     slash_judge_domain,
 };
-pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
+pub use rate::{
+    BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, floor_micro, min_payment, pool_budget_covers,
+    verify_rate,
+};
 pub use store::{
-    CheckpointKey, KeyedCheckpointStore, MemoryPendingSettleStore, MemoryPoolStateStore,
-    PendingSettle, PendingSettleStore, PoolStateStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, MemoryPendingSettleStore, MemoryPoolFloorLossStore,
+    MemoryPoolStateStore, PendingSettle, PendingSettleStore, PoolFloorLossStore, PoolStateStore,
+    StoreError,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use swap_balancer::BalancerV3Venue;

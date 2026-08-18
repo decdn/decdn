@@ -7,9 +7,9 @@ use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
 use super::{
-    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, Hash,
-    LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, VOUCHER_INTERVAL_BYTES, VecDeque,
-    VoucherStop,
+    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, FloorReservation,
+    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VOUCHER_INTERVAL_BYTES,
+    VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -125,7 +125,13 @@ impl ClientHandler {
     /// cumulative over bytes already delivered, so it never pays ahead. With the
     /// window at one interval (the unconfigured default) this reduces to the
     /// pre-credit-window stop-and-wait cadence exactly.
-    #[allow(clippy::too_many_arguments)]
+    // One linear, ADR-ordered serve loop (deliver → recoup → floor/takedown/pool
+    // re-checks); splitting it would scatter the ordering invariants across helpers.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
     pub(super) async fn deliver(
         &self,
         send: &mut SendStream,
@@ -138,7 +144,13 @@ impl ClientHandler {
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
+        floor_reservation: Option<FloorReservation>,
     ) -> anyhow::Result<()> {
+        // Owned here so the pool floor reservation reconciles at every exit —
+        // success, `?`, disconnect, panic — exactly like `LaneSlot`. The serve loop
+        // below keeps its `note_unpaid` current and releases it once the stream
+        // repays a floor; `Drop` folds any residual unpaid loss into `dead_charge`.
+        let floor_reservation = floor_reservation;
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
         // side, AC#4). `export_bao_range_stream` reads the persisted outboard and
@@ -256,6 +268,22 @@ impl ClientHandler {
                 unvouchered = 0;
             }
 
+            // Capture this iteration's maximum in-flight unpaid balance NOW — after
+            // the deliver phase advanced `delivered` and before the recoup phase can
+            // advance `paid` or take an early exit. A stream that dies in its first
+            // iteration (a rejected first voucher returns from the recoup block, or a
+            // `?` faults there) never reaches the end-of-iteration hook below, so
+            // without this note its last-noted unpaid stays 0 and `Drop` would fold
+            // nothing — letting "connect, take one free interval, vanish" escape the
+            // `dead_charge` accounting. Noting here keeps the guard honest at every
+            // exit path (ADR 003 §Pool solvency).
+            if let Some(res) = floor_reservation.as_ref() {
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
+            }
+
             // --- recoup phase: one voucher per completed interval; the voucher
             // advances the in-memory lane watermark and the background flush
             // persists it (ADR 003 §Off-chain voucher state persistence). ---
@@ -285,9 +313,66 @@ impl ClientHandler {
                 }
             }
 
+            // Reconcile the pool floor reservation against this stream's live
+            // balance (ADR 003 §Pool solvency). `paid` and `delivered` are BYTE
+            // counters (see their declaration above); the reservation accounts in
+            // µUSDC, so every byte quantity crosses over through `min_payment` —
+            // the two units are never compared directly.
+            if let Some(res) = floor_reservation.as_ref() {
+                // Free the pool's live reservation once cumulative payment reaches the
+                // amount that was reserved (the ramp-floor credit this stream fronts).
+                // Everything above it is self-funded. Matching release to the reserved
+                // µUSDC keeps it correct at any `credit_ramp_divisor` — with the ramp
+                // disabled the reservation is the full `credit_max`, so release waits
+                // for that much paid, not a single interval.
+                res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
+                // Keep the drop-time reconcile honest with the CURRENT unpaid
+                // balance: on an un-repaid stream `Drop` folds `min(reserved, this)`
+                // (the span-capped reservation) into `dead_charge`. A fully-settled
+                // stream ends `delivered == paid`, so the last note here is
+                // `min_payment(0, rate) == 0` and `Drop` charges nothing.
+                res.note_unpaid(decdn_incentive::min_payment(
+                    delivered.saturating_sub(paid),
+                    rate_per_mb,
+                ));
+            }
+
             // Done when the whole blob is on the wire and every interval, closing
             // partial included, has been paid.
             let done = done_delivering && pending.is_empty() && unvouchered == 0;
+
+            // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
+            // symmetric with the takedown re-check below and under the same
+            // `collected_any && !done` boundary gate: re-read the cached pool
+            // status after each committed batch. A pool drains mid-flight — other
+            // lanes redeem `remaining` down, or `dead_charge` rises — so a long
+            // stream must stop once `remaining − M` no longer covers the pool's
+            // already-committed floor credit. `new_reserve = ZERO` asks exactly
+            // that: is the total ALREADY committed (this stream included) still
+            // within budget? On `false` the pool can no longer fund further credit,
+            // so stop IN-BAND with a clean `PoolExhausted` (not a QUIC reset, unlike
+            // a takedown) so the owner learns to top up — `PoolExhausted` is
+            // post-auth, so naming the condition leaks nothing an open-time refusal
+            // must hide, and it is not watermark-gated (no bundle). A `None` pool
+            // view fails OPEN (the on-chain redeem is the backstop), exactly like
+            // the admission gate and the takedown funder resolution.
+            if collected_any
+                && !done
+                && let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
+                && !self.pool_budget_covers_reserve(lane_key.pool_id, status.remaining, U256::ZERO)
+            {
+                self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
+                    .await?;
+                // A paying in-flight download is being terminated, and `dead_charge`
+                // only grows — an accumulator bug here is permanent per pool, so make
+                // the stop observable rather than a silent `Ok(())` (symmetric with the
+                // takedown re-check below, which also logs).
+                tracing::warn!(
+                    pool_id = %lane_key.pool_id, %hash,
+                    "mid-stream PoolExhausted: pool can no longer fund committed floor credit; owner should top up the deposit"
+                );
+                return Ok(());
+            }
 
             // ADR 011 §On Blacklist Event: in-flight streams for a blacklisted hash
             // are terminated at the next voucher boundary. Under the credit window
@@ -314,6 +399,13 @@ impl ClientHandler {
             }
         }
 
+        // Clean completion: the whole request delivered and every interval paid. Only
+        // reached here — every abnormal exit returns earlier — so mark the reservation
+        // settled, making its drop fold the proportional unpaid tail (0 for a fully
+        // paid stream) rather than the conservative full `reserved` (ADR 003 §Pool solvency).
+        if let Some(res) = floor_reservation.as_ref() {
+            res.mark_settled();
+        }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
         Ok(())

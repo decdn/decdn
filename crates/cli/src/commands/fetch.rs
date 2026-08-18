@@ -847,9 +847,10 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         // cleared the bar.
         bar.finish_and_clear();
 
-        // On the delegated path a `CapExceeded` is terminal — the delegate cannot
-        // top up an owner's pool — so reconnect it to the owner-side remedy rather
-        // than leaving a bare "voucher rejected: CapExceeded".
+        // On the delegated path `SpendingCapExhausted`, `CapabilityExpired`, and
+        // `PoolExhausted` are all terminal — the delegate cannot top up an owner's
+        // pool or raise/re-mint its own capability — so reconnect them to the
+        // owner-side remedy rather than leaving a bare "voucher rejected: ...".
         let err = match result {
             Ok(bytes) => {
                 println!("fetched {bytes} bytes -> {}", args.output.display());
@@ -882,22 +883,30 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         .unwrap_or_else(|| anyhow::anyhow!("no candidate node could deliver the requested blob")))
 }
 
-/// Reconnect a delegated fetch's terminal `CapExceeded` voucher rejection to
-/// the owner-side remedy: the delegate holds no wallet on this pool, so it
-/// cannot `topUp` and cannot raise its own cap. Any other error passes through
-/// verbatim (a stall, a transport fault, or a `NotFound` already annotated by
-/// [`annotate_unbound_cache_miss`] inside `drive_fetch`).
+/// Reconnect a delegated fetch's terminal owner-remedy voucher rejection
+/// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`) to the
+/// owner-side remedy: the delegate holds no wallet on this pool, so it cannot
+/// `topUp`, raise its own cap, or mint itself a fresh capability. Any other
+/// error passes through verbatim (a stall, a transport fault, or a `NotFound`
+/// already annotated by [`annotate_unbound_cache_miss`] inside `drive_fetch`).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
-    let is_cap_exceeded = err
+    use decdn_protocol::client::VoucherRejectReason;
+
+    let needs_owner = err
         .downcast_ref::<UpstreamVoucherRejected>()
         .is_some_and(|rejected| {
-            rejected.reason == decdn_protocol::client::VoucherRejectReason::CapExceeded
+            matches!(
+                rejected.reason,
+                VoucherRejectReason::SpendingCapExhausted
+                    | VoucherRejectReason::CapabilityExpired
+                    | VoucherRejectReason::PoolExhausted
+            )
         });
-    if is_cap_exceeded {
+    if needs_owner {
         err.context(
-            "capability cap or pool balance exhausted — ask the pool owner to top up the pool \
-             or issue a higher-cap capability (a delegated client cannot top up a pool it does \
-             not own)",
+            "capability cap exhausted, capability expired, or pool balance exhausted — ask the \
+             pool owner to top up the pool or issue a fresh, higher-cap capability (a delegated \
+             client cannot top up a pool it does not own)",
         )
     } else {
         err
@@ -1710,7 +1719,7 @@ mod tests {
     #[test]
     fn voucher_rejection_is_terminal() {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: decdn_protocol::client::VoucherRejectReason::CapExceeded,
+            reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         });
         assert_eq!(super::retry_disposition(&err), RetryDisposition::Terminal);
@@ -1885,12 +1894,12 @@ mod tests {
         );
     }
 
-    /// A delegated `CapExceeded` is reconnected to the owner-side remedy; the
+    /// A delegated `SpendingCapExhausted` is reconnected to the owner-side remedy; the
     /// delegate holds no wallet on the pool, so "top up / re-issue" is the fix.
     #[test]
-    fn delegated_cap_exceeded_gets_the_owner_remedy_hint() {
+    fn delegated_spending_cap_exhausted_gets_the_owner_remedy_hint() {
         let err = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: decdn_protocol::client::VoucherRejectReason::CapExceeded,
+            reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         });
         let annotated = super::annotate_delegated_exhaustion(err);
@@ -1901,11 +1910,43 @@ mod tests {
     }
 
     /// Any other error passes through the delegated-exhaustion annotator
-    /// untouched — only `CapExceeded` names the owner-side remedy.
+    /// untouched — only the three owner-remedy reasons
+    /// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`) name the
+    /// owner-side remedy.
     #[test]
     fn delegated_non_cap_error_is_untouched() {
         let annotated = super::annotate_delegated_exhaustion(anyhow::anyhow!("stalled"));
         assert_eq!(annotated.to_string(), "stalled");
+    }
+
+    /// A delegated `CapabilityExpired` rejection also gets the owner-remedy
+    /// hint: the delegate cannot mint itself a fresh capability either.
+    #[test]
+    fn delegated_capability_expired_gets_the_owner_remedy_hint() {
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::CapabilityExpired,
+            bundle: None,
+        });
+        let annotated = super::annotate_delegated_exhaustion(err);
+        assert!(
+            annotated.to_string().contains("expired"),
+            "expected the expiry remedy, got: {annotated}"
+        );
+    }
+
+    /// A delegated `PoolExhausted` rejection also gets the owner-remedy
+    /// hint: it is a pool-wide deposit shortfall, not this signer's cap.
+    #[test]
+    fn delegated_pool_exhausted_gets_the_owner_remedy_hint() {
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: decdn_protocol::client::VoucherRejectReason::PoolExhausted,
+            bundle: None,
+        });
+        let annotated = super::annotate_delegated_exhaustion(err);
+        assert!(
+            annotated.to_string().contains("exhausted"),
+            "expected the exhaustion remedy, got: {annotated}"
+        );
     }
 
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets

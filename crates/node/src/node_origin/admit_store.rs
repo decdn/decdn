@@ -112,7 +112,7 @@ impl IngestStore for NodeAdmitStore {
     /// `UpstreamVoucherRejected`/buyer-side `LocalPullFault`) — the cache decoder
     /// only sees the resulting truncation as a generic `CacheError`. Surfacing
     /// the parked fault verbatim keeps `pull_verdict` fault classification,
-    /// reputation, channel remedies, and reactive top-up (`CapExceeded`) working.
+    /// reputation, channel remedies, and reactive top-up (`SpendingCapExhausted`) working.
     fn ingest_stream<'a, R>(
         &'a self,
         range: &'a AlignedRange,

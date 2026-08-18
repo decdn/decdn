@@ -154,7 +154,7 @@ impl ClientHandler {
     /// (ADR 005 §`VoucherRejected` semantics). `bundle` is the wallet-less
     /// resume watermark (issue #1481): callers pass `Some` only for the three
     /// watermark-gated regression/exhaustion reasons (`AmountRegression`,
-    /// `BytesRegression`, `CapExceeded`), and only after verifying the rejected
+    /// `BytesRegression`, `SpendingCapExhausted`), and only after verifying the rejected
     /// voucher's signature recovered to the lane's pinned `signer` — this method
     /// does not re-derive or re-check that gate, it trusts the caller.
     pub(super) async fn write_reject(

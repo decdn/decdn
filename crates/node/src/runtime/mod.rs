@@ -1168,6 +1168,13 @@ async fn build_chain_and_handlers(
     client_deps.capability_sink =
         Some(Arc::clone(&infra.concrete_channel_store)
             as Arc<dyn crate::channel_store::CapabilitySink>);
+    // Durable per-pool floor dead-charge (ADR 003 §Pool solvency): the same redb
+    // store that holds every lane record also mirrors each pool's unrecoverable
+    // floor loss, so a restart reloads it rather than granting a fresh free-floor
+    // budget.
+    client_deps.floor_loss_store =
+        Some(Arc::clone(&infra.concrete_channel_store)
+            as Arc<dyn decdn_incentive::PoolFloorLossStore>);
     // Cached `getPool` view (owner + remaining) for the floor-`M` solvency gate
     // and the ADR 011 funder gate. Read-only provider — the serve gates never
     // write — with a short TTL so a request burst against one pool costs at most

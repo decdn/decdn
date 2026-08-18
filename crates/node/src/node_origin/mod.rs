@@ -1890,7 +1890,7 @@ async fn pull_from_candidate(
     let _cancel_guard = cancel.drop_guard();
     // Set on the drive thread the first time a reactive top-up ADDS headroom, so the
     // refuse-metering below can tell a pull that never funded itself (an extortion
-    // `CapExceeded` to meter) from one that did (already metered on the wire).
+    // `SpendingCapExhausted` to meter) from one that did (already metered on the wire).
     let reactive_funded = Arc::new(AtomicBool::new(false));
     let reactive_funded_for_thread = Arc::clone(&reactive_funded);
     let join = tokio::task::spawn_blocking(move || {
@@ -2022,7 +2022,7 @@ async fn pull_from_candidate(
         }
         Err(err) => {
             // Meter a refused reactive top-up (#1600): the upstream ended the pull with
-            // `CapExceeded` while OUR ledger still had headroom — an attempt to make us
+            // `SpendingCapExhausted` while OUR ledger still had headroom — an attempt to make us
             // escrow more USDC on its unsupported word. The driver's `genuine_exhaustion`
             // saw the contradiction and never issued a `TopUp`, so `NodeFunder` was never
             // called and nothing else meters this; without it, a lying peer is invisible.
@@ -2036,7 +2036,7 @@ async fn pull_from_candidate(
                 && !reactive_funded.load(Ordering::Relaxed)
                 && err
                     .downcast_ref::<UpstreamVoucherRejected>()
-                    .is_some_and(|r| r.reason == VoucherRejectReason::CapExceeded)
+                    .is_some_and(|r| r.reason == VoucherRejectReason::SpendingCapExhausted)
             {
                 deps.metrics.node_pull_reactive_topup_refused();
             }
@@ -2394,50 +2394,60 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 ///   payment bucket also *hides* it: the ladder checks `UpstreamVoucherRejected` before
 ///   `LocalPullFault`, so a broken buyer key produces a `debug!` about payments instead of
 ///   the `warn!` about a node that cannot pay anyone.
-/// - **This lane to this provider is finished, but the pool's DEPOSIT is not.** The signer's
-///   spending cap is exhausted or its capability expired (`CapExceeded`), our accounting
-///   drifted (`AmountRegression`/`BytesRegression`), or the voucher was addressed to the
-///   wrong pool or a different provider (`WrongPool`/`WrongProvider`). No further voucher on
-///   this lane is accepted, but the shared pool deposit survives it and other lanes still
-///   draw on it — so the provider is suppressed for a bounded window and the pool row is
-///   KEPT for the deposit it still holds.
+/// - **This lane to this provider is finished, but the pool's DEPOSIT is not gone.** The
+///   signer's spending cap is exhausted (`SpendingCapExhausted`) or its capability expired
+///   (`CapabilityExpired`), our accounting drifted (`AmountRegression`/`BytesRegression`),
+///   the voucher was addressed to the wrong pool or a different provider
+///   (`WrongPool`/`WrongProvider`), or the pool's own remaining deposit can no longer fund
+///   further credit (`PoolExhausted`). No further voucher on this lane is accepted, but the
+///   pool row still holds a deposit worth keeping — so the provider is suppressed for a
+///   bounded window and the pool row is KEPT rather than deleted.
 /// - **Try again.** `RateFloorRaised` (a governance floor raise made the quoted rate stale,
 ///   #1382, so the client re-probes/re-quotes at the new floor on a fresh stream). The pool
 ///   is healthy, so leave it alone and retry.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
-/// `CapExceeded`/`AmountRegression`/`BytesRegression`, and it does not need to.
+/// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`, and it does not need to.
 /// The gap-driven `decdn_client_pull::drive` loop (this node's own cache-miss buyer leg)
 /// already retries a resumable rejection in its own loop before it can ever surface here: it
 /// reseeds the pool's ledger and reopens the pull, transparently, and this classifier sees
-/// only the FINAL outcome. The loop also answers a genuine `CapExceeded` with an on-chain
-/// top-up (via [`NodeFunder`]) rather than a terminal error. So by the time `pull_verdict`
-/// downcasts an error to `UpstreamVoucherRejected` and
+/// only the FINAL outcome. The loop also answers a genuine `SpendingCapExhausted` with an
+/// on-chain top-up (via [`NodeFunder`]) rather than a terminal error. So by the time
+/// `pull_verdict` downcasts an error to `UpstreamVoucherRejected` and
 /// reaches this function, the rejection is genuinely terminal: either the reason was never
 /// gated, it carried no bundle, the bundle failed shape validation, or the bounded resume
 /// attempts were exhausted. `OurDeadLane` remains the correct verdict for every lane-terminal
-/// reason in that case — the lane really is unusable, and the shared pool deposit is not what
-/// needs reclaiming.
+/// reason in that case — the lane really is unusable, and the deposit worth keeping the pool
+/// row for is not what needs reclaiming.
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
     match reason {
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
             PullVerdict::OurLocalFault
         }
-        // Pool and signer both fine — re-quote at the new floor (`RateFloorRaised`, #1382)
-        // and try again.
-        VoucherRejectReason::RateFloorRaised => PullVerdict::OurVoucherRetryable(reason),
-        // Terminal for THIS lane while the shared pool deposit is still escrowed. The signer's
-        // cap is spent or its capability expired (`CapExceeded`), our accounting drifted
+        // Our OWN buyer pool, not the upstream — retry, do not suppress the peer.
+        // `RateFloorRaised` re-quotes at the new floor (#1382). `PoolExhausted` says the
+        // pool WE fund the upstream from can no longer cover further credit; it is a
+        // statement about us, so every upstream returns it and routing it to
+        // `OurDeadLane` would walk the candidate list suppressing each healthy peer for
+        // an hour, outliving any top-up. The remedy is a top-up of our pool (see
+        // `genuine_exhaustion`) and a retry, so keep the peer and try again.
+        VoucherRejectReason::RateFloorRaised | VoucherRejectReason::PoolExhausted => {
+            PullVerdict::OurVoucherRetryable(reason)
+        }
+        // Terminal for THIS lane while the pool row is still worth keeping. The signer's
+        // cap is spent (`SpendingCapExhausted`) or its capability expired
+        // (`CapabilityExpired`), our accounting drifted
         // (`AmountRegression`/`BytesRegression`), or the voucher named the wrong pool or a
-        // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered the
-        // pool's money — a mis-addressed or drifted voucher spends nothing, and an exhausted
-        // cap means too little for THIS voucher, not an empty pool — so the provider is
-        // suppressed and the pool row is KEPT for the deposit it still holds.
+        // different provider (`WrongPool`/`WrongProvider`). None of these has surrendered
+        // the pool row's value outright — a mis-addressed or drifted voucher spends
+        // nothing, and an exhausted cap or expired capability means too little for THIS
+        // signer right now — so the provider is suppressed and the pool row is KEPT.
         VoucherRejectReason::WrongPool
         | VoucherRejectReason::WrongProvider
         | VoucherRejectReason::AmountRegression
         | VoucherRejectReason::BytesRegression
-        | VoucherRejectReason::CapExceeded => PullVerdict::OurDeadLane(reason),
+        | VoucherRejectReason::SpendingCapExhausted
+        | VoucherRejectReason::CapabilityExpired => PullVerdict::OurDeadLane(reason),
     }
 }
 
@@ -2870,7 +2880,7 @@ mod tests {
         assert!(timeout.downcast_ref::<HashMismatch>().is_none());
 
         let rejected: anyhow::Error = anyhow::Error::new(UpstreamVoucherRejected {
-            reason: decdn_protocol::client::VoucherRejectReason::CapExceeded,
+            reason: decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         });
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
@@ -3094,14 +3104,14 @@ mod tests {
     /// Known edges, stated precisely because the guarantee is narrower than it looks:
     /// `for_verdict` matches `OurDeadLane(_)` / `OurVoucherRetryable(_)` on their payloads,
     /// so a new `VoucherRejectReason` inherits `Clean` without a build break — acceptable,
-    /// because `voucher_verdict` IS exhaustive over all nine and already routes the node-wide
+    /// because `voucher_verdict` IS exhaustive over all ten and already routes the node-wide
     /// reasons (`BadSignature`, `WrongSigner`) to `OurLocalFault` before this function sees
     /// them. `RefusalVerdict`'s four discriminants are spelled out so a FIFTH does break the
     /// build; its `DurableMiss(_)` payload is not, so a new `DurableMissCause` still inherits
     /// `Clean`.
     #[test]
     fn only_our_own_fault_may_withhold_a_not_found() {
-        let reason = VoucherRejectReason::CapExceeded;
+        let reason = VoucherRejectReason::SpendingCapExhausted;
         for verdict in [
             PullVerdict::OversizeClaim,
             PullVerdict::RateCeiling,

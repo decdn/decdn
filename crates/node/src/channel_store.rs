@@ -42,8 +42,8 @@ use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
 use decdn_incentive::buyer_pool_table::BuyerPoolTable;
 use decdn_incentive::store::{
-    CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore, PoolStateStore,
-    StoreError,
+    CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore, PoolFloorLossStore,
+    PoolStateStore, StoreError,
 };
 use decdn_incentive::{
     AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneKey, LaneState,
@@ -119,6 +119,19 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
 /// value needs no postcard envelope.
 const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("watcher_checkpoint_v1");
+
+/// redb table holding each pool's cumulative unrecoverable floor-credit loss
+/// (`µUSDC`, ADR 003 §Pool solvency — the `dead_charge`): un-vouchered
+/// serve-time exposure that appears in no on-chain quantity and so must be
+/// persisted here to survive a restart. Lives in the same database file as
+/// [`LANE_TABLE`].
+///
+/// Key: raw `PoolId` bytes (`[u8; 32]`). Value: the accumulated `µUSDC` total
+/// as a native redb `u128` — no postcard envelope, matching the
+/// [`PENDING_SETTLE_TABLE`] convention of using redb's built-in scalar
+/// encoding for a single fixed-width number.
+const POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; 32], u128> =
+    TableDefinition::new("pool_floor_loss_v1");
 
 /// Byte width of a capability key on disk: `pool_id ‖ signer` = `32 + 20`. A
 /// capability authorizes one signer under one pool for every provider, so it is
@@ -1049,6 +1062,106 @@ impl PendingSettleStore for PersistentPoolStateStore {
     }
 }
 
+impl PoolFloorLossStore for PersistentPoolStateStore {
+    fn record_loss(&self, pool_id: B256, micro_usdc: u128) -> Result<(), StoreError> {
+        let key: [u8; 32] = pool_id.into();
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        // Force fsync-on-commit, same durability discipline as the other
+        // tables: a lost dead-charge entry after a restart would silently
+        // re-grant a pool a fresh free-floor budget.
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(POOL_FLOOR_LOSS_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            // Monotonic write: a pool's `dead_charge` only ever grows. Concurrent
+            // reservation drops on the same pool commit from independent blocking
+            // threads and can land out of order, so take the max with what is
+            // already on disk — a late, smaller write must never regress the row
+            // and re-grant already-consumed free-floor budget.
+            let existing = table
+                .get(&key)
+                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+                .map_or(0u128, |v| v.value());
+            table
+                .insert(&key, existing.max(micro_usdc))
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
+    fn load_losses(&self) -> Result<Vec<(B256, u128)>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        // A never-written table means no pool has accrued a dead charge yet —
+        // first-boot tolerance, matching the other tables in this file.
+        let table = match read_txn.open_table(POOL_FLOOR_LOSS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut out = Vec::new();
+        let iter = table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            out.push((B256::from(*key_guard.value()), value_guard.value()));
+        }
+        Ok(out)
+    }
+
+    fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError> {
+        let key: [u8; 32] = pool_id.into();
+
+        // Check first whether the table has ever been created. forget on a
+        // never-written store is a no-op by contract and must not create the
+        // table as a side effect.
+        {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            match read_txn.open_table(POOL_FLOOR_LOSS_TABLE) {
+                Ok(_) => {}
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            }
+        }
+
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(POOL_FLOOR_LOSS_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .remove(&key)
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+}
+
 /// [`PendingSettleStore`] over the buyer's `buyer_pending_settle_v1` table,
 /// isolated from the seller's `pending_settle_v1` table so the two settle
 /// sweeps never finalize each other's closes (#988). Wraps the same shared
@@ -1634,6 +1747,40 @@ mod tests {
         store.forget_pending(a.pool_id)?;
         store.forget_pending(b.pool_id)?;
         anyhow::ensure!(store.load_pending()?.is_empty());
+        Ok(())
+    }
+
+    /// The pool floor-loss dead-charge accumulator round-trips, survives a
+    /// reopen (durable commit), and forgets cleanly. Keyed by `pool_id`.
+    #[test]
+    fn redb_pool_floor_loss_round_trip_and_persist() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let a_pool = sample(1).pool_id;
+        let b_pool = sample(2).pool_id;
+        {
+            let store = PersistentPoolStateStore::open(dir.path())?;
+            store.record_loss(a_pool, 1_234_567_890_123u128)?;
+            store.record_loss(b_pool, 42u128)?;
+            // Overwrite must not add a row.
+            store.record_loss(a_pool, 999_999_999_999_999u128)?;
+        }
+        // Reopen over the SAME path — the value must survive the durable commit.
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let mut all = store.load_losses()?;
+        all.sort_by_key(|(id, _)| *id);
+        anyhow::ensure!(all.len() == 2, "overwrite must not add a row");
+        let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
+        let second = all.get(1).ok_or_else(|| anyhow::anyhow!("missing [1]"))?;
+        anyhow::ensure!(*first == (a_pool, 999_999_999_999_999u128));
+        anyhow::ensure!(*second == (b_pool, 42u128));
+
+        // forget clears it, and forget on a never-recorded pool is a no-op.
+        store.forget_loss(a_pool)?;
+        store.forget_loss(b_pool)?;
+        anyhow::ensure!(store.load_losses()?.is_empty());
+        store.forget_loss(b256!(
+            "3333333333333333333333333333333333333333333333333333333333333333"
+        ))?;
         Ok(())
     }
 

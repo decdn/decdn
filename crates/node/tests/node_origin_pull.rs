@@ -5846,7 +5846,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         total_bytes,
         RATE,
         StreamError::VoucherRejected {
-            reason: VoucherRejectReason::CapExceeded,
+            reason: VoucherRejectReason::SpendingCapExhausted,
             bundle: None,
         },
     );
@@ -12455,7 +12455,7 @@ fn honest_bao_wire_from(payload: &[u8], byte_offset: u64) -> Result<Vec<u8>> {
 /// The on-chain deposit an upstream can see, shared with the buyer's opener.
 ///
 /// A real lane rejects a voucher whose cumulative `amount` exceeds the
-/// signer's capability cap (`VoucherRejectReason::CapExceeded`), and a real
+/// signer's capability cap (`VoucherRejectReason::SpendingCapExhausted`), and a real
 /// `topUp` raises the pool's escrowed deposit backing that cap. Modelling it
 /// as one shared cell is what makes the round trip real here:
 /// [`FundingOpener::top_up_channel`] raises the same
@@ -12679,7 +12679,7 @@ async fn serve_with_deposit_ceiling(
     Ok(())
 }
 
-/// Read the buyer's voucher and either accept it or refuse it `CapExceeded`,
+/// Read the buyer's voucher and either accept it or refuse it `SpendingCapExhausted`,
 /// exactly as the `PaymentPool` would: the voucher's CUMULATIVE amount is what the
 /// deposit has to cover. Returns whether it was accepted.
 ///
@@ -12707,7 +12707,7 @@ async fn settle_voucher(
         write_frame(
             send,
             &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::CapExceeded,
+                reason: VoucherRejectReason::SpendingCapExhausted,
                 bundle: None,
             }))?,
         )

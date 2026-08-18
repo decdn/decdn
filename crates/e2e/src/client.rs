@@ -892,11 +892,11 @@ fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
 /// fallthrough.
 ///
 /// Everything else is terminal: a corrupt delivery (`HashMismatch`), a buyer-side
-/// size-cap rejection (`BlobTooLargeClaim`), any mid-stream voucher rejection
-/// (`UpstreamVoucherRejected` — e.g. an `AmountRegression` left by one-sided ack
-/// loss, deposit exhaustion, or a `CapExceeded`), or a refusal by which the node
-/// reports itself degraded / the blob over its own ceiling. Retrying cannot fix
-/// any of those, so we fail fast and surface the real cause.
+/// size-cap rejection (`BlobTooLargeClaim`), any other mid-stream voucher
+/// rejection (`UpstreamVoucherRejected` — e.g. an `AmountRegression` left by
+/// one-sided ack loss, deposit exhaustion, or a `SpendingCapExhausted`), or a refusal by
+/// which the node reports itself degraded / the blob over its own ceiling.
+/// Retrying cannot fix any of those, so we fail fast and surface the real cause.
 ///
 /// The refusal arm is only this precise because the wire code now survives as a
 /// typed `UpstreamRefused` (#1144); before that a refusal was an opaque string and
