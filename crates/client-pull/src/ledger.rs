@@ -26,14 +26,14 @@ pub struct Cumulative {
 }
 
 impl From<&WatermarkBundle> for Cumulative {
-    /// Decode a wallet-less resume bundle's big-endian `uint256` totals
-    /// (issue #1481) into the same shape [`PoolLedger`] tracks. Infallible
-    /// — `U256::from_be_bytes` cannot fail on a fixed 32-byte array — so a
-    /// caller can re-seed directly from a bundle without a `Result`.
+    /// Decode a wallet-less resume bundle's `u64` totals (issue #1481) into
+    /// the same shape [`PoolLedger`] tracks. Infallible — `U256::from`
+    /// cannot fail on a `u64` — so a caller can re-seed directly from a
+    /// bundle without a `Result`.
     fn from(bundle: &WatermarkBundle) -> Self {
         Self {
-            bytes: U256::from_be_bytes(bundle.bytes_delivered),
-            amount: U256::from_be_bytes(bundle.amount),
+            bytes: U256::from(bundle.bytes_delivered),
+            amount: U256::from(bundle.amount),
         }
     }
 }
@@ -393,12 +393,12 @@ mod tests {
     #[test]
     fn cumulative_from_bundle_is_lossless() {
         let bundle = WatermarkBundle {
-            amount: U256::MAX.to_be_bytes(),
-            bytes_delivered: U256::from(1_048_576u64).to_be_bytes(),
+            amount: u64::MAX,
+            bytes_delivered: 1_048_576u64,
             last_signature: vec![0xABu8; 65],
         };
         let cum = Cumulative::from(&bundle);
-        assert_eq!(cum.amount, U256::MAX);
+        assert_eq!(cum.amount, U256::from(u64::MAX));
         assert_eq!(cum.bytes, U256::from(1_048_576u64));
     }
 
@@ -416,8 +416,8 @@ mod tests {
             amount: U256::from(10u64),
         });
         let bundle = WatermarkBundle {
-            amount: U256::from(50u64).to_be_bytes(),
-            bytes_delivered: U256::from(5000u64).to_be_bytes(),
+            amount: 50u64,
+            bytes_delivered: 5000u64,
             last_signature: vec![0xCDu8; 65],
         };
 

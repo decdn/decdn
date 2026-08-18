@@ -606,19 +606,19 @@ impl ChunkData {
 /// is an additional signed, monotone cumulative that must not regress below the
 /// highest accepted; it is what the node verifies against (rather than
 /// reconstructing) so same-lane vouchers settle independent of arrival order.
-/// Both are 256-bit values in big-endian bytes — the protocol crate has no
-/// `U256`, and truncating to `u64` would break pools whose totals exceed
-/// `u64::MAX`.
+/// Both are `u64` cumulative totals matching the contract's on-chain `uint64`
+/// `Lane`/`LaneVoucher` storage; the node zero-extends them to `uint256` to
+/// reconstruct the EIP-712 signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).
     pub signature: Vec<u8>,
-    /// Cumulative payment in token base units, big-endian `uint256`.
-    pub amount: [u8; 32],
-    /// Cumulative bytes delivered, big-endian `uint256`. Signed by the client
-    /// and transmitted so the node verifies against exactly what was signed,
-    /// independent of same-lane stream ordering.
-    pub bytes_delivered: [u8; 32],
+    /// Cumulative payment in token base units.
+    pub amount: u64,
+    /// Cumulative bytes delivered. Signed by the client and transmitted so
+    /// the node verifies against exactly what was signed, independent of
+    /// same-lane stream ordering.
+    pub bytes_delivered: u64,
 }
 
 impl Voucher {
@@ -638,18 +638,18 @@ impl Voucher {
 /// The node's true watermark for a pool capability, echoed back on a gated
 /// [`StreamError::VoucherRejected`] so a wallet-less client can self-heal
 /// (issue #1481). `amount`/`bytes_delivered` mirror the seller-side
-/// `PoolState::last_*` fields, 256-bit big-endian for the same reason as
-/// [`Voucher`] — no `U256` in the protocol crate. `last_signature` is the
-/// node's stored last-accepted **client** signature (`r‖s‖v`, exactly
-/// [`VOUCHER_SIG_LEN`]) — not a node signature over this bundle — so the
-/// client can confirm which of its own vouchers the node holds.
+/// `PoolState::last_*` fields as `u64` cumulative totals, for the same reason
+/// as [`Voucher`] — matching the contract's on-chain `uint64` storage.
+/// `last_signature` is the node's stored last-accepted **client** signature
+/// (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) — not a node signature over this
+/// bundle — so the client can confirm which of its own vouchers the node
+/// holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatermarkBundle {
-    /// Cumulative amount of the node's last-accepted voucher, big-endian `uint256`.
-    pub amount: [u8; 32],
-    /// Cumulative bytes delivered as of the node's last-accepted voucher,
-    /// big-endian `uint256`.
-    pub bytes_delivered: [u8; 32],
+    /// Cumulative amount of the node's last-accepted voucher.
+    pub amount: u64,
+    /// Cumulative bytes delivered as of the node's last-accepted voucher.
+    pub bytes_delivered: u64,
     /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
     /// node's last-accepted voucher. `Vec<u8>` rather than a fixed array,
     /// mirroring [`Voucher::signature`] — postcard/serde signature fields on
@@ -902,8 +902,8 @@ mod tests {
     fn sample_voucher() -> Voucher {
         Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
-            amount: [0x11u8; 32],
-            bytes_delivered: [0x22u8; 32],
+            amount: 0x1111_1111_1111_1111u64,
+            bytes_delivered: 0x2222_2222_2222_2222u64,
         }
     }
 
@@ -1093,8 +1093,8 @@ mod tests {
         let e = StreamError::VoucherRejected {
             reason: VoucherRejectReason::CapExceeded,
             bundle: Some(WatermarkBundle {
-                amount: [0x11u8; 32],
-                bytes_delivered: [0x33u8; 32],
+                amount: 0x1111_1111_1111_1111u64,
+                bytes_delivered: 0x3333_3333_3333_3333u64,
                 last_signature: vec![0x44u8; VOUCHER_SIG_LEN],
             }),
         };
@@ -1263,15 +1263,15 @@ mod tests {
     fn voucher_wire_format_is_stable() -> Result<(), postcard::Error> {
         let v = Voucher {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
-            amount: [0x01u8; 32],
-            bytes_delivered: [0x02u8; 32],
+            amount: 1u64,
+            bytes_delivered: 2u64,
         };
         let bytes = postcard::to_allocvec(&v)?;
         let mut expected = Vec::new();
         expected.push(VOUCHER_SIG_LEN as u8); // signature length prefix (65)
         expected.extend_from_slice(&[0xCDu8; VOUCHER_SIG_LEN]); // signature
-        expected.extend_from_slice(&[0x01u8; 32]); // amount (no length prefix)
-        expected.extend_from_slice(&[0x02u8; 32]); // bytes_delivered (no length prefix)
+        expected.push(1u8); // amount (varint)
+        expected.push(2u8); // bytes_delivered (varint)
         assert_eq!(bytes, expected);
         Ok(())
     }
@@ -1356,8 +1356,8 @@ mod tests {
     #[test]
     fn watermark_bundle_validate_rejects_wrong_len_signature() {
         let b = WatermarkBundle {
-            amount: [0u8; 32],
-            bytes_delivered: [0u8; 32],
+            amount: 0u64,
+            bytes_delivered: 0u64,
             last_signature: vec![0xCDu8; VOUCHER_SIG_LEN - 1],
         };
         assert_eq!(
@@ -1676,8 +1676,8 @@ mod tests {
             ClientMessage::StreamError(StreamError::VoucherRejected {
                 reason: VoucherRejectReason::CapExceeded,
                 bundle: Some(WatermarkBundle {
-                    amount: [0x01u8; 32],
-                    bytes_delivered: [0x03u8; 32],
+                    amount: 0x0101_0101_0101_0101u64,
+                    bytes_delivered: 0x0303_0303_0303_0303u64,
                     last_signature: vec![0x04u8; VOUCHER_SIG_LEN],
                 }),
             }),
