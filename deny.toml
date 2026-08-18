@@ -28,13 +28,6 @@ ignore = [
     # via alloy-primitives -> alloy. No fixed release exists. Re-evaluate when
     # alloy-primitives drops paste (tracked upstream in the alloy-rs/core repo).
     "RUSTSEC-2024-0436",
-    # proc-macro-error2 v2.x: unmaintained (RustSec: author confirmed no longer
-    # maintained; suggests migrating to manyhow / proc-macro2-diagnostics). This is
-    # the formerly-maintained fork of proc-macro-error (itself ignored above as
-    # RUSTSEC-2024-0370) and is now unmaintained too. Build-time proc-macro only,
-    # no runtime code. Transitive via alloy-sol-macro -> alloy-sol-types -> alloy.
-    # No fixed release exists. Re-evaluate when alloy-sol-macro drops it.
-    "RUSTSEC-2026-0173",
     # h2 0.3.x: unbounded empty-DATA-frame DoS (low severity). Patched only in the
     # 0.4 line (>=0.4.16); the 0.3 line has no fixed release. The production binary
     # `decdn-node` ships hyper-1 + h2 0.4, held at 0.4.16 (patched) in Cargo.lock, so
