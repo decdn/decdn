@@ -64,11 +64,12 @@ const E2E_CHAIN_ID: u64 = 31_337_690_000;
 const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const DEPLOYER_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 /// Anvil dev account #1 — the "admin" EOA: deploys the mock USDC, holds the
-/// initial TOKEN supply, and mints/transfers.
+/// initial TOKEN supply, and mints/transfers. Its address is always derived from
+/// this key via [`admin_address`], never a parallel literal, so the EOA the
+/// fixture funds can't drift from the wallet its provider signs with.
 /// Deliberately NOT account #0 (the forge-script broadcaster, whose nonce the
 /// script advances by ~25 — sharing it desyncs alloy's cached nonce).
 const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-const ADMIN_ADDR: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
 /// Address the fixture grants `EMERGENCY_MULTISIG_ROLE` to, purely so
 /// `registerRegionalBody` has a role-holding comparison side for its
@@ -352,7 +353,7 @@ impl ChainFixture {
         let anvil = spawn_anvil(None).await?;
         load_state_snapshot(&anvil.admin, &shared.state_path).await?;
 
-        let admin_addr: Address = ADMIN_ADDR.parse().context("parse admin addr")?;
+        let admin_addr = admin_address()?;
         Ok(Self {
             _anvil: anvil.guard,
             url: anvil.url,
@@ -1980,7 +1981,7 @@ async fn deploy_and_snapshot(
     // Mock USDC first, then the protocol with the initial TOKEN supply held by
     // the admin EOA so it can distribute bond stake to N operators.
     let usdc = deploy_mock_usdc(&anvil.admin, contracts).await?;
-    let token_holder: Address = ADMIN_ADDR.parse().context("parse admin addr")?;
+    let token_holder = admin_address()?;
     run_deploy_script(&anvil.admin, contracts, &anvil.rpc_url, usdc, token_holder).await?;
 
     let (addrs, manifest_usdc) = read_manifest(&forge_manifest)?;
@@ -2087,7 +2088,7 @@ fn artifact_cache_key(contracts: &Path) -> anyhow::Result<String> {
     buf.extend_from_slice(usdc_bc.as_bytes());
     buf.extend_from_slice(deploy_bc.as_bytes());
     buf.extend_from_slice(terms_hash().as_slice());
-    buf.extend_from_slice(ADMIN_ADDR.as_bytes());
+    buf.extend_from_slice(admin_address()?.as_slice());
     buf.extend_from_slice(DEPLOYER_ADDR.as_bytes());
     Ok(short_hash(&buf))
 }
@@ -2316,6 +2317,13 @@ const TERMS_TEXT: &str = include_str!("../../cli/TERMS.md");
 /// fixture chain deploys with, and the value a CLI registration must match.
 fn terms_hash() -> B256 {
     alloy::primitives::keccak256(TERMS_TEXT.as_bytes())
+}
+
+/// The admin EOA address, derived from [`ADMIN_KEY`] so it is always the address
+/// of the wallet the fixture's provider signs with (see [`spawn_anvil`]).
+fn admin_address() -> anyhow::Result<Address> {
+    let signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
+    Ok(signer.address())
 }
 
 /// The global-scope region key: `bytes32("GLOBAL")`.
