@@ -28,7 +28,7 @@ struct Profile {
     decdn_bin: String,
     data_dir: PathBuf,
     rpc_url: String,
-    payment_channel: Address,
+    payment_pool: Address,
     capacity_bond: Option<Address>,
     slash_judge: Option<Address>,
     chain_id: u64,
@@ -44,7 +44,7 @@ pub struct WrapperConfig {
     pub decdn_bin: String,
     pub data_dir: PathBuf,
     pub rpc_url: String,
-    pub payment_channel: Address,
+    pub payment_pool: Address,
     pub capacity_bond: Option<Address>,
     pub slash_judge: Option<Address>,
     pub chain_id: u64,
@@ -113,7 +113,7 @@ impl WrapperConfig {
             decdn_bin: profile.decdn_bin,
             data_dir: expand_home(&profile.data_dir)?,
             rpc_url: profile.rpc_url,
-            payment_channel: profile.payment_channel,
+            payment_pool: profile.payment_pool,
             capacity_bond: profile.capacity_bond,
             slash_judge: profile.slash_judge,
             chain_id: profile.chain_id,
@@ -133,7 +133,7 @@ mod tests {
         decdn_bin = "decdn"
         data_dir = "~/.decdn/data"
         rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
-        payment_channel = "0x0000000000000000000000000000000000000001"
+        payment_pool = "0x0000000000000000000000000000000000000001"
         capacity_bond = "0x0000000000000000000000000000000000000002"
         chain_id = 421614
     "#;
