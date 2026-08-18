@@ -57,10 +57,11 @@ pub struct LaneKey {
 /// [`Self::hydrate`] rather than a struct literal (#751).
 ///
 /// The remaining fields stay `pub` deliberately: `pool_id`/`signer`/`provider`
-/// are immutable identity set once; `cap` and `expiry` are set from the
-/// registered capability by trusted node-side writers. They are not
-/// replay-critical (they don't gate the amount/bytes monotonicity the #527 guard
-/// protects), so they don't need the private treatment the `last_*` fields do.
+/// are immutable identity set once; `cap`, `expiry`, and `registered_until`
+/// are set from the registered capability by trusted node-side writers. They
+/// are not replay-critical (they don't gate the amount/bytes monotonicity the
+/// #527 guard protects), so they don't need the private treatment the
+/// `last_*` fields do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneState {
     /// The pool these vouchers draw from (on-chain `PaymentPool` deposit id).
@@ -77,6 +78,13 @@ pub struct LaneState {
     /// Capability expiry (Unix seconds). The node handler holds the clock and
     /// refuses vouchers at or past this; `0` means "unknown / not tracked".
     pub expiry: u64,
+    /// The observed on-chain capability expiry for this lane's signer
+    /// (`authorized[pool_id][signer].expiry`), in Unix seconds; `0` means
+    /// "unknown / not yet registered". The seller redeemer reads it to skip a
+    /// per-lane `getAuthorization` when the registration is already known and
+    /// still live. Not replay-critical (it gates no amount/bytes monotonicity),
+    /// so it is `pub` like `cap`/`expiry` rather than a private `last_*` field.
+    pub registered_until: u64,
     /// Cumulative amount of the most-recently-accepted voucher (token base
     /// units). `U256::ZERO` until the first voucher is applied. Private
     /// (#527/#751) — read via [`Self::last_amount`].
@@ -107,6 +115,11 @@ impl LaneState {
     /// `signer`/`provider` are both `Address`), so a transposition compiles. Do
     /// not add callers without round-trip coverage that pins a signer distinct
     /// from the provider.
+    ///
+    /// Hydration seeds `registered_until` to `0` (unknown) regardless of
+    /// caller-supplied `expiry`; the trusted on-disk decoder
+    /// (`StoredLaneState::into_state`) assigns the persisted value on the
+    /// returned `Self` after construction.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(
@@ -125,6 +138,7 @@ impl LaneState {
             provider,
             cap,
             expiry,
+            registered_until: 0,
             last_amount,
             last_bytes_delivered,
             last_signature,
@@ -378,6 +392,26 @@ mod tests {
     use alloy::primitives::{address, b256};
     use alloy::signers::local::PrivateKeySigner;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn registered_until_defaults_zero_and_survives_stage_voucher_clone() {
+        let st = LaneState::hydrate(
+            B256::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+            U256::MAX,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+        assert_eq!(st.registered_until, 0, "hydrate seeds unknown");
+        let mut with_reg = st.clone();
+        with_reg.registered_until = 1_800_000_000;
+        // stage_voucher clones self; the clone must carry registered_until forward.
+        let cloned = with_reg.clone();
+        assert_eq!(cloned.registered_until, 1_800_000_000);
+    }
 
     /// `PoolStateStore` whose `record` always errors. Proves the
     /// strict-durability invariant: `apply_voucher` MUST surface the store

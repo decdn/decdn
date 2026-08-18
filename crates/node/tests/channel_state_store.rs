@@ -201,6 +201,39 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `registered_until` (the observed on-chain capability expiry watermark)
+/// must survive a `record` → `flush` → reopen → `get` round trip, the same
+/// durability guarantee the `last_*` voucher fields already have.
+#[test]
+fn registered_until_round_trips_across_restart() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let signer = PrivateKeySigner::random();
+
+    {
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let mut state = make_state(POOL_ID, &signer);
+        state.registered_until = 1_800_000_000;
+        store.record(&state)?;
+        store.flush()?;
+    }
+
+    let store = PersistentPoolStateStore::open(dir.path())?;
+    let key = LaneKey {
+        pool_id: POOL_ID,
+        signer: signer.address(),
+        provider: PROVIDER,
+    };
+    let found = store
+        .get(key)?
+        .ok_or_else(|| anyhow::anyhow!("lane not found after reopen"))?;
+    anyhow::ensure!(
+        found.registered_until == 1_800_000_000,
+        "registered_until did not survive persistence round trip, got {}",
+        found.registered_until,
+    );
+    Ok(())
+}
+
 /// Two distinct lanes with interleaved monotonic voucher progressions must both
 /// reach their expected terminal state — verifies the store does not
 /// cross-contaminate entries across lane keys. Same-lane concurrent acceptance

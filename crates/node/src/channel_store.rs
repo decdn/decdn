@@ -205,6 +205,11 @@ fn lane_key_parts(bytes: &[u8; LANE_KEY_LEN]) -> (B256, Address, Address) {
 /// [`LaneState`] carries the stronger `Option<[u8; 65]>`, and the narrowing
 /// (empty → `None`, 65 → `Some`, anything else → corrupt) lives in
 /// [`StoredLaneState::into_state`].
+///
+/// `registered_until` is appended after `expiry`: the observed on-chain
+/// capability expiry for this lane's signer. It is append-only —
+/// [`SUPPORTED_SCHEMA_VERSION`] does not bump for it, since no prior on-disk
+/// record shape exists to stay compatible with.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredLaneState {
     schema_version: u32,
@@ -213,6 +218,7 @@ struct StoredLaneState {
     signature: Vec<u8>,
     cap: [u8; 32],
     expiry: u64,
+    registered_until: u64,
 }
 
 impl From<&LaneState> for StoredLaneState {
@@ -224,6 +230,7 @@ impl From<&LaneState> for StoredLaneState {
             signature: state.last_signature().map_or_else(Vec::new, |s| s.to_vec()),
             cap: state.cap.to_be_bytes(),
             expiry: state.expiry,
+            registered_until: state.registered_until,
         }
     }
 }
@@ -259,7 +266,7 @@ impl StoredLaneState {
                 })?,
             )
         };
-        Ok(LaneState::hydrate(
+        let mut state = LaneState::hydrate(
             pool_id,
             signer,
             provider,
@@ -268,7 +275,9 @@ impl StoredLaneState {
             U256::from_be_bytes(self.last_amount),
             U256::from_be_bytes(self.last_bytes_delivered),
             last_signature,
-        ))
+        );
+        state.registered_until = self.registered_until;
+        Ok(state)
     }
 }
 
@@ -1477,6 +1486,7 @@ mod tests {
             signature: s.last_signature().map_or_else(Vec::new, |x| x.to_vec()),
             cap: s.cap.to_be_bytes(),
             expiry: s.expiry,
+            registered_until: s.registered_until,
         };
         let encoded = postcard::to_allocvec(&forward)?;
         {
