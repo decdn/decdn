@@ -269,6 +269,45 @@ impl LaneState {
         signed
             .verify_signer(self.signer, domain)
             .map_err(PoolError::Signature)?;
+        self.advance_presigned(signed)
+    }
+
+    /// The amount/bytes monotonicity + cap half of [`Self::stage_voucher`], for a
+    /// voucher whose signature the caller ALREADY verified against `self.signer`.
+    ///
+    /// The serve loop recovers the (watermark-independent) signature OUTSIDE the
+    /// per-lane lock so concurrent same-lane streams do not serialize on the
+    /// `ecrecover` (#1735), then calls this under the lock to re-check the
+    /// (watermark-dependent) monotonicity guards against the LIVE watermark and
+    /// advance atomically. The monotonicity check and the advance MUST stay under
+    /// one lock hold: two streams reading the same watermark and both advancing
+    /// would lose one voucher.
+    ///
+    /// `pool_id` / `provider` are the lane's own identity and are not re-checked:
+    /// the caller reconstructs `signed` from this lane's pinned identity, so they
+    /// match by construction. Every other check mirrors [`Self::stage_voucher`].
+    ///
+    /// # Errors
+    ///
+    /// [`PoolError::AmountRegression`], [`PoolError::BytesRegression`], or
+    /// [`PoolError::CapExceeded`] — the same watermark-dependent taxonomy as
+    /// [`Self::stage_voucher`], minus the signature and pool/provider checks.
+    pub fn advance_presigned(
+        &self,
+        signed: &SignedVoucher,
+    ) -> Result<(Self, VoucherApplied), PoolError> {
+        // The caller reconstructs `signed` from this lane's pinned identity, so
+        // `pool_id`/`provider` match by construction and are not re-checked on the
+        // fast path. Guard against a call site that advances a lane with a voucher
+        // built for a DIFFERENT identity (it would silently mutate the watermark).
+        debug_assert_eq!(
+            signed.voucher.pool_id, self.pool_id,
+            "advance_presigned: voucher pool_id must match the lane's"
+        );
+        debug_assert_eq!(
+            signed.voucher.provider, self.provider,
+            "advance_presigned: voucher provider must match the lane's"
+        );
         if signed.voucher.amount <= self.last_amount {
             return Err(PoolError::AmountRegression {
                 last: self.last_amount,

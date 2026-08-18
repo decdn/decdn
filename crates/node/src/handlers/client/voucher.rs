@@ -13,7 +13,7 @@ use super::{
     SendStream, SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop,
     WatermarkBundle, unix_millis, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
-use decdn_incentive::PoolError;
+use decdn_incentive::{PoolError, VoucherError};
 
 /// A voucher that passed the node-side verify half, carrying the advanced
 /// candidate state, its cumulative byte watermark, and the receipt amount.
@@ -95,8 +95,38 @@ impl ClientHandler {
                 anyhow::anyhow!("voucher read timed out after {VOUCHER_READ_TIMEOUT:?}")
             })??;
 
-        // (2) VERIFY + ADVANCE under the per-lane lock (the watermark checked is
-        // the watermark stored).
+        // (2) RECOVER + verify the signature WITHOUT holding the per-lane lock.
+        // The `ecrecover` is the most expensive op on the serve path, and
+        // signature validity depends only on the voucher bytes and the lane's
+        // IMMUTABLE pinned identity — never the mutable watermark. `lane_key`
+        // carries that identity (`pool_id`/`signer`/`provider`), so this needs no
+        // guard, and concurrent same-lane streams (#1697) recover in parallel
+        // instead of serializing on the crypto (#1735). A malformed or high-`s`
+        // signature (#836) is rejected here as `BadSignature`; a well-formed
+        // signature recovering to the wrong address is `WrongSigner`. Neither
+        // reason is watermark-gated, so both carry no wallet-less-resume bundle
+        // (#1481 §5).
+        let Ok(signed) =
+            wire_voucher_to_signed(&wire, lane_key.pool_id, lane_key.signer, lane_key.provider)
+        else {
+            self.write_reject(send, VoucherRejectReason::BadSignature, None)
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        };
+        if let Err(e) = signed.verify_signer(lane_key.signer, &self.voucher_domain) {
+            let reason = match e {
+                VoucherError::InvalidSignature => VoucherRejectReason::BadSignature,
+                VoucherError::WrongSigner { .. } => VoucherRejectReason::WrongSigner,
+            };
+            self.write_reject(send, reason, None).await?;
+            return Ok(VoucherStop::Rejected);
+        }
+
+        // (3) RE-CHECK the watermark-dependent guards + ADVANCE under the per-lane
+        // lock (the watermark checked is the watermark stored). The signature is
+        // already verified above; only the monotonicity check against the LIVE
+        // watermark and the advance need the lock, and they must stay atomic — two
+        // streams reading the same watermark and both advancing would lose one.
         let mut guard = lane.lock().await;
 
         // Capability-expiry gate (ADR 003 §Capability delegation). `expiry == 0`
@@ -114,6 +144,7 @@ impl ClientHandler {
         let verified = match self.verify_voucher(
             &guard.state,
             guard.bytes_delivered_cumulative,
+            &signed,
             &wire,
             rate_per_mb,
         ) {
@@ -172,14 +203,16 @@ impl ClientHandler {
         Ok(VoucherStop::Continue { credited_bytes })
     }
 
-    /// The node-side verify half for ONE voucher, evaluated against the current
-    /// lane watermark (`state` / `cumulative_bytes`) with no durable side effect.
+    /// The node-side, watermark-dependent verify half for ONE voucher whose
+    /// signature the caller ALREADY verified against the lane's pinned `signer`
+    /// outside the per-lane lock (#1735). Evaluated against the current lane
+    /// watermark (`state` / `cumulative_bytes`) with no durable side effect.
     /// `bytes_delivered` is self-describing: it comes straight off the wire, so
     /// verification does not depend on the order same-lane streams settle in.
-    /// `stage_voucher` runs first (signature + amount/bytes monotonicity); the two
-    /// rate checks then run on the advance path against the aggregate span
-    /// (`applied.amount_delta()` / `applied.bytes_delta()`), which is
-    /// order-independent because it is measured against the lane watermark:
+    /// `advance_presigned` runs first (amount/bytes monotonicity against the live
+    /// watermark); the two rate checks then run on the advance path against the
+    /// aggregate span (`applied.amount_delta()` / `applied.bytes_delta()`), which
+    /// is order-independent because it is measured against the lane watermark:
     /// - the per-span **advertised-rate** check bails on a genuine underpayment
     ///   (no wire reason; delivery just stops);
     /// - the cumulative **live-floor** check rejects cleanly with
@@ -189,6 +222,7 @@ impl ClientHandler {
         &self,
         state: &LaneState,
         cumulative_bytes: U256,
+        signed: &SignedVoucher,
         wire: &decdn_protocol::client::Voucher,
         rate_per_mb: u64,
     ) -> Result<VerifiedVoucher, VerifyStop> {
@@ -197,18 +231,25 @@ impl ClientHandler {
         // same-lane streams settle in.
         let new_bytes = U256::from(wire.bytes_delivered);
 
-        // Reconstruct the signed voucher from wire + lane context. `pool_id`,
-        // `signer`, and `provider` are fixed for the lane; `amount`/`bytes_delivered`
-        // ride the wire.
-        let Ok(signed) = wire_voucher_to_signed(wire, state.pool_id, state.signer, state.provider)
-        else {
-            return Err(VerifyStop::Reject(VoucherRejectReason::BadSignature, None));
-        };
+        // `signed` is the reconstruction of `wire` (the caller builds it via
+        // `wire_voucher_to_signed`). `advance_presigned` reads `signed.*` while the
+        // rate/floor checks below read `wire.*`, so the two MUST agree — a mismatch
+        // would verify inconsistent values. Cheap invariant guard for tests/debug.
+        debug_assert_eq!(
+            signed.voucher.amount,
+            U256::from(wire.amount),
+            "verify_voucher: signed/wire amount must match"
+        );
+        debug_assert_eq!(
+            signed.voucher.bytes_delivered, new_bytes,
+            "verify_voucher: signed/wire bytes_delivered must match"
+        );
 
-        // `stage_voucher` verifies the signature, then the amount/bytes monotonicity
-        // guards, and returns the advanced candidate. It touches no store, so it can
-        // never surface `RetrySignal` here.
-        match state.stage_voucher(&signed, &self.voucher_domain) {
+        // `advance_presigned` re-checks the amount/bytes monotonicity guards
+        // against the LIVE watermark and returns the advanced candidate. It skips
+        // the signature (already verified by the caller) and touches no store, so
+        // it can never surface `RetrySignal` here.
+        match state.advance_presigned(signed) {
             Ok((next_state, applied)) => {
                 // ADVANCE: this voucher raises the lane watermark. Rate-check the
                 // aggregate span it covers (`applied.*_delta()` is measured against
@@ -284,22 +325,23 @@ impl ClientHandler {
             }
             Err(e) => {
                 // Map to the wire reject reason. `Err(RetrySignal)` (a transient
-                // store failure) cannot occur here — `stage_voucher` touches no
+                // store failure) cannot occur here — `advance_presigned` touches no
                 // store — so this is defensive: abort the stream rather than
                 // inventing a wire reason for a fault this path cannot produce.
                 let reason = match voucher_reject_reason(&e) {
                     Ok(reason) => reason,
                     Err(RetrySignal) => {
                         return Err(VerifyStop::Bail(
-                            "stage_voucher touches no store; unexpected RetrySignal".to_string(),
+                            "advance_presigned touches no store; unexpected RetrySignal"
+                                .to_string(),
                         ));
                     }
                 };
                 // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
-                // reason whose rejected voucher recovers to the pinned signer,
-                // attach the node's true watermark so an authorized funder can
-                // re-seed and resume.
-                let bundle = self.watermark_bundle_for_reject(reason, &signed, state);
+                // reason, attach the node's true watermark so an authorized funder
+                // can re-seed and resume. The pinned-signer gate is already
+                // enforced by the caller's lock-free `verify_signer` (#1735).
+                let bundle = Self::watermark_bundle_for_reject(reason, state);
                 Err(VerifyStop::Reject(reason, bundle))
             }
         }
@@ -307,29 +349,29 @@ impl ClientHandler {
 
     /// Build the wallet-less-resume [`WatermarkBundle`] for a rejected voucher
     /// (#1481 §5), or `None` when the voucher is not eligible. Returns `Some`
-    /// only when ALL hold:
+    /// only when BOTH hold:
     /// - `reason` is one of the watermark-gated regression/exhaustion reasons
     ///   (`AmountRegression` / `BytesRegression` / `SpendingCapExhausted`);
-    /// - the `rejected` voucher's signature recovers to `state.signer`, the
-    ///   lane's pinned capability signer — otherwise anyone who guessed the
-    ///   chain-derivable `pool_id` could pull a lane's private watermark;
     /// - the lane has a prior accepted voucher (`last_signature` is `Some`) to
     ///   echo back.
+    ///
+    /// The pinned-signer gate — a bundle leaks a lane's private watermark, so
+    /// only a request that recovers to `state.signer` may pull it, otherwise
+    /// anyone who guessed the chain-derivable `pool_id` could — is enforced by
+    /// the caller: [`Self::commit_one_voucher`] recovers and verifies the signer
+    /// against `state.signer` OUTSIDE the per-lane lock before this runs (#1735).
+    /// A voucher that recovers to a different address is rejected as `WrongSigner`
+    /// and never reaches here, so re-recovering under the lock would only re-do
+    /// the `ecrecover` in the critical section this method must stay out of.
     ///
     /// The watermark reported is `state`'s last-accepted amount / bytes, read
     /// while still holding the per-lane guard, before the caller swaps in the
     /// newly verified state.
     fn watermark_bundle_for_reject(
-        &self,
         reason: VoucherRejectReason,
-        rejected: &SignedVoucher,
         state: &LaneState,
     ) -> Option<WatermarkBundle> {
         if !reason.is_watermark_gated() {
-            return None;
-        }
-        let recovered = rejected.recover_signer(&self.voucher_domain).ok()?;
-        if recovered != state.signer {
             return None;
         }
         let last_signature = state.last_signature()?;
@@ -424,7 +466,7 @@ mod tests {
 
         let snapshot = lane.lock().await.state.clone();
         let verified = handler
-            .verify_voucher(&snapshot, U256::ZERO, &wire, rate_per_mb)
+            .verify_voucher(&snapshot, U256::ZERO, &signed_voucher, &wire, rate_per_mb)
             .expect("a well-formed voucher verifies against a fresh lane");
         assert_eq!(
             verified.new_bytes, new_bytes,
@@ -537,7 +579,7 @@ mod tests {
         // verify against the high watermark; the sibling's watermark already
         // covers this stream's delivered.
         let verified = handler
-            .verify_voucher(&seed, U256::from(two_mb), &wire, rate_per_mb)
+            .verify_voucher(&seed, U256::from(two_mb), &signed_low, &wire, rate_per_mb)
             .expect("a superseded but well-signed voucher is benign, not a reject");
         assert_eq!(
             verified.new_bytes,
@@ -602,7 +644,13 @@ mod tests {
         };
 
         let err = handler
-            .verify_voucher(&seed, U256::from(one_mb), &wire, rate_per_mb)
+            .verify_voucher(
+                &seed,
+                U256::from(one_mb),
+                &divergent_voucher,
+                &wire,
+                rate_per_mb,
+            )
             .expect_err("a divergent equal-amount voucher must be rejected");
         match err {
             super::VerifyStop::Reject(reason, _) => assert_eq!(
@@ -612,5 +660,150 @@ mod tests {
             ),
             super::VerifyStop::Bail(msg) => panic!("expected a Reject, got Bail({msg})"),
         }
+    }
+
+    /// #1735: signature validity is hoisted OUT of the per-lane lock. A voucher
+    /// signed by the wrong key is rejected by the (lock-free) signature recovery
+    /// — `verify_signer` against the lane's pinned signer — while the inside-lock
+    /// `advance_presigned` no longer inspects the signature at all: it would
+    /// happily advance the same voucher. This is exactly what lets concurrent
+    /// same-lane streams recover in parallel and only briefly serialize on the
+    /// advance.
+    #[test]
+    fn wrong_signer_is_rejected_without_the_lane_lock() {
+        use alloy::primitives::{Address, B256, U256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let pinned_key = PrivateKeySigner::random();
+        let pinned_signer = pinned_key.address();
+        let wrong_key = PrivateKeySigner::random();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        // A fresh lane pinned to `pinned_signer` at a zero watermark.
+        let seed = LaneState::hydrate(
+            pool_id,
+            pinned_signer,
+            provider,
+            U256::MAX,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+
+        // A well-formed, monotone voucher — but SIGNED BY THE WRONG KEY. Its
+        // `signer` field still names the pinned signer; only the signature is
+        // forged, so recovery lands on `wrong_key`'s address.
+        let rate_per_mb = 1_000_000u64;
+        let one_mb = decdn_incentive::rate::BYTES_PER_MB;
+        let amount = decdn_incentive::min_payment(one_mb, rate_per_mb);
+        let forged = decdn_incentive::Voucher {
+            pool_id,
+            signer: pinned_signer,
+            provider,
+            amount,
+            bytes_delivered: U256::from(one_mb),
+        }
+        .sign(&wrong_key, &domain)
+        .expect("sign with the wrong key");
+
+        // OUTSIDE the lock: the signature recovery rejects it as WrongSigner. This
+        // is the reject the handler performs before ever taking the guard.
+        let err = forged
+            .verify_signer(pinned_signer, &domain)
+            .expect_err("a wrong-key voucher must fail signature recovery");
+        assert!(
+            matches!(err, decdn_incentive::VoucherError::WrongSigner { .. }),
+            "wrong-key voucher recovers to a different signer: {err:?}"
+        );
+
+        // INSIDE the (would-be) lock: `advance_presigned` does NOT re-check the
+        // signature — it advances the same forged voucher against the live
+        // watermark. The safety of moving recovery out rests on this: the accept
+        // decision is fully made by the lock-free recovery above.
+        let (next, _applied) = seed
+            .advance_presigned(&forged)
+            .expect("advance_presigned ignores the signature and advances");
+        assert_eq!(
+            next.last_bytes_delivered(),
+            U256::from(one_mb),
+            "advance_presigned advanced the watermark without inspecting the signature"
+        );
+    }
+
+    /// #1735: the monotonicity check and the watermark advance stay atomic under
+    /// the lock. Two same-lane streams that both recovered their vouchers against
+    /// the SAME zero snapshot cannot both advance: once the first advances the
+    /// live watermark, the second — re-checked against that LIVE watermark inside
+    /// the lock, not against its stale snapshot — is a benign `AmountRegression`
+    /// rather than a second advance that would lose the first's update.
+    #[test]
+    fn concurrent_advances_recheck_the_live_watermark_no_lost_update() {
+        use alloy::primitives::{Address, B256, U256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+        let signer_key = PrivateKeySigner::random();
+        let signer = signer_key.address();
+        let pool_id = B256::repeat_byte(0x21);
+        let provider = Address::repeat_byte(0x55);
+
+        let rate_per_mb = 1_000_000u64;
+        let one_mb = decdn_incentive::rate::BYTES_PER_MB;
+        let two_mb = one_mb * 2;
+
+        // Both streams see the same zero-watermark snapshot when they recover.
+        let snapshot = LaneState::hydrate(
+            pool_id,
+            signer,
+            provider,
+            U256::MAX,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+        );
+
+        let mk = |bytes: u64| {
+            let amount = decdn_incentive::min_payment(bytes, rate_per_mb);
+            decdn_incentive::Voucher {
+                pool_id,
+                signer,
+                provider,
+                amount,
+                bytes_delivered: U256::from(bytes),
+            }
+            .sign(&signer_key, &domain)
+            .expect("sign voucher")
+        };
+        let voucher_hi = mk(two_mb); // the winner: advances to 2 MB
+        let voucher_lo = mk(one_mb); // the straggler: recovered against zero too
+
+        // First stream advances the live watermark to 2 MB.
+        let (after_hi, _) = snapshot
+            .advance_presigned(&voucher_hi)
+            .expect("the higher cumulative voucher advances from zero");
+        assert_eq!(after_hi.last_bytes_delivered(), U256::from(two_mb));
+
+        // Second stream re-checks against the LIVE (2 MB) watermark — NOT its own
+        // zero snapshot — so its lower cumulative is a regression, not an advance.
+        // Advancing it against the stale snapshot would regress the watermark and
+        // lose the first stream's update.
+        let err = after_hi
+            .advance_presigned(&voucher_lo)
+            .expect_err("a straggler below the live watermark must not advance");
+        assert!(
+            matches!(err, decdn_incentive::PoolError::AmountRegression { .. }),
+            "straggler is a benign amount regression against the live watermark: {err:?}"
+        );
+
+        // Sanity: against its own stale snapshot the straggler WOULD have advanced
+        // — proving the re-check against the live watermark is what prevents the
+        // lost update.
+        snapshot
+            .advance_presigned(&voucher_lo)
+            .expect("against the stale zero snapshot the straggler advances");
     }
 }
