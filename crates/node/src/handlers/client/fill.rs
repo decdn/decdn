@@ -29,7 +29,7 @@ impl ClientHandler {
     /// without this check a blacklisted funder's request could still make this
     /// node front upstream USDC egress and warm its cache on that funder's
     /// behalf, only for the delivery to be refused afterwards.
-    pub(super) async fn pull_authorized(
+    pub(super) fn pull_authorized(
         &self,
         req: &StreamRequest,
         verified_client: Option<Address>,
@@ -54,7 +54,7 @@ impl ClientHandler {
         // check in `dispatch.rs`, which precedes every fill tier — a blacklisted
         // funder is refused there before this authority check is ever reached, so
         // no fill fronts USDC on a blacklisted funder's behalf.
-        self.lanes.lock().await.contains_key(&lane_key)
+        self.lanes.contains_key(&lane_key)
     }
 
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The

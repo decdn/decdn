@@ -32,6 +32,7 @@ use std::time::Duration;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
+use dashmap::DashMap;
 use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::{PoolStateStore, StoreError};
@@ -763,10 +764,13 @@ pub struct ClientHandler {
     /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
     /// (tests) makes both gates fail open.
     pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
-    /// Per-lane state, hydrated from the store at construction. Outer mutex
-    /// guards the map; each inner mutex serializes voucher application for one
-    /// lane across its concurrent streams (ADR 003 §concurrent streams).
-    lanes: Arc<Mutex<HashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>>,
+    /// Per-lane state, hydrated from the store at construction. The sharded map
+    /// resolves independent lanes concurrently — a lookup keyed by [`LaneKey`]
+    /// is a point read that only locks that key's shard; each inner mutex
+    /// serializes voucher application for one lane across its concurrent streams
+    /// (ADR 003 §concurrent streams). No call site holds a map entry across an
+    /// `.await`, so lane lookup never blocks an unrelated lane's admission.
+    lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
     /// Serializes absolute lane snapshots without holding the lane map while
     /// individual lane state (which may be fsync-bound) is locked.
     lane_metrics_refresh: Mutex<()>,
@@ -901,7 +905,7 @@ impl ClientHandler {
     /// state cannot be loaded — the node must not serve paid delivery without
     /// knowing prior voucher state (the #527 replay guard).
     pub fn new(deps: ClientHandlerDeps) -> anyhow::Result<Self> {
-        let mut map = HashMap::new();
+        let map: DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>> = DashMap::new();
         for state in deps.channel_state_store.load_all()? {
             let bytes = state.last_bytes_delivered();
             map.insert(
@@ -952,7 +956,7 @@ impl ClientHandler {
             receipt_sink: deps.receipt_sink,
             capability_sink: deps.capability_sink,
             pool_view: deps.pool_view,
-            lanes: Arc::new(Mutex::new(map)),
+            lanes: Arc::new(map),
             lane_metrics_refresh: Mutex::new(()),
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
@@ -1138,7 +1142,7 @@ impl ClientHandler {
     /// logs and retries.
     pub async fn register_lane(&self, state: LaneState) -> Result<(), StoreError> {
         let key = state.key();
-        if self.lanes.lock().await.contains_key(&key) {
+        if self.lanes.contains_key(&key) {
             return Ok(());
         }
         // The store write is a synchronous fsync (store trait §Durability) —
@@ -1150,7 +1154,7 @@ impl ClientHandler {
             .map_err(|e| StoreError::Backend(format!("register_lane join: {e}")))??;
 
         let bytes = state.last_bytes_delivered();
-        self.lanes.lock().await.entry(key).or_insert_with(|| {
+        self.lanes.entry(key).or_insert_with(|| {
             Arc::new(Mutex::new(LaneDeliveryState {
                 state,
                 bytes_delivered_cumulative: bytes,
@@ -1169,7 +1173,7 @@ impl ClientHandler {
     ///
     /// Propagates a [`StoreError`] if the durable delete fails.
     pub async fn forget_lane(&self, key: LaneKey) -> Result<(), StoreError> {
-        self.lanes.lock().await.remove(&key);
+        self.lanes.remove(&key);
         self.refresh_lane_metrics().await;
         // Drop the in-memory last-voucher stamp too (issue #749 review):
         // `touch` inserts per-lane with no eviction, so without this a settled
@@ -1479,14 +1483,14 @@ impl ClientHandler {
     /// advances only *after* the durable store write commits (#527), so the
     /// snapshot never reports a voucher the node has not persisted.
     pub async fn lane_state_snapshot(&self, key: LaneKey) -> Option<LaneState> {
-        let entry = self.lanes.lock().await.get(&key).cloned()?;
+        let entry = self.lanes.get(&key).map(|e| Arc::clone(e.value()))?;
         let guard = entry.lock().await;
         Some(guard.state.clone())
     }
 
     async fn refresh_lane_metrics(&self) {
         let _refresh = self.lane_metrics_refresh.lock().await;
-        let open = self.lanes.lock().await.len();
+        let open = self.lanes.len();
         // Deposit is a pool-level, on-chain quantity (getPool), not carried per
         // lane, so the seller-side snapshot reports lane count only.
         self.metrics.set_inbound_lane_snapshot(open, U256::ZERO);
@@ -1780,6 +1784,79 @@ mod tests {
         (Arc::new(handler), dir)
     }
 
+    /// The lane registry resolves independent lanes concurrently (#1731). Many
+    /// distinct [`LaneKey`]s register, resolve, and forget in parallel with no
+    /// shared map lock serializing them; the sharded map must still preserve the
+    /// single-mutex semantics — every registered lane is present and resolvable,
+    /// and every forgotten lane is gone.
+    #[tokio::test]
+    async fn distinct_lanes_register_resolve_and_forget_concurrently() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+
+        // Distinct lanes differ only by signer, so they land on different shards
+        // by hash — the case the single mutex used to serialize.
+        let keys: Vec<LaneKey> = (0u8..32)
+            .map(|i| LaneKey {
+                pool_id: B256::repeat_byte(0xC0),
+                signer: Address::repeat_byte(i),
+                provider: handler.eth_signer.address(),
+            })
+            .collect();
+
+        // Register every lane concurrently.
+        let mut register = Vec::new();
+        for key in &keys {
+            let handler = Arc::clone(&handler);
+            let state = LaneState::hydrate(
+                key.pool_id,
+                key.signer,
+                key.provider,
+                U256::from(1_000_000u64),
+                0,
+                U256::ZERO,
+                U256::ZERO,
+                None,
+            );
+            register.push(tokio::spawn(
+                async move { handler.register_lane(state).await },
+            ));
+        }
+        for task in register {
+            task.await.expect("join").expect("register_lane");
+        }
+        assert_eq!(handler.lanes.len(), keys.len(), "every lane is tracked");
+
+        // Resolve every lane concurrently — each is a point read on its own shard.
+        let mut resolve = Vec::new();
+        for key in &keys {
+            let handler = Arc::clone(&handler);
+            let key = *key;
+            resolve.push(tokio::spawn(async move {
+                handler.lane_state_snapshot(key).await.map(|s| s.key())
+            }));
+        }
+        for (task, key) in resolve.into_iter().zip(keys.iter()) {
+            assert_eq!(
+                task.await.expect("join"),
+                Some(*key),
+                "each registered lane resolves to itself"
+            );
+        }
+
+        // Forget every lane concurrently; the map drains to empty.
+        let mut forget = Vec::new();
+        for key in &keys {
+            let handler = Arc::clone(&handler);
+            let key = *key;
+            forget.push(tokio::spawn(async move { handler.forget_lane(key).await }));
+        }
+        for task in forget {
+            task.await.expect("join").expect("forget_lane");
+        }
+        assert_eq!(handler.lanes.len(), 0, "every lane is forgotten");
+    }
+
     /// The floor-`M` solvency arithmetic with a NON-ZERO floor `M`
     /// (`pool_remaining_covers_window`, ADR 003 §Sizing). The node keeps serving a
     /// pool only while its on-chain remaining minus `M` still covers the reserved
@@ -1829,7 +1906,7 @@ mod tests {
             signer: Address::repeat_byte(0x11),
             provider: Address::repeat_byte(0x22),
         };
-        handler.lanes.lock().await.insert(
+        handler.lanes.insert(
             lane,
             Arc::new(Mutex::new(LaneDeliveryState {
                 state: LaneState::hydrate(
@@ -2226,7 +2303,7 @@ mod tests {
             "a forged-owner capability must not be persisted"
         );
         assert!(
-            !handler.lanes.lock().await.contains_key(&lane_key),
+            !handler.lanes.contains_key(&lane_key),
             "a forged-owner capability must not register a lane"
         );
 
@@ -2244,7 +2321,7 @@ mod tests {
             "a correct-owner capability is persisted for the redeemer"
         );
         assert!(
-            handler.lanes.lock().await.contains_key(&lane_key),
+            handler.lanes.contains_key(&lane_key),
             "a correct-owner capability registers its lane so vouchers can be served"
         );
     }

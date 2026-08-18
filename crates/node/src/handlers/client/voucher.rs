@@ -393,11 +393,7 @@ mod tests {
             paid_credited: U256::ZERO,
             active_streams: Arc::new(AtomicU32::new(0)),
         }));
-        handler
-            .lanes
-            .lock()
-            .await
-            .insert(lane_key, Arc::clone(&lane));
+        handler.lanes.insert(lane_key, Arc::clone(&lane));
 
         // A cumulative voucher paying exactly one MB from zero, signed by the
         // lane's pinned signer over the lane context.

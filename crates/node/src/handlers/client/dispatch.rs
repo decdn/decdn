@@ -288,10 +288,10 @@ impl ClientHandler {
         // Resolve the live lane AFTER intake, so a lane just registered from this
         // request's own capability is visible to the spend + serve gates below.
         // The resolved `Arc` is KEPT rather than dropped: the cache-miss arm below
-        // reuses the same lane, and re-resolving it would take the map lock again
-        // for no reason.
+        // reuses the same lane, and re-resolving it would take the lane's shard
+        // lock again for no reason.
         let known_lane = match lane_key {
-            Some(key) => self.lanes.lock().await.get(&key).cloned(),
+            Some(key) => self.lanes.get(&key).map(|e| Arc::clone(e.value())),
             None => None,
         };
 
@@ -543,7 +543,7 @@ impl ClientHandler {
 
                 let mut fault_seen = false;
                 if (req.byte_offset > 0 || req.byte_len > 0)
-                    && self.pull_authorized(&req, verified_client).await
+                    && self.pull_authorized(&req, verified_client)
                 {
                     let (size, range_outcome) = self.try_range_pull_through(hash, &req).await;
                     range_pulled_size = size;
@@ -586,7 +586,7 @@ impl ClientHandler {
                     && !locally_filled
                     && req.byte_offset == 0
                     && req.byte_len == 0
-                    && self.pull_authorized(&req, verified_client).await
+                    && self.pull_authorized(&req, verified_client)
                 {
                     match self.cache.origin_size(hash).await {
                         Ok(Some(total)) => {
@@ -672,7 +672,7 @@ impl ClientHandler {
                 if range_pulled_size.is_none()
                     && !locally_filled
                     && let Some(timeout) = self.local_populate
-                    && self.pull_authorized(&req, verified_client).await
+                    && self.pull_authorized(&req, verified_client)
                 {
                     let local = self.try_local_populate(hash, timeout).await;
                     fault_seen |= local.is_fault();
@@ -707,7 +707,7 @@ impl ClientHandler {
                 } else if let Some(origin) = self.pull_through_origin.as_ref()
                     && req.byte_offset == 0
                     && req.byte_len == 0
-                    && self.pull_authorized(&req, verified_client).await
+                    && self.pull_authorized(&req, verified_client)
                 {
                     // Boxed: the serve future is large; keep it off the
                     // `serve_stream` stack frame (clippy::large_futures). The
@@ -737,7 +737,7 @@ impl ClientHandler {
                     // Buffered pull-through (#831): used when
                     // the window provider is unset or for a resumed request.
                     let buffered = match self.pull_through {
-                        Some(timeout) if self.pull_authorized(&req, verified_client).await => {
+                        Some(timeout) if self.pull_authorized(&req, verified_client) => {
                             self.try_pull_through(hash, timeout).await
                         }
                         // No pull-through configured, or the request is not
