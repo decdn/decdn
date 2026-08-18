@@ -524,7 +524,7 @@ async fn pay_cumulative(
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
     write_client_msg(
         send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
     )
     .await
 }
@@ -1051,7 +1051,7 @@ impl StalledDelivery {
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
         write_client_msg(
             &mut self.send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
         )
         .await?;
 
@@ -1086,7 +1086,7 @@ impl StalledDelivery {
         .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
         write_client_msg(
             &mut self.send,
-            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
         )
         .await?;
         read_client_msg(&mut self.recv).await

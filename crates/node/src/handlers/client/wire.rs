@@ -20,18 +20,18 @@ impl ClientHandler {
     /// drains them FIFO, preserving the audit ordering and shutdown-tail
     /// guarantees CLAUDE.md / ADR 003 require.
     ///
-    /// The `voucher_amount` is rendered as a decimal `uint256` from the
-    /// big-endian wire amount (the pool voucher's cumulative amount — its sole
-    /// ordering key, there is no nonce); `client_node_id` is the iroh node id of
-    /// the paying peer; `delta_bytes` is the bytes this voucher covers.
+    /// The `voucher_amount` is widened to a `uint256` from the `u64` wire
+    /// amount (the pool voucher's cumulative amount — its sole ordering key,
+    /// there is no nonce); `client_node_id` is the iroh node id of the paying
+    /// peer; `delta_bytes` is the bytes this voucher covers.
     pub(super) fn record_receipt(
         &self,
         hash: Hash,
         delta_bytes: u64,
         client_node_id: B256,
-        wire_amount: [u8; 32],
+        wire_amount: u64,
     ) {
-        let voucher_amount = U256::from_be_bytes(wire_amount);
+        let voucher_amount = U256::from(wire_amount);
         let receipt = DownloadReceipt::new(
             &hash,
             delta_bytes,
