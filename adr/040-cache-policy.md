@@ -105,8 +105,8 @@ buffered frequency signal.
 The shipped estimator is W-TinyLFU, implemented in-tree with no external
 dependency: a count-min sketch with periodic halving for aging, sized to a
 fixed in-process memory budget (`sketch_bytes`). It is not durable. State is
-lost on restart, matching the empty-on-boot behavior of the prior
-recency-only tracking.
+lost on restart, matching the empty-on-boot behavior of `lru` recency
+tracking.
 
 The sketch keys on the content hash. Cache keys are already BLAKE3 hashes, so
 the sketch derives its row indices from disjoint slices of the 32-byte key
@@ -203,7 +203,7 @@ parameter. This is a deliberate exception to deCDN's default instinct of
 making economic parameters governance-tunable: cache policy carries no
 economic weight and has no cross-node interoperability requirement.
 
-The defaults, `always` admission and `lru` eviction, reproduce the prior
+The defaults, `always` admission and `lru` eviction, reproduce today's
 recency-only behavior exactly. Adopting `tinylfu` is an explicit operator
 opt-in.
 
@@ -253,15 +253,15 @@ retention.
   budget.
 - Safety invariants — pins, probe-holds, and the deny set — stay
   engine-enforced across every policy combination.
-- The default configuration preserves prior behavior exactly; adopting the
-  new policies is opt-in.
+- The default configuration preserves `lru`/`always` recency-only behavior
+  exactly; adopting the new policies is opt-in.
 
 ### Negative
 
 - Range-aware eviction is not achievable until an upstream `iroh-blobs`
   range-forget primitive exists. Whole-blob reclaim ships in its place.
 - W-TinyLFU state is not durable. Cold-start starvation on a full disk with
-  no warmed signal persists, unchanged from the prior recency-only design.
+  no warmed signal persists under `lru`'s recency-only design too.
 - Probationary admission still writes first-hit bytes; it is not a
   pass-through. Write amplification stays bounded by paid demand.
 
@@ -281,8 +281,8 @@ retention.
 1. `AdmissionPolicy`, `EvictionPolicy`, and `FrequencyEstimator` are defined
    in `crates/cache`. The engine holds them as trait objects and contains no
    inline policy-decision logic.
-2. The `lru` and `always` defaults reproduce prior behavior; the existing
-   eviction-driver test suite passes unchanged under them.
+2. The `lru` and `always` defaults reproduce today's recency-only behavior;
+   the existing eviction-driver test suite passes unchanged under them.
 3. `tinylfu` eviction and probationary admission are available behind
    `cache.eviction_policy` and `cache.admission_policy`; both default off.
 4. When either selector names `tinylfu`, one shared `FrequencyEstimator`
