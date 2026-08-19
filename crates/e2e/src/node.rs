@@ -301,7 +301,10 @@ impl NodeFixture {
     /// [`crate::client::ClientFixture::capture_delivery_wire`]'s
     /// last-operation-on-session contract.
     pub async fn store_blob_present(&self, hash: Hash) -> anyhow::Result<bool> {
-        {
+        // `kill`/`wait` are blocking syscalls; keep them off the async worker
+        // (these journeys run on the multi-thread runtime, where `block_in_place`
+        // moves the current task's thread out of the scheduler for the reap).
+        tokio::task::block_in_place(|| {
             let mut child = self
                 .child
                 .0
@@ -309,7 +312,7 @@ impl NodeFixture {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = child.kill();
             let _ = child.wait();
-        }
+        });
         let cache_dir = self.data_dir.path().join("cache");
         let origins: Vec<Arc<dyn Origin>> = Vec::new();
         let store = CacheEngine::open(&cache_dir, origins, 1024)

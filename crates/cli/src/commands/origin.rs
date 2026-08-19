@@ -102,6 +102,11 @@ pub fn index_fs_origin(base: &Path, force: bool) -> anyhow::Result<IndexStats> {
         };
         let mut tmp = tempfile::NamedTempFile::new_in(shard_dir)?;
         std::io::Write::write_all(&mut tmp, &outboard)?;
+        // Flush the bytes to disk before the rename: a `.obao4` is required for
+        // zero-copy serve, so a power loss right after an unsynced rename must not
+        // leave a present-but-empty outboard. Matches the CLI's other atomic
+        // writers (`bundle create`, `bundle pull`).
+        tmp.as_file().sync_all()?;
         tmp.persist(&obao4_path)
             .map_err(|e| anyhow::anyhow!("failed to persist {}: {e}", obao4_path.display()))?;
         stats.written += 1;

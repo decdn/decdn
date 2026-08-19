@@ -3338,6 +3338,18 @@ impl CacheEngine {
                 "origin zero-copy reader vanished for {hash}"
             )));
         };
+        // Fail before a single frame if the origin file no longer matches the
+        // signed total (truncated or grown between the eligibility gate's stat and
+        // this open). Left unchecked, the encoder would emit some verified bytes
+        // and only fault when it ran past the short file — a partial, already-billed
+        // delivery for a blob that can never complete.
+        if local.size != blob_size {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "origin file for {hash} is {} bytes but the signed total is {blob_size}; \
+                 refusing to serve a size-mismatched blob",
+                local.size
+            )));
+        }
         let Some(outboard) = self.origin_fetch_outboard_bytes(hash, blob_size).await? else {
             return Err(CacheError::Store(anyhow::anyhow!(
                 "origin outboard vanished for {hash}"
