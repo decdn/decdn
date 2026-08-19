@@ -28,8 +28,9 @@
 //! 6. **Paid path.** The reprice must also govern what the daemon *sells* at,
 //!    not just what it advertises. A fresh paid fetch settles on-chain, and the
 //!    settled lane watermark is read back to confirm the blob was sold at the new
-//!    floor — settling alone proves little, since the on-chain floor check rejects
-//!    only *under*-payment, so an over-priced sale would settle just as cleanly.
+//!    floor — settling alone proves little, since the on-chain soft floor clamps
+//!    only an *under*-priced sale's credited bytes, so an over-priced sale settles
+//!    just as cleanly.
 //! 7. **Negative — out-of-safety-bounds.** `setRateBounds` reverts with
 //!    `RateBoundsInvalid` for `floor < MIN_RATE_FLOOR` and for a floor above
 //!    `MAX_RATE_PER_MB`, the ADR 005 wire cap the schema will carry — proven as
@@ -190,10 +191,11 @@ async fn run() -> anyhow::Result<()> {
     // ---- Vote weight (ADR-036 served bytes × age ramp): age past the ~180-day
     // ramp, serve real bytes, then cross an epoch boundary so those bytes sit in
     // a fully-elapsed epoch inside the trailing window at the proposal snapshot.
-    // The delivery is settled *before* the retune on purpose: raising the
-    // delivery floor tightens `PaymentPool`'s settlement-side
-    // `RateFloorViolation` check, so a voucher priced at the old rate must land
-    // on-chain while the old floor is still in force.
+    // The delivery is settled *before* the retune on purpose: once the delivery
+    // floor rises above the old quoted rate, `PaymentPool`'s soft floor clamps the
+    // bytes a voucher priced at the old rate credits toward vote weight, so that
+    // voucher must land on-chain while the old floor is still in force to carry its
+    // full byte weight.
     time::increase_time(chain.admin(), 185 * DAY).await?;
     let outcome = client
         .fetch(&chain, &node, hash, alloy::primitives::U256::ZERO)
@@ -276,18 +278,17 @@ async fn run() -> anyhow::Result<()> {
     // on (`handlers/client/wire.rs`), so observing only the probe would miss a
     // regression where the two disagree.
     //
-    // Settling is necessary but NOT sufficient to prove that: the on-chain floor
-    // check (`PaymentPool._advanceClaimWatermark` → `RateFloorViolation`) is
-    // one-sided — it rejects paying too *little*, so a node that sold above the
-    // floor would settle perfectly cleanly. The price itself is therefore the
-    // observable, read back off the pool the vouchers were signed against.
+    // Settling is necessary but NOT sufficient to prove that: `PaymentPool`'s soft
+    // floor clamps credited bytes rather than rejecting, so a voucher sold at any
+    // price at or above the floor settles cleanly with every byte credited, and
+    // only an under-floor sale would see its byte credit clamped. The price itself
+    // is therefore the observable, read back off the pool the vouchers were signed
+    // against.
     //
-    // Note the under-pricing direction never reaches the chain at all: the node
-    // applies the same floor check at zero tolerance before countersigning
-    // (`handlers/client/voucher.rs`), so a stale-rate voucher fails the fetch
-    // outright rather than settling short. That guard is not observable from an
-    // honest client, which is why this leg asserts on price rather than trying to
-    // provoke `RateFloorViolation`.
+    // Note the node never sells below the floor in the first place: it raises every
+    // quote to the live floor before signing (`handlers/client/wire.rs`), so an
+    // honest client is billed at the clamped rate. This leg asserts on that price
+    // rather than the byte credit, which a clean at-floor sale leaves unclamped.
     let served_before = chain.served_bytes(node.operator_addr()).await?;
     let paid = client
         .fetch(&chain, &node, hash, alloy::primitives::U256::ZERO)
@@ -308,11 +309,11 @@ async fn run() -> anyhow::Result<()> {
 
     // The rate the blob was actually sold at, recovered from the settled voucher.
     // Measured: 100 micro-USDC against 2 MiB of claimed bytes, i.e. exactly the
-    // floor. That also means the settlement sits exactly on the contract's own
-    // limit — `maxBytes = mulDiv(100, BYTES_PER_MB, 50) == bytesDelivered` — which
-    // `_advanceClaimWatermark` admits only because it rejects on `>` rather than
-    // `>=`. Worth knowing: there is no headroom on the under-payment side, so a
-    // future change to voucher pricing or blob size will surface here first.
+    // floor. That also means the sale sits exactly on the soft-floor ceiling —
+    // `maxBytes = mulDiv(100, BYTES_PER_MB, 50) == bytesDelivered` — so every
+    // claimed byte is credited and none is clamped. Worth knowing: there is no
+    // headroom on the under-payment side, so a future change to voucher pricing or
+    // blob size would start clamping credited bytes and surface here first.
     //
     // The `+1` tolerance is for the over-payment side only: each voucher interval
     // prices its delta with `div_ceil`, so a different interval split could round
@@ -330,9 +331,9 @@ async fn run() -> anyhow::Result<()> {
         (U256::from(NEW_FLOOR)..=U256::from(NEW_FLOOR + 1)).contains(&implied_rate),
         "the blob must be sold at the ratified floor ({NEW_FLOOR}/MB): settled {amount} \
          micro-USDC for {billed_bytes} billed bytes = {implied_rate}/MB. A sale at the unclamped \
-         configured rate ({CONFIGURED_RATE}/MB) would be rejected, but any price *above* the \
-         floor would settle just as cleanly on-chain, which is why this asserts the price and \
-         not merely that settlement happened."
+         configured rate ({CONFIGURED_RATE}/MB) would have its credited bytes clamped at \
+         settlement, but any price *above* the floor settles just as cleanly on-chain, which is \
+         why this asserts the price and not merely that settlement happened."
     );
 
     // Cross an epoch so the bytes just served sit in a fully-elapsed epoch, and

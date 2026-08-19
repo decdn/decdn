@@ -2282,10 +2282,10 @@ enum PullVerdict {
     /// takes the provider out of ranking for a fixed window while the pool's deposit stays
     /// intact and available to every other lane.
     OurDeadLane(VoucherRejectReason),
-    /// The peer rejected a voucher we presented, but the pool is FINE — nothing to
-    /// suppress, nothing to top up. `RateFloorRaised` lands here: a governance
-    /// delivery-floor raise made the quoted rate stale (#1382), so the client re-probes and
-    /// re-quotes at the new floor on a fresh stream. Keep the healthy pool and retry.
+    /// The peer rejected a voucher we presented, but the peer is FINE — the fault is in
+    /// OUR buyer pool. `PoolExhausted` lands here: the pool WE fund the upstream from can
+    /// no longer cover further credit (ADR 003 §Pool solvency). The remedy is a top-up of
+    /// our pool and a retry, keeping the healthy peer rather than suppressing it.
     OurVoucherRetryable(VoucherRejectReason),
     /// The peer refused delivery, carrying the wire code's own verdict (#1144).
     Refused(RefusalVerdict),
@@ -2375,14 +2375,14 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 /// - **This lane to this provider is finished, but the pool's DEPOSIT is not gone.** The
 ///   signer's spending cap is exhausted (`SpendingCapExhausted`) or its capability expired
 ///   (`CapabilityExpired`), our accounting drifted (`AmountRegression`/`BytesRegression`),
-///   the voucher was addressed to the wrong pool or a different provider
-///   (`WrongPool`/`WrongProvider`), or the pool's own remaining deposit can no longer fund
-///   further credit (`PoolExhausted`). No further voucher on this lane is accepted, but the
+///   or the voucher was addressed to the wrong pool or a different provider
+///   (`WrongPool`/`WrongProvider`). No further voucher on this lane is accepted, but the
 ///   pool row still holds a deposit worth keeping — so the provider is suppressed for a
 ///   bounded window and the pool row is KEPT rather than deleted.
-/// - **Try again.** `RateFloorRaised` (a governance floor raise made the quoted rate stale,
-///   #1382, so the client re-probes/re-quotes at the new floor on a fresh stream). The pool
-///   is healthy, so leave it alone and retry.
+/// - **Try again.** `PoolExhausted` — the pool WE fund the upstream from can no longer
+///   cover further credit (ADR 003 §Pool solvency). Every upstream returns it, so it is a
+///   statement about us, not the peer. Top up our pool (see `genuine_exhaustion`) and
+///   retry rather than suppress a healthy peer.
 ///
 /// Wallet-less resume: this classifier does NOT special-case a bundled
 /// `SpendingCapExhausted`/`AmountRegression`/`BytesRegression`, and it does not need to.
@@ -2403,15 +2403,12 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
             PullVerdict::OurLocalFault
         }
         // Our OWN buyer pool, not the upstream — retry, do not suppress the peer.
-        // `RateFloorRaised` re-quotes at the new floor (#1382). `PoolExhausted` says the
-        // pool WE fund the upstream from can no longer cover further credit; it is a
-        // statement about us, so every upstream returns it and routing it to
-        // `OurDeadLane` would walk the candidate list suppressing each healthy peer for
-        // an hour, outliving any top-up. The remedy is a top-up of our pool (see
-        // `genuine_exhaustion`) and a retry, so keep the peer and try again.
-        VoucherRejectReason::RateFloorRaised | VoucherRejectReason::PoolExhausted => {
-            PullVerdict::OurVoucherRetryable(reason)
-        }
+        // `PoolExhausted` says the pool WE fund the upstream from can no longer cover
+        // further credit; it is a statement about us, so every upstream returns it and
+        // routing it to `OurDeadLane` would walk the candidate list suppressing each
+        // healthy peer for an hour, outliving any top-up. The remedy is a top-up of our
+        // pool (see `genuine_exhaustion`) and a retry, so keep the peer and try again.
+        VoucherRejectReason::PoolExhausted => PullVerdict::OurVoucherRetryable(reason),
         // Terminal for THIS lane while the pool row is still worth keeping. The signer's
         // cap is spent (`SpendingCapExhausted`) or its capability expired
         // (`CapabilityExpired`), our accounting drifted
@@ -2607,10 +2604,10 @@ fn classify_pull_failure(
             deps.metrics.node_pull_voucher_rejected();
             wedged_channel(deps, pk, provider_addr, hash_bytes, reason, channel);
         }
-        // The pool is fine: a governance floor raise made the quote stale (`RateFloorRaised`,
-        // #1382), so a retry re-probes and re-quotes at the new floor. Skip the candidate this
-        // once and leave the pool alone — suppressing here would throw away a healthy pool
-        // over a hiccup.
+        // The peer is fine, the fault is our buyer pool: `PoolExhausted` means the deposit we
+        // fund the upstream from can no longer cover further credit, cleared by a top-up and a
+        // retry. Skip the candidate this once and leave the peer alone — suppressing here would
+        // throw away a healthy provider over our own funding gap.
         PullVerdict::OurVoucherRetryable(reason) => {
             deps.metrics.node_pull_voucher_rejected();
             debug!(
@@ -2919,7 +2916,7 @@ mod tests {
             StreamError::Overloaded,
             StreamError::BlobTooLarge,
             StreamError::VoucherRejected {
-                reason: VoucherRejectReason::RateFloorRaised,
+                reason: VoucherRejectReason::PoolExhausted,
                 bundle: None,
             },
         ] {
@@ -2937,19 +2934,18 @@ mod tests {
         );
     }
 
-    /// #1382: a `RateFloorRaised` rejection is the honest-buyer re-quote signal —
-    /// a governance delivery-floor raise made the stream's quote stale, so its
-    /// voucher is unredeemable at that rate. The buyer did nothing wrong, so this
-    /// must be judged retryable with the pool KEPT — not an `OurDeadLane`
-    /// (which would suppress a provider needlessly) nor an `OurLocalFault` (which
-    /// would tar the peer for our own stale quote). Re-probing at the new floor is
-    /// the fix, which is exactly what `OurVoucherRetryable` drives.
+    /// A `PoolExhausted` rejection is a statement about OUR buyer pool, not the peer:
+    /// the deposit we fund the upstream from can no longer cover further credit. The
+    /// peer did nothing wrong, so this must be judged retryable with the peer KEPT —
+    /// not an `OurDeadLane` (which would suppress a healthy provider needlessly) nor
+    /// an `OurLocalFault` (which would tar the peer for our own funding gap). A top-up
+    /// and retry is the fix, which is exactly what `OurVoucherRetryable` drives.
     #[test]
-    fn a_rate_floor_raise_is_a_retryable_requote_not_a_dead_channel() {
+    fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_channel() {
         assert_eq!(
-            voucher_verdict(VoucherRejectReason::RateFloorRaised),
-            PullVerdict::OurVoucherRetryable(VoucherRejectReason::RateFloorRaised),
-            "an honest buyer whose quote went stale keeps its channel and retries"
+            voucher_verdict(VoucherRejectReason::PoolExhausted),
+            PullVerdict::OurVoucherRetryable(VoucherRejectReason::PoolExhausted),
+            "our own drained pool keeps the healthy peer and retries after a top-up"
         );
     }
 

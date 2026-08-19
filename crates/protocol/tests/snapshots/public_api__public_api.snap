@@ -35,7 +35,6 @@ pub decdn_protocol::client::VoucherRejectReason::BadSignature
 pub decdn_protocol::client::VoucherRejectReason::BytesRegression
 pub decdn_protocol::client::VoucherRejectReason::CapabilityExpired
 pub decdn_protocol::client::VoucherRejectReason::PoolExhausted
-pub decdn_protocol::client::VoucherRejectReason::RateFloorRaised
 pub decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::client::VoucherRejectReason::WrongPool
 pub decdn_protocol::client::VoucherRejectReason::WrongProvider
@@ -331,7 +330,6 @@ pub decdn_protocol::VoucherRejectReason::BadSignature
 pub decdn_protocol::VoucherRejectReason::BytesRegression
 pub decdn_protocol::VoucherRejectReason::CapabilityExpired
 pub decdn_protocol::VoucherRejectReason::PoolExhausted
-pub decdn_protocol::VoucherRejectReason::RateFloorRaised
 pub decdn_protocol::VoucherRejectReason::SpendingCapExhausted
 pub decdn_protocol::VoucherRejectReason::WrongPool
 pub decdn_protocol::VoucherRejectReason::WrongProvider

@@ -734,8 +734,8 @@ pub enum StreamError {
         /// is `0` until settlement), so this lets it self-heal: re-seed the
         /// ledger's PAYMENT BASELINE to `bytes_delivered` (a pool-cumulative
         /// counter, NOT a blob `byte_offset`) and re-sign from the new
-        /// baseline. `None` for every handler-direct reason (`RateFloorRaised`,
-        /// …) and whenever the signer does not recover to
+        /// baseline. `None` for every handler-direct reason (`CapabilityExpired`,
+        /// `PoolExhausted`) and whenever the signer does not recover to
         /// `voucher_signer`.
         bundle: Option<WatermarkBundle>,
     },
@@ -776,12 +776,10 @@ impl StreamError {
 /// matches those exhaustively so a new `PoolError` variant fails to compile
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
 /// variants have no validation-enum counterpart and are emitted directly by the
-/// `cdn/client/v1` handler: [`Self::RateFloorRaised`] is the honest-buyer
-/// re-quote signal when the live delivery floor rose above a stream's quoted
-/// rate (#1382); [`Self::CapabilityExpired`] fires when the signer's capability
-/// has passed its expiry; and [`Self::PoolExhausted`] fires when the pool's
-/// remaining deposit can no longer fund further credit. Variant order is frozen —
-/// new handler-direct reasons append at the end.
+/// `cdn/client/v1` handler: [`Self::CapabilityExpired`] fires when the signer's
+/// capability has passed its expiry; and [`Self::PoolExhausted`] fires when the
+/// pool's remaining deposit can no longer fund further credit. Variant order is
+/// frozen — new handler-direct reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -805,20 +803,6 @@ pub enum VoucherRejectReason {
     /// Recovery: the pool **owner** raises this signer's cap or delegates a new
     /// capability. `PoolError::CapExceeded`.
     SpendingCapExhausted,
-    /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
-    /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
-    /// stream was quoted at, after the signed `StreamResponse` but before this
-    /// voucher. The cumulative watermark the voucher carries now prices bytes
-    /// below the live floor, so the node cannot redeem it: `PaymentPool`'s
-    /// `_advanceClaimWatermark` would revert `RateFloorViolation` at settlement
-    /// (the chain keeps no per-lane floor snapshot — #1388). Refusing is the
-    /// node's correct self-protection, and the buyer did nothing wrong: the fix
-    /// is to **re-probe/re-quote** at the new floor and open a fresh stream, not
-    /// to resend this voucher (which would be rejected identically) or top up.
-    /// No validation-enum counterpart — `voucher_reject_reason` never returns
-    /// this; the `cdn/client/v1` handler emits it directly (ADR 005
-    /// §`VoucherRejected` semantics, #1382).
-    RateFloorRaised,
     /// The signer's capability has passed its `expiry`. The node's serve-side check
     /// compares its LOCAL wall clock (`unix_now`, operator-settable) against `expiry`
     /// and stops serving the lane; on-chain settlement separately gates redemption on
@@ -843,8 +827,8 @@ impl VoucherRejectReason {
     /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the three
     /// regression/exhaustion reasons a wallet-less client cannot distinguish
     /// from chain, since its local watermark is the only thing that could be
-    /// wrong. Every handler-direct reason (`RateFloorRaised`, plus the
-    /// signer/pool/provider mismatches) is never eligible — a bundle
+    /// wrong. Every handler-direct reason (`CapabilityExpired` / `PoolExhausted`,
+    /// plus the signer/pool/provider mismatches) is never eligible — a bundle
     /// would not help there, since the fix is not "resync the watermark".
     ///
     /// Single source of truth for the gate: the node checks this before
@@ -1194,7 +1178,6 @@ mod tests {
             VoucherRejectReason::AmountRegression,
             VoucherRejectReason::BytesRegression,
             VoucherRejectReason::SpendingCapExhausted,
-            VoucherRejectReason::RateFloorRaised,
             VoucherRejectReason::CapabilityExpired,
             VoucherRejectReason::PoolExhausted,
         ]
