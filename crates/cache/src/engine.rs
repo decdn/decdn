@@ -207,6 +207,9 @@ struct Inner {
     /// sufficient and avoids threading the value through every `open_*`
     /// constructor and its many test call sites.
     max_probe_holds: AtomicUsize,
+    /// Optional shared frequency signal (ADR 040). `None` for the `lru`/`always`
+    /// default — the observe call is skipped, so recency-only pays nothing.
+    frequency: ArcSwap<Option<Arc<dyn crate::policy::FrequencyEstimator>>>,
     /// Append-only file holding lowercase-hex evicted hashes, one per line.
     /// Loaded on [`CacheEngine::open`]; appended to (with `fsync`) on every
     /// successful [`CacheEngine::evict`]. Lives at `<cache_dir>/evicted.log`.
@@ -1027,6 +1030,7 @@ impl CacheEngine {
                 evicted: Mutex::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
+                frequency: ArcSwap::from_pointee(None),
                 evicted_log_path,
                 retry_policy,
                 metrics,
@@ -1820,6 +1824,12 @@ impl CacheEngine {
     /// answers `has_blob: false` to every probe).
     pub fn set_max_probe_holds(&self, max: usize) {
         self.inner.max_probe_holds.store(max, Ordering::Relaxed);
+    }
+
+    /// Install the shared frequency estimator. Called once at bring-up when a
+    /// `tinylfu` policy is selected; absent otherwise.
+    pub fn set_frequency_estimator(&self, est: Arc<dyn crate::policy::FrequencyEstimator>) {
+        self.inner.frequency.store(Arc::new(Some(est)));
     }
 
     /// Attempt to take (or refresh) a probe-triggered eviction hold on
@@ -2881,6 +2891,9 @@ impl CacheEngine {
     fn touch(&self, hash: Hash) {
         if let Ok(mut guard) = self.inner.access_times.lock() {
             guard.insert(hash, Instant::now());
+        }
+        if let Some(est) = self.inner.frequency.load().as_ref() {
+            est.observe(hash);
         }
     }
 
@@ -4991,6 +5004,39 @@ mod tests {
             second > first,
             "access time should advance: first={first:?}, second={second:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn touch_forwards_to_frequency_estimator() -> anyhow::Result<()> {
+        use crate::policy::FrequencyEstimator;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Counter(AtomicU32);
+        impl FrequencyEstimator for Counter {
+            fn observe(&self, _h: Hash) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn estimate(&self, _h: Hash) -> u32 {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello frequency";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let counter = Arc::new(Counter::default());
+        engine.set_frequency_estimator(counter.clone());
+
+        let _ = engine.get(hash).await?;
+
+        anyhow::ensure!(counter.estimate(hash) >= 1, "observe should fire on access");
         Ok(())
     }
 
