@@ -194,19 +194,19 @@ ChunkPreimage { preimage: [u8; 32], index: u8 }
 ```rust
 /// The payment quantum. A protocol constant, never negotiated.
 pub const CHUNK_BYTES: u64 = 1_048_576;
-/// 255 chunks per chain — the largest value a `u8` index can name.
+/// The highest chain index, and so the number of payable chunks per chain.
 ///
-/// The boundary is 255, NOT 256. A `u8` holds `0..=255`, index 0 is reserved
-/// for redeem-time settlement, so the releasable indices are `1..=255` and a
-/// chain meters at most 255 chunks (255 MiB at `CHUNK_BYTES`). A 256-chunk
-/// chain is not representable: it would need index 256, or an `index - 1`
-/// offset encoding that reintroduces the off-by-one this type removes.
+/// The index space is the `u8` domain `0..=255` — 256 slots, exactly one byte.
+/// Index 0 is `chain_root` itself: it meters no chunk, is the settlement case
+/// at redemption, and never travels the wire. Indices `1..=255` each release
+/// one preimage and meter one chunk, so a chain covers 255 MiB at
+/// `CHUNK_BYTES`. 256 counts index slots; 255 counts payable chunks.
 pub const MAX_CHAIN_LENGTH: u8 = 255;
 ```
 
 The decoded byte is the chain index as-is, with no widening and no conversion. The node verifies a preimage by hashing it forward to the deepest preimage it already holds on that lane, and credits the lane-wide chain index whichever stream carried the message.
 
-**The index is one byte end to end.** The same `u8` that names an index here is the low byte of the packed `chainMeter` word the node later submits on-chain ([ADR 003 § Voucher signatures are compact](003-payments.md#voucher-signatures-are-compact-and-their-signers-are-eoas)), so the wire and the calldata agree on the representation and neither side converts. That is also where the chain-length bound comes from: it is a property of the type, not a check either layer performs. **The bound is 255, not 256** — `u8` reaches 255, index 0 is the settlement case and never travels the wire, so the releasable range is `1..=255` and one chain meters at most 255 MiB. Extending to 256 chunks would need an `index - 1` offset on the wire, which trades a real off-by-one hazard for one more chunk per chain; the ADR takes the shorter chain instead.
+**The index is one byte end to end.** The same `u8` that names an index here is the low byte of the packed `chainMeter` word the node later submits on-chain ([ADR 003 § Voucher signatures are compact](003-payments.md#voucher-signatures-are-compact-and-their-signers-are-eoas)), so the wire and the calldata agree on the representation and neither side converts. That is also where the chain length comes from: it is a property of the index type, not a check either layer performs. The `u8` domain `0..=255` is the index space — 256 slots — and index 0 is the root, which meters nothing and never travels the wire. The releasable range is therefore `1..=255`, and one chain meters 255 MiB.
 
 Delivery and payment are not lock-stepped at the chunk, though. A node streams within a **credit window** of several chunks ([ADR 003 — Credit Window](003-payments.md#credit-window)): it keeps sending chunks while the unpaid balance stays within the window and pauses only when it would exceed it. There is no per-proof acknowledgement on the wire — the node's continued delivery is the implicit acknowledgement; a proof the node did not accept simply stops delivery, and the payer resends it. The window is delivery-layer node policy — it appears in no wire field — and it bounds the node's credit exposure to exactly one window of unbilled egress while leaving the payer's exposure at zero (both proofs remain cumulative over bytes already received). At a window of one chunk this reduces to strict stop-and-wait, which is what keeps the two ends interoperable regardless of which pipelines.
 
