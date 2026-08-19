@@ -514,15 +514,10 @@ mod tests {
     /// — is `AlreadySatisfied`: `verify_voucher` returns Ok WITHOUT advancing the
     /// candidate watermark. It must NOT reject (that would kill an honest lagging
     /// stream, #1699).
-    #[tokio::test]
-    async fn stale_voucher_is_benign_and_does_not_regress_watermark() {
+    #[test]
+    fn stale_voucher_is_benign_and_does_not_regress_watermark() {
         use alloy::primitives::B256;
         use alloy::signers::local::PrivateKeySigner;
-
-        let metrics = Arc::new(Metrics::new());
-        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
-            as Arc<dyn PoolStateStore>;
-        let (_handler, _dir) = handler_over_store(&metrics, store).await;
 
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let signer_key = PrivateKeySigner::random();
@@ -588,15 +583,10 @@ mod tests {
     /// The single-signer guard (#1699 rule 4): a voucher at the SAME amount but a
     /// HIGHER `bytes_delivered` — same money, more bytes claimed — is a divergent
     /// fault, not a benign supersede.
-    #[tokio::test]
-    async fn divergent_voucher_at_equal_amount_is_rejected() {
+    #[test]
+    fn divergent_voucher_at_equal_amount_is_rejected() {
         use alloy::primitives::B256;
         use alloy::signers::local::PrivateKeySigner;
-
-        let metrics = Arc::new(Metrics::new());
-        let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
-            as Arc<dyn PoolStateStore>;
-        let (_handler, _dir) = handler_over_store(&metrics, store).await;
 
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let signer_key = PrivateKeySigner::random();
