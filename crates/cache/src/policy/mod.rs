@@ -63,3 +63,4 @@ pub trait FrequencyEstimator: Send + Sync + std::fmt::Debug {
 }
 
 pub use lru::{AlwaysAdmit, LruEviction};
+pub use tinylfu::{TinyLfuEstimator, TinyLfuEviction};
