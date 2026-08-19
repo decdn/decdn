@@ -123,7 +123,7 @@ No bespoke Safe module, no custom fallback handler, no new security-critical con
 
 **Production.** When smart-account clients arrive, nodes gain an ERC-1271 branch: probe the signer address for code, fall through to recovery when it is empty, and otherwise call `isValidSignature(bytes32,bytes)` on the signer and compare against the ERC-1271 magic value. The cost is one L2 RPC round-trip per client connection at binding time, not per message; nodes SHOULD cache the per-address code result, which does not change after deployment (ignoring `SELFDESTRUCT`, deprecated and irrelevant for Safe wallets).
 
-This branch is node-side and additive. It verifies against contracts that already ship `SignatureChecker`, so it rolls out node by node with no coordinated migration — nothing about deferring it makes it harder to add. It is also not useful on its own: a smart-account client could bind but could not sustainably sign vouchers at the fixed voucher-granularity signing frequency with an owner key, so it belongs with the session-key work above rather than ahead of it.
+This branch is node-side and additive. It verifies against contracts that already ship `SignatureChecker`, so it rolls out node by node with no coordinated migration — nothing about deferring it makes it harder to add. It is also not useful on its own: a smart-account client could bind but could not sustainably sign vouchers at the stream-open, rollover, and close cadence with an owner key, so it belongs with the session-key work above rather than ahead of it.
 
 ### Safe Infrastructure on the Canonical Testnet
 

@@ -182,7 +182,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 
 | Attack | Bounded by | Home |
 |---|---|---|
-| Voucher withholding | Self-enforcing per-lane credit window; loss capped at one 1 MiB chunk | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
+| Voucher withholding | Self-enforcing per-lane credit window; loss capped at the ramped window, floored at one 1 MiB chunk | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
 | Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
 | Owner reclaims before a node redeems | Grace window + in-process redemption monitor (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
 | Probe fishing / resource exhaustion | Layered per-peer + per-IP + global token bucket (node policy) | [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) |

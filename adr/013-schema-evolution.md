@@ -82,10 +82,13 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    ChunkPreimage(ChunkPreimage),     // 4  — unsigned, 33 bytes (ADR 005)
+    ChunkPreimage(ChunkPreimage),     // 4  — unsigned, 33-byte body (ADR 005)
     StreamEnd,                        // 5
+    StreamError(StreamError),         // 6
 }
 ```
+
+`VARIANT_COUNT` is 7 after the insertion, and `crates/protocol/src/client.rs` pins it against the highest discriminant.
 
 #### Variant ordering rule
 
@@ -231,13 +234,14 @@ enum ClientMessage {
     Voucher(Voucher),                 // 3
     ChunkPreimage(ChunkPreimage),     // 4
     StreamEnd,                        // 5
+    StreamError(StreamError),         // 6
     // Added via medium evolution
-    Ping(PingRequest),                // 6
-    Pong(PongResponse),               // 7
+    Ping(PingRequest),                // 7
+    Pong(PongResponse),               // 8
 }
 ```
 
-Old peers receiving `Ping` (discriminant 6, the first unknown tail variant) close the stream with `UNSUPPORTED_MESSAGE`; the sender detects this and falls back to QUIC-level keepalive.
+Old peers receiving `Ping` (discriminant 7, the first unknown tail variant) close the stream with `UNSUPPORTED_MESSAGE`; the sender detects this and falls back to QUIC-level keepalive.
 
 #### Tier 3 — Major (ALPN version bump)
 
