@@ -210,6 +210,13 @@ struct Inner {
     /// Optional shared frequency signal (ADR 040). `None` for the `lru`/`always`
     /// default — the observe call is skipped, so recency-only pays nothing.
     frequency: ArcSwap<Option<Arc<dyn crate::policy::FrequencyEstimator>>>,
+    /// Admission policy consulted at store-time (ADR 040). Always present —
+    /// defaults to [`crate::policy::AlwaysAdmit`] (store to
+    /// [`crate::policy::Segment::Main`]), so behavior is unchanged until an
+    /// operator selects a different policy. `ArcSwap<Arc<dyn Trait>>` rather
+    /// than `ArcSwap<dyn Trait>`: the latter needs `RefCnt: Sized`, which
+    /// `arc-swap` 1.9.2 does not give a `dyn` trait object.
+    admission: ArcSwap<Arc<dyn crate::policy::AdmissionPolicy>>,
     /// Append-only file holding lowercase-hex evicted hashes, one per line.
     /// Loaded on [`CacheEngine::open`]; appended to (with `fsync`) on every
     /// successful [`CacheEngine::evict`]. Lives at `<cache_dir>/evicted.log`.
@@ -1031,6 +1038,9 @@ impl CacheEngine {
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
+                admission: ArcSwap::from_pointee(
+                    Arc::new(crate::policy::AlwaysAdmit) as Arc<dyn crate::policy::AdmissionPolicy>
+                ),
                 evicted_log_path,
                 retry_policy,
                 metrics,
@@ -1832,6 +1842,32 @@ impl CacheEngine {
         self.inner.frequency.store(Arc::new(Some(est)));
     }
 
+    /// Install the admission policy consulted at store-time (ADR 040). Called
+    /// once at bring-up when a non-default policy is selected; otherwise the
+    /// engine keeps [`crate::policy::AlwaysAdmit`].
+    pub fn set_admission_policy(&self, policy: Arc<dyn crate::policy::AdmissionPolicy>) {
+        self.inner.admission.store(Arc::new(policy));
+    }
+
+    /// Consult the admission policy for `ctx`, mapping its verdict onto a
+    /// [`crate::policy::Segment`]. `PassThrough` is reserved (spec §3) — no
+    /// shipped policy returns it yet, and no pass-through-without-storing leg
+    /// exists, so it is treated as `Store { Probation }` until one does.
+    fn admission_segment(&self, ctx: &crate::policy::AdmissionContext) -> crate::policy::Segment {
+        match self.inner.admission.load().admit(ctx) {
+            crate::policy::AdmissionDecision::Store { segment } => segment,
+            crate::policy::AdmissionDecision::PassThrough => crate::policy::Segment::Probation,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn admission_segment_for_test(
+        &self,
+        ctx: &crate::policy::AdmissionContext,
+    ) -> crate::policy::Segment {
+        self.admission_segment(ctx)
+    }
+
     /// Attempt to take (or refresh) a probe-triggered eviction hold on
     /// `hash` for [`crate::probe_hold::PROBE_HOLD_DURATION`] (ADR 005
     /// §Probe-triggered eviction hold).
@@ -2138,6 +2174,16 @@ impl CacheEngine {
                     // never read back out of the store (#1132). The wrapper
                     // returns `()`, so there is nothing here to drop by accident.
                     self.pull_through_fill(hash, local_only).await?;
+                    // ADR 040: consult the admission policy now that the fill
+                    // succeeded. Stage A ships only `AlwaysAdmit`, so `segment`
+                    // is always `Main` and the tag path below is unaffected —
+                    // this only records the decision.
+                    let admission_ctx = crate::policy::AdmissionContext {
+                        hash,
+                        known_size: None,
+                    };
+                    let segment = self.admission_segment(&admission_ctx);
+                    tracing::trace!(%hash, ?segment, "admission segment");
                     break;
                 }
             }
@@ -2651,6 +2697,16 @@ impl CacheEngine {
 
         match outcome {
             Ok(_drained) => {
+                // ADR 040: consult the admission policy before protecting the
+                // partial import. Stage A ships only `AlwaysAdmit`, so
+                // `segment` is always `Main` and `protect_partial` below is
+                // unaffected — this only records the decision.
+                let admission_ctx = crate::policy::AdmissionContext {
+                    hash,
+                    known_size: Some(total_bytes),
+                };
+                let segment = self.admission_segment(&admission_ctx);
+                tracing::trace!(%hash, ?segment, "admission segment");
                 if let Err(e) = self.protect_partial(hash).await {
                     return Err((reader, e));
                 }
@@ -5037,6 +5093,27 @@ mod tests {
         let _ = engine.get(hash).await?;
 
         anyhow::ensure!(counter.estimate(hash) >= 1, "observe should fire on access");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_admission_is_main_segment() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello admission";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let ctx = crate::policy::AdmissionContext {
+            hash,
+            known_size: None,
+        };
+        assert_eq!(
+            engine.admission_segment_for_test(&ctx),
+            crate::policy::Segment::Main
+        );
         Ok(())
     }
 
