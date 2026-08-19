@@ -778,6 +778,15 @@ impl RuntimeReloadState {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+                eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
+                admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
+                tinylfu: decdn_common::config::ResolvedTinyLfu {
+                    sketch_bytes: decdn_common::config::DEFAULT_TINYLFU_SKETCH_BYTES,
+                    promotion_threshold: decdn_common::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD,
+                    probation_target_pct:
+                        decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
+                    aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+                },
             },
             // Placeholder rate — `payment.*` is restart-required.
             payment: ResolvedPayment {
@@ -1093,6 +1102,9 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
+        eviction_policy,
+        admission_policy,
+        tinylfu,
     } = c;
     cache_dir.is_some()
         || cache_size_mb.is_some()
@@ -1122,6 +1134,13 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || node_pull_probe_fanout.is_some()
         || node_pull_timeout_sec.is_some()
         || node_pull_stall_timeout_sec.is_some()
+        // Admission/eviction policy selection and its tuning knobs (ADR 040)
+        // are wired once at bring-up — the estimator and policy objects are
+        // constructed in `build_infra` and injected into the engine/driver;
+        // changing them requires a restart.
+        || eviction_policy.is_some()
+        || admission_policy.is_some()
+        || tinylfu.is_some()
 }
 
 /// Whether the file's `[observability]` section sets any field that a
@@ -1240,6 +1259,15 @@ mod tests {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+                eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
+                admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
+                tinylfu: decdn_common::config::ResolvedTinyLfu {
+                    sketch_bytes: decdn_common::config::DEFAULT_TINYLFU_SKETCH_BYTES,
+                    promotion_threshold: decdn_common::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD,
+                    probation_target_pct:
+                        decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
+                    aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+                },
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,

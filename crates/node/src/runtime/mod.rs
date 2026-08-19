@@ -331,6 +331,10 @@ struct Infra {
     node_origin: Option<crate::node_origin::NodeOrigin>,
     pull_through_origin: Option<Arc<crate::node_origin::NodeOrigin>>,
     cache: CacheEngine,
+    /// Cache eviction policy selected by `cache.eviction_policy` (ADR 040).
+    /// Injected into the eviction driver at spawn time
+    /// ([`spawn_background_tasks`]); the engine itself never chooses a policy.
+    eviction_policy: Arc<dyn decdn_cache::EvictionPolicy>,
     ep: Endpoint,
     limiter: Arc<ConnectionLimiter>,
 }
@@ -531,6 +535,46 @@ async fn build_infra(
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
+
+    // Admission/eviction policy selection (ADR 040). One shared frequency
+    // estimator feeds both the engine's hit-signal sink and whichever policy
+    // objects need it; the engine itself owns no policy knowledge beyond the
+    // estimator handle.
+    let want_tinylfu =
+        cfg.cache.eviction_policy == "tinylfu" || cfg.cache.admission_policy == "tinylfu";
+    let estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>> = want_tinylfu.then(|| {
+        Arc::new(decdn_cache::policy::tinylfu::TinyLfuEstimator::new(
+            cfg.cache.tinylfu.sketch_bytes,
+        )) as Arc<dyn decdn_cache::FrequencyEstimator>
+    });
+    if let Some(est) = &estimator {
+        cache.set_frequency_estimator(est.clone());
+    }
+    if cfg.cache.admission_policy == "tinylfu"
+        && let Some(est) = &estimator
+    {
+        cache.set_admission_policy(Arc::new(decdn_cache::policy::tinylfu::ProbationAdmission {
+            freq: est.clone(),
+            promotion_threshold: cfg.cache.tinylfu.promotion_threshold,
+        }));
+    }
+    // promotion_threshold + probation_target_pct live entirely on the policy
+    // object, not on the engine or the eviction driver's `EvictionParams`.
+    let eviction_policy: Arc<dyn decdn_cache::EvictionPolicy> =
+        match cfg.cache.eviction_policy.as_str() {
+            "tinylfu" => match &estimator {
+                Some(est) => Arc::new(decdn_cache::policy::tinylfu::TinyLfuEviction::new(
+                    est.clone(),
+                    cfg.cache.tinylfu.promotion_threshold,
+                    cfg.cache.tinylfu.probation_target_pct,
+                )),
+                // Unreachable: `want_tinylfu` is true whenever eviction_policy
+                // == "tinylfu", so `estimator` is always `Some` here.
+                None => Arc::new(decdn_cache::policy::LruEviction),
+            },
+            _ => Arc::new(decdn_cache::policy::LruEviction),
+        };
+
     let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
@@ -587,6 +631,7 @@ async fn build_infra(
         node_origin,
         pull_through_origin,
         cache,
+        eviction_policy,
         ep,
         limiter,
     })
@@ -1500,7 +1545,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             infra.cache.clone(),
             infra.node_metrics.cache_metrics(),
             params,
-            std::sync::Arc::new(decdn_cache::LruEviction),
+            infra.eviction_policy.clone(),
             eviction_stop_rx,
         ));
         eviction_stop_tx
@@ -3535,6 +3580,15 @@ mod tests {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+                eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
+                admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
+                tinylfu: decdn_common::config::ResolvedTinyLfu {
+                    sketch_bytes: decdn_common::config::DEFAULT_TINYLFU_SKETCH_BYTES,
+                    promotion_threshold: decdn_common::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD,
+                    probation_target_pct:
+                        decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
+                    aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+                },
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,
