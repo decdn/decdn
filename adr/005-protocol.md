@@ -194,12 +194,19 @@ ChunkPreimage { preimage: [u8; 32], index: u8 }
 ```rust
 /// The payment quantum. A protocol constant, never negotiated.
 pub const CHUNK_BYTES: u64 = 1_048_576;
-/// 255 chunks per chain. The value fits `u8` exactly, which is why it is 255
-/// and not 256: releasable indices then need no offset encoding.
+/// 255 chunks per chain — the largest value a `u8` index can name.
+///
+/// The boundary is 255, NOT 256. A `u8` holds `0..=255`, index 0 is reserved
+/// for redeem-time settlement, so the releasable indices are `1..=255` and a
+/// chain meters at most 255 chunks (255 MiB at `CHUNK_BYTES`). A 256-chunk
+/// chain is not representable: it would need index 256, or an `index - 1`
+/// offset encoding that reintroduces the off-by-one this type removes.
 pub const MAX_CHAIN_LENGTH: u8 = 255;
 ```
 
 The decoded byte is the chain index as-is, with no widening and no conversion. The node verifies a preimage by hashing it forward to the deepest preimage it already holds on that lane, and credits the lane-wide chain index whichever stream carried the message.
+
+**The index is one byte end to end.** The same `u8` that names an index here is the low byte of the packed `chainMeter` word the node later submits on-chain ([ADR 003 § Voucher signatures are compact](003-payments.md#voucher-signatures-are-compact-and-their-signers-are-eoas)), so the wire and the calldata agree on the representation and neither side converts. That is also where the chain-length bound comes from: it is a property of the type, not a check either layer performs. **The bound is 255, not 256** — `u8` reaches 255, index 0 is the settlement case and never travels the wire, so the releasable range is `1..=255` and one chain meters at most 255 MiB. Extending to 256 chunks would need an `index - 1` offset on the wire, which trades a real off-by-one hazard for one more chunk per chain; the ADR takes the shorter chain instead.
 
 Delivery and payment are not lock-stepped at the chunk, though. A node streams within a **credit window** of several chunks ([ADR 003 — Credit Window](003-payments.md#credit-window)): it keeps sending chunks while the unpaid balance stays within the window and pauses only when it would exceed it. There is no per-proof acknowledgement on the wire — the node's continued delivery is the implicit acknowledgement; a proof the node did not accept simply stops delivery, and the payer resends it. The window is delivery-layer node policy — it appears in no wire field — and it bounds the node's credit exposure to exactly one window of unbilled egress while leaving the payer's exposure at zero (both proofs remain cumulative over bytes already received). At a window of one chunk this reduces to strict stop-and-wait, which is what keeps the two ends interoperable regardless of which pipelines.
 
