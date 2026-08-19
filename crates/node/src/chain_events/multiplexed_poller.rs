@@ -590,9 +590,12 @@ async fn run_tick<P: Provider + Clone>(
         Err(err) => return Err(fail_whole_tick(poller, shutdown, err)),
     };
 
-    // A per-route floor-derivation failure isolates that route (see
-    // `resolve_route_floors`) rather than failing the whole tick, so this is
-    // infallible; only the shared head/`get_logs` reads fail the tick outright.
+    // `resolve_route_floors` never aborts the tick early: a per-route
+    // floor-derivation failure isolates that route (see its doc) instead of
+    // short-circuiting here, so this call is infallible. The tick can still end
+    // in `Err` below — an isolated route trips `fire_route_hooks`' `any_errored`,
+    // exactly as a sink error does — but only the shared head/`get_logs` reads
+    // abort it up front via `fail_whole_tick`.
     let from = resolve_route_floors(poller, to);
 
     // If every route is already at/above head this is an idle tick: no
