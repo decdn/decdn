@@ -111,10 +111,10 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
     raw.saturating_sub(state.pending_reclaim)
 }
 
-/// One budget-bounded eviction pass. Releases up to `budget` LRU candidates,
-/// oldest access first, stopping early once the projected effective footprint
-/// reaches `target_bytes`. Returns the number of bytes actually released (to be
-/// added to `pending_reclaim`).
+/// One budget-bounded eviction pass. Releases up to `budget` candidates in the
+/// order `policy` ranks them, stopping early once the projected effective
+/// footprint reaches `target_bytes`. Returns the number of bytes actually
+/// released (to be added to `pending_reclaim`).
 ///
 /// Emits `evictions_starved` when there is nothing left to evict while still
 /// over target — either because the candidate set is empty (everything pinned,
@@ -128,6 +128,7 @@ async fn sweep(
     target_bytes: u64,
     budget: u64,
     sizes: &HashMap<decdn_cache::Hash, u64>,
+    policy: &Arc<dyn decdn_cache::EvictionPolicy>,
 ) -> u64 {
     let candidates = cache.eviction_candidates();
     if candidates.is_empty() {
@@ -136,13 +137,11 @@ async fn sweep(
         return 0;
     }
 
-    let mut ordered: Vec<(decdn_cache::Hash, std::time::Instant)> =
-        candidates.into_inner().into_iter().collect();
-    ordered.sort_by_key(|(_, last)| *last); // oldest access first
+    let victims = policy.select_victims(&candidates, sizes);
 
     let mut freed: u64 = 0;
     let mut removed: u64 = 0;
-    for (hash, _) in ordered {
+    for hash in victims {
         if effective.saturating_sub(freed) <= target_bytes {
             break;
         }
@@ -189,6 +188,7 @@ async fn tick(
     target_bytes: u64,
     budget: u64,
     state: &mut DriverState,
+    policy: &Arc<dyn decdn_cache::EvictionPolicy>,
 ) {
     // Exactly ONE store walk per tick: this snapshot is both the footprint
     // source and the sweep's per-hash size lookup, so `sweep` takes it by
@@ -234,7 +234,16 @@ async fn tick(
         state.evicting = true;
     }
 
-    let freed = sweep(cache, metrics, effective, target_bytes, budget, &sizes).await;
+    let freed = sweep(
+        cache,
+        metrics,
+        effective,
+        target_bytes,
+        budget,
+        &sizes,
+        policy,
+    )
+    .await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
 }
 
@@ -245,6 +254,7 @@ pub async fn run(
     cache: CacheEngine,
     metrics: Arc<CacheMetrics>,
     params: EvictionParams,
+    policy: Arc<dyn decdn_cache::EvictionPolicy>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let limit_bytes = params.cache_size_mb.saturating_mul(BYTES_PER_MB);
@@ -277,6 +287,7 @@ pub async fn run(
             target_bytes,
             params.per_sweep_budget,
             &mut state,
+            &policy,
         )
         .await;
     }
@@ -375,5 +386,76 @@ mod tests {
         // Only 100 of the 300 pending bytes get reclaimed this cycle.
         assert_eq!(reconcile(&mut state, 900), 700);
         assert_eq!(state.pending_reclaim, 200);
+    }
+
+    /// Proves `sweep` delegates victim ordering to the injected policy rather
+    /// than sorting inline. `NewestFirst` reverses LRU order, so with a
+    /// budget of 1 the most-recently-touched hash must be the one released —
+    /// the opposite of what the old inline oldest-first sort would pick.
+    #[tokio::test]
+    async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
+        #[derive(Debug)]
+        struct NewestFirst;
+        impl decdn_cache::EvictionPolicy for NewestFirst {
+            fn select_victims(
+                &self,
+                c: &decdn_cache::EvictionCandidates,
+                _s: &HashMap<decdn_cache::Hash, u64>,
+            ) -> Vec<decdn_cache::Hash> {
+                let mut v: Vec<_> = c.iter().map(|(h, t)| (*h, *t)).collect();
+                v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+                v.into_iter().map(|(h, _)| h).collect()
+            }
+        }
+
+        let older_payload = b"eviction policy test: older blob";
+        let newer_payload = b"eviction policy test: newer blob";
+        let older_hash = decdn_cache::Hash::new(older_payload);
+        let newer_hash = decdn_cache::Hash::new(newer_payload);
+
+        let origin_dir = tempfile::tempdir()?;
+        for (hash, payload) in [(older_hash, older_payload), (newer_hash, newer_payload)] {
+            let hex = hash.to_hex();
+            let shard = hex
+                .get(..2)
+                .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+            let dir = origin_dir.path().join(shard);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(hex.as_str()), payload)?;
+        }
+
+        let cache_dir = tempfile::tempdir()?;
+        let origin =
+            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache = CacheEngine::open(
+            cache_dir.path(),
+            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await?;
+
+        // Touch older first, then newer, so the two access times are ordered.
+        let _ = cache.get(older_hash).await?;
+        let _ = cache.get(newer_hash).await?;
+
+        let sizes = cache.size_snapshot().await?;
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(NewestFirst);
+
+        // target_bytes = 0 keeps the sweep over target for the whole pass;
+        // budget = 1 stops it after exactly one release, so only the
+        // policy's first-ranked victim gets evicted.
+        sweep(&cache, &metrics, u64::MAX, 0, 1, &sizes, &policy).await;
+
+        let remaining = cache.eviction_candidates();
+        assert!(
+            remaining.contains_key(&older_hash),
+            "older hash must survive — NewestFirst evicts the newer one first"
+        );
+        assert!(
+            !remaining.contains_key(&newer_hash),
+            "newer hash must be the one released under NewestFirst"
+        );
+        Ok(())
     }
 }

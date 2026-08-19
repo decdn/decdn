@@ -1500,6 +1500,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             infra.cache.clone(),
             infra.node_metrics.cache_metrics(),
             params,
+            std::sync::Arc::new(decdn_cache::LruEviction),
             eviction_stop_rx,
         ));
         eviction_stop_tx
