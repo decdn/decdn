@@ -63,7 +63,7 @@ On-chain data links a pool owner to the provider addresses it pays, revealed at 
 
 ##### Settlement volume leakage (P-22)
 
-At each on-chain redemption the lane's cumulative amount and byte count are public. Vouchers are issued every 4 MiB, so the cumulative amount reveals the count of 4 MiB increments. Combined with P-02 (signer/provider address linkage) and public rate information, an observer computes the exact volume between a specific signer-provider pair. Inherent to on-chain settlement — redemption amounts must be public.
+At each on-chain redemption the lane's cumulative amount and byte count are public. Delivery is metered in 1 MiB chunks, and a redeemed `chainIndex` is itself public, so the cumulative amount reveals the count of 1 MiB increments. Combined with P-02 (signer/provider address linkage) and public rate information, an observer computes the exact volume between a specific signer-provider pair. Inherent to on-chain settlement — redemption amounts must be public.
 
 ##### Protocol fingerprinting (P-04)
 
