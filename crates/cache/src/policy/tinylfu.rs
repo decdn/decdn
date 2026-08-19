@@ -2,8 +2,8 @@
 use super::EvictionPolicy;
 use super::FrequencyEstimator;
 use super::sketch::CountMinSketch;
-use crate::{EvictionCandidates, Hash};
-use std::collections::HashMap;
+use super::{EvictionContext, EvictionPlan};
+use crate::Hash;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -56,18 +56,31 @@ impl TinyLfuEviction {
 }
 
 impl EvictionPolicy for TinyLfuEviction {
-    fn select_victims(
-        &self,
-        candidates: &EvictionCandidates,
-        _sizes: &HashMap<Hash, u64>,
-    ) -> Vec<Hash> {
-        let mut scored: Vec<(Hash, u32, std::time::Instant)> = candidates
+    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan {
+        let mut scored: Vec<(Hash, u32, std::time::Instant)> = ctx
+            .candidates
             .iter()
             .map(|(h, t)| (*h, self.freq.estimate(*h), *t))
             .collect();
         // Least frequent first; tie-break oldest access first (LRFU).
         scored.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-        scored.into_iter().map(|(h, _, _)| h).collect()
+        // Same target/budget loop as LRU. Promotion/probation cap is Task 8.
+        let mut evict = Vec::new();
+        let mut freed = 0u64;
+        for (h, _, _) in scored {
+            if ctx.total_bytes.saturating_sub(freed) <= ctx.target_bytes {
+                break;
+            }
+            if evict.len() as u64 >= ctx.budget {
+                break;
+            }
+            freed = freed.saturating_add(ctx.sizes.get(&h).copied().unwrap_or(0));
+            evict.push(h);
+        }
+        EvictionPlan {
+            evict,
+            promote: Vec::new(),
+        }
     }
 
     fn on_access(&self, hash: Hash) {
@@ -111,12 +124,24 @@ mod tests {
         ); // LRU would evict hot
         map.insert(cold, now);
         let candidates = crate::EvictionCandidates::from_map_for_test(map);
-        let victims = TinyLfuEviction::new(freq)
-            .select_victims(&candidates, &std::collections::HashMap::new());
+        let sizes = std::collections::HashMap::new();
+        let segments = std::collections::HashMap::new();
+        // Empty sizes (all 0) so `freed` never grows: with total > target and a
+        // wide budget the whole set is planned in least-frequent-first order.
+        let plan = TinyLfuEviction::new(freq).plan(&EvictionContext {
+            candidates: &candidates,
+            sizes: &sizes,
+            segments: &segments,
+            total_bytes: 1,
+            target_bytes: 0,
+            budget: 100,
+            cache_bytes: 0,
+        });
         assert_eq!(
-            victims.first().copied(),
+            plan.evict.first().copied(),
             Some(cold),
             "least-frequent must go first"
         );
+        assert!(plan.promote.is_empty());
     }
 }

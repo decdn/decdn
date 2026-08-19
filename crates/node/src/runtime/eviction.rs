@@ -121,12 +121,14 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
 /// operator-evicted, or probe-held, **or** a cold-started node whose in-memory
 /// access map has not been populated by traffic yet) or because a whole pass
 /// released nothing.
+#[allow(clippy::too_many_arguments)]
 async fn sweep(
     cache: &CacheEngine,
     metrics: &CacheMetrics,
     effective: u64,
     target_bytes: u64,
     budget: u64,
+    cache_bytes: u64,
     sizes: &HashMap<decdn_cache::Hash, u64>,
     policy: &Arc<dyn decdn_cache::EvictionPolicy>,
 ) -> u64 {
@@ -137,19 +139,28 @@ async fn sweep(
         return 0;
     }
 
-    let victims = policy.select_victims(&candidates, sizes);
+    // The policy owns the whole sweep decision (ADR 040): it ranks candidates,
+    // applies the target/budget stop conditions, and returns what to evict and
+    // what to promote. The driver is a dumb executor.
+    let segments = cache.segments_snapshot();
+    let plan = policy.plan(&decdn_cache::EvictionContext {
+        candidates: &candidates,
+        sizes,
+        segments: &segments,
+        total_bytes: effective,
+        target_bytes,
+        budget,
+        cache_bytes,
+    });
+
+    // Promotion is a pure in-memory segment move — no store I/O.
+    for (hash, seg) in plan.promote {
+        cache.set_segment(hash, seg);
+    }
 
     let mut freed: u64 = 0;
     let mut removed: u64 = 0;
-    for hash in victims {
-        if effective.saturating_sub(freed) <= target_bytes {
-            break;
-        }
-        if removed >= budget {
-            // Budget spent for this tick; the latch keeps us evicting so the
-            // next tick resumes toward target.
-            break;
-        }
+    for hash in plan.evict {
         match cache.release_for_eviction(hash).await {
             // `Ok(0)` means nothing was released — the hash was pinned (the
             // documented defence-in-depth refusal) or carried no protecting tag.
@@ -181,12 +192,14 @@ async fn sweep(
 /// One driver tick: measure, refresh cache-health gauges, reconcile
 /// pending-reclaim against observed GC progress, apply the hysteresis latch, and
 /// (when latched over target) run one budget-bounded [`sweep`].
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     cache: &CacheEngine,
     metrics: &CacheMetrics,
     high_water_bytes: u64,
     target_bytes: u64,
     budget: u64,
+    cache_bytes: u64,
     state: &mut DriverState,
     policy: &Arc<dyn decdn_cache::EvictionPolicy>,
 ) {
@@ -240,6 +253,7 @@ async fn tick(
         effective,
         target_bytes,
         budget,
+        cache_bytes,
         &sizes,
         policy,
     )
@@ -286,6 +300,7 @@ pub async fn run(
             high_water_bytes,
             target_bytes,
             params.per_sweep_budget,
+            limit_bytes,
             &mut state,
             &policy,
         )
@@ -397,14 +412,25 @@ mod tests {
         #[derive(Debug)]
         struct NewestFirst;
         impl decdn_cache::EvictionPolicy for NewestFirst {
-            fn select_victims(
-                &self,
-                c: &decdn_cache::EvictionCandidates,
-                _s: &HashMap<decdn_cache::Hash, u64>,
-            ) -> Vec<decdn_cache::Hash> {
-                let mut v: Vec<_> = c.iter().map(|(h, t)| (*h, *t)).collect();
+            fn plan(&self, ctx: &decdn_cache::EvictionContext) -> decdn_cache::EvictionPlan {
+                let mut v: Vec<_> = ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
                 v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
-                v.into_iter().map(|(h, _)| h).collect()
+                let mut evict = Vec::new();
+                let mut freed = 0u64;
+                for (h, _) in v {
+                    if ctx.total_bytes.saturating_sub(freed) <= ctx.target_bytes {
+                        break;
+                    }
+                    if evict.len() as u64 >= ctx.budget {
+                        break;
+                    }
+                    freed = freed.saturating_add(ctx.sizes.get(&h).copied().unwrap_or(0));
+                    evict.push(h);
+                }
+                decdn_cache::EvictionPlan {
+                    evict,
+                    promote: Vec::new(),
+                }
             }
         }
 
@@ -445,7 +471,7 @@ mod tests {
         // target_bytes = 0 keeps the sweep over target for the whole pass;
         // budget = 1 stops it after exactly one release, so only the
         // policy's first-ranked victim gets evicted.
-        sweep(&cache, &metrics, u64::MAX, 0, 1, &sizes, &policy).await;
+        sweep(&cache, &metrics, u64::MAX, 0, 1, u64::MAX, &sizes, &policy).await;
 
         let remaining = cache.eviction_candidates();
         assert!(

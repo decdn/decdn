@@ -217,6 +217,14 @@ struct Inner {
     /// than `ArcSwap<dyn Trait>`: the latter needs `RefCnt: Sized`, which
     /// `arc-swap` 1.9.2 does not give a `dyn` trait object.
     admission: ArcSwap<Arc<dyn crate::policy::AdmissionPolicy>>,
+    /// Generic `hash -> Segment` membership the engine tracks with no meaning
+    /// attached (ADR 040 §1). Admission stores the label it chose; the eviction
+    /// policy reads and moves it at the sweep. Pure in-memory metadata — the
+    /// blob's normal commit tag still provides GC protection, so no tag I/O is
+    /// tied to it. Only non-default (`Probation`) entries are stored; an absent
+    /// hash reads back as [`crate::policy::Segment::Main`], so under the default
+    /// `AlwaysAdmit` (always `Main`) the map stays empty and inert.
+    segments: Mutex<HashMap<Hash, crate::policy::Segment>>,
     /// Append-only file holding lowercase-hex evicted hashes, one per line.
     /// Loaded on [`CacheEngine::open`]; appended to (with `fsync`) on every
     /// successful [`CacheEngine::evict`]. Lives at `<cache_dir>/evicted.log`.
@@ -1041,6 +1049,7 @@ impl CacheEngine {
                 admission: ArcSwap::from_pointee(
                     Arc::new(crate::policy::AlwaysAdmit) as Arc<dyn crate::policy::AdmissionPolicy>
                 ),
+                segments: Mutex::new(HashMap::new()),
                 evicted_log_path,
                 retry_policy,
                 metrics,
@@ -1637,6 +1646,11 @@ impl CacheEngine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
 
         // Disk reclaim (#860): serving has already stopped via the logical
         // set above, but a successfully pulled-through blob carries a named
@@ -1866,6 +1880,74 @@ impl CacheEngine {
         ctx: &crate::policy::AdmissionContext,
     ) -> crate::policy::Segment {
         self.admission_segment(ctx)
+    }
+
+    /// Set `hash`'s generic segment membership (ADR 040 §1). Pure in-memory
+    /// metadata — the blob's commit tag still protects it from GC, so this does
+    /// no tag I/O. [`crate::policy::Segment::Main`] is the absent default, so
+    /// setting `Main` removes any entry; under `AlwaysAdmit` (always `Main`)
+    /// this is a no-op and the map stays empty.
+    pub fn set_segment(&self, hash: Hash, segment: crate::policy::Segment) {
+        let mut guard = self
+            .inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match segment {
+            crate::policy::Segment::Main => {
+                guard.remove(&hash);
+            }
+            crate::policy::Segment::Probation => {
+                guard.insert(hash, segment);
+            }
+        }
+    }
+
+    /// Read `hash`'s segment membership; an untracked hash is
+    /// [`crate::policy::Segment::Main`].
+    #[must_use]
+    pub fn segment_of(&self, hash: Hash) -> crate::policy::Segment {
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&hash)
+            .copied()
+            .unwrap_or(crate::policy::Segment::Main)
+    }
+
+    /// Sum the sizes of the members of `seg`, using `sizes` for per-hash bytes.
+    /// For `Main` (the untracked default) this sums every hash in `sizes` not
+    /// present in the segment map.
+    #[must_use]
+    pub fn segment_bytes(&self, seg: crate::policy::Segment, sizes: &HashMap<Hash, u64>) -> u64 {
+        let guard = self
+            .inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        sizes
+            .iter()
+            .filter(|(h, _)| {
+                guard
+                    .get(*h)
+                    .copied()
+                    .unwrap_or(crate::policy::Segment::Main)
+                    == seg
+            })
+            .fold(0u64, |acc, (_, sz)| acc.saturating_add(*sz))
+    }
+
+    /// Snapshot the generic segment membership for the sweep's
+    /// [`crate::policy::EvictionContext`]. Only non-default (`Probation`)
+    /// entries are present.
+    #[must_use]
+    pub fn segments_snapshot(&self) -> HashMap<Hash, crate::policy::Segment> {
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Attempt to take (or refresh) a probe-triggered eviction hold on
@@ -2175,15 +2257,16 @@ impl CacheEngine {
                     // returns `()`, so there is nothing here to drop by accident.
                     self.pull_through_fill(hash, local_only).await?;
                     // ADR 040: consult the admission policy now that the fill
-                    // succeeded. Stage A ships only `AlwaysAdmit`, so `segment`
-                    // is always `Main` and the tag path below is unaffected —
-                    // this only records the decision.
+                    // succeeded and record the chosen segment. Under the default
+                    // `AlwaysAdmit` the segment is `Main`, so `set_segment` is a
+                    // no-op and the tag path below is unaffected — membership is
+                    // pure in-memory metadata, no tag I/O.
                     let admission_ctx = crate::policy::AdmissionContext {
                         hash,
                         known_size: None,
                     };
                     let segment = self.admission_segment(&admission_ctx);
-                    tracing::trace!(%hash, ?segment, "admission segment");
+                    self.set_segment(hash, segment);
                     break;
                 }
             }
@@ -2698,15 +2781,16 @@ impl CacheEngine {
         match outcome {
             Ok(_drained) => {
                 // ADR 040: consult the admission policy before protecting the
-                // partial import. Stage A ships only `AlwaysAdmit`, so
-                // `segment` is always `Main` and `protect_partial` below is
-                // unaffected — this only records the decision.
+                // partial import and record the chosen segment. Under the
+                // default `AlwaysAdmit` the segment is `Main`, so `set_segment`
+                // is a no-op and `protect_partial` below is unaffected —
+                // membership is pure in-memory metadata, no tag I/O.
                 let admission_ctx = crate::policy::AdmissionContext {
                     hash,
                     known_size: Some(total_bytes),
                 };
                 let segment = self.admission_segment(&admission_ctx);
-                tracing::trace!(%hash, ?segment, "admission segment");
+                self.set_segment(hash, segment);
                 if let Err(e) = self.protect_partial(hash).await {
                     return Err((reader, e));
                 }
@@ -2948,7 +3032,10 @@ impl CacheEngine {
         if let Ok(mut guard) = self.inner.access_times.lock() {
             guard.insert(hash, Instant::now());
         }
-        if let Some(est) = self.inner.frequency.load().as_ref() {
+        // `load_full` clones the Arc out and releases the guard before calling
+        // `observe`, so the estimator's own work never runs under the arc-swap
+        // read guard.
+        if let Some(est) = self.inner.frequency.load_full().as_ref() {
             est.observe(hash);
         }
     }
@@ -3034,6 +3121,11 @@ impl CacheEngine {
         };
         self.inner
             .access_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
+        self.inner
+            .segments
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);

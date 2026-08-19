@@ -43,14 +43,43 @@ pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
     fn admit(&self, ctx: &AdmissionContext) -> AdmissionDecision;
 }
 
+/// Everything a policy needs to plan one eviction sweep. The engine assembles
+/// it and never interprets the policy's semantics — `candidates` is already
+/// stripped of pins/holds/deny, and `segments` is the generic `hash -> Segment`
+/// membership the engine tracks with no meaning attached.
+#[derive(Debug)]
+pub struct EvictionContext<'a> {
+    /// Eligible hashes with their last-access `Instant` (pin/hold/deny-filtered).
+    pub candidates: &'a EvictionCandidates,
+    /// Whole-store per-hash byte size.
+    pub sizes: &'a HashMap<Hash, u64>,
+    /// Generic segment membership the engine tracks (absent = `Segment::Main`).
+    pub segments: &'a HashMap<Hash, Segment>,
+    /// Effective footprint the sweep is deciding against.
+    pub total_bytes: u64,
+    /// Evict down to this many bytes.
+    pub target_bytes: u64,
+    /// Maximum releases this sweep.
+    pub budget: u64,
+    /// Configured cache size; a policy sizes its own caps from it (LRU ignores).
+    pub cache_bytes: u64,
+}
+
+/// The single sweep-time decision: what leaves, and what graduates to a new
+/// segment. `LruEviction` returns `promote` empty.
+#[derive(Debug, Default)]
+pub struct EvictionPlan {
+    /// Release these hashes, in order.
+    pub evict: Vec<Hash>,
+    /// Move these hashes to a new segment (e.g. `Probation -> Main`).
+    pub promote: Vec<(Hash, Segment)>,
+}
+
 pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
-    /// Return the eligible candidates in eviction order (first = evict first).
-    /// `candidates` is already stripped of pins/holds/deny by the engine.
-    fn select_victims(
-        &self,
-        candidates: &EvictionCandidates,
-        sizes: &HashMap<Hash, u64>,
-    ) -> Vec<Hash>;
+    /// The one sweep-time decision: what leaves, what graduates. Buffered
+    /// signals (see [`Self::on_access`]) are folded in here. `candidates` is
+    /// already stripped of pins/holds/deny by the engine.
+    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan;
 
     /// Optional per-access hook. Default no-op; `TinyLfu` forwards to its estimator.
     fn on_access(&self, _hash: Hash) {}

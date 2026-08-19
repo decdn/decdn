@@ -60,8 +60,8 @@ pub use origin::{
     OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
 };
 pub use policy::{
-    AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionPolicy,
-    FrequencyEstimator, LruEviction, Segment,
+    AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,
+    EvictionPlan, EvictionPolicy, FrequencyEstimator, LruEviction, Segment,
 };
 pub use probe_hold::{
     PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW, ProbeHoldOutcome,
