@@ -36,13 +36,15 @@
 //! because there is exactly one sink. Here the *tick* fires each route's hooks
 //! independently (routes fail independently), and the loop's `Err` arm only
 //! sleeps the backoff — it never fires a hook itself. The one exception is a
-//! failure in the shared, pre-route-loop work (the head read, or a route's
-//! checkpoint-load floor derivation, or the merged `get_logs` call): those fail
-//! the *whole* tick before any route-specific step runs, so [`fail_whole_tick`]
-//! fires `on_backoff` for every route directly at the failure site — every route
-//! is equally down, just as five independent watchers all convoyed into backoff
-//! together when every one read the shared head through
-//! [`super::shared_head::SharedHead`].
+//! failure in the shared chain reads (the head read, or the merged `get_logs`
+//! call): those fail the *whole* tick before any route-specific step runs, so
+//! [`fail_whole_tick`] fires `on_backoff` for every route directly at the
+//! failure site — every route is equally down, just as five independent watchers
+//! all convoyed into backoff together when every one read the shared head
+//! through [`super::shared_head::SharedHead`]. A route's own checkpoint-load
+//! floor derivation is *not* shared: it fails only that route (see
+//! [`resolve_route_floors`]), because the checkpoint store belongs to one
+//! watcher and its read error says nothing about the siblings.
 //!
 //! The `on_established`/`on_backoff` *edges* are suppressed once `shutdown` is
 //! cancelled (a tick that only "succeeded" because a sink observed the cancel
@@ -220,8 +222,10 @@ pub struct MultiplexedPoller {
     max_backfill_span: u64,
     initial_backoff: Duration,
     /// Ceiling for the shared loop's backoff. One loop now serves every route,
-    /// so a route that used to carry its own tighter cap (slash's 30s) no
-    /// longer can — [`WATCHER_MAX_BACKOFF`] (60s) applies to the whole poller.
+    /// so a route that used to carry its own tighter cap can no longer do so —
+    /// [`WATCHER_MAX_BACKOFF`] applies to the whole poller. That shared ceiling
+    /// is set to slash's 30s (the tightest requirement) so slash recovery does
+    /// not regress; see [`WATCHER_MAX_BACKOFF`] for the rationale.
     max_backoff: Duration,
     rpc_call_timeout: Option<Duration>,
     /// Every route's `(label, on_task_panic)`, extracted out of `routes` at
@@ -370,12 +374,14 @@ impl MultiplexedPollerBuilder {
 /// Fire `on_backoff` for every route (unless `shutdown` is cancelled — the
 /// same edge suppression a successful tick applies) and clear every
 /// route's `established` flag, then hand back `err` unchanged. Used only at
-/// the shared, pre-route-loop failure points (head read, a route's floor
-/// derivation, the merged `get_logs` call): a failure there aborts the whole
-/// tick before any route-specific step has run, so no single route's
-/// `errored` flag would otherwise capture it, and every route is equally
-/// "down" — exactly as before the merge, when every watcher read its own head
-/// and they all convoyed into backoff together.
+/// the shared chain-read failure points (the head read and the merged
+/// `get_logs` call): a failure there aborts the whole tick before any
+/// route-specific step has run, so no single route's `errored` flag would
+/// otherwise capture it, and every route is equally "down" — exactly as before
+/// the merge, when every watcher read its own head and they all convoyed into
+/// backoff together. A route's checkpoint-load floor derivation is deliberately
+/// *not* routed here: it is route-local and isolates that one route instead (see
+/// [`resolve_route_floors`]).
 fn fail_whole_tick(
     poller: &mut MultiplexedPoller,
     shutdown: &CancellationToken,
@@ -395,29 +401,54 @@ fn fail_whole_tick(
 /// Step 1: resolve every route's floor for this tick (its cursor, or a
 /// first-tick `initial_from`) and return the union scan range's lower bound
 /// (`min` over resolved cursors, or `to` if every route is already there — an
-/// idle tick). A `FromCheckpoint` load error is retryable and propagates
-/// (settlement's #751/#762 guard); the caller fails the whole tick on it.
-fn resolve_route_floors(poller: &mut MultiplexedPoller, to: u64) -> Result<u64> {
+/// idle tick).
+///
+/// A `FromCheckpoint` load error (only a `FromCheckpoint` route reaches
+/// `initial_from`'s failing checkpoint read — settlement's #751/#762 guard) is
+/// route-local: the checkpoint store belongs to that one watcher, so its read
+/// failure says nothing about any sibling's health or the shared RPC. It
+/// therefore isolates that single route (holds its `None` cursor, retries floor
+/// derivation next tick, fires only its own `on_backoff`) rather than failing
+/// the whole tick — matching pre-merge behavior, where a settlement checkpoint
+/// error backed off only the settlement watcher and left the others polling.
+/// Isolated routes are excluded from the merged scan range's lower bound.
+fn resolve_route_floors(poller: &mut MultiplexedPoller, to: u64) -> u64 {
     for r in &mut poller.routes {
+        // Clear last tick's isolation before re-evaluating this route.
+        r.errored = false;
         if r.cursor.is_none() {
-            let resolved = match r.start.seed() {
-                Some(seed) => seed,
-                None => r.start.initial_from(poller.from_block, to)?,
-            };
-            r.cursor = Some(resolved);
+            match r.start.seed() {
+                Some(seed) => r.cursor = Some(seed),
+                None => match r.start.initial_from(poller.from_block, to) {
+                    Ok(resolved) => r.cursor = Some(resolved),
+                    Err(err) => {
+                        // Route-local checkpoint-load fault: isolate and retry
+                        // this route only (see this fn's doc). Its stale
+                        // `tick_floor` is never consulted while `errored` — the
+                        // demux, advance, and reconcile steps all skip it.
+                        r.errored = true;
+                        warn!(
+                            label = r.label,
+                            err = %sanitize_err_chain(&err),
+                            "route floor-derivation error; isolating and retrying this route"
+                        );
+                        continue;
+                    }
+                },
+            }
         }
         // Capture the floor for this tick's demux gate; `unwrap_or` never
         // actually falls through (the branch above always leaves `cursor`
         // `Some`), kept as the anti-panic-safe idiom rather than `expect`.
         r.tick_floor = r.cursor.unwrap_or(poller.from_block);
-        r.errored = false;
     }
-    Ok(poller
+    poller
         .routes
         .iter()
+        .filter(|r| !r.errored)
         .filter_map(|r| r.cursor)
         .min()
-        .unwrap_or(to))
+        .unwrap_or(to)
 }
 
 /// Demux one window's logs by `(address, topic0)`, gated by each route's own
@@ -559,10 +590,10 @@ async fn run_tick<P: Provider + Clone>(
         Err(err) => return Err(fail_whole_tick(poller, shutdown, err)),
     };
 
-    let from = match resolve_route_floors(poller, to) {
-        Ok(from) => from,
-        Err(err) => return Err(fail_whole_tick(poller, shutdown, err)),
-    };
+    // A per-route floor-derivation failure isolates that route (see
+    // `resolve_route_floors`) rather than failing the whole tick, so this is
+    // infallible; only the shared head/`get_logs` reads fail the tick outright.
+    let from = resolve_route_floors(poller, to);
 
     // If every route is already at/above head this is an idle tick: no
     // `get_logs`, but the reconcile below still runs every route's
@@ -1460,6 +1491,125 @@ mod tests {
             backoff_b.load(Ordering::SeqCst),
             1,
             "route B must fire on_backoff"
+        );
+    }
+
+    // --- Step 13b: a route's checkpoint-load failure isolates ONLY that route ---
+
+    /// A checkpoint store whose load always fails, to drive a `FromCheckpoint`
+    /// route's first-tick floor-derivation error path.
+    struct FailingLoadStore;
+
+    impl KeyedCheckpointStore for FailingLoadStore {
+        fn load_checkpoint(
+            &self,
+            _key: CheckpointKey,
+        ) -> std::result::Result<Option<u64>, StoreError> {
+            Err(StoreError::Backend("checkpoint store is down".into()))
+        }
+        fn record_checkpoint(
+            &self,
+            _key: CheckpointKey,
+            _block: u64,
+        ) -> std::result::Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    /// Regression guard (#1747 review): a settlement-only checkpoint-load failure
+    /// must NOT trip a healthy sibling's `on_backoff` (its down-seconds alert
+    /// gauge). The failing route isolates and fires only its own hook; the
+    /// sibling advances untouched.
+    #[tokio::test]
+    async fn route_floor_derivation_failure_isolates_only_that_route() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let backoff_checkpoint = Arc::new(AtomicUsize::new(0));
+        let backoff_healthy = Arc::new(AtomicUsize::new(0));
+
+        // Route A resumes from a checkpoint whose store read fails, so its
+        // first-tick floor derivation errors. Route B is a healthy head route.
+        let (mut route_a, _) = seeded_route(
+            "checkpoint",
+            ADDR_A,
+            TOPIC_A,
+            CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
+                    store: Arc::new(FailingLoadStore) as Arc<dyn KeyedCheckpointStore>,
+                    key: CheckpointKey::PoolOpened,
+                },
+                reorg_margin: 0,
+                cold_start: ColdStart::Head,
+            },
+        );
+        let (mut route_b, sink_b) = head_route("healthy", ADDR_B, TOPIC_B);
+        {
+            let counter = Arc::clone(&backoff_checkpoint);
+            route_a.on_backoff = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        {
+            let counter = Arc::clone(&backoff_healthy);
+            route_b.on_backoff = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .route(route_b)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // head=5: route A's checkpoint load fails (isolated); route B floors at
+        // 5 and drives the single merged window [5,5], carrying B's log.
+        asserter.push_success(&U64::from(5));
+        asserter.push_success(&vec![log_at(ADDR_B, TOPIC_B, 5)]);
+
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(
+            result.is_err(),
+            "an isolated route error still fails the tick (drives loop backoff)"
+        );
+
+        // The checkpoint route is isolated: it holds a `None` cursor and fires
+        // its OWN on_backoff.
+        assert_eq!(
+            poller.routes.first().and_then(|r| r.cursor),
+            None,
+            "the checkpoint route holds its unresolved cursor and retries next tick"
+        );
+        assert_eq!(
+            backoff_checkpoint.load(Ordering::SeqCst),
+            1,
+            "the checkpoint route fires its own on_backoff"
+        );
+
+        // The healthy sibling advances and NEVER sees a backoff for a fault that
+        // was not its own — the false positive this test guards against.
+        assert_eq!(
+            poller.routes.get(1).and_then(|r| r.cursor),
+            Some(6),
+            "the healthy route advances past its window despite the sibling's floor error"
+        );
+        assert_eq!(
+            backoff_healthy.load(Ordering::SeqCst),
+            0,
+            "the healthy route must NOT back off on a sibling's checkpoint-load failure"
+        );
+        assert_eq!(
+            sink_b
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .applied
+                .len(),
+            1,
+            "the healthy route applied its log while the sibling was isolated"
         );
     }
 

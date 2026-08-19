@@ -88,9 +88,19 @@ impl Drop for AbortOnDrop {
 /// so the recovery cadence is uniform by construction (#1092).
 pub(crate) const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Default ceiling for the per-tick exponential backoff. See
-/// [`WATCHER_INITIAL_BACKOFF`].
-pub(crate) const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
+/// Ceiling for the per-tick exponential backoff. See [`WATCHER_INITIAL_BACKOFF`].
+///
+/// 30s, not 60s: slash detection is the tightest constraint on this shared
+/// loop. A missed `SlashRecorded` event burns into the operator's fixed 30-day
+/// appeal window, so the standalone slash watcher deliberately capped its own
+/// recovery at 30s (its old `SLASH_MAX_BACKOFF`). The #1747 merge collapsed the
+/// five per-watcher loops into one, which can carry only a single ceiling — so
+/// the whole loop takes slash's tighter cap rather than regress slash recovery
+/// to 60s. This is cheap: a tick is now one merged `eth_getLogs`, so halving the
+/// worst-case retry interval adds at most one merged call per minute against a
+/// struggling RPC — far below the pre-merge five-watcher retry traffic. Do not
+/// relax this to 60s without restoring a per-route ceiling for slash.
+pub(crate) const WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Fallback per-RPC-call timeout when a caller does not set its own. The alloy
 /// HTTP provider has no request timeout of its own, so a provider that keeps the
