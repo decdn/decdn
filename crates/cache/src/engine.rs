@@ -482,6 +482,12 @@ impl EvictionCandidates {
     pub fn into_inner(self) -> HashMap<Hash, Instant> {
         self.0
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn from_map_for_test(map: HashMap<Hash, Instant>) -> Self {
+        Self(map)
+    }
 }
 
 impl<'a> IntoIterator for &'a EvictionCandidates {
