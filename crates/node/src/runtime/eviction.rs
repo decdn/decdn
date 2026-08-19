@@ -1,5 +1,5 @@
-//! LRU cache-eviction driver loop (#1173, appendix-blob-cache-eviction.md
-//! § Eviction driver loop).
+//! LRU cache-eviction driver loop (#1173, ADR 040 §Whole-blob reclaim; range
+//! eviction is upstream-gated).
 //!
 //! A single async task, owned by the node wiring layer (per
 //! `appendix-poc-production-seams.md`), that enforces the `cache.cache_size_mb`
@@ -550,15 +550,24 @@ mod tests {
             promotion_threshold,
         }));
 
+        // Each cold blob is one served miss: `populate_local` fills (admission
+        // reads estimate 0 < threshold, so Probation) and the paired serve emits
+        // the one sighting via `observe_hit` (estimate -> 1). ADR 040 splits the
+        // fill from the hit signal, so the test drives both, mirroring the real
+        // fill-then-serve path.
         for hash in &cold_hashes {
             cache.populate_local(*hash).await?;
+            cache.observe_hit(*hash);
         }
-        // First populate admits (estimate 0 < threshold) into Probation and
-        // touches (estimate -> 1); the second populate is a hit that only
-        // touches (estimate -> 2), so the shared estimator now reads >=
-        // threshold for the sweep below to promote.
+        // The hot blob is requested twice. First request: fill admits (estimate
+        // 0 < threshold) into Probation, serve observes (estimate -> 1). Second
+        // request: fill is a hit (no re-admission), serve observes (estimate ->
+        // 2), so the shared estimator now reads >= threshold for the sweep below
+        // to promote.
         cache.populate_local(hot_hash).await?;
+        cache.observe_hit(hot_hash);
         cache.populate_local(hot_hash).await?;
+        cache.observe_hit(hot_hash);
 
         for hash in cold_hashes.iter().chain(std::iter::once(&hot_hash)) {
             assert_eq!(
@@ -645,14 +654,17 @@ mod tests {
         // Admission stays default (`AlwaysAdmit`) — this test exercises the
         // eviction ranking, not the probation lifecycle.
 
-        // Prime the hot blob well past any cold blob's frequency: the first
-        // populate admits + touches, every subsequent one is a hit that only
-        // touches (bumping the shared estimator each time).
+        // Prime the hot blob well past any cold blob's frequency: each request
+        // fills (first admits, the rest are hits) and the paired serve emits one
+        // sighting via `observe_hit`, bumping the shared estimator each time (ADR
+        // 040 splits fill from the hit signal).
         for _ in 0..20 {
             cache.populate_local(hot_hash).await?;
+            cache.observe_hit(hot_hash);
         }
         for hash in &cold_hashes {
             cache.populate_local(*hash).await?;
+            cache.observe_hit(*hash);
         }
 
         let sizes = cache.size_snapshot().await?;

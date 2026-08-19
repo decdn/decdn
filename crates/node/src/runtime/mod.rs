@@ -1514,7 +1514,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         )
     };
 
-    // LRU cache-eviction driver (#1173, appendix-blob-cache-eviction.md). Async
+    // LRU cache-eviction driver (#1173, ADR 040). Async
     // (the sweep does `total_bytes()`/`release_for_eviction().await`), so it
     // cannot ride `spawn_periodic`'s sync `FnMut`; it spawns directly into the
     // JoinSet with its own oneshot stop, mirroring the metrics server. Enforces

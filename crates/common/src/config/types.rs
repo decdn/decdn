@@ -455,8 +455,7 @@ pub struct CacheConfig {
     /// answer (expired entries reclaimed first).
     pub origin_probe_memo_capacity: Option<u64>,
     /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
-    /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
-    /// § Trigger and target). Absent =>
+    /// the driver actively evicts (#1173, ADR 040). Absent =>
     /// [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`] (90). Hard bounds
     /// `[60, 95]`; set above the 25% probe-hold recommendation so a full hold
     /// budget plus in-flight writes don't trip it, below 95% for write
@@ -482,9 +481,9 @@ pub struct CacheConfig {
     ///
     /// **Cost note:** every tick measures the on-disk footprint, which walks the
     /// blob list and issues one `status()` per blob, plus an O(n) clone of the
-    /// pinned set — latched or not. (`appendix-blob-cache-eviction.md` describes
-    /// an idle tick as "one comparison plus a yield"; that assumed a cached
-    /// footprint this driver does not keep.) On a cache holding many blobs,
+    /// pinned set — latched or not. An idle tick is not free: the driver keeps
+    /// no cached footprint, so it re-measures on every tick (ADR 040). On a
+    /// cache holding many blobs,
     /// raise this to trade eviction latency for steady-state store load.
     pub eviction_tick_secs: Option<u64>,
     /// Maximum number of concurrently held (eviction-exempt) blobs for the

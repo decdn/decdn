@@ -91,10 +91,15 @@ pub trait FrequencyEstimator: Send + Sync + std::fmt::Debug {
 ```
 
 The estimator is the hit-signal sink. The engine holds an optional
-`Arc<dyn FrequencyEstimator>` as an output port and calls `observe` on every
-serve or get. The engine never calls `estimate`; reading the estimate is a
-policy act. When no estimator is configured, the engine skips the call at
-zero cost.
+`Arc<dyn FrequencyEstimator>` as an output port and exposes one entry point,
+`observe_hit`, that emits a single `observe` for a hash. Every path that
+serves bytes to a client calls `observe_hit` exactly once per served request:
+the paid `deliver` and `serve_leg` serve chokepoints, and `get` on its own
+path. A multi-range or multi-interval serve is still one sighting. The fill
+paths — `populate` and `admit_bao_stream` — do not emit the signal; they only
+record recency, so a miss that fills and then serves counts as one sighting,
+not two. The engine never calls `estimate`; reading the estimate is a policy
+act. When no estimator is configured, the engine skips the call at zero cost.
 
 When either the admission selector or the eviction selector is `tinylfu`, the
 `node` wiring layer constructs one estimator and injects the same `Arc` into
@@ -126,18 +131,21 @@ same pull that fills a waiting client also fills the cache. The default
 
 The miss is the admission trigger. There is no separate on-miss signal; the
 engine calls `admit` only on a miss-fill, so the call itself is the miss
-handler. A missed blob still accumulates frequency, because the access
-signal fires on the miss-fill path too, so a repeatedly-missed blob
-eventually admits straight to `Main`.
+handler. A missed blob still accumulates frequency, because every miss is
+paired with the serve that fills it, and that serve emits the one sighting; so
+a repeatedly-missed-and-served blob eventually admits straight to `Main`.
 
 **Ordering invariant.** On a miss-fill, the engine reads the frequency
-estimate for the admission decision before it emits that request's own
-`observe` call. A first-ever request therefore sees an estimate of zero and
-admits to `Probation`; a request is never evidence for its own promotion.
-`promotion_threshold = N` means "admit to `Main` after N prior sightings,"
-not "after N total sightings including this one." Reordering `observe` ahead
-of `admit` on the fill path would send every one-hit-wonder straight to
-`Main` at `threshold = 1`, defeating admission.
+estimate for the admission decision before the paired serve emits that
+request's own `observe`. The fill path never emits the signal itself, and the
+serve chokepoint emits it only after the fill completes, so the admission read
+always precedes the request's own sighting. A first-ever request therefore
+sees an estimate of zero and admits to `Probation`; a request is never
+evidence for its own promotion. `promotion_threshold = N` means "admit to
+`Main` after N prior sightings," not "after N total sightings including this
+one." Emitting the sighting from the fill path, ahead of the admission read,
+would send every one-hit-wonder straight to `Main` at `threshold = 1`,
+defeating admission.
 
 Promotion happens at the sweep, decided by the policy. The engine does not
 promote and does not read the estimator directly. On each sweep,
@@ -275,6 +283,9 @@ retention.
 - Segment membership lives in memory only. A restart loses it, so every
   cached blob returns to an uncapped state until traffic re-observes it and
   the estimator rebuilds its signal.
+- The probation cap measures its footprint over the eviction candidates —
+  blobs touched since process start — so a probation blob not yet touched
+  since boot is excluded from the cap's overage math until it is observed.
 
 ## Acceptance Criteria
 

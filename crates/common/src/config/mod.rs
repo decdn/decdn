@@ -212,7 +212,7 @@ pub const DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC: u64 = 30;
 pub const DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY: usize = 4096;
 
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
-/// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
+/// (#1173, ADR 040). Above this
 /// fraction the driver actively evicts.
 pub const DEFAULT_EVICTION_HIGH_WATER_PCT: u64 = 90;
 /// Hard bounds `[60, 95]` for [`DEFAULT_EVICTION_HIGH_WATER_PCT`].
@@ -1630,7 +1630,7 @@ fn resolve_cache_into(
         .and_then(|c| c.origin_probe_memo_capacity)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY);
 
-    // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
+    // LRU eviction driver knobs (#1173, ADR 040). Each
     // is range-checked against its structural bounds; the target/high-water
     // hysteresis gap is a cross-field invariant enforced after both resolve.
     let eviction_high_water_pct = file
@@ -1781,6 +1781,19 @@ fn resolve_cache_into(
     let tinylfu_promotion_threshold = tinylfu_file
         .and_then(|t| t.promotion_threshold)
         .unwrap_or(DEFAULT_TINYLFU_PROMOTION_THRESHOLD);
+    // `promotion_threshold` counts prior sightings before a probation member
+    // admits to `Main`; zero is nonsensical — it would make admission
+    // always-`Main` and promote everything, defeating probationary admission.
+    // Reject it at load, never clamp (ADR 040 §Probationary admission).
+    bag.check_with(
+        tinylfu_promotion_threshold >= 1,
+        "cache.tinylfu.promotion_threshold",
+        || {
+            format!(
+                "cache.tinylfu.promotion_threshold ({tinylfu_promotion_threshold}) must be >= 1"
+            )
+        },
+    );
     let tinylfu_probation_target_pct = tinylfu_file
         .and_then(|t| t.probation_target_pct)
         .unwrap_or(DEFAULT_TINYLFU_PROBATION_TARGET_PCT);
@@ -4176,6 +4189,26 @@ mod tests {
         assert!(
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
             "probation_target_pct above the [1, 50] bound must be rejected"
+        );
+    }
+
+    /// `promotion_threshold` must be `>= 1`: zero would admit everything straight
+    /// to `Main` and defeat probationary admission, so the resolver rejects it
+    /// rather than clamping (ADR 040 §Probationary admission).
+    #[test]
+    fn resolve_cache_rejects_zero_promotion_threshold() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            eviction_policy: Some("tinylfu".to_string()),
+            tinylfu: Some(types::TinyLfuConfig {
+                promotion_threshold: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "promotion_threshold = 0 must be rejected"
         );
     }
 

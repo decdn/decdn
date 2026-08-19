@@ -194,8 +194,9 @@ struct Inner {
     /// admission and every `eviction_candidates` call (no background task).
     ///
     /// Like [`Self::pinned`] this only blocks *LRU* eviction — an explicit
-    /// operator [`CacheEngine::evict`] still wins (ADR
-    /// appendix-blob-cache-eviction.md §4: DMCA always wins), enforced
+    /// operator [`CacheEngine::evict`] still wins (ADR 040 §Pinning, durable
+    /// operator-evict, and the probe-hold stay engine-enforced: DMCA always
+    /// wins), enforced
     /// because [`CacheEngine::try_probe_hold`] gates on [`CacheEngine::has`]
     /// which already
     /// honors the evicted set.
@@ -733,7 +734,7 @@ async fn gc_protect_inner(
         // - `access_times` is mixed: it recovers where a lost update is
         //   durability-relevant (`evict`, the LRU delete path) and skips on
         //   the read/observability paths (`last_accessed`,
-        //   `access_times_snapshot`, `eviction_candidates`, `touch`). That
+        //   `access_times_snapshot`, `eviction_candidates`, `record_access`). That
         //   split is a gap, not a design — a poisoned `access_times` makes
         //   `eviction_candidates` return empty, which stops LRU eviction
         //   and fills the disk. Tracked separately from #1517.
@@ -1685,8 +1686,7 @@ impl CacheEngine {
             }
         }
         // Operator-evict (DMCA/corruption) counter — distinct from the LRU
-        // `evictions` counter the eviction driver bumps (#1173,
-        // appendix-blob-cache-eviction.md § Observability). Bumped after the
+        // `evictions` counter the eviction driver bumps (#1173, ADR 040). Bumped after the
         // durable append + logical-set commit succeeded above, so the count
         // tracks takedowns that actually stopped serving.
         if let Some(m) = &self.inner.metrics {
@@ -1980,7 +1980,8 @@ impl CacheEngine {
     /// `probe_holds` lock**, closing the TOCTOU window where a concurrent
     /// [`Self::evict`] (DMCA takedown) could land between the initial
     /// [`Self::has`] check and granting the hold — a takedown always wins
-    /// (ADR appendix-blob-cache-eviction.md §4).
+    /// (ADR 040 §Pinning, durable operator-evict, and the probe-hold stay
+    /// engine-enforced).
     pub async fn try_probe_hold(&self, hash: Hash) -> CacheResult<ProbeHoldOutcome> {
         // `has` returns false for operator-evicted hashes too. This stays
         // *before* the `max == 0` check below so an absent/evicted blob is a
@@ -2079,7 +2080,7 @@ impl CacheEngine {
     /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
         if self.has(hash).await? {
-            self.touch(hash);
+            self.observe_hit(hash);
             let bytes = self.read_local(hash).await?;
             if let Some(m) = &self.inner.metrics {
                 m.hits.inc();
@@ -2149,7 +2150,7 @@ impl CacheEngine {
                 }
             }
         };
-        self.touch(hash);
+        self.observe_hit(hash);
         if let Some(m) = &self.inner.metrics {
             m.bytes_returned
                 .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
@@ -2211,7 +2212,9 @@ impl CacheEngine {
     /// skips the `Peer` origin.
     async fn populate_inner(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
         if self.has(hash).await? {
-            self.touch(hash);
+            // Recency only — a fill is not a hit sighting. The paired serve
+            // emits the one `observe` through `observe_hit` (ADR 040).
+            self.record_access(hash);
             return Ok(());
         }
         // Logical-eviction guard (#279): never re-pull a deliberately evicted
@@ -2271,7 +2274,9 @@ impl CacheEngine {
                 }
             }
         }
-        self.touch(hash);
+        // Recency only — the fill's admission read above already consulted the
+        // estimate; the paired serve emits the one hit sighting (ADR 040).
+        self.record_access(hash);
         Ok(())
     }
 
@@ -2977,7 +2982,8 @@ impl CacheEngine {
     ///
     /// A third filter layer (after pinned, before the LRU sort) drops any
     /// hash under an active probe-triggered eviction hold (#318, ADR 005
-    /// §Probe-triggered eviction hold; appendix-blob-cache-eviction.md §4:
+    /// §Probe-triggered eviction hold; ADR 040 §Pinning, durable operator-evict,
+    /// and the probe-hold stay engine-enforced:
     /// "a held hash is invisible to the LRU driver until the hold
     /// expires"). The held set is swept of expired entries here too, so a
     /// node with no probe traffic still releases stale holds.
@@ -3027,16 +3033,36 @@ impl CacheEngine {
         EvictionCandidates(map)
     }
 
-    /// Record an access for `hash` at the current instant.
-    fn touch(&self, hash: Hash) {
-        if let Ok(mut guard) = self.inner.access_times.lock() {
-            guard.insert(hash, Instant::now());
-        }
+    /// Emit the hit signal for `hash`: bump its LRU recency AND forward one
+    /// sighting to the shared frequency estimator (ADR 040 §Hit signal). This is
+    /// the one hit sighting a served or `get` request produces.
+    ///
+    /// Every client-facing serve chokepoint calls this exactly once per served
+    /// request — [`crate::CacheEngine::get`] on its own path, and the `node`
+    /// crate's `deliver` / `serve_leg` on the paid serve paths. The fill paths
+    /// ([`Self::populate`], [`Self::admit_bao_stream`]) deliberately do NOT emit
+    /// it; they only record recency, so a miss that fills and then serves counts
+    /// as ONE sighting (the serve's), never two. This also
+    /// preserves the admission ordering invariant: a fill reads the frequency
+    /// estimate for its admission decision before the paired serve emits this
+    /// request's own `observe`.
+    pub fn observe_hit(&self, hash: Hash) {
+        self.record_access(hash);
         // `load_full` clones the Arc out and releases the guard before calling
         // `observe`, so the estimator's own work never runs under the arc-swap
         // read guard.
         if let Some(est) = self.inner.frequency.load_full().as_ref() {
             est.observe(hash);
+        }
+    }
+
+    /// Record an access for `hash` at the current instant — LRU recency only, no
+    /// frequency observe. The fill paths use this so the blob becomes an eviction
+    /// candidate without counting as a hit sighting; the paired serve emits the
+    /// one sighting through [`Self::observe_hit`].
+    fn record_access(&self, hash: Hash) {
+        if let Ok(mut guard) = self.inner.access_times.lock() {
+            guard.insert(hash, Instant::now());
         }
     }
 
@@ -5156,7 +5182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn touch_forwards_to_frequency_estimator() -> anyhow::Result<()> {
+    async fn observe_hit_forwards_to_frequency_estimator() -> anyhow::Result<()> {
         use crate::policy::FrequencyEstimator;
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -5185,6 +5211,64 @@ mod tests {
         let _ = engine.get(hash).await?;
 
         anyhow::ensure!(counter.estimate(hash) >= 1, "observe should fire on access");
+        Ok(())
+    }
+
+    /// ADR 040 serve-hit signal: the fill path emits NO hit sighting (so a
+    /// fill-and-serve miss never double-counts), and each served request emits
+    /// exactly one sighting through the serve chokepoint's
+    /// [`CacheEngine::observe_hit`]. A hot RESIDENT blob served repeatedly must
+    /// therefore accumulate frequency and become promotable — the case that was
+    /// inverted before serve paths emitted the signal.
+    #[tokio::test]
+    async fn serve_hit_signal_fires_once_per_serve_and_promotes_a_hot_resident_blob()
+    -> anyhow::Result<()> {
+        use crate::policy::{FrequencyEstimator, ProbationAdmission, Segment, TinyLfuEstimator};
+
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hot resident blob";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+
+        let promotion_threshold = 3u32;
+        let freq: Arc<dyn FrequencyEstimator> = Arc::new(TinyLfuEstimator::new(4096));
+        engine.set_frequency_estimator(freq.clone());
+        engine.set_admission_policy(Arc::new(ProbationAdmission {
+            freq: freq.clone(),
+            promotion_threshold,
+        }));
+
+        // Fill as a miss. The fill path reads the estimate for admission (0 ->
+        // Probation) but must NOT emit the hit signal, so estimate stays 0 — this
+        // is what keeps a fill-and-serve miss at one sighting, not two.
+        engine.populate_local(hash).await?;
+        anyhow::ensure!(
+            freq.estimate(hash) == 0,
+            "the fill alone must not observe (no double-count with the serve)"
+        );
+        anyhow::ensure!(
+            engine.segment_of(hash) == Segment::Probation,
+            "first sight lands in probation"
+        );
+
+        // Serve the resident blob repeatedly. Each served request is exactly one
+        // sighting via the serve chokepoint's `observe_hit`.
+        for i in 1..=promotion_threshold {
+            engine.observe_hit(hash);
+            anyhow::ensure!(
+                freq.estimate(hash) == i,
+                "each serve must be exactly one sighting"
+            );
+        }
+        anyhow::ensure!(
+            freq.estimate(hash) >= promotion_threshold,
+            "a hot resident blob served repeatedly must become promotable"
+        );
         Ok(())
     }
 
@@ -6860,7 +6944,7 @@ mod tests {
         )
         .await?;
         let _ = engine.get(hash).await?;
-        engine.touch(hash); // make it an LRU candidate
+        engine.observe_hit(hash); // make it an LRU candidate
 
         // Inject an already-expired hold directly (the real 35s duration is
         // impractical to sleep, and std `Instant` ignores tokio time pause).
