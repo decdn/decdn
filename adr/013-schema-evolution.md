@@ -61,7 +61,7 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 #### `ChunkData` exemption
 
-`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the voucher interval. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
+`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the payment quantum. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` and `ChunkPreimage` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
 
 ### Protocol Enums
 
@@ -82,13 +82,17 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    StreamEnd,                        // 4
+    ChunkPreimage(ChunkPreimage),     // 4  — unsigned, 33-byte body (ADR 005)
+    StreamEnd,                        // 5
+    StreamError(StreamError),         // 6
 }
 ```
 
+`VARIANT_COUNT` is 7 after the insertion, and `crates/protocol/src/client.rs` pins it against the highest discriminant.
+
 #### Variant ordering rule
 
-Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump.
+Discriminants are assigned in declaration order (postcard default). New variants MUST be appended at the end. Reordering or removing variants is a major (breaking) change requiring an ALPN version bump. `ChunkPreimage` sits at 4, beside the `Voucher` it extends, rather than after `StreamEnd`: inserting it renumbers the tail, which is a straight in-place cut while `cdn/client/v1` is pre-deployment and there are no live peers. After the first deployment the same insertion would be a major change.
 
 #### Unknown variant handling
 
@@ -228,14 +232,16 @@ enum ClientMessage {
     StreamResponse(StreamResponse),   // 1
     ChunkData(ChunkData),             // 2
     Voucher(Voucher),                 // 3
-    StreamEnd,                        // 4
+    ChunkPreimage(ChunkPreimage),     // 4
+    StreamEnd,                        // 5
+    StreamError(StreamError),         // 6
     // Added via medium evolution
-    Ping(PingRequest),                // 5
-    Pong(PongResponse),              // 6
+    Ping(PingRequest),                // 7
+    Pong(PongResponse),               // 8
 }
 ```
 
-Old peers receiving `Ping` (discriminant 6) close the stream with `UNSUPPORTED_MESSAGE`; the sender detects this and falls back to QUIC-level keepalive.
+Old peers receiving `Ping` (discriminant 7, the first unknown tail variant) close the stream with `UNSUPPORTED_MESSAGE`; the sender detects this and falls back to QUIC-level keepalive.
 
 #### Tier 3 — Major (ALPN version bump)
 

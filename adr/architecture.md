@@ -70,7 +70,7 @@ How a client or node finds the right peer for a given hash. The DHT is the prima
 
 ### Chapter 3 — Payments
 
-Off-chain vouchers for per-MB delivery, backed by a shared on-chain payment pool that a client opens once and redeems against per node. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
+Off-chain vouchers for per-MB delivery, metered between signatures by a hash chain, backed by a shared on-chain payment pool that a client opens once and redeems against per node. Client-side architecture and smart-wallet support are included here because client trust boundaries and key management hang off the payment path.
 
 1. [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)
 2. [ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)
@@ -138,7 +138,7 @@ Numeric per-ADR index.
 - **[ADR 000 — Language and Core Networking Stack](000-language.md#adr-000-language-and-core-networking-stack)** — Rust + iroh (1.0).
 - **[ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh)** — Flat peer mesh; the on-chain `CapacityBond` registry active set for node discovery; `cdn/dht/v1` (Kademlia subset) for content discovery, with the on-chain origin directory ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) as the deterministic last-resort fallback when DHT returns no providers.
 - **[ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing)** — BLAKE3 content-addressed blobs. Node backends are opaque to the network.
-- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)** — Off-chain vouchers backed by a shared on-chain payment pool (USDC, fixed at deployment): one deposit, many capped signers, node-addressed vouchers, per-lane redemption. Market-driven rates within governance-set bounds.
+- **[ADR 003 — Payment Model](003-payments.md#adr-003-payment-model)** — Off-chain vouchers backed by a shared on-chain payment pool (USDC, fixed at deployment): one deposit, many capped signers, node-addressed vouchers, per-lane redemption. A voucher's cumulative `amount` is the settlement anchor, and an optional PayWord hash chain advances it one 1 MiB chunk per released preimage with no signature. Market-driven rates within governance-set bounds.
 - **[ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol)** — Three core protocols (ALPN-negotiated): `cdn/probe/v1`, `cdn/client/v1`, `cdn/dht/v1`. `cdn/client/v1` covers all paid delivery.
 - **[ADR 008 — Reputation System](008-reputation.md#adr-008-reputation-system)** — Local per-peer interaction-weighted scoring; no cross-node propagation.
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)** — Admin key for PoC; bootstrap multisig phase post-launch; transition to served-bytes-weighted Governor (`FeeRouter.bytesInWindow × age_ramp` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) + Timelock via a one-shot transition the multisig executes when the operator set is broad enough.
@@ -182,7 +182,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 
 | Attack | Bounded by | Home |
 |---|---|---|
-| Voucher withholding | Self-enforcing per-lane credit window; loss capped at one interval | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
+| Voucher withholding | Self-enforcing per-lane credit window; loss capped at the ramped window, floored at one 1 MiB chunk | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
 | Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
 | Owner reclaims before a node redeems | Grace window + in-process redemption monitor (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
 | Probe fishing / resource exhaustion | Layered per-peer + per-IP + global token bucket (node policy) | [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) |
