@@ -1050,70 +1050,139 @@ contract PaymentPoolTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // redeem — rate floor (ADR 003 § Rate-floor enforcement)
+    // redeem — soft rate floor (ADR 003 § Rate-floor enforcement)
+    //
+    // A sub-floor voucher never reverts. It settles its `cumulative` USDC and
+    // credits only `min(bytesDelivered, cumulative * BYTES_PER_MB /
+    // deliveryFloor)` bytes, so cheap bytes cannot inflate the served-bytes
+    // governance weight (ADR 036) yet the payment still clears.
     // -----------------------------------------------------------------
 
-    function test_redeem_rateFloor_boundaryExact() public {
+    function test_redeem_softFloor_creditsFullBytesAtBoundary() public {
         bytes32 id = _open();
         uint64 amount = 100;
         uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
 
-        Sig memory sig = _voucher(id, amount, maxBytes);
-        bytes memory cap = _cap(id, 1000e6, expiry);
         vm.prank(provider);
-        _redeemOne(id, signer, provider, amount, maxBytes, sig, cap);
-        (, uint64 wBytes) = pool.watermark(id, signer, provider);
-        assertEq(wBytes, maxBytes, "exact boundary passes");
-
-        // One byte past the ceiling reverts on a fresh pool/signer.
-        bytes32 id2 = _open();
-        Sig memory sig2 = _signVoucherFor(address(pool), id2, signer, provider, amount, maxBytes + 1, SIGNER_PK);
-        bytes memory cap2 = abi.encode(
-            uint64(1000e6), expiry, _signCapabilityFor(address(pool), id2, signer, 1000e6, expiry, OWNER_PK)
-        );
-        vm.prank(provider);
-        vm.expectRevert(
-            abi.encodeWithSelector(PaymentPool.RateFloorViolation.selector, amount, maxBytes + 1, DELIVERY_FLOOR)
-        );
-        _redeemOne(id2, signer, provider, amount, maxBytes + 1, sig2, cap2);
+        _redeemOne(id, signer, provider, amount, maxBytes, _voucher(id, amount, maxBytes), _cap(id, 1000e6, expiry));
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, amount, "settles the full cumulative at the boundary");
+        assertEq(wBytes, maxBytes, "credits every delivered byte at the boundary");
     }
 
-    function test_redeem_rateFloor_revertsOnInflatedBytes() public {
+    function test_redeem_softFloor_clampsBytesButSettlesCumulative() public {
         bytes32 id = _open();
-        // 1 base unit permits at most BYTES_PER_MB bytes; the widest byte count
-        // a voucher can carry must still surface as `RateFloorViolation`. The
-        // `uint64` field is itself the first guard — a byte count larger than
-        // this is not expressible on the wire at all.
-        uint64 huge = type(uint64).max;
-        Sig memory sig = _voucher(id, 1, huge);
-        bytes memory cap = _cap(id, 1000e6, expiry);
+        uint64 amount = 100;
+        uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
+
+        // One byte over the ceiling no longer reverts: the voucher pays its
+        // full `amount` and credits exactly the ceiling, not the claim.
         vm.prank(provider);
-        vm.expectRevert(abi.encodeWithSelector(PaymentPool.RateFloorViolation.selector, 1, huge, DELIVERY_FLOOR));
-        _redeemOne(id, signer, provider, 1, huge, sig, cap);
+        _redeemOne(
+            id, signer, provider, amount, maxBytes + 1, _voucher(id, amount, maxBytes + 1), _cap(id, 1000e6, expiry)
+        );
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, amount, "pays the full cumulative despite the sub-floor rate");
+        assertEq(wBytes, maxBytes, "credited bytes clamped to the floor ceiling");
+
+        (, uint256 routedBytes, uint256 routedAmount) = router.calls(0);
+        assertEq(routedAmount, amount, "routes the full cumulative");
+        assertEq(routedBytes, maxBytes, "routes only the clamped byte count into the vote-weight counter");
     }
 
-    function test_redeem_rateFloor_honestPathUnaffected() public {
+    function test_redeem_softFloor_clampsWildlyInflatedBytes() public {
+        bytes32 id = _open();
+        // 1 base unit justifies at most BYTES_PER_MB bytes at floor 1. The
+        // widest byte count a voucher can carry settles the 1 unit and credits
+        // exactly that ceiling — the inflation is neutralised, not rejected.
+        uint64 huge = type(uint64).max;
+        uint64 ceiling = uint64(uint256(1) * BYTES_PER_MB / DELIVERY_FLOOR);
+        vm.prank(provider);
+        _redeemOne(id, signer, provider, 1, huge, _voucher(id, 1, huge), _cap(id, 1000e6, expiry));
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 1, "settles the cumulative");
+        assertEq(wBytes, ceiling, "credits only floor-justified bytes");
+    }
+
+    function test_redeem_softFloor_honestPathUnaffected() public {
         bytes32 id = _open();
         // ~38 MB for 390 base units at the $0.01/GB market rate clears the floor by ~10x.
         vm.prank(provider);
         _redeemOne(id, signer, provider, 390, 40_000_000, _voucher(id, 390, 40_000_000), _cap(id, 1000e6, expiry));
         (, uint64 wBytes) = pool.watermark(id, signer, provider);
-        assertEq(wBytes, 40_000_000, "honest traffic clears the floor");
+        assertEq(wBytes, 40_000_000, "honest traffic credits every delivered byte");
     }
 
-    function test_redeem_rateFloor_routedBytesBoundedByPaidAmount() public {
+    function test_redeem_softFloor_routedBytesBoundedByCeiling() public {
         bytes32 id = _open();
         uint64 amount = 100;
         uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
         vm.prank(provider);
-        _redeemOne(id, signer, provider, amount, maxBytes, _voucher(id, amount, maxBytes), _cap(id, 1000e6, expiry));
+        _redeemOne(
+            id, signer, provider, amount, 5 * maxBytes, _voucher(id, amount, 5 * maxBytes), _cap(id, 1000e6, expiry)
+        );
 
         (, uint256 b, uint256 amt) = router.calls(0);
         assertEq(amt, amount);
         assertEq(b, maxBytes, "routed bytes never exceed amount * BYTES_PER_MB / floor");
     }
 
-    function testFuzz_redeem_rateFloor_revertIffBelowFloor(uint64 amount, uint64 bytesDelivered) public {
+    /// @dev A voucher that clears the floor when the node accepts it, pushed
+    ///      sub-floor by a later governance floor raise, still settles its
+    ///      cumulative — it is not stranded — and credits the new, lower
+    ///      ceiling. This is the case the hard revert broke: an accepted
+    ///      voucher the node cannot un-serve.
+    function test_redeem_softFloor_afterFloorRaise_clampsAcceptedVoucher() public {
+        bytes32 id = _open();
+        uint64 amount = 300;
+        uint64 servedBytes = 200_000_000;
+
+        uint256 newFloor = 100;
+        vm.prank(admin);
+        pool.grantRole(GOVERNANCE_ROLE, admin);
+        vm.prank(admin);
+        pool.setRateBounds(newFloor);
+
+        uint64 ceiling = uint64(uint256(amount) * BYTES_PER_MB / newFloor);
+        assertLt(ceiling, servedBytes, "the raise makes the accepted voucher sub-floor");
+
+        vm.prank(provider);
+        _redeemOne(
+            id, signer, provider, amount, servedBytes, _voucher(id, amount, servedBytes), _cap(id, 1000e6, expiry)
+        );
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, amount, "accepted voucher still settles after a floor raise");
+        assertEq(wBytes, ceiling, "credited bytes clamped to the raised floor");
+    }
+
+    /// @dev The motivating fix: one sub-floor lane in a `redeemMany` batch no
+    ///      longer reverts and strands every honest lane sharing the call.
+    function test_redeemMany_softFloor_subFloorLaneDoesNotPoisonBatch() public {
+        bytes32 id = _open();
+        (uint256[] memory pks, address[] memory signers) = _primeLanes(id, uint256(keccak256("soft-floor-batch")), 2);
+
+        uint64 amount = 100;
+        uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
+
+        // Lane 0: honest, well under the ceiling. Lane 1: sub-floor.
+        PaymentPool.LaneVoucher[] memory v = new PaymentPool.LaneVoucher[](2);
+        v[0] = _laneOf(signers[0], amount, maxBytes / 2, _voucherFor(id, signers[0], amount, maxBytes / 2, pks[0]));
+        v[1] =
+            _laneOf(signers[1], amount, maxBytes + 1000, _voucherFor(id, signers[1], amount, maxBytes + 1000, pks[1]));
+
+        PaymentPool.CapabilityReg[] memory noCaps = new PaymentPool.CapabilityReg[](0);
+        vm.prank(provider);
+        uint256 totalPaid = pool.redeemMany(_batch(id, noCaps, v));
+
+        assertEq(totalPaid, 2 * uint256(amount), "both lanes settle; the sub-floor lane does not revert the batch");
+
+        (, uint64 honestBytes) = pool.watermark(id, signers[0], provider);
+        assertEq(honestBytes, maxBytes / 2, "honest lane credits every delivered byte");
+        (, uint64 subFloorBytes) = pool.watermark(id, signers[1], provider);
+        assertEq(subFloorBytes, maxBytes, "sub-floor lane credited only up to the ceiling");
+    }
+
+    function testFuzz_redeem_softFloor_creditsClampedBytes(uint64 amount, uint64 bytesDelivered) public {
         amount = uint64(bound(amount, 1, DEPOSIT));
         uint64 maxBytes = uint64(uint256(amount) * BYTES_PER_MB / DELIVERY_FLOOR);
         // Twice the ceiling for the widest in-bounds `amount` is ~2.1e15, well
@@ -1124,16 +1193,12 @@ contract PaymentPoolTest is Test {
         Sig memory sig = _voucher(id, amount, bytesDelivered);
         bytes memory cap = _cap(id, DEPOSIT, expiry);
         vm.prank(provider);
-        if (bytesDelivered > maxBytes) {
-            vm.expectRevert(
-                abi.encodeWithSelector(PaymentPool.RateFloorViolation.selector, amount, bytesDelivered, DELIVERY_FLOOR)
-            );
-            _redeemOne(id, signer, provider, amount, bytesDelivered, sig, cap);
-        } else {
-            _redeemOne(id, signer, provider, amount, bytesDelivered, sig, cap);
-            (uint64 wAmount,) = pool.watermark(id, signer, provider);
-            assertEq(wAmount, amount);
-        }
+        // Never reverts, whatever the rate: the cumulative always settles.
+        _redeemOne(id, signer, provider, amount, bytesDelivered, sig, cap);
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, amount, "cumulative always settles");
+        uint64 expectedBytes = bytesDelivered < maxBytes ? bytesDelivered : maxBytes;
+        assertEq(wBytes, expectedBytes, "credited bytes clamped to the floor ceiling");
     }
 
     // -----------------------------------------------------------------

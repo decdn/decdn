@@ -234,7 +234,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error NotPoolOwner();
     error InvalidVoucherSignature();
     error InvalidCapabilitySignature();
-    error RateFloorViolation(uint256 amount, uint256 bytesDelivered, uint256 deliveryFloor);
     error PoolClosed();
     error PoolNotClosing();
     error GraceWindowActive();
@@ -452,8 +451,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///         one whose signer is covered by neither this pool's
     ///         `capabilities` nor a prior registration), which the loop simply
     ///         skips, and reverts on a structural error (bad voucher
-    ///         signature, closed pool, sub-floor rate) that rolls back
-    ///         everything.
+    ///         signature or closed pool) that rolls back everything. A sub-floor
+    ///         delivery rate is not a structural error: the voucher settles its
+    ///         `cumulative` and credits only the floor-justified byte ceiling.
     /// @dev    Grouping by pool is what makes the per-pool work per-pool: the
     ///         status gate is read once per group, and `totalRedeemed`
     ///         advances in one write at the end of it, so a pool carrying
@@ -713,11 +713,13 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      `(0, 0)` on a transient-empty voucher that writes no state: an
     ///      unregistered signer, an expired capability, a cumulative at or
     ///      below the lane watermark, or a fully drained / cap-reached lane.
-    ///      Reverts only on structural errors: a bad voucher signature
+    ///      Reverts only on a structural error: a bad voucher signature
     ///      (`InvalidVoucherSignature` — which is also how a voucher signed
-    ///      for a different payee surfaces) or a sub-floor delivery rate
-    ///      (`RateFloorViolation`). The return-0-vs-revert split is what lets
-    ///      `redeemMany` skip an empty voucher without reverting the batch.
+    ///      for a different payee surfaces). A sub-floor delivery rate is not an
+    ///      error — the voucher settles its `cumulative` and credits only the
+    ///      floor-justified byte ceiling (the clamp below). The
+    ///      return-0-vs-revert split is what lets `redeemMany` skip an empty
+    ///      voucher without reverting the batch.
     ///
     ///      Touches no pool storage. The caller has already gated the pool's
     ///      status for the whole group and read its `remaining` (`deposit -
@@ -757,14 +759,6 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp >= a.expiry) return (0, 0, 0);
 
-        // Per-MB price floor on the cumulative claim, evaluated as a bytes
-        // ceiling. `deliveryFloor >= MIN_RATE_FLOOR (1)` keeps the divisor
-        // non-zero, and both operands are `uint64`, so the widened product
-        // cannot overflow the `mulDiv`.
-        if (bytesDelivered > Math.mulDiv(cumulative, BYTES_PER_MB, deliveryFloor)) {
-            revert RateFloorViolation(cumulative, bytesDelivered, deliveryFloor);
-        }
-
         Lane storage w = watermark[poolId][signer][msg.sender];
         // Regression / already-paid cumulative: transient-empty.
         if (cumulative <= w.amount) return (0, 0, 0);
@@ -774,10 +768,23 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // Drained pool or cap reached: transient-empty, retriable after a top-up.
         if (paid == 0) return (0, 0, 0);
 
-        // A voucher whose bytesDelivered has not advanced settles its money
+        // Soft per-MB price floor, evaluated as a bytes ceiling. The
+        // cumulative claim justifies at most `cumulative * BYTES_PER_MB /
+        // deliveryFloor` bytes of delivery credit; a voucher priced below the
+        // floor still settles its `cumulative` USDC, but only that many bytes
+        // are credited toward the served-bytes governance weight (ADR 003 §
+        // Rate-floor enforcement; ADR 036), so cheap bytes cannot inflate vote
+        // weight. `deliveryFloor >= MIN_RATE_FLOOR (1)` keeps the divisor
+        // non-zero; the `min` runs in `uint256` and is bounded above by the
+        // `uint64` `bytesDelivered`, so narrowing the ceiling back to `uint64`
+        // cannot overflow.
+        uint64 creditedBytes = uint64(Math.min(bytesDelivered, Math.mulDiv(cumulative, BYTES_PER_MB, deliveryFloor)));
+
+        // A voucher whose credited bytes have not advanced settles its money
         // with zero bytes credited; the byte watermark holds and recovers
-        // when a later voucher advances it.
-        uint64 bytesDelta = bytesDelivered > w.bytesDelivered ? bytesDelivered - w.bytesDelivered : 0;
+        // when a later voucher advances it (including after a floor raise, which
+        // lowers the ceiling but never claws back already-credited bytes).
+        uint64 bytesDelta = creditedBytes > w.bytesDelivered ? creditedBytes - w.bytesDelivered : 0;
         // `bytesPaid <= bytesDelta` (paid <= desired), so the result is a
         // `uint64` by construction.
         bytesPaid = uint64(Math.mulDiv(bytesDelta, paid, desired));

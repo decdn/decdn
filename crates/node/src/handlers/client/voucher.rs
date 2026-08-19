@@ -141,7 +141,7 @@ impl ClientHandler {
             return Ok(VoucherStop::Rejected);
         }
 
-        let verified = match self.verify_voucher(
+        let verified = match Self::verify_voucher(
             &guard.state,
             guard.bytes_delivered_cumulative,
             &signed,
@@ -207,16 +207,15 @@ impl ClientHandler {
     /// `bytes_delivered` is self-describing: it comes straight off the wire, so
     /// verification does not depend on the order same-lane streams settle in.
     /// `advance_presigned` runs first (amount/bytes monotonicity against the live
-    /// watermark); the two rate checks then run on the advance path against the
-    /// aggregate span (`applied.amount_delta()` / `applied.bytes_delta()`), which
-    /// is order-independent because it is measured against the lane watermark:
-    /// - the per-span **advertised-rate** check bails on a genuine underpayment
-    ///   (no wire reason; delivery just stops);
-    /// - the cumulative **live-floor** check rejects cleanly with
-    ///   `RateFloorRaised` when a governance floor raise made the quote stale
-    ///   (#1382), else bails.
+    /// watermark); the per-span **advertised-rate** check then runs on the advance
+    /// path against the aggregate span (`applied.amount_delta()` /
+    /// `applied.bytes_delta()`), which is order-independent because it is measured
+    /// against the lane watermark, and bails on a genuine underpayment (no wire
+    /// reason; delivery just stops). There is no cumulative rate-floor check: the
+    /// delivery floor is a soft floor that `PaymentPool.redeem` enforces by
+    /// clamping credited bytes, not by rejecting, so a sub-floor cumulative never
+    /// stops the stream here.
     fn verify_voucher(
-        &self,
         state: &LaneState,
         cumulative_bytes: U256,
         signed: &SignedVoucher,
@@ -251,8 +250,7 @@ impl ClientHandler {
                 // ADVANCE: this voucher raises the lane watermark. Rate-check the
                 // aggregate span it covers (`applied.*_delta()` is measured against
                 // the lane watermark, so it is order-independent).
-                let amount = U256::from(wire.amount);
-
+                //
                 // Advertised-rate check (ADR 003 §Voucher withholding). Match every
                 // `RateError` arm (#845) so a future variant is a build failure here.
                 match verify_rate(
@@ -272,28 +270,15 @@ impl ClientHandler {
                     }
                 }
 
-                // Hard per-byte price floor (#846) on the cumulative watermark the
-                // voucher carries (mirrors on-chain `redeem` at zero tolerance).
-                let live_floor = self.rate_bounds.floor();
-                match verify_rate(amount, new_bytes, live_floor, 0) {
-                    Ok(()) => {}
-                    Err(RateError::Underpayment { .. }) => {
-                        self.metrics.voucher_rate_floor_rejected();
-                        if live_floor > rate_per_mb {
-                            return Err(VerifyStop::Reject(
-                                VoucherRejectReason::RateFloorRaised,
-                                None,
-                            ));
-                        }
-                        return Err(VerifyStop::Bail(
-                            "voucher below the cumulative rate floor".to_string(),
-                        ));
-                    }
-                    Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
-                        return Err(VerifyStop::Bail(format!("voucher fails floor check: {e}")));
-                    }
-                }
-
+                // No cumulative-rate floor check here. The delivery floor is a
+                // soft floor: `PaymentPool.redeem` settles a sub-floor voucher's
+                // `cumulative` and clamps only the byte count it credits toward
+                // vote weight (ADR 003 § Rate-floor enforcement). So a voucher
+                // whose cumulative dips below the floor — the mid-stream
+                // floor-raise race, since every quote is already raised to the
+                // floor before signing (`wire.rs::clamped_rate`) — is not a
+                // reason to stop the stream. The advertised-rate check above
+                // still protects this node's per-delta revenue at its own quote.
                 Ok(VerifiedVoucher {
                     next_state,
                     new_bytes,
@@ -462,9 +447,14 @@ mod tests {
         };
 
         let snapshot = lane.lock().await.state.clone();
-        let verified = handler
-            .verify_voucher(&snapshot, U256::ZERO, &signed_voucher, &wire, rate_per_mb)
-            .expect("a well-formed voucher verifies against a fresh lane");
+        let verified = super::ClientHandler::verify_voucher(
+            &snapshot,
+            U256::ZERO,
+            &signed_voucher,
+            &wire,
+            rate_per_mb,
+        )
+        .expect("a well-formed voucher verifies against a fresh lane");
         assert_eq!(
             verified.new_bytes, new_bytes,
             "the candidate advances to the voucher's cumulative bytes"
@@ -532,7 +522,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
             as Arc<dyn PoolStateStore>;
-        let (handler, _dir) = handler_over_store(&metrics, store).await;
+        let (_handler, _dir) = handler_over_store(&metrics, store).await;
 
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let signer_key = PrivateKeySigner::random();
@@ -575,9 +565,14 @@ mod tests {
 
         // verify against the high watermark; the sibling's watermark already
         // covers this stream's delivered.
-        let verified = handler
-            .verify_voucher(&seed, U256::from(two_mb), &signed_low, &wire, rate_per_mb)
-            .expect("a superseded but well-signed voucher is benign, not a reject");
+        let verified = super::ClientHandler::verify_voucher(
+            &seed,
+            U256::from(two_mb),
+            &signed_low,
+            &wire,
+            rate_per_mb,
+        )
+        .expect("a superseded but well-signed voucher is benign, not a reject");
         assert_eq!(
             verified.new_bytes,
             U256::from(two_mb),
@@ -601,7 +596,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let store = Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
             as Arc<dyn PoolStateStore>;
-        let (handler, _dir) = handler_over_store(&metrics, store).await;
+        let (_handler, _dir) = handler_over_store(&metrics, store).await;
 
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let signer_key = PrivateKeySigner::random();
@@ -640,15 +635,14 @@ mod tests {
             bytes_delivered: two_mb,
         };
 
-        let err = handler
-            .verify_voucher(
-                &seed,
-                U256::from(one_mb),
-                &divergent_voucher,
-                &wire,
-                rate_per_mb,
-            )
-            .expect_err("a divergent equal-amount voucher must be rejected");
+        let err = super::ClientHandler::verify_voucher(
+            &seed,
+            U256::from(one_mb),
+            &divergent_voucher,
+            &wire,
+            rate_per_mb,
+        )
+        .expect_err("a divergent equal-amount voucher must be rejected");
         match err {
             super::VerifyStop::Reject(reason, _) => assert_eq!(
                 reason,

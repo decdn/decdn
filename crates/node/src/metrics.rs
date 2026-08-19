@@ -256,16 +256,6 @@ pub struct DecdnMetrics {
     /// validation). Operator-visible name:
     /// `decdn_rate_bounds_clamp_events_total`.
     pub rate_bounds_clamp_events: Counter,
-    /// Vouchers refused because their cumulative `amount / bytes_delivered`
-    /// watermark fell below the configured per-byte price floor (`delivery_floor`)
-    /// at zero tolerance, mirroring the on-chain `PaymentPool`
-    /// `RateFloorViolation` settlement check (which likewise floors the cumulative
-    /// claim, #846). Only increments when `delivery_floor > 0` (i.e. the node has
-    /// synced on-chain bounds); at the default floor of `0` the check is inert and
-    /// this stays zero regardless of voucher quality. A non-zero count means a
-    /// counterparty signed a voucher this node could not redeem on-chain.
-    /// Operator-visible name: `decdn_voucher_rate_floor_rejections_total`.
-    pub voucher_rate_floor_rejections: Counter,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match
     /// the existing `dispatch_rejected_*` convention: a plain counter field
@@ -1749,11 +1739,6 @@ recorders! {
     /// The node clamped `rate_per_mb` to the configured delivery bounds
     /// before signing (ADR 005 §Rate bounds validation).
     rate_bounds_clamped => rate_bounds_clamp_events.inc();
-
-    /// A voucher was refused for paying below the protocol per-byte price
-    /// floor (`delivery_floor`) — the off-chain mirror of the on-chain
-    /// `RateFloorViolation` settlement guard (#846).
-    voucher_rate_floor_rejected => voucher_rate_floor_rejections.inc();
 
     /// An accepted voucher skipped one or more nonce values past
     /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise

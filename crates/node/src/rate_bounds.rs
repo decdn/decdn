@@ -1,11 +1,10 @@
-//! Live per-MB delivery-rate floor (#1172, ADR 019 §3.1 / ADR 003).
+//! Live per-MB delivery-rate floor (ADR 019 §3.1 / ADR 003).
 //!
 //! The seller raises its advertised `rate_per_mb` to a governance-set floor
-//! before signing a `ProbeResponse` / `StreamResponse` and enforces the same
-//! floor again at voucher settlement. The floor lives on-chain in
-//! `PaymentPool.getRateBounds()`; the node reads it once at startup and then
-//! tracks `RateBoundsUpdated` events so a governance retune reaches a running
-//! node without a restart.
+//! before signing a `ProbeResponse` / `StreamResponse`, so it never quotes below
+//! the floor. The floor lives on-chain in `PaymentPool.getRateBounds()`; the node
+//! reads it once at startup and then tracks `RateBoundsUpdated` events so a
+//! governance retune reaches a running node without a restart.
 //!
 //! There is no governance ceiling. A seller self-clamping its own advertised
 //! rate *downward* buys no on-chain safety — a seller never wants to charge
@@ -18,17 +17,13 @@
 //! rate-bounds watcher hold. A single value needs no cross-field consistency
 //! machinery: one `AtomicU64` is read and written whole.
 //!
-//! Do **not** pin a quote-time floor across a stream and reuse it to accept
-//! that stream's later vouchers. The hard per-byte floor enforced at voucher
-//! acceptance (`handlers/client/voucher.rs`) mirrors the on-chain
-//! `PaymentPool.redeem` rate-floor check, which reads the **live**
-//! `deliveryFloor` at settlement — there is no per-channel floor snapshot on
-//! chain. A voucher priced below the live floor is unredeemable
-//! (`RateFloorViolation`), so the acceptance check must read the live floor too;
-//! pinning the quote-time floor would make the node countersign vouchers it
-//! cannot redeem (see #1382 / #1388). Honouring the buyer across a governance
-//! floor raise is a separate concern — it needs a graceful re-quote signal, not
-//! a stale floor.
+//! The floor gates the quote only, not voucher acceptance. `PaymentPool.redeem`
+//! is a soft floor: it settles a sub-floor voucher's `cumulative` and clamps the
+//! bytes it credits toward vote weight (ADR 003 §Rate-floor enforcement), so the
+//! node has no reason to refuse a voucher whose cumulative dips below the live
+//! floor — the mid-stream floor-raise race, since the quote itself was already
+//! raised to the floor before signing. The node keeps quoting at or above the
+//! floor and lets settlement do the clamping.
 
 use std::sync::{
     Arc,
