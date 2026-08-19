@@ -50,16 +50,15 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Log};
+use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
-};
+use crate::chain_events::multiplexed_poller::{Route, SinkSource};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
 use crate::dht::chain_projection::{with_read, with_write};
@@ -100,13 +99,12 @@ pub struct RegistryHandles {
     /// the pull-through-gated `bindings`) so the chain-backed origin directory
     /// can resolve operators locally with no `nodeIdOf` RPC.
     pub operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
-    /// The shared watcher, exposed so the runtime can drive graceful shutdown in
-    /// its deliberate order (this loop stops *after* `router.shutdown` because
-    /// its staker-set projection gates DHT admission during drain). Also held
-    /// inside both façades' projections, so the task lives until the last of the
-    /// three drops. `pub(crate)`, since `WatcherHandle` is crate-private and only
-    /// the runtime drives shutdown.
-    pub(crate) watcher: Arc<WatcherHandle>,
+    /// The membership/binding [`Route`] the runtime registers on the shared
+    /// multiplexed poller. The poller stops *after* `router.shutdown` because
+    /// this route's staker-set projection gates DHT admission during drain.
+    /// `pub(crate)`, since [`Route`] is crate-private and only the runtime wires
+    /// it.
+    pub(crate) route: Route,
 }
 
 /// The chain reads the live watcher performs, behind a trait so the event
@@ -164,8 +162,8 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
     }
 
     async fn node_id_of(&self, operator: Address) -> Result<Option<(NodeId, bool)>> {
-        // Bounded explicitly: `WatcherConfig::rpc_call_timeout` covers only the
-        // loop's own `get_logs`, so a sink's follow-up read stays unbounded unless
+        // Bounded explicitly: the poller's per-call timeout covers only its own
+        // merged `get_logs`, so a sink's follow-up read stays unbounded unless
         // it wraps itself (the `blacklist_watcher::scope_check` precedent). That
         // matters here because this single loop feeds both the staker-set and the
         // bindings projection: one stalled `nodeIdOf` would wedge both.
@@ -485,7 +483,6 @@ where
 pub async fn bootstrap<P>(
     provider: P,
     registry_addr: Address,
-    event_poll_interval: Duration,
     head: Arc<dyn HeadSource>,
     track_node_addresses: bool,
     metrics: Arc<Metrics>,
@@ -543,62 +540,41 @@ where
         // due one interval from now rather than on the first tick.
         last_resync: Some(Instant::now()),
     };
-    let cfg = WatcherConfig::new(
-        head,
-        Filter::new().address(registry_addr).event_signature(vec![
-            CapacityBond::NodeRegistered::SIGNATURE_HASH,
-            CapacityBond::NodeDeregistered::SIGNATURE_HASH,
-            CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
-            CapacityBond::Reinstated::SIGNATURE_HASH,
-            CapacityBond::UnbondingRequested::SIGNATURE_HASH,
-        ]),
-        // Seed the live tail from the enumeration snapshot head; the staker set
-        // is rebuilt from that enumeration each boot, so there is no durable
-        // cursor to persist.
-        CursorStart::Seeded {
-            at: snapshot_block,
-            persist: None,
-        },
-        event_poll_interval,
-        "capacity-bond",
-    )
-    // `staker_set_watcher_*` is the shared `capacity-bond` loop's health, and it
-    // covers the bindings projection too — one loop feeds both, so there is one
-    // thing to report.
-    .on_established(metric_hook(
-        &metrics,
-        Metrics::staker_set_watcher_cycle_established,
-    ))
-    .on_backoff(metric_hook(
-        &metrics,
-        Metrics::staker_set_watcher_backoff_started,
-    ))
-    .on_tick_success(metric_hook(&metrics, Metrics::staker_set_watcher_tick))
-    .on_task_panic(metric_hook(
-        &metrics,
-        Metrics::staker_set_watcher_task_panicked,
-    ));
-    // One task, one `WatcherHandle`, shared by both façades and the runtime: it
-    // lives while any of the three holds it and aborts when the last drops.
-    // Strictly safer than the old shape, where dropping the resolver killed only
-    // its own loop. This sink observes no shutdown token, so it ignores the one
-    // `spawn` mints (`|_| sink`).
-    let watcher = Arc::new(resumable_watcher::spawn(provider, cfg, move |_| sink));
+    let route = Route {
+        addresses: vec![registry_addr],
+        topic0s: registry_route_topic0s(),
+        start: registry_cursor_start(snapshot_block),
+        // This sink observes no shutdown token, so it registers a `Ready` sink.
+        sink: SinkSource::Ready(Box::new(sink)),
+        label: "capacity-bond",
+        // `staker_set_watcher_*` is the shared `capacity-bond` route's health, and
+        // it covers the bindings projection too — one route feeds both, so there
+        // is one thing to report.
+        on_established: Some(metric_hook(
+            &metrics,
+            Metrics::staker_set_watcher_cycle_established,
+        )),
+        on_backoff: Some(metric_hook(
+            &metrics,
+            Metrics::staker_set_watcher_backoff_started,
+        )),
+        on_tick_success: Some(metric_hook(&metrics, Metrics::staker_set_watcher_tick)),
+        on_task_panic: Some(metric_hook(
+            &metrics,
+            Metrics::staker_set_watcher_task_panicked,
+        )),
+    };
 
-    let staker_set: Arc<dyn StakerSet> =
-        Arc::new(ChainStakerSet::from_parts(active, Arc::clone(&watcher)));
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ChainStakerSet::from_parts(active));
     let node_addresses = bindings.map(|b| {
-        Arc::new(ChainNodeAddressDirectory::from_parts(
-            b,
-            Arc::clone(&watcher),
-        )) as Arc<dyn NodeAddressResolver>
+        Arc::new(ChainNodeAddressDirectory::from_parts(b)) as Arc<dyn NodeAddressResolver>
     });
     Ok(RegistryHandles {
         staker_set,
         node_addresses,
         regions,
         operator_to_node,
-        watcher,
+        route,
     })
 }
 
@@ -614,6 +590,30 @@ pub(crate) fn region_of(
     with_read(regions, "registry regions", |m| m.get(&id).cloned())
 }
 
+/// The registry route's demux key: every `CapacityBond` staker-membership
+/// event. Split out from [`bootstrap`] so the exact topic0 set is unit-testable
+/// without a provider.
+fn registry_route_topic0s() -> Vec<B256> {
+    vec![
+        CapacityBond::NodeRegistered::SIGNATURE_HASH,
+        CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+        CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
+        CapacityBond::Reinstated::SIGNATURE_HASH,
+        CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+    ]
+}
+
+/// The registry route's cursor start: seed the live tail from the enumeration
+/// snapshot head. The staker set is rebuilt from that enumeration each boot, so
+/// there is no durable cursor to persist. Split out from [`bootstrap`] so the
+/// cursor shape is unit-testable without a provider.
+const fn registry_cursor_start(snapshot_block: u64) -> CursorStart {
+    CursorStart::Seeded {
+        at: snapshot_block,
+        persist: None,
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -623,7 +623,36 @@ pub(crate) fn region_of(
 )]
 mod tests {
     use super::*;
-    use alloy::primitives::{B256, Bytes, LogData};
+    use alloy::primitives::{Bytes, LogData};
+
+    /// The registry route watches exactly the five `CapacityBond`
+    /// staker-membership events — no more, no fewer.
+    #[test]
+    fn route_topic0s_covers_every_staker_membership_event() {
+        assert_eq!(
+            registry_route_topic0s(),
+            vec![
+                CapacityBond::NodeRegistered::SIGNATURE_HASH,
+                CapacityBond::NodeDeregistered::SIGNATURE_HASH,
+                CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
+                CapacityBond::Reinstated::SIGNATURE_HASH,
+                CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+            ]
+        );
+    }
+
+    /// The registry route seeds its cursor at the enumeration snapshot head,
+    /// with no durable persistence (the staker set is rebuilt from enumeration
+    /// each boot).
+    #[test]
+    fn cursor_start_seeds_at_snapshot_with_no_persistence() {
+        let start = registry_cursor_start(54_321);
+        assert_eq!(start.seed(), Some(54_321));
+        assert!(
+            matches!(start, CursorStart::Seeded { persist: None, .. }),
+            "must not carry a durable checkpoint"
+        );
+    }
 
     fn nid(byte: u8) -> NodeId {
         NodeId::from_bytes([byte; 32])

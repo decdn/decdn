@@ -78,7 +78,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use crate::chain_events::resumable_watcher::WatcherHandle;
 use crate::dht::chain_projection::{ChainProjection, mutate_gauged};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
@@ -108,25 +107,20 @@ pub(super) enum StakerChange {
 
 /// Chain-backed staker set. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers
-/// access the cached set through it. The background watcher task is
-/// owned via the projection (shared with the address-binding façade)
-/// so a node-restart cycle never leaks chain-poll tasks.
+/// access the cached set through it. The background loop that keeps the
+/// cache fresh is the single shared multiplexed-poller task the runtime
+/// owns, so a node-restart cycle never leaks chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainStakerSet {
     proj: ChainProjection<HashSet<NodeId>>,
 }
 
 impl ChainStakerSet {
-    /// Assemble from parts owned by `capacity_bond_registry`, which does the
-    /// enumeration and runs the shared watcher. `watcher` is shared with
-    /// `ChainNodeAddressDirectory` when pull-through is on, so the task outlives
-    /// whichever façade is dropped first.
-    pub(super) const fn from_parts(
-        active: Arc<RwLock<HashSet<NodeId>>>,
-        watcher: Arc<WatcherHandle>,
-    ) -> Self {
+    /// Assemble from the active-set state owned by `capacity_bond_registry`,
+    /// which does the enumeration and registers the shared poller route.
+    pub(super) const fn from_parts(active: Arc<RwLock<HashSet<NodeId>>>) -> Self {
         Self {
-            proj: ChainProjection::from_parts(active, LABEL, watcher),
+            proj: ChainProjection::from_parts(active, LABEL),
         }
     }
 }

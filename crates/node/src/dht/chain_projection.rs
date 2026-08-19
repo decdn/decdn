@@ -13,19 +13,17 @@
 //! - [`mutate_gauged`] — mutate under the write lock, sample the size while
 //!   still holding it, and republish the gauge only when the mutation actually
 //!   changed the set (a re-scanned `eth_getLogs` window replays no-ops).
-//! - [`ChainProjection`] — the façade-held bundle of the shared state and the
-//!   owned [`WatcherHandle`] (#1236), exposing the read seam.
+//! - [`ChainProjection`] — the façade-held bundle of the shared state, exposing
+//!   the read seam.
 //!
 //! The mutation helpers stay free functions over `&RwLock<T>` because the
-//! *sink* — which lives inside the watcher task, so it cannot reach back into
-//! the [`ChainProjection`] that owns the task — is what applies mutations,
-//! holding its own `Arc<RwLock<T>>` clone made in `bootstrap`.
+//! *sink* — which lives inside the shared poller task, so it cannot reach back
+//! into the [`ChainProjection`] — is what applies mutations, holding its own
+//! `Arc<RwLock<T>>` clone made in `bootstrap`.
 
 use std::sync::{Arc, RwLock};
 
 use tracing::warn;
-
-use crate::chain_events::resumable_watcher::WatcherHandle;
 
 /// Poison-tolerant `RwLock` read. A poisoned lock means something panicked while
 /// holding the write guard; the cached state is still structurally valid (no
@@ -76,36 +74,22 @@ pub(super) fn mutate_gauged<T, S>(
     }
 }
 
-/// The shared state plus the owned watcher handle behind a chain-backed
-/// projection. Cheap to build via [`from_parts`](ChainProjection::from_parts);
-/// the watcher is an `Arc<WatcherHandle>` so the capacity-bond registry can feed
-/// one loop into both the staker-set and address-binding projections, the task
-/// living while either façade does.
+/// The shared state behind a chain-backed projection. Cheap to build via
+/// [`from_parts`](ChainProjection::from_parts). The background loop that keeps
+/// the state fresh is the single [`multiplexed_poller`] task the runtime owns
+/// and shuts down; the projection no longer holds a per-watcher handle.
+///
+/// [`multiplexed_poller`]: crate::chain_events::multiplexed_poller
 #[derive(Debug)]
 pub(super) struct ChainProjection<T> {
     state: Arc<RwLock<T>>,
     label: &'static str,
-    /// Held purely for its `Arc` refcount: as long as a projection built from
-    /// this handle is alive, the shared watcher task it points at is too. No
-    /// accessor reads it back — the runtime drives graceful shutdown through
-    /// the `Arc<WatcherHandle>` it keeps directly from `bootstrap` instead.
-    #[allow(dead_code)]
-    watcher: Arc<WatcherHandle>,
 }
 
 impl<T> ChainProjection<T> {
-    /// Assemble from the state the sink also holds (created in `bootstrap`) and
-    /// the watcher that keeps it fresh.
-    pub(super) const fn from_parts(
-        state: Arc<RwLock<T>>,
-        label: &'static str,
-        watcher: Arc<WatcherHandle>,
-    ) -> Self {
-        Self {
-            state,
-            label,
-            watcher,
-        }
+    /// Assemble from the state the sink also holds (created in `bootstrap`).
+    pub(super) const fn from_parts(state: Arc<RwLock<T>>, label: &'static str) -> Self {
+        Self { state, label }
     }
 
     /// Poison-tolerant read of the cached state.

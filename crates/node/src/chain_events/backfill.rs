@@ -1,7 +1,7 @@
 //! Windowing + reorg-margin primitives shared by every on-chain watcher.
 //!
-//! `resumable_watcher::run` walks a `[cursor, head]` gap in bounded
-//! `eth_getLogs` windows and rewinds a shallow reorg margin on resume. Kept here
+//! The `multiplexed_poller` loop walks each route's `[cursor, head]` gap in
+//! bounded `eth_getLogs` windows and rewinds a shallow reorg margin on resume. Kept here
 //! (rather than in any one watcher) so a new consumer picks up the shared span
 //! instead of forking a fresh one (#1092).
 //!

@@ -117,7 +117,7 @@ const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 /// overriding alloy's localhost-detected 250 ms default (#1011).
 ///
 /// Despite the config knob's name, this does not touch event watching: the
-/// chain watchers tick on `WatcherConfig::poll_interval` and never read the
+/// multiplexed poller ticks on its own `poll_interval` and never reads the
 /// client interval. The one consumer still reachable from this node is
 /// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
 /// `heart.rs`), which the node awaits in `payment_settlement` and
@@ -695,8 +695,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     bind_domain: alloy::dyn_abi::Eip712Domain,
     payment_pool_addr: alloy::primitives::Address,
     staker_set: Arc<dyn StakerSet>,
-    capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
-    slash_watcher: crate::slash_watcher::SlashWatcher,
+    /// The single multiplexed chain-event poller driving all five watcher routes.
+    /// Stopped once, late in shutdown (after `router.shutdown`), because the
+    /// capacity-bond route's staker set gates DHT admission through drain.
+    poller: crate::chain_events::resumable_watcher::WatcherHandle,
     slash_store: crate::slash_watcher::SlashStore,
     node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>>,
     probe_rate_limiter: Arc<ProbeRateLimiter>,
@@ -711,9 +713,7 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     registry_regions: Arc<std::sync::RwLock<std::collections::HashMap<crate::dht::NodeId, String>>>,
     client_handler: Arc<ClientHandler>,
     payment_service: PoolSettlementService<P>,
-    blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
-    rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     /// Bring-up node-id binding self-check (#1034), carried through to
     /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
     /// handle: the binding only moves by an explicit operator transaction, so
@@ -775,10 +775,10 @@ async fn build_chain_and_handlers(
     // Retained for the blacklist watcher's read-only provider after `rpc_url`
     // moves into the buyer wallet provider below.
     let blacklist_rpc_url = rpc_url.clone();
-    // One value, two consumers (#1011/#1106): the `eth_getLogs` tick cadence each
-    // watcher gets via `WatcherConfig::poll_interval`, and — through
-    // `with_poll_interval` below — the pending-tx receipt heartbeat, overriding
-    // alloy's 250 ms localhost default that would hammer a dev anvil.
+    // One value, two consumers (#1011/#1106): the multiplexed poller's merged
+    // `eth_getLogs` tick cadence, and — through `with_poll_interval` below — the
+    // pending-tx receipt heartbeat, overriding alloy's 250 ms localhost default
+    // that would hammer a dev anvil.
     let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
     let chain_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
     // One `eth_blockNumber` per TTL window for ALL watchers, instead of one per
@@ -791,21 +791,27 @@ async fn build_chain_and_handlers(
         ProviderFactory::shared_head(rpc_url.clone()),
         event_poll_interval,
     ));
-    // Each watcher's `spawn` mints its own shutdown token and returns a
-    // `WatcherHandle` that owns it, so the runtime drives graceful stop through the
-    // handle (`handle.shutdown()` in the sequence below) rather than a token it
-    // might forget to cancel.
-    //
-    // One CapacityBond enumeration + one watcher feeding both registry
-    // projections (#1110). The bindings half is built only when pull-through is
-    // on; it derives from page data already read here, so — unlike when it had its
-    // own bootstrap — it has no RPC that can fail on its own. `getRegisteredNodes`
-    // failure was already fatal via this same (unconditional, first-to-run) call,
-    // so nothing that boots today loses pull-through.
+    // Every on-chain watcher registers a `Route` on ONE shared multiplexed
+    // poller instead of running its own `eth_getLogs` loop: five watchers scan
+    // disjoint `(address, topic0)` slices of the same three contracts, so one
+    // merged `get_logs` per tick — demuxed after the fact — replaces five. The
+    // routes are collected as each watcher bootstraps below and spawned once (see
+    // `build`/`spawn` near the end of this function). The poller mints one
+    // shutdown token; the runtime drives graceful stop through the single handle.
+    let mut poller_routes: Vec<crate::chain_events::multiplexed_poller::Route> = Vec::new();
+    // One read-only provider for the poller's merged `get_logs` (each sink still
+    // holds its own contract instance for its follow-up reads/writes).
+    let poller_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
+
+    // One CapacityBond enumeration + one route feeding both registry projections
+    // (#1110). The bindings half is built only when pull-through is on; it derives
+    // from page data already read here, so — unlike when it had its own bootstrap
+    // — it has no RPC that can fail on its own. `getRegisteredNodes` failure was
+    // already fatal via this same (unconditional, first-to-run) call, so nothing
+    // that boots today loses pull-through.
     let registry = crate::dht::capacity_bond_registry::bootstrap(
         chain_provider,
         capacity_bond_addr,
-        event_poll_interval,
         Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
         Arc::clone(&infra.node_metrics),
@@ -815,14 +821,12 @@ async fn build_chain_and_handlers(
     let staker_set: Arc<dyn StakerSet> = registry.staker_set;
     let registry_regions = Arc::clone(&registry.regions);
     // The shared `operator address → NodeId` reverse projection (#1110), kept
-    // current by the same registry watcher. The lazy `ChainOriginDirectory`
-    // resolves against it directly rather than maintaining its own binding
-    // cache.
+    // current by the same registry route. The lazy `ChainOriginDirectory`
+    // resolves against it directly rather than maintaining its own binding cache.
     let operator_to_node = Arc::clone(&registry.operator_to_node);
-    // The shared registry watcher, held for the ordered graceful stop below (it
-    // cancels *after* `router.shutdown`, as its staker set gates DHT admission
-    // during drain). Also held inside both façades' projections.
-    let capacity_bond_watcher = registry.watcher;
+    // The registry route MUST stay live through drain (its staker set gates DHT
+    // admission), which forces the single poller stop to the LATE point below.
+    poller_routes.push(registry.route);
 
     // Slash-detection watcher (#1032, G-NODE-05): enumerate this operator's
     // still-appealable slashes from `CapacityBond` and follow `SlashRecorded`, so
@@ -833,17 +837,16 @@ async fn build_chain_and_handlers(
     // above on the same contract that already gates startup — so it adds no new
     // failure mode; thereafter a tail blip retries and the periodic resync heals
     // drift, so detection is never disabled for the daemon's lifetime.
-    let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
+    let (slash_store, slash_route) = crate::slash_watcher::bootstrap(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         capacity_bond_addr,
         infra.eth_signer.address(),
-        event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
     )
     .await
     .context("bootstrap the slash-detection watcher")?;
-    let slash_store = slash_watcher.store();
+    poller_routes.push(slash_route);
 
     // NodeId → bonded operator address resolver for node-to-node pulls (#831),
     // produced by the same CapacityBond bootstrap as the staker set above and
@@ -1183,7 +1186,7 @@ async fn build_chain_and_handlers(
         Arc::new(crate::channel_store::StoredCapabilitySource::new(
             Arc::clone(&infra.concrete_channel_store),
         ));
-    let payment_service = PoolSettlementService::bootstrap(
+    let (payment_service, settlement_route) = PoolSettlementService::bootstrap(
         wallet_provider,
         payment_pool_addr,
         infra.eth_signer.address(),
@@ -1194,8 +1197,6 @@ async fn build_chain_and_handlers(
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
         usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
-        event_poll_interval,
-        Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
         pool_view,
         redeem_tx,
@@ -1203,6 +1204,7 @@ async fn build_chain_and_handlers(
     )
     .await
     .context("PaymentPool settlement service bootstrap")?;
+    poller_routes.push(settlement_route);
 
     // Blacklist compliance watcher (ADR 011/031, issue #1031). Its boot pass
     // ENUMERATES the current on-chain deny-set at one pinned block
@@ -1212,17 +1214,16 @@ async fn build_chain_and_handlers(
     // cascades to DHT-announce suppression (the republisher's `is_evicted` gate),
     // probe `has_blob:false`, and delivery refusal — the node's only local
     // protection against the slash for serving blacklisted content.
-    // `blacklist_ready_rx` gates the ALPN router below on that first enumeration;
-    // the returned `WatcherHandle` owns the loop's shutdown token (its sink shares
-    // it, #1236). The tail carries no durable cursor, so teardown has no scan
-    // checkpoint to flush.
+    // `blacklist_ready_rx` gates the ALPN router below on that first enumeration.
+    // The route carries a shutdown-token-observing sink factory (its re-scope
+    // polls the poller's token, #1236); the tail carries no durable cursor, so
+    // teardown has no scan checkpoint to flush.
     let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
-    let blacklist_watcher = crate::blacklist_watcher::spawn(
+    let blacklist_route = crate::blacklist_watcher::bootstrap(
         ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
         content_blacklist_addr,
         infra.eth_signer.address(),
         infra.cache.clone(),
-        event_poll_interval,
         Arc::clone(&head),
         Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
         blacklist_ready_tx,
@@ -1231,21 +1232,40 @@ async fn build_chain_and_handlers(
     )
     .await
     .context("blacklist compliance watcher boot enumeration")?;
+    poller_routes.push(blacklist_route);
 
-    // Rate-bounds watcher (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` off
-    // the shared-head getLogs poller and re-reads `getRateBounds()`
-    // authoritatively every `rate_bounds_poll_interval_sec` as a safety net,
-    // storing into the same shared `rate_bounds` clamp the handlers hold (seeded
-    // by the startup read above). Read-only, no durable cursor.
-    let rate_bounds_watcher = crate::rate_bounds_watcher::spawn(
+    // Rate-bounds route (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` on the
+    // shared poller and re-reads `getRateBounds()` authoritatively every
+    // `rate_bounds_poll_interval_sec` as a safety net, storing into the same
+    // shared `rate_bounds` clamp the handlers hold (seeded by the startup read
+    // above). Read-only, no durable cursor.
+    let rate_bounds_route = crate::rate_bounds_watcher::route(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         payment_pool_addr,
         rate_bounds.clone(),
-        event_poll_interval,
         Duration::from_secs(cfg.blockchain.rate_bounds_poll_interval_sec),
-        Arc::clone(&head),
         &infra.node_metrics,
     );
+    poller_routes.push(rate_bounds_route);
+
+    // Assemble and spawn the ONE poller for all five routes. `build` fails fast
+    // if two routes claim the same `(address, topic0)` — a wiring bug, not a
+    // runtime condition — surfacing it at boot. Three contract addresses
+    // (payment_pool, capacity_bond, content_blacklist) with disjoint topic0s per
+    // (address, topic0).
+    let poller = crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(
+        Arc::clone(&head),
+        event_poll_interval,
+    );
+    let poller = poller_routes
+        .into_iter()
+        .fold(
+            poller,
+            crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::route,
+        )
+        .build()
+        .context("assemble the multiplexed chain-event poller")?;
+    let poller = crate::chain_events::multiplexed_poller::spawn(poller_provider, poller);
 
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
     // active-staker set + parallel `FindNode(self.node_id)` against a
@@ -1275,8 +1295,7 @@ async fn build_chain_and_handlers(
         bind_domain,
         payment_pool_addr,
         staker_set,
-        capacity_bond_watcher,
-        slash_watcher,
+        poller,
         slash_store,
         node_address_resolver,
         probe_rate_limiter,
@@ -1289,9 +1308,7 @@ async fn build_chain_and_handlers(
         registry_regions,
         client_handler,
         payment_service,
-        blacklist_watcher,
         blacklist_ready_rx,
-        rate_bounds_watcher,
         binding_report,
     })
 }
@@ -2045,12 +2062,9 @@ pub async fn run(
         probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
         republish_stop_tx: bg.republish_stop_tx,
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
-        blacklist_watcher: ch.blacklist_watcher,
-        rate_bounds_watcher: ch.rate_bounds_watcher,
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
-        capacity_bond_watcher: ch.capacity_bond_watcher,
-        slash_watcher: ch.slash_watcher,
+        poller: ch.poller,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
         receipt_writer: infra.receipt_writer,
@@ -2081,12 +2095,12 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     republish_stop_tx: oneshot::Sender<()>,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
-    blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
-    rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
-    capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
-    slash_watcher: crate::slash_watcher::SlashWatcher,
+    /// The single multiplexed chain-event poller. Stopped once, late (after
+    /// `router.shutdown`), because its capacity-bond route gates DHT admission
+    /// through drain — see the cancel site in [`shutdown`].
+    poller: crate::chain_events::resumable_watcher::WatcherHandle,
     receipt_writer_shutdown: CancellationToken,
     payment_service: PoolSettlementService<P>,
     receipt_writer: tokio::task::JoinHandle<()>,
@@ -2102,7 +2116,7 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
 /// PR1). Consumes every field of [`ShutdownHandles`] via an exhaustive
 /// destructure — see that type's docs for why the `..`-free binding is
 /// load-bearing. The teardown ordering here is itself load-bearing (metrics
-/// accept-loop stop first; `capacity_bond_watcher` shutdown after
+/// accept-loop stop first; the multiplexed `poller` stops after
 /// `router.shutdown`) and must not be reordered.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn shutdown<P: Provider + Clone + 'static>(
@@ -2123,12 +2137,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
         probe_rate_limit_gc_stop_tx,
         republish_stop_tx,
         bucket_refresh_stop_tx,
-        blacklist_watcher,
-        rate_bounds_watcher,
         mut admin_stop_tx,
         rpc_watchdog,
-        capacity_bond_watcher,
-        slash_watcher,
+        poller,
         receipt_writer_shutdown,
         payment_service,
         receipt_writer,
@@ -2175,14 +2186,14 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
-    blacklist_watcher.shutdown();
-    // Rate-bounds watcher (#1172): read-only, no cursor to flush — just cancel.
-    rate_bounds_watcher.shutdown();
-    // The origin directory has no watcher and no cursor to flush: it is a lazy,
-    // on-demand cache with no background task to stop. The blacklist watcher is
-    // the same shape re its own cursor — it re-enumerates the deny-set from
-    // chain on every boot and its live tail carries no durable cursor — so
-    // there is nothing to flush there either.
+    // The five chain watchers are now one multiplexed poller with one shutdown
+    // token, so the previous staggered per-watcher stops collapse to a SINGLE
+    // `poller.shutdown()` at the LATE point below (after `router.shutdown`). The
+    // blacklist and rate-bounds routes, which used to stop here early, move to
+    // that late stop: it is harmless — neither carries a durable cursor to flush,
+    // and neither is consulted for a drain-time decision (unlike the
+    // capacity-bond route's staker set), so they only keep applying
+    // compliance/rate updates a little longer.
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -2226,24 +2237,26 @@ async fn shutdown<P: Provider + Clone + 'static>(
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
-    // The two watchers stopped here exit cooperatively — each cancels its own
-    // loop at its next await boundary, once nothing depends on it any more.
+    // The ONE multiplexed poller driving all five watcher routes stops here,
+    // once. It exits cooperatively — cancelling its loop at the next await
+    // boundary and flushing every persisting route's checkpoint (settlement's
+    // `PoolOpened`) before returning — with its `WatcherHandle`'s `AbortOnDrop`
+    // as the backstop.
     //
-    // *After* `router.shutdown` deliberately, and the capacity-bond one is why:
+    // *After* `router.shutdown` deliberately, and the capacity-bond route is why:
     // its projection is the cached active-staker set, which gates DHT `Store`
     // admission and decides which probes the stake-lane reservation sheds.
     // Cancelling it before the drain would freeze that set while the router is
-    // still serving, so a membership change landing mid-drain would be missed
-    // by exactly the requests still in flight. Slash is not consulted by the
-    // serve path and could stop earlier, but it stops here too — one cancel site
-    // for the shared `capacity-bond`-era watchers is easier to keep correct than
-    // two orderings each justified separately.
-    //
-    // Neither persists a cursor, so unlike the origin watcher above there is no
-    // checkpoint to flush and no deadline this must beat: the cancel buys a clean
-    // exit, and each `WatcherHandle`'s `AbortOnDrop` remains the backstop.
-    capacity_bond_watcher.shutdown();
-    slash_watcher.shutdown();
+    // still serving, so a membership change landing mid-drain would be missed by
+    // exactly the requests still in flight. This binding constraint forces the
+    // single stop late; the other four routes (slash, settlement, blacklist,
+    // rate-bounds) are not drain-consulted and could stop earlier, but one shared
+    // token means they stop here too. `shutdown` only cancels the token — it is
+    // not awaited — so settlement's checkpoint flush races the redeem sweep just
+    // below rather than completing before it; that is fine because the flush is
+    // best-effort and the checkpoint is independent of, and idempotent with
+    // respect to, the redeem sweep.
+    poller.shutdown();
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so
@@ -2252,10 +2265,14 @@ async fn shutdown<P: Provider + Clone + 'static>(
 
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers arrive and the persisted lane state is final. A pool is
-    // owner-closed only, so there is nothing to close here — the shutdown stops
-    // the watcher, flushes the scan checkpoint, and runs one final best-effort
-    // redeem sweep so an above-threshold lane is not left un-redeemed. Bounded by
-    // the deadline so a slow RPC cannot hang shutdown.
+    // owner-closed only, so there is nothing to close here. The poller cancel
+    // above triggers settlement's tail stop and checkpoint flush asynchronously
+    // (best-effort, not awaited before this point), so this quiesces the redeemer
+    // and runs one final best-effort redeem sweep so an above-threshold lane is
+    // not left un-redeemed. The redeem sweep does not depend on the checkpoint
+    // flush having completed — the scan checkpoint is independent lane state and
+    // idempotent to re-scan. Bounded by the deadline
+    // so a slow RPC cannot hang shutdown.
     payment_service.shutdown(SHUTDOWN_DEADLINE).await;
 
     // Final durable flush before stop, so the last interval of frontier lands.

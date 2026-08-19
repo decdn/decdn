@@ -1,10 +1,11 @@
 //! Shared chain-event log streaming for the on-chain watchers.
 //!
-//! Every watcher drives its log source through `resumable_watcher::run`, a
-//! single `eth_getLogs` polling loop that unifies historical backfill and the
-//! live tail into one resumable, cursor-persisting loop (#1092). The node makes
-//! no `watch_logs`/`eth_newFilter` call: the default public Arbitrum Sepolia RPC
-//! and most keyless endpoints reject those with `-32601` (#1106).
+//! Every watcher registers a `Route` on one `multiplexed_poller`, a single
+//! `eth_getLogs` polling loop that merges all routes into one call per tick and
+//! unifies historical backfill and the live tail into one resumable,
+//! cursor-persisting loop (#1092). The node makes no `watch_logs`/`eth_newFilter`
+//! call: the default public Arbitrum Sepolia RPC and most keyless endpoints
+//! reject those with `-32601` (#1106).
 //!
 //! # Watchers scan to head, deliberately
 //!
@@ -46,10 +47,19 @@
 //! rather than the wiring.
 
 pub(crate) mod backfill;
+// Public because `Route` appears in the `pub` watcher `bootstrap` signatures and
+// the builder/`spawn` are driven by external integration tests
+// (`tests/anvil_settlement_e2e.rs`) to run the settlement route.
+pub mod multiplexed_poller;
 pub(crate) mod resumable_watcher;
 // Public because it appears in the `pub` watcher `bootstrap` signatures, which
 // external integration tests (`tests/anvil_settlement_e2e.rs`) call.
 pub mod shared_head;
+
+// `resumable_watcher` is crate-private, but `WatcherHandle` is the return type of
+// the `pub multiplexed_poller::spawn`, so external callers must be able to name
+// it. Re-export it on a public path rather than widen the whole module.
+pub use resumable_watcher::WatcherHandle;
 
 pub(crate) use backfill::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows};
 
@@ -74,9 +84,8 @@ impl Drop for AbortOnDrop {
 
 /// Default first backoff after a failing poll tick, doubled (bounded by
 /// [`WATCHER_MAX_BACKOFF`]) on each successive failure and reset on a clean
-/// tick. Shared by every watcher so the recovery cadence can't drift between
-/// them (#1092); a watcher that genuinely needs a different cap overrides
-/// `max_backoff` explicitly at its `WatcherConfig` site (e.g. the slash watcher).
+/// tick. The one shared multiplexed poller drives every route on this schedule,
+/// so the recovery cadence is uniform by construction (#1092).
 pub(crate) const WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Default ceiling for the per-tick exponential backoff. See

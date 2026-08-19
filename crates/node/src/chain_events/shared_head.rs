@@ -262,13 +262,13 @@ mod tests {
     }
 
     /// The end-to-end proof of the reduction, over real HTTP through the real
-    /// `resumable_watcher::run` loop rather than inferred from the unit tests
-    /// above: N watchers sharing one [`SharedHead`] must issue far fewer
-    /// `eth_blockNumber` calls than one-per-watcher-per-tick.
+    /// `multiplexed_poller::run` loop rather than inferred from the unit tests
+    /// above: N separate poller loops sharing one [`SharedHead`] must issue far
+    /// fewer `eth_blockNumber` calls than one-per-loop-per-tick.
     ///
     /// Asserts both bounds that matter: the TTL bound (what the cache promises)
     /// and `< WATCHERS * ticks` (what it replaces). The second is the one that
-    /// would catch a regression where `head` is accidentally rebuilt per watcher.
+    /// would catch a regression where `head` is accidentally rebuilt per loop.
     /// Discards logs — the counting test measures RPC counts, not projection state.
     struct NullSink;
 
@@ -327,8 +327,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn watchers_sharing_one_head_collapse_the_block_number_reads() {
-        use super::super::resumable_watcher::{self, CursorStart, WatcherConfig};
-        use alloy::rpc::types::Filter;
+        use super::super::multiplexed_poller::{MultiplexedPollerBuilder, Route, SinkSource, run};
+        use super::super::resumable_watcher::CursorStart;
+        use alloy::primitives::{Address, B256};
         use std::sync::atomic::Ordering;
         use tokio_util::sync::CancellationToken;
 
@@ -337,34 +338,31 @@ mod tests {
         const RUN_FOR: Duration = Duration::from_millis(550);
 
         let (_server, provider, head_hits) = counting_server().await;
-        // The one thing under test: a single head source behind every watcher.
+        // The one thing under test: a single head source behind every loop.
         let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(provider.clone(), INTERVAL));
         let shutdown = CancellationToken::new();
 
+        // N separate single-route poller loops, each reading head through the one
+        // shared source. Each loop's own head reads collapse onto the cache.
         let watchers: Vec<_> = (0..WATCHERS)
             .map(|_| {
-                let cfg = WatcherConfig {
-                    head: Arc::clone(&head),
-                    filter: Filter::new(),
-                    from_block: 0,
-                    poll_interval: INTERVAL,
-                    max_backfill_span: 10_000,
+                let route = Route {
+                    addresses: vec![Address::ZERO],
+                    topic0s: vec![B256::ZERO],
                     start: CursorStart::HeadMinusWindow { window_blocks: 0 },
-                    initial_backoff: Duration::from_millis(10),
-                    max_backoff: Duration::from_millis(10),
-                    rpc_call_timeout: None,
+                    sink: SinkSource::Ready(Box::new(NullSink)),
                     label: "count-test",
                     on_established: None,
                     on_backoff: None,
                     on_tick_success: None,
                     on_task_panic: None,
                 };
-                tokio::spawn(resumable_watcher::run(
-                    provider.clone(),
-                    cfg,
-                    NullSink,
-                    shutdown.clone(),
-                ))
+                let built = MultiplexedPollerBuilder::new(Arc::clone(&head), INTERVAL)
+                    .max_backfill_span(10_000)
+                    .route(route)
+                    .build();
+                let poller = built.unwrap_or_else(|e| panic!("build must succeed: {e:#}"));
+                tokio::spawn(run(provider.clone(), poller, shutdown.clone()))
             })
             .collect();
 

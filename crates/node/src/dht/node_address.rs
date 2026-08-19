@@ -44,7 +44,6 @@ use std::sync::{Arc, RwLock};
 
 use alloy::primitives::Address;
 
-use crate::chain_events::resumable_watcher::WatcherHandle;
 use crate::dht::chain_projection::{ChainProjection, mutate_gauged};
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
@@ -105,23 +104,20 @@ impl NodeAddressResolver for StaticNodeAddressDirectory {
 }
 
 /// Chain-backed [`NodeAddressResolver`]. Cheap to clone via the shared inner
-/// [`Arc`]; the background watcher is owned via the projection (shared with the
-/// staker-set façade) so a node-restart cycle never leaks chain-poll tasks.
+/// [`Arc`]; the background loop that keeps the cache fresh is the single shared
+/// multiplexed-poller task the runtime owns, so a node-restart cycle never leaks
+/// chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainNodeAddressDirectory {
     proj: ChainProjection<HashMap<NodeId, Address>>,
 }
 
 impl ChainNodeAddressDirectory {
-    /// Assemble from parts owned by `capacity_bond_registry`, which does the
-    /// enumeration and runs the shared watcher. `watcher` is shared with
-    /// `ChainStakerSet`, so the task outlives whichever façade is dropped first.
-    pub(super) const fn from_parts(
-        bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
-        watcher: Arc<WatcherHandle>,
-    ) -> Self {
+    /// Assemble from the bindings state owned by `capacity_bond_registry`, which
+    /// does the enumeration and registers the shared poller route.
+    pub(super) const fn from_parts(bindings: Arc<RwLock<HashMap<NodeId, Address>>>) -> Self {
         Self {
-            proj: ChainProjection::from_parts(bindings, LABEL, watcher),
+            proj: ChainProjection::from_parts(bindings, LABEL),
         }
     }
 }
