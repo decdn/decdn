@@ -454,7 +454,7 @@ pub struct CacheConfig {
     /// best-effort, so at capacity one arbitrary entry is dropped to admit a new
     /// answer (expired entries reclaimed first).
     pub origin_probe_memo_capacity: Option<u64>,
-    /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
+    /// Cache eviction driver: percent of [`Self::cache_size_mb`] above which
     /// the driver actively evicts (#1173, ADR 040). Absent =>
     /// [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`] (90). Hard bounds
     /// `[60, 95]`; set above the 25% probe-hold recommendation so a full hold

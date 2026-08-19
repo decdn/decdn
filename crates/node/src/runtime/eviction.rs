@@ -1,13 +1,14 @@
-//! LRU cache-eviction driver loop (#1173, ADR 040 §Whole-blob reclaim; range
+//! Cache-eviction driver loop (#1173, ADR 040 §Whole-blob reclaim; range
 //! eviction is upstream-gated).
 //!
 //! A single async task, owned by the node wiring layer (per
 //! `appendix-poc-production-seams.md`), that enforces the `cache.cache_size_mb`
 //! ceiling the cache write path deliberately does not. It periodically measures
-//! on-disk footprint and, once over the high-water mark, releases
-//! least-recently-used blobs (via [`CacheEngine::release_for_eviction`], the
-//! soft-evict path that is *not* the durable operator-evict) down to the target
-//! mark, bounded by a per-sweep budget.
+//! on-disk footprint and, once over the high-water mark, releases the blobs the
+//! injected `EvictionPolicy` ranks for eviction (via
+//! [`CacheEngine::release_for_eviction`], the soft-evict path that is *not* the
+//! durable operator-evict) down to the target mark, bounded by a per-sweep
+//! budget.
 //!
 //! ## The driver's actuator is indirect — hence pending-reclaim accounting
 //!
