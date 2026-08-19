@@ -1,0 +1,300 @@
+# ADR 040: Pluggable Cache Admission and Eviction Policies
+
+**Status:** Accepted
+
+## Context
+
+A node's local blob cache decides two things: which pulled content it keeps
+(admission) and which cached content it drops under size pressure (eviction).
+The protocol does not mandate a specific policy. Two nodes with different
+policies still interoperate: policy is a node-local implementation choice, not
+a wire concern.
+
+Admission and eviction are pluggable behind clean trait boundaries in
+`crates/cache`. The `node` crate selects and wires concrete implementations;
+`cache` defines no mode branching and holds no policy semantics itself. This
+follows the leaf/wiring seam pattern in
+[appendix-poc-production-seams.md](appendix-poc-production-seams.md#appendix-pocproduction-seam-architecture-rust-implementation).
+
+Ingest stays bounded to paid demand: a node ingests content only behind a
+live, paying client. Admission policy narrows what a node keeps after ingest;
+it never widens what a node pulls.
+
+## Decision
+
+### Signals in, decisions at the sweep
+
+The engine emits signals to the policy layer in real time and exposes generic
+store primitives. The policies own every semantic. The engine holds no
+segment meaning, reads no frequency estimate, and runs no promotion logic.
+
+`AdmissionPolicy` acts instantly. At store time the engine asks it for a
+target segment and tags the blob with `set_segment`. This is the only
+real-time policy action that mutates the store.
+
+`EvictionPolicy` buffers signals and decides once, at the sweep. Its `plan`
+method returns what to evict and what to promote. The eviction driver is a
+dumb executor: it applies the plan through engine primitives
+(`set_segment`, `segment_of`, `segment_bytes`) and enforces nothing itself. No
+segment tag moves between sweeps, other than the admission-time tag.
+
+```rust
+pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
+    fn admit(&self, ctx: &AdmissionContext) -> AdmissionDecision;
+}
+
+pub enum Segment { Probation, Main }
+
+pub enum AdmissionDecision {
+    Store { segment: Segment },
+    PassThrough,
+}
+
+pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
+    fn plan(&self, ctx: &EvictionContext) -> EvictionPlan;
+    fn on_access(&self, _hash: Hash) {}
+}
+
+pub struct EvictionPlan {
+    pub evict: Vec<Hash>,
+    pub promote: Vec<(Hash, Segment)>,
+}
+```
+
+`Segment` is an opaque label to the engine. It carries no meaning inside
+`cache`; only the policies interpret it.
+
+Three boundary rules keep the split clean:
+
+- The engine owns every safety exemption: pins, probe-triggered holds, and
+  the deny/takedown set. Eviction candidates arrive to the policy already
+  filtered of them, and the engine refuses to act on a pinned, held, or
+  denied hash regardless of what a plan says.
+- The engine owns the store and reclaim path. It exposes generic segment
+  primitives and assigns them no meaning of its own; it stores the label
+  admission chose and moves it when a plan says to. Policies hold no store
+  handles.
+- The two traits are independent. `lru` eviction paired with `always`
+  admission is a valid, supported combination; `lru` ignores segment
+  membership and never promotes.
+
+Reclaim is whole-blob only. `EvictionPlan.evict` is a list of hashes, not
+byte ranges. See [§ Whole-blob reclaim](#whole-blob-reclaim-range-eviction-is-upstream-gated).
+
+### The hit signal and its shared estimator
+
+```rust
+pub trait FrequencyEstimator: Send + Sync + std::fmt::Debug {
+    fn observe(&self, hash: Hash);
+    fn estimate(&self, hash: Hash) -> u32;
+}
+```
+
+The estimator is the hit-signal sink. The engine holds an optional
+`Arc<dyn FrequencyEstimator>` as an output port and calls `observe` on every
+serve or get. The engine never calls `estimate`; reading the estimate is a
+policy act. When no estimator is configured, the engine skips the call at
+zero cost.
+
+When either the admission selector or the eviction selector is `tinylfu`, the
+`node` wiring layer constructs one estimator and injects the same `Arc` into
+both. One sketch feeds two readers: admission's instant segment choice and
+eviction's sweep-time ranking and promotion decision both read the same
+buffered frequency signal.
+
+The shipped estimator is W-TinyLFU, implemented in-tree with no external
+dependency: a count-min sketch with periodic halving for aging, sized to a
+fixed in-process memory budget (`sketch_bytes`). It is not durable. State is
+lost on restart, matching the empty-on-boot behavior of the prior
+recency-only tracking.
+
+The sketch keys on the content hash. Cache keys are already BLAKE3 hashes, so
+the sketch derives its row indices from disjoint slices of the 32-byte key
+and needs no separate hash functions. The estimator omits the classic
+doorkeeper bloom filter: a doorkeeper exists to keep one-hit-wonders out of
+the sketch, and the probationary segment (see below) already serves that
+role. Frequency tracking stays whole-blob; the sketch keys on hash, not on
+byte range.
+
+### Probationary admission (mechanism C)
+
+First sighting of a cache miss admits to the probationary segment. The engine
+calls `set_segment(hash, Probation)`. Stream-while-store is unchanged: the
+same pull that fills a waiting client also fills the cache. The default
+`AlwaysAdmit` policy always returns `Main`; probation stays inert unless the
+`tinylfu` admission selector is active.
+
+The miss is the admission trigger. There is no separate on-miss signal; the
+engine calls `admit` only on a miss-fill, so the call itself is the miss
+handler. A missed blob still accumulates frequency, because the access
+signal fires on the miss-fill path too, so a repeatedly-missed blob
+eventually admits straight to `Main`.
+
+**Ordering invariant.** On a miss-fill, the engine reads the frequency
+estimate for the admission decision before it emits that request's own
+`observe` call. A first-ever request therefore sees an estimate of zero and
+admits to `Probation`; a request is never evidence for its own promotion.
+`promotion_threshold = N` means "admit to `Main` after N prior sightings,"
+not "after N total sightings including this one." Reordering `observe` ahead
+of `admit` on the fill path would send every one-hit-wonder straight to
+`Main` at `threshold = 1`, defeating admission.
+
+Promotion happens at the sweep, decided by the policy. The engine does not
+promote and does not read the estimator directly. On each sweep,
+`EvictionPolicy::plan` returns `promote: Vec<(Hash, Segment)>`: the
+probationary members whose buffered frequency has reached
+`promotion_threshold`. The driver applies each promotion through
+`move_segment`. Promotion matters only under cap pressure — a hot
+probationary blob otherwise ranks high and is never evicted — so deciding it
+at sweep time, rather than per-serve, is sufficient and avoids retag churn.
+No tag moves between sweeps.
+
+The probationary cap lives in the policy, not the driver. `TinyLfuEviction`
+holds `probation_target_pct` and enforces it inside `plan`, using segment
+membership and blob sizes from `EvictionContext`. It evicts the
+least-frequent probationary members first, so a scan of cold one-hit-wonders
+cannot push the hot working set out of `Main`. The driver only supplies
+context and executes the plan; the engine only measures, through
+`segment_bytes`.
+
+### Whole-blob reclaim; range eviction is upstream-gated
+
+Shipped reclaim removes whole blobs, through the existing tag-drop-then-GC
+path. `iroh-blobs` exposes no range-removal or partial-truncation primitive:
+it offers `import_bao` to add ranges, `export_ranges` and `observe` to read
+them, and a whole-hash `delete`. Reclaim granularity is therefore the whole
+hash.
+
+Partial blobs already occupy only their present ranges on disk, at
+chunk-group granularity, because the store writes at offsets and persists
+only present ranges. Punching holes in a partial blob outside the store's
+own bookkeeping would desynchronize its bitfield and break verification, so
+a node cannot reclaim ranges behind the store's back.
+
+Range-carrying eviction stays in the `EvictionPolicy` trait shape as
+forward-compatible surface, but no shipped policy emits it. Range reclaim is
+blocked on an upstream `iroh-blobs` primitive that atomically forgets a byte
+range across the bitfield, outboard, and data file. Until that primitive
+exists, range reclaim is future work, external to this ADR.
+
+### Configuration surface
+
+```toml
+[cache]
+admission_policy = "always"     # "always" | "tinylfu"   (default "always")
+eviction_policy  = "lru"        # "lru"    | "tinylfu"   (default "lru")
+
+[cache.tinylfu]                 # inert unless a selector = "tinylfu"
+sketch_bytes         = 262144
+promotion_threshold  = 2
+probation_target_pct = 10
+aging_halflife_sec   = 600
+```
+
+`node` owns the name-to-implementation mapping and validates the selectors.
+`cache` exports the traits and implementations and makes no selection
+itself. An unknown selector name is a config error at load; there is no
+silent fallback. The `[cache.tinylfu]` parameters resolve but stay unused
+when neither selector names `tinylfu`.
+
+Cache policy is node-local. A node's disk is its own resource. Policy
+selection is operator configuration, not a governance or consensus
+parameter. This is a deliberate exception to deCDN's default instinct of
+making economic parameters governance-tunable: cache policy carries no
+economic weight and has no cross-node interoperability requirement.
+
+The defaults, `always` admission and `lru` eviction, reproduce the prior
+recency-only behavior exactly. Adopting `tinylfu` is an explicit operator
+opt-in.
+
+### Pinning, durable operator-evict, and the probe-hold stay engine-enforced
+
+Three exemption layers sit above every admission and eviction policy, and the
+cache engine enforces all three regardless of the active policy.
+
+**Operator pinning overrides eviction.** A pinned hash never appears among
+eviction candidates. The pin set reloads atomically on `SIGHUP`. Pinning does
+not affect segment membership or frequency tracking; an unpinned hash
+re-enters the eviction pool at whatever segment and frequency it already
+carries.
+
+**Durable operator-evict is orthogonal to eviction policy.**
+`CacheEngine::evict` is the DMCA and corruption-recovery path. It records the
+hash in a durable, `fsync`-backed log and makes the engine treat the hash as
+absent for every subsequent lookup, independent of any cache-pressure
+eviction. Disk reclaim for an evicted hash follows on the next GC sweep, when
+periodic GC is enabled and the protecting tag deletion succeeds. Pinning
+protects a hash against eviction-policy pressure but not against
+`CacheEngine::evict`: a durable operator directive always wins.
+
+**The probe-triggered hold composes above policy.** A hash a node has just
+advertised as present, per [ADR 005 § Probe-Triggered Eviction
+Hold](005-protocol.md#probe-triggered-eviction-hold), is exempt from eviction
+for `probe_hold_duration` regardless of segment or frequency. The hold budget
+(`max_probe_holds`) and its exhaustion behavior are unchanged by this ADR.
+
+Reputation does not factor into admission or eviction. The unified
+reputation score governs peer *selection*
+([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh),
+[ADR 008](008-reputation.md#adr-008-reputation-system)), not local cache
+retention.
+
+## Consequences
+
+### Positive
+
+- New admission and eviction policies plug in without touching the cache
+  engine.
+- Policies are pure functions over their context structs, so they are
+  unit-testable without a live store.
+- W-TinyLFU raises hit rate under a fixed disk budget and resists scan-driven
+  eviction of the hot working set.
+- The probationary segment bounds one-hit-wonder disk usage to a fixed
+  budget.
+- Safety invariants — pins, probe-holds, and the deny set — stay
+  engine-enforced across every policy combination.
+- The default configuration preserves prior behavior exactly; adopting the
+  new policies is opt-in.
+
+### Negative
+
+- Range-aware eviction is not achievable until an upstream `iroh-blobs`
+  range-forget primitive exists. Whole-blob reclaim ships in its place.
+- W-TinyLFU state is not durable. Cold-start starvation on a full disk with
+  no warmed signal persists, unchanged from the prior recency-only design.
+- Probationary admission still writes first-hit bytes; it is not a
+  pass-through. Write amplification stays bounded by paid demand.
+
+### Known limitations carried forward
+
+- A `gc_interval_sec` of zero disables periodic GC, so the size ceiling is
+  unenforceable and the boot path only warns.
+- The write path applies no disk-full backpressure. Footprint overshoot is
+  bounded only by the reactive eviction driver and the per-blob
+  `max_blob_size` limit.
+- Segment membership lives in memory only. A restart loses it, so every
+  cached blob returns to an uncapped state until traffic re-observes it and
+  the estimator rebuilds its signal.
+
+## Acceptance Criteria
+
+1. `AdmissionPolicy`, `EvictionPolicy`, and `FrequencyEstimator` are defined
+   in `crates/cache`. The engine holds them as trait objects and contains no
+   inline policy-decision logic.
+2. The `lru` and `always` defaults reproduce prior behavior; the existing
+   eviction-driver test suite passes unchanged under them.
+3. `tinylfu` eviction and probationary admission are available behind
+   `cache.eviction_policy` and `cache.admission_policy`; both default off.
+4. When either selector names `tinylfu`, one shared `FrequencyEstimator`
+   feeds both the admission and the eviction policy.
+5. Probationary footprint is capped by `probation_target_pct`. Promotion
+   happens on a member's `promotion_threshold`-th sighting. The hot working
+   set survives a cold scan.
+6. Shipped policies emit only whole-blob eviction targets. Range reclaim is
+   documented as blocked on an upstream `iroh-blobs` primitive.
+7. Pins, probe-holds, and the deny set are never evicted, regardless of the
+   active policy; the engine enforces this independent of any plan.
+8. An unknown policy name is a config error at load, with no silent
+   fallback.
+9. The workspace builds clean under the anti-panic clippy lints
+   (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing` denied).
