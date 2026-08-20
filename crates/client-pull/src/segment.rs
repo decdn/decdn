@@ -9,22 +9,74 @@
 // these are unreached from any call site.
 #![allow(dead_code)]
 
-use decdn_bao_range::{AlignedRange, align_range};
+use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, align_range};
 
 /// Floor below which an idle source does not split/steal a remaining range —
 /// no fresh stream for a tail smaller than this (spec §8).
 pub(crate) const MIN_SPLIT_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Round `[start, start + len)` out to its enclosing 16 KiB chunk-group
+/// boundaries — start DOWN, end UP, end clamped to `total_bytes` — then merge
+/// any of the resulting spans that now touch or overlap into one disjoint,
+/// group-aligned set, in ascending order.
+///
+/// Bao verification is chunk-group-granular: a partial boundary group can only
+/// be fetched (and independently verified) as a whole group, and a
+/// [`decdn_bao_range::RangedStore`] only ever holds whole verified groups. So
+/// on real inputs — gaps already derived from a group-aligned present/missing
+/// split — every span here is already on a group boundary and this
+/// canonicalization is a no-op. On any unaligned input (e.g. a raw byte range
+/// a caller has not yet aligned) it guarantees the spans handed to the caller
+/// are disjoint and group-aligned: every downstream `align_range` call then
+/// operates on an already-aligned boundary, so its own ceiling-up can never
+/// carry a segment past where the caller intended it to stop and overlap a
+/// neighboring span. The one cost is a bounded over-fetch of at most one group
+/// at each original edge, which is idempotent to re-fetch into the store.
+fn canonicalize_ranges(spans: &[(u64, u64)], total_bytes: u64) -> Vec<(u64, u64)> {
+    let mut canon: Vec<(u64, u64)> = spans
+        .iter()
+        .filter(|&&(_, len)| len > 0)
+        .map(|&(start, len)| {
+            let raw_end = start.saturating_add(len);
+            let canon_start = (start / CHUNK_GROUP_BYTES) * CHUNK_GROUP_BYTES;
+            let canon_end = raw_end
+                .div_ceil(CHUNK_GROUP_BYTES)
+                .saturating_mul(CHUNK_GROUP_BYTES)
+                .min(total_bytes);
+            (canon_start, canon_end)
+        })
+        .filter(|&(s, e)| e > s)
+        .collect();
+    canon.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(canon.len());
+    for (s, e) in canon.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+            continue;
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
 /// Split the gap-set into up to `n` contiguous bao-aligned segments of roughly
 /// equal total size. Never returns an empty segment; may return fewer than `n`
 /// when the gap-set is small or a group-aligned split would otherwise degenerate.
 ///
-/// Each returned segment lies wholly within a single input gap (a segment can
-/// never span data the buyer already holds), so the `n` cap is enforced
-/// per-gap: once the running count reaches `n`, the rest of the CURRENT gap
-/// folds into its final segment. A gap-set fragmented into more than `n`
-/// disjoint gaps therefore yields one segment per remaining gap beyond that —
-/// exact coverage is never sacrificed to honor the cap exactly.
+/// The gap-set is first [canonicalized](canonicalize_ranges) to whole,
+/// disjoint, group-aligned spans, and every returned segment lies wholly
+/// within one canonical span — so segments are pairwise non-overlapping by
+/// construction, never straddling a boundary another segment also claims. A
+/// segment may include up to one chunk group of boundary-adjacent bytes the
+/// buyer already holds (see [`canonicalize_ranges`]); fetching that group
+/// again is redundant but idempotent, never double-counted by the store. The
+/// `n` cap is enforced per-canonical-span: once the running count reaches `n`,
+/// the rest of the CURRENT span folds into its final segment. A gap-set
+/// fragmented into more than `n` disjoint spans therefore yields one segment
+/// per remaining span beyond that — exact coverage is never sacrificed to
+/// honor the cap exactly.
 ///
 /// # Errors
 ///
@@ -35,35 +87,39 @@ pub(crate) fn initial_segments(
     n: usize,
     total_bytes: u64,
 ) -> anyhow::Result<Vec<AlignedRange>> {
-    let total_gap: u64 = gaps.iter().map(|&(_, len)| len).sum();
+    let canon = canonicalize_ranges(gaps, total_bytes);
+    let total_gap: u64 = canon.iter().map(|&(s, e)| e - s).sum();
     if total_gap == 0 || n == 0 {
         return Ok(Vec::new());
     }
     let target = total_gap.div_ceil(n as u64).max(1);
     let mut out: Vec<AlignedRange> = Vec::new();
-    for &(start, len) in gaps {
+    for &(start, end) in &canon {
         let mut off = start;
-        let end = start.saturating_add(len);
         while off < end {
-            // Once the segment cap is reached, fold the rest of THIS gap (and any
-            // later gaps) into the final segment so coverage stays exact — never
-            // silently drop the remainder.
+            // Once the segment cap is reached, fold the rest of THIS span (and
+            // any later spans) into the final segment so coverage stays exact —
+            // never silently drop the remainder.
             let want = if out.len() + 1 >= n {
                 end - off
             } else {
                 target.min(end - off)
             };
             let seg = align_range(off, want, total_bytes)?;
-            // Group-align the end, clamped to this gap's own end (a later gap
-            // starts at its own aligned boundary, so this never re-covers bytes
-            // a prior segment already claimed).
+            // `end` is itself a chunk-group boundary (canonicalize_ranges), so a
+            // group-aligned ceiling from `off` can never land past it — this is
+            // a defensive clamp, not a correctness-load-bearing one.
             let seg_end = seg.fetch_end().min(end);
             if seg_end <= off {
-                // A degenerate zero-width step (would only occur at a gap of
+                // A degenerate zero-width step (would only occur at a span of
                 // width 0, which the outer `while off < end` already excludes).
                 break;
             }
-            let aligned = align_range(off, seg_end - off, total_bytes)?;
+            let aligned = if seg_end == seg.fetch_end() {
+                seg
+            } else {
+                align_range(off, seg_end - off, total_bytes)?
+            };
             out.push(aligned);
             off = seg_end;
         }
@@ -74,6 +130,12 @@ pub(crate) fn initial_segments(
 /// Pick the largest remaining range and, if it is at least [`MIN_SPLIT_SIZE`],
 /// return its aligned second half for a freed source to steal. Returns `None`
 /// when nothing remaining is worth a fresh stream.
+///
+/// The chosen range is first [canonicalized](canonicalize_ranges) to its
+/// enclosing group boundaries, so the returned half never rounds up past the
+/// range's true end into bytes a neighboring segment already owns — the same
+/// hazard [`initial_segments`] guards against, and the same up-to-one-group
+/// boundary-adjacent over-fetch trade-off applies here.
 ///
 /// # Errors
 ///
@@ -88,11 +150,16 @@ pub(crate) fn steal_split(
     if len < MIN_SPLIT_SIZE {
         return Ok(None);
     }
-    let mid_offset = start + len / 2;
-    // Align the candidate second half; if group-alignment collapses it back
-    // onto (or past) the whole range, there is nothing worth splitting off.
-    let second_half = align_range(mid_offset, start + len - mid_offset, total_bytes)?;
-    if second_half.fetch_start() <= start || second_half.fetch_start() >= start + len {
+    let Some(&(canon_start, canon_end)) = canonicalize_ranges(&[(start, len)], total_bytes).first()
+    else {
+        return Ok(None);
+    };
+    let mid_offset = canon_start + (canon_end - canon_start) / 2;
+    // Align the candidate second half against the CANONICAL end, so the
+    // ceiling-up align_range performs internally cannot carry it past the
+    // range's own true end into a neighboring segment's territory.
+    let second_half = align_range(mid_offset, canon_end - mid_offset, total_bytes)?;
+    if second_half.fetch_start() <= canon_start || second_half.fetch_start() >= canon_end {
         return Ok(None);
     }
     Ok(Some(second_half))
@@ -152,6 +219,62 @@ mod tests {
         let total = 100 * 1024 * 1024;
         // Largest remaining is 8 MiB < 16 MiB floor -> don't steal.
         assert!(super::steal_split(&[(0, 8 * 1024 * 1024)], total)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn initial_segments_two_gaps_separated_by_less_than_one_group_never_overlap()
+    -> anyhow::Result<()> {
+        // Two gaps separated by 4 KiB of held data — less than the 16 KiB chunk
+        // group. Canonicalization must merge them into one span before
+        // splitting, so no returned segment can straddle into the other gap's
+        // territory and overlap a segment covering it.
+        let total = 8 * 1024 * 1024;
+        let gap_a = (0, 5 * 1024 * 1024 + 3 * 1024);
+        let gap_b = (5 * 1024 * 1024 + 4 * 1024, 1024 * 1024);
+        let segs = super::initial_segments(&[gap_a, gap_b], 4, total)?;
+        assert!(!segs.is_empty());
+        for s in &segs {
+            assert_eq!(s.fetch_start() % (16 * 1024), 0);
+            assert_eq!(s.fetch_end() % (16 * 1024), 0);
+        }
+        for w in segs.windows(2) {
+            assert!(
+                w[1].fetch_start() >= w[0].fetch_end(),
+                "segments must not overlap: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        // Coverage reaches the (group-aligned) end of the canonicalized set.
+        let last = segs.last().expect("nonempty");
+        let canon_end = (gap_b.0 + gap_b.1).div_ceil(16 * 1024) * (16 * 1024);
+        assert_eq!(last.fetch_end(), canon_end.min(total));
+        Ok(())
+    }
+
+    #[test]
+    fn initial_segments_single_unaligned_gap_last_end_is_group_aligned() -> anyhow::Result<()> {
+        let total = 16 * 1024 * 1024;
+        let gap = (0, 5 * 1024 * 1024 + 3 * 1024);
+        let segs = super::initial_segments(&[gap], 4, total)?;
+        let last = segs.last().expect("nonempty");
+        assert_eq!(last.fetch_end() % (16 * 1024), 0);
+        let enclosing_group_end = (gap.0 + gap.1).div_ceil(16 * 1024) * (16 * 1024);
+        assert!(last.fetch_end() <= enclosing_group_end.min(total));
+        Ok(())
+    }
+
+    #[test]
+    fn steal_split_second_half_never_exceeds_group_aligned_end_of_source_range()
+    -> anyhow::Result<()> {
+        // A range with an unaligned end, embedded inside a larger blob so the
+        // true end of the range (not the blob) is what must bound the steal.
+        let range = (0, 20 * 1024 * 1024 + 3 * 1024);
+        let total = 64 * 1024 * 1024;
+        let stolen = super::steal_split(&[range], total)?.expect("above floor");
+        let enclosing_group_end = (range.0 + range.1).div_ceil(16 * 1024) * (16 * 1024);
+        assert!(stolen.fetch_end() <= enclosing_group_end.min(total));
         Ok(())
     }
 }
