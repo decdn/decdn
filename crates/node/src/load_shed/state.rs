@@ -47,6 +47,7 @@ impl ShedState {
         ShedSlot {
             state: Arc::clone(self),
             client,
+            counter,
         }
     }
 
@@ -54,26 +55,6 @@ impl ShedState {
     #[must_use]
     pub fn tracked_clients(&self) -> usize {
         self.per_client.len()
-    }
-
-    /// Release one slot: decrement both counters and prune a zeroed per-client
-    /// entry so the map stays bounded. Called only by [`ShedSlot::drop`].
-    fn release(&self, client: B256) {
-        let _ = self
-            .node_active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
-        if let Some(counter) = self.per_client.get(&client).map(|c| Arc::clone(c.value())) {
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
-        }
-        // Prune the entry if it dropped to zero. `remove_if` re-checks under the
-        // shard lock, so a concurrent `acquire` that just re-incremented keeps
-        // its entry; the worst case is a stale zero entry pruned next release.
-        self.per_client
-            .remove_if(&client, |_, c| c.load(Ordering::Relaxed) == 0);
     }
 }
 
@@ -84,11 +65,28 @@ impl ShedState {
 pub struct ShedSlot {
     state: Arc<ShedState>,
     client: B256,
+    counter: Arc<AtomicU32>,
 }
 
 impl Drop for ShedSlot {
     fn drop(&mut self) {
-        self.state.release(self.client);
+        let _ = self
+            .state
+            .node_active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        let _ = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        // Best-effort prune: only removes if whatever is currently mapped for
+        // this key is zero; a concurrently-recreated live entry is left intact
+        // (remove_if re-checks under the shard lock).
+        self.state
+            .per_client
+            .remove_if(&self.client, |_, c| c.load(Ordering::Relaxed) == 0);
     }
 }
 
@@ -129,5 +127,28 @@ mod tests {
             0,
             "per-client map must not leak zeroed entries"
         );
+    }
+
+    #[test]
+    fn reacquire_after_prune_counts_the_new_slot_only() {
+        let state = ShedState::new();
+        let a = state.acquire(client(7));
+        assert_eq!(state.counts(client(7)), (1, 1));
+        assert_eq!(state.tracked_clients(), 1);
+        drop(a);
+        assert_eq!(state.counts(client(7)), (0, 0));
+        assert_eq!(
+            state.tracked_clients(),
+            0,
+            "entry must be pruned after drop"
+        );
+
+        // Reacquire for the same client: gets a fresh entry, counts only the new slot.
+        let b = state.acquire(client(7));
+        assert_eq!(state.counts(client(7)), (1, 1));
+        assert_eq!(state.tracked_clients(), 1);
+        drop(b);
+        assert_eq!(state.counts(client(7)), (0, 0));
+        assert_eq!(state.tracked_clients(), 0);
     }
 }
