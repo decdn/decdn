@@ -113,6 +113,12 @@ pub struct AdminState {
     /// [`BindingReport::unknown`] — the honest answer for a state that was
     /// never sampled, and the one the unit tests here construct.
     binding: BindingReport,
+    /// Live on-chain active-staker set, attached via
+    /// [`AdminState::with_staker_set`] (#1030). `None` (unit tests, and any
+    /// build with no chain wiring) reports `registry_active: false`: an unwired
+    /// `AdminState` cannot confirm registration, and the optimistic answer would
+    /// tell an operator their node is registered when nothing checked.
+    staker_set: Option<Arc<dyn crate::dht::staker_set::StakerSet>>,
 }
 
 /// Read-only lane handles the `admin_v1_lanes` handler snapshots (issue
@@ -319,7 +325,25 @@ impl AdminState {
             lanes: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
+            staker_set: None,
         }
+    }
+
+    /// Whether this node is in the on-chain active-staker set right now
+    /// (#1030), read from the same shared projection that feeds DHT admission
+    /// so the two can never disagree.
+    ///
+    /// Diagnostic only — nothing in the serve path consults it. See
+    /// [`decdn_common::admin::HealthResponse::registry_active`] for why the
+    /// daemon does not gate delivery on its own registration.
+    ///
+    /// `false` when no set is attached: an unwired `AdminState` cannot confirm
+    /// registration, and the optimistic answer would claim something nothing
+    /// checked.
+    fn registry_active(&self) -> bool {
+        self.staker_set.as_ref().is_some_and(|set| {
+            set.is_active(&crate::dht::routing::NodeId::from_bytes(self.node_id))
+        })
     }
 
     /// Attach the bring-up node-id binding check so `admin_v1_health` can
@@ -330,6 +354,20 @@ impl AdminState {
     #[must_use]
     pub const fn with_binding(mut self, binding: BindingReport) -> Self {
         self.binding = binding;
+        self
+    }
+
+    /// Attach the live active-staker set so `admin_v1_health` can report
+    /// whether this node is registered on-chain (#1030). The production runtime
+    /// calls this once after `new` with the SAME `Arc` DHT admission holds. Not
+    /// `const`: unlike [`Self::with_binding`]'s `Copy` report, assigning over an
+    /// `Option<Arc<_>>` runs a destructor.
+    #[must_use]
+    pub fn with_staker_set(
+        mut self,
+        staker_set: Arc<dyn crate::dht::staker_set::StakerSet>,
+    ) -> Self {
+        self.staker_set = Some(staker_set);
         self
     }
 
@@ -428,6 +466,7 @@ impl AdminRpcServer for AdminRpcImpl {
                 .binding
                 .bound_node_id
                 .map(alloy::primitives::hex::encode),
+            registry_active: self.state.registry_active(),
         })
     }
 

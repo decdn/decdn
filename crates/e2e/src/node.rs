@@ -223,7 +223,39 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
-        Self::launch_configured(chain, region, serve_blobs, false, &[]).await
+        Self::launch_configured(chain, region, serve_blobs, false, &[], true).await
+    }
+
+    /// Provision and launch a node that is **not** onboarded on-chain: no bond,
+    /// no `registerNode`, no binding. Everything else matches
+    /// [`Self::launch_with_blobs`] — data dir, keystore, iroh key, seeded fs
+    /// origin, rendered config, a live daemon whose admin RPC is healthy.
+    ///
+    /// This is the "bare" end of G-NODE-01 (#1030), and the only fixture that
+    /// can reach it: every other entry point onboards before the daemon spawns,
+    /// so no journey could observe a node in the state an operator's first
+    /// `decdn-node run` actually produces.
+    ///
+    /// The daemon comes up healthy on purpose. Registration is not a startup
+    /// gate — a daemon that refused to boot unregistered could not be used to
+    /// run the very `decdn setup` that fixes it — so what a caller should expect
+    /// here is a *serving* gate: `admin_v1_health` reports
+    /// `registry_active: false` and every paid fetch is refused (ADR 019
+    /// §Phase 4, criterion 1).
+    ///
+    /// The operator is funded with gas but **not** TOKEN, so a subsequent
+    /// `decdn setup` exercises its real funding pre-flight.
+    pub async fn launch_bare(
+        chain: &ChainFixture,
+        region: &str,
+        serve_blob: &[u8],
+    ) -> anyhow::Result<(Self, Hash)> {
+        let (node, mut hashes) =
+            Self::launch_configured(chain, region, &[serve_blob], false, &[], false).await?;
+        let hash = hashes
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("launch_bare returned no hash"))?;
+        Ok((node, hash))
     }
 
     /// Launch an empty bonded cache node whose misses use paid node-to-node
@@ -234,7 +266,7 @@ impl NodeFixture {
         discovery_peers: &[&NodeFixture],
     ) -> anyhow::Result<Self> {
         let (node, hashes) =
-            Self::launch_configured(chain, region, &[], true, discovery_peers).await?;
+            Self::launch_configured(chain, region, &[], true, discovery_peers, true).await?;
         anyhow::ensure!(
             hashes.is_empty(),
             "empty cache launch returned seeded hashes"
@@ -333,6 +365,7 @@ impl NodeFixture {
         serve_blobs: &[&[u8]],
         node_to_node_pull_through: bool,
         discovery_peers: &[&NodeFixture],
+        onboard: bool,
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
         let data_dir = tempfile::tempdir().context("create node data dir")?;
         // `identity::ensure_data_dir` (and the keystore/identity writers) require
@@ -378,10 +411,7 @@ impl NodeFixture {
         let [bind_port, admin_port, metrics_port] = crate::free_ports::<3>()?;
         let multiaddr = format!("/ip4/127.0.0.1/udp/{bind_port}/quic-v1");
 
-        chain
-            .onboard_operator(&operator, &node_secret, region, &multiaddr)
-            .await
-            .context("onboard operator on-chain")?;
+        provision_on_chain(chain, &operator, &node_secret, region, &multiaddr, onboard).await?;
 
         let cache_dir = data_dir.path().join("cache");
         // Bind to a local so the `&str` field borrows a value that clearly
@@ -830,6 +860,38 @@ fn spawn_daemon(config_path: &std::path::Path, home: &std::path::Path) -> anyhow
         .arg("run")
         .spawn()
         .context("spawn decdn-node")
+}
+
+/// Put the operator in the on-chain state a launch asks for: fully onboarded, or
+/// bare with gas only.
+///
+/// A free function rather than inline in `launch_configured` so that method
+/// stays inside the workspace's 100-line clippy ceiling.
+///
+/// The bare arm funds gas and NOTHING else, deliberately. The operator must be
+/// able to SEND the onboarding transactions, but must not already hold the TOKEN
+/// for them — a journey that drives `decdn setup` funds that itself, so the
+/// command's funding pre-flight has a real step to clear rather than a
+/// pre-satisfied one (#1030).
+async fn provision_on_chain(
+    chain: &ChainFixture,
+    operator: &PrivateKeySigner,
+    node_secret: &iroh::SecretKey,
+    region: &str,
+    multiaddr: &str,
+    onboard: bool,
+) -> anyhow::Result<()> {
+    if onboard {
+        chain
+            .onboard_operator(operator, node_secret, region, multiaddr)
+            .await
+            .context("onboard operator on-chain")
+    } else {
+        chain
+            .fund_eth(operator.address(), 100)
+            .await
+            .context("fund a bare operator's gas")
+    }
 }
 
 #[cfg(test)]

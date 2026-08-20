@@ -2053,7 +2053,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // `build_chain_and_handlers`. Surfacing it here too is what lets an
         // operator (or the G-NODE-07 journey) detect the unslashable state
         // without scraping the daemon's log for a WARN line.
-        .with_binding(ch.binding_report);
+        .with_binding(ch.binding_report)
+        // Live ADR 019 §Phase 4 registry state (#1030). The same `Arc` the serve
+        // gate reads, so `decdn node health` cannot report a node as servable
+        // while `serve_stream` is refusing it — and an operator who has just run
+        // `decdn setup` sees `registry_active` flip without a restart.
+        .with_staker_set(Arc::clone(&ch.staker_set));
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
