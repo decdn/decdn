@@ -331,6 +331,10 @@ struct Infra {
     node_origin: Option<crate::node_origin::NodeOrigin>,
     pull_through_origin: Option<Arc<crate::node_origin::NodeOrigin>>,
     cache: CacheEngine,
+    /// Cache eviction policy selected by `cache.eviction_policy` (ADR 040).
+    /// Injected into the eviction driver at spawn time
+    /// ([`spawn_background_tasks`]); the engine itself never chooses a policy.
+    eviction_policy: Arc<dyn decdn_cache::EvictionPolicy>,
     ep: Endpoint,
     limiter: Arc<ConnectionLimiter>,
 }
@@ -531,6 +535,63 @@ async fn build_infra(
     // `build_cache` succeeds so a SIGHUP delivered during the rest of
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
+
+    // Admission/eviction policy selection (ADR 040). One shared frequency
+    // estimator feeds both the engine's hit-signal sink and whichever policy
+    // objects need it; the engine itself owns no policy knowledge beyond the
+    // estimator handle.
+    let want_tinylfu =
+        cfg.cache.eviction_policy == "tinylfu" || cfg.cache.admission_policy == "tinylfu";
+    let estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>> = want_tinylfu.then(|| {
+        Arc::new(decdn_cache::policy::tinylfu::TinyLfuEstimator::new(
+            cfg.cache.tinylfu.sketch_bytes,
+        )) as Arc<dyn decdn_cache::FrequencyEstimator>
+    });
+    if let Some(est) = &estimator {
+        cache.set_frequency_estimator(est.clone());
+    }
+    if cfg.cache.admission_policy == "tinylfu"
+        && let Some(est) = &estimator
+    {
+        cache.set_admission_policy(Arc::new(decdn_cache::policy::tinylfu::ProbationAdmission {
+            freq: est.clone(),
+            promotion_threshold: cfg.cache.tinylfu.promotion_threshold,
+        }));
+    }
+    // promotion_threshold + probation_target_pct live entirely on the policy
+    // object, not on the engine or the eviction driver's `EvictionParams`.
+    let eviction_policy: Arc<dyn decdn_cache::EvictionPolicy> =
+        match cfg.cache.eviction_policy.as_str() {
+            "tinylfu" => match &estimator {
+                Some(est) => Arc::new(decdn_cache::policy::tinylfu::TinyLfuEviction::new(
+                    est.clone(),
+                    cfg.cache.tinylfu.promotion_threshold,
+                    cfg.cache.tinylfu.probation_target_pct,
+                )),
+                // Unreachable: `want_tinylfu` is true whenever eviction_policy
+                // == "tinylfu", so `estimator` is always `Some` here.
+                None => Arc::new(decdn_cache::policy::LruEviction),
+            },
+            _ => Arc::new(decdn_cache::policy::LruEviction),
+        };
+
+    // `tinylfu` admission only does useful work paired with `tinylfu` eviction:
+    // promotion out of probation and the probation cap both live in
+    // `TinyLfuEviction::plan`. With `lru` eviction the probation labels are set
+    // but never promoted or capped, and the estimator pays a per-serve cost for
+    // no effect. Warn rather than silently no-op (the resolver already rejects
+    // typos; this valid-but-inert combination deserves a heads-up).
+    if cfg.cache.admission_policy == "tinylfu" && cfg.cache.eviction_policy != "tinylfu" {
+        tracing::warn!(
+            admission_policy = %cfg.cache.admission_policy,
+            eviction_policy = %cfg.cache.eviction_policy,
+            "cache.admission_policy = \"tinylfu\" is inert unless cache.eviction_policy is \
+             also \"tinylfu\": probation admission relies on the tinylfu eviction policy to \
+             promote and cap probation members; under lru eviction the labels do nothing and \
+             the frequency estimator runs for no effect",
+        );
+    }
+
     let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),
@@ -587,6 +648,7 @@ async fn build_infra(
         node_origin,
         pull_through_origin,
         cache,
+        eviction_policy,
         ep,
         limiter,
     })
@@ -1160,11 +1222,11 @@ async fn build_chain_and_handlers(
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
-    // (the staker-set provider above is read-only) signs the `withdraw` /
-    // `closeChannel` transactions with the same eth keystore signer. The
-    // bootstrap self-checks the contract via `usdc()`; the watcher persists
-    // channels opened against this node so the handler accepts their vouchers,
-    // and forgets settled ones. Redemption is purely periodic: a self-tick
+    // (the staker-set provider above is read-only) signs the `redeemMany`
+    // transactions with the same eth keystore signer. The bootstrap
+    // self-checks the contract via `usdc()`; the watcher folds `PaymentPool`
+    // events so the serve path reads pool solvency in-memory, and forgets a
+    // reclaimed pool's lanes. Redemption is purely periodic: a self-tick
     // flushes the lane store then sweeps every above-threshold lane.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it
@@ -1472,7 +1534,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         )
     };
 
-    // LRU cache-eviction driver (#1173, appendix-blob-cache-eviction.md). Async
+    // Cache-eviction driver (#1173, ADR 040). Async
     // (the sweep does `total_bytes()`/`release_for_eviction().await`), so it
     // cannot ride `spawn_periodic`'s sync `FnMut`; it spawns directly into the
     // JoinSet with its own oneshot stop, mirroring the metrics server. Enforces
@@ -1503,6 +1565,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             infra.cache.clone(),
             infra.node_metrics.cache_metrics(),
             params,
+            infra.eviction_policy.clone(),
             eviction_stop_rx,
         ));
         eviction_stop_tx
@@ -3549,6 +3612,15 @@ mod tests {
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
                     decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+                eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
+                admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
+                tinylfu: decdn_common::config::ResolvedTinyLfu {
+                    sketch_bytes: decdn_common::config::DEFAULT_TINYLFU_SKETCH_BYTES,
+                    promotion_threshold: decdn_common::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD,
+                    probation_target_pct:
+                        decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
+                    aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+                },
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,

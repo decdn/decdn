@@ -75,12 +75,12 @@ BOOK_SRCS := \
   _build/part-6-governance.md \
   009-governance.md 036-served-bytes-voting-weight.md 016-contract-interactions.md \
   _build/part-7-operations.md \
-  019-node-onboarding.md \
+  019-node-onboarding.md 040-cache-policy.md \
   _build/part-8-supporting.md \
   013-schema-evolution.md 017-privacy.md \
   _build/part-9-appendices.md \
   appendix-bundles.md appendix-observability.md \
-  appendix-blob-cache-eviction.md appendix-l2-deployment.md \
+  appendix-l2-deployment.md \
   appendix-poc-production-seams.md appendix-binaries.md \
   appendix-local-admin-http.md appendix-operator-key-rotation.md \
   appendix-operator-upgrade-path.md appendix-fraud-detection.md \

@@ -424,6 +424,14 @@ impl ClientHandler {
         }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
+        // ADR 040: emit the ONE hit sighting for this served request, only after the
+        // terminal StreamEnd frame is written — so a serve that fails to finish cleanly
+        // is never counted. This is necessarily after the concurrent pull leg filled the
+        // whole range and ran its fill-time admission read, so the serve's `observe`
+        // follows the admission estimate read, preserving the ordering invariant even
+        // though the two legs run concurrently. One sighting per served blob, regardless
+        // of range or interval count.
+        self.cache.observe_hit(hash);
         Ok(())
     }
 }

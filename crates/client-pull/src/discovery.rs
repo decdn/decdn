@@ -746,12 +746,12 @@ pub struct WarmingCandidate {
 ///
 /// `candidates` must already exclude the holders — the caller does this.
 ///
-/// The full ordered list is returned so a caller *can* fall back from a proxy
-/// that declines to the next candidate and finally to the direct holder, per
-/// ADR 037 § Fallback. **The current caller uses only the first entry** — a real
-/// fallback needs a second payment channel against the fallback provider, which
-/// is deliberate follow-up work. Proxy warming is opt-in (default off) until it
-/// lands, so a declining proxy cannot regress a default fetch.
+/// The full ordered list is returned so the caller falls back from a proxy that
+/// declines to the next candidate and finally to the direct holder, per ADR 037
+/// § Fallback. The CLI `fetch` loop iterates this whole list: each provider is
+/// its own lane on the same shared payment pool, so a fallback escrows no new
+/// on-chain deposit and resumes the partial it already has. Proxy warming is
+/// therefore default-on, and a declining proxy never regresses a fetch.
 #[must_use]
 pub fn proxy_warming_order(
     best_holder_rtt_ms: f64,

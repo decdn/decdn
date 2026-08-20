@@ -1,5 +1,6 @@
 //! Probe-triggered eviction-hold constants (ADR 005 §Probe-triggered
-//! eviction hold, §Hold budget; appendix-blob-cache-eviction.md §4).
+//! eviction hold, §Hold budget; ADR 040 §Pinning, durable operator-evict, and
+//! the probe-hold stay engine-enforced).
 //!
 //! When a node signs `has_blob: true` in a `ProbeResponse` it tries to keep the
 //! blob eviction-exempt for [`PROBE_HOLD_DURATION`] so it is still resident when

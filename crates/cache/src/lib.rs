@@ -21,6 +21,7 @@ pub mod fill_session;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
+pub mod policy;
 pub mod probe_hold;
 pub mod range_pull;
 pub mod ranged_store;
@@ -58,6 +59,10 @@ pub use metrics::CacheMetrics;
 pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
     OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
+};
+pub use policy::{
+    AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,
+    EvictionPlan, EvictionPolicy, FrequencyEstimator, LruEviction, Segment,
 };
 pub use probe_hold::{
     PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW, ProbeHoldOutcome,

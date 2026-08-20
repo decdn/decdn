@@ -384,6 +384,14 @@ fn build_config(
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,
+            eviction_policy: decdn_common::config::DEFAULT_EVICTION_POLICY.to_string(),
+            admission_policy: decdn_common::config::DEFAULT_ADMISSION_POLICY.to_string(),
+            tinylfu: decdn_common::config::ResolvedTinyLfu {
+                sketch_bytes: decdn_common::config::DEFAULT_TINYLFU_SKETCH_BYTES,
+                promotion_threshold: decdn_common::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD,
+                probation_target_pct: decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
+                aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+            },
         },
         payment: ResolvedPayment {
             rate_per_mb: 10,

@@ -3938,6 +3938,7 @@ impl decdn_node::pool_view::PoolView for FixedRemainingPoolView {
         Some(decdn_node::pool_view::PoolStatus {
             owner: self.owner,
             remaining: self.remaining,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
         })
     }
 }
@@ -4013,6 +4014,7 @@ impl decdn_node::pool_view::PoolView for DrainingPoolView {
         Some(decdn_node::pool_view::PoolStatus {
             owner: self.owner,
             remaining,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
         })
     }
 }

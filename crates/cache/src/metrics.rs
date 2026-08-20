@@ -208,7 +208,7 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_circuit_breaker_short_circuits_total`.
     pub circuit_breaker_short_circuits: Counter,
-    // ---- Cache-health / eviction observability (#1173, appendix-blob-cache-eviction.md § Observability) ----
+    // ---- Cache-health / eviction observability (#1173, ADR 040) ----
     /// Current on-disk cache footprint in bytes (`decdn_cache_bytes`).
     /// Set by the eviction driver each sweep from
     /// [`crate::CacheEngine::total_bytes`]. Pairs with `size_limit_bytes`

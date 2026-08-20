@@ -103,9 +103,10 @@ The governance model that sets the parameters earlier chapters consume, and the 
 
 ### Chapter 7 — Operations
 
-The operator-facing onboarding flow that takes a bare server through staking, registration, and accepting paid delivery.
+The operator-facing onboarding flow that takes a bare server through staking, registration, and accepting paid delivery, and the node-local cache policy that governs what an onboarded node keeps on disk.
 
 1. [ADR 019 — Node Onboarding and Bootstrapping Flow](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
+2. [ADR 040 — Pluggable Cache Admission and Eviction Policies](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)
 
 ### Chapter 8 — Supporting infrastructure
 
@@ -122,14 +123,13 @@ Appendices document patterns, reference implementations, and operational guidanc
 
 1. [Directory Bundles (`decdn bundle`)](appendix-bundles.md#appendix-directory-bundles-decdn-bundle) — publisher-side convenience for grouping content-addressed blobs into a single JSON manifest; nodes deliver individual hashes and do not require bundle support
 2. [Observability and Metrics](appendix-observability.md#appendix-observability-and-metrics) — recommended metric naming, registry, and slash-risk alert thresholds
-3. [Blob Cache Eviction Policy](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy) — LRU keyed on last successful `CacheEngine::get` timestamp; operator pinning overrides LRU; operator evict is durable and orthogonal; probe-hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) composes above LRU; reputation does not factor into eviction
-4. [Production L2 Deployment Target](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — Arbitrum One selection (deployment decision; protocol depends on Arbitrum-class properties calibrated in core ADRs)
-5. [PoC/Production Seam Architecture (Rust)](appendix-poc-production-seams.md#appendix-pocproduction-seam-architecture-rust-implementation) — leaf-crate principle, wiring-layer mode selection, contract surface is not a PoC/production seam
-6. [deCDN Binaries — `decdn-node` + `decdn` Split](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split) — rationale for the dockerd-style split into the long-lived cache-node daemon (`decdn-node`) and the one-shot operator/publisher CLI (`decdn`)
-7. [Local Admin HTTP Surface](appendix-local-admin-http.md#appendix-local-admin-http-surface) — loopback-bound admin API for operator runbook automation
-8. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
-9. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) — tier-independent safe-restart drain procedure plus Tier 1/2 operator checklists for compatible in-version releases; Tier 3 migrations are defined with the concrete breaking change
-10. [Permissionless Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis) — optional, anyone-can-run off-chain analysis of public redemption/settlement flows for self-routing and wash-trading patterns, feeding governance parameter-tuning
+3. [Production L2 Deployment Target](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — Arbitrum One selection (deployment decision; protocol depends on Arbitrum-class properties calibrated in core ADRs)
+4. [PoC/Production Seam Architecture (Rust)](appendix-poc-production-seams.md#appendix-pocproduction-seam-architecture-rust-implementation) — leaf-crate principle, wiring-layer mode selection, contract surface is not a PoC/production seam
+5. [deCDN Binaries — `decdn-node` + `decdn` Split](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split) — rationale for the dockerd-style split into the long-lived cache-node daemon (`decdn-node`) and the one-shot operator/publisher CLI (`decdn`)
+6. [Local Admin HTTP Surface](appendix-local-admin-http.md#appendix-local-admin-http-surface) — loopback-bound admin API for operator runbook automation
+7. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
+8. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) — tier-independent safe-restart drain procedure plus Tier 1/2 operator checklists for compatible in-version releases; Tier 3 migrations are defined with the concrete breaking change
+9. [Permissionless Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis) — optional, anyone-can-run off-chain analysis of public redemption/settlement flows for self-routing and wash-trading patterns, feeding governance parameter-tuning
 
 ## Architectural Decisions
 
@@ -184,7 +184,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 |---|---|---|
 | Voucher withholding | Self-enforcing per-lane credit window; loss capped at the ramped window, floored at one 1 MiB chunk | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
 | Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
-| Owner reclaims before a node redeems | Grace window + in-process redemption monitor (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
+| Owner reclaims before a node redeems | Grace window + periodic redeem sweep capped well inside it (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
 | Probe fishing / resource exhaustion | Layered per-peer + per-IP + global token bucket (node policy) | [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) |
 
 **Malicious serving node** — wants payment without honest service, or to cheat pricing, region, or takedown.
@@ -234,7 +234,7 @@ Attacks the protocol does **not** defend against — where it relies on an outsi
 
 The system relies on several infrastructure-level assumptions beyond the cryptographic guarantees verified on-chain or in-protocol. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents the client-specific trust boundary (verified / trusted / not trusted); this section covers system-wide assumptions that span multiple components.
 
-- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `PoolCloseInitiated` events from a node's in-process redemption monitor, so the node misses the grace window and forfeits outstanding vouchers, or return a fabricated node list to eclipse a client. Mitigation: multi-source bootstrap ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) Option B) and multiple independent RPC providers.
+- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could censor a node's redemption transactions so it misses the grace window and forfeits outstanding vouchers (the same force-inclusion path covers this — see [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)), or return a fabricated node list to eclipse a client. Mitigation: multi-source bootstrap ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) Option B) and multiple independent RPC providers.
 
 - **Encrypted transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers only traverse encrypted authenticated channels between the relevant parties: client↔node and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
 

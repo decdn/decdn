@@ -432,6 +432,13 @@ impl ClientHandler {
         }
         self.write_message(send, &ClientMessage::StreamEnd).await?;
         let _ = send.finish();
+        // ADR 040: emit the ONE hit sighting for this served request, only after the
+        // terminal StreamEnd frame is written — so a serve that fails to finish cleanly
+        // is never counted. Fires exactly once per served blob (a multi-range or
+        // multi-interval serve is still one sighting) and after any fill-time admission
+        // read on the miss paths that reach `deliver`. This is what makes a hot RESIDENT
+        // blob — served here on every hit — accumulate frequency and become promotable.
+        self.cache.observe_hit(hash);
         Ok(())
     }
 }

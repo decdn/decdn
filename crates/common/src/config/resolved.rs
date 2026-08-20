@@ -319,6 +319,36 @@ pub struct ResolvedCache {
     /// never on a large blob or a slow link (#1134). Default
     /// [`crate::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC`].
     pub node_pull_stall_timeout_sec: u64,
+    /// Cache eviction policy selector (ADR 040). `"lru"` or `"tinylfu"`.
+    /// Default [`crate::config::DEFAULT_EVICTION_POLICY`].
+    pub eviction_policy: String,
+    /// Cache admission policy selector (ADR 040). `"always"` or `"tinylfu"`.
+    /// Default [`crate::config::DEFAULT_ADMISSION_POLICY`].
+    pub admission_policy: String,
+    /// W-TinyLFU tuning knobs (ADR 040), resolved regardless of whether either
+    /// policy selector above is `"tinylfu"` — cheap to resolve and keeps this
+    /// struct free of `Option`.
+    pub tinylfu: ResolvedTinyLfu,
+}
+
+/// Resolved W-TinyLFU tuning knobs. See [`ResolvedCache::tinylfu`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedTinyLfu {
+    /// Count-min sketch size in bytes. Default
+    /// [`crate::config::DEFAULT_TINYLFU_SKETCH_BYTES`].
+    pub sketch_bytes: usize,
+    /// Prior sightings before a probation member promotes to main. Default
+    /// [`crate::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD`].
+    pub promotion_threshold: u32,
+    /// Percent of `cache.cache_size_mb` the probation segment is capped to.
+    /// Validated to `[1, 50]`. Default
+    /// [`crate::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT`].
+    pub probation_target_pct: u64,
+    /// Reserved: half-life in seconds for aging the frequency sketch. Resolved
+    /// and stored but not currently consulted by the shipped sketch (fixed
+    /// sample-count reset, not wall-clock aging). Default
+    /// [`crate::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC`].
+    pub aging_halflife_sec: u64,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors
