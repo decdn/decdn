@@ -25,6 +25,7 @@ pub mod dispatch;
 pub mod fee_shares;
 pub mod fee_shares_watcher;
 pub mod handlers;
+pub mod load_shed;
 pub mod metrics;
 pub(crate) mod net;
 pub mod node_origin;

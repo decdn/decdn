@@ -185,7 +185,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 |---|---|---|
 | Voucher withholding | Self-enforcing per-lane credit window; loss capped at the ramped window, floored at one 1 MiB chunk | [ADR 003 § Voucher withholding](003-payments.md#voucher-withholding) |
 | Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
-| Owner reclaims before a node redeems | Grace window + in-process redemption monitor (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
+| Owner reclaims before a node redeems | Grace window + periodic redeem sweep capped well inside it (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
 | Probe fishing / resource exhaustion | Layered per-peer + per-IP + global token bucket (node policy) | [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) |
 
 **Malicious serving node** — wants payment without honest service, or to cheat pricing, region, or takedown.
@@ -235,7 +235,7 @@ Attacks the protocol does **not** defend against — where it relies on an outsi
 
 The system relies on several infrastructure-level assumptions beyond the cryptographic guarantees verified on-chain or in-protocol. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents the client-specific trust boundary (verified / trusted / not trusted); this section covers system-wide assumptions that span multiple components.
 
-- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could hide `PoolCloseInitiated` events from a node's in-process redemption monitor, so the node misses the grace window and forfeits outstanding vouchers, or return a fabricated node list to eclipse a client. Mitigation: multi-source bootstrap ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) Option B) and multiple independent RPC providers.
+- **L2 RPC provider honesty.** Nodes and clients trust their RPC provider to return correct event logs for registry queries, blacklist polling, and rate-bounds lookups. A malicious RPC provider could censor a node's redemption transactions so it misses the grace window and forfeits outstanding vouchers (the same force-inclusion path covers this — see [ADR 003 § L2 sequencer censorship](003-payments.md#l2-sequencer-censorship)), or return a fabricated node list to eclipse a client. Mitigation: multi-source bootstrap ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) Option B) and multiple independent RPC providers.
 
 - **Encrypted transport integrity for voucher confidentiality.** Vouchers are bearer instruments — a leaked voucher is valid regardless of how it was obtained. The system assumes vouchers only traverse encrypted authenticated channels between the relevant parties: client↔node and node↔node cache-miss pulls. Mitigation: QUIC/TLS provides in-transit encryption on all these links; vouchers are never logged or persisted in plaintext. Endpoint compromise or debug output leaking vouchers remains an operational risk.
 

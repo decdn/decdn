@@ -28,6 +28,9 @@ pub struct FileConfig {
     pub observability: Option<ObservabilityConfig>,
     /// Connection rate-limiting settings.
     pub security: Option<SecurityConfig>,
+    /// Node-local load-shedding thresholds (overload protection). Absent
+    /// => the resolved defaults.
+    pub load_shed: Option<LoadShedConfig>,
     /// `cdn/dht/v1` Kademlia DHT settings (ADR 022). Absent => defaults
     /// from the ADR 022 §DHT Rate Limiting table.
     pub dht: Option<DhtConfig>,
@@ -441,15 +444,22 @@ pub struct CacheConfig {
     /// it). Shorter intervals pick up new files faster at the cost of more
     /// directory-walk + `size()` I/O per minute.
     pub fs_rescan_interval_sec: Option<u64>,
-    /// TTL, in seconds, for a memoised live-origin probe answer (#1130 pt3).
-    /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A probe for
-    /// a hash absent from the `fs`-enumeration ∪ pins index falls back to a live
-    /// `HEAD`/`HeadObject` against the http/s3 origin; the answer — present-with-
-    /// size OR absent — is cached for this long so a non-pinned bucket object is
-    /// discoverable without a per-probe origin round-trip. Caching the negative
-    /// is what blunts a random-hash probe flood. Shorter TTLs track origin
-    /// deletions faster at the cost of more `HEAD` traffic.
+    /// TTL, in seconds, for a memoised positive live-origin probe answer (#1130
+    /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A
+    /// probe for a hash absent from the `fs`-enumeration ∪ pins index falls back
+    /// to a live `HEAD`/`HeadObject` against the http/s3 origin; a present-with-
+    /// size answer is cached for this long so a non-pinned bucket object is
+    /// discoverable without a per-probe origin round-trip on every probe.
+    /// Shorter TTLs track origin deletions faster at the cost of more `HEAD`
+    /// traffic. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
     pub origin_probe_ttl_sec: Option<u64>,
+    /// TTL, in seconds, for a memoised negative (absent) live-origin probe
+    /// answer (#1130 pt3). Absent =>
+    /// [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`] (2). Caching the
+    /// negative answer is what blunts a random-hash probe flood; keeping this
+    /// TTL short bounds how long a stale `Absent` can hide newly-available own
+    /// content from a probe.
+    pub origin_probe_negative_ttl_sec: Option<u64>,
     /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
     /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
     /// (2000). A slow origin must never stall the probe hot path; on timeout the
@@ -528,6 +538,12 @@ pub struct CacheConfig {
     /// behind a valid, pool-bound client so an unpaid request cannot drive
     /// egress.
     pub node_to_node_pull_through_enabled: Option<bool>,
+    /// When `false`, the node serves and seeds only content its own backend
+    /// holds; a foreign hash is declined like a miss. Absent resolves to a
+    /// role-derived default: `false` (origin-only) when an origin backend is
+    /// configured, `true` (relay) when none is. Set this explicitly to
+    /// override either default. Node-local; `cache.*` is restart-required.
+    pub relay_foreign_namespaces: Option<bool>,
     /// Number of discovered providers to probe before ranking on a
     /// node-to-node pull (#831). Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`] (5). Higher widens
@@ -932,6 +948,24 @@ pub struct SecurityConfig {
     /// baseline. Default: 4096. `0` makes the map unbounded — see the
     /// type-level docs for the operator-opt-in warning.
     pub max_tracked_sources: Option<usize>,
+}
+
+/// `[load_shed]` section — node-local load-shedding thresholds (overload
+/// protection). All fields optional; unset falls back to the resolved
+/// defaults.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadShedConfig {
+    /// `resource-pressure` (default) or `always-admit`.
+    pub policy: Option<String>,
+    /// Serving egress budget in Mbps; `0` disables the egress ceiling.
+    pub egress_budget_mbps: Option<u64>,
+    /// Concurrency high-water mark (start shedding misses at/above).
+    pub max_concurrent_serves_high: Option<u32>,
+    /// Concurrency low-water mark (resume at/below).
+    pub max_concurrent_serves_low: Option<u32>,
+    /// Per-client concurrent-serve cap, enforced only under pressure; `0` off.
+    pub per_client_serve_cap: Option<u32>,
 }
 
 /// `[dht]` section — `cdn/dht/v1` settings (ADR 022).

@@ -270,6 +270,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     } else {
         writeln!(w, "  node_to_node_pull:        disabled")?;
     }
+    if resolved.cache.relay_foreign_namespaces {
+        writeln!(w, "  relay_foreign_namespaces: true")?;
+    } else {
+        writeln!(w, "  relay_foreign_namespaces: false (origin-only node)")?;
+    }
     writeln!(
         w,
         "  rate_per_mb:              {}",
@@ -636,8 +641,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # [cache]
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518). NOTE: the eviction driver only drops GC protection, so with 0 it can never reclaim disk and cache_size_mb is unenforceable (#1173)
 # fs_rescan_interval_sec = 60              # re-walk the fs origin + re-check pins into the origin-held index, so a file dropped into the origin becomes probe-answerable and DHT-announced within one interval (#1130); 0 disables the timer (startup and `decdn node reload` still rescan)
-# origin_probe_ttl_sec = 15                # TTL for a memoised live-origin probe answer — a hash absent from the fs/pins index falls back to a HEAD/HeadObject against the http/s3 origin, cached this long (#1130 pt3)
-# origin_probe_timeout_ms = 2000           # per-probe ceiling on the live-origin HEAD/HeadObject; on timeout the probe answers has_blob:false and the miss is memoised absent for one TTL (#1130 pt3)
+# origin_probe_ttl_sec = 15                # TTL for a memoised positive live-origin probe answer — a hash absent from the fs/pins index falls back to a HEAD/HeadObject against the http/s3 origin, a present answer cached this long (#1130 pt3)
+# origin_probe_negative_ttl_sec = 2        # TTL for a memoised negative (absent) live-origin probe answer; short on purpose so a stale absent cannot hide newly-available own content for long (#1130 pt3)
+# origin_probe_timeout_ms = 2000           # per-probe ceiling on the live-origin HEAD/HeadObject; on timeout the probe answers has_blob:false and the miss is memoised absent for one negative TTL (#1130 pt3)
 # origin_probe_memo_capacity = 4096        # max distinct hashes held in the live-origin probe memo; bounds memo memory under a random-hash probe flood (#1130 pt3)
 # eviction_high_water_pct = 90             # LRU driver evicts above this % of cache_size_mb (#1173); bounds [60,95]
 # eviction_target_pct = 80                 # LRU driver evicts down to this % (#1173); bounds [40,90], must be <= high_water-5
@@ -646,6 +652,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
+# relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); default is role-derived — origin-only (false) when a [cache.origin]/[[cache.origins]] backend is configured, relay (true) when none is; set explicitly to override
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall timeout, so every ranked upstream can be tried before falling back (#831, #859)
 # node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
@@ -683,6 +690,13 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # per_source_rate_per_sec = 100.0           # per-source rate-limit refill (cells/sec); 0.0 disables the layer
 # per_source_burst = 200                    # per-source burst capacity; required > 0 when the rate is > 0
 # max_tracked_sources = 4096                # cap on tracked sources in the keyed limiter; 0 = unbounded
+
+[load_shed]
+# policy = "resource-pressure"              # "resource-pressure" (default) or "always-admit"
+# egress_budget_mbps = 0                    # serving egress budget in Mbps; 0 disables the egress ceiling
+# max_concurrent_serves_high = 256          # concurrency high-water mark; start shedding misses at/above
+# max_concurrent_serves_low = 192           # concurrency low-water mark; resume at/below
+# per_client_serve_cap = 32                 # per-client concurrent-serve cap under pressure; 0 disables
 
 [dht.rate_limit]
 # per_peer_rate_per_sec = 20.0              # per-peer (NodeId) sustained rate (ADR 022); 0.0 disables the layer
@@ -751,6 +765,7 @@ mod tests {
             payment,
             observability,
             security,
+            load_shed,
             dht,
             probe,
             receipts,
@@ -768,6 +783,7 @@ mod tests {
             ("payment", payment.is_some()),
             ("observability", observability.is_some()),
             ("security", security.is_some()),
+            ("load_shed", load_shed.is_some()),
             ("dht", dht.is_some()),
             ("probe", probe.is_some()),
             ("receipts", receipts.is_some()),
@@ -919,6 +935,7 @@ mod tests {
             gc_interval_sec,
             fs_rescan_interval_sec,
             origin_probe_ttl_sec,
+            origin_probe_negative_ttl_sec,
             origin_probe_timeout_ms,
             origin_probe_memo_capacity,
             eviction_high_water_pct,
@@ -928,6 +945,7 @@ mod tests {
             max_probe_holds,
             stake_lane_reserved_holds,
             node_to_node_pull_through_enabled,
+            relay_foreign_namespaces,
             node_pull_probe_fanout,
             node_pull_timeout_sec,
             node_pull_stall_timeout_sec,
@@ -950,6 +968,10 @@ mod tests {
             ("gc_interval_sec =", gc_interval_sec.is_none()),
             ("fs_rescan_interval_sec =", fs_rescan_interval_sec.is_none()),
             ("origin_probe_ttl_sec =", origin_probe_ttl_sec.is_none()),
+            (
+                "origin_probe_negative_ttl_sec =",
+                origin_probe_negative_ttl_sec.is_none(),
+            ),
             (
                 "origin_probe_timeout_ms =",
                 origin_probe_timeout_ms.is_none(),
@@ -976,6 +998,10 @@ mod tests {
             (
                 "node_to_node_pull_through_enabled =",
                 node_to_node_pull_through_enabled.is_none(),
+            ),
+            (
+                "relay_foreign_namespaces =",
+                relay_foreign_namespaces.is_none(),
             ),
             ("node_pull_probe_fanout =", node_pull_probe_fanout.is_none()),
             ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),

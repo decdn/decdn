@@ -542,6 +542,16 @@ enum ServeRejectReason {
     /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire,
     /// see [`Self::wire_error`].
     LaneAtCapacity,
+    /// A cache-HIT serve shed under node overload — egress saturation, or this
+    /// client's fair-share cap while the node is pressured. Distinct from
+    /// [`Self::LoadShedMiss`] for the per-reason metric ONLY — both collapse to
+    /// `NotFound` on the wire (see [`Self::wire_error`]) so a client cannot
+    /// read node load, and both are reputation-benign (a client scores
+    /// `NotFound` as no fault).
+    LoadShedHit,
+    /// A cache-MISS serve shed under node overload — concurrency pressure,
+    /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
+    LoadShedMiss,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
     HashDenied,
@@ -553,6 +563,13 @@ enum ServeRejectReason {
     /// The channel's funding address is on the origin blacklist — the operator's
     /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
     OriginDenied,
+    /// The origin-only policy (#1759, `cache.relay_foreign_namespaces = false`)
+    /// declined a hash this node's own backend genuinely does not hold. Distinct
+    /// from [`Self::CacheMiss`] for the operator's per-reason metric ONLY — both
+    /// collapse to `NotFound` on the wire (a declined foreign hash and a real
+    /// miss must look the same to a client, which re-routes either way), see
+    /// [`Self::wire_error`].
+    ForeignNamespaceDeclined,
 }
 
 impl ServeRejectReason {
@@ -588,7 +605,10 @@ impl ServeRejectReason {
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
             | Self::LaneAtCapacity
-            | Self::RangeNotSatisfiable => StreamError::NotFound,
+            | Self::LoadShedHit
+            | Self::LoadShedMiss
+            | Self::RangeNotSatisfiable
+            | Self::ForeignNamespaceDeclined => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
@@ -720,6 +740,8 @@ pub struct ClientHandlerDeps {
     pub node_id: PublicKey,
     pub metrics: Arc<Metrics>,
     pub limiter: Arc<ConnectionLimiter>,
+    /// Overload-protection gate: sheds new serves under resource pressure.
+    pub shed: Arc<crate::load_shed::LoadShedController>,
     pub cache: CacheEngine,
     pub eth_signer: Arc<PrivateKeySigner>,
     pub slash_domain: Eip712Domain,
@@ -802,6 +824,11 @@ pub struct ClientHandlerDeps {
     /// `(1 − f)` numerator the ADR 041 serve credit realizes. Defaults to zero
     /// (tests): a zero share credits nothing.
     pub operator_shares: crate::fee_shares::OperatorShares,
+    /// Origin-only policy (#1759). When `false`, `serve_stream` declines any
+    /// hash its own backend does not hold — including a cache HIT for a
+    /// foreign hash — before any discovery, lane accounting, or spend. `true`
+    /// (the default) preserves today's relay behavior.
+    pub relay_foreign_namespaces: bool,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -834,11 +861,13 @@ impl ClientHandlerDeps {
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
         pool_min_remaining_deposit: U256,
+        shed: Arc<crate::load_shed::LoadShedController>,
     ) -> Self {
         Self {
             node_id,
             metrics,
             limiter,
+            shed,
             cache,
             eth_signer,
             slash_domain,
@@ -865,6 +894,7 @@ impl ClientHandlerDeps {
             floor_loss_store: None,
             warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
+            relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
         }
     }
 }
@@ -874,6 +904,8 @@ pub struct ClientHandler {
     node_id: PublicKey,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
+    /// Overload-protection gate: sheds new serves under resource pressure.
+    shed: Arc<crate::load_shed::LoadShedController>,
     cache: CacheEngine,
     eth_signer: Arc<PrivateKeySigner>,
     /// `SlashJudge` EIP-712 domain for `StreamResponse.slash_sig`.
@@ -1018,6 +1050,10 @@ pub struct ClientHandler {
     warming: Arc<crate::warming_allowance::WarmingAllowance>,
     /// Live operator fee-share (basis points), the ADR 041 serve-credit numerator.
     operator_shares: crate::fee_shares::OperatorShares,
+    /// Origin-only policy (#1759), set at construction via
+    /// [`ClientHandlerDeps::relay_foreign_namespaces`]. Read by the gate at the
+    /// top of `serve_stream`.
+    relay_foreign_namespaces: bool,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -1089,6 +1125,7 @@ impl ClientHandler {
             node_id: deps.node_id,
             metrics: deps.metrics,
             limiter: deps.limiter,
+            shed: deps.shed,
             cache: deps.cache,
             eth_signer: deps.eth_signer,
             slash_domain: deps.slash_domain,
@@ -1120,6 +1157,7 @@ impl ClientHandler {
             pool_recheck_interval: deps.pool_recheck_interval,
             warming: deps.warming,
             operator_shares: deps.operator_shares,
+            relay_foreign_namespaces: deps.relay_foreign_namespaces,
         })
     }
 
@@ -1848,6 +1886,17 @@ impl BufferedVoucherReader {
     }
 }
 
+/// A load-shed controller that never sheds, for handler-layer tests that are
+/// not exercising the load-shed gate itself. Keeps every existing serve test
+/// admitting exactly as it did before the gate was wired in.
+#[cfg(test)]
+fn always_admit_shed() -> Arc<crate::load_shed::LoadShedController> {
+    crate::load_shed::LoadShedController::from_config(&decdn_common::config::ResolvedLoadShed {
+        policy: decdn_common::config::LoadShedPolicyKind::AlwaysAdmit,
+        ..Default::default()
+    })
+}
+
 /// Build a `ClientHandler` over an arbitrary [`PoolStateStore`] for the
 /// sibling-module tests (e.g. `voucher.rs`'s #527 durability tests need a
 /// fault-injecting store). Kept at module level (not inside `mod tests`) so a
@@ -1890,6 +1939,7 @@ pub(super) async fn handler_over_store(
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
         U256::ZERO,
+        always_admit_shed(),
     );
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
@@ -1945,9 +1995,47 @@ mod tests {
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             pool_min_remaining_deposit,
+            always_admit_shed(),
         );
         let handler = ClientHandler::new(deps).expect("handler");
         (Arc::new(handler), dir)
+    }
+
+    /// The load-shed controller sheds a cache-miss once the node is at its
+    /// configured concurrency ceiling, while a cache-hit for a DIFFERENT client
+    /// still rides — a hit is local, zero-upstream-cost margin, so it is shed
+    /// last (miss-before-hit). Exercises the controller directly at the wiring
+    /// boundary rather than standing up a full QUIC loopback.
+    #[tokio::test]
+    async fn miss_is_shed_when_node_at_capacity_but_hit_admitted() {
+        // Build a handler whose shed controller trips at 1 concurrent serve.
+        let cfg = decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 0,
+            max_concurrent_serves_high: 1,
+            max_concurrent_serves_low: 0,
+            per_client_serve_cap: 0,
+        };
+        let shed = crate::load_shed::LoadShedController::from_config(&cfg);
+        // Occupy the one slot.
+        let _held = shed
+            .try_admit(crate::load_shed::RequestClass::CacheHit, B256::ZERO)
+            .expect("first serve admits");
+        // A new miss is shed; a new hit rides (egress under budget).
+        assert!(
+            shed.try_admit(
+                crate::load_shed::RequestClass::CacheMiss,
+                B256::from([1u8; 32])
+            )
+            .is_err()
+        );
+        assert!(
+            shed.try_admit(
+                crate::load_shed::RequestClass::CacheHit,
+                B256::from([1u8; 32])
+            )
+            .is_ok()
+        );
     }
 
     /// The lane registry resolves independent lanes concurrently (#1731). Many
@@ -2299,6 +2387,7 @@ mod tests {
             Some(crate::pool_view::PoolStatus {
                 owner: self.owner,
                 remaining: U256::MAX,
+                lifecycle: crate::pool_view::Lifecycle::Open,
             })
         }
     }
@@ -2347,6 +2436,7 @@ mod tests {
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             U256::ZERO,
+            always_admit_shed(),
         );
         deps.capability_sink = Some(Arc::new(RecordingCapabilitySink {
             recorded: Arc::clone(&recorded),

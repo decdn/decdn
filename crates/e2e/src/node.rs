@@ -663,6 +663,14 @@ redeem_threshold_micro_usdc = 10
 cache_dir = '{cache_dir}'
 cache_size_mb = 4096
 node_to_node_pull_through_enabled = {node_to_node_pull_through}
+# The fixture always configures a `[cache.origin]` backend below (even a pull-
+# through node's is an empty fs origin it never seeds), so the resolver's
+# role-derived default (#1759) would otherwise make every fixture node
+# origin-only. Pin it explicitly to the fixture's actual intent: a
+# pull-through node exists to relay content it does not itself hold, so it
+# opts back into relay; an own-origin node keeps the origin-only behavior its
+# journeys were already written against.
+relay_foreign_namespaces = {relay_foreign_namespaces}
 
 [cache.origin]
 kind = "fs"
@@ -693,6 +701,11 @@ metrics_bind = "127.0.0.1"
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),
         node_to_node_pull_through = c.node_to_node_pull_through,
+        // A pull-through node's only purpose is relaying content it does not
+        // itself hold, so it opts into relay explicitly; see the `[cache]`
+        // comment above for why every fixture node must pin this rather than
+        // rely on the resolver's role-derived default (#1759).
+        relay_foreign_namespaces = c.node_to_node_pull_through,
         origin_dir = c.origin_dir.display(),
         admin_port = c.admin_port,
         metrics_port = c.metrics_port,

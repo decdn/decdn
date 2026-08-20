@@ -148,6 +148,12 @@ pub struct ProbeHandler {
     /// pre-#757 behaviour; `Some` reserves hold headroom for registered
     /// node-to-node requesters under budget pressure.
     stake_lane: Option<StakeLanePolicy>,
+    /// Mirrors `ResolvedCache::relay_foreign_namespaces` (ADR 002 origin-only
+    /// node policy). `true` (the default) is the unchanged relay path below.
+    /// `false` restricts `has_blob` to backend-held content only — a
+    /// store-present blob it will now decline to relay is never advertised —
+    /// so a foreign decline never reads as "advertised but didn't serve".
+    relay_foreign_namespaces: bool,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -176,6 +182,7 @@ impl ProbeHandler {
         slash_domain: Eip712Domain,
         rate_bounds: crate::rate_bounds::RateBounds,
         stake_lane: Option<StakeLanePolicy>,
+        relay_foreign_namespaces: bool,
     ) -> Self {
         Self {
             node_id,
@@ -188,6 +195,7 @@ impl ProbeHandler {
             slash_domain,
             rate_bounds,
             stake_lane,
+            relay_foreign_namespaces,
         }
     }
 
@@ -345,139 +353,156 @@ impl ProbeHandler {
             None => false,
         };
 
-        // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
-        // hold). The hold is **best-effort**: a node answers `has_blob: true`
-        // whenever it holds the blob and has not refused it, then keeps a 35s
-        // eviction hold *if it can* so the blob is still resident for the
-        // follow-up pull. Budget pressure or a stake-lane reservation only means
-        // "place no hold" — never "deny an honest answer", so a probe flood that
-        // fills the hold cache can never suppress a truthful `has_blob`.
-        //
-        // What an unheld advertisement actually costs, if the blob is
-        // LRU-evicted before the pull lands: one wasted round trip. The delivery
-        // path answers a plain `NotFound` and the requester goes elsewhere. It
-        // is NOT a slash (no offense pairs a probe with a miss — ADR 014), and
-        // it is NOT a reputation penalty either: `classify_refusal` rates
-        // `NotFound` as `RefusalVerdict::Transient`, which briefly suppresses
-        // the (peer, hash) pair *without* scoring the peer, because a miss is
-        // not attributable to it (see `node_origin.rs`). Do not justify this
-        // path by reputation — nothing records an outcome for it.
-        //
-        // The hold is attempted *after* the rate limiter (ADR 005 §Probe rate
-        // limiting: hold admission occurs only after the limiter passes — do not
-        // reorder).
-        let (has_blob, total_bytes) = if stake_lane_reserved {
-            // End-client shed to protect stake-lane hold headroom (#757): place
-            // no hold, but still answer honestly — presence does not depend on a
-            // slot. `has()` already folds in `refuses()` (denied / chain-denied /
-            // operator-evicted), so it alone settles presence; the second
-            // `refuses` call is not a distinct predicate but a re-check that
-            // narrows the TOCTOU window the `await` opens, because signing
-            // `has_blob: true` for a blacklisted hash is a blacklist-violation
-            // offense (ADR 014).
-            self.metrics
-                .probe_hold_unavailable(ProbeHoldUnavailableReason::StakeLaneReserved);
-            match self.cache.has(hash).await {
-                Ok(true) if !self.cache.refuses(hash) => (true, self.inspect_size(hash).await),
-                Ok(_) => (false, None),
-                // Same reasoning as the `try_probe_hold` `Err` arm below: a store
-                // fault is not "absent" and must not be silently indistinguishable
-                // from one. This path runs only under hold pressure — precisely
-                // when a degrading backend is most worth surfacing.
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        %hash,
-                        "cache error during stake-lane shed presence check; \
-                         answering has_blob:false"
-                    );
-                    (false, None)
+        let (has_blob, total_bytes) = if self.relay_foreign_namespaces {
+            // Probe-triggered eviction hold (ADR 005 §Probe-triggered eviction
+            // hold). The hold is **best-effort**: a node answers `has_blob: true`
+            // whenever it holds the blob and has not refused it, then keeps a 35s
+            // eviction hold *if it can* so the blob is still resident for the
+            // follow-up pull. Budget pressure or a stake-lane reservation only means
+            // "place no hold" — never "deny an honest answer", so a probe flood that
+            // fills the hold cache can never suppress a truthful `has_blob`.
+            //
+            // What an unheld advertisement actually costs, if the blob is
+            // LRU-evicted before the pull lands: one wasted round trip. The delivery
+            // path answers a plain `NotFound` and the requester goes elsewhere. It
+            // is NOT a slash (no offense pairs a probe with a miss — ADR 014), and
+            // it is NOT a reputation penalty either: `classify_refusal` rates
+            // `NotFound` as `RefusalVerdict::Transient`, which briefly suppresses
+            // the (peer, hash) pair *without* scoring the peer, because a miss is
+            // not attributable to it (see `node_origin.rs`). Do not justify this
+            // path by reputation — nothing records an outcome for it.
+            //
+            // The hold is attempted *after* the rate limiter (ADR 005 §Probe rate
+            // limiting: hold admission occurs only after the limiter passes — do not
+            // reorder).
+            let (has_blob, total_bytes) = if stake_lane_reserved {
+                // End-client shed to protect stake-lane hold headroom (#757): place
+                // no hold, but still answer honestly — presence does not depend on a
+                // slot. `has()` already folds in `refuses()` (denied / chain-denied /
+                // operator-evicted), so it alone settles presence; the second
+                // `refuses` call is not a distinct predicate but a re-check that
+                // narrows the TOCTOU window the `await` opens, because signing
+                // `has_blob: true` for a blacklisted hash is a blacklist-violation
+                // offense (ADR 014).
+                self.metrics
+                    .probe_hold_unavailable(ProbeHoldUnavailableReason::StakeLaneReserved);
+                match self.cache.has(hash).await {
+                    Ok(true) if !self.cache.refuses(hash) => (true, self.inspect_size(hash).await),
+                    Ok(_) => (false, None),
+                    // Same reasoning as the `try_probe_hold` `Err` arm below: a store
+                    // fault is not "absent" and must not be silently indistinguishable
+                    // from one. This path runs only under hold pressure — precisely
+                    // when a degrading backend is most worth surfacing.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            %hash,
+                            "cache error during stake-lane shed presence check; \
+                             answering has_blob:false"
+                        );
+                        (false, None)
+                    }
                 }
-            }
-        } else {
-            match self.cache.try_probe_hold(hash).await {
-                Ok(ProbeHoldOutcome::Held) => (true, self.inspect_size(hash).await),
-                Ok(ProbeHoldOutcome::BudgetExhausted) => {
-                    // Present but every hold slot is live: advertise anyway and
-                    // forgo the hold. A probe flood that fills the best-effort
-                    // hold cache cannot suppress an honest answer — the blob is
-                    // here now (a `BudgetExhausted` outcome already means present
-                    // and not refused). If it is evicted before the pull, that
-                    // costs one wasted round trip (see the block comment above).
-                    // Raising `max_probe_holds` is still the remedy for the lost
-                    // holds (#739).
-                    self.metrics
-                        .probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
-                    (true, self.inspect_size(hash).await)
+            } else {
+                match self.cache.try_probe_hold(hash).await {
+                    Ok(ProbeHoldOutcome::Held) => (true, self.inspect_size(hash).await),
+                    Ok(ProbeHoldOutcome::BudgetExhausted) => {
+                        // Present but every hold slot is live: advertise anyway and
+                        // forgo the hold. A probe flood that fills the best-effort
+                        // hold cache cannot suppress an honest answer — the blob is
+                        // here now (a `BudgetExhausted` outcome already means present
+                        // and not refused). If it is evicted before the pull, that
+                        // costs one wasted round trip (see the block comment above).
+                        // Raising `max_probe_holds` is still the remedy for the lost
+                        // holds (#739).
+                        self.metrics
+                            .probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
+                        (true, self.inspect_size(hash).await)
+                    }
+                    Ok(ProbeHoldOutcome::HoldsDisabled) => {
+                        // Holds disabled by config (`max_probe_holds == 0`) is the
+                        // operator's explicit opt-out from advertising *store-backed*
+                        // content: answer `has_blob: false` so this node is not
+                        // selected off the evictable store. Distinct from budget
+                        // pressure (which still advertises) — a deliberate choice,
+                        // not load (#739).
+                        //
+                        // It is not a blanket "answer false to everything": the
+                        // origin-held fallback below takes no hold and so is
+                        // unaffected by this setting. A node with a configured origin
+                        // still advertises origin-servable content with
+                        // `max_probe_holds == 0`.
+                        self.metrics
+                            .probe_hold_unavailable(ProbeHoldUnavailableReason::Disabled);
+                        (false, None)
+                    }
+                    // Blob genuinely absent, operator-evicted, or refused
+                    // (blacklisted/denied) — a true negative, no signal needed.
+                    Ok(ProbeHoldOutcome::Unavailable) => (false, None),
+                    // A transient cache fault is *not* the same as "absent": the
+                    // node may actually hold the blob. We still conservatively
+                    // answer `has_blob: false` (a store it cannot read is one it
+                    // cannot serve), but a degrading backend must be
+                    // operator-visible rather than indistinguishable from a normal
+                    // miss. The registry has no metric for this; a warn log is the
+                    // actionable signal.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "cache error during probe hold check; answering has_blob:false"
+                        );
+                        (false, None)
+                    }
                 }
-                Ok(ProbeHoldOutcome::HoldsDisabled) => {
-                    // Holds disabled by config (`max_probe_holds == 0`) is the
-                    // operator's explicit opt-out from advertising *store-backed*
-                    // content: answer `has_blob: false` so this node is not
-                    // selected off the evictable store. Distinct from budget
-                    // pressure (which still advertises) — a deliberate choice,
-                    // not load (#739).
-                    //
-                    // It is not a blanket "answer false to everything": the
-                    // origin-held fallback below takes no hold and so is
-                    // unaffected by this setting. A node with a configured origin
-                    // still advertises origin-servable content with
-                    // `max_probe_holds == 0`.
-                    self.metrics
-                        .probe_hold_unavailable(ProbeHoldUnavailableReason::Disabled);
-                    (false, None)
-                }
-                // Blob genuinely absent, operator-evicted, or refused
-                // (blacklisted/denied) — a true negative, no signal needed.
-                Ok(ProbeHoldOutcome::Unavailable) => (false, None),
-                // A transient cache fault is *not* the same as "absent": the
-                // node may actually hold the blob. We still conservatively
-                // answer `has_blob: false` (a store it cannot read is one it
-                // cannot serve), but a degrading backend must be
-                // operator-visible rather than indistinguishable from a normal
-                // miss. The registry has no metric for this; a warn log is the
-                // actionable signal.
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "cache error during probe hold check; answering has_blob:false"
-                    );
-                    (false, None)
-                }
-            }
-        };
+            };
 
-        // Origin-held fallback (#1130). If the store can't back a
-        // `has_blob: true` — the blob was never pulled into it, holds are
-        // disabled, or the store read faulted — but it is servable from a
-        // configured origin (fs directory entry, or a present pin), advertise it
-        // anyway so cold origin content is discoverable on the first probe
-        // rather than only after a warm.
-        //
-        // Origin content takes **no** eviction hold: it lives on disk / behind
-        // the origin, not in the evictable store, so hold-budget pressure and
-        // `max_probe_holds` are both irrelevant to it — which is why
-        // `max_probe_holds == 0` silences store-backed advertisements but not
-        // these. If the origin object later vanishes before the pull, the
-        // delivery path answers a plain miss and the requester retries
-        // elsewhere: one wasted round trip, not a slash (ADR 014) and not a
-        // reputation penalty (see the hold block comment above).
-        let (has_blob, total_bytes) =
-            fold_origin_held((has_blob, total_bytes), self.cache.origin_held_size(hash));
-        // Live-origin HEAD fallback (#1130 pt3). The index above covers fs
-        // enumeration ∪ pins; http/s3 do not list, so a non-pinned bucket object
-        // is invisible to it. When nothing has answered `true` yet, consult the
-        // origin directly (`HEAD`/`HeadObject`, no body) with a TTL memo so a
-        // non-pinned remote object is discoverable on the first probe rather than
-        // never. Skipped once `has_blob` is already true — no point paying a HEAD
-        // for a blob the store or the index already backs.
-        let (has_blob, total_bytes) = if has_blob {
-            (has_blob, total_bytes)
+            // Origin-held fallback (#1130). If the store can't back a
+            // `has_blob: true` — the blob was never pulled into it, holds are
+            // disabled, or the store read faulted — but it is servable from a
+            // configured origin (fs directory entry, or a present pin), advertise it
+            // anyway so cold origin content is discoverable on the first probe
+            // rather than only after a warm.
+            //
+            // Origin content takes **no** eviction hold: it lives on disk / behind
+            // the origin, not in the evictable store, so hold-budget pressure and
+            // `max_probe_holds` are both irrelevant to it — which is why
+            // `max_probe_holds == 0` silences store-backed advertisements but not
+            // these. If the origin object later vanishes before the pull, the
+            // delivery path answers a plain miss and the requester retries
+            // elsewhere: one wasted round trip, not a slash (ADR 014) and not a
+            // reputation penalty (see the hold block comment above).
+            let (has_blob, total_bytes) =
+                fold_origin_held((has_blob, total_bytes), self.cache.origin_held_size(hash));
+            // Live-origin HEAD fallback (#1130 pt3). The index above covers fs
+            // enumeration ∪ pins; http/s3 do not list, so a non-pinned bucket object
+            // is invisible to it. When nothing has answered `true` yet, consult the
+            // origin directly (`HEAD`/`HeadObject`, no body) with a TTL memo so a
+            // non-pinned remote object is discoverable on the first probe rather than
+            // never. Skipped once `has_blob` is already true — no point paying a HEAD
+            // for a blob the store or the index already backs.
+            if has_blob {
+                (has_blob, total_bytes)
+            } else {
+                fold_origin_held(
+                    (has_blob, total_bytes),
+                    self.cache.origin_probe_size(hash).await,
+                )
+            }
         } else {
-            fold_origin_held(
-                (has_blob, total_bytes),
-                self.cache.origin_probe_size(hash).await,
-            )
+            // Origin-only nodes (ADR 002 origin-only node policy): advertise
+            // exactly what the serve gate will honor, which is backend-held
+            // content only. A store hit for a blob outside this node's own
+            // origin(s) must NOT be advertised here, or a later foreign-namespace
+            // serve decline reads as "advertised but didn't serve" (the reputation
+            // hazard this policy closes). This short-circuits the entire
+            // store-present / probe-hold / origin-held-index derivation above —
+            // presence is decided purely by the backend probe (index-or-live-HEAD,
+            // memoised) — and, like every other path here, still answers `false`
+            // for a `refuses`-listed hash (`origin_probe_size` checks it first).
+            match self.cache.origin_probe_size(hash).await {
+                Some(size) => (true, Some(size)),
+                None => (false, None),
+            }
         };
         // On the shed path no hold was attempted, so the value sampled for
         // the gate is still current — reuse it instead of re-acquiring the

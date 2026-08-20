@@ -3938,6 +3938,7 @@ impl decdn_node::pool_view::PoolView for FixedRemainingPoolView {
         Some(decdn_node::pool_view::PoolStatus {
             owner: self.owner,
             remaining: self.remaining,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
         })
     }
 }
@@ -4013,6 +4014,7 @@ impl decdn_node::pool_view::PoolView for DrainingPoolView {
         Some(decdn_node::pool_view::PoolStatus {
             owner: self.owner,
             remaining,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
         })
     }
 }
@@ -7387,6 +7389,359 @@ async fn spawn_pull_through_server(
     Ok((target, server_eth.address(), server_ep, server_task))
 }
 
+/// Spawn a `ClientHandler` server with `relay_foreign_namespaces = false`
+/// (#1759): an origin-only node. Reactive fs-origin pull-through
+/// (`ClientHandlerDeps.pull_through`) is wired the same as
+/// [`spawn_pull_through_server`] so a hash the backend genuinely holds can
+/// still be served; the only difference is the origin-only gate.
+async fn spawn_origin_only_server(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.relay_foreign_namespaces = false;
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth.address(), server_ep, server_task))
+}
+
+/// Same as [`spawn_origin_only_server`] but also returns the server's
+/// [`Metrics`], so a test can tell a policy decline (`ForeignNamespaceDeclined`)
+/// apart from a backend fault (`InternalError`) by the operator's own counters,
+/// not just by the wire error (#1766).
+async fn spawn_origin_only_server_with_metrics(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Address,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.relay_foreign_namespaces = false;
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((
+        target,
+        server_eth.address(),
+        server_ep,
+        server_task,
+        metrics,
+    ))
+}
+
+/// #1766: an origin-only node whose own backend FAULTS on the live probe (a
+/// connection-refused `HEAD` against an unreachable http origin) must refuse
+/// with `InternalError`, NOT a signed `NotFound` — a fault is not an
+/// absence, and signing an authoritative negative during a backend outage
+/// would tell a paying client this node's own content is gone.
+///
+/// `http://127.0.0.1:1/` is used as the "unreachable" origin: port 1 is a
+/// privileged, essentially never-listening port, so `reqwest` gets an
+/// immediate connection-refused rather than a slow timeout — the origin-chain
+/// walk in `origin_probe_presence` sees a live `Err`, not the timeout arm
+/// (that arm is already covered by the cache-engine unit tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
+    let hash = decdn_cache::Hash::new(b"origin-only fault probe");
+    let cache_dir = tempfile::tempdir()?;
+    let unreachable = decdn_cache::parse_origin_url("http://127.0.0.1:1/")?;
+    let origin = Arc::new(decdn_cache::HttpOrigin::new(unreachable)?);
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::new(CacheMetrics::default())),
+        Duration::ZERO,
+    )
+    .await?;
+    anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
+        spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("a faulting backend probe must not deliver"),
+        Err(e) => {
+            let msg = e.to_string();
+            anyhow::ensure!(
+                msg.contains("InternalError"),
+                "a faulting backend probe must surface as InternalError, got: {e}"
+            );
+            anyhow::ensure!(
+                !msg.contains("NotFound"),
+                "a faulting backend probe must NOT sign an authoritative NotFound, got: {e}"
+            );
+        }
+    }
+
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_internal_error_total 1"
+        ),
+        "expected the fault to land in the internal-error counter, not the \
+         foreign-decline one; counters were:\n{}",
+        encoded
+            .lines()
+            .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_foreign_declined_total 0"
+        ),
+        "a backend fault must not be counted as a foreign decline"
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Build a cache holding a blob that the local STORE has already accepted (a
+/// past import) but whose backing filesystem origin no longer exists — the
+/// backend genuinely does not hold it anymore, so a fresh
+/// `CacheEngine::origin_probe_size` reads `None` (a transport error against
+/// the now-deleted origin directory) even though `cache.has` is `true`. Used
+/// to prove the origin-only gate (#1759) sits ABOVE the cache-hit branch: a
+/// foreign hash already sitting in the store is still declined.
+async fn cache_with_foreign_blob_imported(
+    payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    Arc<CacheMetrics>,
+    tempfile::TempDir,
+)> {
+    let hash = decdn_cache::Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    let _ = cache.get(hash).await?; // pulls into the local store now
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "precondition: the blob must be in the local store"
+    );
+    // Drop the fs origin directory: the backend no longer holds the object,
+    // even though the store already imported it.
+    drop(origin_dir);
+    Ok((cache, hash, cache_metrics, cache_dir))
+}
+
+/// #1759: an origin-only node declines a hash its own backend does not hold,
+/// even for a request carrying a valid client binding — the gate is
+/// backend-authoritative, not a binding/authorization check.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
+    // Backend holds `payload`/`hash`; we request a DIFFERENT (foreign) hash.
+    let payload = vec![0x11u8; 64 * 1024];
+    let (cache, _own_hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let foreign_hash = decdn_cache::Hash::from([0x9Au8; 32]);
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let res = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *foreign_hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await;
+    anyhow::ensure!(res.is_err(), "origin-only node must decline a foreign hash");
+
+    // Declined BEFORE any origin egress / discovery.
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "foreign decline must not touch the origin, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1759 control: an origin-only node still serves a hash its own backend
+/// holds — the gate refuses only foreign content, not everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
+    let payload = vec![0x22u8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch for own-backend hash"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 origin fetch to fill the own-backend hash, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1759: the gate is categorical — it sits ABOVE the cache-hit branch, so a
+/// foreign hash already sitting in the store (imported by an earlier relay,
+/// say) is still declined once the backend no longer holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::Result<()> {
+    let payload = vec![0x33u8; 32 * 1024];
+    let (cache, foreign_hash, cache_metrics, _cache_tmp) =
+        cache_with_foreign_blob_imported(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    // Baseline AFTER setup's own origin fetch (from importing the blob into the
+    // store), so the assertion below isolates fetches caused by THIS request.
+    let baseline_fetches = cache_metrics.origin_fetches.get();
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let res = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *foreign_hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await;
+    anyhow::ensure!(
+        res.is_err(),
+        "origin-only node must decline a foreign hash even when it is already cached"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == baseline_fetches,
+        "the cache-hit gate must not touch the origin, got {} beyond baseline {}",
+        cache_metrics.origin_fetches.get(),
+        baseline_fetches
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
 /// #1115: a direct client fetch that sends the ADR 005 client identity binding
 /// authorizes reactive origin pull-through — with the blob present only in the
 /// node's filesystem origin (an empty local store), the miss populates from the
@@ -8500,5 +8855,186 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     client_ep_b.close().await;
     server_ep_b.close().await;
     server_task_b.await?;
+    Ok(())
+}
+
+/// End-to-end coverage for the load-shed gate's two `Err` branches in
+/// `serve_stream` (dispatch.rs): the cache-miss admission call refuses with
+/// `ServeRejectReason::LoadShedMiss`, and the cache-hit admission call refuses
+/// with `ServeRejectReason::LoadShedHit`. Both collapse to the same signed wire
+/// `NotFound` a paying client sees. The policy's own admit/shed arithmetic
+/// already has unit coverage in `load_shed::resource_pressure`; what these two
+/// tests add is proof the handler actually wires a shed `Err` into the exact
+/// on-wire refusal, through a real loopback connection and a real bound
+/// request.
+///
+/// Both tests pre-set the controller's counters before the client ever
+/// connects, so the shed decision is already fixed at admission time — no
+/// timing or concurrency race is involved.
+///
+/// A hash the node genuinely lacks: the request lands on the cache-miss
+/// admission call. The node's concurrency ceiling is pre-occupied by a held
+/// slot, so it is already at its one-slot high-water mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_miss_refused_under_concurrency_pressure() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    // Concurrency high-water mark of 1: pre-occupying one slot before the
+    // client connects puts the node at capacity for every request that follows.
+    let shed = decdn_node::load_shed::LoadShedController::from_config(
+        &decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 0,
+            max_concurrent_serves_high: 1,
+            max_concurrent_serves_low: 0,
+            per_client_serve_cap: 0,
+        },
+    );
+    let held = shed
+        .try_admit(
+            decdn_node::load_shed::RequestClass::CacheHit,
+            B256::repeat_byte(0xAA),
+        )
+        .map_err(|reason| anyhow::anyhow!("pre-occupy the sole concurrency slot: {reason:?}"))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.shed = Arc::clone(&shed);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // A hash the empty cache never has: the cache-miss admission branch.
+    let miss_hash = Hash::new(b"load-shed test: never cached");
+    let refusal = open_expecting_refusal(&conn, *miss_hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "a cache-miss request must be shed while the node is at its concurrency ceiling"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    // Release the held slot only after the refusal is observed, so the shed
+    // decision above is provably driven by the pre-occupied slot.
+    drop(held);
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// A hash the node already has cached: the request lands on the cache-hit
+/// admission call. Concurrency never trips (the high/low water marks are far
+/// above anything this test does); only the egress ceiling is saturated, which
+/// `ResourcePressure` sheds regardless of the pressure latch (it also sheds
+/// hits, unlike the concurrency gate above).
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
+    let payload = b"load-shed test: a blob the node already has cached".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let shed = decdn_node::load_shed::LoadShedController::from_config(
+        &decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 1, // 1 Mbps = 125_000 B/s ceiling
+            max_concurrent_serves_high: 10_000,
+            max_concurrent_serves_low: 9_000,
+            per_client_serve_cap: 0,
+        },
+    );
+    // Pre-feed the egress meter over budget before the client ever connects,
+    // so the instant rate the handler samples at admission time is already
+    // fixed above the ceiling.
+    shed.record_egress(1_000_000);
+    let sampled = shed.sample_egress(1);
+    anyhow::ensure!(
+        sampled >= 125_000,
+        "instant egress rate must be at/above the 1 Mbps ceiling, got {sampled}"
+    );
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.shed = Arc::clone(&shed);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let refusal = open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "a cache-hit request must be shed while measured egress is at the configured ceiling"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
     Ok(())
 }

@@ -257,11 +257,15 @@ pub struct ResolvedCache {
     /// one). Default [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`] when the
     /// TOML section omits the field.
     pub fs_rescan_interval_sec: u64,
-    /// TTL in seconds for a memoised live-origin probe answer (#1130 pt3).
-    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
+    /// TTL in seconds for a memoised positive live-origin probe answer (#1130
+    /// pt3). Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
     /// per-probe `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
     /// objects the enumeration index cannot see.
     pub origin_probe_ttl_sec: u64,
+    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`]. The
+    /// negative-answer TTL for the origin-probe memo — the bound on how long a
+    /// stale `Absent` can hide newly-available own content.
+    pub origin_probe_negative_ttl_sec: u64,
     /// Per-probe live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
     /// off the probe hot path.
@@ -303,6 +307,14 @@ pub struct ResolvedCache {
     /// pull on a miss (behind a valid client channel). `cache.*` is
     /// restart-required, so this is read once at bring-up.
     pub node_to_node_pull_through_enabled: bool,
+    /// When `false`, the node serves and seeds only content its own backend
+    /// holds; a foreign hash is declined like a miss. The default is
+    /// role-derived: `false` (origin-only) when an origin backend is
+    /// configured — an origin is not a general proxy — and `true` (relay)
+    /// when no origin is configured, since a pure edge node's only function
+    /// is relaying. Explicit config overrides either default. Node-local;
+    /// `cache.*` is restart-required.
+    pub relay_foreign_namespaces: bool,
     /// Providers probed before ranking on a node-to-node pull (#831). Default
     /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`].
     pub node_pull_probe_fanout: usize,
@@ -619,6 +631,37 @@ pub struct ResolvedSecurity {
     pub max_tracked_sources: usize,
 }
 
+/// Which load-shed policy the node runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadShedPolicyKind {
+    ResourcePressure,
+    AlwaysAdmit,
+}
+
+/// Resolved load-shedding thresholds.
+#[derive(Debug, Clone)]
+pub struct ResolvedLoadShed {
+    pub policy: LoadShedPolicyKind,
+    pub egress_budget_mbps: u64,
+    pub max_concurrent_serves_high: u32,
+    pub max_concurrent_serves_low: u32,
+    pub per_client_serve_cap: u32,
+}
+
+impl Default for ResolvedLoadShed {
+    /// Reuses the `DEFAULT_LOAD_SHED_*` resolver constants so hand-built
+    /// `ResolvedConfig`s in tests cannot drift from the production defaults.
+    fn default() -> Self {
+        Self {
+            policy: LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: super::DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS,
+            max_concurrent_serves_high: super::DEFAULT_LOAD_SHED_SERVES_HIGH,
+            max_concurrent_serves_low: super::DEFAULT_LOAD_SHED_SERVES_LOW,
+            per_client_serve_cap: super::DEFAULT_LOAD_SHED_PER_CLIENT_CAP,
+        }
+    }
+}
+
 /// Resolved download-receipt audit-log retention fields (#802).
 ///
 /// `max_file_bytes` is always within `[MIN_RECEIPT_MAX_FILE_BYTES,
@@ -662,6 +705,7 @@ pub struct ResolvedConfig {
     pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
     pub security: ResolvedSecurity,
+    pub load_shed: ResolvedLoadShed,
     pub dht: ResolvedDht,
     pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,

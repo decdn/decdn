@@ -831,9 +831,9 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
             )?;
             writeln!(
                 w,
-                "Keep the OLD Ethereum keystore reachable until every channel that pinned it as \
-                 voucherSigner has settled or expired — it is the only key that can sign a further \
-                 voucher or countersign a cooperative close on those."
+                "Keep the OLD Ethereum keystore reachable until every capability that pinned it as \
+                 voucherSigner has expired — it is the only key that can sign a further voucher on \
+                 those lanes."
             )?;
         }
         // The remaining phases either submit nothing or only return the

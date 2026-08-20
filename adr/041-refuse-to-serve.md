@@ -181,9 +181,10 @@ warming_budget = 5_000_000    # per-source allowance B; $5 in payment base units
 warming_refill = 58           # allowance refill rate, base units per second (~$5/day)
 ```
 
-The allowance is debited by the speculative gap a buy takes above the
-profit-guarantee price, not the full buy price, so a `$5` budget covers a large
-volume of cold warming per source before it cuts a source off.
+The per-source ledger is debited the full upstream buy cost on a speculative
+pull and credited the realized operator margin on each serve, so a one-hit blob
+nets the fee skim as its lasting loss. A `$5` budget therefore covers a large
+volume of unrecovered one-hit warming per source before it cuts a source off.
 
 The default is `margin`. With a warming allowance, a node buys cold blobs at the
 market price and warms; without operator action the gate still bounds speculative

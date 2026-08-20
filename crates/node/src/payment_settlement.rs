@@ -35,11 +35,19 @@
 //!   so a dropped hint never strands a lane whose chunk has cleared the floor.
 //!   The node flushes the lane store durable after planning a chunk and before
 //!   submitting it, so post-crash on-disk `owed ≥ submitted`.
-//! - **Close monitor.** A pool is owner-closed only. On a `PoolCloseInitiated`
-//!   for a pool this node holds lanes against, the monitor redeems its highest
-//!   voucher per lane before `disputeDeadline` (ADR 003 § Owner reclaims before a
-//!   node redeems) — a node that has not redeemed by the deadline forfeits its
-//!   outstanding vouchers.
+//! - **Redeem before reclaim.** A pool is owner-owned and owner-closed; the node
+//!   never closes, disputes, or settles. An owner's `closePool` only starts the
+//!   grace window (ADR 003 § Owner reclaims before a node redeems). The node runs
+//!   no force-redeem on close: the self-tick sweep runs far inside the 48h grace
+//!   floor (`redeem_interval_secs` is capped well below it at config load), so it
+//!   redeems every lane worth the gas before the owner can `reclaim`. A lane below
+//!   the per-chunk floor is left for the owner to reclaim — spending more gas than
+//!   it recovers is not worth it — and a node offline for the whole grace window
+//!   forfeits its unredeemed vouchers, a node-ops failure, not a protocol gap.
+//!   The sink does fold `PoolCloseInitiated` into the projection (marking the pool
+//!   `Closing` with its deadline) so the redeemer's solvency gate drops a drained
+//!   or past-deadline lane instead of submitting a `redeemMany` that reverts
+//!   `PoolClosed`.
 //!
 //! Buyer-side `openPool`/`topUp`/`reclaim` (node→node cache-miss pulls) is out of
 //! scope here. The paid-watermark watcher is a [`Route`] the runtime registers on
@@ -73,7 +81,7 @@ use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart,
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::PoolProjection;
+use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
 /// delays a redemption until the next voucher or self-tick sweep), so a bounded
@@ -93,21 +101,17 @@ const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 /// (a transient error mis-flagged as oversize) at 2^6 doomed sub-sends.
 const MAX_SPLIT_DEPTH: u32 = 6;
 
-/// Current Unix time in seconds for on-chain deadline comparisons. A broken
-/// system clock (time before the epoch) yields `0`, which makes every pool look
-/// still inside its grace window — the safe direction (attempt the redeem; the
-/// contract's own `block.timestamp` check is the authoritative backstop).
+/// Current Unix time in seconds, compared against a lane's cached
+/// `registered_until` to skip the on-chain authorization read while the
+/// registration is still live (`registered_until > now`). A broken system clock
+/// (time before the epoch) yields `0`, so any non-zero `registered_until` looks
+/// live and the read is skipped. This is benign: if the capability has actually
+/// expired on-chain, the redemption simply no-ops as transient-empty at the
+/// contract, which stays the authoritative backstop.
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// Whether a capability/grace deadline has passed. `deadline == 0` means
-/// "untracked / never" and is treated as not passed — the safe direction (keep
-/// serving/redeeming) when the deadline is unknown.
-pub(crate) const fn is_expired(now: u64, deadline: u64) -> bool {
-    deadline != 0 && now >= deadline
 }
 
 /// Debounce thresholds for the watcher scan checkpoint (#784). The persisted
@@ -223,6 +227,7 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     redeem_threshold: U256,
     redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
+    pool_view: PoolProjection,
     /// The redemption task handle. Held so shutdown can abort+await it before a
     /// final redeem sweep. `take()`n by [`Self::quiesce_redeemer`]; the [`Drop`]
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
@@ -281,16 +286,13 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         // single write path for the paid side, so a drained-pool partial pay is
         // recorded exactly — the node never assumes its voucher cleared.
         let sink = PoolSettlementSink {
-            contract: contract.clone(),
             self_address,
             store: Arc::clone(&store),
             handler,
             paid: paid.clone(),
-            capabilities: Arc::clone(&capabilities),
             redeem_tx: redeem_tx.clone(),
-            redeem_max_vouchers_per_tx,
             metrics: Arc::clone(&metrics),
-            pool_view,
+            pool_view: pool_view.clone(),
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -331,6 +333,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_interval,
             redeem_rx,
             Arc::clone(&metrics),
+            pool_view.clone(),
         ));
 
         Ok((
@@ -344,6 +347,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 redeem_threshold,
                 redeem_max_vouchers_per_tx,
                 metrics,
+                pool_view,
                 redeemer: std::sync::Mutex::new(Some(redeemer)),
             },
             route,
@@ -402,6 +406,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             self.redeem_max_vouchers_per_tx,
             false,
             &self.metrics,
+            &self.pool_view,
         )
         .await;
     }
@@ -501,10 +506,10 @@ fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
 }
 
 /// The settlement route's demux key: every `PaymentPool` lifecycle event the
-/// paid-watermark cache and close monitor need. Split out from
+/// paid-watermark cache and pool projection need. Split out from
 /// [`PoolSettlementService::bootstrap`] so the exact topic0 set is
 /// unit-testable without a provider — dropping `PoolOpened` here, for example,
-/// would silently blind the close monitor to newly opened pools.
+/// would silently blind the projection to newly opened pools.
 fn settlement_route_topic0s() -> Vec<B256> {
     vec![
         PaymentPool::PoolOpened::SIGNATURE_HASH,
@@ -515,35 +520,32 @@ fn settlement_route_topic0s() -> Vec<B256> {
     ]
 }
 
-/// Applies `PaymentPool` settlement logs to the paid-watermark cache and drives
-/// the close monitor. One per settlement watcher; the resumable `eth_getLogs`
+/// Applies `PaymentPool` settlement logs to the paid-watermark cache and pool
+/// projection. One per settlement watcher; the resumable `eth_getLogs`
 /// poller feeds it block-ordered logs and advances + persists the scan checkpoint
 /// per window on a clean tick.
 ///
 /// Failure policy: paid-watermark updates are in-memory and always `Ok`. A
 /// `PoolReclaimed` forget failure is logged and skipped (`Ok`) — the settled lane
-/// owes nothing and the forget is idempotent. The close monitor is best-effort
-/// and never fails the tick. An undecodable log is log-and-skip so a permanently
-/// undecodable log never hot-loops the deterministic re-scan.
-struct PoolSettlementSink<P: Provider + Clone> {
-    contract: PaymentPool::PaymentPoolInstance<P>,
+/// owes nothing and the forget is idempotent. An undecodable log is log-and-skip
+/// so a permanently undecodable log never hot-loops the deterministic re-scan.
+struct PoolSettlementSink {
     self_address: Address,
     store: Arc<dyn PoolStateStore>,
     handler: Arc<ClientHandler>,
     paid: PaidWatermarks,
-    capabilities: Arc<dyn CapabilitySource>,
     redeem_tx: mpsc::Sender<LaneKey>,
-    redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
     /// The serve path's pool solvency/funder view. This sink is its single writer:
     /// it folds `PoolOpened` (owner + deposit), `PoolToppedUp` (new deposit),
-    /// `PoolRedeemed` for EVERY provider (pool-wide `totalRedeemed`), and
-    /// `PoolReclaimed` (drop) into the projection so a serve request reads
-    /// `{owner, remaining}` in-memory rather than through a `getPool` `eth_call`.
+    /// `PoolRedeemed` for EVERY provider (pool-wide `totalRedeemed`),
+    /// `PoolCloseInitiated` (mark `Closing` with its deadline), and `PoolReclaimed`
+    /// (drop) into the projection so a serve request reads `{owner, remaining}`
+    /// in-memory rather than through a `getPool` `eth_call`.
     pool_view: PoolProjection,
 }
 
-impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
+impl LogSink for PoolSettlementSink {
     #[allow(clippy::cognitive_complexity)]
     async fn apply(&mut self, log: Log) -> Result<()> {
         match log.topic0().copied() {
@@ -624,27 +626,16 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                         return Ok(());
                     }
                 };
-                debug!(
-                    pool_id = %event.poolId,
-                    dispute_deadline = %event.disputeDeadline,
-                    "PoolCloseInitiated observed; redeeming this node's lanes before the deadline"
-                );
-                // Best-effort and INLINE: redeem the node's highest voucher per
-                // lane before the owner can reclaim. Never returns `Err` — a
-                // benign revert (already fully redeemed, window closed) must not
-                // fail the tick and re-scan the window.
-                redeem_pool_on_close(
-                    &self.contract,
-                    &self.store,
-                    &self.capabilities,
-                    &self.paid,
-                    self.self_address,
+                // Mark the pool `Closing` in the projection so the redeemer's
+                // solvency gate reads its dispute deadline: a lane whose pool is
+                // drained or already past the deadline is dropped from planning
+                // instead of submitting a `redeemMany` that reverts `PoolClosed`.
+                // The node runs no force-redeem here — the periodic sweep redeems
+                // every lane worth the gas well inside the grace window.
+                self.pool_view.record_closing(
                     event.poolId,
-                    saturating_u64(event.disputeDeadline),
-                    self.redeem_max_vouchers_per_tx,
-                    &self.metrics,
-                )
-                .await;
+                    u64::try_from(event.disputeDeadline).unwrap_or(u64::MAX),
+                );
             }
             Some(sig) if sig == PaymentPool::PoolReclaimed::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolReclaimed::decode_log_data(&log.inner.data) {
@@ -671,7 +662,7 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
     }
 }
 
-impl<P: Provider + Clone> PoolSettlementSink<P> {
+impl PoolSettlementSink {
     /// Hint the redeemer for every lane of `pool_id` this node provides, so a
     /// top-up re-drives lanes a dry pool left `owed > paid`. Best-effort: a full
     /// hint channel drops the nudge (the self-tick sweep is the backstop).
@@ -718,69 +709,6 @@ impl<P: Provider + Clone> PoolSettlementSink<P> {
     }
 }
 
-/// Narrow an on-chain `uint256` deadline to `u64`, clamping an out-of-range value
-/// to `u64::MAX` ("effectively never") — the safe direction for a redeem deadline.
-fn saturating_u64(v: U256) -> u64 {
-    u64::try_from(v).unwrap_or(u64::MAX)
-}
-
-/// Redeem this node's highest voucher per lane of a closing pool before its grace
-/// deadline (ADR 003 § Owner reclaims before a node redeems). Best-effort: a
-/// per-lane failure is logged and never propagated. Forces redemption regardless
-/// of the floor — a node that has not redeemed by the deadline forfeits its
-/// outstanding vouchers.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
-async fn redeem_pool_on_close<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &Arc<dyn PoolStateStore>,
-    capabilities: &Arc<dyn CapabilitySource>,
-    paid: &PaidWatermarks,
-    self_address: Address,
-    pool_id: PoolId,
-    dispute_deadline: u64,
-    max_vouchers: usize,
-    metrics: &Arc<Metrics>,
-) {
-    if is_expired(unix_now(), dispute_deadline) {
-        debug!(%pool_id, "grace window already closed; skipping close-redeem");
-        return;
-    }
-    let states = match store.load_all() {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(%err, %pool_id, "close-redeem: failed to load lane state");
-            return;
-        }
-    };
-    let pool_states: Vec<LaneState> = states
-        .into_iter()
-        .filter(|st| st.pool_id == pool_id && st.provider == self_address)
-        .collect();
-    let plans = plan_lanes(
-        contract,
-        store,
-        capabilities,
-        paid,
-        self_address,
-        pool_states,
-        metrics,
-    )
-    .await;
-    // Force: any non-zero unredeemed balance is worth redeeming before reclaim.
-    // The close path redeems regardless of a flush failure — forfeiting the claim
-    // at the deadline is worse than a bounded re-serve risk (`strict_flush` false).
-    redeem_planned_lanes(
-        contract,
-        store,
-        plans,
-        U256::ZERO,
-        max_vouchers,
-        false,
-        metrics,
-    )
-    .await;
-}
-
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
 /// its aggregate unredeemed value clears the floor, driven by two sources —
 /// advisory hints ([`LaneKey`]) from the voucher-accept path and a
@@ -799,6 +727,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     redeem_interval: Duration,
     mut redeem_rx: mpsc::Receiver<LaneKey>,
     metrics: Arc<Metrics>,
+    pool_view: PoolProjection,
 ) {
     let mut ticker = tokio::time::interval(redeem_interval);
     // Skip the immediate first tick: nothing has accrued right after bootstrap,
@@ -810,7 +739,7 @@ async fn redeemer_loop<P: Provider + Clone>(
                 Some(key) => {
                     redeem_one(
                         &contract, &store, &capabilities, &paid, self_address,
-                        redeem_threshold, max_vouchers, key, &metrics,
+                        redeem_threshold, max_vouchers, key, &metrics, &pool_view,
                     )
                     .await;
                 }
@@ -820,7 +749,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             _ = ticker.tick() => {
                 redeem_sweep(
                     &contract, &store, &capabilities, &paid, self_address,
-                    redeem_threshold, max_vouchers, true, &metrics,
+                    redeem_threshold, max_vouchers, true, &metrics, &pool_view,
                 )
                 .await;
             }
@@ -906,6 +835,50 @@ fn chunk_redemptions(
             sum >= floor
         })
         .collect()
+}
+
+/// Redemption policy: whether a lane whose pool has this `status` is worth
+/// submitting now. Fails OPEN on an unknown pool (`None`) — a projection gap
+/// (cold start, reorg, an unfolded event) must never hold a lane and strand real
+/// money; only a positive zero-`remaining` holds. A drained `Open` pool is held
+/// (a top-up re-drives it); a drained `Closing` pool is dropped (it cannot be
+/// topped up, so `remaining == 0` is irreversible); a funded `Closing` pool is
+/// redeemable only before its deadline, past which `redeemMany` reverts
+/// `PoolClosed`.
+fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
+    match status {
+        None => true,
+        Some(s) => {
+            if s.remaining.is_zero() {
+                return false;
+            }
+            match s.lifecycle {
+                Lifecycle::Open => true,
+                Lifecycle::Closing { deadline } => now < deadline,
+            }
+        }
+    }
+}
+
+/// Split candidate lanes into the ones whose pool can pay now and a count of the
+/// ones held/dropped by [`pool_is_redeemable`]. A pool absent from `snapshot` is
+/// `None` (fail open).
+fn partition_redeemable(
+    states: Vec<LaneState>,
+    snapshot: &HashMap<PoolId, Option<PoolStatus>>,
+    now: u64,
+) -> (Vec<LaneState>, usize) {
+    let mut kept = Vec::with_capacity(states.len());
+    let mut skipped = 0usize;
+    for st in states {
+        let pool_status = snapshot.get(&st.pool_id).copied().flatten();
+        if pool_is_redeemable(pool_status, now) {
+            kept.push(st);
+        } else {
+            skipped += 1;
+        }
+    }
+    (kept, skipped)
 }
 
 /// Whether a lane's observed registration is still live at `now`. `0`
@@ -1031,7 +1004,7 @@ async fn batched_authorizations<P: Provider + Clone>(
 /// the observed `expiry` is persisted so later sweeps skip its read too. A batch
 /// read failure defers the read-needing lanes to the next sweep (their planning
 /// is dropped this pass) while still planning the known-registered lanes.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 async fn plan_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -1040,8 +1013,21 @@ async fn plan_lanes<P: Provider + Clone>(
     self_address: Address,
     states: Vec<LaneState>,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) -> Vec<PlannedLane> {
     let now = unix_now();
+    // Solvency gate first: hold/drop lanes whose pool cannot pay, before any
+    // getAuthorizations read or planning. Fail open on an unknown pool.
+    let mut snapshot: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
+    for st in &states {
+        snapshot
+            .entry(st.pool_id)
+            .or_insert_with(|| pool_view.snapshot(st.pool_id));
+    }
+    let (states, skipped) = partition_redeemable(states, &snapshot, now);
+    if skipped > 0 {
+        metrics.redemption_skipped_insolvent_by(skipped as u64);
+    }
     let read_keys: Vec<LaneKey> = states
         .iter()
         .filter(|st| st.provider == self_address && !is_registered(st.registered_until, now))
@@ -1107,6 +1093,7 @@ async fn redeem_one<P: Provider + Clone>(
     max_vouchers: usize,
     key: LaneKey,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) {
     let st = match store.get(key) {
         Ok(Some(st)) => st,
@@ -1125,6 +1112,7 @@ async fn redeem_one<P: Provider + Clone>(
         self_address,
         vec![st],
         metrics,
+        pool_view,
     )
     .await;
     // Hint path: require the durability floor and skip the submit on a failed
@@ -1148,6 +1136,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     max_vouchers: usize,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) {
     let states = match store.load_all() {
         Ok(s) => s,
@@ -1164,6 +1153,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         self_address,
         states,
         metrics,
+        pool_view,
     )
     .await;
     redeem_planned_lanes(
@@ -1514,6 +1504,78 @@ fn is_oversize_send_err(msg: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn status(remaining: u64, lifecycle: Lifecycle) -> PoolStatus {
+        PoolStatus {
+            owner: Address::from([1u8; 20]),
+            remaining: U256::from(remaining),
+            lifecycle,
+        }
+    }
+
+    #[test]
+    fn unknown_pool_fails_open() {
+        assert!(pool_is_redeemable(None, 1_000));
+    }
+
+    #[test]
+    fn open_funded_is_redeemable() {
+        assert!(pool_is_redeemable(
+            Some(status(500, Lifecycle::Open)),
+            1_000
+        ));
+    }
+
+    #[test]
+    fn open_drained_is_held() {
+        assert!(!pool_is_redeemable(Some(status(0, Lifecycle::Open)), 1_000));
+    }
+
+    #[test]
+    fn closing_drained_is_dropped() {
+        assert!(!pool_is_redeemable(
+            Some(status(0, Lifecycle::Closing { deadline: 2_000 })),
+            1_000
+        ));
+    }
+
+    #[test]
+    fn closing_funded_before_deadline_is_redeemable() {
+        assert!(pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            1_999
+        ));
+    }
+
+    #[test]
+    fn closing_funded_at_or_after_deadline_is_dropped() {
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            2_000
+        ));
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            2_500
+        ));
+    }
+
+    #[test]
+    fn partition_keeps_redeemable_and_counts_skips() {
+        // pool 1: open+funded (keep), pool 2: open+drained (skip), pool 3: unknown (keep, fail open)
+        let s1 = signed_lane_state(1, 10, 20);
+        let s2 = signed_lane_state(2, 11, 20);
+        let s3 = signed_lane_state(3, 12, 20);
+        let mut snap: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
+        snap.insert(s1.pool_id, Some(status(500, Lifecycle::Open)));
+        snap.insert(s2.pool_id, Some(status(0, Lifecycle::Open)));
+        // s3's pool intentionally absent from snap -> None -> fail open
+        let (kept, skipped) = partition_redeemable(vec![s1.clone(), s2, s3.clone()], &snap, 1_000);
+        let kept_pools: Vec<_> = kept.iter().map(|st| st.pool_id).collect();
+        assert_eq!(skipped, 1);
+        assert!(kept_pools.contains(&s1.pool_id));
+        assert!(kept_pools.contains(&s3.pool_id));
+        assert_eq!(kept.len(), 2);
+    }
+
     /// Build a [`PlannedLane`] for a given pool/signer, with an optional
     /// capability registration, for `group_by_pool` tests.
     fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane {
@@ -1791,8 +1853,13 @@ mod tests {
     }
 
     /// The settlement route watches exactly the five `PaymentPool` lifecycle
-    /// events — no more, no fewer. `PoolOpened` in particular must never be
-    /// dropped: it is the close monitor's only signal that a pool exists.
+    /// events the paid-watermark cache and pool projection need — no more, no
+    /// fewer. `PoolOpened` in particular must never be dropped: it is the
+    /// projection's only signal that a pool exists. `PoolCloseInitiated` folds a
+    /// pool's `Closing` deadline into the projection so the redeemer's solvency
+    /// gate drops a drained or past-deadline lane instead of submitting a
+    /// `redeemMany` that reverts `PoolClosed`; the node still runs no force-redeem
+    /// on close.
     #[test]
     fn route_topic0s_covers_every_pool_lifecycle_event() {
         assert_eq!(

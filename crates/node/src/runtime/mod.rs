@@ -64,6 +64,12 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// keyspace is empty.
 const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 
+/// Sampling period for the load-shed controller's egress-bytes EWMA. One
+/// second keeps the `ResourcePressure` policy's egress-budget check
+/// responsive to short bursts, without sampling so often that the EWMA
+/// mostly reflects request-arrival jitter.
+const EGRESS_EWMA_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Interval between periodic GC sweeps of the DHT rate-limiter's per-IP
 /// and per-peer keyed maps (#645). 60s matches `DISPATCH_GC_INTERVAL` —
 /// the two limiters share the same operator mental model for keyspace
@@ -738,6 +744,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// threaded to the node-origin pull path for the region-latency penalty.
     registry_regions: Arc<std::sync::RwLock<std::collections::HashMap<crate::dht::NodeId, String>>>,
     client_handler: Arc<ClientHandler>,
+    /// Shared with the reload state (`attach_load_shed`) and the egress-EWMA
+    /// sampling tick spawned in [`spawn_background_tasks`], so all three see
+    /// the same live policy.
+    shed_controller: Arc<crate::load_shed::LoadShedController>,
     payment_service: PoolSettlementService<P>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
@@ -957,6 +967,7 @@ async fn build_chain_and_handlers(
         slash_domain.clone(),
         rate_bounds.clone(),
         stake_lane_policy,
+        cfg.cache.relay_foreign_namespaces,
     ));
 
     // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
@@ -1225,6 +1236,14 @@ async fn build_chain_and_handlers(
     // drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
+    // Overload-protection gate (load-shed): sheds new serves under resource
+    // pressure so in-flight streams stay fast. Bound to a named local, not
+    // inlined into the deps literal, so the reload section (`[load_shed]`,
+    // hot-reloadable via `RuntimeReloadState::attach_load_shed`) and the
+    // egress-EWMA sampling tick spawned in `spawn_background_tasks` both
+    // reach the SAME controller.
+    let shed_controller = crate::load_shed::LoadShedController::from_config(&cfg.load_shed);
+    reload_state.attach_load_shed(Some(Arc::clone(&shed_controller)));
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1244,6 +1263,7 @@ async fn build_chain_and_handlers(
         MAX_CLIENT_STREAMS,
         Arc::clone(&content_denylist),
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
+        Arc::clone(&shed_controller),
     );
     // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
     // gate persists a presented capability so the redeemer registers the signer
@@ -1279,14 +1299,16 @@ async fn build_chain_and_handlers(
     // and the eviction path forgets, plus the live operator fee-share cell.
     client_deps.warming = Arc::clone(&warming);
     client_deps.operator_shares = operator_shares.clone();
+    // Origin-only policy (#1759): backend-authoritative own/foreign decision.
+    client_deps.relay_foreign_namespaces = cfg.cache.relay_foreign_namespaces;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
-    // (the staker-set provider above is read-only) signs the `withdraw` /
-    // `closeChannel` transactions with the same eth keystore signer. The
-    // bootstrap self-checks the contract via `usdc()`; the watcher persists
-    // channels opened against this node so the handler accepts their vouchers,
-    // and forgets settled ones. Redemption is purely periodic: a self-tick
+    // (the staker-set provider above is read-only) signs the `redeemMany`
+    // transactions with the same eth keystore signer. The bootstrap
+    // self-checks the contract via `usdc()`; the watcher folds `PaymentPool`
+    // events so the serve path reads pool solvency in-memory, and forgets a
+    // reclaimed pool's lanes. Redemption is purely periodic: a self-tick
     // flushes the lane store then sweeps every above-threshold lane.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it
@@ -1451,6 +1473,7 @@ async fn build_chain_and_handlers(
         dht_routing,
         registry_regions,
         client_handler,
+        shed_controller,
         payment_service,
         blacklist_ready_rx,
         binding_report,
@@ -1470,6 +1493,7 @@ async fn build_chain_and_handlers(
 struct Background {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
+    egress_ewma_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
     origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
@@ -1582,6 +1606,20 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     "dispatch GC sweep complete"
                 );
             }
+        })
+    };
+
+    // Periodic load-shed egress-EWMA sample: folds the last interval's served
+    // bytes into the controller's smoothed rate and republishes it as the
+    // gauges the `ResourcePressure` policy's egress-budget check reads live
+    // from `try_admit`, and that operators watch via metrics.
+    let egress_ewma_stop_tx = {
+        let shed = Arc::clone(&ch.shed_controller);
+        let metrics = Arc::clone(&infra.node_metrics);
+        spawn_periodic(&mut tasks, "egress_ewma", EGRESS_EWMA_INTERVAL, move || {
+            let bps = shed.sample_egress(EGRESS_EWMA_INTERVAL.as_secs());
+            metrics.load_shed_egress_bps(i64::try_from(bps).unwrap_or(i64::MAX));
+            metrics.load_shed_pressure_active(shed.pressure_active());
         })
     };
 
@@ -1728,14 +1766,22 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // the logged count honest and coalesces a hash that is both stored and
     // origin-held into one jitter draw. On a store list-error we still seed the
     // origin-held set — announce degrades only for the store half.
+    //
+    // Under the origin-only policy (`relay_foreign_namespaces == false`) the
+    // store union is skipped: the store may still hold leftover foreign
+    // content from before the toggle was set, and seeding it would announce
+    // blobs the serve gate now declines. Own content is unaffected — it lives
+    // in `origin_held_hashes()` regardless of the toggle.
     let mut cold_start_set: std::collections::HashSet<decdn_cache::Hash> =
         infra.cache.origin_held_hashes().into_iter().collect();
-    match infra.cache.iter_hashes().await {
-        Ok(hashes) => cold_start_set.extend(hashes),
-        Err(err) => tracing::warn!(
-            error = %err,
-            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
-        ),
+    if cfg.cache.relay_foreign_namespaces {
+        match infra.cache.iter_hashes().await {
+            Ok(hashes) => cold_start_set.extend(hashes),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
+            ),
+        }
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
         cold_start_set
@@ -2144,6 +2190,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     Ok(Background {
         metrics_stop_tx,
         dispatch_gc_stop_tx,
+        egress_ewma_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
         eviction_stop_tx,
@@ -2220,6 +2267,7 @@ pub async fn run(
     let handles = ShutdownHandles {
         metrics_stop_tx: bg.metrics_stop_tx,
         dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
+        egress_ewma_stop_tx: bg.egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
         origin_rescan_stop_tx: bg.origin_rescan_stop_tx,
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
@@ -2251,6 +2299,7 @@ pub async fn run(
 struct ShutdownHandles<P: Provider + Clone + 'static> {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
+    egress_ewma_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
@@ -2295,6 +2344,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let ShutdownHandles {
         metrics_stop_tx,
         dispatch_gc_stop_tx,
+        egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
@@ -2335,6 +2385,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    // Best-effort, same rationale as the dispatch-GC stop above: the egress
+    // EWMA tick only exits early on a panic, which surfaces through
+    // `JoinSet::join_next` during the drain phase below.
+    let _ = egress_ewma_stop_tx.send(());
     // Cancel a still-running buyer bootstrap and release the task's
     // process-lifetime hold on the service (#1109). Best-effort: on the
     // bootstrap-failed path the task already returned and dropped the receiver,
@@ -3048,6 +3102,7 @@ async fn build_cache(
     // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
     engine.set_origin_probe_config(
         std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
+        std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
         std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
         usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
     );
@@ -3761,6 +3816,8 @@ mod tests {
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_negative_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
@@ -3771,6 +3828,7 @@ mod tests {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
@@ -3814,6 +3872,7 @@ mod tests {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
+            load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),

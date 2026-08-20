@@ -20,11 +20,11 @@ use crate::redact::redact_userinfo;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent, ResolvedDht,
-    ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe, ResolvedReceipts,
-    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServeEconomics,
-    ResolvedTinyLfu,
+    LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
+    ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
+    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
 
@@ -94,6 +94,12 @@ const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
 const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
+/// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
+/// node's only defense against an owner's grace-window close — it must run several
+/// times inside the 48h grace floor so accrued vouchers redeem before the owner
+/// can `reclaim`. 6h leaves 8× headroom for tx landing and retries. An operator
+/// who wants a laxer cadence to shave gas builds from source or opens an issue.
+const MAX_REDEEM_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// Default pool-open and refill-target deposit every top-up restores the pool
 /// balance toward: 10 USDC (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics
 /// recommends a 10 USDC practical minimum (gas overhead ~2.3%); it is a
@@ -123,6 +129,14 @@ const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
 const DEFAULT_PER_SOURCE_BURST: u32 = 200;
 /// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
+/// Egress ceiling off unless the operator sets one.
+const DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS: u64 = 0;
+/// Load-shed concurrency high-water mark (start shedding misses at/above).
+const DEFAULT_LOAD_SHED_SERVES_HIGH: u32 = 256;
+/// Load-shed concurrency low-water mark (resume at/below).
+const DEFAULT_LOAD_SHED_SERVES_LOW: u32 = 192;
+/// Default per-client concurrent-serve cap under pressure.
+const DEFAULT_LOAD_SHED_PER_CLIENT_CAP: u32 = 32;
 /// Default sustained per-peer (`NodeId`) rate for `cdn/dht/v1` inbound
 /// (ADR 022 §DHT Rate Limiting). Conservative ceiling on adversarial load,
 /// not a steady-state target.
@@ -186,6 +200,13 @@ pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 /// probe-hold horizon.
 pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
 
+/// Default TTL in seconds for a memoised `Absent` live-origin probe answer.
+/// Short on purpose: it bounds how long a stale `Absent` can hide
+/// newly-available own content from a probe, while a random-hash flood never
+/// repeats a hash within any window so the short TTL barely changes flood
+/// cost.
+pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
+
 /// Default per-probe ceiling in milliseconds on the live-origin
 /// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the probe hot
 /// path; on overrun the probe answers `has_blob: false` and memoises the miss.
@@ -194,6 +215,14 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
 /// Default cap on distinct hashes in the live-origin probe memo (#1130 pt3).
 /// Bounds memo memory under a random-hash probe flood.
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
+
+/// Fallback for `cache.relay_foreign_namespaces` (#1759) on a node with no
+/// origin configured. The resolver's effective default is role-derived, not
+/// this flat constant: an origin node (a backend is configured) defaults to
+/// origin-only (`false`) — an origin is not a general proxy — while a
+/// no-origin node is a pure relay edge and falls back to this `true`. An
+/// operator sets the field explicitly to override either default.
+pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
 /// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
@@ -258,8 +287,11 @@ pub const DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS: u32 = 5000;
 /// Default `cache.serve_economics.n_max` (ADR 041).
 pub const DEFAULT_SERVE_ECONOMICS_N_MAX: u32 = 64;
 /// Default `cache.serve_economics.warming_budget` (ADR 041). $5 in USDC
-/// 6-decimal base units. Debited by the speculative gap (~`0.4·P_sell`), so on
-/// a $0.01/GB flat mesh this covers ~1,250 GB of cold warming per source.
+/// 6-decimal base units. The per-source net-P&L ledger is debited the full
+/// upstream buy cost on a speculative pull and credited the realized operator
+/// margin on each serve, so a one-hit blob nets the fee skim (~`0.4·P_sell`) as
+/// its lasting loss; on a $0.01/GB flat mesh this `$5` bounds roughly 1,250 GB of
+/// unrecovered one-hit warming per source before it drops to the profit floor.
 pub const DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET: u64 = 5_000_000;
 /// Default `cache.serve_economics.warming_refill` (ADR 041). ~$5/day: honest
 /// sources recover their allowance daily; sustained grief is bounded to
@@ -493,6 +525,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let observability =
         resolve_observability_into(&cli.observability, file.observability.as_ref(), &mut bag);
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
+    let load_shed = resolve_load_shed_into(file.load_shed.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
@@ -511,6 +544,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         payment,
         observability,
         security,
+        load_shed,
         dht,
         probe,
         receipts,
@@ -1454,6 +1488,21 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
+    // The sweep is the only thing that redeems this node's vouchers before an
+    // owner's grace-window close lets them `reclaim`. It must run several times
+    // inside the 48h grace floor, so cap the interval at 6h — a laxer cadence
+    // risks forfeiting real earnings on a pool that closes between sweeps.
+    bag.check_with(
+        redeem_interval_secs <= MAX_REDEEM_INTERVAL_SECS,
+        "blockchain.redeem_interval_secs",
+        || {
+            format!(
+                "blockchain.redeem_interval_secs must be <= {MAX_REDEEM_INTERVAL_SECS} (6h): the \
+                 redeem sweep must run well inside the 48h grace window to secure vouchers \
+                 before an owner can reclaim a closing pool"
+            )
+        },
+    );
 
     let redeem_max_vouchers_per_tx = file
         .and_then(|b| b.redeem_max_vouchers_per_tx)
@@ -1661,6 +1710,9 @@ fn resolve_cache_into(
     let origin_probe_ttl_sec = file
         .and_then(|c| c.origin_probe_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TTL_SEC);
+    let origin_probe_negative_ttl_sec = file
+        .and_then(|c| c.origin_probe_negative_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
     let origin_probe_timeout_ms = file
         .and_then(|c| c.origin_probe_timeout_ms)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
@@ -1761,6 +1813,12 @@ fn resolve_cache_into(
     let node_to_node_pull_through_enabled = file
         .and_then(|c| c.node_to_node_pull_through_enabled)
         .unwrap_or(false);
+    let relay_foreign_namespaces = file
+        .and_then(|c| c.relay_foreign_namespaces)
+        // Role-derived default: an origin node (a backend is configured) serves only
+        // its own namespace; a node with no origin is a pure relay edge and relays.
+        // Explicit config overrides either way.
+        .unwrap_or(origins.is_empty());
     let node_pull_probe_fanout = file
         .and_then(|c| c.node_pull_probe_fanout)
         .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
@@ -1912,6 +1970,7 @@ fn resolve_cache_into(
         gc_interval_sec,
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
+        origin_probe_negative_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,
@@ -1921,6 +1980,7 @@ fn resolve_cache_into(
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
+        relay_foreign_namespaces,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
@@ -2862,6 +2922,53 @@ pub fn resolve_security_into(
         per_source_rate_per_sec,
         per_source_burst,
         max_tracked_sources,
+    }
+}
+
+/// Resolve node-local load-shedding thresholds.
+pub fn resolve_load_shed(file: Option<&types::LoadShedConfig>) -> anyhow::Result<ResolvedLoadShed> {
+    one_section(|bag| resolve_load_shed_into(file, bag))
+}
+
+/// Bag-threading variant of [`resolve_load_shed`]. Shares a bag with other
+/// sections during startup ([`resolve_config`]) and SIGHUP reload
+/// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
+pub fn resolve_load_shed_into(
+    file: Option<&types::LoadShedConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedLoadShed {
+    let policy = match file.and_then(|c| c.policy.as_deref()) {
+        None | Some("resource-pressure") => LoadShedPolicyKind::ResourcePressure,
+        Some("always-admit") => LoadShedPolicyKind::AlwaysAdmit,
+        Some(other) => {
+            bag.push(
+                "load_shed.policy",
+                format!(
+                    "load_shed.policy must be \"resource-pressure\" or \"always-admit\", got {other:?}"
+                ),
+            );
+            LoadShedPolicyKind::ResourcePressure
+        }
+    };
+    let high = file
+        .and_then(|c| c.max_concurrent_serves_high)
+        .unwrap_or(DEFAULT_LOAD_SHED_SERVES_HIGH);
+    let low = file
+        .and_then(|c| c.max_concurrent_serves_low)
+        .unwrap_or(DEFAULT_LOAD_SHED_SERVES_LOW);
+    bag.check_with(high >= low, "load_shed.max_concurrent_serves_high", || {
+        format!("load_shed.max_concurrent_serves_high ({high}) must be >= _low ({low})")
+    });
+    ResolvedLoadShed {
+        policy,
+        egress_budget_mbps: file
+            .and_then(|c| c.egress_budget_mbps)
+            .unwrap_or(DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS),
+        max_concurrent_serves_high: high,
+        max_concurrent_serves_low: low,
+        per_client_serve_cap: file
+            .and_then(|c| c.per_client_serve_cap)
+            .unwrap_or(DEFAULT_LOAD_SHED_PER_CLIENT_CAP),
     }
 }
 
@@ -4651,6 +4758,64 @@ swap_pool_address = \"0xPool\"
             resolved.origins.is_empty(),
             "absent origin section must yield empty vec, got len {}",
             resolved.origins.len(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_defaults_false_with_origin() -> anyhow::Result<()> {
+        // Role-derived default (#1759): a node with an origin backend
+        // configured is an origin, not a general proxy — absent an explicit
+        // override it defaults to origin-only (`false`).
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            !resolved.relay_foreign_namespaces,
+            "a node with an origin configured must default to origin-only (relay_foreign_namespaces = false)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_defaults_true_without_origin() -> anyhow::Result<()> {
+        // Role-derived default (#1759): a node with no origin backend is a
+        // pure relay edge — its only function is relaying, so absent an
+        // explicit override it defaults to relay (`true`).
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig::default();
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.relay_foreign_namespaces,
+            "a node with no origin configured must default to relay (relay_foreign_namespaces = true)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_explicit_true_overrides_origin_default()
+    -> anyhow::Result<()> {
+        // Explicit config always wins: an origin node may opt back into
+        // relay to also earn relay revenue.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            relay_foreign_namespaces: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.relay_foreign_namespaces,
+            "an explicit relay_foreign_namespaces = true must override the origin-only default"
         );
         Ok(())
     }
@@ -8863,6 +9028,62 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
+    fn resolve_blockchain_rejects_redeem_interval_above_grace_margin() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS + 1),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem interval exceeds the 6h cap");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_interval_secs"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_redeem_interval_at_grace_margin() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.redeem_interval_secs, MAX_REDEEM_INTERVAL_SECS);
+        Ok(())
+    }
+
+    #[test]
     fn resolve_blockchain_rejects_zero_redeem_max_vouchers_per_tx() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
@@ -10241,6 +10462,41 @@ bind_port = 12345
                 < f64::EPSILON
         );
         assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+    }
+
+    // --- resolve_load_shed ----------------------------------------------------
+
+    #[test]
+    fn load_shed_defaults_are_resource_pressure() {
+        let r = resolve_load_shed(None).expect("defaults resolve");
+        assert_eq!(r.policy, LoadShedPolicyKind::ResourcePressure);
+        assert_eq!(r.egress_budget_mbps, DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS);
+        assert!(r.max_concurrent_serves_high >= r.max_concurrent_serves_low);
+    }
+
+    #[test]
+    fn load_shed_rejects_high_below_low() {
+        let raw = types::LoadShedConfig {
+            max_concurrent_serves_high: Some(10),
+            max_concurrent_serves_low: Some(20),
+            ..Default::default()
+        };
+        assert!(
+            resolve_load_shed(Some(&raw)).is_err(),
+            "high < low must be a config error"
+        );
+    }
+
+    #[test]
+    fn load_shed_parses_always_admit() {
+        let raw = types::LoadShedConfig {
+            policy: Some("always-admit".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_load_shed(Some(&raw)).expect("parse").policy,
+            LoadShedPolicyKind::AlwaysAdmit
+        );
     }
 
     // --- resolve_dht: keyspace caps (#645) -----------------------------------
