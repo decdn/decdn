@@ -2262,6 +2262,7 @@ mod tests {
             Some(crate::pool_view::PoolStatus {
                 owner: self.owner,
                 remaining: U256::MAX,
+                lifecycle: crate::pool_view::Lifecycle::Open,
             })
         }
     }

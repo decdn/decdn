@@ -7582,6 +7582,7 @@ async fn build_node_b_with_leaves(
             decdn_node::pool_view::PoolStatus {
                 owner: *leaf_funder,
                 remaining: *leaf_deposit,
+                lifecycle: decdn_node::pool_view::Lifecycle::Open,
             },
         );
     }
