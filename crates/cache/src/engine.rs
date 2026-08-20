@@ -1296,20 +1296,30 @@ impl CacheEngine {
     /// as an authoritative absence (the origin-only serve gate) use this
     /// directly instead of the size-only wrapper.
     ///
-    /// A memo hit returns with no I/O. On a miss the origin chain is probed via
-    /// [`Self::origin_size`] under a `cache.origin_probe_timeout_ms` ceiling:
+    /// A memo hit returns with no I/O. On a miss the origin chain is walked
+    /// directly (NOT via [`Self::origin_size`] — that helper's per-origin
+    /// error handling is deliberately swallow-and-advance, so other callers
+    /// can fall through a dead origin to a live one; a fault-aware caller
+    /// needs the raw per-origin outcomes instead), under a
+    /// `cache.origin_probe_timeout_ms` ceiling for the whole walk:
     ///
-    /// - a live `Some(size)` is `Present(size)`, memoised under the positive TTL;
-    /// - a live `None` (a genuine `HEAD` 404, or [`CacheError::NoOrigin`] — this
-    ///   node has no origins configured, so it genuinely holds nothing) is
-    ///   `Absent`, memoised under the short negative TTL — deliberately, so a
-    ///   random-hash probe flood still costs at most one `HeadObject` per hash
-    ///   per negative-TTL window;
-    /// - a transport error or a timeout is `Fault`, and is **never memoised** —
-    ///   a fault is transient, so the next probe should retry the backend
-    ///   immediately rather than parrot a cached non-answer, and not caching it
-    ///   does not weaken the flood bound (an attacker's random hashes genuinely
-    ///   404, they do not fault).
+    /// - ANY origin answering `Ok(Some(size))` is `Present(size)`, memoised
+    ///   under the positive TTL — the first such answer wins, same order as
+    ///   [`Self::origin_size`];
+    /// - failing that, ANY origin answering `Err(_)` (a transport error), or
+    ///   the whole walk overrunning the timeout, is `Fault` and is **never
+    ///   memoised** — a fault is transient, so the next probe should retry
+    ///   the backend immediately rather than parrot a cached non-answer, and
+    ///   not caching it does not weaken the flood bound (an attacker's
+    ///   random hashes genuinely 404, they do not fault);
+    /// - only when every configured origin answered `Ok(None)` (a genuine
+    ///   `HEAD` 404, checked on all of them) — or no origin is configured at
+    ///   all, the old [`CacheError::NoOrigin`] case: a node with nothing
+    ///   configured genuinely holds nothing, which is not transient — is the
+    ///   answer `Absent`, memoised under the short negative TTL. This is
+    ///   deliberately the lowest-precedence outcome: if at least one origin
+    ///   is unreachable and none confirmed the object, the honest answer is
+    ///   "unknown" (`Fault`), never an authoritative `NotFound`.
     ///
     /// **Never fetches the body** — existence and size only.
     pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {
@@ -1324,22 +1334,51 @@ impl CacheEngine {
             }
             memo.timeout()
         };
-        // Live probe off the memo lock (never hold it across the await).
-        match tokio::time::timeout(timeout, self.origin_size(hash)).await {
-            Ok(Ok(Some(size))) => {
-                let presence = Presence::Present(size);
-                self.probe_memo_lock().insert(hash, presence, now);
-                OriginPresence::Present(size)
+        // Live probe off the memo lock (never hold it across the await). Own
+        // chain walk (see the doc comment above for why this does not go
+        // through `origin_size`): `Present` wins outright, a live `Err`
+        // downgrades an all-`None` sweep from `Absent` to `Fault`, and the
+        // whole walk is bounded by one timeout so a slow origin cannot stall
+        // behind a fast one that already answered.
+        let walk = async {
+            let mut any_fault = false;
+            for origin in &self.inner.origins {
+                match origin.size(hash).await {
+                    Ok(Some(size)) => return OriginPresence::Present(size),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            %hash,
+                            kind = ?origin.kind(),
+                            error = %e,
+                            "origin-probe HEAD faulted; checking remaining origins",
+                        );
+                        any_fault = true;
+                    }
+                }
             }
-            Ok(Ok(None) | Err(CacheError::NoOrigin { .. })) => {
-                self.probe_memo_lock().insert(hash, Presence::Absent, now);
+            if any_fault {
+                OriginPresence::Fault
+            } else {
                 OriginPresence::Absent
             }
-            // A true backend fault: a transport/protocol error surfaced by
-            // `origin_size`, or the live HEAD overran the probe timeout. Not
-            // memoised — see the doc comment above.
-            Ok(Err(_)) | Err(_) => OriginPresence::Fault,
+        };
+        let presence = match tokio::time::timeout(timeout, walk).await {
+            Ok(presence) => presence,
+            Err(_) => OriginPresence::Fault,
+        };
+        match presence {
+            OriginPresence::Present(size) => {
+                self.probe_memo_lock()
+                    .insert(hash, Presence::Present(size), now);
+            }
+            OriginPresence::Absent => {
+                self.probe_memo_lock().insert(hash, Presence::Absent, now);
+            }
+            // Never memoised — see the doc comment above.
+            OriginPresence::Fault => {}
         }
+        presence
     }
 
     /// Lock the origin-probe memo, recovering a poisoned mutex rather than
@@ -4548,6 +4587,95 @@ mod tests {
                 Ok(matches.then_some(size))
             })
         }
+    }
+
+    /// Origin whose `size()` (a `HEAD`/`HeadObject` stand-in) always fails
+    /// with a transport error, and COUNTS the calls — the `Fault`-arm
+    /// counterpart to [`CountingSizeOrigin`].
+    #[derive(Debug)]
+    struct FailingSizeOrigin {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FailingSizeOrigin {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    calls: Arc::clone(&calls),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl Origin for FailingSizeOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(OriginFetch::NotFound) })
+        }
+
+        fn size(
+            &self,
+            _hash: Hash,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
+        {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                    "synthetic HEAD outage (connection refused)"
+                )))
+            })
+        }
+    }
+
+    /// A per-origin transport error on the live `HEAD` — not just a timeout —
+    /// is `Fault`, never `Absent` (#1766 follow-up): `origin_probe_presence`
+    /// walks the origin chain itself rather than going through
+    /// [`CacheEngine::origin_size`], whose swallow-and-advance per-origin
+    /// error handling would otherwise launder a connection-refused/5xx/DNS
+    /// outage into a false `Ok(None)`. Also confirms the fault is never
+    /// memoised: a second probe re-walks the chain (call count 1 -> 2).
+    #[tokio::test]
+    async fn origin_probe_presence_transport_error_is_fault_not_absent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"faulting origin probe");
+        let (origin, calls) = FailingSizeOrigin::new();
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        assert_eq!(
+            engine.origin_probe_presence(hash).await,
+            OriginPresence::Fault,
+            "a per-origin transport error must be Fault, not Absent",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend HEAD attempt");
+        assert_eq!(
+            engine.origin_probe_presence(hash).await,
+            OriginPresence::Fault,
+            "a fault is never memoised",
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the second probe re-walked the origin chain rather than serving \
+             a cached fault",
+        );
+        assert_eq!(
+            engine.origin_probe_size(hash).await,
+            None,
+            "the thin size wrapper still folds Fault to None",
+        );
+        Ok(())
     }
 
     /// A present remote object is discovered by a live `HEAD` and the answer is

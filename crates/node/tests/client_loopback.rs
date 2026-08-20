@@ -7422,6 +7422,143 @@ async fn spawn_origin_only_server(
     Ok((target, server_eth.address(), server_ep, server_task))
 }
 
+/// Same as [`spawn_origin_only_server`] but also returns the server's
+/// [`Metrics`], so a test can tell a policy decline (`ForeignNamespaceDeclined`)
+/// apart from a backend fault (`InternalError`) by the operator's own counters,
+/// not just by the wire error (#1766).
+async fn spawn_origin_only_server_with_metrics(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Address,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.relay_foreign_namespaces = false;
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((
+        target,
+        server_eth.address(),
+        server_ep,
+        server_task,
+        metrics,
+    ))
+}
+
+/// #1766: an origin-only node whose own backend FAULTS on the live probe (a
+/// connection-refused `HEAD` against an unreachable http origin) must refuse
+/// with `InternalError`, NOT a signed `NotFound` — a fault is not an
+/// absence, and signing an authoritative negative during a backend outage
+/// would tell a paying client this node's own content is gone.
+///
+/// `http://127.0.0.1:1/` is used as the "unreachable" origin: port 1 is a
+/// privileged, essentially never-listening port, so `reqwest` gets an
+/// immediate connection-refused rather than a slow timeout — the origin-chain
+/// walk in `origin_probe_presence` sees a live `Err`, not the timeout arm
+/// (that arm is already covered by the cache-engine unit tests).
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
+    let hash = decdn_cache::Hash::new(b"origin-only fault probe");
+    let cache_dir = tempfile::tempdir()?;
+    let unreachable = decdn_cache::parse_origin_url("http://127.0.0.1:1/")?;
+    let origin = Arc::new(decdn_cache::HttpOrigin::new(unreachable)?);
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::new(CacheMetrics::default())),
+        Duration::ZERO,
+    )
+    .await?;
+    anyhow::ensure!(!cache.has(hash).await?, "cache store must start empty");
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
+        spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    match stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(_) => anyhow::bail!("a faulting backend probe must not deliver"),
+        Err(e) => {
+            let msg = e.to_string();
+            anyhow::ensure!(
+                msg.contains("InternalError"),
+                "a faulting backend probe must surface as InternalError, got: {e}"
+            );
+            anyhow::ensure!(
+                !msg.contains("NotFound"),
+                "a faulting backend probe must NOT sign an authoritative NotFound, got: {e}"
+            );
+        }
+    }
+
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_internal_error_total 1"
+        ),
+        "expected the fault to land in the internal-error counter, not the \
+         foreign-decline one; counters were:\n{}",
+        encoded
+            .lines()
+            .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_foreign_declined_total 0"
+        ),
+        "a backend fault must not be counted as a foreign decline"
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Build a cache holding a blob that the local STORE has already accepted (a
 /// past import) but whose backing filesystem origin no longer exists — the
 /// backend genuinely does not hold it anymore, so a fresh
