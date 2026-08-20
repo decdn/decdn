@@ -10,6 +10,10 @@ Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
+**Present-tense canon, never changelog voice.** Docstrings, comments, and ADRs describe current behavior as it is. No "replaced the old X", "used to…", "re-homed from", dates, or "supersedes". Every line must stand alone read cold; history belongs in git, not the source.
+
+**Working specs stay out of the repo.** Write specs to a scratch location while you work; never commit them. Repos store no historical specs.
+
 **ADRs.** ADRs live in `adr/`. They are the primary design artifacts. `adr/architecture.md` is the living overview. See [CONTRIBUTING.md](CONTRIBUTING.md) for ADR conventions.
 
 - The next ADR number is 040. Name each file `NNN-topic.md`. Use a 3-digit prefix.
@@ -81,4 +85,6 @@ The two binaries share `common` for config schema, identity, and admin wire type
 - No external origin URLs are ever exposed — origin backends (S3/R2/B2) are opaque per-node config
 - All byte transfers are paid, including node-to-node cache-miss pulls
 - TOKEN for staking/governance, USDC for payments (dual-currency model)
+- Payment is content-agnostic by design — no on-chain content gates. Compliance is enforced via blacklist + bounty-slash, not by gating delivery on content.
+- "Unnecessary at tens of nodes but earns its keep at scale" is not a valid reason to drop a feature. Drop-cases must hold at all scales.
 - Domain crates (`cache`, `reputation`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations. See [adr/appendix-poc-production-seams.md](adr/appendix-poc-production-seams.md) for the full Rust implementation pattern.
