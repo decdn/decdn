@@ -261,6 +261,12 @@ impl PoolProjection {
             pools.remove(&pool_id);
         });
     }
+
+    /// A non-blocking snapshot read for callers outside an async trait object.
+    #[must_use]
+    pub fn snapshot(&self, pool_id: B256) -> Option<PoolStatus> {
+        self.pools.load().get(&pool_id).map(PoolEntry::status)
+    }
 }
 
 #[async_trait::async_trait]

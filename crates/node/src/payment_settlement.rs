@@ -223,6 +223,7 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     redeem_threshold: U256,
     redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
+    pool_view: PoolProjection,
     /// The redemption task handle. Held so shutdown can abort+await it before a
     /// final redeem sweep. `take()`n by [`Self::quiesce_redeemer`]; the [`Drop`]
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
@@ -290,7 +291,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_tx: redeem_tx.clone(),
             redeem_max_vouchers_per_tx,
             metrics: Arc::clone(&metrics),
-            pool_view,
+            pool_view: pool_view.clone(),
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -331,6 +332,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_interval,
             redeem_rx,
             Arc::clone(&metrics),
+            pool_view.clone(),
         ));
 
         Ok((
@@ -344,6 +346,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 redeem_threshold,
                 redeem_max_vouchers_per_tx,
                 metrics,
+                pool_view,
                 redeemer: std::sync::Mutex::new(Some(redeemer)),
             },
             route,
@@ -402,6 +405,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             self.redeem_max_vouchers_per_tx,
             false,
             &self.metrics,
+            &self.pool_view,
         )
         .await;
     }
@@ -629,6 +633,11 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                     dispute_deadline = %event.disputeDeadline,
                     "PoolCloseInitiated observed; redeeming this node's lanes before the deadline"
                 );
+                // Mark the pool `Closing` in the serve projection so the redeemer's
+                // solvency gate and the serve path's mid-stream re-check both see
+                // the dispute deadline.
+                self.pool_view
+                    .record_closing(event.poolId, saturating_u64(event.disputeDeadline));
                 // Best-effort and INLINE: redeem the node's highest voucher per
                 // lane before the owner can reclaim. Never returns `Err` — a
                 // benign revert (already fully redeemed, window closed) must not
@@ -643,6 +652,7 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                     saturating_u64(event.disputeDeadline),
                     self.redeem_max_vouchers_per_tx,
                     &self.metrics,
+                    &self.pool_view,
                 )
                 .await;
             }
@@ -740,6 +750,7 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
     dispute_deadline: u64,
     max_vouchers: usize,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) {
     if is_expired(unix_now(), dispute_deadline) {
         debug!(%pool_id, "grace window already closed; skipping close-redeem");
@@ -764,6 +775,7 @@ async fn redeem_pool_on_close<P: Provider + Clone>(
         self_address,
         pool_states,
         metrics,
+        pool_view,
     )
     .await;
     // Force: any non-zero unredeemed balance is worth redeeming before reclaim.
@@ -799,6 +811,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     redeem_interval: Duration,
     mut redeem_rx: mpsc::Receiver<LaneKey>,
     metrics: Arc<Metrics>,
+    pool_view: PoolProjection,
 ) {
     let mut ticker = tokio::time::interval(redeem_interval);
     // Skip the immediate first tick: nothing has accrued right after bootstrap,
@@ -810,7 +823,7 @@ async fn redeemer_loop<P: Provider + Clone>(
                 Some(key) => {
                     redeem_one(
                         &contract, &store, &capabilities, &paid, self_address,
-                        redeem_threshold, max_vouchers, key, &metrics,
+                        redeem_threshold, max_vouchers, key, &metrics, &pool_view,
                     )
                     .await;
                 }
@@ -820,7 +833,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             _ = ticker.tick() => {
                 redeem_sweep(
                     &contract, &store, &capabilities, &paid, self_address,
-                    redeem_threshold, max_vouchers, true, &metrics,
+                    redeem_threshold, max_vouchers, true, &metrics, &pool_view,
                 )
                 .await;
             }
@@ -916,9 +929,6 @@ fn chunk_redemptions(
 /// topped up, so `remaining == 0` is irreversible); a funded `Closing` pool is
 /// redeemable only before its deadline, past which `redeemMany` reverts
 /// `PoolClosed`.
-// `plan_lanes` does not call this yet — the solvency gate lands as a separate
-// call site. Pure and unit-tested standalone in the meantime.
-#[allow(dead_code)]
 fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
     match status {
         None => true,
@@ -937,7 +947,6 @@ fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
 /// Split candidate lanes into the ones whose pool can pay now and a count of the
 /// ones held/dropped by [`pool_is_redeemable`]. A pool absent from `snapshot` is
 /// `None` (fail open).
-#[allow(dead_code)]
 fn partition_redeemable(
     states: Vec<LaneState>,
     snapshot: &HashMap<PoolId, Option<PoolStatus>>,
@@ -1079,7 +1088,7 @@ async fn batched_authorizations<P: Provider + Clone>(
 /// the observed `expiry` is persisted so later sweeps skip its read too. A batch
 /// read failure defers the read-needing lanes to the next sweep (their planning
 /// is dropped this pass) while still planning the known-registered lanes.
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 async fn plan_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
@@ -1088,8 +1097,21 @@ async fn plan_lanes<P: Provider + Clone>(
     self_address: Address,
     states: Vec<LaneState>,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) -> Vec<PlannedLane> {
     let now = unix_now();
+    // Solvency gate first: hold/drop lanes whose pool cannot pay, before any
+    // getAuthorizations read or planning. Fail open on an unknown pool.
+    let mut snapshot: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
+    for st in &states {
+        snapshot
+            .entry(st.pool_id)
+            .or_insert_with(|| pool_view.snapshot(st.pool_id));
+    }
+    let (states, skipped) = partition_redeemable(states, &snapshot, now);
+    if skipped > 0 {
+        metrics.redemption_skipped_insolvent_by(skipped as u64);
+    }
     let read_keys: Vec<LaneKey> = states
         .iter()
         .filter(|st| st.provider == self_address && !is_registered(st.registered_until, now))
@@ -1155,6 +1177,7 @@ async fn redeem_one<P: Provider + Clone>(
     max_vouchers: usize,
     key: LaneKey,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) {
     let st = match store.get(key) {
         Ok(Some(st)) => st,
@@ -1173,6 +1196,7 @@ async fn redeem_one<P: Provider + Clone>(
         self_address,
         vec![st],
         metrics,
+        pool_view,
     )
     .await;
     // Hint path: require the durability floor and skip the submit on a failed
@@ -1196,6 +1220,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     max_vouchers: usize,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
 ) {
     let states = match store.load_all() {
         Ok(s) => s,
@@ -1212,6 +1237,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         self_address,
         states,
         metrics,
+        pool_view,
     )
     .await;
     redeem_planned_lanes(
