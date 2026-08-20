@@ -318,6 +318,13 @@ pub struct NodeOriginConfig {
     /// BEFORE the on-chain floor clamp — the same base value the probe handler
     /// is constructed with.
     pub sell_rate_base: u64,
+    /// ADR 041 per-source warming allowance: bounds the loss from speculative
+    /// above-floor buys per upstream source node. The buy loop reads
+    /// `available(source)` to pick the warm-at-market vs amortized-floor regime,
+    /// and debits the full buy cost on a successful speculative pull. The SAME
+    /// `Arc` is shared with the serve path (which credits realized margin on each
+    /// re-serve) and the eviction path (which forgets a dropped hash's tag).
+    pub warming: Arc<crate::warming_allowance::WarmingAllowance>,
 }
 
 /// ADR 030 default heuristic (RTT > 150ms to a same-claimed-region node). The
@@ -669,6 +676,18 @@ impl NodeOrigin {
             debug!("node-origin: candidate has no resolvable operator address; skipping");
             return Err(PullMiss::Clean);
         };
+        // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
+        // ceiling BEFORE opening a channel to it, so a refusal costs nothing on the
+        // wire. A skip folds into the walk as `BelowMargin`.
+        let heat = heat_of(deps, hash_bytes);
+        let (rate_ceiling, speculative) =
+            match economic_ceiling(deps, candidate.node_id, heat, candidate.rate_per_mb) {
+                EconGate::Allow {
+                    rate_ceiling,
+                    speculative,
+                } => (rate_ceiling, speculative),
+                EconGate::Skip => return Err(PullMiss::BelowMargin),
+            };
         let ctx = match deps
             .buyer
             // Bounded by its OWN budget, not the per-candidate one (#1143). A wedged
@@ -748,14 +767,14 @@ impl NodeOrigin {
             0,
             now_micros(),
             deps.config.max_blob_size_bytes,
-            // Refuse a stream quote above the lower of the candidate's probe rate
-            // and the configured absolute ceiling, before paying (#1375).
-            // `candidate.rate_per_mb >= 1` always: `ProbeResponse::validate`
-            // rejects a zero rate (`RateIsZero`) and `probe_candidate` drops any
-            // candidate that fails `validate`, so `effective_rate_ceiling` never
-            // treats the probe bound as unbounded here — a probe-rate-0
-            // bait-and-switch cannot select through this path.
-            effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb),
+            // Refuse a stream quote above the lower of the candidate's probe rate,
+            // the configured absolute ceiling, and — under the `margin` policy — the
+            // economic buy cap, before paying (#1375, ADR 041). `candidate.rate_per_mb
+            // >= 1` always: `ProbeResponse::validate` rejects a zero rate (`RateIsZero`)
+            // and `probe_candidate` drops any candidate that fails `validate`, so
+            // `effective_rate_ceiling` never treats the probe bound as unbounded here —
+            // a probe-rate-0 bait-and-switch cannot select through this path.
+            rate_ceiling,
             deadlines,
             // Whole-tail fetch; a bounded gap request is the gap-driven driver's
             // (#1608) `source::PeerSource`, not this candidate-fallback open.
@@ -774,6 +793,8 @@ impl NodeOrigin {
                     started: Instant::now(),
                     delivered: 0,
                     hash_bytes,
+                    speculative,
+                    buy_rate_per_mb: candidate.rate_per_mb,
                     settle: SettleOnDrop {
                         deps: Arc::clone(&self.deps),
                         provider_addr,
@@ -853,6 +874,11 @@ pub struct NodeProgressivePull {
     delivered: u64,
     /// Blob hash, for failure classification and provider scoring.
     hash_bytes: [u8; 32],
+    /// ADR 041: this buy was priced above the amortized profit-guaranteed floor, so
+    /// a clean completion debits the source's warming allowance by the full buy cost.
+    speculative: bool,
+    /// The candidate's per-MB buy rate, for the speculative warming debit.
+    buy_rate_per_mb: u64,
     /// Settles the voucher watermark on EVERY exit, including a drop.
     ///
     /// A field rather than a `Drop` impl on this struct, because the terminal methods
@@ -921,6 +947,8 @@ impl NodeProgressivePull {
             started,
             delivered,
             hash_bytes,
+            speculative,
+            buy_rate_per_mb,
             settle,
             stream_guard,
         } = self;
@@ -943,6 +971,16 @@ impl NodeProgressivePull {
             Ok(_) => {
                 match tee_verdict {
                     TeeVerdict::Verified => {
+                        // ADR 041: a clean speculative pull debits the source's warming
+                        // allowance by the full buy cost. `delivered` is wire bytes; the
+                        // debit accounts them in whole MB at the candidate's buy rate.
+                        if speculative {
+                            deps.config.warming.debit_speculative(
+                                *pk.as_bytes(),
+                                hash_bytes,
+                                buy_rate_per_mb.saturating_mul(mb_of(delivered)),
+                            );
+                        }
                         record_outcome(
                             deps,
                             pk,
@@ -1636,6 +1674,98 @@ impl PullMiss {
     }
 }
 
+/// The ADR 041 buy-side economic decision for one ranked candidate.
+enum EconGate {
+    /// The candidate's quote is above this node's buy ceiling: skip it. The walk
+    /// records the skip as a [`PullMiss::BelowMargin`], so an exhausted walk whose
+    /// only failures were economic answers `NotFound` — distinct from a clean
+    /// no-provider miss for observability, identical on the wire.
+    Skip,
+    /// The candidate is buyable. `rate_ceiling` is the effective per-MB ceiling to
+    /// enforce on the stream (the lower of the candidate's probe rate, the static
+    /// `max_rate_per_mb`, and — under the `margin` policy — the economic buy cap, so
+    /// a bait-and-switch above the cap aborts mid-pull). `speculative` is true when
+    /// the quote sits above the amortized profit-guaranteed floor: a successful pull
+    /// then debits the source's warming allowance by the full buy cost.
+    Allow {
+        rate_ceiling: u64,
+        speculative: bool,
+    },
+}
+
+/// The ADR 041 buy ceiling for one candidate: derive this node's sell rate and the
+/// policy's two-regime buy cap, fold the cap into the effective stream ceiling, and
+/// decide whether to buy at all.
+///
+/// `source` is the candidate's node id — the warming-allowance key. `heat` is the
+/// ADR 040 frequency estimate for the hash, computed once per miss. `candidate_rate`
+/// is the probe-advertised per-MB rate.
+///
+/// With `OffPolicy` (no economic gate) the only bound is the static
+/// `max_rate_per_mb`, and no allowance is touched (never speculative). Under
+/// `MarginPolicy` the cap is `max(sell, amortized)` while the source has warming
+/// allowance, else the amortized floor; a quote above the cap is refused, and a
+/// quote merely above the amortized floor is allowed but flagged speculative.
+fn economic_ceiling(
+    deps: &NodeOriginDeps,
+    source: [u8; 32],
+    heat: u32,
+    candidate_rate: u64,
+) -> EconGate {
+    let (sell, _floor) = deps
+        .config
+        .sell_rate_bounds
+        .raise_to_floor(deps.config.sell_rate_base);
+    let operator_bps = deps.config.operator_shares.bps();
+    let warm = deps.config.warming.available(source);
+    let mk = |warming_available| crate::serve_economics::ServeEconomicsCtx {
+        sell_rate_per_mb: sell,
+        operator_bps,
+        heat_estimate: heat,
+        warming_available,
+    };
+    // `ceiling` is the actual buy cap under the live warming regime; `amortized_floor`
+    // is the profit-guaranteed price (the spent-allowance regime). A buy above the
+    // floor is speculative and debits the source's allowance on success.
+    let ceiling = deps.config.serve_economics.max_buy_per_mb(&mk(warm));
+    let amortized_floor = deps.config.serve_economics.max_buy_per_mb(&mk(false));
+    match ceiling {
+        // No economic gate: only the static ceiling applies, no allowance interaction.
+        None => EconGate::Allow {
+            rate_ceiling: effective_rate_ceiling(candidate_rate, deps.config.max_rate_per_mb),
+            speculative: false,
+        },
+        Some(max_buy) if candidate_rate > max_buy => {
+            deps.metrics.serve_economics_refused();
+            EconGate::Skip
+        }
+        Some(max_buy) => {
+            // Fold `max_buy` into the pull-commit ceiling so a bait-and-switch above
+            // the cap aborts mid-pull, then take the lower of that and the quote.
+            let bound = effective_rate_ceiling(deps.config.max_rate_per_mb, max_buy);
+            let speculative = candidate_rate > amortized_floor.unwrap_or(candidate_rate);
+            EconGate::Allow {
+                rate_ceiling: effective_rate_ceiling(candidate_rate, bound),
+                speculative,
+            }
+        }
+    }
+}
+
+/// Bytes to whole MB (round up), the unit the warming allowance accounts in.
+const fn mb_of(bytes: u64) -> u64 {
+    bytes.div_ceil(decdn_protocol::MB_BYTES)
+}
+
+/// The ADR 040 frequency estimate for `hash_bytes` — the `margin` policy's heat
+/// input. `0` (cold) when no estimator is wired.
+fn heat_of(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> u32 {
+    deps.config
+        .frequency_estimator
+        .as_ref()
+        .map_or(0, |e| e.estimate(Hash::from(hash_bytes)))
+}
+
 /// Walk the ranked candidates (best-first), opening a channel and pulling from
 /// each until one delivers, bounded by `budget` remaining attempts. Records a
 /// reputation outcome for every candidate that reaches the wire;
@@ -1750,6 +1880,17 @@ async fn pull_from_candidate(
         debug!("node-origin: candidate has no resolvable operator address; skipping");
         return Err(PullMiss::Clean);
     };
+    // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy ceiling
+    // BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
+    let heat = heat_of(deps, hash_bytes);
+    let (rate_ceiling, speculative) =
+        match economic_ceiling(deps, candidate.node_id, heat, candidate.rate_per_mb) {
+            EconGate::Allow {
+                rate_ceiling,
+                speculative,
+            } => (rate_ceiling, speculative),
+            EconGate::Skip => return Err(PullMiss::BelowMargin),
+        };
     let ctx = match deps
         .buyer
         // Same channel-open bound as the window path (#1143) — see there.
@@ -1829,8 +1970,8 @@ async fn pull_from_candidate(
 
     // Header handshake: a free whole-tail open to read the committed `total_bytes`,
     // then abort — no bytes pulled, no voucher. `NO_NAMESPACE`, as this hash-only
-    // populate path carries no served-client namespace.
-    let rate_ceiling = effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb);
+    // populate path carries no served-client namespace. `rate_ceiling` folds the ADR
+    // 041 buy cap in (computed above with the skip decision).
     let (header, probe) = match open_progressive_upstream(
         &deps.endpoint,
         EndpointAddr::new(pk),
@@ -2029,6 +2170,15 @@ async fn pull_from_candidate(
             // `total_bytes`. `paid_wait` is not subtracted here, matching the
             // gap-driven `run_pull_leg` path (settle waits are rare and the driver
             // bounds them).
+            // ADR 041: a clean speculative pull debits the source's warming allowance
+            // by the full buy cost (whole MB at the candidate's buy rate).
+            if speculative {
+                deps.config.warming.debit_speculative(
+                    candidate.node_id,
+                    hash_bytes,
+                    candidate.rate_per_mb.saturating_mul(mb_of(total_bytes)),
+                );
+            }
             record_outcome(
                 deps,
                 pk,

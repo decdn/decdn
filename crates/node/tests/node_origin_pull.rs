@@ -44,7 +44,7 @@ use decdn_node::dht::{
     ProbedProvider, StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
 };
 use decdn_node::metrics::Metrics;
-use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, TeeVerdict};
+use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, PullMiss, TeeVerdict};
 use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
@@ -803,6 +803,12 @@ async fn build_origin_with_probe_caches(
             frequency_estimator: None,
             sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
+            // A budget far larger than any test's buy cost, so these fixtures warm
+            // freely and the ADR 041 gate never changes their behaviour.
+            warming: std::sync::Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+                1_000_000_000,
+                0,
+            )),
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -949,6 +955,12 @@ async fn build_origin_multi_hash(
             frequency_estimator: None,
             sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
+            // A budget far larger than any test's buy cost, so these fixtures warm
+            // freely and the ADR 041 gate never changes their behaviour.
+            warming: std::sync::Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+                1_000_000_000,
+                0,
+            )),
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1494,6 +1506,12 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
             frequency_estimator: None,
             sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
+            // A budget far larger than any test's buy cost, so these fixtures warm
+            // freely and the ADR 041 gate never changes their behaviour.
+            warming: std::sync::Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+                1_000_000_000,
+                0,
+            )),
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -9675,6 +9693,12 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             frequency_estimator: None,
             sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
+            // A budget far larger than any test's buy cost, so these fixtures warm
+            // freely and the ADR 041 gate never changes their behaviour.
+            warming: std::sync::Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+                1_000_000_000,
+                0,
+            )),
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -12152,6 +12176,12 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             frequency_estimator: None,
             sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base: 0,
+            // A budget far larger than any test's buy cost, so these fixtures warm
+            // freely and the ADR 041 gate never changes their behaviour.
+            warming: std::sync::Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+                1_000_000_000,
+                0,
+            )),
         },
         ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -13314,5 +13344,247 @@ async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once()
     assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
 
     fixture.shutdown().await;
+    Ok(())
+}
+
+// ===========================================================================
+// ADR 041 — buy-side serve-economics gate + warming allowance (Task 8).
+// ===========================================================================
+
+/// Provision B's `NodeOrigin` exactly like [`build_origin_with_probe_caches`] but
+/// with a caller-chosen ADR 041 serve-economics policy, operator fee-share, base
+/// sell rate, and a SHARED [`decdn_node::warming_allowance::WarmingAllowance`] the
+/// test seeds/spends before the miss. Live probe + fresh caches, single provider.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+async fn build_origin_economics(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    buyer: Arc<dyn PoolOpener>,
+    local_rep: &Arc<LocalReputation>,
+    metrics: &Arc<Metrics>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    serve_economics: Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>,
+    operator_bps: u16,
+    sell_rate_base: u64,
+    warming: Arc<decdn_node::warming_allowance::WarmingAllowance>,
+) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
+    let stakers = ConfigStakerSet::new(providers.iter().copied().collect());
+    let mut dir = HashMap::new();
+    dir.insert(U256::ZERO, providers);
+    let (engine, engine_tmp) = throwaway_engine()
+        .await
+        .expect("throwaway engine for the economics fixture");
+    let origin = NodeOrigin::new();
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
+        staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
+        origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: b_dht,
+        slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
+        local_rep: Arc::clone(local_rep),
+        negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
+        metrics: Arc::clone(metrics),
+        registry_regions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(20),
+            max_blob_size_bytes: 0,
+            max_rate_per_mb: 0,
+            working_deposit: U256::ZERO,
+            event_poll_interval: Duration::from_millis(50),
+            lookup: decdn_node::dht::LookupConfig::default(),
+            own_region: None,
+            serve_economics,
+            operator_shares: decdn_node::fee_shares::OperatorShares::new(operator_bps),
+            frequency_estimator: None,
+            sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
+            sell_rate_base,
+            warming,
+        },
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        engine: engine.clone(),
+    });
+    (origin, engine, engine_tmp)
+}
+
+/// Drive one cache-miss against a single serving candidate under the `margin`
+/// serve-economics policy, and report whether the buy loop opened the pull or
+/// refused it. `quote` is A's advertised (and served) per-MB rate; `sell` is B's
+/// base sell rate; `op_bps` is the operator fee-share; `warm` seeds A's source as
+/// having warming allowance (else it is spent below zero before the miss).
+///
+/// Returns the [`NodeOrigin::open_progressive_pull`] outcome flattened to
+/// `Ok(())` on a clean open (served) or `Err(PullMiss)` on a refusal.
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn drive_miss_single_candidate(
+    quote: u64,
+    sell: u64,
+    op_bps: u16,
+    warm: bool,
+) -> Result<std::result::Result<(), PullMiss>> {
+    let payload = vec![0xC1u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe (quote) + client (quote). -------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let pool_id = B256::repeat_byte(0xE1);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        quote,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        quote,
+    );
+
+    // --- Node B: dial-only endpoint hosting the economics NodeOrigin. ---------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+
+    // The shared warming allowance. When `!warm`, spend A's source past zero so the
+    // buy loop reads the amortized-floor regime (net P&L negative → unavailable).
+    let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+        1_000_000_000,
+        0,
+    ));
+    if !warm {
+        warming.debit_speculative(*a_id.as_bytes(), [0xAAu8; 32], u64::MAX);
+    }
+    let serve_economics = Arc::new(decdn_node::serve_economics::MarginPolicy::new(5000, 64))
+        as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded,
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, _engine, _engine_tmp) = build_origin_economics(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+        serve_economics,
+        op_bps,
+        sell,
+        Arc::clone(&warming),
+    )
+    .await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?;
+
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
+    Ok(outcome.map(|_| ()))
+}
+
+/// A warm source quoting the flat market price (`quote == sell`) is SERVED: with
+/// `max_buy = max(sell, amortized) = sell`, the candidate is exactly at the ceiling
+/// and the buy loop opens the pull.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn warm_source_relays_at_market_flat_mesh() -> Result<()> {
+    let outcome = drive_miss_single_candidate(1000, 1000, 6000, true).await?;
+    anyhow::ensure!(
+        outcome.is_ok(),
+        "a warm at-market candidate must open (warming works), got {outcome:?}"
+    );
+    Ok(())
+}
+
+/// Once a source's allowance is spent, the ceiling drops to the amortized floor
+/// (`0.6·sell`); an at-market quote (`sell > 0.6·sell`) is skipped, and with no
+/// other candidate the walk answers `BelowMargin`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn spent_source_refuses_at_market_and_is_below_margin() -> Result<()> {
+    let outcome = drive_miss_single_candidate(1000, 1000, 6000, false).await?;
+    anyhow::ensure!(
+        matches!(outcome, Err(PullMiss::BelowMargin)),
+        "a spent source at market must refuse below margin, got {outcome:?}"
+    );
+    Ok(())
+}
+
+/// A quote far above the market price is refused even while the source is warm
+/// (Attack A): `max_buy = max(sell, amortized) = sell`, and `quote ≫ sell` skips.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn above_market_is_refused_even_when_warm() -> Result<()> {
+    let outcome = drive_miss_single_candidate(3000, 1000, 6000, true).await?;
+    anyhow::ensure!(
+        matches!(outcome, Err(PullMiss::BelowMargin)),
+        "an above-market quote must refuse even when warm, got {outcome:?}"
+    );
     Ok(())
 }

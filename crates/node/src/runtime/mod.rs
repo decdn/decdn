@@ -755,6 +755,11 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// Live operator fee-share (basis points) cell, seeded from chain at
     /// startup and kept current by the fee-shares watcher.
     operator_shares: crate::fee_shares::OperatorShares,
+    /// ADR 041 per-source warming allowance. The SAME `Arc` the client handler holds
+    /// (for the serve-side realized-margin credit) and the eviction path holds (to
+    /// forget a dropped hash's tag), threaded to
+    /// [`crate::node_origin::NodeOriginConfig`] for the buy-side debit.
+    warming: Arc<crate::warming_allowance::WarmingAllowance>,
 }
 
 /// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
@@ -1124,6 +1129,15 @@ async fn build_chain_and_handlers(
     // config-selectable; `off` disables the economic ceiling entirely.
     let serve_economics = crate::serve_economics::select_policy(&cfg.cache.serve_economics);
 
+    // ADR 041 per-source warming allowance, bounding the loss from speculative
+    // above-floor buys per upstream source. Built once and shared by the buy loop
+    // (debit), the serve path (credit realized margin), and the eviction path
+    // (forget a dropped hash's tag).
+    let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(
+        cfg.cache.serve_economics.warming_budget,
+        cfg.cache.serve_economics.warming_refill,
+    ));
+
     // Bring-up self-check: is the key we are about to serve under the one bound
     // to this operator on-chain? A node that answers "no" is UNSLASHABLE
     // (`SlashJudge` resolves the accused through `nodeIdOf`), and nothing else
@@ -1438,6 +1452,7 @@ async fn build_chain_and_handlers(
         rate_bounds,
         serve_economics,
         operator_shares,
+        warming,
     })
 }
 
@@ -1907,6 +1922,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         frequency_estimator: infra.frequency_estimator.clone(),
         sell_rate_bounds: ch.rate_bounds.clone(),
         sell_rate_base: cfg.payment.rate_per_mb,
+        warming: Arc::clone(&ch.warming),
     };
     // Arc/handle clones for the task — the originals are used later in `run()`.
     let ep_for_buyer = infra.ep.clone();
