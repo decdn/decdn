@@ -272,15 +272,20 @@ This is the design's strongest commitment.
 
 ```
 vote_weight(op, t) = min(
-    served_bytes_window(op, t),
+    capped_served_window(op, t),
     voteCapBps × total_bytes_window(t) / 10_000
 ) × age_ramp(op, t)
 
-served_bytes_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.bytesPerEpoch[op][e]
+capped_served_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} min(
+    FeeRouter.bytesPerEpoch[op][e],
+    CapacityBond.declaredMbpsAtEpoch(op, e) × epochLength × 125_000
+)
 age_ramp(op, t)            = min((t − CapacityBond.firstBondedAt[op]) / (age_ramp_months × seconds_per_month), 1.0)
 endEpoch(t)                = (t / EPOCH_LENGTH) == 0 ? ∅ : (t / EPOCH_LENGTH) − 1   // last fully-elapsed epoch; ∅ ⇒ weight 0
 N                          = windowEpochs                                               // default 13 (~1 quarter)
 ```
+
+Each epoch's counted bytes are capped at what the operator's declared capacity tier at that epoch's close could physically deliver — see [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula) for the full derivation, including the epoch-end checkpoint sampling and the megabits-to-bytes conversion constant.
 
 - Fresh bonds vote at zero (no served bytes); full weight requires both `age_ramp_months` of tenure and sustained delivery across the `windowEpochs` trailing window.
 - Defends against "buy your way to instant governance" attacks on both axes: `age_ramp` gates speed-to-influence by tenure, and the rolling bytes window requires sustained activity.
