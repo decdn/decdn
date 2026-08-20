@@ -1605,7 +1605,8 @@ impl PullMiss {
         }
     }
 
-    /// Fold another attempt's miss into this one: a local fault LATCHES.
+    /// Fold another attempt's miss into this one: a local fault LATCHES, and an
+    /// economics refusal outranks a clean miss.
     ///
     /// A walk reports a local fault if ANY of its attempts hit one, mirroring the
     /// serve path's `fault_seen` latch — a later candidate's clean miss must not
@@ -1614,6 +1615,13 @@ impl PullMiss {
     /// DECIDES anything when nothing delivered: a candidate that faults locally
     /// followed by one that succeeds is a plain success, and the walk returns the
     /// payload without consulting the latch at all.
+    ///
+    /// Below a local fault, a [`Self::BelowMargin`] outranks a [`Self::Clean`] the
+    /// same way, for the same reason at one rung down: it preserves the "an
+    /// economics refusal happened somewhere in this walk" signal so the buy loop
+    /// can tell a below-margin miss apart from a genuinely empty one, rather than
+    /// letting a later candidate's honest miss erase the fact that an earlier one
+    /// quoted above this node's buy ceiling.
     const fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::LocalFault, _) | (_, Self::LocalFault) => Self::LocalFault,
@@ -3163,6 +3171,40 @@ mod tests {
             miss_answer(PullMiss::BelowMargin),
             Ok(OriginFetch::NotFound)
         ));
+    }
+
+    /// A [`PullMiss::BelowMargin`] never masks, and is never masked by, a
+    /// [`PullMiss::LocalFault`] in the fold: `LocalFault` outranks everything else
+    /// regardless of position, in both argument orders. A [`PullMiss::BelowMargin`]
+    /// DOES outrank a plain [`PullMiss::Clean`], again in both orders, because the
+    /// fold's job is to carry the strongest signal seen anywhere in the walk forward
+    /// — losing a below-margin classification to a later clean miss would report a
+    /// genuinely empty walk when an economics refusal actually happened partway
+    /// through it.
+    #[test]
+    fn below_margin_never_masks_or_is_masked_by_a_local_fault() {
+        assert_eq!(
+            PullMiss::LocalFault.or(PullMiss::BelowMargin),
+            PullMiss::LocalFault,
+            "a local fault must survive being folded against a later economics refusal"
+        );
+        assert_eq!(
+            PullMiss::BelowMargin.or(PullMiss::LocalFault),
+            PullMiss::LocalFault,
+            "a local fault reached later in the walk must still win over an earlier \
+             economics refusal"
+        );
+        assert_eq!(
+            PullMiss::BelowMargin.or(PullMiss::Clean),
+            PullMiss::BelowMargin,
+            "an economics refusal must survive being folded against a later clean miss"
+        );
+        assert_eq!(
+            PullMiss::Clean.or(PullMiss::BelowMargin),
+            PullMiss::BelowMargin,
+            "an economics refusal reached later in the walk must still win over an \
+             earlier clean miss"
+        );
     }
 
     /// A local fault LATCHES across a walk: one candidate's fault is not erased by the next
