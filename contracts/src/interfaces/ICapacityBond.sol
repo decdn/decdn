@@ -29,6 +29,14 @@ interface ICapacityBond {
     ///         `DecdnGovernor._getVotes` per ADR 036 § Slashing zero-out.
     function slashedAtEpoch(address operator) external view returns (uint64);
 
+    /// @notice `declaredMbps` in effect at the END of `epoch`
+    ///         (`(epoch + 1) × EPOCH_LENGTH − 1`). `DecdnGovernor` caps each
+    ///         epoch's vote-weight bytes at this capacity per ADR 036 § Formula
+    ///         — declared capacity caps delivery-based weight, it never grants
+    ///         weight. Returns 0 when the operator has no declaration on or
+    ///         before that instant.
+    function declaredMbpsAtEpoch(address operator, uint64 epoch) external view returns (uint256);
+
     /// @notice On-chain slash record consumed by `SlashAppeal.openSlashAppeal`
     ///         to validate appeals against a specific slash without trusting
     ///         the appellant's `operator` parameter (ADR 028 § Contract

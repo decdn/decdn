@@ -55,6 +55,10 @@ const DAY: u64 = 24 * 60 * 60;
 /// Appeal status codes (mirrors `ISlashAppeal.AppealStatus`).
 const STATUS_OPEN: u8 = 1;
 const STATUS_RESOLVED: u8 = 3;
+/// The contract's `minCapacityMbps` default — the lowest declarable tier.
+/// `bond_required` for this tier sits far below `minBond`, so declaring it
+/// costs no extra bond beyond what `onboard_operator` already posted.
+const FLOOR_MBPS: u64 = 10;
 
 /// Heavy journey tier (see [`decdn_e2e::timeout`] for the tier rule): its
 /// internal poll ladder is 120+30+30s (served, then two post-restart polls),
@@ -99,6 +103,28 @@ async fn run() -> anyhow::Result<()> {
     let payload = vec![0xABu8; 2 * MIB];
     let (node_a, _hash_a) = NodeFixture::launch(&chain, "US", &payload).await?;
     let (node_b, hash_b) = NodeFixture::launch(&chain, "US", &payload).await?;
+
+    // ---- Declare a capacity tier for B so it carries Governor vote weight.
+    // `DecdnGovernor`'s weight caps each epoch's served bytes at the
+    // operator's DECLARED capacity for that epoch, and `onboard_operator`
+    // bonds `minBond` but never declares — an undeclared operator's
+    // `declaredMbpsAtEpoch` is 0 for every epoch, so its capped weight is 0
+    // regardless of bytes served. B is the proposer/voter that grants A's
+    // appeal below, so it is the one that needs weight; A's own weight is
+    // zeroed by the slash regardless. Declared here, before the age warp and
+    // the serve below, so the `declareMbps` checkpoint precedes the served
+    // epoch's end (the cap samples `declaredMbpsAtEpoch` at that boundary).
+    let declare_target = chain
+        .min_bond()
+        .await?
+        .max(chain.bond_required(FLOOR_MBPS).await?);
+    let active = chain.active_bond(node_b.operator_addr()).await?;
+    if declare_target > active {
+        chain
+            .transfer_token(node_b.operator_addr(), declare_target - active)
+            .await?;
+    }
+    run_node_cli(&node_b, &["bond", "--mbps", &FLOOR_MBPS.to_string()])?;
 
     // ---- Age the chain past the ~180-day vote-weight ramp so B's weight is at
     // full strength once it has served bytes.
@@ -288,6 +314,24 @@ async fn fund_and_approve_bond(
         .get_receipt()
         .await?;
     anyhow::ensure!(receipt.status(), "bond approve must mine");
+    Ok(())
+}
+
+/// Run `decdn node <args…>` against the fixture's config + keystore, asserting
+/// a clean exit. Mirrors `g_node_06_unbond.rs::run_node_cli`.
+fn run_node_cli(node: &NodeFixture, args: &[&str]) -> anyhow::Result<()> {
+    let status = decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?
+        .arg("node")
+        .args(args)
+        .arg("--config")
+        .arg(node.config_path())
+        .status()
+        .context("spawn decdn node")?;
+    anyhow::ensure!(
+        status.success(),
+        "`decdn node {}` exited non-zero: {status}",
+        args.join(" "),
+    );
     Ok(())
 }
 
