@@ -553,20 +553,6 @@ enum ServeRejectReason {
     /// The channel's funding address is on the origin blacklist — the operator's
     /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
     OriginDenied,
-    /// This node is not in the on-chain active set, so it MUST NOT sell bytes
-    /// (ADR 019 §Phase 4, acceptance criterion 1). Covers every way a node can
-    /// fall out of that set at once, because the predicate is a single
-    /// `StakerSet::is_active` on the node's own id: never registered, registered
-    /// under a key this process no longer holds, deregistered, auto-ejected,
-    /// blacklist-ejected, bond below `minBond`, or an unbonding request in
-    /// flight.
-    ///
-    /// A node refusing for this reason is by definition UNSLASHABLE
-    /// (`SlashJudge._checkRegistered` resolves an accused node through its
-    /// binding), so the `slash_sig` on this particular refusal is
-    /// unattributable — correct to produce, since it costs nothing and keeps the
-    /// wire shape uniform, but not usable as on-chain evidence.
-    NotRegistered,
 }
 
 impl ServeRejectReason {
@@ -580,7 +566,7 @@ impl ServeRejectReason {
     ///
     /// The requester side of this mapping is `decdn_client_pull::UpstreamRefused`,
     /// which recovers the wire code — and ONLY the wire code — from a refusal
-    /// (#1144). So the `NotFound` collapse is what a requester sees for all seven
+    /// (#1144). So the `NotFound` collapse is what a requester sees for all six
     /// reasons below, and the reputation consequences it draws must hold for the
     /// weakest of them. They do: it scores `NotFound` as no fault at all, and only
     /// `InternalError` as a degraded peer.
@@ -597,19 +583,12 @@ impl ServeRejectReason {
             // a requester scores `InternalError` as a degraded peer (#1144), and a
             // client's own malformed range must not penalise the node for it. The
             // distinction survives in the per-reason metric.
-            // `NotRegistered` joins the collapse rather than getting a code of
-            // its own. A client's correct response is identical to a miss — go
-            // to another node — and the on-chain active set is public, so there
-            // is nothing to leak either way. What a distinct code WOULD buy is a
-            // cheap oracle for scraping which operators are currently unable to
-            // sell, which is exactly the map the other collapses exist to deny.
             Self::CacheMiss
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
             | Self::LaneAtCapacity
-            | Self::RangeNotSatisfiable
-            | Self::NotRegistered => StreamError::NotFound,
+            | Self::RangeNotSatisfiable => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
@@ -768,20 +747,6 @@ pub struct ClientHandlerDeps {
     /// `getRateBounds()` and updated by the `RateBoundsUpdated` watcher,
     /// replacing the by-value config stand-in.
     pub rate_bounds: crate::rate_bounds::RateBounds,
-    /// Live on-chain active-staker set (ADR 019 §Phase 4, criterion 1; #1030).
-    /// The serve path asks it exactly one question — is THIS node's own id in
-    /// the set — and refuses paid delivery when the answer is no.
-    ///
-    /// Required rather than `Option`, for the same reason `content_deny` below
-    /// is: a forgotten wiring must not be indistinguishable from "serve
-    /// unconditionally". The runtime passes the same `Arc` the DHT admission
-    /// path holds, so there is exactly one projection of the active set in the
-    /// process and no way for the two to disagree.
-    ///
-    /// Tests that do not care about the gate pass a set containing their own
-    /// node id; `ConfigStakerSet::empty()` refuses everything, which is the
-    /// correct default for a set that was never populated.
-    pub staker_set: Arc<dyn crate::dht::staker_set::StakerSet>,
     pub max_blob_size_bytes: u64,
     pub max_concurrent_streams: usize,
     /// Live content deny-set (ADR 011): the operator's local denylist unioned
@@ -854,7 +819,6 @@ impl ClientHandlerDeps {
         receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
         rate_bounds: crate::rate_bounds::RateBounds,
-        staker_set: Arc<dyn crate::dht::staker_set::StakerSet>,
         max_blob_size_bytes: u64,
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
@@ -876,7 +840,6 @@ impl ClientHandlerDeps {
             pool_min_remaining_deposit,
             rate_per_mb,
             rate_bounds,
-            staker_set,
             max_blob_size_bytes,
             max_concurrent_streams,
             content_deny,
@@ -1009,12 +972,6 @@ pub struct ClientHandler {
     /// [`ClientHandlerDeps::rate_per_mb`]).
     rate_per_mb: u64,
     rate_bounds: crate::rate_bounds::RateBounds,
-    /// Live on-chain active-staker set (see [`ClientHandlerDeps::staker_set`]).
-    staker_set: Arc<dyn crate::dht::staker_set::StakerSet>,
-    /// This node's own id in the staker set's key type, derived once at
-    /// construction from `node_id`. Precomputed so the per-request gate is a
-    /// set lookup and not a conversion plus a lookup.
-    self_staker_id: crate::dht::routing::NodeId,
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     /// Throttle state for the insufficient-deposit refusal log (#1520): the
@@ -1136,8 +1093,6 @@ impl ClientHandler {
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
-            self_staker_id: crate::dht::routing::NodeId::from_bytes(*deps.node_id.as_bytes()),
-            staker_set: deps.staker_set,
             max_blob_size_bytes: deps.max_blob_size_bytes,
             max_concurrent_streams: deps.max_concurrent_streams,
             deposit_refusal_last_warn_ms: AtomicU64::new(0),
@@ -1860,20 +1815,6 @@ impl BufferedVoucherReader {
 /// sibling-module tests (e.g. `voucher.rs`'s #527 durability tests need a
 /// fault-injecting store). Kept at module level (not inside `mod tests`) so a
 /// child module's `#[cfg(test)]` can reach it as `super::handler_over_store`.
-/// A [`StakerSet`](crate::dht::staker_set::StakerSet) that contains exactly
-/// `node_id`, for tests whose subject is not the ADR 019 registry gate (#1030).
-///
-/// Every test handler needs one: `ConfigStakerSet::empty()` refuses ALL paid
-/// delivery, which is the correct default for an unpopulated set but would make
-/// every serve test fail for a reason it is not testing. A test that DOES want
-/// the gate closed overwrites `deps.staker_set` with an empty set.
-#[cfg(test)]
-pub(super) fn serving_staker_set(node_id: PublicKey) -> Arc<dyn crate::dht::staker_set::StakerSet> {
-    Arc::new(crate::dht::staker_set::ConfigStakerSet::new(
-        std::iter::once(crate::dht::routing::NodeId::from_bytes(*node_id.as_bytes())).collect(),
-    ))
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(super) async fn handler_over_store(
@@ -1885,9 +1826,8 @@ pub(super) async fn handler_over_store(
         .await
         .expect("cache");
     let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-    let node_id = iroh::SecretKey::generate().public();
     let deps = ClientHandlerDeps::new(
-        node_id,
+        iroh::SecretKey::generate().public(),
         Arc::clone(metrics),
         Arc::new(ConnectionLimiter::new(
             &decdn_common::config::ResolvedSecurity {
@@ -1909,7 +1849,6 @@ pub(super) async fn handler_over_store(
         ))) as Arc<dyn ReceiptSink>,
         1,
         crate::rate_bounds::RateBounds::new(0),
-        serving_staker_set(node_id),
         0,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
@@ -1941,9 +1880,8 @@ mod tests {
             .await
             .expect("cache");
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-        let node_id = iroh::SecretKey::generate().public();
         let deps = ClientHandlerDeps::new(
-            node_id,
+            iroh::SecretKey::generate().public(),
             Arc::clone(metrics),
             Arc::new(ConnectionLimiter::new(
                 &decdn_common::config::ResolvedSecurity {
@@ -1966,7 +1904,6 @@ mod tests {
             ))) as Arc<dyn ReceiptSink>,
             1,
             crate::rate_bounds::RateBounds::new(0),
-            serving_staker_set(node_id),
             0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
@@ -2346,9 +2283,8 @@ mod tests {
             .expect("cache");
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let node_id = iroh::SecretKey::generate().public();
         let mut deps = ClientHandlerDeps::new(
-            node_id,
+            iroh::SecretKey::generate().public(),
             Arc::clone(metrics),
             Arc::new(ConnectionLimiter::new(
                 &decdn_common::config::ResolvedSecurity {
@@ -2371,7 +2307,6 @@ mod tests {
             ))) as Arc<dyn ReceiptSink>,
             1,
             crate::rate_bounds::RateBounds::new(0),
-            serving_staker_set(node_id),
             0,
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),

@@ -771,8 +771,8 @@ async fn cli_drain_wait_treats_econnrefused_as_complete() -> anyhow::Result<()> 
                 // producers stay in step.
                 "binding": "unknown",
                 "bound_node_id": null,
-                // A node being drained is one that was serving, so the ADR 019
-                // registry gate was open (#1030). The drain path does not read
+                // A node being drained is one that was serving, so it was in
+                // the on-chain registry (#1030). The drain path does not read
                 // this field; it is here because the DTO requires it.
                 "registry_active": true,
             }))

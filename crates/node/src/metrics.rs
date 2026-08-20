@@ -1024,16 +1024,6 @@ pub struct DecdnMetrics {
     /// (ADR 011 §On Blacklist Event). Signed as `OriginBlacklisted`. Visible
     /// name: `decdn_serve_stream_rejected_origin_denied_total`.
     pub serve_stream_rejected_origin_denied: Counter,
-    /// Delivery refused because this node is not in the on-chain active set, so
-    /// it must not sell bytes (ADR 019 §Phase 4, criterion 1; #1030). Signed as
-    /// `NotFound`, wire-indistinguishable from a cache miss — so for the
-    /// operator this counter is the ONLY signal that the node is up, healthy,
-    /// holding the blob, and still earning nothing. A non-zero value here means
-    /// `decdn node health` will report `registry_active: false`; the cause is
-    /// one of never-registered, key not bound on-chain, deregistered, ejected,
-    /// bond below `minBond`, or an unbonding request in flight. Visible name:
-    /// `decdn_serve_stream_rejected_not_registered_total`.
-    pub serve_stream_rejected_not_registered: Counter,
     /// An ALREADY-RUNNING delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event). Visible
     /// name: `decdn_serve_stream_terminated_takedown_total`.
@@ -1746,10 +1736,6 @@ recorders! {
     /// Record a `serve_stream` delivery refused because the channel's funding
     /// address is a blacklisted origin (ADR 011 §On Blacklist Event).
     serve_stream_rejected_origin_denied => serve_stream_rejected_origin_denied.inc();
-
-    /// Record a `serve_stream` delivery refused because this node is not in the
-    /// on-chain active set (ADR 019 §Phase 4, criterion 1; #1030).
-    serve_stream_rejected_not_registered => serve_stream_rejected_not_registered.inc();
 
     /// Record an in-flight delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
@@ -2872,11 +2858,6 @@ mod tests {
             "decdn_serve_stream_rejected_hash_denied_total",
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
-            // #1030: the ADR 019 §Phase 4 registry gate. Load-bearing for the
-            // operator — the refusal is wire-indistinguishable from a miss, so
-            // this series is the only place "up, healthy, and unable to sell"
-            // is visible.
-            "decdn_serve_stream_rejected_not_registered_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -2898,7 +2879,6 @@ mod tests {
         metrics.serve_stream_rejected_hash_denied();
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();
-        metrics.serve_stream_rejected_not_registered();
 
         let text = metrics.encode().unwrap();
         for name in reasons {

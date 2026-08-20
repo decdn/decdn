@@ -129,10 +129,11 @@ fn write_health(w: &mut impl io::Write, resp: &HealthResponse) -> io::Result<()>
         writeln!(w, "bound_node_id={bound}")?;
     }
     // Always printed (#1030). `false` is the answer to "the node is up and
-    // healthy, why is it earning nothing": every paid request is being refused
-    // as `NotFound`, which on the wire is indistinguishable from a cache miss,
-    // so this line and the `decdn_serve_stream_rejected_not_registered_total`
-    // counter are the only places the real cause is visible.
+    // healthy, why is it earning nothing": it is absent from the on-chain
+    // registry, so it accrues no governance weight (its declared capacity caps
+    // credited bytes at zero) and peers have no reason to route to a node they
+    // cannot slash. Nothing on the wire says so — the node simply gets no
+    // requests — which is exactly why this line exists.
     writeln!(w, "registry_active={}", resp.registry_active)?;
     Ok(())
 }

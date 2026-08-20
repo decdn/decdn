@@ -1179,11 +1179,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.receipt_sink),
         cfg.payment.rate_per_mb,
         rate_bounds.clone(),
-        // ADR 019 §Phase 4 registry gate (#1030). The SAME `Arc` the DHT
-        // admission path holds, deliberately: one projection of the active set
-        // per process means the serve gate and DHT admission can never disagree
-        // about whether this node is a live staker.
-        Arc::clone(&staker_set),
         cfg.cache
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),

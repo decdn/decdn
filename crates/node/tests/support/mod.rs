@@ -417,19 +417,6 @@ fn client_handler_deps(
         receipt_sink,
         rate,
         decdn_node::rate_bounds::RateBounds::new(0),
-        // The ADR 019 §Phase 4 registry gate (#1030) is OPEN by default here:
-        // the fixture's own node id is the sole member of the set. These
-        // loopback fixtures have no chain, so an empty set — which refuses all
-        // paid delivery — would fail every serve test for a reason none of them
-        // is about. A test that wants the gate CLOSED overwrites the
-        // `staker_set` field via the `configure` closure of
-        // `build_handler_with`, exactly as the deny-set tests do above.
-        Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::new(
-            std::iter::once(decdn_node::dht::routing::NodeId::from_bytes(
-                *server_id.as_bytes(),
-            ))
-            .collect(),
-        )),
         max_blob_size_bytes,
         max_concurrent_streams,
         // Empty by default; a test needing a populated deny-set overwrites the

@@ -115,9 +115,9 @@ pub struct AdminState {
     binding: BindingReport,
     /// Live on-chain active-staker set, attached via
     /// [`AdminState::with_staker_set`] (#1030). `None` (unit tests, and any
-    /// build with no chain wiring) reports `registry_active: false` — the same
-    /// fail-closed answer the serve gate gives, so `decdn node health` never
-    /// claims a node is servable when the gate would refuse it.
+    /// build with no chain wiring) reports `registry_active: false`: an unwired
+    /// `AdminState` cannot confirm registration, and the optimistic answer would
+    /// tell an operator their node is registered when nothing checked.
     staker_set: Option<Arc<dyn crate::dht::staker_set::StakerSet>>,
 }
 
@@ -329,13 +329,17 @@ impl AdminState {
         }
     }
 
-    /// Whether this node is in the on-chain active-staker set right now — the
-    /// exact predicate `serve_stream`'s ADR 019 §Phase 4 gate applies (#1030),
-    /// read from the same shared projection so the two can never disagree.
+    /// Whether this node is in the on-chain active-staker set right now
+    /// (#1030), read from the same shared projection that feeds DHT admission
+    /// so the two can never disagree.
+    ///
+    /// Diagnostic only — nothing in the serve path consults it. See
+    /// [`decdn_common::admin::HealthResponse::registry_active`] for why the
+    /// daemon does not gate delivery on its own registration.
     ///
     /// `false` when no set is attached: an unwired `AdminState` cannot confirm
-    /// activity, and reporting the optimistic answer would tell an operator the
-    /// node is selling when it is not.
+    /// registration, and the optimistic answer would claim something nothing
+    /// checked.
     fn registry_active(&self) -> bool {
         self.staker_set.as_ref().is_some_and(|set| {
             set.is_active(&crate::dht::routing::NodeId::from_bytes(self.node_id))
@@ -354,10 +358,10 @@ impl AdminState {
     }
 
     /// Attach the live active-staker set so `admin_v1_health` can report
-    /// whether this node will accept paid delivery (#1030). The production
-    /// runtime calls this once after `new` with the SAME `Arc` the serve gate
-    /// and DHT admission hold. Not `const`: unlike [`Self::with_binding`]'s
-    /// `Copy` report, assigning over an `Option<Arc<_>>` runs a destructor.
+    /// whether this node is registered on-chain (#1030). The production runtime
+    /// calls this once after `new` with the SAME `Arc` DHT admission holds. Not
+    /// `const`: unlike [`Self::with_binding`]'s `Copy` report, assigning over an
+    /// `Option<Arc<_>>` runs a destructor.
     #[must_use]
     pub fn with_staker_set(
         mut self,

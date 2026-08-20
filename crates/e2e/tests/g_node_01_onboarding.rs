@@ -8,23 +8,32 @@
 //! already onboarded (`NodeFixture::launch` onboards before the daemon spawns),
 //! so this is the only one that observes the bare state at all.
 //!
-//! # The hinge
+//! # What this covers that nothing else does
 //!
-//! The interesting assertion is not that `setup` succeeds — `cli_setup_partial`
-//! already drives the command, and `smoke` already proves a bonded node
-//! delivers. It is that **the same running daemon** flips from refusing to
-//! serving, with no restart:
+//! `cli_setup_partial` already drives `decdn setup`, but only into a revert;
+//! `smoke` already proves an *already-bonded* node delivers. Neither runs the
+//! command to a clean finish, and neither starts from nothing. This does both,
+//! on **one process**: a daemon that is bare when it boots is selling by the
+//! end of the test, with no restart in between.
 //!
-//! 1. Bare: `registry_active: false`, and a paid fetch is refused with the ADR
-//!    019 §Phase 4 registry gate's own counter (#1030).
-//! 2. `decdn setup` runs against that live daemon.
-//! 3. The registration event reaches the daemon's registry projection, the gate
-//!    opens, and the identical fetch now delivers and settles on-chain.
+//! The no-restart property is the load-bearing one. It is what proves the
+//! daemon's registry projection is live — that a `NodeRegistered` event reaches
+//! a running node — rather than a value sampled once at bring-up. `decdn node
+//! health`'s `registry_active` is the observable.
 //!
-//! Step 1 is the negative the issue asks for ("daemon refuses paid delivery
-//! before registration is confirmed on-chain"), and step 3 is what proves the
-//! gate is live rather than sampled at boot. Splitting them into separate tests
-//! would lose exactly the property that matters, so they are one journey.
+//! # This journey asserts no serve-side enforcement, deliberately
+//!
+//! #1030's third negative asked for "daemon refuses paid delivery before
+//! registration is confirmed on-chain". There is no such refusal, and there
+//! should not be: a node deciding whether to honour *its own* registration
+//! status is not a control an adversary is subject to — anyone who wants to
+//! sell unregistered deletes the check and rebuilds.
+//!
+//! The real constraints are external and already exist. An unregistered
+//! operator never called `declareMbps`, so `DecdnGovernor._getVotes` caps every
+//! epoch's credited bytes at `declaredMbpsAtEpoch × …` = 0 and it accrues no
+//! vote weight; and a peer choosing an upstream should not pull from a node it
+//! cannot slash. See ADR 019 §Phase 4.
 //!
 //! # A correction to the issue text
 //!
@@ -85,12 +94,6 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// covers the curve's crossover.
 const TARGET_MBPS: u64 = 100;
 
-/// The daemon's serve-gate refusal counter (#1030). Every reject reason
-/// collapses to a wire `NotFound`, so this is the ONLY place the cause of a
-/// refusal is observable — asserting on the error alone would pass just as
-/// happily for a cache miss.
-const NOT_REGISTERED_METRIC: &str = "decdn_serve_stream_rejected_not_registered_total";
-
 #[tokio::test(flavor = "multi_thread")]
 async fn onboarding_from_bare_reaches_paid_delivery() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_journey()))
@@ -124,11 +127,13 @@ async fn run_journey() -> anyhow::Result<()> {
     let (node, hash) = NodeFixture::launch_bare(&chain, "US", &payload).await?;
     let operator = node.operator_addr();
 
-    // ---- 1. Bare. The daemon is UP and healthy, and holds the blob.
+    // ---- 1. Bare. The daemon is UP and healthy, and holds the blob, but
+    // nothing about it exists on chain yet.
     //
     // Startup is deliberately not gated on registration: a daemon that refused
     // to boot unregistered could not be used to run the `decdn setup` that fixes
-    // it. So "bare" means healthy-but-not-selling, and both halves are asserted.
+    // it. `registry_active` is the diagnostic that says so — it is what an
+    // operator reads when their node is up and earning nothing.
     let admin = node.admin_client()?;
     let health = admin.health().await.context("admin health while bare")?;
     assert!(
@@ -144,35 +149,10 @@ async fn run_journey() -> anyhow::Result<()> {
         "a bare operator cannot be active"
     );
 
-    // ---- 1a. THE NEGATIVE: a paid fetch is refused, and refused for the RIGHT
-    // reason. ADR 019 §Phase 4 criterion 1 — the node is not in the on-chain
-    // active set, so it must not sell, however much it holds.
-    let refused_before = node.scrape_metric(NOT_REGISTERED_METRIC).await?;
+    // No paid fetch is attempted here. A bare node WILL serve — see the module
+    // doc — and pinning that either way would be asserting on a decision the
+    // protocol deliberately does not delegate to the seller.
     let client = ClientFixture::new(&chain).await?;
-    let err = client
-        .fetch(&chain, &node, hash, U256::ZERO)
-        .await
-        .err()
-        .context(
-            "an unregistered node delivered a paid blob — the ADR 019 §Phase 4 serve gate is \
-             not enforcing criterion 1",
-        )?;
-    let refused_after = poll(Duration::from_secs(30), || async {
-        let n = node.scrape_metric(NOT_REGISTERED_METRIC).await?;
-        Ok((n > refused_before).then_some(n))
-    })
-    .await?
-    .with_context(|| {
-        format!(
-            "the refusal did not bump {NOT_REGISTERED_METRIC}, so it was NOT the registry gate \
-             — every reject reason collapses to `NotFound` on the wire, so a refusal that moves \
-             no counter is indistinguishable from a cache miss. Fetch error was: {err:#}"
-        )
-    })?;
-    assert!(
-        refused_after > refused_before,
-        "registry-gate refusals must be counted"
-    );
 
     // ---- 2. Run the real `decdn setup` against the LIVE daemon.
     //
@@ -264,11 +244,12 @@ async fn run_journey() -> anyhow::Result<()> {
         "the on-chain binding must name the daemon's live key"
     );
 
-    // ---- 5. THE HINGE. No restart anywhere in this test: the daemon has been
-    // the same process since step 1. `registry_active` flipping proves the
-    // registration reached the running node's registry projection off the
-    // `NodeRegistered` event, which is what makes the gate live rather than a
-    // boot-time sample.
+    // ---- 5. The load-bearing assertion. No restart anywhere in this test: the
+    // daemon has been the same process since step 1. `registry_active` flipping
+    // proves the registration reached the running node's registry projection off
+    // the `NodeRegistered` event, rather than being a value sampled once at
+    // bring-up. That projection is what feeds DHT admission, so a stale one is a
+    // real defect — this is the cheapest end-to-end proof that it is live.
     poll(Duration::from_secs(60), || async {
         let h = admin.health().await.context("admin health after setup")?;
         Ok(h.registry_active.then_some(()))
@@ -276,7 +257,7 @@ async fn run_journey() -> anyhow::Result<()> {
     .await?
     .context(
         "the daemon never saw its own registration: `registry_active` stayed false after a \
-         successful `decdn setup`, so the serve gate would keep refusing until a restart",
+         successful `decdn setup`, so its registry projection is stale until a restart",
     )?;
 
     // ---- 6. ADR 019 Phase 3 state sync, now that the node is servable.
@@ -301,17 +282,11 @@ async fn run_journey() -> anyhow::Result<()> {
         "the node must see at least itself in the active-staker set: {status:?}"
     );
 
-    // ---- 7. Phase 4: the identical fetch now delivers.
+    // ---- 7. Phase 4: a paid fetch delivers.
     let outcome = client.fetch(&chain, &node, hash, U256::ZERO).await?;
     assert_eq!(
         outcome.bytes, payload,
         "delivered bytes must match the blob"
-    );
-    // The gate did not fire again on the successful path.
-    assert_eq!(
-        node.scrape_metric(NOT_REGISTERED_METRIC).await?,
-        refused_after,
-        "a registered node must not trip the registry gate"
     );
 
     // ---- 8. And it is real money: the daemon reports a lane on the pool we

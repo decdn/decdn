@@ -95,9 +95,16 @@ pub struct HealthResponse {
     /// `node_id`) and, more usefully, for [`BindingStatus::Mismatch`], where it
     /// names the key to restore. `None` for `Unbound` and `Unknown`.
     pub bound_node_id: Option<String>,
-    /// Whether this node is in the on-chain active-staker set right now, and so
-    /// whether it will accept paid delivery at all (ADR 019 §Phase 4, criterion
-    /// 1; #1030).
+    /// Whether this node is in the on-chain active-staker set right now
+    /// (ADR 019 §Phase 4, criterion 1; #1030).
+    ///
+    /// Purely diagnostic. The daemon does **not** gate delivery on it — a node
+    /// policing its own registration constrains only operators who were never
+    /// the threat (see ADR 019 §How criterion 1 is enforced). What `false`
+    /// means is that the two EXTERNAL constraints are in force: the operator
+    /// accrues no governance weight, because its declared capacity caps
+    /// credited bytes at zero, and peers have no reason to route to a node they
+    /// cannot slash.
     ///
     /// Unlike [`Self::binding`], this is read LIVE on every poll — it is a
     /// lookup in the registry projection the daemon already keeps current off
@@ -106,11 +113,10 @@ pub struct HealthResponse {
     /// daemon.
     ///
     /// `false` is the answer to "my node is up and healthy, why is it earning
-    /// nothing": every `cdn/client/v1` request is being refused as `NotFound`,
-    /// which is wire-indistinguishable from a cache miss. The cause is one of
-    /// never registered, registered under a key this process no longer holds
-    /// (see [`Self::binding`]), deregistered, ejected, bond below `minBond`, or
-    /// an unbonding request in flight.
+    /// nothing". Nothing on the wire says so; the traffic simply does not
+    /// arrive. The cause is one of never registered, registered under a key
+    /// this process no longer holds (see [`Self::binding`]), deregistered,
+    /// ejected, bond below `minBond`, or an unbonding request in flight.
     pub registry_active: bool,
 }
 
