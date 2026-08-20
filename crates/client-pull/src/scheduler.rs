@@ -1294,4 +1294,136 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Part B — the shared gate actually BLOCKS a lane (no collective overspend).
+    ///
+    /// A 64 MiB blob splits into two 32 MiB segments. Lane B's source faults at
+    /// once (delivers nothing), but its ledger is PRE-SEEDED with a committed
+    /// amount `PRIOR_SPEND` — a peer lane that has already drawn most of the pool
+    /// on earlier streams. Lane A is healthy: it fetches its OWN 32 MiB segment
+    /// (a first leg always draws — voucher cost is unpriced until the first open),
+    /// then B's faulted segment is reassigned to it as a SECOND leg. By then A's
+    /// worker has a priced voucher cost AND the aggregate reader reports
+    /// `A_committed + PRIOR_SPEND`, which is at/over the deposit — so the second
+    /// leg is REFUSED. The fetch ends incomplete, and A never bills a second
+    /// segment.
+    ///
+    /// The bound this asserts and why: the aggregate gate stops a lane STARTING a
+    /// new leg once the SHARED committed leaves less than the next voucher's cost.
+    /// It is a leg-boundary gate, so the honest ceiling on total committed is
+    /// `deposit + Σ (one in-flight leg per lane)` — a leg already admitted against
+    /// headroom may overshoot it by its own cost (here A's first leg's small bao-
+    /// proof overshoot), and the on-chain pool is the hard backstop that never
+    /// redeems past its deposit. What the gate PROVABLY prevents — the unbounded
+    /// growth a naive own-committed gate would allow — is a lane opening a FURTHER
+    /// leg into an already-drained pool. This test pins exactly that: A is capped
+    /// at ONE segment, not two.
+    ///
+    /// RED (documented in the task report): with a naive `deposit - own_committed`
+    /// gate, A's second-leg check reads `deposit - A_committed` (headroom remains,
+    /// `PRIOR_SPEND` invisible), so A DRAWS the reassigned segment, the fetch
+    /// COMPLETES, and A bills ~two segments — combined committed climbs past the
+    /// deposit. The aggregate gate flips every one of those.
+    #[tokio::test]
+    async fn shared_gate_refuses_a_second_leg_into_a_drained_pool() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let total = data.len() as u64;
+        let deposit = U256::from(100u64);
+        // A peer lane that has already spent most of the pool (68 of 100 units) on
+        // prior streams — enough that A's own 32 MiB segment (~33 units of wire)
+        // fits in the remaining headroom, but a SECOND segment cannot.
+        let prior_spend = U256::from(68u64);
+
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(68u64 * 1024 * 1024),
+            amount: prior_spend,
+        }));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        // Lane B faults at its first byte: it contributes no new bytes and issues
+        // no voucher, so its committed stays exactly the pre-seeded `prior_spend`.
+        // Its 32 MiB segment is then reassigned to lane A.
+        let src_b = ScriptedSource::new(data.clone())?
+            .with_fault_after(0, || anyhow::anyhow!("scripted immediate fault"))
+            .paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let lanes = vec![
+            SourceLane {
+                source: &src_a,
+                ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
+                ledger: Arc::clone(&ledger_a),
+            },
+            SourceLane {
+                source: &src_b,
+                ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
+                ledger: Arc::clone(&ledger_b),
+            },
+        ];
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            multi_source_fetch(
+                &store,
+                &lanes,
+                &pacer,
+                &funder,
+                root,
+                0,
+                total,
+                &DriveConfig {
+                    working_deposit: U256::ZERO,
+                    max_settle_waits: 0,
+                    settle_backoff: Duration::from_millis(1),
+                },
+                &MultiSourceConfig {
+                    max_sources: 2,
+                    unit_deadline: Duration::from_secs(30),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("must not hang");
+
+        // The gate blocked A's second leg, so the blob never completed.
+        assert!(
+            result.is_err(),
+            "the shared gate must refuse A's reassigned second leg once the pool is drained"
+        );
+
+        let committed_a = ledger_a.committed().amount;
+        let committed_b = ledger_b.committed().amount;
+        // B never delivered, so its committed is exactly the pre-seed.
+        assert_eq!(
+            committed_b, prior_spend,
+            "the faulted peer lane billed nothing new"
+        );
+        // A billed its OWN one segment (~33 units of wire) and NOTHING for the
+        // refused second — well under the ~66 two-segment bill a naive gate yields.
+        assert!(
+            committed_a > U256::ZERO && committed_a < U256::from(50u64),
+            "A must bill exactly ONE segment, never the refused second: committed_a={committed_a:?}"
+        );
+        // A delivered only its own segment, never the reassigned one.
+        assert!(
+            src_a.delivered_bytes() < total,
+            "A must not have delivered the whole blob — its second leg was refused: delivered={}",
+            src_a.delivered_bytes()
+        );
+        // No-collective-overspend bound: combined committed stays within the
+        // deposit plus at most one in-flight leg's overshoot per lane (here only
+        // A had an in-flight first leg). A naive own-committed gate would push this
+        // to `prior_spend + ~2 segments` ≈ 134, far past the ceiling.
+        let combined = committed_a.saturating_add(committed_b);
+        let one_leg_ceiling = deposit.saturating_add(U256::from(40u64));
+        assert!(
+            combined <= one_leg_ceiling,
+            "combined committed must stay within deposit + one in-flight leg: \
+             combined={combined:?} ceiling={one_leg_ceiling:?}"
+        );
+        Ok(())
+    }
 }
