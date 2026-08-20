@@ -52,9 +52,8 @@ use decdn_protocol::client::{
 };
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, ContentHash, MB_BYTES, ProbeMessage,
-    VOUCHER_INTERVAL_BYTES, decode_message, encode_message, encode_stream_request, read_frame,
-    write_frame,
+    ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, CHUNK_SIZE, ContentHash, MB_BYTES, ProbeMessage,
+    decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
 use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
@@ -132,6 +131,15 @@ struct StubOpener {
     /// the row is gone. A test can therefore tell a channel that was *recorded* as
     /// retired from one that actually stopped being reused.
     retired: Arc<Mutex<Vec<(Address, B256)>>>,
+    /// The hash-chain epoch each provider's lane will next open at, mirroring
+    /// what the store-backed service persists (ADR 003 §One chain per lane).
+    ///
+    /// Modelled rather than stubbed to zero because a stale counter is not a
+    /// harmless simplification: re-opening an epoch the upstream has already
+    /// seen re-releases preimages it has already credited, and every one of
+    /// them pays nothing — so the reuse path would wedge exactly as it would in
+    /// production against a store that forgot this field.
+    epochs: Arc<Mutex<std::collections::HashMap<Address, u64>>>,
 }
 
 #[async_trait]
@@ -165,7 +173,18 @@ impl PoolOpener for StubOpener {
             .find(|(provider, ..)| *provider == provider_addr)
             .filter(|_| !was_retired)
             .map_or((U256::ZERO, U256::ZERO), |(_, b, a)| (*b, *a));
+        let prior_epoch = if was_retired {
+            0
+        } else {
+            self.epochs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?
+                .get(&provider_addr)
+                .copied()
+                .unwrap_or(0)
+        };
         Ok(PoolContext {
+            prior_epoch,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: self.deposit,
@@ -184,6 +203,7 @@ impl PoolOpener for StubOpener {
         pool_id: B256,
         bytes_delivered: U256,
         amount: U256,
+        next_epoch: u64,
     ) -> Result<()> {
         // The orchestrator must persist progress against the pool it pulled
         // on — i.e. the id from the `PoolContext` it just opened/reused.
@@ -193,6 +213,16 @@ impl PoolOpener for StubOpener {
             "record_progress pool_id {pool_id} != opened pool {}",
             self.pool_id
         );
+        // The epoch counter settles high: it only ever moves forward, so a
+        // straggler reporting an older value must not walk it back.
+        {
+            let mut epochs = self
+                .epochs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?;
+            let slot = epochs.entry(provider_addr).or_insert(0);
+            *slot = (*slot).max(next_epoch);
+        }
         self.recorded
             .lock()
             .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
@@ -285,6 +315,7 @@ impl PoolOpener for WedgedOpener {
             });
         }
         Ok(PoolContext {
+            prior_epoch: 0,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: self.deposit,
@@ -303,6 +334,7 @@ impl PoolOpener for WedgedOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
+        _next_epoch: u64,
     ) -> Result<()> {
         Ok(())
     }
@@ -316,6 +348,7 @@ impl PoolOpener for FailingRecordOpener {
         _budget: Duration,
     ) -> Result<PoolContext> {
         Ok(PoolContext {
+            prior_epoch: 0,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: self.deposit,
@@ -334,6 +367,7 @@ impl PoolOpener for FailingRecordOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
+        _next_epoch: u64,
     ) -> Result<()> {
         anyhow::bail!("simulated buyer-pool store write failure")
     }
@@ -545,6 +579,7 @@ async fn provisioned_origin_with_deadlines(
 ) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(buyer_signer),
@@ -587,6 +622,7 @@ async fn provisioned_origin_with_ceiling(
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(buyer_signer),
@@ -1133,6 +1169,8 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -1248,6 +1286,8 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics = Arc::new(Metrics::new());
@@ -1399,6 +1439,8 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -1463,6 +1505,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     .await?;
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -2268,6 +2311,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -2342,6 +2387,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -2465,6 +2511,8 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics = Arc::new(Metrics::new());
@@ -2713,6 +2761,8 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -2801,6 +2851,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
 
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3282,6 +3333,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let retired = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3439,6 +3491,7 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x5A),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3543,6 +3596,7 @@ impl PoolOpener for FailingOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
+        _next_epoch: u64,
     ) -> Result<()> {
         Ok(())
     }
@@ -3701,6 +3755,7 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x5D),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3894,6 +3949,8 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&a_metrics);
@@ -3949,6 +4006,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -4412,15 +4470,14 @@ async fn serve_a_paid_interval_then_go_silent(
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
-    // Exactly one voucher interval: CHUNK_SIZE divides VOUCHER_INTERVAL_BYTES
+    // Exactly one voucher interval: CHUNK_SIZE divides CHUNK_BYTES
     // evenly, so this lands the buyer's unvouchered counter precisely on the
     // interval boundary and it must present a voucher before it will take
     // another byte.
     // Honest bao bytes, for the reason `serve_then_go_silent` records: the buyer
     // verifies each chunk group as it decodes, so filler would end the pull as
     // corruption long before the voucher round trip this fixture is built around.
-    let interval_chunks =
-        usize::try_from(VOUCHER_INTERVAL_BYTES).unwrap_or(usize::MAX) / CHUNK_SIZE;
+    let interval_chunks = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX) / CHUNK_SIZE;
     for frame in wire_frames(&wire, interval_chunks)? {
         write_frame(&mut send, &frame)
             .await
@@ -4514,8 +4571,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // Advertise two voucher intervals but serve only the first one, so the buyer is
     // left waiting for a remainder that never comes — with one interval already
     // bought and acked.
-    let payload_len =
-        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(2)).unwrap_or(usize::MAX);
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(2)).unwrap_or(usize::MAX);
     let payload = vec![0x7Du8; payload_len];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
@@ -4552,6 +4608,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xD2),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -4590,7 +4647,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     );
 
     // The upstream acked one voucher interval before going quiet: nonce 1,
-    // VOUCHER_INTERVAL_BYTES of bytes, `ceil(VOUCHER_INTERVAL_BYTES × RATE / 1 MiB)`
+    // CHUNK_BYTES of bytes, `ceil(CHUNK_BYTES × RATE / 1 MiB)`
     // in amount. That is real USDC, and it must be on the buyer's books even though
     // the pull that spent it never returned.
     //
@@ -4601,12 +4658,8 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // cancellation, not synchronously with it — poll for it rather than reading once.
     // (Were the settle still on the outer future, or missing, this poll would time out:
     // that is the wedge this test guards.)
-    let interval_amount = min_payment(VOUCHER_INTERVAL_BYTES, RATE);
-    let want = vec![(
-        a_eth.address(),
-        U256::from(VOUCHER_INTERVAL_BYTES),
-        interval_amount,
-    )];
+    let interval_amount = min_payment(CHUNK_BYTES, RATE);
+    let want = vec![(a_eth.address(), U256::from(CHUNK_BYTES), interval_amount)];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while progress_log(&recorded)? != want {
         anyhow::ensure!(
@@ -4937,6 +4990,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xE8),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5032,6 +5086,7 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xE9),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5152,6 +5207,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xD1),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5272,6 +5328,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x7E),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5398,6 +5455,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x8B),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5513,6 +5571,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x4D),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5621,6 +5680,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xA1),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5745,6 +5805,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x9C),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5903,6 +5964,8 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&a_metrics);
@@ -5960,6 +6023,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     addr_map.insert(a_dht, a_eth.address());
 
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6092,6 +6156,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x51),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6202,6 +6267,8 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_n = Arc::new(Metrics::new());
     let handler_n = build_handler_full(
@@ -6242,6 +6309,8 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
@@ -6291,6 +6360,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     addr_map.insert(n_dht, n_eth.address());
     addr_map.insert(a_dht, a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6443,6 +6513,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x6B),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6585,6 +6656,7 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x4E),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6756,6 +6828,8 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -6882,6 +6956,8 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics = Arc::new(Metrics::new());
@@ -7014,6 +7090,8 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -7066,6 +7144,7 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -7178,6 +7257,8 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics = Arc::new(Metrics::new());
@@ -7396,7 +7477,7 @@ async fn leaf_paced_pull(
     // count the same forwarded wire bytes into `interval_bytes`.
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(total, &bao_tree::ChunkRanges::all());
-    let interval_bytes = VOUCHER_INTERVAL_BYTES;
+    let interval_bytes = CHUNK_BYTES;
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -7422,6 +7503,8 @@ async fn leaf_paced_pull(
                         provider,
                         amount,
                         bytes_delivered: U256::from(cumulative),
+                        chain_root: B256::ZERO,
+                        chunk_price: U256::ZERO,
                     }
                     .sign(leaf_eth.as_ref(), &voucher_dom())
                     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
@@ -7609,6 +7692,8 @@ async fn build_node_b_with_leaves(
             U256::ZERO,
             U256::ZERO,
             None,
+            decdn_incentive::LaneChain::NONE,
+            None,
         ))?;
         pool_status_map.insert(
             *leaf_channel_id,
@@ -7695,6 +7780,8 @@ async fn spawn_node_a(
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -7730,11 +7817,10 @@ async fn spawn_node_a(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
-    // 1.5x the pacing window (which floors at `VOUCHER_INTERVAL_BYTES`, ADR 003
+    // 1.5x the pacing window (which floors at `CHUNK_BYTES`, ADR 003
     // §Credit window), so the pull crosses exactly one window boundary and pauses
     // once, with a real remainder left to resume.
-    let payload_len =
-        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0xCDu8; payload_len];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
@@ -7811,17 +7897,15 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     // independently, so the two legs' summed payment is more than a single
     // cumulative ceiling over the whole wire would be.
     let leg1_wire =
-        u64::try_from(honest_bao_wire_range(&payload, 0, VOUCHER_INTERVAL_BYTES)?.len())
-            .unwrap_or(u64::MAX);
+        u64::try_from(honest_bao_wire_range(&payload, 0, CHUNK_BYTES)?.len()).unwrap_or(u64::MAX);
     let leg2_wire =
-        u64::try_from(honest_bao_wire_range(&payload, VOUCHER_INTERVAL_BYTES, 0)?.len())
-            .unwrap_or(u64::MAX);
+        u64::try_from(honest_bao_wire_range(&payload, CHUNK_BYTES, 0)?.len()).unwrap_or(u64::MAX);
     let expected_wire = leg1_wire.saturating_add(leg2_wire);
     let per_leg_amount = |wire: u64| -> U256 {
         let mut amount = U256::ZERO;
         let mut remaining = wire;
         while remaining > 0 {
-            let chunk = remaining.min(VOUCHER_INTERVAL_BYTES);
+            let chunk = remaining.min(CHUNK_BYTES);
             amount += min_payment(chunk, RATE);
             remaining -= chunk;
         }
@@ -8412,11 +8496,11 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
 /// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
 /// reused as the leaf channel) and same signer, dialed over two independent
 /// connections, mirroring two concurrent client streams on one payment lane.
-/// `remaining = 50` covers `min_payment(floor, RATE)` (40, `floor` = one
-/// `VOUCHER_INTERVAL_BYTES`) — enough for the first stream's own pre-flight
-/// floor-M guard inside `serve_via_window_pull_through` — but not
-/// `min_payment(2 * floor, RATE)` (80), the reserve the hoisted gate charges once
-/// a second same-lane stream sees `n_active == 1`. This is the same one-floor
+/// `remaining` covers `min_payment(floor, RATE)` with a little slack (`floor` =
+/// one `CHUNK_BYTES`) — enough for the first stream's own pre-flight floor-M
+/// guard inside `serve_via_window_pull_through` — but not
+/// `min_payment(2 * floor, RATE)`, the reserve the hoisted gate charges once a
+/// second same-lane stream sees `n_active == 1`. This is the same one-floor
 /// headroom tuning as `second_same_lane_stream_refused_when_budget_covers_one` in
 /// `client_loopback.rs`, extended to a request that MISSES locally and fills via
 /// the window-paced pull-through provider instead of a cache hit.
@@ -8442,9 +8526,10 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     // One lane: one leaf channel, one signer, shared by both concurrent opens.
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x8A);
-    // Tuned to admit exactly one floor's worth of reserved credit-window headroom
-    // (see the doc comment above for the arithmetic).
-    let remaining = U256::from(50u64);
+    // Exactly one floor's worth of reserved credit-window headroom, plus slack
+    // strictly under a second floor. Derived from the payment quantum rather
+    // than hard-coded, so it tracks `CHUNK_BYTES` instead of drifting with it.
+    let remaining = decdn_incentive::min_payment(CHUNK_BYTES, RATE) + U256::from(2u64);
     let (handler_b, b_target, ep_b, _recorded, cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b_with_leaves(
             a_id,
@@ -8895,19 +8980,69 @@ async fn spawn_lying_node_a(
     Ok((a_id, addr_a, a_eth, ep_a, task_a))
 }
 
-/// Read one frame and require it to be a `Voucher` — the per-interval exchange
-/// [`serve_wire_paced`] performs at each 1 MiB boundary. Acceptance is implicit
-/// (continued delivery is the ack, ADR 005), so no reply is written.
-async fn read_voucher(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
+/// One scripted upstream's view of a lane's claim under `PayWord` (ADR 003
+/// §Hash-chain metering).
+///
+/// A proof is a signed voucher or a released preimage. The voucher sets the
+/// anchor and the chunk price; each reveal extends that anchor by
+/// `index × chunk_price` without a signature. These stubs model
+/// `PaymentPool.redeemMany`'s arithmetic, so they resolve the same way it does:
+/// `claimed = amount + chain_index × chunk_price`.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScriptedLane {
+    anchor: U256,
+    price: U256,
+    index: u8,
+}
+
+impl ScriptedLane {
+    /// What the lane is owed right now.
+    fn claim(self) -> U256 {
+        self.anchor
+            .saturating_add(self.price.saturating_mul(U256::from(self.index)))
+    }
+
+    /// Fold one proof in, reporting whether it ADVANCED the claim.
+    ///
+    /// A voucher that merely re-asserts the live root advances nothing — that is
+    /// the per-stream re-anchor every stream sends before its first reveal of an
+    /// epoch, and a real node treats it as already-satisfied.
+    fn apply(&mut self, proof: &ClientMessage) -> bool {
+        let before = self.claim();
+        match proof {
+            ClientMessage::Voucher(v) => {
+                self.anchor = U256::from(v.amount);
+                self.price = U256::from(v.chunk_price);
+                self.index = 0;
+            }
+            ClientMessage::ChunkPreimage(p) => {
+                self.index = self.index.max(p.index);
+            }
+            _ => return false,
+        }
+        self.claim() > before
+    }
+}
+
+/// Read one payment proof — a `Voucher` or a `ChunkPreimage`, the whole
+/// payer→node vocabulary after the opening request.
+async fn read_proof(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
     let frame = read_frame(recv)
         .await
-        .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("read proof: {e}"))?;
     let (msg, _) =
         decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    let ClientMessage::Voucher(_) = msg else {
-        anyhow::bail!("paced upstream: expected a Voucher");
-    };
-    Ok(())
+    match msg {
+        ClientMessage::Voucher(_) | ClientMessage::ChunkPreimage(_) => Ok(msg),
+        other => anyhow::bail!("scripted upstream: expected a payment proof, got {other:?}"),
+    }
+}
+
+/// Read one payment proof — the per-chunk exchange [`serve_wire_paced`] performs
+/// at each 1 MiB boundary. Acceptance is implicit (continued delivery is the
+/// ack, ADR 005), so no reply is written.
+async fn read_voucher(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
+    read_proof(recv).await.map(|_| ())
 }
 
 /// Like [`serve_wrong_bytes`], but serves `wire` (a bao verified-stream,
@@ -8975,7 +9110,7 @@ async fn serve_wire_paced(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    let interval_bytes = VOUCHER_INTERVAL_BYTES;
+    let interval_bytes = CHUNK_BYTES;
     let mut unvouchered: u64 = 0;
     for chunk in wire.chunks(CHUNK_SIZE) {
         if !gap.is_zero() {
@@ -9165,8 +9300,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
     // corruption), with a single byte flipped just past that first interval —
     // every group before it verifies, the containing group fails, and a real
     // remainder of wire stays undelivered behind it.
-    let payload_len =
-        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0xB7u8; payload_len];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
@@ -9187,8 +9321,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         .get(8..)
         .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
         .to_vec();
-    let corrupt_at =
-        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_add(400_000)).unwrap_or(usize::MAX);
+    let corrupt_at = usize::try_from(CHUNK_BYTES.saturating_add(400_000)).unwrap_or(usize::MAX);
     let byte = wire
         .get_mut(corrupt_at)
         .ok_or_else(|| anyhow::anyhow!("corruption offset outside the wire"))?;
@@ -9315,7 +9448,7 @@ async fn leaf_underpays_first_voucher(
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     };
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
-    let interval_bytes = VOUCHER_INTERVAL_BYTES;
+    let interval_bytes = CHUNK_BYTES;
 
     // Read chunks until the first interval boundary, then underpay it.
     let mut cumulative: u64 = 0;
@@ -9338,6 +9471,8 @@ async fn leaf_underpays_first_voucher(
         provider: leaf_eth.address(),
         amount: U256::from(1u64), // far below the rate floor for one interval
         bytes_delivered: U256::from(cumulative),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
     }
     .sign(leaf_eth.as_ref(), &voucher_dom())
     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
@@ -9361,10 +9496,9 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     // (VoucherOutcome::Rejected), B must abandon the partial fill (nothing cached),
     // its upstream spend stays bounded to ~one window, and the client-abandoned
     // counter fires. The payload exceeds one voucher accounting interval
-    // (`VOUCHER_INTERVAL_BYTES`), so the leaf actually reaches an interval boundary
+    // (`CHUNK_BYTES`), so the leaf actually reaches an interval boundary
     // to underpay rather than draining the whole blob first.
-    let payload_len =
-        usize::try_from(VOUCHER_INTERVAL_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0x7Cu8; payload_len];
     let hash = Hash::new(&payload);
 
@@ -9415,8 +9549,8 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         .last()
         .map_or(0, |(_, bytes, _)| u64::try_from(*bytes).unwrap_or(u64::MAX));
     // The ramped credit window (#1669): at `paid = 0` it floors to one voucher
-    // interval — the fixed `VOUCHER_INTERVAL_BYTES` (4 MiB).
-    let one_window = VOUCHER_INTERVAL_BYTES;
+    // interval — the fixed `CHUNK_BYTES` (4 MiB).
+    let one_window = CHUNK_BYTES;
     // The window bounds CONTENT bytes, but the upstream watermark meters WIRE bytes
     // (bao content + interleaved proof, ADR 038), so one window of content costs one
     // window + its proof overhead plus up to a group of boundary overshoot. One
@@ -9589,6 +9723,8 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -9643,6 +9779,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -9803,6 +9940,8 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -9932,6 +10071,8 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -9987,6 +10128,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let b_buyer2 = Arc::clone(&b_buyer);
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: b_buyer2,
@@ -10089,6 +10231,8 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -10142,6 +10286,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10313,6 +10458,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     addr_map.insert(n2_dht, n2_eth.address());
 
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x3B),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10498,6 +10644,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     addr_map.insert(h_dht, h_eth.address());
 
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10565,6 +10712,8 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics_h_side = Arc::new(Metrics::new());
@@ -10712,6 +10861,8 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -10772,6 +10923,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     addr_map.insert(n_dht, n_eth.address());
     addr_map.insert(a_dht, a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10883,6 +11035,8 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
@@ -11096,6 +11250,7 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     addr_map.insert(h_dht, h_eth.address());
 
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11146,6 +11301,8 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         0,
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
     let metrics_h_side = Arc::new(Metrics::new());
@@ -11376,6 +11533,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     addr_map.insert(n2_dht, n2_eth.address());
 
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x7C),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11565,6 +11723,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*n_id.as_bytes()), n_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x2F),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11717,6 +11876,8 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_h_side = Arc::new(Metrics::new());
     let limiter_h = permissive_limiter(&metrics_h_side);
@@ -11779,6 +11940,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     addr_map.insert(a_dht, a_eth.address());
     addr_map.insert(h_dht, h_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -12059,6 +12221,8 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -12127,6 +12291,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let mut addr_map = HashMap::new();
     addr_map.insert(a_dht, a_eth.address());
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -12378,6 +12543,10 @@ struct FundingOpener {
     topups: Arc<Mutex<Vec<(Address, U256)>>>,
     /// Whether a top-up actually adds headroom. `false` models a refusal.
     funds: bool,
+    /// The hash-chain epoch each provider's lane will next open at, mirroring
+    /// what the store-backed service persists (ADR 003 §One chain per lane).
+    /// Modelled for the same reason as [`StubOpener::epochs`].
+    epochs: Arc<Mutex<std::collections::HashMap<Address, u64>>>,
 }
 
 #[async_trait]
@@ -12397,7 +12566,15 @@ impl PoolOpener for FundingOpener {
             .find(|(provider, ..)| *provider == provider_addr)
             .map_or((U256::ZERO, U256::ZERO), |(_, b, a)| (*b, *a));
         drop(recorded);
+        let prior_epoch = self
+            .epochs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?
+            .get(&provider_addr)
+            .copied()
+            .unwrap_or(0);
         Ok(PoolContext {
+            prior_epoch,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: read_deposit(&self.deposit)?,
@@ -12416,12 +12593,23 @@ impl PoolOpener for FundingOpener {
         pool_id: B256,
         bytes_delivered: U256,
         amount: U256,
+        next_epoch: u64,
     ) -> Result<()> {
         anyhow::ensure!(
             pool_id == self.pool_id,
             "record_progress pool_id {pool_id} != opened pool {}",
             self.pool_id
         );
+        // The epoch counter settles high: it only ever moves forward, so a
+        // straggler reporting an older value must not walk it back.
+        {
+            let mut epochs = self
+                .epochs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?;
+            let slot = epochs.entry(provider_addr).or_insert(0);
+            *slot = (*slot).max(next_epoch);
+        }
         self.recorded
             .lock()
             .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
@@ -12484,6 +12672,7 @@ async fn serve_with_deposit_ceiling(
     deposit: &SharedDeposit,
     resume_delay: Duration,
     initial_ceiling: U256,
+    lane: &Mutex<ScriptedLane>,
 ) -> Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -12534,8 +12723,8 @@ async fn serve_with_deposit_ceiling(
         .await
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
         unvouchered = unvouchered.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        if unvouchered >= VOUCHER_INTERVAL_BYTES {
-            if !settle_voucher(&mut send, &mut recv, deposit).await? {
+        if unvouchered >= CHUNK_BYTES {
+            if !settle_voucher(&mut send, &mut recv, deposit, lane).await? {
                 // Refused: hold the connection so the buyer reads the rejection frame
                 // rather than a transport reset (which would score as unreachable).
                 let _ = send.finish();
@@ -12545,7 +12734,7 @@ async fn serve_with_deposit_ceiling(
             unvouchered = 0;
         }
     }
-    if unvouchered > 0 && !settle_voucher(&mut send, &mut recv, deposit).await? {
+    if unvouchered > 0 && !settle_voucher(&mut send, &mut recv, deposit, lane).await? {
         let _ = send.finish();
         conn.closed().await;
         return Ok(());
@@ -12573,28 +12762,39 @@ async fn settle_voucher(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
     deposit: &SharedDeposit,
+    lane: &Mutex<ScriptedLane>,
 ) -> Result<bool> {
-    let frame = read_frame(recv)
-        .await
-        .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
-    let (msg, _) =
-        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    let ClientMessage::Voucher(v) = msg else {
-        anyhow::bail!("deposit-capped upstream: expected a Voucher");
-    };
-    if U256::from(v.amount) > read_deposit(deposit)? {
-        write_frame(
-            send,
-            &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
-                reason: VoucherRejectReason::SpendingCapExhausted,
-                bundle: None,
-            }))?,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("write rejection: {e}"))?;
-        return Ok(false);
+    // Read proofs until one credits this chunk. The payer sends housekeeping
+    // vouchers ahead of a reveal (a stream's first root voucher for an epoch, a
+    // rollover), and neither advances the claim.
+    for _ in 0..4u8 {
+        let proof = read_proof(recv).await?;
+        let (advanced, claim) = {
+            let mut lane = lane
+                .lock()
+                .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))?;
+            let advanced = lane.apply(&proof);
+            (advanced, lane.claim())
+        };
+        // The deposit has to cover the CHAIN-EXTENDED claim, not just the signed
+        // anchor — a reveal spends real money without a signature.
+        if claim > read_deposit(deposit)? {
+            write_frame(
+                send,
+                &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
+                    reason: VoucherRejectReason::SpendingCapExhausted,
+                    bundle: None,
+                }))?,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("write rejection: {e}"))?;
+            return Ok(false);
+        }
+        if advanced {
+            return Ok(true);
+        }
     }
-    Ok(true)
+    anyhow::bail!("deposit-capped upstream: four proofs in a row credited nothing")
 }
 
 /// Spawn a provider that answers probes truthfully and serves under a live deposit
@@ -12617,6 +12817,11 @@ fn spawn_deposit_capped_server(
         .first()
         .map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
     let payloads = Arc::new(payloads);
+    // ONE lane, shared by every stream this upstream serves — which is what a
+    // lane is: `(pool_id, signer, provider)`, not `(…, stream)`. Concurrent
+    // pulls to one provider share a chain and a claim, so a per-stream view
+    // would let each one spend the whole deposit independently.
+    let lane: Arc<Mutex<ScriptedLane>> = Arc::new(Mutex::new(ScriptedLane::default()));
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(connecting) = incoming.accept() else {
@@ -12627,6 +12832,7 @@ fn spawn_deposit_capped_server(
             let dom = slash.clone();
             let payloads = Arc::clone(&payloads);
             let deposit = Arc::clone(&deposit);
+            let lane = Arc::clone(&lane);
             if conn.alpn() == ALPN_PROBE {
                 tokio::spawn(async move {
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
@@ -12642,6 +12848,7 @@ fn spawn_deposit_capped_server(
                         &deposit,
                         resume_delay,
                         initial_ceiling,
+                        &lane,
                     )
                     .await;
                 });
@@ -12771,6 +12978,7 @@ async fn top_up_fixture_multi_rep(
     let metrics = Arc::new(Metrics::new());
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let opener = Arc::new(FundingOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x15),
         deposit,
         ceiling,
@@ -13227,10 +13435,10 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 /// `decdn_client_pull::driver::drive`.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Result<()> {
-    // Four voucher intervals (`VOUCHER_INTERVAL_BYTES` is 4 MiB) of content per blob:
-    // large enough that each stream's ramped credit window (floored at one interval)
-    // cannot front the whole payload on credit, so real vouchers come due mid-pull.
-    let len = usize::try_from(VOUCHER_INTERVAL_BYTES).unwrap_or(usize::MAX) * 4 + 777;
+    // Four chunks of content per blob: large enough that each stream's ramped
+    // credit window (floored at one chunk) cannot front the whole payload on
+    // credit, so real proofs come due mid-pull.
+    let len = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX) * 4 + 777;
     let payload_a: Arc<Vec<u8>> = Arc::new(
         (0..len)
             .map(|i| u8::try_from(i % 249).unwrap_or(0))

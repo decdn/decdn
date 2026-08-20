@@ -22,6 +22,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use alloy::primitives::B256;
+
 use decdn_client_pull::{Cumulative, PoolLedger};
 use decdn_incentive::LaneKey;
 
@@ -44,6 +46,11 @@ impl BuyerLedgers {
     /// The ledger to issue this pull's vouchers through: the live one for `key`, or a fresh
     /// one seeded from `seed` if there is none.
     ///
+    /// `master` and `epoch` seed the lane's hash chain — the payer's derived master secret
+    /// and the counter its next chain opens at (ADR 003 §One chain per lane). They share
+    /// `seed`'s precedence: a live ledger has the authoritative epoch, because a concurrent
+    /// pull may already have rolled past the persisted counter.
+    ///
     /// An existing entry for the SAME lane wins over `seed`, and that precedence is the
     /// whole point. `seed` comes from the persisted row that `open_or_reuse_pool` read; a
     /// concurrent pull holding the live ledger may already have issued vouchers the row does
@@ -54,14 +61,20 @@ impl BuyerLedgers {
     /// read nor evict this lane's ledger. The provider's other lanes are pruned here, but
     /// only those no pull still holds (`Arc::strong_count == 1`), so a rotation cannot throw
     /// away a ledger a concurrent pull is issuing through.
-    pub fn get_or_seed(&self, key: LaneKey, seed: Cumulative) -> Arc<PoolLedger> {
+    pub fn get_or_seed(
+        &self,
+        key: LaneKey,
+        master: B256,
+        epoch: u64,
+        seed: Cumulative,
+    ) -> Arc<PoolLedger> {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         // Bound cardinality by dropping this provider's OTHER lanes — but only those no pull
         // still holds, so a stale/rotated key cannot evict a live ledger.
         live.retain(|k, l| k.provider != key.provider || *k == key || Arc::strong_count(l) > 1);
         Arc::clone(
             live.entry(key)
-                .or_insert_with(|| Arc::new(PoolLedger::new(seed))),
+                .or_insert_with(|| Arc::new(PoolLedger::new(key, master, epoch, seed))),
         )
     }
 
@@ -103,8 +116,8 @@ mod tests {
     #[test]
     fn concurrent_pulls_on_one_lane_share_a_ledger() {
         let ledgers = BuyerLedgers::default();
-        let a = ledgers.get_or_seed(lane(9, 1), seed_at(7));
-        let b = ledgers.get_or_seed(lane(9, 1), seed_at(7));
+        let a = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(7));
+        let b = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(7));
         assert!(
             Arc::ptr_eq(&a, &b),
             "both pulls must issue through the same ledger, or they sign the same watermark"
@@ -117,8 +130,8 @@ mod tests {
     #[test]
     fn a_stale_seed_cannot_rewind_a_live_ledger() {
         let ledgers = BuyerLedgers::default();
-        let live = ledgers.get_or_seed(lane(9, 1), seed_at(7));
-        let rejoined = ledgers.get_or_seed(lane(9, 1), seed_at(7));
+        let live = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(7));
+        let rejoined = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(7));
         assert!(Arc::ptr_eq(&live, &rejoined));
         assert_eq!(
             rejoined.committed().amount,
@@ -132,8 +145,8 @@ mod tests {
     #[test]
     fn a_rotated_pool_gets_a_fresh_ledger() {
         let ledgers = BuyerLedgers::default();
-        let old = ledgers.get_or_seed(lane(9, 1), seed_at(7));
-        let new = ledgers.get_or_seed(lane(10, 1), seed_at(0));
+        let old = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(7));
+        let new = ledgers.get_or_seed(lane(10, 1), B256::ZERO, 0, seed_at(0));
         assert!(!Arc::ptr_eq(&old, &new));
         assert_eq!(
             new.committed().amount,
@@ -146,17 +159,17 @@ mod tests {
     #[test]
     fn forget_drops_only_the_named_lane() {
         let ledgers = BuyerLedgers::default();
-        let first = ledgers.get_or_seed(lane(9, 1), seed_at(7));
+        let first = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(7));
         // A concurrent open already rotated us onto pool 10; a late retire of pool 9 must not
         // throw away the live ledger.
-        let live = ledgers.get_or_seed(lane(10, 1), seed_at(0));
+        let live = ledgers.get_or_seed(lane(10, 1), B256::ZERO, 0, seed_at(0));
         ledgers.forget(lane(9, 1));
-        let rejoined = ledgers.get_or_seed(lane(10, 1), seed_at(0));
+        let rejoined = ledgers.get_or_seed(lane(10, 1), B256::ZERO, 0, seed_at(0));
         assert!(Arc::ptr_eq(&live, &rejoined), "pool 10's ledger survives");
         drop(first);
 
         ledgers.forget(lane(10, 1));
-        let fresh = ledgers.get_or_seed(lane(10, 1), seed_at(3));
+        let fresh = ledgers.get_or_seed(lane(10, 1), B256::ZERO, 0, seed_at(3));
         assert!(!Arc::ptr_eq(&live, &fresh), "its own retire does drop it");
     }
 
@@ -168,12 +181,12 @@ mod tests {
     fn a_stale_pool_does_not_evict_the_live_ledger() {
         let ledgers = BuyerLedgers::default();
         // The live lane, held by a concurrent pull (so its `Arc` outlives the map entry).
-        let live = ledgers.get_or_seed(lane(10, 1), seed_at(5));
+        let live = ledgers.get_or_seed(lane(10, 1), B256::ZERO, 0, seed_at(5));
         // A late call with a STALE pool: keyed by `LaneKey`, it addresses pool 9's
         // own entry and never touches pool 10's live ledger.
-        let _stale = ledgers.get_or_seed(lane(9, 1), seed_at(0));
+        let _stale = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(0));
         // pool 10's live ledger survives — a subsequent pull on it rejoins the SAME Arc.
-        let rejoined = ledgers.get_or_seed(lane(10, 1), seed_at(0));
+        let rejoined = ledgers.get_or_seed(lane(10, 1), B256::ZERO, 0, seed_at(0));
         assert!(
             Arc::ptr_eq(&live, &rejoined),
             "a stale pool must not evict the live lane's ledger"
@@ -189,8 +202,8 @@ mod tests {
     #[test]
     fn distinct_providers_get_distinct_ledgers() {
         let ledgers = BuyerLedgers::default();
-        let a = ledgers.get_or_seed(lane(9, 1), seed_at(0));
-        let b = ledgers.get_or_seed(lane(9, 2), seed_at(0));
+        let a = ledgers.get_or_seed(lane(9, 1), B256::ZERO, 0, seed_at(0));
+        let b = ledgers.get_or_seed(lane(9, 2), B256::ZERO, 0, seed_at(0));
         assert!(!Arc::ptr_eq(&a, &b));
     }
 }

@@ -36,9 +36,7 @@ use decdn_incentive::{
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
-use decdn_protocol::{
-    ALPN_CLIENT, MB_BYTES, VOUCHER_INTERVAL_BYTES, encode_stream_request, write_frame,
-};
+use decdn_protocol::{ALPN_CLIENT, CHUNK_BYTES, MB_BYTES, encode_stream_request, write_frame};
 use iroh::EndpointAddr;
 use iroh::endpoint::SendStream;
 use wiremock::matchers::{header, header_exists, method, path};
@@ -108,6 +106,8 @@ async fn handler_over_http_origin(
         0, // expiry: 0 = untracked, never expires
         U256::ZERO,
         U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
         None,
     ))?;
 
@@ -233,7 +233,7 @@ async fn ranged_paid_pull(
             .map_err(|e| anyhow::anyhow!("align range: {e}"))?;
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(resp.body.total_bytes, aligned.chunk_ranges());
-    let interval_bytes = VOUCHER_INTERVAL_BYTES;
+    let interval_bytes = CHUNK_BYTES;
 
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
@@ -260,6 +260,8 @@ async fn ranged_paid_pull(
                         provider,
                         amount,
                         bytes_delivered: U256::from(cumulative),
+                        chain_root: B256::ZERO,
+                        chunk_price: U256::ZERO,
                     }
                     .sign(client_eth.as_ref(), &voucher_dom())
                     .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
@@ -1365,6 +1367,8 @@ async fn handler_two_channels_over_http_origin(
             0,
             U256::ZERO,
             U256::ZERO,
+            None,
+            decdn_incentive::LaneChain::NONE,
             None,
         ))?;
     }

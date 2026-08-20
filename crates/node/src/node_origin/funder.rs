@@ -272,6 +272,7 @@ mod tests {
             _pool_id: PoolId,
             _bytes_delivered: U256,
             _amount: U256,
+            _next_epoch: u64,
         ) -> Result<()> {
             unreachable!("not exercised by NodeFunder tests")
         }
@@ -289,6 +290,7 @@ mod tests {
     fn test_ctx(deposit: U256) -> Arc<Mutex<PoolContext>> {
         let signer = PrivateKeySigner::random();
         Arc::new(Mutex::new(PoolContext {
+            prior_epoch: 0,
             pool_id: B256::ZERO,
             provider: Address::repeat_byte(9),
             deposit,
@@ -304,7 +306,7 @@ mod tests {
     /// A lane ledger whose committed spend is `committed` — the amount already
     /// vouchered, which `deposit - committed` is the spendable headroom over.
     fn test_ledger(committed: U256) -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::new(decdn_client_pull::Cumulative {
+        Arc::new(PoolLedger::unmetered(decdn_client_pull::Cumulative {
             bytes: U256::ZERO,
             amount: committed,
         }))

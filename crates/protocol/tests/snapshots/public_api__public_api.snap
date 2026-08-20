@@ -6,6 +6,7 @@ pub mod decdn_protocol
 pub mod decdn_protocol::client
 pub enum decdn_protocol::client::ClientMessage
 pub decdn_protocol::client::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
+pub decdn_protocol::client::ClientMessage::ChunkPreimage(decdn_protocol::client::ChunkPreimage)
 pub decdn_protocol::client::ClientMessage::StreamEnd
 pub decdn_protocol::client::ClientMessage::StreamError(decdn_protocol::client::StreamError)
 pub decdn_protocol::client::ClientMessage::StreamRequest(decdn_protocol::client::StreamRequest)
@@ -31,11 +32,15 @@ pub const fn decdn_protocol::client::StreamError::is_delivery_side(&self) -> boo
 pub const fn decdn_protocol::client::StreamError::is_mid_stream(&self) -> bool
 pub enum decdn_protocol::client::VoucherRejectReason
 pub decdn_protocol::client::VoucherRejectReason::AmountRegression
+pub decdn_protocol::client::VoucherRejectReason::BadPreimage
 pub decdn_protocol::client::VoucherRejectReason::BadSignature
 pub decdn_protocol::client::VoucherRejectReason::BytesRegression
 pub decdn_protocol::client::VoucherRejectReason::CapabilityExpired
+pub decdn_protocol::client::VoucherRejectReason::ChainIndexTooLarge
+pub decdn_protocol::client::VoucherRejectReason::ChunkPriceMismatch
 pub decdn_protocol::client::VoucherRejectReason::PoolExhausted
 pub decdn_protocol::client::VoucherRejectReason::SpendingCapExhausted
+pub decdn_protocol::client::VoucherRejectReason::UnanchoredPreimage
 pub decdn_protocol::client::VoucherRejectReason::WrongPool
 pub decdn_protocol::client::VoucherRejectReason::WrongProvider
 pub decdn_protocol::client::VoucherRejectReason::WrongSigner
@@ -46,6 +51,11 @@ impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
 pub fn decdn_protocol::client::ChunkData::into_bytes(self) -> alloc::vec::Vec<u8>
 pub fn decdn_protocol::client::ChunkData::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::client::ChunkPreimage
+pub decdn_protocol::client::ChunkPreimage::index: u8
+pub decdn_protocol::client::ChunkPreimage::preimage: [u8; 32]
+impl decdn_protocol::client::ChunkPreimage
+pub const fn decdn_protocol::client::ChunkPreimage::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::ClientBinding
 pub decdn_protocol::client::ClientBinding::binding_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::client::ClientBinding::ethereum_address: [u8; 20]
@@ -80,13 +90,19 @@ pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::client::Voucher
 pub decdn_protocol::client::Voucher::amount: u64
 pub decdn_protocol::client::Voucher::bytes_delivered: u64
+pub decdn_protocol::client::Voucher::chain_root: [u8; 32]
+pub decdn_protocol::client::Voucher::chunk_price: u64
 pub decdn_protocol::client::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::WatermarkBundle
 pub decdn_protocol::client::WatermarkBundle::amount: u64
 pub decdn_protocol::client::WatermarkBundle::bytes_delivered: u64
+pub decdn_protocol::client::WatermarkBundle::chain_root: [u8; 32]
+pub decdn_protocol::client::WatermarkBundle::chunk_price: u64
 pub decdn_protocol::client::WatermarkBundle::last_signature: alloc::vec::Vec<u8>
+pub decdn_protocol::client::WatermarkBundle::tip: [u8; 32]
+pub decdn_protocol::client::WatermarkBundle::verified_index: u8
 impl decdn_protocol::client::WatermarkBundle
 pub const fn decdn_protocol::client::WatermarkBundle::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::WireCapability
@@ -96,10 +112,11 @@ pub decdn_protocol::client::WireCapability::spending_cap: [u8; 32]
 impl decdn_protocol::client::WireCapability
 pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
+pub const decdn_protocol::client::CHUNK_BYTES: u64
 pub const decdn_protocol::client::CHUNK_SIZE: usize
+pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
-pub const decdn_protocol::client::VOUCHER_INTERVAL_BYTES: u64
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::client::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
@@ -263,6 +280,7 @@ pub fn decdn_protocol::region::Region::deserialize<D: serde_core::de::Deserializ
 pub fn decdn_protocol::region::is_valid_region(&str) -> bool
 pub enum decdn_protocol::ClientMessage
 pub decdn_protocol::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
+pub decdn_protocol::ClientMessage::ChunkPreimage(decdn_protocol::client::ChunkPreimage)
 pub decdn_protocol::ClientMessage::StreamEnd
 pub decdn_protocol::ClientMessage::StreamError(decdn_protocol::client::StreamError)
 pub decdn_protocol::ClientMessage::StreamRequest(decdn_protocol::client::StreamRequest)
@@ -326,11 +344,15 @@ pub const fn decdn_protocol::client::StreamError::is_delivery_side(&self) -> boo
 pub const fn decdn_protocol::client::StreamError::is_mid_stream(&self) -> bool
 pub enum decdn_protocol::VoucherRejectReason
 pub decdn_protocol::VoucherRejectReason::AmountRegression
+pub decdn_protocol::VoucherRejectReason::BadPreimage
 pub decdn_protocol::VoucherRejectReason::BadSignature
 pub decdn_protocol::VoucherRejectReason::BytesRegression
 pub decdn_protocol::VoucherRejectReason::CapabilityExpired
+pub decdn_protocol::VoucherRejectReason::ChainIndexTooLarge
+pub decdn_protocol::VoucherRejectReason::ChunkPriceMismatch
 pub decdn_protocol::VoucherRejectReason::PoolExhausted
 pub decdn_protocol::VoucherRejectReason::SpendingCapExhausted
+pub decdn_protocol::VoucherRejectReason::UnanchoredPreimage
 pub decdn_protocol::VoucherRejectReason::WrongPool
 pub decdn_protocol::VoucherRejectReason::WrongProvider
 pub decdn_protocol::VoucherRejectReason::WrongSigner
@@ -346,6 +368,11 @@ impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
 pub fn decdn_protocol::client::ChunkData::into_bytes(self) -> alloc::vec::Vec<u8>
 pub fn decdn_protocol::client::ChunkData::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::ChunkPreimage
+pub decdn_protocol::ChunkPreimage::index: u8
+pub decdn_protocol::ChunkPreimage::preimage: [u8; 32]
+impl decdn_protocol::client::ChunkPreimage
+pub const fn decdn_protocol::client::ChunkPreimage::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::ClientBinding
 pub decdn_protocol::ClientBinding::binding_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::ClientBinding::ethereum_address: [u8; 20]
@@ -468,6 +495,8 @@ pub decdn_protocol::StreamResponseBody::total_bytes: u64
 pub struct decdn_protocol::Voucher
 pub decdn_protocol::Voucher::amount: u64
 pub decdn_protocol::Voucher::bytes_delivered: u64
+pub decdn_protocol::Voucher::chain_root: [u8; 32]
+pub decdn_protocol::Voucher::chunk_price: u64
 pub decdn_protocol::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
@@ -476,16 +505,17 @@ pub const decdn_protocol::ALPN_DHT: &[u8]
 pub const decdn_protocol::ALPN_PROBE: &[u8]
 pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
+pub const decdn_protocol::CHUNK_BYTES: u64
 pub const decdn_protocol::CHUNK_SIZE: usize
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
+pub const decdn_protocol::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::MAX_MESSAGE_SIZE: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MB_BYTES: u64
 pub const decdn_protocol::SLASH_SIG_LEN: usize
-pub const decdn_protocol::VOUCHER_INTERVAL_BYTES: u64
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize
 pub trait decdn_protocol::TopLevelEnum
 pub const decdn_protocol::TopLevelEnum::VARIANT_COUNT: u32

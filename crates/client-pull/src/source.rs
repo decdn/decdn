@@ -521,9 +521,12 @@ mod doubles {
                 // driver's paid frontier tracks payment.
                 if reader.wire_len > 0 {
                     ledger
-                        .issue(reader.wire_len, SCRIPTED_RATE_PER_MB, |_next| async {
-                            Ok(())
-                        })
+                        .issue(
+                            reader.wire_len,
+                            SCRIPTED_RATE_PER_MB,
+                            crate::EpochAction::Keep,
+                            |_next, _chain| async { Ok(()) },
+                        )
                         .await?;
                 }
                 Ok(VoucherProgress::from_cumulative(

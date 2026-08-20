@@ -376,7 +376,18 @@ impl NodeOrigin {
                 return Err(PullMiss::for_verdict(verdict));
             }
         };
-        let ledger = lane_ledger(deps, provider_addr, &ctx);
+        // Deriving this lane's chain master is a signing operation, so it can
+        // fail on a remote or hardware signer. A failure is ours, not the
+        // candidate's — it classifies like any other local fault rather than
+        // scoring the peer.
+        let ledger = match lane_ledger(deps, provider_addr, &ctx) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                let verdict =
+                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+                return Err(PullMiss::for_verdict(verdict));
+            }
+        };
         // Folds the candidate probe rate, the static ceiling, and the ADR 041 buy cap.
         let rate_ceiling = econ_rate_ceiling;
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
@@ -736,6 +747,7 @@ impl Funder for NullFunder {
 #[allow(dead_code, reason = "wired by the own-origin serve-miss orchestration")]
 fn local_bookkeeping_ctx() -> PoolContext {
     PoolContext {
+        prior_epoch: 0,
         pool_id: B256::ZERO,
         // No provider is paid: rate 0 means no voucher is ever signed, so the
         // ZERO-provider signing guard is never reached on this local leg.
@@ -747,6 +759,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
         voucher_domain: decdn_incentive::voucher_domain(0, Address::ZERO),
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        // No chain either: rate 0 means nothing is ever metered on this leg.
         client_binding: None,
         capability: None,
     }
@@ -1077,7 +1090,7 @@ mod local_pull_leg_tests {
     }
 
     fn fresh_ledger() -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::new(Cumulative::default()))
+        Arc::new(PoolLedger::unmetered(Cumulative::default()))
     }
 
     /// Build an engine over one `FakeOrigin` in `mode`, plus the root/outboard/total

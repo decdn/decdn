@@ -128,16 +128,37 @@ mod sol_types {
             /// `InvalidVoucherSignature`. The signature is the EIP-2098
             /// compact pair `(r, vs)`, which makes this struct *static*: an
             /// array of it carries no per-element offset, no length word and
-            /// no padding, so a lane costs 160 calldata bytes instead of 288.
-            /// A voucher signer must therefore be an EOA — the contract
-            /// recovers with `ecrecover`, not ERC-1271. Field order is part
-            /// of the ABI tuple; do not rearrange.
+            /// no padding. A voucher signer must therefore be an EOA — the
+            /// contract recovers with `ecrecover`, not ERC-1271. Field order
+            /// is part of the ABI tuple; do not rearrange.
+            ///
+            /// `PayWord` adds three words, for 8 words / 256 calldata bytes per
+            /// lane (ADR 003 §Voucher signatures are compact). `chainMeter`
+            /// is the packing that keeps it at 8 rather than 9:
+            ///
+            /// ```text
+            ///  byte  0                     22 23            30 31
+            ///       +------------------------+----------------+--+
+            ///       |  reserved — MUST be 0  |   chunkPrice   |ci|
+            ///       +------------------------+----------------+--+
+            /// ```
+            ///
+            /// The packing is invisible to signers: the contract decodes
+            /// `chunkPrice`, widens it back to `uint256`, and rebuilds the
+            /// same EIP-712 digest, while `chainIndex` is a redemption
+            /// parameter and is not signed at all. On a cooperative
+            /// redemption all three words are nearly all zero bytes — a
+            /// closing voucher carries a zero root, a zero preimage, and a
+            /// zero index — so they compress to almost nothing on an L2.
             struct LaneVoucher {
                 address signer;
                 uint64 cumulative;
                 uint64 bytesDelivered;
                 bytes32 r;
                 bytes32 vs;
+                bytes32 chainRoot;
+                bytes32 preimage;
+                uint256 chainMeter;
             }
 
             /// Everything a node redeems against one pool. Naming the pool
@@ -492,7 +513,7 @@ mod tests {
         );
         assert_eq!(
             PaymentPool::LaneVoucher::eip712_encode_type(),
-            "LaneVoucher(address signer,uint64 cumulative,uint64 bytesDelivered,bytes32 r,bytes32 vs)"
+            "LaneVoucher(address signer,uint64 cumulative,uint64 bytesDelivered,bytes32 r,bytes32 vs,bytes32 chainRoot,bytes32 preimage,uint256 chainMeter)"
         );
     }
 

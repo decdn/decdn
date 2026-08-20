@@ -152,7 +152,7 @@ async fn run() -> anyhow::Result<()> {
     // advancing the persisted lane watermark.
     let prior_amount = deposit - U256::from(1u64);
     let outcome = store
-        .advance_progress(buyer_addr, pool_id, lane, U256::from(1u64), prior_amount)
+        .advance_progress(buyer_addr, pool_id, lane, U256::from(1u64), prior_amount, 0)
         .context("advance watermark")?;
     anyhow::ensure!(
         matches!(
@@ -331,7 +331,7 @@ fn topup_fetch_argv_with_deposits(
 //     The gate prices a cold, unbounded request at `paid = 0` (ADR 003
 //     §Credit window, #1669), which the ramp collapses to its floor — exactly
 //     ONE fixed 4 MiB voucher accounting interval
-//     (`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`); at `MULTI_RATE_PER_MB`
+//     (`decdn_protocol::client::CHUNK_BYTES`); at `MULTI_RATE_PER_MB`
 //     that floor costs 4 * 2_000_000 = 8 USDC, so the deposit must clear
 //     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later

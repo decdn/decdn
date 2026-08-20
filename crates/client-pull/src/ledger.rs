@@ -8,7 +8,9 @@
 
 use std::future::Future;
 
-use alloy::primitives::U256;
+use alloy::primitives::{B256, U256};
+use decdn_incentive::LaneKey;
+use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH};
 use decdn_protocol::MB_BYTES;
 use decdn_protocol::client::WatermarkBundle;
 use tokio::sync::Mutex;
@@ -23,6 +25,18 @@ pub struct Cumulative {
     pub bytes: U256,
     /// Cumulative lane amount paid (token base units).
     pub amount: U256,
+}
+
+impl Cumulative {
+    /// Componentwise sum — the anchor plus what the chain has accrued on top of
+    /// it, which together are what the lane is owed.
+    #[must_use]
+    const fn plus(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_add(other.bytes),
+            amount: self.amount.saturating_add(other.amount),
+        }
+    }
 }
 
 impl From<&WatermarkBundle> for Cumulative {
@@ -53,12 +67,89 @@ fn next_voucher(cur: &Cumulative, delta_bytes: u64, rate_per_mb: u64) -> Cumulat
     }
 }
 
+/// One lane's live hash-chain epoch: the payer half of the `PayWord` meter
+/// (ADR 003 §Hash-chain metering).
+///
+/// The seed is **derived, never stored** — `chain::derive_seed(master, lane,
+/// epoch)` reproduces it from the payer's signing key, so a restart resumes the
+/// same chain with no secret at rest and only `epoch` persisted.
+///
+/// The whole 256-entry ladder is materialised at open. One pass of
+/// `MAX_CHAIN_LENGTH` keccaks fills it (`preimages[255] = seed`, each earlier
+/// entry one more hash, `preimages[0] = root`), which turns every later release
+/// into an array read. The alternative — re-hashing from the seed per release —
+/// would put up to 255 keccaks under the issuance lock on the delivery path, to
+/// save 8 KiB per lane.
+#[derive(Debug)]
+struct ChainEpoch {
+    /// Which epoch this is on the lane. Increments on every rollover, and is
+    /// the only part of the chain that has to survive a restart.
+    id: u64,
+    /// `preimages[k]` is the value released at index `k`; `preimages[0]` is the
+    /// `chain_root` the voucher commits.
+    preimages: Box<[B256; 256]>,
+    /// What one chunk adds over the anchor. Fixed for the epoch by the voucher
+    /// that opened it.
+    chunk_price: U256,
+    /// The deepest index released so far. `0` means only the root exists, which
+    /// is the state a fresh epoch opens in.
+    released: u8,
+}
+
+impl ChainEpoch {
+    fn open(lane: &LaneKey, master: B256, id: u64, chunk_price: U256) -> Self {
+        let seed = decdn_incentive::chain::derive_seed(master, lane, id);
+        let mut preimages = Box::new([B256::ZERO; 256]);
+        let mut acc = seed;
+        // Walk down from the seed at index 255 to the root at index 0, so the
+        // ladder costs one pass rather than one pass per entry.
+        for index in (0..=usize::from(MAX_CHAIN_LENGTH)).rev() {
+            if let Some(slot) = preimages.get_mut(index) {
+                *slot = acc;
+            }
+            acc = alloy::primitives::keccak256(acc);
+        }
+        Self {
+            id,
+            preimages,
+            chunk_price,
+            released: 0,
+        }
+    }
+
+    /// The head this epoch commits — the value at index 0.
+    fn root(&self) -> B256 {
+        self.preimages.first().copied().unwrap_or(B256::ZERO)
+    }
+
+    /// The next index to release, or `None` once the epoch is spent and the
+    /// payer must roll to a fresh root.
+    fn next_index(&self) -> Option<u8> {
+        (self.released < MAX_CHAIN_LENGTH).then_some(self.released + 1)
+    }
+}
+
 /// The committed watermark plus the one-step rewind and the ambiguous in-flight
 /// voucher, under a single lock so a reader never catches a half-applied update.
 /// All three are read from a `Drop` impl, so the lock is a `std::sync::Mutex` —
 /// see [`PoolLedger::committed`].
 #[derive(Debug)]
 struct Pipeline {
+    /// What the chain has accrued SINCE the last signature: `released ×
+    /// chunk_price` on the money axis and `released × CHUNK_BYTES` on the byte
+    /// axis (ADR 003 §Hash-chain metering).
+    ///
+    /// Kept apart from `committed` — which stays the **signed anchor**, mirroring
+    /// exactly what the node stores as its lane watermark — because a chain
+    /// extends an anchor rather than replacing it. Folding accrual into the
+    /// anchor early would make every later signature an implicit fold, and a
+    /// fold that does not also roll to a fresh root is counted twice: once in
+    /// the signed amount, and again by the frontier the node still holds under
+    /// that same root.
+    accrued: Cumulative,
+    /// The accrual as of the previous signature, so a rejection rewinds both
+    /// halves of the claim together.
+    prev_accrued: Cumulative,
     /// The highest voucher whose send SUCCEEDED — presumed accepted, because
     /// continued delivery IS acceptance (ADR 005: only rejection is signalled).
     /// Advanced optimistically on each successful [`PoolLedger::issue`], rewound
@@ -79,6 +170,80 @@ struct Pipeline {
     /// persists what the upstream may hold. Cleared on the next successful
     /// [`PoolLedger::issue`] or a [`PoolLedger::reseed`].
     armed: Option<Cumulative>,
+}
+
+/// What a voucher should do with the lane's hash chain.
+///
+/// A chain is not a second payment object: the lane has one voucher whose
+/// cumulative `amount` is the settlement anchor, and the chain is an optional
+/// extension that advances that anchor without another signature. So every
+/// voucher makes exactly one of these three statements about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochAction {
+    /// Commit to whatever the lane already meters against — the live epoch's
+    /// root, or a **sealed** section if it holds none. Opens nothing.
+    ///
+    /// This is what a per-stream re-anchor and a closing residual voucher both
+    /// use. Re-asserting a root the node already holds is free, because an
+    /// at-or-below-watermark voucher is already-satisfied rather than rejected,
+    /// and settling a partial trailing chunk this way leaves the chain live for
+    /// every sibling stream on the lane — which sealing would not.
+    Keep,
+    /// Commit to the live epoch, opening one if the lane meters nothing yet.
+    /// A stream sends this before its first reveal.
+    Open,
+    /// Retire the live epoch and commit to a fresh root. The payer rolls when it
+    /// exhausts a chain, and may roll earlier at its own discretion; either way
+    /// the fold is the frontier actually reached, never a flat 255.
+    Roll,
+    /// Meter nothing: a **sealed** voucher, with a zero root at a zero price.
+    /// This is the cooperative close, and the only thing that settles a partial
+    /// trailing chunk — a preimage always advances the claim by a whole chunk,
+    /// so a residual smaller than one needs a signature to be exact.
+    Seal,
+}
+
+/// The chain section a voucher signs: what the payer commits to, and what the
+/// node checks its own quoted rate against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainCommit {
+    /// The chain head, or zero on a sealed voucher.
+    pub chain_root: B256,
+    /// What one chunk adds over the anchor, or zero on a sealed voucher.
+    pub chunk_price: U256,
+}
+
+impl ChainCommit {
+    /// The sealed section: uniformly zero, which is what lets the node's check
+    /// be `chain_root == 0 ⟺ chunk_price == 0` with no branch on either side.
+    pub const SEALED: Self = Self {
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    };
+}
+
+/// A preimage the payer has released, and where it sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Released {
+    /// The released value.
+    pub preimage: B256,
+    /// Its depth in the chain. Always `1..=MAX_CHAIN_LENGTH` — index 0 names the
+    /// root and proves nothing the voucher does not already say, so it never
+    /// travels the wire.
+    pub index: u8,
+    /// The epoch it belongs to, so a caller can tell whether the stream it is
+    /// sending on has already carried that epoch's root voucher.
+    pub epoch_id: u64,
+}
+
+/// Outcome of one [`PoolLedger::meter`] tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Metered {
+    /// A preimage went out and the lane advanced by one chunk.
+    Released(Released),
+    /// The epoch has no index left (or the lane holds no chain). Nothing was
+    /// sent; the caller signs a rollover voucher and meters again.
+    Exhausted,
 }
 
 /// One lane's live voucher ledger, shared by every concurrent stream that draws
@@ -102,6 +267,26 @@ pub struct PoolLedger {
     /// already spent (#1145 review). Held for a few instructions at a time and
     /// never across an await, so it cannot deadlock with the issuance lock.
     pipeline: std::sync::Mutex<Pipeline>,
+    /// The lane's live hash-chain epoch. Guarded by its own sync mutex for the
+    /// same reason `pipeline` is, and only ever touched while the `issuance`
+    /// lock is held — the payer is one process, so it serializes the chain
+    /// index and the rollover decision under a local lock while bytes stream
+    /// concurrently (ADR 003 §Concurrent Streams).
+    ///
+    /// `None` on a lane that has not opened a chain yet: a transfer smaller
+    /// than one chunk never meters, and settles through a single sealed
+    /// amount-voucher.
+    epoch: std::sync::Mutex<Option<ChainEpoch>>,
+    /// Lane identity and the payer's master secret, together the derivation
+    /// inputs every epoch on this lane is drawn from. Held rather than passed
+    /// per call so a rollover needs no cooperation from the caller.
+    lane: LaneKey,
+    master: B256,
+    /// The id the NEXT epoch on this lane will open at. Persisted alongside the
+    /// lane's cumulative so a restart never re-opens a root the node has
+    /// already seen. An `AtomicU64` because a reader wants it without taking
+    /// either mutex.
+    next_epoch_id: std::sync::atomic::AtomicU64,
 }
 
 impl PoolLedger {
@@ -109,15 +294,44 @@ impl PoolLedger {
     /// last voucher issued on earlier streams/invocations). Pass
     /// `Cumulative::default()` for a brand-new lane.
     #[must_use]
-    pub fn new(seed: Cumulative) -> Self {
+    pub fn new(lane: LaneKey, master: B256, epoch: u64, seed: Cumulative) -> Self {
         Self {
             issuance: Mutex::new(()),
             pipeline: std::sync::Mutex::new(Pipeline {
                 committed: seed,
                 prev: None,
                 armed: None,
+                accrued: Cumulative::default(),
+                prev_accrued: Cumulative::default(),
             }),
+            epoch: std::sync::Mutex::new(None),
+            lane,
+            master,
+            next_epoch_id: std::sync::atomic::AtomicU64::new(epoch),
         }
+    }
+
+    /// A ledger for a lane that meters **nothing**: no identity, no master, no
+    /// chain.
+    ///
+    /// The unpaid legs use this — the node's own-origin `BackendSource` quotes
+    /// rate 0, so it never prices, signs, or meters anything, and a real lane
+    /// identity would be a fiction. Callers MUST NOT drive
+    /// [`EpochAction::Open`] or [`EpochAction::Roll`] through it: with a zero
+    /// master every lane would derive the same seed, which is precisely the
+    /// cross-lane reuse this module's seed derivation exists to prevent.
+    #[must_use]
+    pub fn unmetered(seed: Cumulative) -> Self {
+        Self::new(
+            LaneKey {
+                pool_id: B256::ZERO,
+                signer: alloy::primitives::Address::ZERO,
+                provider: alloy::primitives::Address::ZERO,
+            },
+            B256::ZERO,
+            0,
+            seed,
+        )
     }
 
     /// Lock the pipeline, recovering the inner value on poison. A poisoned lock
@@ -136,7 +350,8 @@ impl PoolLedger {
     /// buffered pull persists.
     #[must_use]
     pub fn committed(&self) -> Cumulative {
-        self.pipeline().committed
+        let pipeline = self.pipeline();
+        pipeline.committed.plus(pipeline.accrued)
     }
 
     /// The cumulative a cancelled pull must PERSIST — the drop-path counterpart of
@@ -154,9 +369,10 @@ impl PoolLedger {
     #[must_use]
     pub fn settlement(&self) -> Cumulative {
         let pipeline = self.pipeline();
+        let owed = pipeline.committed.plus(pipeline.accrued);
         match pipeline.armed {
-            Some(armed) if armed.amount > pipeline.committed.amount => armed,
-            _ => pipeline.committed,
+            Some(armed) if armed.amount > owed.amount => armed,
+            _ => owed,
         }
     }
 
@@ -180,44 +396,253 @@ impl PoolLedger {
         &self,
         delta_bytes: u64,
         rate_per_mb: u64,
+        epoch: EpochAction,
         exchange: F,
     ) -> anyhow::Result<Cumulative>
     where
-        F: FnOnce(Cumulative) -> Fut,
+        F: FnOnce(Cumulative, ChainCommit) -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
         // Serialize issuance. Held across the send below.
         let _issuing = self.issuance.lock().await;
-        // Compute the next voucher from the current frontier (highest of the
-        // committed watermark and any armed voucher) and arm it, all under one
-        // pipeline lock so the basis we build on cannot shift between reading it
-        // and recording it. Build on the SETTLEMENT frontier, not `committed`
-        // alone: a voucher already on the wire must be exceeded, or we re-sign a
+
+        // Read the accrual and the frontier this voucher builds on under one
+        // pipeline lock, so the basis cannot shift between reading it and
+        // recording it. Build on the SETTLEMENT frontier, not the anchor alone:
+        // a voucher already on the wire must be exceeded, or we re-sign a
         // cumulative the upstream may hold.
+        let (frontier, accrued) = {
+            let pipeline = self.pipeline();
+            let owed = pipeline.committed.plus(pipeline.accrued);
+            let frontier = match pipeline.armed {
+                Some(armed) if armed.amount > owed.amount => armed,
+                _ => owed,
+            };
+            (frontier, pipeline.accrued)
+        };
+
+        // **A voucher that folds must also roll.** Signing the accrued frontier
+        // into `amount` is what retires the chain that proved it, so the voucher
+        // MUST carry a fresh root — otherwise the node keeps the old root's
+        // frontier alongside an amount that already folded it in, and the same
+        // chunks are counted twice (ADR 003 §Rollover: the fold and the fresh
+        // root are one step, not two).
+        //
+        // A voucher with nothing accrued folds nothing, so it commits to
+        // whatever the caller asked for: an opening anchor, a free re-anchor
+        // that re-asserts a root the node already holds, or a sealed close.
+        let epoch = if accrued.amount.is_zero() && accrued.bytes.is_zero() {
+            epoch
+        } else {
+            EpochAction::Roll
+        };
+        let commit = self.commit_epoch(epoch, rate_per_mb);
+
         let next = {
             let mut pipeline = self.pipeline();
-            let frontier = match pipeline.armed {
-                Some(armed) if armed.amount > pipeline.committed.amount => armed,
-                _ => pipeline.committed,
-            };
             let next = next_voucher(&frontier, delta_bytes, rate_per_mb);
             pipeline.armed = Some(next);
             next
         };
-        // Send. On ANY error the voucher stays armed and `committed` does not
+        // Send. On ANY error the voucher stays armed and the anchor does not
         // advance: a send failure is as ambiguous as a drop, so `settlement`
         // settles high. A rejection is NOT an issuance outcome — it arrives later
         // as a `StreamError` message and is disarmed via `resolve_reject`.
-        exchange(next).await?;
-        // The send succeeded: commit optimistically. Remember the prior committed
-        // watermark so a later `resolve_reject` can un-commit exactly this voucher.
+        exchange(next, commit).await?;
+        // The send succeeded: commit optimistically. The accrual is now folded
+        // into the signed anchor, so it resets to zero — and the previous pair
+        // is remembered so a later `resolve_reject` can un-commit exactly this
+        // voucher, both halves together.
         {
             let mut pipeline = self.pipeline();
             pipeline.prev = Some(pipeline.committed);
+            pipeline.prev_accrued = pipeline.accrued;
             pipeline.committed = next;
+            pipeline.accrued = Cumulative::default();
             pipeline.armed = None;
         }
         Ok(next)
+    }
+
+    /// Apply an [`EpochAction`] and report what the resulting voucher commits.
+    ///
+    /// Callers hold the issuance lock, which is what makes "read the epoch,
+    /// maybe replace it, report it" one indivisible step against the concurrent
+    /// streams sharing this lane.
+    fn commit_epoch(&self, action: EpochAction, rate_per_mb: u64) -> ChainCommit {
+        let mut slot = self.epoch();
+        match action {
+            EpochAction::Seal => {
+                // A sealed voucher meters no chunk, so its whole chain section
+                // is zero. Dropping the epoch is what retires the chain: a
+                // preimage released under the old root extends nothing once the
+                // node has adopted a zero root.
+                *slot = None;
+                ChainCommit::SEALED
+            }
+            EpochAction::Keep => slot
+                .as_ref()
+                .map_or(ChainCommit::SEALED, |live| ChainCommit {
+                    chain_root: live.root(),
+                    chunk_price: live.chunk_price,
+                }),
+            EpochAction::Open => {
+                if let Some(live) = slot.as_ref() {
+                    return ChainCommit {
+                        chain_root: live.root(),
+                        chunk_price: live.chunk_price,
+                    };
+                }
+                let opened = self.open_epoch(rate_per_mb);
+                let commit = ChainCommit {
+                    chain_root: opened.root(),
+                    chunk_price: opened.chunk_price,
+                };
+                *slot = Some(opened);
+                commit
+            }
+            EpochAction::Roll => {
+                let opened = self.open_epoch(rate_per_mb);
+                let commit = ChainCommit {
+                    chain_root: opened.root(),
+                    chunk_price: opened.chunk_price,
+                };
+                *slot = Some(opened);
+                commit
+            }
+        }
+    }
+
+    /// Draw the next epoch on this lane and bump the persisted counter.
+    ///
+    /// Each epoch gets an independent seed from the lane triple plus its own id,
+    /// so no two chains this payer opens — across providers, pools, or its own
+    /// sibling signers — are derivable from each other. That is the whole
+    /// defence against the cross-lane preimage spend, and it is payer-side by
+    /// design: reuse costs the payer and pays the node, so no node-side rule
+    /// would protect anyone who chose to run without it (ADR 003 §One chain per
+    /// lane).
+    fn open_epoch(&self, rate_per_mb: u64) -> ChainEpoch {
+        let id = self
+            .next_epoch_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ChainEpoch::open(&self.lane, self.master, id, U256::from(rate_per_mb))
+    }
+
+    /// Lock the epoch slot, recovering the inner value on poison — same reason
+    /// as [`Self::pipeline`].
+    fn epoch(&self) -> std::sync::MutexGuard<'_, Option<ChainEpoch>> {
+        self.epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The chain this lane is currently metering against, or
+    /// [`ChainCommit::SEALED`] if it holds none.
+    ///
+    /// Read by a stream that needs to know whether it has already carried the
+    /// current epoch's root voucher: on each stream, the epoch's `chain_root`
+    /// voucher MUST precede that stream's own preimages for that epoch, or the
+    /// node cannot name the chain a bare reveal belongs to.
+    #[must_use]
+    pub fn chain_commit(&self) -> ChainCommit {
+        self.epoch()
+            .as_ref()
+            .map_or(ChainCommit::SEALED, |live| ChainCommit {
+                chain_root: live.root(),
+                chunk_price: live.chunk_price,
+            })
+    }
+
+    /// The id of the live epoch, or `None` on a lane metering nothing. A stream
+    /// compares this against the epoch it last anchored itself to.
+    #[must_use]
+    pub fn epoch_id(&self) -> Option<u64> {
+        self.epoch().as_ref().map(|live| live.id)
+    }
+
+    /// The epoch id a restart should resume from — the counter this lane will
+    /// draw its next chain at. Persisted alongside the cumulative; the seed
+    /// itself never is.
+    #[must_use]
+    pub fn next_epoch_id(&self) -> u64 {
+        self.next_epoch_id
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Meter one delivered chunk: release the next preimage and SEND it.
+    ///
+    /// This is the tick the whole design exists for — one keccak-ladder read,
+    /// one 33-byte message, no signature, no acknowledgement, and nothing
+    /// durable to write before the node sends the next chunk. The released value
+    /// is self-proving: nobody derives a deeper preimage from a shallower one
+    /// without the seed, so it IS the receipt for every chunk below it.
+    ///
+    /// Released only AFTER the payer has received and verified the chunk it pays
+    /// for, which is what keeps the payer's exposure at zero.
+    ///
+    /// Holds the issuance lock across compute → send, exactly as [`Self::issue`]
+    /// does, so concurrent streams on one lane release strictly deepening
+    /// indices and never two values at the same depth.
+    ///
+    /// Returns [`Metered::Exhausted`] **without sending anything** when the
+    /// epoch has no index left. The caller then signs a rollover voucher
+    /// ([`EpochAction::Roll`]) — whose amount already folds this chain's
+    /// frontier, since every release advanced the committed cumulative — and
+    /// meters again.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an `exchange` failure. The index is NOT consumed on a failed
+    /// send: an unreleased preimage proves nothing, so re-releasing the same
+    /// index later is both safe and correct.
+    pub async fn meter<F, Fut>(&self, exchange: F) -> anyhow::Result<Metered>
+    where
+        F: FnOnce(Released) -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        let _issuing = self.issuance.lock().await;
+        let (released, price) = {
+            let slot = self.epoch();
+            let Some(live) = slot.as_ref() else {
+                return Ok(Metered::Exhausted);
+            };
+            let Some(index) = live.next_index() else {
+                return Ok(Metered::Exhausted);
+            };
+            let Some(preimage) = live.preimages.get(usize::from(index)).copied() else {
+                return Ok(Metered::Exhausted);
+            };
+            (
+                Released {
+                    preimage,
+                    index,
+                    epoch_id: live.id,
+                },
+                live.chunk_price,
+            )
+        };
+
+        exchange(released).await?;
+
+        // The reveal is out. Advance the lane's worth by exactly one chunk on
+        // both axes — the node credits the same, because it derives both from
+        // the same two protocol constants rather than from anything on the wire.
+        {
+            let mut slot = self.epoch();
+            if let Some(live) = slot.as_mut() {
+                live.released = released.index;
+            }
+        }
+        {
+            let mut pipeline = self.pipeline();
+            pipeline.accrued.amount = pipeline.accrued.amount.saturating_add(price);
+            pipeline.accrued.bytes = pipeline
+                .accrued
+                .bytes
+                .saturating_add(U256::from(CHUNK_BYTES));
+        }
+        Ok(Metered::Released(released))
     }
 
     /// Wallet-less self-heal (issue #1481): overwrite the committed watermark to
@@ -243,11 +668,13 @@ impl PoolLedger {
     #[must_use]
     pub fn reseed(&self, cum: Cumulative) -> bool {
         let mut pipeline = self.pipeline();
-        if cum.amount <= pipeline.committed.amount {
+        if cum.amount <= pipeline.committed.plus(pipeline.accrued).amount {
             return false;
         }
         pipeline.committed = cum;
+        pipeline.accrued = Cumulative::default();
         pipeline.prev = None;
+        pipeline.prev_accrued = Cumulative::default();
         pipeline.armed = None;
         true
     }
@@ -271,7 +698,20 @@ impl PoolLedger {
         pipeline.armed = None;
         match pipeline.prev.take() {
             Some(prev) => {
+                // Rewind BOTH halves. The rejected voucher folded whatever had
+                // accrued at the time it was signed, so restoring the anchor
+                // without giving that accrual back would silently forget chunks
+                // the node has already been shown preimages for.
+                //
+                // The fold comes back ON TOP of whatever has accrued SINCE —
+                // reveals released after that signature are still released, and
+                // a released preimage cannot be taken back. Overwriting with
+                // `prev_accrued` alone would drop them, and the payer would
+                // then believe it owes less than the node can already redeem.
                 pipeline.committed = prev;
+                pipeline.accrued = pipeline
+                    .accrued
+                    .plus(std::mem::take(&mut pipeline.prev_accrued));
                 true
             }
             None => false,
@@ -292,12 +732,12 @@ mod tests {
     /// at the exact sum of the 100-byte deltas and never more.
     #[tokio::test]
     async fn concurrent_issue_is_monotonic_and_exact() -> anyhow::Result<()> {
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let mut handles = Vec::new();
         for _ in 0..50u32 {
             let l = Arc::clone(&ledger);
             handles.push(tokio::spawn(async move {
-                l.issue(100, 10, |_signed| async {
+                l.issue(100, 10, EpochAction::Keep, |_signed, _chain| async {
                     tokio::task::yield_now().await;
                     Ok(())
                 })
@@ -327,9 +767,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_does_not_commit() -> anyhow::Result<()> {
-        let ledger = PoolLedger::new(Cumulative::default());
+        let ledger = PoolLedger::unmetered(Cumulative::default());
         let result = ledger
-            .issue(100, 10, |_signed| async { anyhow::bail!("send lost") })
+            .issue(100, 10, EpochAction::Keep, |_signed, _chain| async {
+                anyhow::bail!("send lost")
+            })
             .await;
         assert!(result.is_err(), "a failed send must surface the error");
         // Committed unmoved: a send that never confirmed never advances committed.
@@ -344,10 +786,10 @@ mod tests {
     /// of. Settle low and the deposit is stranded; settle high and it is honoured.
     #[tokio::test]
     async fn a_pull_dropped_inside_the_send_settles_at_the_voucher_it_sent() {
-        let ledger = PoolLedger::new(Cumulative::default());
+        let ledger = PoolLedger::unmetered(Cumulative::default());
         let dropped = tokio::time::timeout(
             Duration::from_millis(20),
-            ledger.issue(100, 10, |_next| {
+            ledger.issue(100, 10, EpochAction::Keep, |_next, _chain| {
                 std::future::pending::<anyhow::Result<()>>()
             }),
         )
@@ -373,9 +815,11 @@ mod tests {
     /// keeping it, so — with nothing else in flight — settlement falls back.
     #[tokio::test]
     async fn a_rejected_voucher_is_not_settled_optimistically() -> anyhow::Result<()> {
-        let ledger = PoolLedger::new(Cumulative::default());
+        let ledger = PoolLedger::unmetered(Cumulative::default());
         // Issue + successful send: committed advances to the voucher.
-        ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+        ledger
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
+            .await?;
         assert_eq!(ledger.committed().bytes, U256::from(100u64));
         // The upstream rejects it (arrived as a mid-stream VoucherRejected).
         assert!(ledger.resolve_reject(), "the committed voucher is rewound");
@@ -393,6 +837,10 @@ mod tests {
     #[test]
     fn cumulative_from_bundle_is_lossless() {
         let bundle = WatermarkBundle {
+            chain_root: [0u8; 32],
+            verified_index: 0,
+            tip: [0u8; 32],
+            chunk_price: 0,
             amount: u64::MAX,
             bytes_delivered: 1_048_576u64,
             last_signature: vec![0xABu8; 65],
@@ -411,11 +859,15 @@ mod tests {
         // The caller's local ledger thinks it is at amount 10 (a wallet-less
         // delegate that never persisted the true watermark), but the node's true
         // watermark — echoed on the gated reject — is amount 50.
-        let ledger = PoolLedger::new(Cumulative {
+        let ledger = PoolLedger::unmetered(Cumulative {
             bytes: U256::from(1000u64),
             amount: U256::from(10u64),
         });
         let bundle = WatermarkBundle {
+            chain_root: [0u8; 32],
+            verified_index: 0,
+            tip: [0u8; 32],
+            chunk_price: 0,
             amount: 50u64,
             bytes_delivered: 5000u64,
             last_signature: vec![0xCDu8; 65],
@@ -423,7 +875,9 @@ mod tests {
 
         // A voucher armed then ambiguously failed (settle high) before the reject.
         let _ = ledger
-            .issue(100, 10, |_next| async { anyhow::bail!("ambiguous") })
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async {
+                anyhow::bail!("ambiguous")
+            })
             .await;
         assert!(ledger.settlement().amount > U256::from(10u64));
 
@@ -438,7 +892,9 @@ mod tests {
             "reseed cleared the armed voucher and reset to the bundle watermark"
         );
 
-        let issued = ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+        let issued = ledger
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
+            .await?;
         assert_eq!(issued.bytes, U256::from(5100u64)); // bundle.bytes_delivered + 100
         assert_eq!(issued.amount, U256::from(51u64)); // bundle.amount + ceil(100*10/MiB)
         Ok(())
@@ -455,8 +911,10 @@ mod tests {
             bytes: U256::from(5000u64),
             amount: U256::from(50u64),
         };
-        let ledger = PoolLedger::new(committed);
-        ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+        let ledger = PoolLedger::unmetered(committed);
+        ledger
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
+            .await?;
         let after_issue = ledger.committed();
 
         // The exhausted-lane echo: same amount we already hold.
@@ -519,9 +977,14 @@ mod tests {
             },
             || anyhow::anyhow!("connection reset by peer"),
         ] {
-            let ledger = PoolLedger::new(Cumulative::default());
+            let ledger = PoolLedger::unmetered(Cumulative::default());
             let result = ledger
-                .issue(100, 10, move |_next| async move { Err(make_err()) })
+                .issue(
+                    100,
+                    10,
+                    EpochAction::Keep,
+                    move |_next, _chain| async move { Err(make_err()) },
+                )
                 .await;
             assert!(result.is_err(), "the ambiguous send must surface its error");
             assert_eq!(ledger.committed(), Cumulative::default());
@@ -538,9 +1001,9 @@ mod tests {
     /// not re-sign the same cumulative — which the upstream may already hold.
     #[tokio::test]
     async fn a_later_issue_builds_on_an_armed_voucher() -> anyhow::Result<()> {
-        let ledger = PoolLedger::new(Cumulative::default());
+        let ledger = PoolLedger::unmetered(Cumulative::default());
         let stalled = ledger
-            .issue(100, 10, |_next| async {
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async {
                 Err(anyhow::Error::new(PullStalled {
                     after: Duration::from_secs(1),
                 }))
@@ -548,7 +1011,9 @@ mod tests {
             .await;
         assert!(stalled.is_err());
         // Second issue must build on the armed voucher (bytes 200, not 100).
-        let sent = ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+        let sent = ledger
+            .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
+            .await?;
         assert_eq!(
             sent.bytes,
             U256::from(200u64),
@@ -561,9 +1026,11 @@ mod tests {
     /// watermark is the running cumulative, never ahead of what was delivered.
     #[tokio::test]
     async fn a_sequence_of_issues_stays_ordered_and_exact() -> anyhow::Result<()> {
-        let ledger = PoolLedger::new(Cumulative::default());
+        let ledger = PoolLedger::unmetered(Cumulative::default());
         for expected in 1..=100u64 {
-            let sent = ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+            let sent = ledger
+                .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
+                .await?;
             assert_eq!(sent.bytes, U256::from(expected * 100));
         }
         let committed = ledger.committed();

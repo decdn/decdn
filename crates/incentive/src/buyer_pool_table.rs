@@ -85,6 +85,10 @@ struct StoredLane {
     provider: [u8; 20],
     last_amount: [u8; 32],
     last_bytes: [u8; 32],
+    /// The hash-chain epoch this lane's next chain opens at. The seed itself is
+    /// derived from the signing key and never written down; only this counter
+    /// has to survive a restart (ADR 003 §One chain per lane).
+    next_epoch: u64,
 }
 
 /// On-disk buyer-pool record. All numeric fields are fixed-size big-endian
@@ -123,6 +127,7 @@ impl From<&BuyerPoolState> for StoredBuyerPoolState {
                 provider: key.provider.into(),
                 last_amount: progress.last_amount.to_be_bytes(),
                 last_bytes: progress.last_bytes.to_be_bytes(),
+                next_epoch: progress.next_epoch,
             })
             .collect();
         // Deterministic order: the pool_id is fixed for the whole record, so
@@ -159,6 +164,7 @@ impl StoredBuyerPoolState {
                 let progress = BuyerLaneProgress {
                     last_amount: U256::from_be_bytes(l.last_amount),
                     last_bytes: U256::from_be_bytes(l.last_bytes),
+                    next_epoch: l.next_epoch,
                 };
                 (key, progress)
             })
@@ -555,6 +561,7 @@ impl<'a> BuyerPoolTable<'a> {
         lane: LaneKey,
         bytes: U256,
         amount: U256,
+        next_epoch: u64,
     ) -> Result<AdvanceOutcome, StoreError> {
         let index_key: [u8; 20] = owner.into();
         let primary_key: [u8; 32] = pool_id.into();
@@ -592,7 +599,7 @@ impl<'a> BuyerPoolTable<'a> {
             // Drop the borrow of `table` held by `value_guard` before
             // mutating.
             drop(value_guard);
-            if let Err(err) = state.advance_lane(lane, bytes, amount) {
+            if let Err(err) = state.advance_lane(lane, bytes, amount, next_epoch) {
                 return Ok(AdvanceOutcome::Regressed(err));
             }
             let encoded = encode_record(&state)?;
@@ -760,6 +767,7 @@ mod tests {
             lane,
             U256::from(byte) * U256::from(1_024u64),
             U256::from(byte) * U256::from(1_000u64),
+            0,
         );
         s
     }
@@ -795,15 +803,20 @@ mod tests {
             Address::repeat_byte(0x33),
             U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
         );
+        // Distinct NON-ZERO epochs, so the golden actually pins the field: a
+        // pair of zeros would encode to the same byte whether the field were
+        // read, defaulted, or absent.
         s.advance_lane(
             lane_a,
             U256::from(0xDDDD_DDDD_DDDD_DDDDu64),
             U256::from(0xBBBB_BBBB_BBBB_BBBBu64),
+            7,
         )?;
         s.advance_lane(
             lane_b,
             U256::from(0xEEEE_EEEE_EEEE_EEEEu64),
             U256::from(0xCCCC_CCCC_CCCC_CCCCu64),
+            42,
         )?;
         Ok(s)
     }
@@ -813,6 +826,12 @@ mod tests {
     /// Postcard encoding of [`golden_state`] (schema v1). Two lanes, sorted
     /// by `(signer, provider)` for a deterministic encoding regardless of
     /// `HashMap` iteration order.
+    ///
+    /// `next_epoch` was appended to the lane row for `PayWord` (ADR 003 §One
+    /// chain per lane). That is a deliberate, UNVERSIONED break — deCDN is
+    /// pre-launch with no deployed store to stay compatible with, so
+    /// `BUYER_SUPPORTED_SCHEMA_VERSION` does not bump; the golden simply moves
+    /// with it, which is exactly the tripwire firing as designed.
     const GOLDEN_RECORD_HEX: &str = concat!(
         "01",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
@@ -824,10 +843,12 @@ mod tests {
         "7777777777777777777777777777777777777777", // lane a: provider
         "000000000000000000000000000000000000000000000000bbbbbbbbbbbbbbbb", // lane a: last_amount
         "000000000000000000000000000000000000000000000000dddddddddddddddd", // lane a: last_bytes
+        "07",                                       // lane a: next_epoch (varint)
         "8888888888888888888888888888888888888888", // lane b: signer
         "9999999999999999999999999999999999999999", // lane b: provider
         "000000000000000000000000000000000000000000000000cccccccccccccccc", // lane b: last_amount
         "000000000000000000000000000000000000000000000000eeeeeeeeeeeeeeee", // lane b: last_bytes
+        "2a",                                       // lane b: next_epoch (varint)
     );
 
     /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
@@ -1142,6 +1163,7 @@ mod tests {
             lane,
             progress.last_bytes - U256::from(1u64),
             progress.last_amount,
+            0,
         )?;
         anyhow::ensure!(
             matches!(outcome, AdvanceOutcome::Regressed(_)),
@@ -1175,7 +1197,8 @@ mod tests {
                 ghost.pool_id,
                 ghost_lane,
                 U256::from(1u64),
-                U256::from(1u64)
+                U256::from(1u64),
+                0
             )? == AdvanceOutcome::UnknownPool
         );
         anyhow::ensure!(
@@ -1206,7 +1229,8 @@ mod tests {
                 absent.pool_id,
                 absent_lane,
                 U256::from(1u64),
-                U256::from(1u64)
+                U256::from(1u64),
+                0
             )? == AdvanceOutcome::UnknownPool,
             "advance_progress on an absent row of an existing table"
         );
@@ -1222,7 +1246,8 @@ mod tests {
                 OTHER_POOL,
                 lane,
                 U256::from(99u64),
-                U256::from(99u64)
+                U256::from(99u64),
+                0
             )? == AdvanceOutcome::PoolMismatch
         );
         anyhow::ensure!(
@@ -1263,7 +1288,8 @@ mod tests {
                 s.pool_id,
                 lane,
                 U256::from(1u64),
-                U256::from(1u64)
+                U256::from(1u64),
+                0
             )? == AdvanceOutcome::UnknownPool
         );
         anyhow::ensure!(table_absent(&db)?, "advance_progress created the table");
@@ -1339,6 +1365,7 @@ mod tests {
                     lane,
                     progress.last_bytes + U256::from(3_000u64),
                     progress.last_amount + U256::from(30u64),
+                    0,
                 )? == AdvanceOutcome::Advanced
             );
             anyhow::ensure!(
@@ -1389,7 +1416,7 @@ mod tests {
             signer: base.owner,
             provider: address!("00000000000000000000000000000000000000b6"),
         };
-        base.advance_lane(lane, U256::ZERO, U256::ZERO)?;
+        base.advance_lane(lane, U256::ZERO, U256::ZERO, 0)?;
         tbl(&db).record(&base)?;
         let (owner, pool_id) = (base.owner, base.pool_id);
 
@@ -1413,6 +1440,7 @@ mod tests {
                     lane,
                     U256::from(i) * U256::from(1_024u64),
                     U256::from(i) * U256::from(10u64),
+                    0,
                 )?;
                 anyhow::ensure!(
                     outcome == AdvanceOutcome::Advanced,

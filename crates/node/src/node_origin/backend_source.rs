@@ -163,7 +163,14 @@ impl BlobSource for BackendSource {
             // payment; see the module docs.
             if reader.wire_len > 0 {
                 self.self_pay
-                    .issue(reader.wire_len, 0, |_next| async { Ok(()) })
+                    .issue(
+                        reader.wire_len,
+                        0,
+                        // No chain on the unpaid leg: `Keep` on a lane that has
+                        // opened none commits a sealed section and opens nothing.
+                        decdn_client_pull::EpochAction::Keep,
+                        |_next, _chain| async { Ok(()) },
+                    )
                     .await?;
             }
             Ok(VoucherProgress::from_cumulative(
@@ -336,7 +343,7 @@ mod tests {
     }
 
     fn fresh_ledger() -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::new(Cumulative::default()))
+        Arc::new(PoolLedger::unmetered(Cumulative::default()))
     }
 
     /// (a) Full-miss whole-blob: `BackendSource::open` yields wire that a fresh

@@ -81,6 +81,19 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`).
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
+    /// @dev The payment quantum: one chunk of delivery, in bytes. A `PayWord`
+    ///      hash-chain tick pays for exactly this much (ADR 003 §Chunk
+    ///      Cadence). Equal to `BYTES_PER_MB` **by identity**, which is what
+    ///      makes a chunk cost exactly the advertised per-MB rate with no
+    ///      rounding at any rate — so the chain introduces no second price
+    ///      unit, and its payability floor is the `deliveryFloor` this
+    ///      contract already enforces. Named separately from `BYTES_PER_MB`
+    ///      because the two mean different things: one is a price denominator,
+    ///      the other a meter resolution. A change here invalidates every
+    ///      signature made against a live chain, so it is a protocol-version
+    ///      change and not a knob.
+    uint256 internal constant CHUNK_BYTES = BYTES_PER_MB;
+
     // -----------------------------------------------------------------
     // EIP-712 typing (ADR 003 § EIP-712 Voucher Signature)
     // -----------------------------------------------------------------
@@ -93,8 +106,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @dev Signer-signed, node-addressed. `signer` binds the voucher to the
     ///      authorized key `redeem` validates against; `provider` binds it to
     ///      a single payee, so one node cannot redeem another node's voucher.
-    bytes32 public constant VOUCHER_TYPEHASH =
-        keccak256("Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered)");
+    bytes32 public constant VOUCHER_TYPEHASH = keccak256(
+        "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,bytes32 chainRoot,uint256 chunkPrice)"
+    );
 
     /// @notice The EIP-712 domain separator this contract's capabilities and
     ///         vouchers are signed against (ADR 003 § EIP-712 Voucher
@@ -239,6 +253,21 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error GraceWindowActive();
     error RouterUnchanged();
     error LengthMismatch();
+    /// @dev A submitted hash-chain preimage does not reach `chainRoot` in
+    ///      `chainIndex` steps. Caller error, not transient pool state, so it
+    ///      reverts the whole call rather than being skipped.
+    error BadPreimage();
+    /// @dev The packed `chainMeter` word has a non-zero byte in its reserved
+    ///      upper span. Rejected rather than masked away, so the span stays
+    ///      claimable by a later field without any voucher signed today
+    ///      becoming reinterpretable.
+    error ChainMeterReservedNonZero();
+    /// @dev The chain-extended claim (`cumulative + chainIndex * chunkPrice`,
+    ///      or its byte twin) does not fit `uint64`. Unlike every other value
+    ///      here, these two are *derived* from calldata rather than read from
+    ///      a signed `uint64`, so they are bounded by this check rather than
+    ///      by construction (ADR 003 §PaymentPool).
+    error ClaimOverflow();
 
     // -----------------------------------------------------------------
     // Constructor
@@ -416,17 +445,44 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @dev    The signature is the EIP-2098 compact pair `(r, vs)` rather
     ///         than a `bytes` blob, which is what makes this struct *static*:
     ///         an array of it carries no per-element offset, no length word,
-    ///         and no padding, so a lane costs 160 calldata bytes instead of
-    ///         288. That width is the binding constraint on how small a lane
+    ///         and no padding. That width is the binding constraint on how small a lane
     ///         balance a node can still afford to redeem, so it is worth the
     ///         one capability it gives up — a voucher signer must be an EOA
     ///         (see `_verifyVoucher`).
+    ///
+    ///         `PayWord` adds three words, for **8 words / 256 calldata bytes**
+    ///         per lane (ADR 003 §Voucher signatures are compact). `chainRoot`
+    ///         is the chain head the signer committed, `preimage` is the
+    ///         released value being redeemed, and `chainMeter` packs
+    ///         `chunkPrice` and `chainIndex` into one word so the struct stays
+    ///         at 8 rather than 9:
+    ///
+    ///         ```text
+    ///          byte  0                     22 23            30 31
+    ///               +------------------------+----------------+--+
+    ///               |  reserved — MUST be 0  |   chunkPrice   |ci|
+    ///               +------------------------+----------------+--+
+    ///                  23 bytes                 8 bytes (u64)  1 byte (u8)
+    ///         ```
+    ///
+    ///         The packing is invisible to signers: `_verifyVoucher` decodes
+    ///         `chunkPrice`, widens it back to `uint256`, and rebuilds the same
+    ///         EIP-712 digest, while `chainIndex` is a redemption parameter and
+    ///         is not signed at all. `chainIndex` also needs no range check —
+    ///         extracting it as a `uint8` caps it at 255 by construction, the
+    ///         same bound the one-byte wire index carries. On the cooperative
+    ///         path all three words are nearly all zero bytes (a closing
+    ///         voucher carries a zero root, a zero preimage and a zero meter),
+    ///         so they compress to almost nothing on an L2.
     struct LaneVoucher {
         address signer;
         uint64 cumulative;
         uint64 bytesDelivered;
         bytes32 r;
         bytes32 vs;
+        bytes32 chainRoot;
+        bytes32 preimage;
+        uint256 chainMeter;
     }
 
     /// @notice Everything a node redeems against one pool. Naming the pool
@@ -744,15 +800,19 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         returns (uint64 paid, uint64 bytesPaid, uint64 newCumulative)
     {
         address signer = v.signer;
-        uint64 cumulative = v.cumulative;
-        uint64 bytesDelivered = v.bytesDelivered;
 
         Authorization storage a = authorized[poolId][signer];
         // Unregistered signer: transient-empty. The single `redeem` path has
         // registered via `_registerCapability` first; the batch path skips it.
         if (a.cap == 0 && a.expiry == 0) return (0, 0, 0);
 
-        _verifyVoucher(poolId, v);
+        // Resolve the chain BEFORE the signature check, because the signature
+        // is taken over the `chunkPrice` this unpacks. Both of its reverts are
+        // caller error, exactly like a bad signature, so ordering them together
+        // costs nothing and keeps the skip-vs-revert split clean below.
+        (uint64 claimed, uint64 claimedBytes, uint256 chunkPrice) = _resolveClaim(v);
+
+        _verifyVoucher(poolId, v, chunkPrice);
 
         // Expired capability is transient-empty (skippable in a batch); the
         // single path surfaces it as `NothingToRedeem`.
@@ -760,25 +820,35 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         if (block.timestamp >= a.expiry) return (0, 0, 0);
 
         Lane storage w = watermark[poolId][signer][msg.sender];
-        // Regression / already-paid cumulative: transient-empty.
-        if (cumulative <= w.amount) return (0, 0, 0);
+        // Regression / already-paid claim: transient-empty. This is where a
+        // superseded chain lands — a rollover voucher already folded its
+        // frontier into a higher `cumulative`, so re-presenting the retired
+        // one resolves at or below what the lane has been paid and is simply
+        // skipped. Cumulative accounting is what makes that safe with no chain
+        // state stored anywhere.
+        if (claimed <= w.amount) return (0, 0, 0);
 
-        uint64 desired = cumulative - w.amount;
+        uint64 desired = claimed - w.amount;
         paid = uint64(Math.min(desired, Math.min(a.cap - a.spent, remaining)));
         // Drained pool or cap reached: transient-empty, retriable after a top-up.
         if (paid == 0) return (0, 0, 0);
 
-        // Soft per-MB price floor, evaluated as a bytes ceiling. The
-        // cumulative claim justifies at most `cumulative * BYTES_PER_MB /
-        // deliveryFloor` bytes of delivery credit; a voucher priced below the
-        // floor still settles its `cumulative` USDC, but only that many bytes
-        // are credited toward the served-bytes governance weight (ADR 003 §
-        // Rate-floor enforcement; ADR 036), so cheap bytes cannot inflate vote
-        // weight. `deliveryFloor >= MIN_RATE_FLOOR (1)` keeps the divisor
-        // non-zero; the `min` runs in `uint256` and is bounded above by the
-        // `uint64` `bytesDelivered`, so narrowing the ceiling back to `uint64`
-        // cannot overflow.
-        uint64 creditedBytes = uint64(Math.min(bytesDelivered, Math.mulDiv(cumulative, BYTES_PER_MB, deliveryFloor)));
+        // Soft per-MB price floor, evaluated as a bytes ceiling. The claim
+        // justifies at most `claimed * BYTES_PER_MB / deliveryFloor` bytes of
+        // delivery credit; a voucher priced below the floor still settles its
+        // USDC, but only that many bytes are credited toward the served-bytes
+        // governance weight (ADR 003 §Rate-floor enforcement; ADR 036), so
+        // cheap bytes cannot inflate vote weight. `deliveryFloor >=
+        // MIN_RATE_FLOOR (1)` keeps the divisor non-zero; the `min` runs in
+        // `uint256` and is bounded above by the `uint64` `claimedBytes`, so
+        // narrowing the ceiling back to `uint64` cannot overflow.
+        //
+        // The clamp reads the CHAIN-EXTENDED pair, not the signed `cumulative`
+        // and `bytesDelivered`: bytes proved by preimage carry the same per-byte
+        // price obligation as bytes proved by signature, and pricing only the
+        // signed half would let a chain credit its 255 chunks of bytes against
+        // whatever the anchor happened to cost.
+        uint64 creditedBytes = uint64(Math.min(claimedBytes, Math.mulDiv(claimed, BYTES_PER_MB, deliveryFloor)));
 
         // A voucher whose credited bytes have not advanced settles its money
         // with zero bytes credited; the byte watermark holds and recovers
@@ -796,6 +866,74 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         newCumulative = w.amount;
     }
 
+    /// @dev Resolve a voucher's chain into the claim it authorizes, before any
+    ///      of it is paid (ADR 003 §Hash-chain metering (`PayWord`)).
+    ///
+    ///      Three things happen here, in order:
+    ///
+    ///      1. **Unpack** `chainMeter` into `chunkPrice` (bytes 23..=30) and
+    ///         `chainIndex` (the low byte), rejecting a non-zero reserved span.
+    ///         That span is rejected rather than masked so a later field can
+    ///         claim those bits without any voucher signed today becoming
+    ///         reinterpretable — one comparison for a permanent option. The
+    ///         index needs no bound of its own: extracting it as a `uint8` caps
+    ///         it at 255 by construction, which is a stronger guarantee than a
+    ///         runtime check and matches the one-byte wire index exactly.
+    ///      2. **Walk** `preimage` forward `chainIndex` times and require the
+    ///         result to equal `chainRoot`. The walk always starts from the
+    ///         SUBMITTED value and never from a stored intermediate, which is
+    ///         what lets this contract keep no chain state at all and need no
+    ///         root-matching branch. Its cost is `chainIndex` keccaks — zero on
+    ///         the cooperative path, and bounded at 255 in the mid-chain
+    ///         abandonment case the chain exists to cover.
+    ///      3. **Extend** the anchor: `claimed = cumulative + chainIndex *
+    ///         chunkPrice` over `claimedBytes = bytesDelivered + chainIndex *
+    ///         CHUNK_BYTES`.
+    ///
+    ///      There is no branch for the sealed voucher. `chainRoot = 0` at
+    ///      `chainIndex = 0` with a zero preimage satisfies the same equality
+    ///      with zeros and resolves to exactly `cumulative`; at any higher
+    ///      index the same check would need a value that hashes to `0`, which
+    ///      keccak preimage resistance makes infeasible. A real-root voucher
+    ///      settles its own `cumulative` the same way, by passing the root as
+    ///      its own preimage — so nothing anywhere tests `chainRoot == 0`.
+    ///
+    ///      Factored out of `_applyVoucher` for the same reason
+    ///      `_verifyVoucher` is: this contract compiles without the IR pipeline,
+    ///      and that frame is already at the stack limit.
+    /// @return claimed The chain-extended cumulative USDC this voucher claims.
+    /// @return claimedBytes The chain-extended cumulative bytes it claims.
+    /// @return chunkPrice The decoded price, widened for the EIP-712 rebuild.
+    function _resolveClaim(LaneVoucher calldata v)
+        internal
+        pure
+        returns (uint64 claimed, uint64 claimedBytes, uint256 chunkPrice)
+    {
+        uint256 meter = v.chainMeter;
+        if (meter >> 72 != 0) revert ChainMeterReservedNonZero();
+        chunkPrice = uint256(uint64(meter >> 8));
+        uint256 chainIndex = uint256(uint8(meter));
+
+        bytes32 walked = v.preimage;
+        for (uint256 i = 0; i < chainIndex; i++) {
+            walked = keccak256(abi.encodePacked(walked));
+        }
+        if (walked != v.chainRoot) revert BadPreimage();
+
+        // Resolved at full width and bounded by an explicit check: unlike every
+        // other value here these two are DERIVED from calldata rather than read
+        // from a signed `uint64`, so neither is bounded by its field width
+        // (ADR 003 §PaymentPool). Everything downstream — the watermark, the
+        // fee-router totals — is `uint64`, so the check has to happen before
+        // the narrowing, not after it.
+        uint256 wideClaimed = uint256(v.cumulative) + chainIndex * chunkPrice;
+        uint256 wideBytes = uint256(v.bytesDelivered) + chainIndex * CHUNK_BYTES;
+        if (wideClaimed > type(uint64).max || wideBytes > type(uint64).max) revert ClaimOverflow();
+
+        claimed = uint64(wideClaimed);
+        claimedBytes = uint64(wideBytes);
+    }
+
     /// @dev Verify an EIP-712 `Voucher` signature against `v.signer` over the
     ///      canonical typed data, with `msg.sender` as the `provider` the
     ///      voucher must name. Factored out of `_applyVoucher` to keep that
@@ -804,6 +942,14 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      the `uint256 amount` / `uint256 bytesDelivered` the `Voucher`
     ///      typehash names — narrowing the fields changes no signature a
     ///      client produces.
+    ///
+    ///      `chunkPrice` arrives already decoded out of the packed `chainMeter`
+    ///      word and is re-widened to `uint256` here, exactly as the typehash
+    ///      declares, so the packing is invisible to every signer and changes
+    ///      no digest. `chainIndex` is deliberately absent: it is a redemption
+    ///      parameter the node chooses per submission, not something the payer
+    ///      signed — which is precisely what lets one signature settle at any
+    ///      depth the node can prove.
     ///
     ///      **A voucher signer is an EOA.** Recovery is a plain `ecrecover`
     ///      over the EIP-2098 compact pair, not an ERC-1271 check, so a
@@ -814,9 +960,12 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      unaffected: `_registerCapability` still verifies through
     ///      `SignatureChecker`, so a Safe or other smart account can own a
     ///      pool and delegate to EOA voucher signers.
-    function _verifyVoucher(bytes32 poolId, LaneVoucher calldata v) internal view {
-        bytes32 structHash =
-            keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, v.signer, msg.sender, v.cumulative, v.bytesDelivered));
+    function _verifyVoucher(bytes32 poolId, LaneVoucher calldata v, uint256 chunkPrice) internal view {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                VOUCHER_TYPEHASH, poolId, v.signer, msg.sender, v.cumulative, v.bytesDelivered, v.chainRoot, chunkPrice
+            )
+        );
         bytes32 digest = _hashTypedDataV4(structHash);
         // The dropped third return is `errorArg`, the offending value behind a
         // recovery failure. `err` alone decides the outcome here — there is no

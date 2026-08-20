@@ -65,7 +65,7 @@ pub mod sink;
 pub mod source;
 
 pub use driver::{PacingWait, drive};
-pub use ledger::{Cumulative, PoolLedger};
+pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released};
 pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer};
 pub use ranged_store::ClientRangedStore;
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
@@ -94,7 +94,8 @@ use decdn_protocol::client::{
     VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, VOUCHER_INTERVAL_BYTES, decode_message, encode_message, read_frame, write_frame,
+    ALPN_CLIENT, CHUNK_BYTES, ChunkPreimage, decode_message, encode_message, read_frame,
+    write_frame,
 };
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
@@ -131,6 +132,13 @@ pub struct PoolContext {
     pub prior_bytes_delivered: U256,
     /// Cumulative amount paid on this lane before this stream.
     pub prior_amount: U256,
+    /// The hash-chain epoch this lane's next chain opens at (ADR 003
+    /// §Hash-chain metering). Persisted alongside the two cumulatives; the seed
+    /// itself never is, because it is derived from `client_signer` on demand.
+    /// A restart that resumed at a stale counter would re-open a root the node
+    /// has already seen, so this is the one piece of chain state that has to
+    /// survive.
+    pub prior_epoch: u64,
     /// Optional ADR 005 client identity binding (address + `BindNodeId`
     /// signature over the requester's own iroh `NodeId`, see
     /// [`sign_client_binding`]). Attached to every `cdn/client/v1` request's
@@ -176,6 +184,7 @@ impl PoolContext {
             voucher_domain,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
+            prior_epoch: 0,
             client_binding: None,
             capability: None,
         }
@@ -195,6 +204,59 @@ impl PoolContext {
         self.prior_bytes_delivered = prior_bytes_delivered;
         self.prior_amount = prior_amount;
         self
+    }
+
+    /// Resume this lane's hash chain at `epoch` — the counter the lane's next
+    /// chain opens at, read back from the buyer's persisted lane row. Defaults
+    /// to `0`, which is correct for a lane that has never metered.
+    #[must_use]
+    pub const fn with_chain_epoch(mut self, epoch: u64) -> Self {
+        self.prior_epoch = epoch;
+        self
+    }
+
+    /// This context's `(pool_id, signer, provider)` lane — the scope of one
+    /// hash chain, and the key every seed is derived under.
+    #[must_use]
+    pub fn lane(&self) -> decdn_incentive::LaneKey {
+        decdn_incentive::LaneKey {
+            pool_id: self.pool_id,
+            signer: self.client_signer.address(),
+            provider: self.provider,
+        }
+    }
+
+    /// Derive this payer's master chain secret from its voucher signing key.
+    ///
+    /// Deterministic, so a restart reproduces every live chain with no secret
+    /// kept on disk. Costs one signature per lane setup, against the one per
+    /// 4 MiB the chain replaces.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a signer failure.
+    pub fn chain_master(&self) -> anyhow::Result<B256> {
+        decdn_incentive::chain::master_secret(self.client_signer.as_ref()).map_err(|e| {
+            anyhow::anyhow!("chain master derivation failed: {e}").context(LocalPullFault)
+        })
+    }
+
+    /// The ledger seed for this lane: its persisted cumulative plus the epoch
+    /// its next chain opens at.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a signer failure from [`Self::chain_master`].
+    pub fn new_ledger(&self) -> anyhow::Result<PoolLedger> {
+        Ok(PoolLedger::new(
+            self.lane(),
+            self.chain_master()?,
+            self.prior_epoch,
+            Cumulative {
+                bytes: self.prior_bytes_delivered,
+                amount: self.prior_amount,
+            },
+        ))
     }
 
     /// Attach an ADR 005 client identity binding so this context's
@@ -315,6 +377,11 @@ pub struct VoucherProgress {
     amount: U256,
     /// Whether the watermark moved past the lane's seed on this stream.
     advanced: bool,
+    /// The hash-chain epoch this lane's next chain opens at (ADR 003 §One chain
+    /// per lane). Persisted alongside the two cumulatives so a restart never
+    /// re-opens a root the node has already seen; the seed itself is derived on
+    /// demand and never written down.
+    next_epoch: u64,
 }
 
 impl VoucherProgress {
@@ -333,11 +400,43 @@ impl VoucherProgress {
             bytes_delivered: cum.bytes,
             amount: cum.amount,
             advanced: cum.amount > prior_amount,
+            next_epoch: 0,
+        }
+    }
+
+    /// The same watermark, read from a live ledger so it carries that lane's
+    /// chain epoch as well as its cumulatives. Prefer this wherever a ledger is
+    /// in hand: [`Self::from_cumulative`] cannot see the epoch and reports `0`,
+    /// which the store's max-merge then ignores.
+    #[must_use]
+    pub fn from_ledger(ledger: &PoolLedger, prior_amount: U256) -> Self {
+        Self {
+            next_epoch: ledger.next_epoch_id(),
+            ..Self::from_cumulative(ledger.settlement(), prior_amount)
         }
     }
 
     fn set_from_cumulative(&mut self, cum: Cumulative, prior_amount: U256) {
         *self = Self::from_cumulative(cum, prior_amount);
+    }
+
+    /// The hash-chain epoch this lane's next chain opens at.
+    #[must_use]
+    pub const fn next_epoch(&self) -> u64 {
+        self.next_epoch
+    }
+
+    /// Stamp the lane's chain epoch onto this watermark.
+    ///
+    /// The epoch settles HIGH on every outcome, unlike the two cumulatives: a
+    /// conservative choice there costs at most a re-signed voucher, but a
+    /// conservative choice here re-opens an epoch the node has already seen and
+    /// re-releases preimages it has already credited — every one of which would
+    /// pay nothing.
+    #[must_use]
+    pub const fn with_epoch(mut self, next_epoch: u64) -> Self {
+        self.next_epoch = next_epoch;
+        self
     }
 
     /// The cumulative `(bytes_delivered, amount)` to persist via the lane record,
@@ -1269,10 +1368,7 @@ pub async fn stream_fetch_tracked_with_progress(
     // One-shot ledger seeded from the channel's prior cumulative state. A single
     // (non-shared) pull owns its ledger; concurrent shared-channel pulls use
     // `stream_fetch_shared` with a caller-owned ledger instead.
-    let ledger = PoolLedger::new(Cumulative {
-        bytes: ctx.prior_bytes_delivered,
-        amount: ctx.prior_amount,
-    });
+    let ledger = ctx.new_ledger()?;
     let result = with_hard_cap(
         deadlines.hard_cap,
         fetch_inner(
@@ -1701,6 +1797,8 @@ pub fn resumable_watermark<'a>(
         provider: ctx.provider,
         amount: U256::from(bundle.amount),
         bytes_delivered: U256::from(bundle.bytes_delivered),
+        chain_root: B256::from(bundle.chain_root),
+        chunk_price: U256::from(bundle.chunk_price),
     };
     voucher_signed_by(
         &claimed,
@@ -1882,7 +1980,6 @@ async fn fetch_inner_once(
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
-    let interval_bytes = VOUCHER_INTERVAL_BYTES;
     // Paid/received bytes are **wire** bytes — content plus interleaved bao proof
     // nodes (ADR 038 §Payment metering) — not the content-byte remainder.
     let total_bytes = resp.body.total_bytes;
@@ -1894,7 +1991,6 @@ async fn fetch_inner_once(
         ctx,
         ledger,
         rate_per_mb,
-        interval_bytes,
         expected_wire,
         stall,
         on_progress,
@@ -1964,17 +2060,19 @@ async fn receive_and_pay(
     ctx: &PoolContext,
     ledger: &PoolLedger,
     rate_per_mb: u64,
-    interval_bytes: u64,
     expected_wire_bytes: u64,
     stall: Duration,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<(BytesMut, u64)> {
     let mut buf = BytesMut::new();
     let mut cumulative: u64 = 0;
-    // Bytes received but not yet covered by a voucher — the per-voucher *delta*
-    // handed to the ledger (which accumulates deltas across this and any concurrent
-    // streams on the channel, advancing only after the upstream acks).
-    let mut bytes_since_voucher: u64 = 0;
+    // Bytes received but not yet covered by a proof. Every whole chunk in here
+    // is released as a preimage; whatever is left over at the end of the
+    // transfer settles through one closing signature, because a preimage always
+    // advances the claim by a whole chunk and cannot price a partial one.
+    let mut unproved: u64 = 0;
+    // This stream's anchor: which epoch it has told the node about.
+    let mut meter = StreamMeter::default();
     // The inactivity deadline (#1134). Reset only inside the `ChunkData` arm below —
     // never on a non-chunk frame — and a `ChunkData` that exists carries at least one
     // byte, because `ChunkData::new` and the decode gate are the only ways to obtain
@@ -2058,18 +2156,24 @@ async fn receive_and_pay(
                 if let Some(cb) = on_progress {
                     cb(cumulative, expected_wire_bytes);
                 }
-                bytes_since_voucher = bytes_since_voucher.saturating_add(chunk_len);
-                // Pay at each interval boundary, and a closing voucher once all
-                // expected bytes have arrived — matching the node's pacing. The send
-                // commits the voucher optimistically (implicit acceptance, ADR 005):
-                // there is no ack to wait for, so the loop keeps reading bytes and only
-                // a rejection (a mid-stream `StreamError`) ever comes back.
-                let boundary = bytes_since_voucher >= interval_bytes && interval_bytes > 0;
-                let closing = cumulative >= expected_wire_bytes && bytes_since_voucher > 0;
-                if boundary || closing {
-                    send_voucher(send, ctx, ledger, rate_per_mb, bytes_since_voucher).await?;
-                    bytes_since_voucher = 0;
-                }
+                unproved = unproved.saturating_add(chunk_len);
+                // Meter at each chunk boundary, and close with one signature
+                // once every expected byte has arrived — matching the node's
+                // pacing. A reveal is released only AFTER the bytes it pays for
+                // have been received and verified, so the payer's exposure stays
+                // at zero. Nothing is acknowledged: continued delivery IS
+                // acceptance (ADR 005), so the loop keeps reading and only a
+                // rejection (a mid-stream `StreamError`) ever comes back.
+                unproved = meter
+                    .pay(
+                        send,
+                        ctx,
+                        ledger,
+                        rate_per_mb,
+                        unproved,
+                        cumulative >= expected_wire_bytes,
+                    )
+                    .await?;
             }
             // Acceptance is implicit — continued delivery IS acceptance (ADR 005),
             // so there is no positive ack to consume. Only a rejection is signalled,
@@ -2189,8 +2293,10 @@ pub struct UpstreamPullHeader {
     /// Upstream rate; informational for the caller (the buyer pays it inside
     /// [`UpstreamPull::next_chunk`]).
     pub rate_per_mb: u64,
-    /// Upstream voucher cadence in bytes (the buyer pays one voucher per
-    /// interval as chunks arrive).
+    /// Upstream metering quantum in bytes: the buyer releases one hash-chain
+    /// preimage per chunk as they arrive. Always `CHUNK_BYTES` on a paid
+    /// upstream — it is a protocol constant, not a negotiated value — and `0`
+    /// on an unpaid source, which is the only reason it is carried at all.
     pub interval_bytes: u64,
 }
 
@@ -2246,7 +2352,8 @@ pub struct UpstreamPull {
     ledger: Arc<PoolLedger>,
     hash: [u8; 32],
     rate_per_mb: u64,
-    interval_bytes: u64,
+    /// This stream's chain anchor — which epoch it has told the upstream about.
+    meter: StreamMeter,
     /// Inactivity budget for every streaming read (#1134). Reset on byte progress.
     stall: Duration,
     /// Promised **wire** bytes for this stream: the bao-encoded size of the
@@ -2255,8 +2362,8 @@ pub struct UpstreamPull {
     expected_wire_bytes: u64,
     /// Wire bytes received so far on this stream.
     cumulative: u64,
-    /// Wire bytes received since the last voucher.
-    unvouchered: u64,
+    /// Wire bytes received but not yet covered by a proof.
+    unproved: u64,
     /// `StreamEnd` seen — `next_chunk` returns `None` and `finish` skips the
     /// drain.
     ended: bool,
@@ -2377,7 +2484,6 @@ pub async fn open_progressive_pull(
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
-    let interval_bytes = VOUCHER_INTERVAL_BYTES;
     // Wire-byte bound (bao-encoded size of the aligned range), not content bytes —
     // the window path forwards this stream verbatim and pays the upstream in wire
     // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
@@ -2386,7 +2492,7 @@ pub async fn open_progressive_pull(
     let header = UpstreamPullHeader {
         total_bytes,
         rate_per_mb,
-        interval_bytes,
+        interval_bytes: CHUNK_BYTES,
     };
     let pull = UpstreamPull {
         stall,
@@ -2397,10 +2503,10 @@ pub async fn open_progressive_pull(
         ledger,
         hash,
         rate_per_mb,
-        interval_bytes,
+        meter: StreamMeter::default(),
         expected_wire_bytes,
         cumulative: 0,
-        unvouchered: 0,
+        unproved: 0,
         ended: false,
     };
     Ok((header, pull))
@@ -2426,7 +2532,7 @@ impl UpstreamPull {
     /// that happened. See the ledger's docs.
     #[must_use]
     pub fn progress(&self) -> VoucherProgress {
-        VoucherProgress::from_cumulative(self.ledger.settlement(), self.ctx.prior_amount)
+        VoucherProgress::from_ledger(&self.ledger, self.ctx.prior_amount)
     }
 
     /// Send one voucher for `delta_bytes` newly delivered since the last voucher,
@@ -2434,16 +2540,18 @@ impl UpstreamPull {
     /// their vouchers are serialized into strict cumulative-amount order rather than
     /// colliding (see [`stream_fetch_shared`]). Sends optimistically (#1484): the ack is
     /// read back by [`Self::next_chunk`] / [`Self::finish`], not awaited here.
-    async fn pay_one(&mut self, delta_bytes: u64) -> anyhow::Result<()> {
+    async fn pay_one(&mut self, unproved: u64, complete: bool) -> anyhow::Result<u64> {
         let ledger = Arc::clone(&self.ledger);
-        send_voucher(
-            &mut self.send,
-            &self.ctx,
-            &ledger,
-            self.rate_per_mb,
-            delta_bytes,
-        )
-        .await
+        self.meter
+            .pay(
+                &mut self.send,
+                &self.ctx,
+                &ledger,
+                self.rate_per_mb,
+                unproved,
+                complete,
+            )
+            .await
     }
 
     /// Read the next `ChunkData`, paying the upstream at each voucher-interval
@@ -2510,18 +2618,14 @@ impl UpstreamPull {
                     // verifying decoder (`import_and_verify_stream`), which checks the
                     // cached copy against the root (ADR 038); the downstream client
                     // verifies its own copy with its decoder.
-                    self.unvouchered = self.unvouchered.saturating_add(chunk_len);
-                    let boundary =
-                        self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
-                    let closing =
-                        self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
-                    if boundary || closing {
-                        let delta = self.unvouchered;
-                        // The send commits optimistically; only a rejection comes back,
-                        // on a later `next_chunk`/`finish` read.
-                        self.pay_one(delta).await?;
-                        self.unvouchered = 0;
-                    }
+                    self.unproved = self.unproved.saturating_add(chunk_len);
+                    // One reveal per whole chunk, plus one closing signature for
+                    // the residual once every promised byte has arrived. The
+                    // sends commit optimistically; only a rejection comes back,
+                    // on a later `next_chunk`/`finish` read.
+                    let unproved = self.unproved;
+                    let complete = self.cumulative >= self.expected_wire_bytes;
+                    self.unproved = self.pay_one(unproved, complete).await?;
                     Ok(Some(Bytes::from(chunk.into_bytes())))
                 }
                 // A mid-stream `StreamError` is either a `VoucherRejected` (our
@@ -2647,6 +2751,7 @@ async fn send_voucher(
     ledger: &PoolLedger,
     rate_per_mb: u64,
     delta_bytes: u64,
+    epoch: EpochAction,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !ctx.provider.is_zero(),
@@ -2654,23 +2759,196 @@ async fn send_voucher(
          before signing"
     );
     ledger
-        .issue(delta_bytes, rate_per_mb, |next: Cumulative| async move {
-            let signed = Voucher {
-                pool_id: ctx.pool_id,
-                signer: ctx.client_signer.address(),
-                provider: ctx.provider,
-                amount: next.amount,
-                bytes_delivered: next.bytes,
-            }
-            .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
-            .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault))?;
-            let wire_voucher = signed_to_wire_voucher(&signed).map_err(|e| {
-                anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault)
-            })?;
-            write_message(send, &ClientMessage::Voucher(wire_voucher)).await
-        })
+        .issue(
+            delta_bytes,
+            rate_per_mb,
+            epoch,
+            |next: Cumulative, chain: ChainCommit| async move {
+                let signed = Voucher {
+                    pool_id: ctx.pool_id,
+                    signer: ctx.client_signer.address(),
+                    provider: ctx.provider,
+                    amount: next.amount,
+                    bytes_delivered: next.bytes,
+                    chain_root: chain.chain_root,
+                    chunk_price: chain.chunk_price,
+                }
+                .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
+                .map_err(|e| {
+                    anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault)
+                })?;
+                let wire_voucher = signed_to_wire_voucher(&signed).map_err(|e| {
+                    anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault)
+                })?;
+                write_message(send, &ClientMessage::Voucher(wire_voucher)).await
+            },
+        )
         .await
         .map(|_sent| ())
+}
+
+/// One stream's view of the lane's hash chain (ADR 003 §Concurrent Streams).
+///
+/// The chain's scope is the **lane**, not the stream: every stream from one
+/// signer to one node shares a single root and a single index, because a
+/// released preimage advances the lane and cannot be attributed to whichever
+/// stream happened to carry it. What IS per-stream is the *anchor* — which
+/// epoch this stream has told the node about.
+///
+/// That distinction is the whole reason this type exists. A bare preimage names
+/// no chain, so the node places it against the anchor of the stream it arrived
+/// on. If a stream released a reveal before carrying that epoch's root voucher,
+/// the node could not name the chain the reveal belongs to and would reject it
+/// `UnanchoredPreimage`. So each stream re-anchors itself whenever the lane
+/// rolls, rather than trusting a sibling to have done it — QUIC orders within a
+/// stream, so a fast stream that has already adopted a new root can never
+/// invalidate a slower sibling still finishing the old one.
+#[derive(Debug, Default)]
+struct StreamMeter {
+    /// The epoch id this stream has already carried the root voucher for.
+    /// `None` until it has anchored to anything.
+    anchored_epoch: Option<u64>,
+}
+
+impl StreamMeter {
+    /// Ensure this stream has told the node which chain its reveals belong to,
+    /// sending the epoch's root voucher first if it has not.
+    ///
+    /// `open` distinguishes the two callers: a stream about to release a reveal
+    /// needs a chain to exist (`EpochAction::Open`), while one merely settling a
+    /// residual commits to whatever the lane already meters against, opening
+    /// nothing.
+    async fn anchor(
+        &mut self,
+        send: &mut SendStream,
+        ctx: &PoolContext,
+        ledger: &PoolLedger,
+        rate_per_mb: u64,
+        open: EpochAction,
+    ) -> anyhow::Result<()> {
+        if ledger.epoch_id().is_none() && open == EpochAction::Open {
+            send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?;
+            self.anchored_epoch = ledger.epoch_id();
+            return Ok(());
+        }
+        let live = ledger.epoch_id();
+        if live.is_some() && self.anchored_epoch != live {
+            // A sibling rolled the lane, or this is our first reveal on an epoch
+            // a sibling opened. Re-anchoring costs one signature per stream per
+            // rollover and nothing else: the voucher carries the same cumulative
+            // the node already holds, which it treats as already-satisfied.
+            send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Keep).await?;
+            self.anchored_epoch = live;
+        }
+        Ok(())
+    }
+
+    /// Meter one delivered chunk: release the next preimage on this stream,
+    /// rolling the chain first if the epoch is spent.
+    ///
+    /// The reveal costs one hash and one 33-byte message — no signature, no
+    /// acknowledgement, and nothing durable to write — which is the whole point
+    /// of the chain. A rollover costs one signature, and happens once per 255
+    /// chunks rather than once per chunk.
+    async fn release_chunk(
+        &mut self,
+        send: &mut SendStream,
+        ctx: &PoolContext,
+        ledger: &PoolLedger,
+        rate_per_mb: u64,
+    ) -> anyhow::Result<()> {
+        // Two attempts, never more: the first can find the epoch spent, and the
+        // roll that follows opens a chain with index 1 available by
+        // construction. A third pass would mean the ledger contradicted itself.
+        for attempt in 0..2u8 {
+            self.anchor(&mut *send, ctx, ledger, rate_per_mb, EpochAction::Open)
+                .await?;
+            // Reborrow per iteration: the closure takes the stream by unique
+            // reference for the duration of the send, and the loop needs it back.
+            let wire = &mut *send;
+            match ledger
+                .meter(|released: Released| async move {
+                    write_message(
+                        wire,
+                        &ClientMessage::ChunkPreimage(ChunkPreimage {
+                            preimage: released.preimage.into(),
+                            index: released.index,
+                        }),
+                    )
+                    .await
+                })
+                .await?
+            {
+                Metered::Released(_) => return Ok(()),
+                Metered::Exhausted if attempt == 0 => {
+                    // Roll. The new voucher's `amount` already folds this
+                    // chain's frontier — every reveal advanced the committed
+                    // cumulative as it went — so the fold is the frontier
+                    // actually reached, never a flat 255 (ADR 003 §Rollover).
+                    send_voucher(&mut *send, ctx, ledger, rate_per_mb, 0, EpochAction::Roll)
+                        .await?;
+                    self.anchored_epoch = ledger.epoch_id();
+                }
+                Metered::Exhausted => {
+                    anyhow::bail!("hash chain still exhausted after a rollover")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Settle a residual smaller than one chunk with a signed voucher.
+    ///
+    /// A preimage always advances the claim by a *whole* chunk, so a partial
+    /// trailing chunk cannot be priced by one — it settles through a signature,
+    /// exact to one token base unit. The voucher re-asserts the live root rather
+    /// than sealing the lane, so sibling streams keep metering against it.
+    async fn settle_residual(
+        &mut self,
+        send: &mut SendStream,
+        ctx: &PoolContext,
+        ledger: &PoolLedger,
+        rate_per_mb: u64,
+        residual_bytes: u64,
+    ) -> anyhow::Result<()> {
+        send_voucher(
+            send,
+            ctx,
+            ledger,
+            rate_per_mb,
+            residual_bytes,
+            EpochAction::Keep,
+        )
+        .await?;
+        self.anchored_epoch = ledger.epoch_id();
+        Ok(())
+    }
+
+    /// Emit the proofs `delivered` new bytes have earned: one reveal per whole
+    /// chunk, plus a closing signature for any residual once the transfer is
+    /// complete.
+    ///
+    /// Returns the bytes still unproved — always below one chunk.
+    async fn pay(
+        &mut self,
+        send: &mut SendStream,
+        ctx: &PoolContext,
+        ledger: &PoolLedger,
+        rate_per_mb: u64,
+        mut unproved: u64,
+        complete: bool,
+    ) -> anyhow::Result<u64> {
+        while unproved >= CHUNK_BYTES {
+            self.release_chunk(send, ctx, ledger, rate_per_mb).await?;
+            unproved -= CHUNK_BYTES;
+        }
+        if complete && unproved > 0 {
+            self.settle_residual(send, ctx, ledger, rate_per_mb, unproved)
+                .await?;
+            unproved = 0;
+        }
+        Ok(unproved)
+    }
 }
 
 /// Turn a mid-stream `StreamError` read off the receive loop into the typed error
@@ -2750,6 +3028,7 @@ const fn variant_name(msg: &ClientMessage) -> &'static str {
         ClientMessage::StreamResponse(_) => "StreamResponse",
         ClientMessage::ChunkData(_) => "ChunkData",
         ClientMessage::Voucher(_) => "Voucher",
+        ClientMessage::ChunkPreimage(_) => "ChunkPreimage",
         ClientMessage::StreamEnd => "StreamEnd",
         ClientMessage::StreamError(_) => "StreamError",
     }
@@ -2939,6 +3218,7 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let domain = decdn_incentive::bind_node_id_domain(1, Address::ZERO);
         let ctx = PoolContext {
+            prior_epoch: 0,
             pool_id: B256::ZERO,
             provider: Address::ZERO,
             deposit: U256::ZERO,
@@ -3010,6 +3290,7 @@ mod tests {
         domain: &alloy::dyn_abi::Eip712Domain,
     ) -> PoolContext {
         PoolContext {
+            prior_epoch: 0,
             pool_id,
             provider,
             deposit: U256::ZERO,
@@ -3033,18 +3314,28 @@ mod tests {
         amount: U256,
         bytes_delivered: U256,
     ) -> anyhow::Result<WatermarkBundle> {
+        // A SEALED watermark: zero root, zero price. The bundle's authentication
+        // gate recovers `last_signature` over the full seven-field voucher, so
+        // the chain half has to be exactly what was signed — building the bundle
+        // and the signature from one shape is what keeps that honest.
         let voucher_signature = Voucher {
             pool_id,
             signer: signer.address(),
             provider,
             amount,
             bytes_delivered,
+            chain_root: alloy::primitives::B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(signer, domain)
         .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}"))?;
         Ok(WatermarkBundle {
             amount: u64::try_from(amount)?,
             bytes_delivered: u64::try_from(bytes_delivered)?,
+            chain_root: [0u8; 32],
+            verified_index: 0,
+            tip: [0u8; 32],
+            chunk_price: 0,
             last_signature: voucher_signature.signature.as_bytes().to_vec(),
         })
     }

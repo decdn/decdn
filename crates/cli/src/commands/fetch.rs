@@ -40,8 +40,8 @@ use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
     BlobTooLargeClaim, BudgetPacer, ClientRangedStore, Cumulative, PeerSource, PoolContext,
-    PoolLedger, ProgressCallback, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected,
-    VoucherProgress, open_progressive_pull, sign_client_binding,
+    ProgressCallback, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    open_progressive_pull, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -576,15 +576,16 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow:
     // reasons onto `NotFound` (which exists so a prober cannot map other
     // clients' balances).
     //
-    // The node's pre-flight reservation is one voucher interval (the ramp floor);
-    // the window only widens as this pool pays, so one interval is the true lower
-    // bound on what it reserves before serving. Estimated with the fixed
-    // `VOUCHER_INTERVAL_BYTES`, since we cannot read the node's config. The miss
-    // direction is "we stay silent when we could have spoken" — never a fabricated
-    // shortfall — so it is phrased as a possibility and as a lower bound.
+    // The node's pre-flight reservation is one chunk (the ramp floor); the window
+    // only widens as this pool pays, so one chunk is the true lower bound on what
+    // it reserves before serving. Estimated with the fixed `CHUNK_BYTES`, since we
+    // cannot read the node's config — and because `CHUNK_BYTES == BYTES_PER_MB`,
+    // that estimate is exactly the quoted per-MB rate. The miss direction is "we
+    // stay silent when we could have spoken" — never a fabricated shortfall — so
+    // it is phrased as a possibility and as a lower bound.
     if let Some(quoted_rate) = refused.evidence().map(|resp| resp.body.rate_per_mb) {
         let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
-        let estimate = min_payment(decdn_protocol::client::VOUCHER_INTERVAL_BYTES, quoted_rate);
+        let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, quoted_rate);
         if quoted_rate > 0 && headroom < estimate {
             causes.push(format!(
                 "this pool's remaining deposit ({headroom}) is below the ~{estimate} the node \
@@ -643,7 +644,14 @@ fn persist_watermark(
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
     // means the watermark did NOT move — same hazard as a backend error — so
     // surface it too rather than dropping it on the floor.
-    match store.advance_progress(owner, pool_id, lane, bytes_delivered, amount) {
+    match store.advance_progress(
+        owner,
+        pool_id,
+        lane,
+        bytes_delivered,
+        amount,
+        progress.next_epoch(),
+    ) {
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => eprintln!(
             "warning: voucher watermark not persisted for pool {pool_id} (provider {}): \
@@ -994,17 +1002,21 @@ fn select_watermark(
     committed: Cumulative,
     settlement: Cumulative,
     prior_amount: U256,
+    next_epoch: u64,
 ) -> VoucherProgress {
-    match outcome {
-        Ok(()) => VoucherProgress::from_cumulative(committed, prior_amount),
-        Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
-            VoucherProgress::from_cumulative(committed, prior_amount)
-        }
+    let cum = match outcome {
+        Ok(()) => committed,
+        Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => committed,
         // Any other `Err` (stall, IO error, …): the node persists a voucher
         // before acking, so an ambiguous failure probably holds the armed one —
         // settle HIGH so a reuse never re-signs a spent lane state.
-        Err(_) => VoucherProgress::from_cumulative(settlement, prior_amount),
-    }
+        Err(_) => settlement,
+    };
+    // The chain epoch settles high unconditionally, on every outcome. It is not
+    // a watermark to be conservative about: re-opening an epoch the node has
+    // already seen would re-release preimages it has already credited, and every
+    // one of them would pay nothing.
+    VoucherProgress::from_cumulative(cum, prior_amount).with_epoch(next_epoch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1035,10 +1047,7 @@ where
     // the first voucher continues at `prior_amount` (a restart-from-zero would
     // be rejected as a regression). Shared (`Arc`) with the driver and source;
     // the watermark to persist afterwards is read straight back off it.
-    let ledger = Arc::new(PoolLedger::new(Cumulative {
-        bytes: ctx.prior_bytes_delivered,
-        amount: ctx.prior_amount,
-    }));
+    let ledger = Arc::new(ctx.new_ledger()?);
 
     // Learn the whole-blob size before constructing the ranged store: the store is
     // keyed on `(root, total_bytes)`, and the signed `StreamResponse` header is the
@@ -1142,6 +1151,7 @@ where
         ledger.committed(),
         ledger.settlement(),
         prior_amount,
+        ledger.next_epoch_id(),
     );
     persist_watermark(deps.store, deps.self_address, pool_id, lane, &vprogress);
 
@@ -1673,6 +1683,7 @@ mod tests {
 
     fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
         PoolContext {
+            prior_epoch: 0,
             pool_id: B256::ZERO,
             provider: Address::ZERO,
             deposit: U256::ZERO,
@@ -2045,7 +2056,7 @@ mod tests {
             bytes: U256::from(30u64),
             amount: U256::from(40u64),
         };
-        let progress = select_watermark(&Ok(()), committed, settlement, U256::ZERO);
+        let progress = select_watermark(&Ok(()), committed, settlement, U256::ZERO, 0);
         assert_eq!(
             progress.advanced(),
             Some((committed.bytes, committed.amount))
@@ -2063,7 +2074,7 @@ mod tests {
             amount: U256::from(40u64),
         };
         let err = Err(anyhow::anyhow!("stall"));
-        let progress = select_watermark(&err, committed, settlement, U256::ZERO);
+        let progress = select_watermark(&err, committed, settlement, U256::ZERO, 0);
         assert_eq!(
             progress.advanced(),
             Some((settlement.bytes, settlement.amount))

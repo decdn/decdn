@@ -721,6 +721,7 @@ mod tests {
     fn healthy_ctx() -> PoolContext {
         let signer = PrivateKeySigner::random();
         PoolContext {
+            prior_epoch: 0,
             pool_id: B256::ZERO,
             // Pinned to a non-zero test provider: `send_voucher` fast-fails on
             // `Address::ZERO` (an unpinned lane), so every driver test that
@@ -783,7 +784,7 @@ mod tests {
         );
         let want_gap_bytes: u64 = want_gaps.iter().map(|(_, l)| *l).sum();
 
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -872,7 +873,7 @@ mod tests {
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
 
         drive(
             &store,
@@ -936,7 +937,7 @@ mod tests {
         // is already held, so < 5 MiB of wire remains) is under the threshold and
         // completes. One source instance across both drives, so `opened_ranges`
         // records both opens.
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .with_fault_after(5 * 1024 * 1024, || {
@@ -1041,7 +1042,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1189,7 +1190,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let inner = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1289,7 +1290,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1368,7 +1369,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));
@@ -1445,7 +1446,7 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .paying(Arc::clone(&ledger));

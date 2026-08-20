@@ -179,8 +179,14 @@ contract PaymentPoolTest is Test {
     bytes32 internal constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     bytes32 internal constant CAPABILITY_TYPEHASH =
         keccak256("Capability(address signer,uint256 spendingCap,bytes32 poolId,uint64 expiry)");
-    bytes32 internal constant VOUCHER_TYPEHASH =
-        keccak256("Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered)");
+    bytes32 internal constant VOUCHER_TYPEHASH = keccak256(
+        "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,bytes32 chainRoot,uint256 chunkPrice)"
+    );
+    /// @dev Mirrors `PaymentPool.CHUNK_BYTES` / `BYTES_PER_MB` (both internal).
+    uint256 internal constant CHUNK_BYTES = 1_048_576;
+    /// @dev Mirrors the ADR 003 `MAX_CHAIN_LENGTH`: the highest chain index,
+    ///      which is the `uint8` domain's own ceiling.
+    uint8 internal constant MAX_CHAIN_LENGTH = 255;
     bytes32 internal constant POOL_OPENED_SIG = keccak256("PoolOpened(bytes32,address,uint256)");
 
     /// @dev Mirrors `PaymentPool.PoolRedeemed` for `vm.expectEmit`.
@@ -534,8 +540,39 @@ contract PaymentPoolTest is Test {
         uint64 bytesDelivered,
         uint256 pk
     ) internal view returns (Sig memory) {
-        bytes32 structHash = keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, _digestFor(verifyingContract, structHash));
+        return _signVoucherChained(
+            verifyingContract, poolId, signer_, provider_, amount, bytesDelivered, bytes32(0), 0, pk
+        );
+    }
+
+    /// @dev The full seven-field voucher signature, including the two `PayWord`
+    ///      fields. `_signVoucherFor` is the sealed case of this — a zero root
+    ///      at a zero price — which is what every pre-`PayWord` test in this
+    ///      file now exercises.
+    function _signVoucherChained(
+        address verifyingContract,
+        bytes32 poolId,
+        address signer_,
+        address provider_,
+        uint64 amount,
+        uint64 bytesDelivered,
+        bytes32 chainRoot,
+        uint64 chunkPrice,
+        uint256 pk
+    ) internal view returns (Sig memory) {
+        bytes32 digest;
+        // Scoped so `structHash` dies before `vm.sign`'s three returns land:
+        // this file compiles without the IR pipeline, and nine parameters plus
+        // an eight-field `abi.encode` is already at the stack limit.
+        {
+            bytes32 structHash = keccak256(
+                abi.encode(
+                    VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered, chainRoot, uint256(chunkPrice)
+                )
+            );
+            digest = _digestFor(verifyingContract, structHash);
+        }
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
         return Sig({ r: r, vs: bytes32(uint256(s) | (uint256(v - 27) << 255)) });
     }
 
@@ -547,9 +584,57 @@ contract PaymentPoolTest is Test {
         pure
         returns (PaymentPool.LaneVoucher memory)
     {
+        return _laneOfChained(signer_, amount, bytesDelivered, sig, bytes32(0), bytes32(0), 0);
+    }
+
+    /// @dev A lane presenting a `PayWord` chain: `chainRoot` is what the signer
+    ///      committed, `preimage` the released value, and `chainMeter` the
+    ///      packed `(chunkPrice, chainIndex)` word. `_laneOf` is the sealed case
+    ///      — all three zero — which resolves to exactly `amount` and walks
+    ///      nothing.
+    function _laneOfChained(
+        address signer_,
+        uint64 amount,
+        uint64 bytesDelivered,
+        Sig memory sig,
+        bytes32 chainRoot,
+        bytes32 preimage,
+        uint256 chainMeter
+    ) internal pure returns (PaymentPool.LaneVoucher memory) {
         return PaymentPool.LaneVoucher({
-            signer: signer_, cumulative: amount, bytesDelivered: bytesDelivered, r: sig.r, vs: sig.vs
+            signer: signer_,
+            cumulative: amount,
+            bytesDelivered: bytesDelivered,
+            r: sig.r,
+            vs: sig.vs,
+            chainRoot: chainRoot,
+            preimage: preimage,
+            chainMeter: chainMeter
         });
+    }
+
+    /// @dev Pack `chunkPrice` (bytes 23..=30) and `chainIndex` (the low byte)
+    ///      into the single `chainMeter` word, leaving the reserved upper span
+    ///      zero.
+    function _meter(uint64 chunkPrice, uint8 chainIndex) internal pure returns (uint256) {
+        return (uint256(chunkPrice) << 8) | uint256(chainIndex);
+    }
+
+    /// @dev `keccak^(MAX_CHAIN_LENGTH - index)(seed)` — the value a payer
+    ///      releases at `index`. At `index == 0` this is the chain root itself,
+    ///      which is why a real-root voucher settles its own `cumulative` by
+    ///      passing the root as its own preimage.
+    function _preimage(bytes32 seed, uint8 index) internal pure returns (bytes32 acc) {
+        acc = seed;
+        for (uint256 i = 0; i < MAX_CHAIN_LENGTH - uint256(index); i++) {
+            acc = keccak256(abi.encodePacked(acc));
+        }
+    }
+
+    /// @dev `keccak^MAX_CHAIN_LENGTH(seed)` — the head the payer signs into the
+    ///      voucher.
+    function _chainRoot(bytes32 seed) internal pure returns (bytes32) {
+        return _preimage(seed, 0);
     }
 
     /// @dev Owner-signed capability for `signer`, packed as the
@@ -1202,6 +1287,423 @@ contract PaymentPoolTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // PayWord hash chain (ADR 003 § Hash-chain metering)
+    // -----------------------------------------------------------------
+
+    /// @dev The payer's per-lane seed for these tests. Real seeds are derived
+    ///      per `(pool, signer, provider)` lane; here one is enough, because
+    ///      every test drives a single lane.
+    bytes32 internal constant SEED = keccak256("decdn/test/payword/seed");
+    /// @dev One chunk of delivery, priced at the expected market rate. Because
+    ///      `CHUNK_BYTES == BYTES_PER_MB`, this is also exactly one MB of price.
+    uint64 internal constant CHUNK_PRICE = 10;
+
+    /// @dev Redeem one chained lane: sign `(amount, bytes, root, price)`, then
+    ///      present it extended by the preimage at `index`.
+    /// @dev One chained lane's inputs, as a memory struct rather than a
+    ///      parameter list: this file compiles without the IR pipeline, and six
+    ///      loose values plus a signature and a batch exceed the stack.
+    struct Chained {
+        uint64 amount;
+        uint64 bytesDelivered;
+        bytes32 root;
+        uint64 chunkPrice;
+        bytes32 preimage;
+        uint8 index;
+    }
+
+    /// @dev Redeem one chained lane: sign `(amount, bytes, root, price)`, then
+    ///      present it extended by the preimage at `index`. Pass an empty
+    ///      `cap` once the signer is already registered.
+    function _redeemChained(bytes32 id, Chained memory c, bytes memory cap) internal returns (uint256) {
+        PaymentPool.LaneVoucher[] memory v = new PaymentPool.LaneVoucher[](1);
+        v[0] = _laneOfChained(
+            signer,
+            c.amount,
+            c.bytesDelivered,
+            _signVoucherChained(
+                address(pool), id, signer, provider, c.amount, c.bytesDelivered, c.root, c.chunkPrice, SIGNER_PK
+            ),
+            c.root,
+            c.preimage,
+            _meter(c.chunkPrice, c.index)
+        );
+        return pool.redeemMany(_batch(id, _capsOf(cap), v));
+    }
+
+    /// @dev A [`Chained`] with no anchor bytes — the common shape in these
+    ///      tests, where the byte axis is not what is under test.
+    function _chained(uint64 amount, bytes32 root, uint64 chunkPrice, bytes32 preimage, uint8 index)
+        internal
+        pure
+        returns (Chained memory)
+    {
+        return Chained({
+            amount: amount, bytesDelivered: 0, root: root, chunkPrice: chunkPrice, preimage: preimage, index: index
+        });
+    }
+
+    /// @dev The `CapabilityReg[]` a `_cap(...)` blob unpacks into — empty when
+    ///      the signer is already registered.
+    function _capsOf(bytes memory capability) internal view returns (PaymentPool.CapabilityReg[] memory caps) {
+        caps = new PaymentPool.CapabilityReg[](capability.length == 0 ? 0 : 1);
+        if (capability.length != 0) {
+            (uint64 spendingCap, uint64 exp, bytes memory ownerSig) = abi.decode(capability, (uint64, uint64, bytes));
+            caps[0] = PaymentPool.CapabilityReg({
+                signer: signer, spendingCap: spendingCap, expiry: exp, ownerSig: ownerSig
+            });
+        }
+    }
+
+    /// @notice The cooperative close. A sealed voucher — zero root, zero index,
+    ///         zero preimage, zero price — settles exactly its `cumulative`
+    ///         through the ordinary walk, with no branch testing
+    ///         `chainRoot == 0` anywhere in the contract.
+    function test_redeem_payWord_sealedVoucherSettlesExactlyItsAmount() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        _redeemChained(
+            id,
+            Chained({
+                amount: 5000,
+                bytesDelivered: 5 * uint64(CHUNK_BYTES),
+                root: bytes32(0),
+                chunkPrice: 0,
+                preimage: bytes32(0),
+                index: 0
+            }),
+            _cap(id, DEPOSIT, expiry)
+        );
+
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 5000, "a sealed voucher settles exactly its cumulative");
+        assertEq(wBytes, 5 * uint64(CHUNK_BYTES), "and exactly its signed bytes");
+    }
+
+    /// @notice Nothing hashes to zero, so a sealed voucher cannot be redeemed
+    ///         at any index above 0. This is what makes the zero root a safe
+    ///         sentinel rather than a special case.
+    function test_redeem_payWord_sealedVoucherRevertsAtAnyIndexAboveZero() public {
+        bytes32 id = _open();
+        bytes memory cap = _cap(id, DEPOSIT, expiry);
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.BadPreimage.selector);
+        _redeemChained(id, _chained(5000, bytes32(0), CHUNK_PRICE, _preimage(SEED, 1), 1), cap);
+    }
+
+    /// @notice A REAL-root voucher settles its own `cumulative` the same way a
+    ///         sealed one does: the node submits the root as its own preimage
+    ///         at index 0 and the walk runs zero times. Both shapes reach
+    ///         "settle the signed amount" through one check.
+    function test_redeem_payWord_realRootAtIndexZeroSettlesExactlyItsAmount() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        vm.prank(provider);
+        _redeemChained(
+            id,
+            Chained({
+                amount: 5000,
+                bytesDelivered: uint64(CHUNK_BYTES),
+                root: root,
+                chunkPrice: CHUNK_PRICE,
+                preimage: root,
+                index: 0
+            }),
+            _cap(id, DEPOSIT, expiry)
+        );
+
+        (uint64 wAmount,) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 5000, "index 0 adds no increment");
+    }
+
+    /// @notice One tick pays one `chunkPrice` over the anchor and credits one
+    ///         `CHUNK_BYTES` — the whole point of the meter.
+    function test_redeem_payWord_oneTickExtendsTheAnchorByOneChunk() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        vm.prank(provider);
+        _redeemChained(
+            id,
+            Chained({
+                amount: 5000,
+                bytesDelivered: uint64(CHUNK_BYTES),
+                root: root,
+                chunkPrice: CHUNK_PRICE,
+                preimage: _preimage(SEED, 1),
+                index: 1
+            }),
+            _cap(id, DEPOSIT, expiry)
+        );
+
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 5000 + CHUNK_PRICE, "one chunk of price over the anchor");
+        assertEq(wBytes, 2 * uint64(CHUNK_BYTES), "one chunk of bytes over the anchor");
+    }
+
+    /// @notice The full-depth walk: a payer that abandons a stream mid-chain
+    ///         leaves the node a claim worth 255 chunks over its anchor, and
+    ///         every one of them is provable in a bounded 255 keccaks.
+    function test_redeem_payWord_fullDepthWalkAtMaxChainLength() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        uint64 anchorBytes = uint64(CHUNK_BYTES);
+        vm.prank(provider);
+        _redeemChained(
+            id,
+            Chained({
+                amount: 5000,
+                bytesDelivered: anchorBytes,
+                root: root,
+                chunkPrice: CHUNK_PRICE,
+                preimage: _preimage(SEED, MAX_CHAIN_LENGTH),
+                index: MAX_CHAIN_LENGTH
+            }),
+            _cap(id, DEPOSIT, expiry)
+        );
+
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 5000 + uint64(MAX_CHAIN_LENGTH) * CHUNK_PRICE, "255 chunks over the anchor");
+        assertEq(wBytes, anchorBytes + uint64(MAX_CHAIN_LENGTH) * uint64(CHUNK_BYTES), "255 chunks of bytes");
+    }
+
+    /// @notice There is no index-256 case to test at this layer, and that is
+    ///         the point: `chainIndex` is extracted as a `uint8`, so 255 is the
+    ///         ceiling by construction. What a caller CAN do is set a byte in
+    ///         the packed word's reserved span, and that is refused rather than
+    ///         masked away — which is what keeps the span claimable by a later
+    ///         field without reinterpreting any voucher signed today.
+    function test_redeem_payWord_reservedChainMeterSpanIsRejected() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        Sig memory sig = _signVoucherChained(address(pool), id, signer, provider, 5000, 0, root, CHUNK_PRICE, SIGNER_PK);
+        PaymentPool.LaneVoucher[] memory v = new PaymentPool.LaneVoucher[](1);
+        // One bit immediately above the price field — the lowest reserved bit.
+        v[0] = _laneOfChained(signer, 5000, 0, sig, root, root, _meter(CHUNK_PRICE, 0) | (uint256(1) << 72));
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.ChainMeterReservedNonZero.selector);
+        pool.redeemMany(_batch(id, _capsOf(_cap(id, DEPOSIT, expiry)), v));
+    }
+
+    /// @notice A preimage from another chain is caller error, not transient
+    ///         pool state, so it reverts the whole call — unlike a zero-paying
+    ///         voucher, which is skipped.
+    function test_redeem_payWord_foreignPreimageRevertsTheWholeCall() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        bytes memory cap = _cap(id, DEPOSIT, expiry);
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.BadPreimage.selector);
+        _redeemChained(id, _chained(5000, root, CHUNK_PRICE, _preimage(keccak256("other"), 3), 3), cap);
+    }
+
+    /// @notice A shallower preimage cannot be passed off as a deeper one:
+    ///         reaching the root takes the hashes it takes.
+    function test_redeem_payWord_shallowerPreimageCannotClaimADeeperIndex() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        bytes memory cap = _cap(id, DEPOSIT, expiry);
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.BadPreimage.selector);
+        _redeemChained(id, _chained(5000, root, CHUNK_PRICE, _preimage(SEED, 4), 5), cap);
+    }
+
+    /// @notice Rollover, both ways round. Redeeming the retired chain and then
+    ///         the folded voucher collects exactly what redeeming only the
+    ///         folded voucher collects — because payment is `claimed - paid`,
+    ///         so the second call is already net of the first.
+    function test_redeem_payWord_rolloverOldThenNewEqualsNewOnly() public {
+        bytes32 rootA = _chainRoot(SEED);
+        bytes32 rootB = _chainRoot(keccak256("decdn/test/payword/seed2"));
+        uint64 anchor = 5000;
+        uint8 reached = 4;
+        uint64 folded = anchor + uint64(reached) * CHUNK_PRICE;
+
+        // Path 1: redeem the retired chain at its frontier, then the fold.
+        bytes32 idA = _open();
+        vm.startPrank(provider);
+        _redeemChained(
+            idA, _chained(anchor, rootA, CHUNK_PRICE, _preimage(SEED, reached), reached), _cap(idA, DEPOSIT, expiry)
+        );
+        _redeemChained(idA, _chained(folded, rootB, CHUNK_PRICE, rootB, 0), "");
+        vm.stopPrank();
+        (uint64 amountA,) = pool.watermark(idA, signer, provider);
+
+        // Path 2: skip the retired chain and redeem only the fold.
+        bytes32 idB = _open();
+        vm.prank(provider);
+        _redeemChained(idB, _chained(folded, rootB, CHUNK_PRICE, rootB, 0), _cap(idB, DEPOSIT, expiry));
+        (uint64 amountB,) = pool.watermark(idB, signer, provider);
+
+        assertEq(amountA, folded, "old-then-new lands on the folded total");
+        assertEq(amountA, amountB, "both redemption orders collect the same total");
+    }
+
+    /// @notice A superseded chain pays 0 and is SKIPPED, not reverted: the
+    ///         cumulative resolution makes a stale claim worthless without any
+    ///         chain state stored on-chain to detect it.
+    function test_redeem_payWord_supersededChainPaysZeroAndIsSkipped() public {
+        bytes32 id = _open();
+        bytes32 rootA = _chainRoot(SEED);
+        bytes32 rootB = _chainRoot(keccak256("decdn/test/payword/seed2"));
+        uint8 reached = 4;
+        uint64 folded = 5000 + uint64(reached) * CHUNK_PRICE;
+
+        vm.startPrank(provider);
+        _redeemChained(id, _chained(folded, rootB, CHUNK_PRICE, rootB, 0), _cap(id, DEPOSIT, expiry));
+        // The retired chain, presented afterwards at the frontier it reached.
+        uint256 paid = _redeemChained(id, _chained(5000, rootA, CHUNK_PRICE, _preimage(SEED, reached), reached), "");
+        vm.stopPrank();
+
+        assertEq(paid, 0, "a superseded chain pays nothing");
+        (uint64 wAmount,) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, folded, "and moves the watermark nowhere");
+    }
+
+    /// @notice The soft floor clamps the CHAIN-EXTENDED pair, not the signed
+    ///         half. Bytes proved by preimage carry the same per-byte price
+    ///         obligation as bytes proved by signature — otherwise a chain
+    ///         could credit 255 chunks of bytes against whatever its anchor
+    ///         happened to cost.
+    function test_redeem_payWord_floorCeilingRisesWithTheChainExtendedClaim() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        // A 1-base-unit anchor over 1 MB of signed bytes. Read on the SIGNED
+        // pair alone, that money justifies only 1 MB at the floor, so a
+        // signed-only ceiling would clamp here. The chain adds 2 chunks of
+        // price, lifting the claim to 21 and the ceiling to 21 MB, which is
+        // comfortably above the 3 MB the extended byte claim asks for — so
+        // nothing is clamped and every proved byte is credited.
+        uint8 index = 2;
+        vm.prank(provider);
+        _redeemChained(
+            id,
+            Chained({
+                amount: 1,
+                bytesDelivered: uint64(CHUNK_BYTES),
+                root: root,
+                chunkPrice: CHUNK_PRICE,
+                preimage: _preimage(SEED, index),
+                index: index
+            }),
+            _cap(id, DEPOSIT, expiry)
+        );
+
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 1 + uint64(index) * CHUNK_PRICE, "the extended claim settles in full");
+        assertEq(wBytes, 3 * uint64(CHUNK_BYTES), "every chain-proved byte is credited");
+        assertGt(wBytes, uint64(CHUNK_BYTES), "a signed-only ceiling would have clamped at 1 MB");
+    }
+
+    /// @notice And the clamp still bites when the EXTENDED claim cannot justify
+    ///         the extended bytes — the ceiling is computed from `claimed`, not
+    ///         from the signed `cumulative`.
+    function test_redeem_payWord_floorClampBitesOnTheExtendedPair() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        // 1 base unit of anchor over 100 MB of signed bytes, extended by two
+        // chunks: claim 21, byte claim 102 MB, ceiling 21 MB. The clamp lands
+        // at 21 MB — which is only reachable because the ceiling read the
+        // extended claim; the signed `cumulative` of 1 would have allowed 1 MB.
+        uint8 index = 2;
+        vm.prank(provider);
+        _redeemChained(
+            id,
+            Chained({
+                amount: 1,
+                bytesDelivered: 100 * uint64(CHUNK_BYTES),
+                root: root,
+                chunkPrice: CHUNK_PRICE,
+                preimage: _preimage(SEED, index),
+                index: index
+            }),
+            _cap(id, DEPOSIT, expiry)
+        );
+
+        (uint64 wAmount, uint64 wBytes) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 21, "the extended claim settles in full");
+        assertEq(
+            uint256(wBytes),
+            uint256(wAmount) * BYTES_PER_MB / DELIVERY_FLOOR,
+            "credited bytes clamped to the ceiling the EXTENDED claim justifies"
+        );
+    }
+
+    /// @notice A chain whose extension would push the claim past `uint64` is
+    ///         refused rather than silently wrapping. These two values are the
+    ///         one pair here derived from calldata rather than read from a
+    ///         signed `uint64`, so they are the one pair bounded by a check.
+    function test_redeem_payWord_overflowingClaimIsRefused() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        uint64 huge = type(uint64).max;
+        bytes memory cap = _cap(id, DEPOSIT, expiry);
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.ClaimOverflow.selector);
+        _redeemChained(id, _chained(huge, root, huge, _preimage(SEED, 1), 1), cap);
+    }
+
+    /// @notice A bad preimage on ONE lane reverts the whole batch, where a
+    ///         zero-paying lane is merely skipped. That split is the point: a
+    ///         mismatched hash is caller error the node can fix locally, while
+    ///         a drained pool is transient state it should retry through.
+    function test_redeemMany_payWord_badPreimageLanePoisonsTheBatch() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+
+        PaymentPool.LaneVoucher[] memory v = new PaymentPool.LaneVoucher[](2);
+        v[0] = _laneOf(signer, 1000, uint64(CHUNK_BYTES), _voucher(id, 1000, uint64(CHUNK_BYTES)));
+        v[1] = _laneOfChained(
+            signer,
+            2000,
+            0,
+            _signVoucherChained(address(pool), id, signer, provider, 2000, 0, root, CHUNK_PRICE, SIGNER_PK),
+            root,
+            _preimage(keccak256("other"), 2),
+            _meter(CHUNK_PRICE, 2)
+        );
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentPool.BadPreimage.selector);
+        pool.redeemMany(_batch(id, _capsOf(_cap(id, DEPOSIT, expiry)), v));
+    }
+
+    /// @notice The chain adds no storage. `chainRoot`, `preimage` and
+    ///         `chainMeter` are calldata the contract resolves and discards —
+    ///         only the paid watermark persists, which is what lets a lane stay
+    ///         one storage slot and needs no anti-replay state of its own.
+    function test_redeem_payWord_replayingTheSameProofPaysZero() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        bytes memory cap = _cap(id, DEPOSIT, expiry);
+
+        vm.startPrank(provider);
+        _redeemChained(id, _chained(5000, root, CHUNK_PRICE, _preimage(SEED, 3), 3), cap);
+        uint256 again = _redeemChained(id, _chained(5000, root, CHUNK_PRICE, _preimage(SEED, 3), 3), "");
+        vm.stopPrank();
+
+        assertEq(again, 0, "re-presenting a fully-paid claim pays nothing");
+    }
+
+    /// @notice Presenting a DEEPER preimage on the same anchor collects only
+    ///         the difference — the frontier advances, and the money already
+    ///         paid is not paid twice.
+    function test_redeem_payWord_deeperPreimageCollectsOnlyTheDifference() public {
+        bytes32 id = _open();
+        bytes32 root = _chainRoot(SEED);
+        bytes memory cap = _cap(id, DEPOSIT, expiry);
+
+        vm.startPrank(provider);
+        _redeemChained(id, _chained(5000, root, CHUNK_PRICE, _preimage(SEED, 3), 3), cap);
+        uint256 delta = _redeemChained(id, _chained(5000, root, CHUNK_PRICE, _preimage(SEED, 7), 7), "");
+        vm.stopPrank();
+
+        assertEq(delta, 4 * CHUNK_PRICE, "only the four chunks past the paid frontier");
+        (uint64 wAmount,) = pool.watermark(id, signer, provider);
+        assertEq(wAmount, 5000 + 7 * CHUNK_PRICE, "the lane sits at the deeper frontier");
+    }
+
+    // -----------------------------------------------------------------
     // redeemMany — register-batch then redeem-batch (ADR 003 § Batch redemption)
     // -----------------------------------------------------------------
 
@@ -1797,10 +2299,16 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N vouchers", gasUsed);
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
-        // doc comment (crates/common/src/config/mod.rs): N = 507,093 gas.
+        // doc comment (crates/common/src/config/mod.rs): N = 515,619 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
         // masking a real regression.
-        assertApproxEqAbs(gasUsed, 507_093, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
+        //
+        // Re-pinned for `PayWord` (was 507,093): every lane now carries three
+        // more calldata words and runs `_resolveClaim`. These lanes are all
+        // SEALED vouchers — zero root, zero preimage, zero meter — so the walk
+        // is empty and the added words are pure zero bytes, which is the
+        // cooperative path a finalized delivery actually redeems.
+        assertApproxEqAbs(gasUsed, 515_619, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
     }
 
     /// @notice Companion to `test_redeemMany_gas_NVouchers` — same setup,
@@ -1812,10 +2320,11 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 2_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, N+1 vouchers", gasUsed);
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
-        // doc comment (crates/common/src/config/mod.rs): N+1 = 541,614 gas.
+        // doc comment (crates/common/src/config/mod.rs): N+1 = 550,993 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
-        // masking a real regression.
-        assertApproxEqAbs(gasUsed, 541_614, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
+        // masking a real regression. Re-pinned for `PayWord` (was 541,614);
+        // see `test_redeemMany_gas_NVouchers` for what moved.
+        assertApproxEqAbs(gasUsed, 550_993, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
     }
 
     /// @dev Opens a fresh pool and, unlike `_redeemFreshLanesAndSnapshotGas`,
@@ -1872,8 +2381,9 @@ contract PaymentPoolTest is Test {
         // Pinned from an actual `forge test -vv` run on this branch. Includes
         // N owner-signed capability registrations plus N cold voucher
         // settlements in one call.
+        // Re-pinned for `PayWord` (was 795,817).
         assertApproxEqAbs(
-            gasUsed, 795_817, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
+            gasUsed, 804_352, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
         );
     }
 
@@ -1890,8 +2400,9 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 3_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, first-time N+1 vouchers", gasUsed);
         // Pinned from an actual `forge test -vv` run on this branch.
+        // Re-pinned for `PayWord` (was 859,221).
         assertApproxEqAbs(
-            gasUsed, 859_221, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
+            gasUsed, 868_611, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
         );
     }
 

@@ -134,7 +134,7 @@ async fn pool_floor_credit_bound_holds_across_distinct_lanes_and_a_real_miss() -
 /// journey never overrides it, so the daemon serves under the exact same
 /// value production ships. One ramp-floor at [`RATE_PER_MB`] is
 /// `floor_micro(RATE_PER_MB)`: at cold start (`paid == 0`) the ramped credit
-/// window always collapses to exactly one `VOUCHER_INTERVAL_BYTES` interval
+/// window always collapses to exactly one `CHUNK_BYTES` interval
 /// regardless of `credit_max`/`credit_ramp_divisor` (ADR 003 §Credit window),
 /// so every lane below reserves — and, once withheld, folds — exactly this
 /// amount into the pool's `dead_charge` accumulator

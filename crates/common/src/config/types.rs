@@ -856,14 +856,14 @@ pub struct PaymentConfig {
     /// node's credit exposure (unbilled egress already on the wire) to
     /// `paid / credit_ramp_divisor`; the client's exposure stays zero (vouchers
     /// are cumulative over delivered bytes). Absent =>
-    /// [`crate::config::DEFAULT_CREDIT_MAX`] (64 MiB). Floored at one voucher
-    /// accounting interval ([`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`]);
-    /// a value at or below one interval reproduces the pre-ramp stop-and-wait
-    /// cadence. It is node-local config, not a governance-owned parameter — no
+    /// [`crate::config::DEFAULT_CREDIT_MAX`] (64 MiB). Floored at one chunk
+    /// ([`decdn_protocol::client::CHUNK_BYTES`], 1 MiB); a value at or below one
+    /// chunk reproduces the strict stop-and-wait cadence — deliver a chunk, then
+    /// recoup it. It is node-local config, not a governance-owned parameter — no
     /// contract holds a delivery-cadence value.
     pub credit_max: Option<decdn_config_types::Bytes>,
     /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
-    /// `paid / credit_ramp_divisor`, floored at one voucher interval and capped at
+    /// `paid / credit_ramp_divisor`, floored at one chunk and capped at
     /// [`Self::credit_max`]. Absent => [`crate::config::DEFAULT_CREDIT_RAMP_DIVISOR`]
     /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
     /// behavior. It is node-local config, not a governance-owned parameter.
@@ -1096,7 +1096,7 @@ pub struct ObservabilityConfig {
 /// Download-receipt audit-log retention section of the config file (#802).
 ///
 /// Bounds the otherwise-unbounded `download_receipts.jsonl` (one line per
-/// accepted voucher interval, ~1 per MiB delivered) with size-based rotation:
+/// accepted payment proof, ~1 per MiB delivered) with size-based rotation:
 /// once the live file reaches `max_file_bytes` it is rotated to a numbered
 /// backup (`download_receipts.jsonl.1`, `.2`, …) and a fresh file is opened;
 /// the oldest backup beyond `retained_files` is deleted. Both fields are

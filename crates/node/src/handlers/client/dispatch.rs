@@ -3,11 +3,11 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage, Connection,
-    FillOutcome, FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex,
+    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage,
+    Connection, FillOutcome, FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex,
     OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VOUCHER_INTERVAL_BYTES, VarInt,
-    read_first_message, reset_stream, verify_binding,
+    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 use std::sync::atomic::Ordering;
@@ -361,7 +361,7 @@ impl ClientHandler {
         // exit (success, `?`, disconnect, panic).
         let mut lane_slot: Option<LaneSlot> = None;
         if let (Some(lane), Some(status)) = (known_lane.as_ref(), pool_status) {
-            let floor = self.credit_window(VOUCHER_INTERVAL_BYTES, 0);
+            let floor = self.credit_window(CHUNK_BYTES, 0);
             let guard = lane.lock().await;
             let active = guard.active_streams.clone();
             let n_active = active.load(Ordering::Relaxed);
@@ -580,7 +580,7 @@ impl ClientHandler {
                 // from an offset) the billed size genuinely is unknowable pre-fill,
                 // so the window stands. Be clear about the residual that leaves:
                 // this guard prices at `paid = 0`, i.e. the ramp floor — one
-                // voucher interval (`VOUCHER_INTERVAL_BYTES`, a fixed 4 MiB) —
+                // voucher interval (`CHUNK_BYTES`, a fixed 4 MiB) —
                 // not the fully-ramped `credit_max` ceiling (64 MiB by default),
                 // since a cold request has confirmed no payment yet. A channel
                 // funded for the blob but not for a floor interval is refused
@@ -588,7 +588,7 @@ impl ClientHandler {
                 // to run before the floor, which is a larger change than this one.
                 //
                 // `window.rs` keeps its own guard. Its window is exactly
-                // `self.credit_window(interval_bytes, 0)` — the same ramp-floor
+                // `self.credit_window(chunk_bytes, 0)` — the same ramp-floor
                 // computation this site uses — so the two guards are redundant at
                 // this floor. It is also the tier that fronts UPSTREAM spend (the
                 // pull leg's `RampPacer`, #1669, paces against the SAME ramp as it
@@ -615,12 +615,12 @@ impl ClientHandler {
                     && let Some(status) = pool_status
                 {
                     // Reserve the un-self-funded credit this stream fronts before it
-                    // pays: the ramp floor at `paid = 0` (one interval normally, the
+                    // pays: the ramp floor at `paid = 0` (one chunk normally, the
                     // full `credit_max` when `credit_ramp_divisor == 0`), span-capped
                     // for a bounded request. `release_live_repaid` frees it once
                     // cumulative payment REACHES this reserved amount (see the serve
                     // loop), so release stays matched to what was reserved at any divisor.
-                    let window = self.credit_window(VOUCHER_INTERVAL_BYTES, 0);
+                    let window = self.credit_window(CHUNK_BYTES, 0);
                     let reserved_bytes = if req.byte_len > 0 {
                         aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
                     } else {
@@ -1022,9 +1022,9 @@ impl ClientHandler {
         // Reserve the ramp-floor credit exposure (`credit_window` at `paid = 0`),
         // span-capped by the request. `release_live_repaid` frees it once payment
         // reaches this reserved amount, so release matches reserved at any divisor.
-        let interval_bytes = VOUCHER_INTERVAL_BYTES;
+        let chunk_bytes = CHUNK_BYTES;
         let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
-            .min(self.credit_window(interval_bytes, 0));
+            .min(self.credit_window(chunk_bytes, 0));
         if let Some(status) = pool_status {
             let refused = if floor_reservation.is_none() {
                 let reserved = decdn_incentive::min_payment(guard_bytes, rate_per_mb);

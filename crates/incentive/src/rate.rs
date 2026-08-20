@@ -18,7 +18,7 @@
 //! client does when computing `amount = ceil(bytes / 1_048_576) * rate`.
 
 use alloy::primitives::U256;
-use decdn_protocol::client::VOUCHER_INTERVAL_BYTES;
+use decdn_protocol::client::CHUNK_BYTES;
 
 /// 1 `MB` in bytes per ADR 005 §Probe-Triggered Eviction Hold's `MB`
 /// definition.
@@ -108,11 +108,16 @@ pub fn min_payment(bytes: u64, rate_per_mb: u64) -> U256 {
         .div_ceil(U256::from(BYTES_PER_MB))
 }
 
-/// One voucher-interval floor priced in `µUSDC` — the un-self-funded credit a fresh
-/// lane draws before its first voucher (ADR 003 §Credit window / §Pool solvency).
+/// One-chunk floor priced in `µUSDC` — the un-self-funded credit a fresh lane
+/// draws before its first proof (ADR 003 §Credit window / §Pool solvency).
+///
+/// The credit window is floored at one chunk so a stream can always make
+/// progress: deliver a full chunk, then recoup it. Because `CHUNK_BYTES ==
+/// BYTES_PER_MB`, this is exactly `rate_per_mb` — one chunk costs one MB of
+/// price, by identity (ADR 003 §Chunk Cadence).
 #[must_use]
 pub fn floor_micro(rate_per_mb: u64) -> U256 {
-    min_payment(VOUCHER_INTERVAL_BYTES, rate_per_mb)
+    min_payment(CHUNK_BYTES, rate_per_mb)
 }
 
 /// Stateful-B pool solvency: the pool's remaining deposit minus the refundable
@@ -363,15 +368,14 @@ mod tests {
         Ok(())
     }
 
+    /// The floor is one chunk, and `CHUNK_BYTES == BYTES_PER_MB`, so it prices
+    /// to exactly the advertised per-MB rate with no rounding at any rate —
+    /// the identity ADR 003 §Chunk sizing and the payability floor rests on.
     #[test]
-    fn floor_micro_is_one_interval() {
-        // 4 MiB interval at 100 µUSDC/MB = 4 * 100 = 400 µUSDC (4 MiB = 4 MB-units
-        // here per min_payment rounding).
+    fn floor_micro_is_one_chunk_which_is_exactly_the_per_mb_rate() {
         let f = floor_micro(100);
-        assert_eq!(
-            f,
-            min_payment(decdn_protocol::client::VOUCHER_INTERVAL_BYTES, 100)
-        );
+        assert_eq!(f, min_payment(decdn_protocol::client::CHUNK_BYTES, 100));
+        assert_eq!(f, U256::from(100u64));
         assert!(f > U256::ZERO);
     }
 

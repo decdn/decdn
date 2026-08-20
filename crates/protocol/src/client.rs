@@ -43,20 +43,36 @@ use crate::message::{MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 
 /// Exact byte length of a `ChunkData` payload, except the final chunk which MAY
 /// be smaller (ADR 005 §`cdn/client/v1`, §Partial final chunk). Matches
-/// iroh-blobs' internal 1024-byte chunk granularity; the voucher accounting
-/// granularity (`VOUCHER_INTERVAL_BYTES`) is coarser, so a buffering layer sits
-/// between the payment and transfer tick rates (ADR 005 §Tradeoffs).
+/// iroh-blobs' internal 1024-byte chunk granularity; the payment quantum
+/// ([`CHUNK_BYTES`]) is coarser, so a buffering layer sits between the payment
+/// and transfer tick rates (ADR 005 §Tradeoffs).
 pub const CHUNK_SIZE: usize = 1024;
 
 /// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
-/// of `rate_per_mb` and [`VOUCHER_INTERVAL_BYTES`].
+/// of `rate_per_mb` and, by the identity below, of [`CHUNK_BYTES`].
 pub const MB_BYTES: u64 = 1_048_576;
 
-/// Fixed byte-accounting granularity for cumulative vouchers. Buyer and seller
-/// both step their cumulative `bytes_delivered` in this unit, so each voucher
-/// signs over a byte count both sides derive identically without carrying it on
-/// the wire. 4 MiB.
-pub const VOUCHER_INTERVAL_BYTES: u64 = 4 * MB_BYTES;
+/// The payment quantum: one chunk of delivery, 1 MiB (ADR 003 §Chunk Cadence).
+///
+/// A protocol constant, never negotiated. No message carries it, no node
+/// advertises it, and governance does not move it — a chunk is the unit one
+/// hash-chain tick pays for, so payer and node disagreeing on it would make one
+/// released preimage worth two different amounts.
+///
+/// `CHUNK_BYTES == MB_BYTES` by identity, which is what makes a chunk cost
+/// exactly the advertised `rate_per_mb` with no rounding at any rate.
+pub const CHUNK_BYTES: u64 = MB_BYTES;
+
+/// The highest chain index: the hash chain's incremental range over its anchor
+/// (ADR 003 §Chain length and rollover).
+///
+/// The index space is the `u8` domain `0..=255` — 256 slots, exactly one byte.
+/// Index 0 names `chain_root` and resolves to the voucher's own `amount`, so
+/// the base voucher is payable with no chain at all; it adds no increment,
+/// which is why it never travels the wire. Indices `1..=255` each release one
+/// preimage and add one `chunk_price` over that anchor, so a chain adds up to
+/// 255 MiB at [`CHUNK_BYTES`]. 256 slots = one payable base + 255 increments.
+pub const MAX_CHAIN_LENGTH: u8 = 255;
 
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
 /// Mirrors [`SLASH_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
@@ -91,18 +107,23 @@ pub enum ClientMessage {
     /// is implicit — delivery simply continues; only rejection is signalled,
     /// via [`Self::StreamError`].
     Voucher(Voucher),
-    /// discriminant 4 — payer → node, signals the payer received the full blob.
+    /// discriminant 4 — payer → node, one released hash-chain preimage,
+    /// advancing the lane's claim by one chunk without a signature (ADR 003
+    /// §Hash-chain metering (`PayWord`)). Acceptance is implicit, exactly as for
+    /// [`Self::Voucher`].
+    ChunkPreimage(ChunkPreimage),
+    /// discriminant 5 — payer → node, signals the payer received the full blob.
     StreamEnd,
-    /// discriminant 5 — node → payer, mid-stream failure (carries
+    /// discriminant 6 — node → payer, mid-stream failure (carries
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
     /// [`StreamResponse::error`].
     StreamError(StreamError),
 }
 
 impl crate::framing::TopLevelEnum for ClientMessage {
-    /// `StreamRequest` (0) … `StreamError` (5). Pinned by
+    /// `StreamRequest` (0) … `StreamError` (6). Pinned by
     /// `client_message_variant_count_matches_discriminants`.
-    const VARIANT_COUNT: u32 = 6;
+    const VARIANT_COUNT: u32 = 7;
 }
 
 impl ClientMessage {
@@ -144,6 +165,7 @@ impl ClientMessage {
             Self::StreamResponse(resp) => resp.validate(),
             Self::Voucher(voucher) => voucher.validate(),
             Self::ChunkData(chunk) => chunk.validate(),
+            Self::ChunkPreimage(preimage) => preimage.validate(),
             Self::StreamRequest(_) | Self::StreamEnd | Self::StreamError(_) => Ok(()),
         }
     }
@@ -597,18 +619,23 @@ impl ChunkData {
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
 ///
-/// The wire carries `{signature, amount, bytes_delivered}`; the receiver
-/// reconstructs the full EIP-712 typed data `{poolId, signer, provider, amount,
-/// bytesDelivered}` from stream context (`poolId`/`signer`/`provider` fixed for
-/// the stream) plus the self-described `amount` and `bytesDelivered`. There is
-/// no nonce: `amount` is the sole ordering and replay key — a voucher whose
-/// `amount` is no greater than the highest accepted is stale. `bytes_delivered`
-/// is an additional signed, monotone cumulative that must not regress below the
-/// highest accepted; it is what the node verifies against (rather than
-/// reconstructing) so same-lane vouchers settle independent of arrival order.
-/// Both are `u64` cumulative totals matching the contract's on-chain `uint64`
-/// `Lane`/`LaneVoucher` storage; the node zero-extends them to `uint256` to
-/// reconstruct the EIP-712 signature.
+/// The wire carries `{signature, amount, bytes_delivered, chain_root,
+/// chunk_price}`; the receiver reconstructs the full EIP-712 typed data
+/// `{poolId, signer, provider, amount, bytesDelivered, chainRoot, chunkPrice}`
+/// from stream context (`poolId`/`signer`/`provider` fixed for the stream) plus
+/// the self-described fields. There is no nonce: `amount` is the sole ordering
+/// and replay key — a voucher whose `amount` is no greater than the highest
+/// accepted is stale. `bytes_delivered` is an additional signed, monotone
+/// cumulative that must not regress below the highest accepted; it is what the
+/// node verifies against (rather than reconstructing) so same-lane vouchers
+/// settle independent of arrival order. Both are `u64` cumulative totals
+/// matching the contract's on-chain `uint64` `Lane`/`LaneVoucher` storage; the
+/// node zero-extends them to `uint256` to reconstruct the EIP-712 signature.
+///
+/// `amount` is the **settlement anchor**, and `chain_root` heads the optional
+/// hash chain that advances it between signatures (ADR 003 §Hash-chain metering
+/// (`PayWord`)). Redemption resolves both with one formula:
+/// `claimed = amount + chain_index × chunk_price`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Voucher {
     /// EOA secp256k1 EIP-712 signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]).
@@ -619,6 +646,18 @@ pub struct Voucher {
     /// the node verifies against exactly what was signed, independent of
     /// same-lane stream ordering.
     pub bytes_delivered: u64,
+    /// Head of the hash chain this voucher opens: `keccak^MAX_CHAIN_LENGTH` of
+    /// the payer's per-lane seed. All-zero **seals** the voucher at exactly
+    /// `amount` — no value that hashes to zero is findable, so no index above 0
+    /// can redeem against it (ADR 003 §The sealed voucher (zero-hash root)).
+    pub chain_root: [u8; 32],
+    /// The price one chunk of delivery adds over `amount`, in token base units.
+    /// Signed so the claim arithmetic is fixed at signing time. A metering
+    /// voucher MUST carry the node's quoted `rate_per_mb` (`CHUNK_BYTES ==
+    /// MB_BYTES`, so a chunk costs exactly one MB); a sealed voucher meters no
+    /// chunk and MUST carry `0`. The node rejects otherwise with
+    /// [`VoucherRejectReason::ChunkPriceMismatch`] (ADR 003 §Chunk Cadence).
+    pub chunk_price: u64,
 }
 
 impl Voucher {
@@ -631,6 +670,62 @@ impl Voucher {
                 len: self.signature.len(),
             });
         }
+        Ok(())
+    }
+}
+
+/// Payer → node released hash-chain preimage, advancing the lane's claim by one
+/// chunk with no signature (ADR 003 §Hash-chain metering (`PayWord`), ADR 005
+/// §Payment quantum and credit window).
+///
+/// Released after the payer has received and verified the chunk it pays for, so
+/// the payer's exposure stays at zero. Preimage resistance makes the value
+/// self-proving: nobody derives `keccak^(N−k−1)(s)` from `keccak^(N−k)(s)`
+/// without the seed, so a deeper preimage **is** the receipt for every chunk
+/// below it.
+///
+/// # Wire encoding
+///
+/// `preimage ‖ index`, 33 bytes flat — postcard writes a `[u8; 32]` raw and a
+/// `u8` as one byte, so there is no length prefix and no varint. The byte IS
+/// the index, with no offset on send and no increment on receipt.
+///
+/// # Index domain
+///
+/// Releasable indices are `1..=`[`MAX_CHAIN_LENGTH`]. `index == 0` is a
+/// protocol error — index 0 names `chain_root` and is the settlement case at
+/// redemption, so it proves nothing the voucher does not already say. It is
+/// rejected **in band** by the delivery handler as
+/// [`VoucherRejectReason::ChainIndexTooLarge`] rather than at decode, so the
+/// payer learns why instead of seeing an opaque stream close. An index above
+/// [`MAX_CHAIN_LENGTH`] cannot be encoded at all: the walk is bounded at 255
+/// hashes by the type, which is stronger than a runtime comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkPreimage {
+    /// The released value, `keccak^(MAX_CHAIN_LENGTH − index)` of the payer's
+    /// per-lane seed.
+    pub preimage: [u8; 32],
+    /// Depth of `preimage` in the chain. Verified as
+    /// `keccak^(index − verified)(preimage) == tip` against the receiving
+    /// stream's anchor.
+    pub index: u8,
+}
+
+impl ChunkPreimage {
+    /// Always `Ok`. Both fields are fixed-width, so a decoded `ChunkPreimage`
+    /// has no shape to check — and the one value invariant (`index != 0`) is
+    /// deliberately **not** enforced here: it must surface as an in-band
+    /// [`VoucherRejectReason::ChainIndexTooLarge`] from the delivery handler,
+    /// which holds the stream it has to answer on. Validating it here would
+    /// collapse that reason into a decode failure and close the stream mute.
+    ///
+    /// Present so [`ClientMessage::validate`] stays total over the enum, for
+    /// the same reason `ChunkData::validate` is.
+    ///
+    /// # Errors
+    ///
+    /// Never.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
         Ok(())
     }
 }
@@ -650,6 +745,18 @@ pub struct WatermarkBundle {
     pub amount: u64,
     /// Cumulative bytes delivered as of the node's last-accepted voucher.
     pub bytes_delivered: u64,
+    /// Root the lane is currently metering against; all-zero when the lane
+    /// holds no live chain.
+    pub chain_root: [u8; 32],
+    /// Deepest chain index the node has verified under `chain_root`.
+    pub verified_index: u8,
+    /// The preimage bytes at `verified_index`; all-zero when the node has
+    /// verified none. Echoed so a re-seeding signer folds
+    /// `verified_index × chunk_price` back into the amount it re-signs rather
+    /// than dropping the frontier (ADR 005 §Watermark bundle).
+    pub tip: [u8; 32],
+    /// The `chunk_price` the node's last-accepted voucher was signed at.
+    pub chunk_price: u64,
     /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
     /// node's last-accepted voucher. `Vec<u8>` rather than a fixed array,
     /// mirroring [`Voucher::signature`] — postcard/serde signature fields on
@@ -777,9 +884,12 @@ impl StreamError {
 /// until this enum is extended (ADR 005 §Mirror obligation). The remaining
 /// variants have no validation-enum counterpart and are emitted directly by the
 /// `cdn/client/v1` handler: [`Self::CapabilityExpired`] fires when the signer's
-/// capability has passed its expiry; and [`Self::PoolExhausted`] fires when the
-/// pool's remaining deposit can no longer fund further credit. Variant order is
-/// frozen — new handler-direct reasons append at the end.
+/// capability has passed its expiry; [`Self::PoolExhausted`] fires when the
+/// pool's remaining deposit can no longer fund further credit; and the four
+/// hash-chain reasons ([`Self::BadPreimage`], [`Self::ChainIndexTooLarge`],
+/// [`Self::UnanchoredPreimage`], [`Self::ChunkPriceMismatch`]) are raised where
+/// the handler holds the per-stream chain anchor a validation enum cannot see.
+/// Variant order is frozen — new handler-direct reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -820,6 +930,42 @@ pub enum VoucherRejectReason {
     /// capability ownership; the open-time equivalent stays wire-`NotFound`
     /// (anti-enumeration). Not watermark-gated.
     PoolExhausted,
+    /// A released [`ChunkPreimage`] does not hash to the stream's deepest
+    /// verified preimage in `index − verified` steps (ADR 003 §Concurrent
+    /// Streams, Rule 2). A payer bug — a wrong seed, a wrong chain, or a
+    /// mis-derived index. On-chain the same mismatch reverts `BadPreimage`,
+    /// which is caller error and not transient state, so this is terminal and
+    /// carries **no** watermark bundle: a preimage has no signature of its own,
+    /// and a payment watermark cannot repair a hash-chain mismatch.
+    BadPreimage,
+    /// A [`ChunkPreimage`] arrived with `index == 0`, which never travels the
+    /// wire — index 0 names `chain_root` and is the settlement case at
+    /// redemption. A payer bug; do not retry.
+    ///
+    /// The other half of the name needs no check: the wire index is a `u8` and
+    /// [`MAX_CHAIN_LENGTH`] is 255, so an index past the end of the chain
+    /// cannot be encoded. A chain that has run out of indices is not this
+    /// reason — the payer rolls to a fresh `chain_root` first.
+    ChainIndexTooLarge,
+    /// A [`ChunkPreimage`] arrived on a stream that holds no chain anchor, so
+    /// the node cannot name the chain the reveal belongs to (ADR 003
+    /// §Concurrent Streams, Rule 1). Per-stream and therefore decidable, which
+    /// a lane-wide reading would not be. **Not fatal**: the payer sends the
+    /// current epoch's `chain_root` voucher on this stream and resends the
+    /// preimage. The resend is free — an at-or-below-watermark voucher is
+    /// already-satisfied rather than rejected.
+    UnanchoredPreimage,
+    /// The voucher's `chunk_price` is not the node's quoted `rate_per_mb` on a
+    /// metering voucher, or is non-zero on a sealed one (`chain_root == 0`).
+    ///
+    /// `chunk_price` is signed by the *payer* and a preimage carries no price
+    /// of its own, so a voucher signed at the governance floor against a node
+    /// quoting ten times that would meter every later chunk at a tenth of the
+    /// quote, with no per-tick moment revealing it. The node therefore checks
+    /// the price it is being paid before it meters against it (ADR 003 §Chunk
+    /// Cadence). A payer bug: re-read `rate_per_mb` from the `StreamResponse`
+    /// and re-sign; do not retry with the same price.
+    ChunkPriceMismatch,
 }
 
 impl VoucherRejectReason {
@@ -908,6 +1054,15 @@ mod tests {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: 0x1111_1111_1111_1111u64,
             bytes_delivered: 0x2222_2222_2222_2222u64,
+            chain_root: [0x55u8; 32],
+            chunk_price: 0x6666_6666_6666_6666u64,
+        }
+    }
+
+    fn sample_preimage() -> ChunkPreimage {
+        ChunkPreimage {
+            preimage: [0x77u8; 32],
+            index: 42,
         }
     }
 
@@ -1077,6 +1232,51 @@ mod tests {
     }
 
     #[test]
+    fn chunk_preimage_roundtrip() -> Result<(), postcard::Error> {
+        let p = sample_preimage();
+        let bytes = postcard::to_allocvec(&p)?;
+        let decoded: ChunkPreimage = postcard::from_bytes(&bytes)?;
+        assert_eq!(p, decoded);
+        Ok(())
+    }
+
+    /// ADR 005 §Payment quantum: `preimage ‖ index`, **33 bytes flat** — no
+    /// length prefix and no varint. The byte IS the index. This is the property
+    /// that lets the wire index and the on-chain packed `chainMeter` low byte
+    /// agree with no offset on send and no increment on receipt, so pin the
+    /// exact bytes rather than only the round-trip.
+    #[test]
+    fn chunk_preimage_wire_format_is_stable() -> Result<(), postcard::Error> {
+        let p = ChunkPreimage {
+            preimage: [0xA5u8; 32],
+            index: MAX_CHAIN_LENGTH,
+        };
+        let bytes = postcard::to_allocvec(&p)?;
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0xA5u8; 32]); // preimage (raw, no prefix)
+        expected.push(255u8); // index (one byte, as itself)
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.len(), 33);
+        Ok(())
+    }
+
+    /// `index == 0` decodes cleanly and passes `validate()`. The rejection is
+    /// the delivery handler's, in band as `ChainIndexTooLarge` — if this ever
+    /// starts failing at decode, the payer loses the reason and sees only a
+    /// closed stream.
+    #[test]
+    fn chunk_preimage_index_zero_decodes_and_validates() -> Result<(), postcard::Error> {
+        let p = ChunkPreimage {
+            preimage: [0u8; 32],
+            index: 0,
+        };
+        let bytes = postcard::to_allocvec(&ClientMessage::ChunkPreimage(p))?;
+        let decoded: ClientMessage = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded.validate(), Ok(()));
+        Ok(())
+    }
+
+    #[test]
     fn stream_error_voucher_rejected_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
             reason: VoucherRejectReason::SpendingCapExhausted,
@@ -1099,6 +1299,10 @@ mod tests {
             bundle: Some(WatermarkBundle {
                 amount: 0x1111_1111_1111_1111u64,
                 bytes_delivered: 0x3333_3333_3333_3333u64,
+                chain_root: [0x55u8; 32],
+                verified_index: 7,
+                tip: [0x66u8; 32],
+                chunk_price: 0x7777_7777_7777_7777u64,
                 last_signature: vec![0x44u8; VOUCHER_SIG_LEN],
             }),
         };
@@ -1129,10 +1333,14 @@ mod tests {
             2
         );
         assert_eq!(first_byte(&ClientMessage::Voucher(sample_voucher()))?, 3);
-        assert_eq!(first_byte(&ClientMessage::StreamEnd)?, 4);
+        assert_eq!(
+            first_byte(&ClientMessage::ChunkPreimage(sample_preimage()))?,
+            4
+        );
+        assert_eq!(first_byte(&ClientMessage::StreamEnd)?, 5);
         assert_eq!(
             first_byte(&ClientMessage::StreamError(StreamError::NotFound))?,
-            5
+            6
         );
         Ok(())
     }
@@ -1180,6 +1388,10 @@ mod tests {
             VoucherRejectReason::SpendingCapExhausted,
             VoucherRejectReason::CapabilityExpired,
             VoucherRejectReason::PoolExhausted,
+            VoucherRejectReason::BadPreimage,
+            VoucherRejectReason::ChainIndexTooLarge,
+            VoucherRejectReason::UnanchoredPreimage,
+            VoucherRejectReason::ChunkPriceMismatch,
         ]
         .into_iter()
         .enumerate()
@@ -1208,7 +1420,7 @@ mod tests {
     #[test]
     fn client_message_variant_count_matches_discriminants() -> Result<(), postcard::Error> {
         use crate::framing::TopLevelEnum;
-        assert_eq!(ClientMessage::VARIANT_COUNT, 6);
+        assert_eq!(ClientMessage::VARIANT_COUNT, 7);
         // The last declared variant (`StreamError`) must encode to discriminant
         // VARIANT_COUNT - 1. Compare against postcard's own varint encoding of
         // that index (not `first_byte`/`bytes.first()`) so the pin survives a
@@ -1222,8 +1434,8 @@ mod tests {
 
     #[test]
     fn client_message_unknown_discriminant_is_flagged_unsupported() {
-        // Discriminant 6 is the first index past the known set → UNSUPPORTED.
-        assert!(crate::is_unknown_variant::<ClientMessage>(&[6u8, 0, 0]));
+        // Discriminant 7 is the first index past the known set → UNSUPPORTED.
+        assert!(crate::is_unknown_variant::<ClientMessage>(&[7u8, 0, 0]));
         // A known in-range discriminant (1 = StreamResponse) with a bad payload
         // stays MALFORMED.
         assert!(!crate::is_unknown_variant::<ClientMessage>(&[1u8, 0xFF]));
@@ -1270,6 +1482,8 @@ mod tests {
             signature: vec![0xCDu8; VOUCHER_SIG_LEN],
             amount: 1u64,
             bytes_delivered: 2u64,
+            chain_root: [0xABu8; 32],
+            chunk_price: 3u64,
         };
         let bytes = postcard::to_allocvec(&v)?;
         let mut expected = Vec::new();
@@ -1277,6 +1491,8 @@ mod tests {
         expected.extend_from_slice(&[0xCDu8; VOUCHER_SIG_LEN]); // signature
         expected.push(1u8); // amount (varint)
         expected.push(2u8); // bytes_delivered (varint)
+        expected.extend_from_slice(&[0xABu8; 32]); // chain_root (raw, no prefix)
+        expected.push(3u8); // chunk_price (varint)
         assert_eq!(bytes, expected);
         Ok(())
     }
@@ -1363,6 +1579,10 @@ mod tests {
         let b = WatermarkBundle {
             amount: 0u64,
             bytes_delivered: 0u64,
+            chain_root: [0u8; 32],
+            verified_index: 0,
+            tip: [0u8; 32],
+            chunk_price: 0u64,
             last_signature: vec![0xCDu8; VOUCHER_SIG_LEN - 1],
         };
         assert_eq!(
@@ -1677,12 +1897,17 @@ mod tests {
             ClientMessage::StreamResponse(sample_response()),
             ClientMessage::ChunkData(ChunkData::new(vec![0x7u8; 1000])?),
             ClientMessage::Voucher(sample_voucher()),
+            ClientMessage::ChunkPreimage(sample_preimage()),
             ClientMessage::StreamEnd,
             ClientMessage::StreamError(StreamError::VoucherRejected {
                 reason: VoucherRejectReason::SpendingCapExhausted,
                 bundle: Some(WatermarkBundle {
                     amount: 0x0101_0101_0101_0101u64,
                     bytes_delivered: 0x0303_0303_0303_0303u64,
+                    chain_root: [0x05u8; 32],
+                    verified_index: 9,
+                    tip: [0x06u8; 32],
+                    chunk_price: 0x0707_0707_0707_0707u64,
                     last_signature: vec![0x04u8; VOUCHER_SIG_LEN],
                 }),
             }),

@@ -6,9 +6,11 @@ use bytes::{Bytes, BytesMut};
 use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
+use super::MAX_PROOFS_PER_CHUNK;
+use super::voucher::StreamAnchor;
 use super::{
-    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VOUCHER_INTERVAL_BYTES,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ChunkData, ClientHandler, ClientMessage,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256,
     VecDeque, VoucherRejectReason, VoucherStop,
 };
 
@@ -113,7 +115,7 @@ impl ChunkFramer {
 
 impl ClientHandler {
     /// Stream blob bytes to the paying client behind a credit window (ADR 003
-    /// §Credit window): keep delivering `VOUCHER_INTERVAL_BYTES`-sized batches while
+    /// §Credit window): keep delivering `CHUNK_BYTES`-sized batches while
     /// `delivered − paid ≤ credit_window`, collecting cumulative vouchers as they
     /// arrive instead of stalling a full round trip at every interval boundary. A
     /// closing voucher settles the final partial batch. Returns `Ok(())` on a
@@ -186,7 +188,7 @@ impl ClientHandler {
             .await
             .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
 
-        let interval_bytes = VOUCHER_INTERVAL_BYTES;
+        let chunk_bytes = CHUNK_BYTES;
 
         // The in-flight takedown re-check (ADR 011 compliance) keys on the pool
         // FUNDER — the pool owner (`getPool.owner`), resolved from the cached
@@ -206,7 +208,13 @@ impl ClientHandler {
         // One buffered voucher reader for the whole stream: it buffers a
         // pipelined voucher across recoup calls, so every voucher read MUST go
         // through it — a second reader would lose bytes it read ahead.
-        let mut reader = BufferedVoucherReader::default();
+        let mut reader = BufferedProofReader::default();
+        // This stream's chain anchor — which epoch it has been told about, so a
+        // bare reveal arriving on it can be placed (ADR 003 §Concurrent
+        // Streams, Rule 1). Per stream and in memory only: a restart drops the
+        // streams, and the lane's durable record keeps the strongest claim's
+        // chain state.
+        let mut anchor = StreamAnchor::default();
 
         // `ChunkFramer` yields no frames for an empty export and never a
         // zero-length frame, so `ChunkData::new` cannot reject one here — the empty
@@ -231,7 +239,7 @@ impl ClientHandler {
             // window). Recomputed each iteration: as `paid` advances in the recoup
             // phase the window widens, so a paying stream ramps toward `credit_max`
             // while a non-payer stays pinned at the one-interval floor.
-            let window = self.credit_window(interval_bytes, paid);
+            let window = self.credit_window(chunk_bytes, paid);
 
             // --- deliver phase: stream chunks while the window has room. The
             // window is checked BEFORE each send, so the frontier
@@ -261,7 +269,7 @@ impl ClientHandler {
                 delivered = delivered.saturating_add(len);
                 self.shed.record_egress(len);
                 unvouchered = unvouchered.saturating_add(len);
-                if unvouchered >= interval_bytes {
+                if unvouchered >= chunk_bytes {
                     pending.push_back(unvouchered);
                     unvouchered = 0;
                 }
@@ -293,32 +301,58 @@ impl ClientHandler {
                 ));
             }
 
-            // --- recoup phase: one voucher per completed interval; the voucher
-            // advances the in-memory lane watermark and the background flush
-            // persists it (ADR 003 §Off-chain voucher state persistence). ---
+            // --- recoup phase: collect proofs until each completed chunk is
+            // paid for. The proof advances the in-memory lane watermark and the
+            // background flush persists it (ADR 003 §Off-chain voucher state
+            // persistence). ---
+            //
+            // A chunk is paid by one reveal, but the payer may send housekeeping
+            // vouchers ahead of it — this stream's first root voucher for an
+            // epoch, or a rollover voucher when the chain is spent. Those
+            // re-assert a cumulative the node already holds, so they credit
+            // nothing, and the chunk they precede is still outstanding. Hence
+            // the delta stays queued until something actually credits it, and
+            // `MAX_PROOFS_PER_CHUNK` bounds how long a payer may keep answering
+            // with proofs that pay nothing.
             let collected_any = !pending.is_empty();
-            while let Some(delta) = pending.pop_front() {
-                let stop = self
-                    .commit_one_voucher(
-                        send,
-                        recv,
-                        &mut reader,
-                        hash,
-                        lane_key,
-                        lane,
-                        client_node_id,
-                        rate_per_mb,
-                        delta,
-                    )
-                    .await?;
-                match stop {
-                    // Advance `paid` by the watermark-capped credit (rule #1), not the
-                    // raw delivered delta: a benign already-satisfied voucher credits
-                    // nothing and cannot reopen the credit window for unsettled bytes.
-                    VoucherStop::Continue { credited_bytes } => {
-                        paid = paid.saturating_add(credited_bytes);
+            while let Some(&delta) = pending.front() {
+                let mut attempts = 0u32;
+                loop {
+                    let stop = self
+                        .commit_one_proof(
+                            send,
+                            recv,
+                            &mut reader,
+                            &mut anchor,
+                            hash,
+                            lane_key,
+                            lane,
+                            client_node_id,
+                            rate_per_mb,
+                            delta,
+                        )
+                        .await?;
+                    match stop {
+                        // Advance `paid` by the watermark-capped credit (rule #1),
+                        // not the raw delivered delta: a benign already-satisfied
+                        // voucher credits nothing and cannot reopen the credit
+                        // window for unsettled bytes.
+                        VoucherStop::Continue { credited_bytes } if credited_bytes > 0 => {
+                            paid = paid.saturating_add(credited_bytes);
+                            pending.pop_front();
+                            break;
+                        }
+                        VoucherStop::Continue { .. } => {
+                            attempts = attempts.saturating_add(1);
+                            if attempts >= MAX_PROOFS_PER_CHUNK {
+                                anyhow::bail!(
+                                    "payer sent {attempts} proofs that credited nothing for one \
+                                     outstanding chunk"
+                                );
+                            }
+                        }
+                        VoucherStop::Rejected => return Ok(()),
                     }
-                    VoucherStop::Rejected => return Ok(()),
                 }
             }
 

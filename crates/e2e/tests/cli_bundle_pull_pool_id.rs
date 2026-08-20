@@ -11,7 +11,7 @@
 //! `--provider-address` is passed alongside `--node-id` to pin every entry to
 //! this one node, so both entries share the same `(signer, provider)` lane. Each
 //! blob is under one voucher interval but their sum is over it, so the shared
-//! lane watermark crosses the 4 MiB `VOUCHER_INTERVAL_BYTES` boundary across the
+//! lane watermark crosses the 4 MiB `CHUNK_BYTES` boundary across the
 //! two entries — and the persisted watermark must be the EXACT aggregate wire
 //! bytes (monotone, never double-paid), the per-provider serialization holding
 //! that the two same-lane pulls do not race the cumulative counter (#1689).
@@ -47,7 +47,7 @@ use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
 use decdn_incentive::lane::LaneKey;
-use decdn_protocol::client::VOUCHER_INTERVAL_BYTES;
+use decdn_protocol::client::CHUNK_BYTES;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "bundle-pool-e2e-password";
@@ -82,7 +82,7 @@ async fn run() -> anyhow::Result<()> {
     // the per-provider voucher lane lock. The sizes are deliberate: each blob is
     // under one voucher interval (so a single entry never crosses the boundary
     // alone), but their aggregate is over it, so the shared lane watermark crosses
-    // the 4 MiB `VOUCHER_INTERVAL_BYTES` boundary across the two entries.
+    // the 4 MiB `CHUNK_BYTES` boundary across the two entries.
     let blob_a = vec![0x41u8; 3 * 1024 * 1024];
     let blob_b = vec![0x42u8; 2 * 1024 * 1024];
     let hash_a = Hash::new(&blob_a);
@@ -97,14 +97,14 @@ async fn run() -> anyhow::Result<()> {
         .checked_add(wire_b)
         .context("aggregate wire-byte overflow")?;
     anyhow::ensure!(
-        wire_a < VOUCHER_INTERVAL_BYTES && wire_b < VOUCHER_INTERVAL_BYTES,
+        wire_a < CHUNK_BYTES && wire_b < CHUNK_BYTES,
         "each blob must stay under one voucher interval: a={wire_a}, b={wire_b}, \
-         interval={VOUCHER_INTERVAL_BYTES}"
+         interval={CHUNK_BYTES}"
     );
     anyhow::ensure!(
-        aggregate_wire > VOUCHER_INTERVAL_BYTES,
+        aggregate_wire > CHUNK_BYTES,
         "the two entries must aggregate past one interval: {aggregate_wire} <= \
-         {VOUCHER_INTERVAL_BYTES}"
+         {CHUNK_BYTES}"
     );
     let (node, hashes) =
         NodeFixture::launch_with_blobs(&chain, "US", &[blob_a.as_slice(), blob_b.as_slice()])
