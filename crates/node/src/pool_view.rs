@@ -210,11 +210,10 @@ impl PoolProjection {
 
     /// Apply a `PoolReclaimed(poolId, ..)`: the pool is `Closed` and its remainder
     /// refunded. Drop it — a later read returns `None` and the serve gate fails
-    /// open, exactly as for a pool the projection has not yet seen. A
-    /// `PoolCloseInitiated` is deliberately NOT applied here: `redeem` stays
-    /// callable until the dispute deadline and on-chain `getPool` still reports the
-    /// real `deposit − totalRedeemed`, so the projection keeps serving that pool
-    /// until the reclaim actually lands.
+    /// open, exactly as for a pool the projection has not yet seen. The projection
+    /// tracks no `Closing` state: `redeem` stays callable until the dispute
+    /// deadline and the pool's `deposit − totalRedeemed` is still valid, so the
+    /// projection keeps serving that pool until the reclaim actually lands.
     pub fn forget(&self, pool_id: B256) {
         if !self.pools.load().contains_key(&pool_id) {
             return;

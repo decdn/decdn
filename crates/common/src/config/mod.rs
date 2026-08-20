@@ -93,6 +93,12 @@ const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
 const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
+/// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
+/// node's only defense against an owner's grace-window close — it must run several
+/// times inside the 48h grace floor so accrued vouchers redeem before the owner
+/// can `reclaim`. 6h leaves 8× headroom for tx landing and retries. An operator
+/// who wants a laxer cadence to shave gas builds from source or opens an issue.
+const MAX_REDEEM_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// Default pool-open and refill-target deposit every top-up restores the pool
 /// balance toward: 10 USDC (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics
 /// recommends a 10 USDC practical minimum (gas overhead ~2.3%); it is a
@@ -1415,6 +1421,21 @@ fn resolve_blockchain_into(
             "blockchain.redeem_interval_secs must be > 0 (a 0 interval is not a valid \
              sweep period)"
                 .to_string()
+        },
+    );
+    // The sweep is the only thing that redeems this node's vouchers before an
+    // owner's grace-window close lets them `reclaim`. It must run several times
+    // inside the 48h grace floor, so cap the interval at 6h — a laxer cadence
+    // risks forfeiting real earnings on a pool that closes between sweeps.
+    bag.check_with(
+        redeem_interval_secs <= MAX_REDEEM_INTERVAL_SECS,
+        "blockchain.redeem_interval_secs",
+        || {
+            format!(
+                "blockchain.redeem_interval_secs must be <= {MAX_REDEEM_INTERVAL_SECS} (6h): the \
+                 redeem sweep must run well inside the 48h grace window to secure vouchers \
+                 before an owner can reclaim a closing pool"
+            )
         },
     );
 
@@ -8701,6 +8722,62 @@ swap_pool_address = \"0xPool\"
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert_eq!(resolved.redeem_interval_secs, DEFAULT_REDEEM_INTERVAL_SECS);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_redeem_interval_above_grace_margin() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS + 1),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem interval exceeds the 6h cap");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_interval_secs"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_redeem_interval_at_grace_margin() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.redeem_interval_secs, MAX_REDEEM_INTERVAL_SECS);
         Ok(())
     }
 
