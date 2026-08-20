@@ -97,10 +97,13 @@ const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 /// (a transient error mis-flagged as oversize) at 2^6 doomed sub-sends.
 const MAX_SPLIT_DEPTH: u32 = 6;
 
-/// Current Unix time in seconds, used to skip the on-chain read for a lane whose
-/// cached capability registration is still live. A broken system clock (time
-/// before the epoch) yields `0`, which makes every registration look expired — the
-/// safe direction (re-read the authorization; the contract is the backstop).
+/// Current Unix time in seconds, compared against a lane's cached
+/// `registered_until` to skip the on-chain authorization read while the
+/// registration is still live (`registered_until > now`). A broken system clock
+/// (time before the epoch) yields `0`, so any non-zero `registered_until` looks
+/// live and the read is skipped. This is benign: if the capability has actually
+/// expired on-chain, the redemption simply no-ops as transient-empty at the
+/// contract, which stays the authoritative backstop.
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
