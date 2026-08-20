@@ -36,4 +36,5 @@ pub mod rate_limit;
 pub mod receipt_log;
 pub mod runtime;
 pub mod selection;
+pub mod serve_economics;
 pub mod slash_watcher;
