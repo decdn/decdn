@@ -343,6 +343,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 7000,
             rate_bounds_poll_interval_sec: 3600,
+            fee_shares_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,

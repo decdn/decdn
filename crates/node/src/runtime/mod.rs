@@ -113,6 +113,15 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
+/// The `FeeRouter` contract's own `OPERATOR_BPS_FLOOR` (`contracts/src/FeeRouter.sol`):
+/// the minimum operator share governance can configure. Used as the startup
+/// fallback for the live operator fee-share seed (ADR 041) — a conservative
+/// UNDER-estimate of the true operator share, which only makes the `margin`
+/// serve-economics policy's buy ceiling more conservative (it assumes MORE
+/// future serve revenue is skimmed by fees than governance has actually set),
+/// never a griefing surface.
+const FEE_ROUTER_OPERATOR_BPS_FLOOR: u16 = 4000;
+
 /// Apply an explicit client poll interval to a freshly built provider,
 /// overriding alloy's localhost-detected 250 ms default (#1011).
 ///
@@ -335,6 +344,12 @@ struct Infra {
     /// Injected into the eviction driver at spawn time
     /// ([`spawn_background_tasks`]); the engine itself never chooses a policy.
     eviction_policy: Arc<dyn decdn_cache::EvictionPolicy>,
+    /// Shared ADR 040 frequency estimator, when built (`cache.eviction_policy`
+    /// / `cache.admission_policy` == `"tinylfu"`, or `cache.serve_economics.policy`
+    /// == `"margin"`). `None` when no consumer needs it. Threaded into
+    /// [`crate::node_origin::NodeOriginConfig`] at spawn time
+    /// ([`spawn_background_tasks`]) as the ADR 041 `margin` policy's heat input.
+    frequency_estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
     ep: Endpoint,
     limiter: Arc<ConnectionLimiter>,
 }
@@ -536,61 +551,9 @@ async fn build_infra(
     // startup will still find a target.
     reload_state.attach_cache(Some(cache.clone()));
 
-    // Admission/eviction policy selection (ADR 040). One shared frequency
-    // estimator feeds both the engine's hit-signal sink and whichever policy
-    // objects need it; the engine itself owns no policy knowledge beyond the
-    // estimator handle.
-    let want_tinylfu =
-        cfg.cache.eviction_policy == "tinylfu" || cfg.cache.admission_policy == "tinylfu";
-    let estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>> = want_tinylfu.then(|| {
-        Arc::new(decdn_cache::policy::tinylfu::TinyLfuEstimator::new(
-            cfg.cache.tinylfu.sketch_bytes,
-        )) as Arc<dyn decdn_cache::FrequencyEstimator>
-    });
-    if let Some(est) = &estimator {
-        cache.set_frequency_estimator(est.clone());
-    }
-    if cfg.cache.admission_policy == "tinylfu"
-        && let Some(est) = &estimator
-    {
-        cache.set_admission_policy(Arc::new(decdn_cache::policy::tinylfu::ProbationAdmission {
-            freq: est.clone(),
-            promotion_threshold: cfg.cache.tinylfu.promotion_threshold,
-        }));
-    }
-    // promotion_threshold + probation_target_pct live entirely on the policy
-    // object, not on the engine or the eviction driver's `EvictionParams`.
-    let eviction_policy: Arc<dyn decdn_cache::EvictionPolicy> =
-        match cfg.cache.eviction_policy.as_str() {
-            "tinylfu" => match &estimator {
-                Some(est) => Arc::new(decdn_cache::policy::tinylfu::TinyLfuEviction::new(
-                    est.clone(),
-                    cfg.cache.tinylfu.promotion_threshold,
-                    cfg.cache.tinylfu.probation_target_pct,
-                )),
-                // Unreachable: `want_tinylfu` is true whenever eviction_policy
-                // == "tinylfu", so `estimator` is always `Some` here.
-                None => Arc::new(decdn_cache::policy::LruEviction),
-            },
-            _ => Arc::new(decdn_cache::policy::LruEviction),
-        };
-
-    // `tinylfu` admission only does useful work paired with `tinylfu` eviction:
-    // promotion out of probation and the probation cap both live in
-    // `TinyLfuEviction::plan`. With `lru` eviction the probation labels are set
-    // but never promoted or capped, and the estimator pays a per-serve cost for
-    // no effect. Warn rather than silently no-op (the resolver already rejects
-    // typos; this valid-but-inert combination deserves a heads-up).
-    if cfg.cache.admission_policy == "tinylfu" && cfg.cache.eviction_policy != "tinylfu" {
-        tracing::warn!(
-            admission_policy = %cfg.cache.admission_policy,
-            eviction_policy = %cfg.cache.eviction_policy,
-            "cache.admission_policy = \"tinylfu\" is inert unless cache.eviction_policy is \
-             also \"tinylfu\": probation admission relies on the tinylfu eviction policy to \
-             promote and cap probation members; under lru eviction the labels do nothing and \
-             the frequency estimator runs for no effect",
-        );
-    }
+    // Admission/eviction policy selection (ADR 040) plus the ADR 041 estimator
+    // decoupling (see `wire_cache_policies`).
+    let (eviction_policy, estimator) = wire_cache_policies(&cfg.cache, &cache);
 
     let retry = cfg.cache.origin_retry;
     tracing::info!(
@@ -649,6 +612,7 @@ async fn build_infra(
         pull_through_origin,
         cache,
         eviction_policy,
+        frequency_estimator: estimator,
         ep,
         limiter,
     })
@@ -781,6 +745,16 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// handle: the binding only moves by an explicit operator transaction, so
     /// there is nothing live to keep.
     binding_report: crate::binding_check::BindingReport,
+    /// Live per-MB delivery-rate floor clamp — the same handle the probe and
+    /// client handlers hold. Threaded to [`crate::node_origin::NodeOriginConfig`]
+    /// (ADR 041) so the buy-side gate can derive this node's current sell rate.
+    rate_bounds: crate::rate_bounds::RateBounds,
+    /// ADR 041 buy-side profitability gate policy, selected from
+    /// `cache.serve_economics.policy`.
+    serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
+    /// Live operator fee-share (basis points) cell, seeded from chain at
+    /// startup and kept current by the fee-shares watcher.
+    operator_shares: crate::fee_shares::OperatorShares,
 }
 
 /// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
@@ -1079,6 +1053,77 @@ async fn build_chain_and_handlers(
         );
     }
 
+    // Live operator fee-share seed (ADR 041 / ADR 016 § Tunable Economics).
+    // Mirrors the delivery-rate-floor startup read above — `PaymentPool.feeRouter()`
+    // resolves the router address, then `FeeRouter.getShares()` reads the current
+    // 3-way split, narrowed to the operator's bps. Unlike the rate-bounds read,
+    // NO leg of this chain is fatal to boot: an RPC failure or an unnarrowable
+    // split falls back to `FEE_ROUTER_OPERATOR_BPS_FLOOR` and the node still comes
+    // up, because the `margin` policy is an economic optimization, not a safety
+    // invariant. When the router address itself cannot be read, there is also
+    // nothing to watch, so the `SharesUpdated` route below is only registered on
+    // the success path; a re-read failure of `getShares()` alone still registers
+    // the route, since the watcher's own periodic re-read can recover from there.
+    let fee_router_addr = decdn_incentive::payment_pool::PaymentPool::new(
+        payment_pool_addr,
+        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+    )
+    .feeRouter()
+    .call()
+    .await
+    .inspect_err(|err| {
+        tracing::warn!(
+            %err,
+            fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
+            "PaymentPool.feeRouter() startup read failed; operator fee share seeded to the \
+             FeeRouter OPERATOR_BPS_FLOOR and the fee-shares watcher is not registered"
+        );
+    })
+    .ok();
+    let seed_operator_bps = match fee_router_addr {
+        Some(addr) => {
+            let fee_router_contract = decdn_incentive::payment_pool::FeeRouter::new(
+                addr,
+                ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+            );
+            match fee_router_contract.getShares().call().await {
+                Ok(shares) => {
+                    match crate::fee_shares::operator_bps_from_shares(shares, &addr.to_string()) {
+                        Ok(bps) => bps,
+                        Err(err) => {
+                            tracing::warn!(
+                                %err,
+                                fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
+                                "FeeRouter.getShares() startup read could not be narrowed to \
+                                 operator bps; falling back to OPERATOR_BPS_FLOOR"
+                            );
+                            FEE_ROUTER_OPERATOR_BPS_FLOOR
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        fallback_bps = FEE_ROUTER_OPERATOR_BPS_FLOOR,
+                        "FeeRouter.getShares() startup read failed; falling back to \
+                         OPERATOR_BPS_FLOOR"
+                    );
+                    FEE_ROUTER_OPERATOR_BPS_FLOOR
+                }
+            }
+        }
+        None => FEE_ROUTER_OPERATOR_BPS_FLOOR,
+    };
+    let operator_shares = crate::fee_shares::OperatorShares::new(seed_operator_bps);
+    tracing::info!(
+        bps = seed_operator_bps,
+        "seeded live operator fee share for serve-economics"
+    );
+
+    // ADR 041 buy-side profitability gate for cache-miss relay legs. Node-local,
+    // config-selectable; `off` disables the economic ceiling entirely.
+    let serve_economics = crate::serve_economics::select_policy(&cfg.cache.serve_economics);
+
     // Bring-up self-check: is the key we are about to serve under the one bound
     // to this operator on-chain? A node that answers "no" is UNSLASHABLE
     // (`SlashJudge` resolves the accused through `nodeIdOf`), and nothing else
@@ -1310,11 +1355,29 @@ async fn build_chain_and_handlers(
     );
     poller_routes.push(rate_bounds_route);
 
-    // Assemble and spawn the ONE poller for all five routes. `build` fails fast
-    // if two routes claim the same `(address, topic0)` — a wiring bug, not a
-    // runtime condition — surfacing it at boot. Three contract addresses
-    // (payment_pool, capacity_bond, content_blacklist) with disjoint topic0s per
-    // (address, topic0).
+    // Fee-shares route (ADR 041 / ADR 016 § Tunable Economics): follows
+    // `SharesUpdated` on the shared poller and re-reads `getShares()`
+    // authoritatively every `fee_shares_poll_interval_sec` as a safety net,
+    // storing into the same shared `operator_shares` cell seeded by the startup
+    // read above. Only registered when the startup `feeRouter()` read succeeded
+    // — with no router address there is nothing to watch, and the seed already
+    // fell back to `FEE_ROUTER_OPERATOR_BPS_FLOOR`. Read-only, no durable cursor.
+    if let Some(addr) = fee_router_addr {
+        let fee_shares_route = crate::fee_shares_watcher::route(
+            ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+            addr,
+            operator_shares.clone(),
+            Duration::from_secs(cfg.blockchain.fee_shares_poll_interval_sec),
+            &infra.node_metrics,
+        );
+        poller_routes.push(fee_shares_route);
+    }
+
+    // Assemble and spawn the ONE poller for all routes. `build` fails fast if
+    // two routes claim the same `(address, topic0)` — a wiring bug, not a
+    // runtime condition — surfacing it at boot. Up to four contract addresses
+    // (payment_pool, capacity_bond, content_blacklist, fee_router) with
+    // disjoint topic0s per (address, topic0).
     let poller = crate::chain_events::multiplexed_poller::MultiplexedPollerBuilder::new(
         Arc::clone(&head),
         event_poll_interval,
@@ -1372,6 +1435,9 @@ async fn build_chain_and_handlers(
         payment_service,
         blacklist_ready_rx,
         binding_report,
+        rate_bounds,
+        serve_economics,
+        operator_shares,
     })
 }
 
@@ -1832,6 +1898,15 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // Own self-attested region for the ADR 030 latency-vs-claim penalty
         // (#1177); `None` disables it (nothing to compare a peer's claim against).
         own_region: cfg.identity.region.clone(),
+        // ADR 041 buy-side profitability gate + its inputs: the policy object
+        // itself, the live operator fee-share cell, the shared ADR 040
+        // frequency estimator (when built), and the handles the buy loop reads
+        // to derive this node's current sell rate `P_sell`.
+        serve_economics: ch.serve_economics.clone(),
+        operator_shares: ch.operator_shares.clone(),
+        frequency_estimator: infra.frequency_estimator.clone(),
+        sell_rate_bounds: ch.rate_bounds.clone(),
+        sell_rate_base: cfg.payment.rate_per_mb,
     };
     // Arc/handle clones for the task — the originals are used later in `run()`.
     let ep_for_buyer = infra.ep.clone();
@@ -2794,6 +2869,80 @@ fn log_join_result(result: Result<(), tokio::task::JoinError>, phase: &'static s
     }
 }
 
+/// Admission/eviction policy selection (ADR 040) plus the ADR 041 estimator
+/// decoupling. One shared frequency estimator feeds both the engine's
+/// hit-signal sink and whichever policy objects need it; the engine itself
+/// owns no policy knowledge beyond the estimator handle. The ADR 041 `margin`
+/// serve-economics policy also consumes the estimator's heat signal (as its
+/// buy-ceiling `n_hat` input), independent of which cache eviction/admission
+/// policy is selected — so a node running plain `lru`/`always` cache policy
+/// with `margin` serve economics still needs the estimator built and wired
+/// into the cache. Returns the selected eviction policy and the estimator
+/// itself (`None` when no consumer requested one) — callers thread the latter
+/// on to `Infra::frequency_estimator` for the ADR 041 buy-side gate.
+fn wire_cache_policies(
+    cache_cfg: &decdn_common::config::resolved::ResolvedCache,
+    cache: &CacheEngine,
+) -> (
+    Arc<dyn decdn_cache::EvictionPolicy>,
+    Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
+) {
+    let want_estimator = cache_cfg.eviction_policy == "tinylfu"
+        || cache_cfg.admission_policy == "tinylfu"
+        || cache_cfg.serve_economics.policy == "margin";
+    let estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>> = want_estimator.then(|| {
+        Arc::new(decdn_cache::policy::tinylfu::TinyLfuEstimator::new(
+            cache_cfg.tinylfu.sketch_bytes,
+        )) as Arc<dyn decdn_cache::FrequencyEstimator>
+    });
+    if let Some(est) = &estimator {
+        cache.set_frequency_estimator(est.clone());
+    }
+    if cache_cfg.admission_policy == "tinylfu"
+        && let Some(est) = &estimator
+    {
+        cache.set_admission_policy(Arc::new(decdn_cache::policy::tinylfu::ProbationAdmission {
+            freq: est.clone(),
+            promotion_threshold: cache_cfg.tinylfu.promotion_threshold,
+        }));
+    }
+    // promotion_threshold + probation_target_pct live entirely on the policy
+    // object, not on the engine or the eviction driver's `EvictionParams`.
+    let eviction_policy: Arc<dyn decdn_cache::EvictionPolicy> =
+        match cache_cfg.eviction_policy.as_str() {
+            "tinylfu" => match &estimator {
+                Some(est) => Arc::new(decdn_cache::policy::tinylfu::TinyLfuEviction::new(
+                    est.clone(),
+                    cache_cfg.tinylfu.promotion_threshold,
+                    cache_cfg.tinylfu.probation_target_pct,
+                )),
+                // Unreachable: `want_estimator` is true whenever eviction_policy
+                // == "tinylfu", so `estimator` is always `Some` here.
+                None => Arc::new(decdn_cache::policy::LruEviction),
+            },
+            _ => Arc::new(decdn_cache::policy::LruEviction),
+        };
+
+    // `tinylfu` admission only does useful work paired with `tinylfu` eviction:
+    // promotion out of probation and the probation cap both live in
+    // `TinyLfuEviction::plan`. With `lru` eviction the probation labels are set
+    // but never promoted or capped, and the estimator pays a per-serve cost for
+    // no effect. Warn rather than silently no-op (the resolver already rejects
+    // typos; this valid-but-inert combination deserves a heads-up).
+    if cache_cfg.admission_policy == "tinylfu" && cache_cfg.eviction_policy != "tinylfu" {
+        tracing::warn!(
+            admission_policy = %cache_cfg.admission_policy,
+            eviction_policy = %cache_cfg.eviction_policy,
+            "cache.admission_policy = \"tinylfu\" is inert unless cache.eviction_policy is \
+             also \"tinylfu\": probation admission relies on the tinylfu eviction policy to \
+             promote and cap probation members; under lru eviction the labels do nothing and \
+             the frequency estimator runs for no effect",
+        );
+    }
+
+    (eviction_policy, estimator)
+}
+
 /// Construct the cache engine from resolved config. The
 /// `[cache.origins]` array picks an ordered list of backends — HTTP,
 /// filesystem, or S3 (#437, #284). The singular `[cache.origin]` TOML
@@ -3559,6 +3708,7 @@ mod tests {
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
+                fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
@@ -3706,6 +3856,48 @@ mod tests {
         let _engine = build_cache(&cfg, metrics_handle, None)
             .await
             .expect("S3 origin with static credentials must construct without I/O");
+    }
+
+    /// ADR 041 estimator decoupling: `cache.serve_economics.policy = "margin"`
+    /// must build and wire the shared frequency estimator even when neither
+    /// `cache.eviction_policy` nor `cache.admission_policy` is `"tinylfu"` —
+    /// the `margin` policy's `n_hat` buy-ceiling input needs a heat signal
+    /// independent of which cache policy is selected. Exercises the real
+    /// production wiring function (`wire_cache_policies`), not a re-derivation
+    /// of its condition.
+    #[tokio::test]
+    async fn margin_policy_builds_estimator_without_tinylfu_cache_policy() {
+        let (_tmp, mut cfg) = cfg_with_origin(None);
+        assert_eq!(
+            cfg.cache.eviction_policy, "lru",
+            "test assumes the lru default"
+        );
+        assert_eq!(
+            cfg.cache.admission_policy, "always",
+            "test assumes the always-admit default"
+        );
+        cfg.cache.serve_economics.policy = "margin".to_string();
+
+        let metrics_handle = Arc::new(metrics::Metrics::new());
+        let cache = build_cache(&cfg, metrics_handle, None)
+            .await
+            .expect("cache must construct");
+        assert!(
+            !cache.has_frequency_estimator(),
+            "no estimator before wiring runs"
+        );
+
+        let (_eviction_policy, estimator) = wire_cache_policies(&cfg.cache, &cache);
+
+        assert!(
+            estimator.is_some(),
+            "margin serve-economics policy must build a frequency estimator even under \
+             lru eviction / always admission"
+        );
+        assert!(
+            cache.has_frequency_estimator(),
+            "the built estimator must be installed on the cache engine"
+        );
     }
 
     /// The conversion helper unwraps `SecretString` via `.expose()`.

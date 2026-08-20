@@ -282,6 +282,12 @@ pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 /// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
 pub const DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC: u64 = 3600;
 
+/// Default seconds between authoritative `FeeRouter.getShares()` re-reads by
+/// the fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics) — the
+/// safety-net cadence alongside the `SharesUpdated` event subscription.
+/// Mirrors [`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`]'s one-hour cadence.
+pub const DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC: u64 = 3600;
+
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
 /// peers probing one hash share a single slot. Re-exported from the
@@ -1339,6 +1345,21 @@ fn resolve_blockchain_into(
          for the default (3600s)",
     );
 
+    let fee_shares_poll_interval_sec = file
+        .and_then(|b| b.fee_shares_poll_interval_sec)
+        .unwrap_or(DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC);
+    // Mirrors `rate_bounds_poll_interval_sec`: `0` would make the authoritative
+    // re-read run every tick (no throttle), hammering the RPC — the
+    // `SharesUpdated` event subscription is already the prompt path, so the
+    // re-read is a slow safety net. Reject rather than silently over-poll.
+    bag.check(
+        fee_shares_poll_interval_sec != 0,
+        "blockchain.fee_shares_poll_interval_sec",
+        "blockchain.fee_shares_poll_interval_sec must not be 0 — the \
+         authoritative getShares() re-read is a slow safety net; omit it \
+         for the default (3600s)",
+    );
+
     let origin_directory_positive_ttl_sec = file
         .and_then(|b| b.origin_directory_positive_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC);
@@ -1501,6 +1522,7 @@ fn resolve_blockchain_into(
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
         rate_bounds_poll_interval_sec,
+        fee_shares_poll_interval_sec,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,

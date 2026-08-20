@@ -193,6 +193,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  fee_shares_poll_interval_sec: {}",
+        resolved.blockchain.fee_shares_poll_interval_sec
+    )?;
+    writeln!(
+        w,
         "  redeem_threshold_micro_usdc: {}",
         resolved.blockchain.redeem_threshold_micro_usdc
     )?;
@@ -563,6 +568,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
 # rate_bounds_poll_interval_sec = 3600 # authoritative getRateBounds() re-read cadence, safety net beside the RateBoundsUpdated subscription (#1172); default 3600s, must be > 0
+# fee_shares_poll_interval_sec = 3600  # authoritative getShares() re-read cadence, safety net beside the SharesUpdated subscription (ADR 041); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
@@ -808,6 +814,7 @@ mod tests {
             rpc_watchdog_interval_sec,
             event_poll_interval_ms,
             rate_bounds_poll_interval_sec,
+            fee_shares_poll_interval_sec,
             redeem_threshold_micro_usdc,
             redeem_max_vouchers_per_tx,
             redeem_interval_secs,
@@ -866,6 +873,10 @@ mod tests {
             (
                 "rate_bounds_poll_interval_sec =",
                 rate_bounds_poll_interval_sec.is_none(),
+            ),
+            (
+                "fee_shares_poll_interval_sec =",
+                fee_shares_poll_interval_sec.is_none(),
             ),
             (
                 "redeem_threshold_micro_usdc =",

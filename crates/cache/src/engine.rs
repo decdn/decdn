@@ -1856,6 +1856,16 @@ impl CacheEngine {
         self.inner.frequency.store(Arc::new(Some(est)));
     }
 
+    /// Whether a shared frequency estimator is installed (ADR 040 / ADR 041).
+    /// Introspection for bring-up wiring tests: the estimator is shared by any
+    /// consumer that needs a heat signal — `tinylfu` eviction/admission and the
+    /// `margin` serve-economics policy — so this only reports whether *some*
+    /// consumer requested one, not which.
+    #[must_use]
+    pub fn has_frequency_estimator(&self) -> bool {
+        self.inner.frequency.load().is_some()
+    }
+
     /// Install the admission policy consulted at store-time (ADR 040). Called
     /// once at bring-up when a non-default policy is selected; otherwise the
     /// engine keeps [`crate::policy::AlwaysAdmit`].

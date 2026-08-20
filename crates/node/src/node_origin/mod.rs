@@ -295,6 +295,29 @@ pub struct NodeOriginConfig {
     /// (`REGION_LATENCY_MAX_MS`) is a region-spoofing signal. `None` disables the
     /// penalty (nothing to compare against).
     pub own_region: Option<String>,
+    /// ADR 041 buy-side profitability gate: the most this node pays upstream,
+    /// per MB, on a cache-miss relay leg. `select_policy(&cfg.cache.serve_economics)`
+    /// picks `OffPolicy` (no ceiling) or `MarginPolicy` at construction.
+    pub serve_economics: Arc<dyn crate::serve_economics::ServeEconomicsPolicy>,
+    /// Live operator fee-share (basis points) from `FeeRouter.getShares()[0]`,
+    /// the `(1 - f)` numerator the `margin` serve-economics policy amortizes
+    /// over. Seeded from chain at startup and kept current by the fee-shares
+    /// watcher (`crate::fee_shares_watcher::route`).
+    pub operator_shares: crate::fee_shares::OperatorShares,
+    /// ADR 040 shared frequency estimator, when built (`cache.eviction_policy`
+    /// / `cache.admission_policy` == `"tinylfu"`, or `cache.serve_economics.policy`
+    /// == `"margin"`). Feeds the `margin` policy's heat-estimate ceiling input;
+    /// `None` when no consumer needs it.
+    pub frequency_estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
+    /// This node's live delivery-rate floor clamp — the same handle the probe
+    /// and client handlers hold. Combined with `sell_rate_base` to derive the
+    /// node's current sell rate `P_sell`, the serve-economics policy's other
+    /// input.
+    pub sell_rate_bounds: crate::rate_bounds::RateBounds,
+    /// This node's configured base served rate per MB (`payment.rate_per_mb`),
+    /// BEFORE the on-chain floor clamp — the same base value the probe handler
+    /// is constructed with.
+    pub sell_rate_base: u64,
 }
 
 /// ADR 030 default heuristic (RTT > 150ms to a same-claimed-region node). The

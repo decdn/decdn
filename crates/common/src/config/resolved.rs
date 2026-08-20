@@ -146,6 +146,12 @@ pub struct ResolvedBlockchain {
     /// `RateBoundsUpdated` event subscription. Defaults to 3600s
     /// (`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`); the resolver rejects `0`.
     pub rate_bounds_poll_interval_sec: u64,
+    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
+    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). Safety-net
+    /// cadence alongside the `SharesUpdated` event subscription. Defaults to
+    /// 3600s (`DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`); the resolver rejects
+    /// `0`.
+    pub fee_shares_poll_interval_sec: u64,
     /// Per-chunk redemption floor (base units, `µUSDC`). The seller
     /// settlement path submits an on-chain redemption transaction for a
     /// chunk of lanes only once the aggregate un-redeemed value across that

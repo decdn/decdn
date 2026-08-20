@@ -201,6 +201,14 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
     /// be `0` (that would poll every tick); rejected at config resolution.
     pub rate_bounds_poll_interval_sec: Option<u64>,
+    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
+    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). This is the
+    /// safety-net cadence *in addition to* the `SharesUpdated` event
+    /// subscription (which follows [`Self::event_poll_interval_ms`]); it
+    /// reconciles any log the event tail missed. Absent =>
+    /// [`super::DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
+    /// be `0` (that would poll every tick); rejected at config resolution.
+    pub fee_shares_poll_interval_sec: Option<u64>,
     /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
     /// early withdrawal). The node submits an on-chain redemption
     /// transaction for a chunk of lanes only once the aggregate un-redeemed
