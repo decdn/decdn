@@ -159,6 +159,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
 
     function _bondOperatorsAndSeedVoteWeight() internal {
         address[3] memory ops = [proposer, voter1, voter2];
+        uint256 floorMbps = bond.minCapacityMbps();
 
         // Fund each operator with TOKEN, approve CapacityBond, and bond.
         for (uint256 i = 0; i < ops.length; i++) {
@@ -167,6 +168,12 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             token.approve(address(bond), type(uint256).max);
             vm.prank(ops[i]);
             bond.bond(MIN_BOND);
+            // Declare capacity so the ADR 036 per-epoch cap does not bind on
+            // the settlements seeded below: the floor tier's byte ceiling
+            // (10 Mbps × 7-day epoch × 125_000) vastly exceeds the
+            // 1_000_000-byte fixture settlements.
+            vm.prank(ops[i]);
+            bond.declareMbps(floorMbps);
         }
 
         // Fund the test harness with USDC and approve the router. Each epoch

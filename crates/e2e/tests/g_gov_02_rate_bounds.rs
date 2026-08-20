@@ -66,6 +66,7 @@
     clippy::duration_suboptimal_units
 )]
 
+use std::process::Output;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
@@ -74,9 +75,11 @@ use alloy::sol_types::{SolCall, SolError};
 use anyhow::Context;
 use decdn_e2e::bindings::{DecdnGovernor, PaymentPool, TimelockController};
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::cli::decdn_command;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::NodeFixture;
+use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use decdn_e2e::time;
+use tokio::process::Command;
 
 /// `PaymentPool`'s governance write + safety-bound error. The production
 /// `decdn_incentive` binding covers the pool-lifecycle and settlement surface,
@@ -131,6 +134,10 @@ const NEW_FLOOR: u64 = 50;
 const RELEASED_FLOOR: u64 = 1;
 /// `NodeFixture::render_config`'s `[payment] rate_per_mb`.
 const CONFIGURED_RATE: u64 = 10;
+/// The contract's `minCapacityMbps` default — the lowest declarable tier.
+/// `bond_required` for this tier sits far below `minBond`, so declaring it
+/// costs no extra bond beyond what `onboard_operator` already posted.
+const FLOOR_MBPS: u64 = 10;
 
 /// OZ `IGovernor.ProposalState::Queued`.
 const PROPOSAL_STATE_QUEUED: u8 = 5;
@@ -173,6 +180,26 @@ async fn run() -> anyhow::Result<()> {
     // vote.
     let payload = vec![0x9Au8; 2 * MIB];
     let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
+
+    // ---- Declare a capacity tier so the operator carries Governor vote
+    // weight. `DecdnGovernor`'s weight caps each epoch's served bytes at the
+    // operator's DECLARED capacity for that epoch, and `onboard_operator`
+    // bonds `minBond` but never declares — an undeclared operator's
+    // `declaredMbpsAtEpoch` is 0 for every epoch, so its capped weight is 0
+    // regardless of bytes served. Declared here, before the age warp and the
+    // serve below, so the `declareMbps` checkpoint precedes the served
+    // epoch's end (the cap samples `declaredMbpsAtEpoch` at that boundary).
+    let declare_target = chain
+        .min_bond()
+        .await?
+        .max(chain.bond_required(FLOOR_MBPS).await?);
+    let active = chain.active_bond(node.operator_addr()).await?;
+    if declare_target > active {
+        chain
+            .transfer_token(node.operator_addr(), declare_target - active)
+            .await?;
+    }
+    run_node_cli(&node, &["bond", "--mbps", &FLOOR_MBPS.to_string()]).await?;
 
     // ---- Baseline: chain ships a floor of `1`, and the daemon quotes its
     // configured rate verbatim because it already sits above that floor.
@@ -776,6 +803,33 @@ fn expect_revert<T, E: SolError>(
         alloy::hex::encode(&data)
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+/// Run `decdn node <args…>` against the fixture's config + keystore, asserting
+/// a clean exit. Mirrors `g_node_06_unbond.rs::run_node_cli`.
+async fn run_node_cli(node: &NodeFixture, args: &[&str]) -> anyhow::Result<Output> {
+    let out = Command::from(decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?)
+        .arg("node")
+        .args(args)
+        .arg("--config")
+        .arg(node.config_path())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn decdn node")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`decdn node {}` exited non-zero: {}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,16 @@ contract MockCapacityBond is ICapacityBond {
         return slashedAtEpochOf[operator];
     }
 
+    mapping(address => mapping(uint64 => uint256)) public declaredMbpsAtEpochOf;
+
+    function setDeclaredMbpsAtEpoch(address operator, uint64 epoch, uint256 mbps) external {
+        declaredMbpsAtEpochOf[operator][epoch] = mbps;
+    }
+
+    function declaredMbpsAtEpoch(address operator, uint64 epoch) external view override returns (uint256) {
+        return declaredMbpsAtEpochOf[operator][epoch];
+    }
+
     /// @notice Per-slashId record. Tests configure via `setSlashRecord` then
     ///         pass `slashId` to `SlashAppeal.openSlashAppeal`.
     struct SlashRecord {
