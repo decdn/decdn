@@ -1218,6 +1218,18 @@ pub struct DecdnMetrics {
     /// (ADR 011 §On Blacklist Event). Signed as `OriginBlacklisted`. Visible
     /// name: `decdn_serve_stream_rejected_origin_denied_total`.
     pub serve_stream_rejected_origin_denied: Counter,
+    /// Delivery declined by the origin-only policy (#1759,
+    /// `cache.relay_foreign_namespaces = false`): a memoized live probe of this
+    /// node's own backend genuinely does not hold the hash. Signed as
+    /// `NotFound`, identically to [`Self::serve_stream_rejected_cache_miss`] —
+    /// a client cannot tell a policy decline from a real miss, which is the
+    /// point — so this counter is the only place an operator can separate the
+    /// two. Distinct from a backend FAULT during that same probe, which is
+    /// never counted here: a fault is not an absence and is signed
+    /// `InternalError`, landing in
+    /// [`Self::serve_stream_rejected_internal_error`] instead. Visible name:
+    /// `decdn_serve_stream_rejected_foreign_declined_total`.
+    pub serve_stream_rejected_foreign_declined: Counter,
     /// An ALREADY-RUNNING delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event). Visible
     /// name: `decdn_serve_stream_terminated_takedown_total`.
@@ -2038,6 +2050,11 @@ recorders! {
     /// Record a `serve_stream` delivery refused because the channel's funding
     /// address is a blacklisted origin (ADR 011 §On Blacklist Event).
     serve_stream_rejected_origin_denied => serve_stream_rejected_origin_denied.inc();
+
+    /// Record a `serve_stream` delivery declined by the origin-only policy
+    /// (#1759, #1766): a live probe of this node's own backend genuinely does
+    /// not hold the hash.
+    serve_stream_rejected_foreign_declined => serve_stream_rejected_foreign_declined.inc();
 
     /// Record an in-flight delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
@@ -3161,6 +3178,7 @@ mod tests {
             "decdn_serve_stream_rejected_hash_denied_total",
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
+            "decdn_serve_stream_rejected_foreign_declined_total",
             "decdn_cooperative_close_request_unauthorized_total",
             // #1495: the two otherwise-invisible cooperative-close paths.
             "decdn_cooperative_close_auth_no_echo_total",
@@ -3187,6 +3205,7 @@ mod tests {
         metrics.serve_stream_rejected_hash_denied();
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();
+        metrics.serve_stream_rejected_foreign_declined();
         metrics.cooperative_close_request_unauthorized();
         metrics.cooperative_close_auth_no_echo();
         metrics.buyer_reconcile_watermark_healed();

@@ -39,6 +39,37 @@ use crate::retry::{
 };
 use crate::{from_store_hash, to_store_hash};
 
+/// A live origin-existence answer (#1766), distinguishing a genuine negative
+/// from a backend fault. It is the target of the two-way collapse in
+/// `crate::origin_probe::Presence`: `Present`/`Absent` map straight across,
+/// and `Fault` is folded into "don't advertise" — see
+/// [`CacheEngine::origin_probe_size`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginPresence {
+    /// A configured origin holds the blob; carries the total byte size.
+    Present(u64),
+    /// No configured origin holds the blob: a genuine `HEAD`/`HeadObject`
+    /// 404, or no origin is configured at all ([`CacheError::NoOrigin`] — a
+    /// node with nothing configured genuinely holds nothing; that is not a
+    /// transient condition).
+    Absent,
+    /// The probe could not get an authoritative answer: a transport error, or
+    /// the live `HEAD` overran `cache.origin_probe_timeout_ms`. Distinct from
+    /// `Absent` on purpose — a caller that would otherwise sign an
+    /// authoritative `NotFound` must not do so on a fault; see the
+    /// origin-only serve gate (`dispatch.rs`).
+    Fault,
+}
+
+impl From<Presence> for OriginPresence {
+    fn from(presence: Presence) -> Self {
+        match presence {
+            Presence::Present(size) => OriginPresence::Present(size),
+            Presence::Absent => OriginPresence::Absent,
+        }
+    }
+}
+
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
 /// configured, bytes are pulled and BLAKE3-verified. Insert-before-return is a
@@ -1245,38 +1276,70 @@ impl CacheEngine {
     /// [`Self::origin_held_size`]. Callers should consult the in-memory index
     /// first (zero I/O) and only fall back here on its miss.
     ///
-    /// A memo hit returns with no I/O. On a miss the origin chain is probed via
-    /// [`Self::origin_size`] under a `cache.origin_probe_timeout_ms` ceiling, and
-    /// the answer — `Present(size)` OR `Absent` — is memoised for
-    /// `cache.origin_probe_ttl_sec`. Caching the negative is deliberate: it is
-    /// what stops a random-hash probe flood from issuing a `HeadObject` per
-    /// probe. A timeout, a transport error, an unknown size, and a genuine 404
-    /// all fold to `Absent`/`None` — the safe "do not advertise" answer, which
-    /// post-#1512 is never slashable (an unservable `has_blob:false`, or a later
-    /// `NotFound` on the serve, carries only local reputation, not a bond slash).
+    /// A thin wrapper over [`Self::origin_probe_presence`]: `Present(size)`
+    /// advertises `Some(size)`, and both `Absent` and `Fault` advertise `None`
+    /// — a probing caller (the `probe` handler's `has_blob`, DHT announce)
+    /// never distinguishes "genuinely missing" from "backend unreachable
+    /// right now"; either way it must not advertise the blob.
     ///
     /// **Never fetches the body** — existence and size only.
     pub async fn origin_probe_size(&self, hash: Hash) -> Option<u64> {
+        match self.origin_probe_presence(hash).await {
+            OriginPresence::Present(size) => Some(size),
+            OriginPresence::Absent | OriginPresence::Fault => None,
+        }
+    }
+
+    /// Live existence probe against the configured origins, distinguishing a
+    /// genuine negative from a backend fault (#1766). This is the primitive
+    /// behind [`Self::origin_probe_size`]; callers that must NOT treat a fault
+    /// as an authoritative absence (the origin-only serve gate) use this
+    /// directly instead of the size-only wrapper.
+    ///
+    /// A memo hit returns with no I/O. On a miss the origin chain is probed via
+    /// [`Self::origin_size`] under a `cache.origin_probe_timeout_ms` ceiling:
+    ///
+    /// - a live `Some(size)` is `Present(size)`, memoised under the positive TTL;
+    /// - a live `None` (a genuine `HEAD` 404, or [`CacheError::NoOrigin`] — this
+    ///   node has no origins configured, so it genuinely holds nothing) is
+    ///   `Absent`, memoised under the short negative TTL — deliberately, so a
+    ///   random-hash probe flood still costs at most one `HeadObject` per hash
+    ///   per negative-TTL window;
+    /// - a transport error or a timeout is `Fault`, and is **never memoised** —
+    ///   a fault is transient, so the next probe should retry the backend
+    ///   immediately rather than parrot a cached non-answer, and not caching it
+    ///   does not weaken the flood bound (an attacker's random hashes genuinely
+    ///   404, they do not fault).
+    ///
+    /// **Never fetches the body** — existence and size only.
+    pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {
         if self.refuses(hash) {
-            return None;
+            return OriginPresence::Absent;
         }
         let now = Instant::now();
         let timeout = {
             let mut memo = self.probe_memo_lock();
             if let Some(presence) = memo.get(hash, now) {
-                return presence.size();
+                return presence.into();
             }
             memo.timeout()
         };
-        // Live probe off the memo lock (never hold it across the await). A
-        // `NoOrigin` error (no origins configured), any transport error, an
-        // unknown size, or the timeout all collapse to `Absent`.
-        let presence = match tokio::time::timeout(timeout, self.origin_size(hash)).await {
-            Ok(Ok(Some(size))) => Presence::Present(size),
-            Ok(Ok(None) | Err(_)) | Err(_) => Presence::Absent,
-        };
-        self.probe_memo_lock().insert(hash, presence, now);
-        presence.size()
+        // Live probe off the memo lock (never hold it across the await).
+        match tokio::time::timeout(timeout, self.origin_size(hash)).await {
+            Ok(Ok(Some(size))) => {
+                let presence = Presence::Present(size);
+                self.probe_memo_lock().insert(hash, presence, now);
+                OriginPresence::Present(size)
+            }
+            Ok(Ok(None) | Err(CacheError::NoOrigin { .. })) => {
+                self.probe_memo_lock().insert(hash, Presence::Absent, now);
+                OriginPresence::Absent
+            }
+            // A true backend fault: a transport/protocol error surfaced by
+            // `origin_size`, or the live HEAD overran the probe timeout. Not
+            // memoised — see the doc comment above.
+            Ok(Err(_)) | Err(_) => OriginPresence::Fault,
+        }
     }
 
     /// Lock the origin-probe memo, recovering a poisoned mutex rather than
@@ -4583,6 +4646,104 @@ mod tests {
             engine.origin_probe_size(hash).await,
             None,
             "a HEAD slower than the ceiling folds to absent",
+        );
+        Ok(())
+    }
+
+    /// `origin_probe_presence` distinguishes `Present`/`Absent`/`Fault`
+    /// (#1766): a hash the origin holds is `Present(size)`, a hash it does not
+    /// is `Absent`, and a `HEAD` slower than the probe ceiling is `Fault` —
+    /// NOT `Absent` — and is never memoised, so a second probe re-hits the
+    /// backend rather than parroting a cached non-answer.
+    #[tokio::test]
+    async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyhow::Result<()> {
+        // `Present`/`Absent` against a fast origin.
+        let tmp = tempfile::tempdir()?;
+        let present = Hash::new(b"present for presence");
+        let absent = Hash::new(b"absent for presence");
+        let (present_origin, _present_calls) = CountingSizeOrigin::new(present, 777);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(present_origin) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        assert_eq!(
+            engine.origin_probe_presence(present).await,
+            OriginPresence::Present(777),
+            "a live HEAD hit is Present, not folded away",
+        );
+        assert_eq!(
+            engine.origin_probe_presence(absent).await,
+            OriginPresence::Absent,
+            "a genuine miss is Absent",
+        );
+
+        // `Fault` against a separate engine whose only origin overruns the
+        // probe ceiling (a shared origin would delay the Present/Absent
+        // probes above too, since `CountingSizeOrigin`'s delay is unconditional).
+        let tmp2 = tempfile::tempdir()?;
+        let slow = Hash::new(b"slow for presence");
+        let (slow_origin, slow_calls) =
+            CountingSizeOrigin::slow(slow, 100, Duration::from_millis(400));
+        let fault_engine = CacheEngine::open(
+            tmp2.path(),
+            vec![Arc::new(slow_origin) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        // Tight timeout so the 400 ms origin overruns it.
+        fault_engine.set_origin_probe_config(
+            Duration::from_secs(15),
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            16,
+        );
+        assert_eq!(
+            fault_engine.origin_probe_presence(slow).await,
+            OriginPresence::Fault,
+            "a HEAD slower than the ceiling is Fault, not Absent",
+        );
+        assert_eq!(
+            slow_calls.load(Ordering::SeqCst),
+            1,
+            "one backend attempt for the first faulting probe",
+        );
+        assert_eq!(
+            fault_engine.origin_probe_presence(slow).await,
+            OriginPresence::Fault,
+            "a fault is never memoised, so the same hash faults again",
+        );
+        assert_eq!(
+            slow_calls.load(Ordering::SeqCst),
+            2,
+            "the second probe re-hit the backend rather than serving a cached fault",
+        );
+        Ok(())
+    }
+
+    /// `origin_probe_size` stays a thin `Present -> Some`, `Absent`/`Fault ->
+    /// None` wrapper (#1766): callers that only care about advertising size
+    /// (probe `has_blob`, DHT announce) must not change behavior when a fault
+    /// is now distinguishable one layer down.
+    #[tokio::test]
+    async fn origin_probe_size_folds_fault_to_none_like_absent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"slow object for size wrapper");
+        let (origin, _calls) = CountingSizeOrigin::slow(hash, 100, Duration::from_millis(400));
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        engine.set_origin_probe_config(
+            Duration::from_secs(15),
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            16,
+        );
+
+        assert_eq!(
+            engine.origin_probe_size(hash).await,
+            None,
+            "a fault still folds to None through the size wrapper",
         );
         Ok(())
     }

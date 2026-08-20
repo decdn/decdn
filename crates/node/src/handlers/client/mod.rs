@@ -553,6 +553,13 @@ enum ServeRejectReason {
     /// The channel's funding address is on the origin blacklist — the operator's
     /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
     OriginDenied,
+    /// The origin-only policy (#1759, `cache.relay_foreign_namespaces = false`)
+    /// declined a hash this node's own backend genuinely does not hold. Distinct
+    /// from [`Self::CacheMiss`] for the operator's per-reason metric ONLY — both
+    /// collapse to `NotFound` on the wire (a declined foreign hash and a real
+    /// miss must look the same to a client, which re-routes either way), see
+    /// [`Self::wire_error`].
+    ForeignNamespaceDeclined,
 }
 
 impl ServeRejectReason {
@@ -588,7 +595,8 @@ impl ServeRejectReason {
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
             | Self::LaneAtCapacity
-            | Self::RangeNotSatisfiable => StreamError::NotFound,
+            | Self::RangeNotSatisfiable
+            | Self::ForeignNamespaceDeclined => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
