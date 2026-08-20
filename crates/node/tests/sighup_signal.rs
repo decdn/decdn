@@ -115,6 +115,13 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
                 probation_target_pct: decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
                 aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
             },
+            serve_economics: decdn_common::config::ResolvedServeEconomics {
+                policy: decdn_common::config::DEFAULT_SERVE_ECONOMICS_POLICY.to_string(),
+                discount_bps: decdn_common::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS,
+                n_max: decdn_common::config::DEFAULT_SERVE_ECONOMICS_N_MAX,
+                warming_budget: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET,
+                warming_refill: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL,
+            },
         },
         payment: ResolvedPayment {
             rate_per_mb: rate,

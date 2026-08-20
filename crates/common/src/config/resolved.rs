@@ -321,6 +321,9 @@ pub struct ResolvedCache {
     /// policy selector above is `"tinylfu"` — cheap to resolve and keeps this
     /// struct free of `Option`.
     pub tinylfu: ResolvedTinyLfu,
+    /// Refuse-to-serve economics tuning (ADR 041): the margin policy, its
+    /// discount, and per-source speculative-warming allowance.
+    pub serve_economics: ResolvedServeEconomics,
 }
 
 /// Resolved W-TinyLFU tuning knobs. See [`ResolvedCache::tinylfu`].
@@ -341,6 +344,31 @@ pub struct ResolvedTinyLfu {
     /// sample-count reset, not wall-clock aging). Default
     /// [`crate::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC`].
     pub aging_halflife_sec: u64,
+}
+
+/// Resolved refuse-to-serve economics tuning (ADR 041). See
+/// [`ResolvedCache::serve_economics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedServeEconomics {
+    /// Refuse-to-serve policy. `"off"` or `"margin"`. Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_POLICY`].
+    pub policy: String,
+    /// Discount applied to the sell price when deciding whether a
+    /// speculative pull clears its margin gate, in basis points. Validated
+    /// to `[1, 10_000]` (`5000` == `0.5`). Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS`].
+    pub discount_bps: u32,
+    /// Maximum number of concurrent speculative-warming sources. `>= 1`.
+    /// Default [`crate::config::DEFAULT_SERVE_ECONOMICS_N_MAX`].
+    pub n_max: u32,
+    /// Per-source speculative-warming allowance, in payment base units.
+    /// `> 0`. Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET`].
+    pub warming_budget: u64,
+    /// Per-source allowance refill rate, in payment base units per second.
+    /// `0` disables time-based refill. Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL`].
+    pub warming_refill: u64,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

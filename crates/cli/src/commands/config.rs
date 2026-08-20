@@ -650,6 +650,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # promotion_threshold = 2                  # prior sightings before a probation member promotes to main
 # probation_target_pct = 10                # % of cache_size_mb the probation segment is capped to; bounds [1,50]
 # aging_halflife_sec = 600                 # reserved: not yet consulted by the shipped sketch (fixed sample-count reset)
+# [cache.serve_economics]                  # refuse-to-serve economics (ADR 041)
+# policy = "margin"                        # "off" or "margin"
+# discount = 0.5                           # (0.0, 1.0]; discount applied to the sell price for the margin gate
+# n_max = 64                               # max concurrent speculative-warming sources; >= 1
+# warming_budget = 5000000                 # per-source warming allowance, in payment base units; > 0
+# warming_refill = 58                      # per-source allowance refill rate, base units/sec; 0 disables time-based refill
 
 [payment]
 # rate_per_mb = 10
@@ -917,6 +923,7 @@ mod tests {
             eviction_policy,
             admission_policy,
             tinylfu,
+            serve_economics,
         } = &config::types::CacheConfig::default();
         let cache = [
             ("cache_dir =", cache_dir.is_none()),
@@ -968,6 +975,7 @@ mod tests {
             ("eviction_policy =", eviction_policy.is_none()),
             ("admission_policy =", admission_policy.is_none()),
             ("[cache.tinylfu]", tinylfu.is_none()),
+            ("[cache.serve_economics]", serve_economics.is_none()),
         ];
 
         let config::types::PaymentConfig {
