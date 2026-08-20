@@ -698,6 +698,82 @@ pub fn select_candidates(
     candidates
 }
 
+/// Pick up to `max_sources` candidates from an already-ranked `ordered` list,
+/// greedily spreading across `eth_address` (operator) first and `region_hint`
+/// second, without disturbing rank order beyond what diversity requires. Used
+/// by the multi-source scheduler's engagement gate to pick the source set for
+/// a parallel fetch — `select_candidates`/`rank` pick a single best node,
+/// this picks a *set*.
+///
+/// Two-pass greedy, both passes walking `ordered` in rank order:
+/// - Pass 1: admit a candidate the first time its `eth_address` is seen, so
+///   the output holds at most one candidate per operator, in rank order.
+///   Within that constraint, once diversity is possible, a candidate is only
+///   skipped when it doesn't add a new operator — so this pass never reorders
+///   two candidates that are equally diversifying, it only skips ahead over
+///   already-represented operators.
+/// - Pass 2: if the first pass didn't reach `max_sources` (too few distinct
+///   operators), fill the remainder from `ordered` in rank order, operators
+///   now free to repeat.
+///
+/// Region is not a separate tiebreaking pass: pass 1 already walks candidates
+/// in rank order, so among several unseen operators the one ranked first (which
+/// is also, incidentally, the first with a given region) is the one admitted —
+/// there is nothing left for a region check to change without reordering by
+/// something other than rank, which the contract forbids.
+///
+/// The result has length `min(max_sources, ordered.len())`. Diversity is
+/// best-effort: with only one operator present, this still returns up to
+/// `max_sources` candidates from it rather than shrinking the set.
+#[must_use]
+pub fn admit_sources(ordered: Vec<NodeCandidate>, max_sources: usize) -> Vec<NodeCandidate> {
+    if max_sources == 0 {
+        return Vec::new();
+    }
+    // `Option`-wrapped so pass 2 can move a candidate out of its slot by index
+    // without cloning — `ordered` is consumed once, here.
+    let mut slots: Vec<Option<NodeCandidate>> = ordered.into_iter().map(Some).collect();
+
+    // Pass 1: record the indices of the first candidate seen per operator, in
+    // rank order, without taking ownership yet — a later slot's `eth_address`
+    // still needs to be readable while an earlier one is deferred to pass 2's
+    // fill-from-remainder scan.
+    let mut seen_operators = std::collections::HashSet::with_capacity(max_sources);
+    let mut pass1_indices = Vec::with_capacity(max_sources);
+    for (i, slot) in slots.iter().enumerate() {
+        if pass1_indices.len() >= max_sources {
+            break;
+        }
+        if let Some(c) = slot
+            && seen_operators.insert(c.eth_address)
+        {
+            pass1_indices.push(i);
+        }
+    }
+
+    let mut out = Vec::with_capacity(max_sources.min(slots.len()));
+    for &i in &pass1_indices {
+        if let Some(c) = slots.get_mut(i).and_then(Option::take) {
+            out.push(c);
+        }
+    }
+
+    // Pass 2: fill any remaining slots from what pass 1 left untouched, in
+    // rank order, operators now free to repeat.
+    if out.len() < max_sources {
+        for slot in &mut slots {
+            if out.len() >= max_sources {
+                break;
+            }
+            if let Some(c) = slot.take() {
+                out.push(c);
+            }
+        }
+    }
+
+    out
+}
+
 /// A probed candidate that holds the blob, with its measured RTT and whether the
 /// client already has a live payment channel with it.
 #[derive(Debug, Clone)]
@@ -943,6 +1019,81 @@ mod tests {
         let out = select_candidates(cands, Some("US"), 5);
         assert_eq!(out[0].eth_address, Address::repeat_byte(2));
         assert_eq!(out[1].eth_address, Address::repeat_byte(1));
+    }
+
+    /// An iroh node id derived from a small seed, for [`cand`] fixtures — mirrors
+    /// [`candidate`]'s own key derivation but named to match the brief's helper
+    /// naming (`pk`/`addr`/`cand`) for the `admit_sources` tests below.
+    fn pk(seed: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// A distinct Ethereum address per seed, for [`cand`] fixtures — the
+    /// "operator" identity `admit_sources` spreads across.
+    fn addr(seed: u8) -> Address {
+        Address::repeat_byte(seed)
+    }
+
+    /// Build a [`NodeCandidate`] from an already-derived node id and address,
+    /// plus a region code (parsed the same way [`candidate`] does). Distinct
+    /// from `candidate(seed, region)` above because `admit_sources` tests need
+    /// the node id and operator address to vary independently (several nodes
+    /// under the same operator).
+    fn cand(node_id: PublicKey, eth_address: Address, region: Option<&str>) -> NodeCandidate {
+        NodeCandidate {
+            node_id,
+            eth_address,
+            region_hint: region.and_then(Region::parse),
+        }
+    }
+
+    #[test]
+    fn admit_sources_spreads_across_operators_then_fills() {
+        // Ranked: [op1/us, op1/us, op2/eu, op3/us]. max=3 → prefer distinct
+        // operators: op1, op2, op3 (not op1, op1, op2).
+        let ranked = vec![
+            cand(pk(1), addr(1), Some("US")),
+            cand(pk(2), addr(1), Some("US")),
+            cand(pk(3), addr(2), Some("EU")),
+            cand(pk(4), addr(3), Some("US")),
+        ];
+        let out = admit_sources(ranked, 3);
+        let ops: Vec<_> = out.iter().map(|c| c.eth_address).collect();
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            ops.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn admit_sources_falls_back_when_diversity_exhausted() {
+        // Only one operator available: still return up to max from it.
+        let ranked = vec![
+            cand(pk(1), addr(1), Some("US")),
+            cand(pk(2), addr(1), Some("US")),
+        ];
+        assert_eq!(admit_sources(ranked, 4).len(), 2);
+    }
+
+    /// `max_sources` larger than the candidate count returns everything, not a
+    /// padded or truncated set.
+    #[test]
+    fn admit_sources_max_larger_than_candidates_returns_all() {
+        let ranked = vec![
+            cand(pk(1), addr(1), Some("US")),
+            cand(pk(2), addr(2), Some("EU")),
+        ];
+        let out = admit_sources(ranked.clone(), 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out, ranked, "rank order preserved when nothing is dropped");
+    }
+
+    /// `max_sources == 0` is a valid, non-panicking request for nothing.
+    #[test]
+    fn admit_sources_zero_max_returns_empty() {
+        let ranked = vec![cand(pk(1), addr(1), Some("US"))];
+        assert_eq!(admit_sources(ranked, 0), Vec::new());
     }
 
     #[test]
