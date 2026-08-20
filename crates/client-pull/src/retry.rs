@@ -10,7 +10,6 @@
 //! provider or lane can fix it, while a delivery fault is a property of one
 //! provider's leg and is worth retrying against another.
 
-use crate::driver::PoolExhausted;
 use crate::{BlobTooLargeClaim, UpstreamRefused, UpstreamVoucherRejected};
 use decdn_protocol::client::StreamError;
 
@@ -41,10 +40,6 @@ pub enum RetryDisposition {
 ///   every provider (ADR 003), so its remaining deposit, its capability cap, and
 ///   the on-chain delivery floor are the same against any provider, and the
 ///   driver has already exhausted any wallet-less watermark self-heal.
-/// - A [`PoolExhausted`] refusal is **terminal** — the shared pool's remaining
-///   deposit cannot cover the next voucher and top-up is disabled or exhausted,
-///   which is the same against every provider and every lane (all draw the one
-///   pool).
 /// - [`StreamError::OriginBlacklisted`] is **terminal** — the pool's funder is
 ///   refused under this address everywhere.
 /// - A [`BlobTooLargeClaim`] is **terminal** — the blob is BLAKE3-addressed, so
@@ -56,13 +51,21 @@ pub enum RetryDisposition {
 ///   served — is a property of this provider's delivery, so the fetch **fails
 ///   over**. When every candidate is exhausted the caller returns the last such
 ///   error, so a genuinely absent or wrong hash still surfaces its refusal.
+///
+/// A shared-pool exhaustion ([`crate::PoolExhausted`], the pacer's
+/// [`PaceDecision::Refuse`](crate::PaceDecision)) is deliberately **NOT** terminal
+/// here — it is `RetryElsewhere`. Single-source failover (#1174) intends to try
+/// another provider on a budget refusal: provider A's rate-priced next voucher may
+/// not fit the remaining deposit while a cheaper provider B's does. Only the
+/// multi-source scheduler treats pool exhaustion as terminal (all its lanes draw
+/// the ONE pool, so no lane can fix it), and it applies that rule itself rather
+/// than folding it into this shared classifier.
 #[must_use]
 pub fn retry_disposition(err: &anyhow::Error) -> RetryDisposition {
     use RetryDisposition::{RetryElsewhere, Terminal};
 
     if err.downcast_ref::<UpstreamVoucherRejected>().is_some()
         || err.downcast_ref::<BlobTooLargeClaim>().is_some()
-        || err.downcast_ref::<PoolExhausted>().is_some()
     {
         return Terminal;
     }
@@ -120,15 +123,19 @@ mod tests {
         assert_eq!(retry_disposition(&err), RetryDisposition::Terminal);
     }
 
-    /// A shared-pool exhaustion (the pacer refused the next voucher, top-up off or
-    /// spent) is terminal — every provider and every lane draws the same pool.
+    /// A shared-pool exhaustion is `RetryElsewhere`, NOT terminal, in the shared
+    /// classifier: single-source failover (#1174) must try another provider on a
+    /// budget refusal — provider A's rate-priced voucher may not fit the remaining
+    /// deposit while a cheaper provider B's does. The multi-source scheduler owns
+    /// the "exhaustion is terminal for a shared pool" rule separately. This test
+    /// guards against re-introducing the single-source regression.
     #[test]
-    fn pool_exhausted_is_terminal() {
+    fn pool_exhausted_falls_over_in_the_shared_classifier() {
         let err = anyhow::Error::new(PoolExhausted {
             gap_start: 0,
             gap_len: 1 << 20,
         });
-        assert_eq!(retry_disposition(&err), RetryDisposition::Terminal);
+        assert_eq!(retry_disposition(&err), RetryDisposition::RetryElsewhere);
     }
 
     /// Every "try another node" refusal fails over to the next candidate.

@@ -51,13 +51,22 @@
 //!
 //! # Terminal faults — no pointless reassignment
 //!
-//! A `fill_gap` `Err` the classifier rules `Terminal` — a payment-layer voucher
-//! rejection, a drained shared pool ([`crate::PoolExhausted`]), an origin
-//! blacklist, or an over-cap blob — cannot be fixed by another lane: every lane
-//! draws the ONE shared pool, and the blob is the same size whoever holds it. So
-//! the worker propagates THAT typed error out of the set, which cancels the peer
-//! workers and fails `multi_source_fetch` with it — the CLI inspects the type to
-//! surface the correct owner-side remedy. The range is NOT reassigned.
+//! Two kinds of `fill_gap` `Err` abort the whole fetch instead of reassigning the
+//! range, because another lane cannot fix either:
+//!
+//! - What the SHARED classifier ([`crate::retry_disposition`]) rules `Terminal` —
+//!   a payment-layer voucher rejection, an origin blacklist, or an over-cap blob —
+//!   which is terminal on the single-source path too.
+//! - A shared-pool exhaustion ([`crate::PoolExhausted`], the pacer's `Refuse`).
+//!   This is terminal ONLY for this scheduler: every lane draws the ONE shared
+//!   pool, so no lane can fund it. The single-source path instead fails over on a
+//!   budget refusal (a cheaper provider may fit), so the shared classifier keeps
+//!   `PoolExhausted` retryable and this scheduler applies the pool-scope rule
+//!   itself.
+//!
+//! Either way the worker propagates THAT typed error out of the set, which cancels
+//! the peer workers and fails `multi_source_fetch` with it — the CLI inspects the
+//! type to surface the correct owner-side remedy. The range is NOT reassigned.
 //!
 //! If every source stops with the request still incomplete without a terminal
 //! fault, the fetch returns a generic "all sources failed" error rather than
@@ -73,8 +82,8 @@ use decdn_bao_range::{AlignedRange, align_range};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, contiguous_byte_ranges,
-    drive_with_interval_flush, fill_gap,
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted,
+    contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
 };
 use crate::retry::{RetryDisposition, retry_disposition};
 use crate::segment::{initial_segments, steal_split};
@@ -466,24 +475,33 @@ where
                     biased;
                     res = fill => match res {
                         Ok(()) => UnitOutcome::Completed,
-                        // Classify the fault the same way the single-source
-                        // failover loop does. A TERMINAL fault — a payment-layer
-                        // voucher rejection, a drained shared pool
-                        // ([`PoolExhausted`]), an origin blacklist, or an
-                        // over-cap blob — cannot be fixed by reassigning the range
-                        // to another lane (every lane draws the ONE shared pool,
-                        // and the blob is the same size whoever holds it), so abort
-                        // the whole fetch with THAT typed error rather than
-                        // dropping each lane in turn and masking it as the generic
-                        // "all sources failed". `try_join_all` cancels the peer
-                        // workers, so the failed source's range is NOT reassigned.
-                        // A RETRYABLE fault (a stall, a transport reset, a
-                        // node-specific refusal) faults this one source: its
-                        // remainder is re-queued for a DIFFERENT lane.
-                        Err(e) => match retry_disposition(&e) {
-                            RetryDisposition::Terminal => return Err(e),
-                            RetryDisposition::RetryElsewhere => UnitOutcome::Faulted,
-                        },
+                        // Classify the fault. Two conditions abort the whole fetch
+                        // with THAT typed error rather than reassigning the range:
+                        //
+                        // - The SHARED classifier rules it terminal — a
+                        //   payment-layer voucher rejection, an origin blacklist, or
+                        //   an over-cap blob — which no provider or lane can fix.
+                        // - It is a shared-pool exhaustion ([`PoolExhausted`], the
+                        //   pacer's `Refuse`). This is terminal ONLY here, not in
+                        //   the shared classifier: single-source failover tries a
+                        //   cheaper provider on a budget refusal, but every lane of
+                        //   THIS scheduler draws the ONE pool, so reassigning cannot
+                        //   fund it. Keeping this test in the scheduler preserves
+                        //   single-source failover-on-refusal (#1174).
+                        //
+                        // `try_join_all` cancels the peer workers, so the failed
+                        // source's range is NOT reassigned. A RETRYABLE fault (a
+                        // stall, a transport reset, a node-specific refusal, or a
+                        // single-source-style budget refusal) faults this one
+                        // source: its remainder is re-queued for a DIFFERENT lane.
+                        Err(e) => {
+                            let terminal = retry_disposition(&e) == RetryDisposition::Terminal
+                                || e.downcast_ref::<PoolExhausted>().is_some();
+                            if terminal {
+                                return Err(e);
+                            }
+                            UnitOutcome::Faulted
+                        }
                     },
                     () = cancelled(&handle) => UnitOutcome::Cancelled,
                     () = watchdog(store, g_start, g_len, unit_deadline) => UnitOutcome::Faulted,
@@ -547,13 +565,13 @@ where
 ///
 /// # Errors
 ///
-/// An empty `lanes`; a TERMINAL `fill_gap` fault propagated verbatim from a
-/// worker (a payment-layer rejection, a drained pool [`crate::PoolExhausted`], an
-/// origin blacklist, or an over-cap blob — see
-/// [`crate::retry_disposition`]); a segmentation alignment
-/// error; an I/O failure flushing the present record; or, if every source drops
-/// on RETRYABLE faults with the request still incomplete, a generic "all sources
-/// failed" error.
+/// An empty `lanes`; a TERMINAL `fill_gap` fault propagated verbatim from a worker
+/// — either a shared-classifier terminal ([`crate::retry_disposition`]: a
+/// payment-layer rejection, an origin blacklist, or an over-cap blob) or a
+/// shared-pool exhaustion ([`crate::PoolExhausted`], terminal only for this
+/// scheduler); a segmentation alignment error; an I/O failure flushing the present
+/// record; or, if every source drops on RETRYABLE faults with the request still
+/// incomplete, a generic "all sources failed" error.
 #[allow(clippy::too_many_arguments)]
 pub async fn multi_source_fetch<St, S, P, F>(
     store: &St,
@@ -684,6 +702,7 @@ mod tests {
 
     use super::{MultiSourceConfig, SourceLane, multi_source_fetch};
     use crate::driver::DriveConfig;
+    use crate::driver::PoolExhausted;
     use crate::pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
     use crate::source::{FakeFunder, ScriptedSource};
     use crate::{ClientRangedStore, Cumulative, PoolContext, PoolLedger};
@@ -1239,6 +1258,114 @@ mod tests {
         assert_eq!(
             missing_bytes, probe,
             "the failed source's range must not be reassigned to a peer"
+        );
+        Ok(())
+    }
+
+    /// Shared-pool exhaustion is terminal FOR THE SCHEDULER (not the shared
+    /// classifier): a lane whose pacer refuses the next voucher aborts
+    /// `multi_source_fetch` with the typed [`PoolExhausted`] rather than
+    /// reassigning the refused range and masking it as the generic "all sources
+    /// failed". Lane B faults at once (its segment is reassigned to A). A fetches
+    /// its OWN 32 MiB segment (a first leg always draws — voucher cost is unpriced
+    /// until the first open), then, with the pool pre-drained by a peer's
+    /// `prior_spend`, the reassigned second leg is REFUSED at the leg boundary — a
+    /// `PoolExhausted` — before A delivers any of it. So a whole ~32 MiB segment
+    /// stays unfetched: the refused range is NOT reassigned onward.
+    ///
+    /// This is the multi-source counterpart to the single-source failover path,
+    /// which instead RETRIES a budget refusal against a cheaper provider (asserted
+    /// by `retry.rs`'s `pool_exhausted_falls_over_in_the_shared_classifier`) — the
+    /// pool-scope terminality lives here, in the scheduler, not the shared
+    /// classifier.
+    #[tokio::test]
+    async fn pool_exhaustion_aborts_the_scheduler_and_is_not_reassigned() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let total = data.len() as u64;
+        let deposit = U256::from(100u64);
+        // A peer lane that has already spent most of the pool on prior streams —
+        // enough that A's own 32 MiB segment fits the remaining headroom, but the
+        // reassigned second segment cannot.
+        let prior_spend = U256::from(68u64);
+
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative {
+            bytes: U256::from(68u64 * 1024 * 1024),
+            amount: prior_spend,
+        }));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        // Lane B faults at its first byte: it contributes nothing, so its 32 MiB
+        // segment is reassigned to lane A as a second leg.
+        let src_b = ScriptedSource::new(data.clone())?
+            .with_fault_after(0, || anyhow::anyhow!("scripted immediate fault"))
+            .paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let lanes = vec![
+            SourceLane {
+                source: &src_a,
+                ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
+                ledger: Arc::clone(&ledger_a),
+            },
+            SourceLane {
+                source: &src_b,
+                ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
+                ledger: Arc::clone(&ledger_b),
+            },
+        ];
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            multi_source_fetch(
+                &store,
+                &lanes,
+                &pacer,
+                &funder,
+                root,
+                0,
+                total,
+                &DriveConfig {
+                    // Reactive top-up disabled: a budget refusal is a hard
+                    // `PoolExhausted`, not a top-up.
+                    working_deposit: U256::ZERO,
+                    max_settle_waits: 0,
+                    settle_backoff: Duration::from_millis(1),
+                },
+                &MultiSourceConfig {
+                    max_sources: 2,
+                    unit_deadline: Duration::from_secs(30),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("pool exhaustion must abort promptly, not hang");
+
+        // The typed `PoolExhausted` propagated — the scheduler aborted rather than
+        // masking it as the generic "all sources failed".
+        let err = result.expect_err("a shared-pool exhaustion must fail the fetch");
+        assert!(
+            err.downcast_ref::<PoolExhausted>().is_some(),
+            "the pool-exhaustion error must propagate verbatim from the scheduler, \
+             not be masked as 'all sources failed': {err:#}"
+        );
+
+        // A whole ~32 MiB segment stays unfetched: the refused reassigned range was
+        // NOT covered by any lane (A delivered only its own one segment).
+        let missing =
+            crate::driver::contiguous_byte_ranges(&store.missing_ranges(0, total).await?, total);
+        let missing_bytes: u64 = missing.iter().map(|(_, l)| *l).fold(0, u64::saturating_add);
+        assert!(
+            missing_bytes >= 30 * 1024 * 1024,
+            "the refused segment must stay unfetched (a whole ~32 MiB), not be \
+             reassigned onward: only {missing_bytes} bytes missing"
+        );
+        assert!(
+            src_a.delivered_bytes() < total,
+            "A delivered only its own segment, never the refused reassigned one: {}",
+            src_a.delivered_bytes()
         );
         Ok(())
     }
