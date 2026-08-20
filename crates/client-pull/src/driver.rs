@@ -291,6 +291,16 @@ where
         .await?;
     }
 
+    // Flush the store's in-memory present-range snapshot to its durable
+    // `.ranges` record now that every gap this drive filled has landed:
+    // `ClientRangedStore::checkpoint` no longer persists the record per
+    // checkpoint (spec §5.5, single-writer flush point), so the single-source
+    // path's resume durability depends on `drive` flushing here — a crash
+    // after this point loses at most the un-checkpointed tail of the LAST gap,
+    // exactly the durability window `ingest_stream`'s checkpoint cadence
+    // already bounds.
+    store.flush_present_record()?;
+
     // Promote only when the WHOLE blob is present — `finalize` verifies and
     // renames the whole `.partial`, which it cannot do while bytes outside `R`
     // are still missing. A whole-blob `R` reaches this complete; a partial `R`

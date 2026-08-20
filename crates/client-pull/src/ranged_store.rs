@@ -615,9 +615,18 @@ impl ClientRangedStore {
 
     /// Durably checkpoint the prefix `[range.fetch_start(), received_end)` of
     /// an in-progress [`Self::ingest_stream`]: fsync the data and outboard
-    /// files, THEN union the corresponding chunk ranges into `present` and
-    /// persist the `.ranges` record. The fsync-before-record ordering is
-    /// load-bearing — see the durability contract on [`Self::ingest_stream`].
+    /// files, THEN union the corresponding chunk ranges into `present`. The
+    /// fsync-before-union ordering is load-bearing — see the durability
+    /// contract on [`Self::ingest_stream`].
+    ///
+    /// Does NOT persist the `.ranges` record — that is
+    /// [`Self::flush_present_record`]'s job. Several `ingest_stream` calls can
+    /// run concurrently on one store (the multi-source scheduler), so writing
+    /// the record here, per checkpoint, out of the `present` lock would both
+    /// race the record's write-and-rename across sources and serialize every
+    /// source on the record's fsync. `present` only ever grows and is unioned
+    /// under the mutex AFTER the data/outboard fsync, so whenever the record
+    /// is next flushed it never claims a range that is not durably on disk.
     fn checkpoint(
         &self,
         data_file: &mut std::fs::File,
@@ -634,16 +643,36 @@ impl ClientRangedStore {
             self.total_bytes,
         )?;
 
-        let updated = {
-            let mut guard = self
+        let mut guard = self
+            .present
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("present")))?;
+        *guard |= received.chunk_ranges().clone();
+        Ok(())
+    }
+
+    /// Persist the current in-memory `present` snapshot to the `.ranges`
+    /// record. The single-writer flush point (spec §5.5): callers (the
+    /// scheduler's flush owner for multi-source fetches, and `finalize`, and
+    /// the end of single-source `drive`) invoke this so no two writers race
+    /// the record file. `present` only ever grows and is unioned under the
+    /// mutex AFTER data/outboard fsync (the `checkpoint` helper's ordering),
+    /// so the persisted record never claims a range that is not durably on
+    /// disk.
+    ///
+    /// # Errors
+    ///
+    /// The `present` lock is poisoned, or the record's tempfile-plus-rename
+    /// write fails.
+    pub fn flush_present_record(&self) -> io::Result<()> {
+        let snapshot = {
+            let guard = self
                 .present
                 .lock()
-                .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("present")))?;
-            *guard |= received.chunk_ranges().clone();
+                .map_err(|_| io::Error::other(lock_poisoned("present")))?;
             guard.clone()
         };
-        write_ranges_record(&self.ranges_path, &updated)?;
-        Ok(())
+        write_ranges_record(&self.ranges_path, &snapshot)
     }
 }
 
@@ -820,6 +849,15 @@ impl RangedStore for ClientRangedStore {
                 return Err(RangedStoreError::Incomplete);
             }
 
+            // Flush the in-memory `present` snapshot to the `.ranges` record
+            // before the verify sweep: checkpoints during ingest no longer
+            // persist the record themselves (see `checkpoint`), so this is
+            // the single-writer point that makes the on-disk record current.
+            // A crash right after this and before promotion still leaves an
+            // accurate record to resume from.
+            self.flush_present_record()
+                .map_err(|e| RangedStoreError::Backend(Box::new(e)))?;
+
             let root = self.root;
             let tree = self.tree;
             let total_bytes = self.total_bytes;
@@ -937,6 +975,10 @@ impl crate::source::IngestStore for ClientRangedStore {
         R: crate::source::BaoRangeReader + 'a,
     {
         Box::pin(self.ingest_stream(range, reader, on_progress))
+    }
+
+    fn flush_present_record(&self) -> std::io::Result<()> {
+        self.flush_present_record()
     }
 }
 
@@ -1597,6 +1639,13 @@ mod tests {
             "the parked typed fault must survive: {err}"
         );
 
+        // Checkpoints no longer persist the `.ranges` record themselves
+        // (single-writer flush point, spec §5.5) — a real caller reaches this
+        // via `drive`'s post-gap-loop flush, but this test drives
+        // `ingest_stream` directly, so it flushes explicitly here before
+        // simulating the resumed process re-opening the store.
+        store.flush_present_record()?;
+
         // Re-open the store fresh (simulating a resumed process) and inspect
         // the persisted record: it must reflect the checkpointed prefix —
         // more than one checkpoint interval's worth (proving a checkpoint
@@ -1633,6 +1682,73 @@ mod tests {
                 .expect("slice")
         );
 
+        Ok(())
+    }
+
+    /// Deterministic `len`-byte blob (xorshift fill, mirrors `synth_blob`'s
+    /// plaintext generation) — used by the concurrent-checkpoint test to build
+    /// a fixed-content blob before splitting it into disjoint ranges.
+    fn blob(len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        let mut x: u32 = 0x2545_f491;
+        for b in &mut v {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes().first().copied().unwrap_or(0);
+        }
+        v
+    }
+
+    /// Thin wrapper over `PreOrderMemOutboard::create`: the bao root and full
+    /// pre-order outboard for an already-built blob, for tests that construct
+    /// `data` themselves rather than through `synth_blob`.
+    fn bao_root_and_outboard(data: &[u8]) -> ([u8; 32], Bytes) {
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(data, IROH_BLOCK_SIZE);
+        (*ob.root.as_bytes(), Bytes::from(ob.data))
+    }
+
+    /// The header-less bao wire (content + interleaved proof) for `range` of
+    /// `data`, ready to hand to [`ClientRangedStore::ingest_stream`] as a
+    /// `Bytes` reader — a thin wrapper over `encode_verified_range`, mirroring
+    /// `ScriptedSource::wire_for` (`crate::source`).
+    fn scripted_reader_for(data: &[u8], range: &AlignedRange) -> anyhow::Result<Bytes> {
+        let (root, outboard) = bao_root_and_outboard(data);
+        let s = usize::try_from(range.fetch_start())?;
+        let e = usize::try_from(range.fetch_end())?;
+        let slice = data
+            .get(s..e)
+            .ok_or_else(|| anyhow::anyhow!("scripted range out of bounds"))?;
+        let combined = decdn_bao_range::encode_verified_range(root, range, slice, outboard)?;
+        let wire = combined
+            .get(8..)
+            .ok_or_else(|| anyhow::anyhow!("combined wire shorter than its 8-byte header"))?;
+        Ok(Bytes::copy_from_slice(wire))
+    }
+
+    #[tokio::test]
+    async fn concurrent_ingest_present_record_never_regresses() -> anyhow::Result<()> {
+        // Two disjoint bao-aligned ranges of one blob, ingested concurrently, then
+        // flushed. The persisted .ranges must equal the union of both ranges.
+        let dir = tempfile::tempdir()?;
+        let data = blob(8 * 1024 * 1024); // 8 MiB -> two 4 MiB halves, group-aligned
+        let (root, _) = bao_root_and_outboard(&data);
+        let store = ClientRangedStore::create(dir.path(), "b", root, data.len() as u64)?;
+
+        let lo = decdn_bao_range::align_range(0, 4 * 1024 * 1024, data.len() as u64)?;
+        let hi = decdn_bao_range::align_range(4 * 1024 * 1024, 4 * 1024 * 1024, data.len() as u64)?;
+
+        let a = store.ingest_stream(&lo, scripted_reader_for(&data, &lo)?, None);
+        let b = store.ingest_stream(&hi, scripted_reader_for(&data, &hi)?, None);
+        let (ra, rb) = tokio::join!(a, b);
+        ra?;
+        rb?;
+
+        store.flush_present_record()?;
+
+        let on_disk = read_ranges_record(store.ranges_path())?;
+        let expected = lo.chunk_ranges().clone() | hi.chunk_ranges().clone();
+        assert_eq!(on_disk, expected);
         Ok(())
     }
 
