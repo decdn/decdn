@@ -1219,11 +1219,11 @@ async fn build_chain_and_handlers(
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
-    // (the staker-set provider above is read-only) signs the `withdraw` /
-    // `closeChannel` transactions with the same eth keystore signer. The
-    // bootstrap self-checks the contract via `usdc()`; the watcher persists
-    // channels opened against this node so the handler accepts their vouchers,
-    // and forgets settled ones. Redemption is purely periodic: a self-tick
+    // (the staker-set provider above is read-only) signs the `redeemMany`
+    // transactions with the same eth keystore signer. The bootstrap
+    // self-checks the contract via `usdc()`; the watcher folds `PaymentPool`
+    // events so the serve path reads pool solvency in-memory, and forgets a
+    // reclaimed pool's lanes. Redemption is purely periodic: a self-tick
     // flushes the lane store then sweeps every above-threshold lane.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it

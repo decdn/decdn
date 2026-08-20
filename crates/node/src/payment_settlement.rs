@@ -35,11 +35,15 @@
 //!   so a dropped hint never strands a lane whose chunk has cleared the floor.
 //!   The node flushes the lane store durable after planning a chunk and before
 //!   submitting it, so post-crash on-disk `owed ≥ submitted`.
-//! - **Close monitor.** A pool is owner-closed only. On a `PoolCloseInitiated`
-//!   for a pool this node holds lanes against, the monitor redeems its highest
-//!   voucher per lane before `disputeDeadline` (ADR 003 § Owner reclaims before a
-//!   node redeems) — a node that has not redeemed by the deadline forfeits its
-//!   outstanding vouchers.
+//! - **Redeem before reclaim.** A pool is owner-owned and owner-closed; the node
+//!   never closes, disputes, or settles. An owner's `closePool` only starts the
+//!   grace window (ADR 003 § Owner reclaims before a node redeems). The node needs
+//!   no dedicated close watcher: the self-tick sweep runs far inside the 48h grace
+//!   floor (`redeem_interval_secs` is capped well below it at config load), so it
+//!   redeems every lane worth the gas before the owner can `reclaim`. A lane below
+//!   the per-chunk floor is left for the owner to reclaim — spending more gas than
+//!   it recovers is not worth it — and a node offline for the whole grace window
+//!   forfeits its unredeemed vouchers, a node-ops failure, not a protocol gap.
 //!
 //! Buyer-side `openPool`/`topUp`/`reclaim` (node→node cache-miss pulls) is out of
 //! scope here. The paid-watermark watcher is a [`Route`] the runtime registers on
@@ -93,21 +97,17 @@ const REDEEM_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 /// (a transient error mis-flagged as oversize) at 2^6 doomed sub-sends.
 const MAX_SPLIT_DEPTH: u32 = 6;
 
-/// Current Unix time in seconds for on-chain deadline comparisons. A broken
-/// system clock (time before the epoch) yields `0`, which makes every pool look
-/// still inside its grace window — the safe direction (attempt the redeem; the
-/// contract's own `block.timestamp` check is the authoritative backstop).
+/// Current Unix time in seconds, compared against a lane's cached
+/// `registered_until` to skip the on-chain authorization read while the
+/// registration is still live (`registered_until > now`). A broken system clock
+/// (time before the epoch) yields `0`, so any non-zero `registered_until` looks
+/// live and the read is skipped. This is benign: if the capability has actually
+/// expired on-chain, the redemption simply no-ops as transient-empty at the
+/// contract, which stays the authoritative backstop.
 pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// Whether a capability/grace deadline has passed. `deadline == 0` means
-/// "untracked / never" and is treated as not passed — the safe direction (keep
-/// serving/redeeming) when the deadline is unknown.
-pub(crate) const fn is_expired(now: u64, deadline: u64) -> bool {
-    deadline != 0 && now >= deadline
 }
 
 /// Debounce thresholds for the watcher scan checkpoint (#784). The persisted
@@ -281,14 +281,11 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         // single write path for the paid side, so a drained-pool partial pay is
         // recorded exactly — the node never assumes its voucher cleared.
         let sink = PoolSettlementSink {
-            contract: contract.clone(),
             self_address,
             store: Arc::clone(&store),
             handler,
             paid: paid.clone(),
-            capabilities: Arc::clone(&capabilities),
             redeem_tx: redeem_tx.clone(),
-            redeem_max_vouchers_per_tx,
             metrics: Arc::clone(&metrics),
             pool_view,
         };
@@ -501,39 +498,34 @@ fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
 }
 
 /// The settlement route's demux key: every `PaymentPool` lifecycle event the
-/// paid-watermark cache and close monitor need. Split out from
+/// paid-watermark cache and pool projection need. Split out from
 /// [`PoolSettlementService::bootstrap`] so the exact topic0 set is
 /// unit-testable without a provider — dropping `PoolOpened` here, for example,
-/// would silently blind the close monitor to newly opened pools.
+/// would silently blind the projection to newly opened pools.
 fn settlement_route_topic0s() -> Vec<B256> {
     vec![
         PaymentPool::PoolOpened::SIGNATURE_HASH,
         PaymentPool::PoolRedeemed::SIGNATURE_HASH,
         PaymentPool::PoolToppedUp::SIGNATURE_HASH,
-        PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
         PaymentPool::PoolReclaimed::SIGNATURE_HASH,
     ]
 }
 
-/// Applies `PaymentPool` settlement logs to the paid-watermark cache and drives
-/// the close monitor. One per settlement watcher; the resumable `eth_getLogs`
+/// Applies `PaymentPool` settlement logs to the paid-watermark cache and pool
+/// projection. One per settlement watcher; the resumable `eth_getLogs`
 /// poller feeds it block-ordered logs and advances + persists the scan checkpoint
 /// per window on a clean tick.
 ///
 /// Failure policy: paid-watermark updates are in-memory and always `Ok`. A
 /// `PoolReclaimed` forget failure is logged and skipped (`Ok`) — the settled lane
-/// owes nothing and the forget is idempotent. The close monitor is best-effort
-/// and never fails the tick. An undecodable log is log-and-skip so a permanently
-/// undecodable log never hot-loops the deterministic re-scan.
-struct PoolSettlementSink<P: Provider + Clone> {
-    contract: PaymentPool::PaymentPoolInstance<P>,
+/// owes nothing and the forget is idempotent. An undecodable log is log-and-skip
+/// so a permanently undecodable log never hot-loops the deterministic re-scan.
+struct PoolSettlementSink {
     self_address: Address,
     store: Arc<dyn PoolStateStore>,
     handler: Arc<ClientHandler>,
     paid: PaidWatermarks,
-    capabilities: Arc<dyn CapabilitySource>,
     redeem_tx: mpsc::Sender<LaneKey>,
-    redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
     /// The serve path's pool solvency/funder view. This sink is its single writer:
     /// it folds `PoolOpened` (owner + deposit), `PoolToppedUp` (new deposit),
@@ -543,7 +535,7 @@ struct PoolSettlementSink<P: Provider + Clone> {
     pool_view: PoolProjection,
 }
 
-impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
+impl LogSink for PoolSettlementSink {
     #[allow(clippy::cognitive_complexity)]
     async fn apply(&mut self, log: Log) -> Result<()> {
         match log.topic0().copied() {
@@ -615,37 +607,6 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
                 // this node provides.
                 self.redrive_pool_lanes(event.poolId);
             }
-            Some(sig) if sig == PaymentPool::PoolCloseInitiated::SIGNATURE_HASH => {
-                let event = match PaymentPool::PoolCloseInitiated::decode_log_data(&log.inner.data)
-                {
-                    Ok(event) => event,
-                    Err(err) => {
-                        warn!(%err, "skipping undecodable PoolCloseInitiated log");
-                        return Ok(());
-                    }
-                };
-                debug!(
-                    pool_id = %event.poolId,
-                    dispute_deadline = %event.disputeDeadline,
-                    "PoolCloseInitiated observed; redeeming this node's lanes before the deadline"
-                );
-                // Best-effort and INLINE: redeem the node's highest voucher per
-                // lane before the owner can reclaim. Never returns `Err` — a
-                // benign revert (already fully redeemed, window closed) must not
-                // fail the tick and re-scan the window.
-                redeem_pool_on_close(
-                    &self.contract,
-                    &self.store,
-                    &self.capabilities,
-                    &self.paid,
-                    self.self_address,
-                    event.poolId,
-                    saturating_u64(event.disputeDeadline),
-                    self.redeem_max_vouchers_per_tx,
-                    &self.metrics,
-                )
-                .await;
-            }
             Some(sig) if sig == PaymentPool::PoolReclaimed::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolReclaimed::decode_log_data(&log.inner.data) {
                     Ok(event) => event,
@@ -671,7 +632,7 @@ impl<P: Provider + Clone> LogSink for PoolSettlementSink<P> {
     }
 }
 
-impl<P: Provider + Clone> PoolSettlementSink<P> {
+impl PoolSettlementSink {
     /// Hint the redeemer for every lane of `pool_id` this node provides, so a
     /// top-up re-drives lanes a dry pool left `owed > paid`. Best-effort: a full
     /// hint channel drops the nudge (the self-tick sweep is the backstop).
@@ -716,69 +677,6 @@ impl<P: Provider + Clone> PoolSettlementSink<P> {
         }
         self.handler.forget_pool_floor(pool_id).await;
     }
-}
-
-/// Narrow an on-chain `uint256` deadline to `u64`, clamping an out-of-range value
-/// to `u64::MAX` ("effectively never") — the safe direction for a redeem deadline.
-fn saturating_u64(v: U256) -> u64 {
-    u64::try_from(v).unwrap_or(u64::MAX)
-}
-
-/// Redeem this node's highest voucher per lane of a closing pool before its grace
-/// deadline (ADR 003 § Owner reclaims before a node redeems). Best-effort: a
-/// per-lane failure is logged and never propagated. Forces redemption regardless
-/// of the floor — a node that has not redeemed by the deadline forfeits its
-/// outstanding vouchers.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
-async fn redeem_pool_on_close<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    store: &Arc<dyn PoolStateStore>,
-    capabilities: &Arc<dyn CapabilitySource>,
-    paid: &PaidWatermarks,
-    self_address: Address,
-    pool_id: PoolId,
-    dispute_deadline: u64,
-    max_vouchers: usize,
-    metrics: &Arc<Metrics>,
-) {
-    if is_expired(unix_now(), dispute_deadline) {
-        debug!(%pool_id, "grace window already closed; skipping close-redeem");
-        return;
-    }
-    let states = match store.load_all() {
-        Ok(s) => s,
-        Err(err) => {
-            warn!(%err, %pool_id, "close-redeem: failed to load lane state");
-            return;
-        }
-    };
-    let pool_states: Vec<LaneState> = states
-        .into_iter()
-        .filter(|st| st.pool_id == pool_id && st.provider == self_address)
-        .collect();
-    let plans = plan_lanes(
-        contract,
-        store,
-        capabilities,
-        paid,
-        self_address,
-        pool_states,
-        metrics,
-    )
-    .await;
-    // Force: any non-zero unredeemed balance is worth redeeming before reclaim.
-    // The close path redeems regardless of a flush failure — forfeiting the claim
-    // at the deadline is worse than a bounded re-serve risk (`strict_flush` false).
-    redeem_planned_lanes(
-        contract,
-        store,
-        plans,
-        U256::ZERO,
-        max_vouchers,
-        false,
-        metrics,
-    )
-    .await;
 }
 
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
@@ -1790,9 +1688,12 @@ mod tests {
         }
     }
 
-    /// The settlement route watches exactly the five `PaymentPool` lifecycle
-    /// events — no more, no fewer. `PoolOpened` in particular must never be
-    /// dropped: it is the close monitor's only signal that a pool exists.
+    /// The settlement route watches exactly the four `PaymentPool` lifecycle
+    /// events the paid-watermark cache and pool projection need — no more, no
+    /// fewer. `PoolOpened` in particular must never be dropped: it is the
+    /// projection's only signal that a pool exists. `PoolCloseInitiated` is
+    /// deliberately absent — the periodic redeem sweep, capped well inside the
+    /// grace window, redeems before reclaim without watching for the close.
     #[test]
     fn route_topic0s_covers_every_pool_lifecycle_event() {
         assert_eq!(
@@ -1801,7 +1702,6 @@ mod tests {
                 PaymentPool::PoolOpened::SIGNATURE_HASH,
                 PaymentPool::PoolRedeemed::SIGNATURE_HASH,
                 PaymentPool::PoolToppedUp::SIGNATURE_HASH,
-                PaymentPool::PoolCloseInitiated::SIGNATURE_HASH,
                 PaymentPool::PoolReclaimed::SIGNATURE_HASH,
             ]
         );

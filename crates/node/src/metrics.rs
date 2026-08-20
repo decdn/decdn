@@ -429,67 +429,6 @@ pub struct DecdnMetrics {
     /// visible name:
     /// `decdn_buyer_pool_store_skipped_undecodable_records_total`.
     pub buyer_pool_store_skipped_undecodable_records: Counter,
-    /// Idle buyer channels cooperatively closed by the reconcile sweep (#972),
-    /// reclaiming their deposit early instead of waiting for on-chain expiry. A
-    /// healthy capital-efficiency signal — each increment is one deposit freed
-    /// ahead of expiry. Operator-visible name:
-    /// `decdn_buyer_reconcile_settled_total`.
-    pub buyer_reconcile_settled: Counter,
-    /// Cooperative closes that settled at a watermark ABOVE this node's own
-    /// persisted buyer record, after the provider proved with our own voucher
-    /// signature that we had signed it (#1495). Each increment means our durable
-    /// buyer store lagged what we actually signed — an unclean shutdown that lost
-    /// committed vouchers, or a persistence bug. The close is correct and the
-    /// record is healed, so this is not an error; it is the only signal that the
-    /// underlying durability gap exists at all, and a sustained rate warrants
-    /// investigating the buyer store rather than the close path. Operator-visible
-    /// name: `decdn_buyer_reconcile_watermark_healed_total`.
-    pub buyer_reconcile_watermark_healed: Counter,
-    /// Idle buyer channels the reconcile sweep `closeChannel`d **unilaterally**
-    /// because the provider was unreachable for a cooperative close (#988) —
-    /// either it deregistered (`node_id_for` → `None`) or it failed
-    /// `RECONCILE_CLOSE_ESCALATION_THRESHOLD` consecutive dial/waiver attempts
-    /// with a timeout-shaped error. This is the *timeout-shaped unreachability*
-    /// bucket #989 asks for: it is the count of escalations to the unilateral
-    /// close path, distinct from `buyer_unilateral_close_rpc_failure` (an
-    /// on-chain submission fault). The unilateral close opens the dispute window;
-    /// the buyer settle sweep finalizes it. Operator-visible name:
-    /// `decdn_buyer_unilateral_close_unreachable_total`.
-    pub buyer_unilateral_close_unreachable: Counter,
-    /// Unilateral `closeChannel` submissions (#988) that did NOT secure the
-    /// claim because the RPC send / receipt errored or the tx reverted on-chain
-    /// — an infrastructure or on-chain fault, NOT evidence the provider is
-    /// unreachable (#989). Split from `buyer_unilateral_close_unreachable` so an
-    /// operator can tell "provider genuinely gone" from "our gas wallet / RPC is
-    /// the problem"; a sustained rate here means the early-reclaim optimization
-    /// is failing for a reason the operator can fix. The expiry-reclaim sweep
-    /// remains the safety net. Operator-visible name:
-    /// `decdn_buyer_unilateral_close_rpc_failure_total`.
-    pub buyer_unilateral_close_rpc_failure: Counter,
-    /// Unilateral `closeChannel` submissions (#988) that landed, opening the
-    /// dispute window so the buyer settle sweep can reclaim the deposit ~2 days
-    /// out instead of at the 90-day expiry. The healthy signal of the early
-    /// unilateral path. Operator-visible name:
-    /// `decdn_buyer_unilateral_close_ok_total`.
-    pub buyer_unilateral_close_ok: Counter,
-    /// Buyer `settleChannel` finalization passes (#988) that landed — the
-    /// unilaterally-closed channel cleared its dispute window and the deposit
-    /// refund settled — or that re-read the channel as already-`Closed` (a
-    /// co-settler finalized first). The healthy terminal outcome of the buyer
-    /// close→settle lifecycle. Operator-visible name:
-    /// `decdn_buyer_settle_ok_total`.
-    pub buyer_settle_ok: Counter,
-    /// Buyer `settleChannel` finalization passes (#988) that did not finalize
-    /// this sweep and were left for the next one: a transient RPC send/receipt
-    /// fault, a dispute-extended re-stamp, an unresolved revert, or a pending
-    /// store-write failure. Folds the seller path's finer `transient_*` /
-    /// `restamped` / `confirm_failed` / `persist_failure` split into one
-    /// retry-pending signal — the buyer's settle is a self-refund with the
-    /// expiry-reclaim safety net, so the fine breakdown the revenue-critical
-    /// seller path needs is not warranted here. A sustained rate means buyer
-    /// deposits are not reclaiming early (check gas wallet / RPC). Operator-
-    /// visible name: `decdn_buyer_settle_deferred_total`.
-    pub buyer_settle_deferred: Counter,
     /// Background low-water top-ups (#1146) that landed: a reused buyer channel
     /// whose remaining deposit had fallen below its 20% low-water mark was
     /// re-funded to the working deposit, so sustained miss pulls to that provider
@@ -509,16 +448,11 @@ pub struct DecdnMetrics {
     /// their deposits drain (check the gas wallet / RPC / USDC balance). Operator-
     /// visible name: `decdn_buyer_topup_failure_total`.
     pub buyer_topup_failure: Counter,
-    /// Channel-lifecycle reconciliation the settlement watcher could not apply
-    /// from a poll tick: a failed `register_open_channel` /
-    /// `update_channel_deposit` / `forget_channel` store write (#751), or a
-    /// failed closing-reconciliation on a `ChannelCloseInitiated` (#839) — which
-    /// is a `getChannel` read *or* a `record_pending` write, so this counter is
-    /// not store-writes-only. Recovery differs by arm: the `ChannelOpened` /
-    /// `ChannelToppedUp` / `ChannelCloseInitiated` arms return `Err`, failing the
-    /// tick so the window re-scans on the next one; the `forget_channel` arm is
-    /// swallowed (the cursor advances past it) and is re-driven only by the settle
-    /// sweep. Either way a non-zero rate flags a struggling channel store or RPC.
+    /// Lane-store reconciliation the settlement watcher could not apply from a
+    /// poll tick: a `forget_lane` store write that failed while dropping a
+    /// reclaimed pool's lanes on a `PoolReclaimed` event. The failure is
+    /// swallowed (logged, and the cursor advances past it), so a non-zero rate
+    /// flags a struggling lane store or RPC rather than a stuck settlement.
     /// Operator-visible name: `decdn_watcher_persist_failures_total`.
     pub watcher_persist_failures: Counter,
     /// Lane-store background flushes that failed (the dirty set is retained and
@@ -543,114 +477,6 @@ pub struct DecdnMetrics {
     /// other chain watchers — since `admin_v1_slashes` is always wired, this is
     /// the only signal that a wedged watcher could be silently missing slashes.
     pub slash_watcher_down_seconds: Gauge,
-    /// Channels the seller path proactively `closeChannel`d because an
-    /// operator-configured auto-settlement trigger fired — the un-redeemed
-    /// value or voucher count crossed its threshold (#742). Each close starts
-    /// the dispute window so a large unsubmitted balance is secured before the
-    /// client can go dark; the settle sweep finalizes the remainder. A rising
-    /// count is normal under heavy delivery; a flat-zero count on a node that
-    /// configured a trigger means nothing has crossed it yet. Operator-visible
-    /// name: `decdn_settlement_auto_triggered_total`.
-    pub settlement_auto_triggered: Counter,
-    /// Auto-settlement close attempts that FAILED after a trigger fired (#742):
-    /// the `closeChannel` submit returned no pending tx, or the awaited receipt
-    /// reverted / errored. Distinct from `settlement_auto_triggered` (which
-    /// counts only secured closes) so an operator can compute a fire-vs-secured
-    /// ratio — a sustained non-zero rate means a configured trigger keeps firing
-    /// but the close never lands (RPC / wallet / on-chain revert), so the
-    /// at-risk balance is NOT being secured and the revenue-protection feature
-    /// is silently defeated. The fall-through leaves the redeem path to run, so
-    /// `redemption_failures` does NOT move on these — this is the only signal.
-    /// Operator-visible name: `decdn_settlement_auto_failures_total`.
-    pub settlement_auto_failures: Counter,
-    /// A self-defense `disputeChannel` (#1586) landed: a counterparty closed the
-    /// channel at a stale watermark, and the node submitted its own
-    /// higher-nonce voucher inside the dispute window to recover the residual
-    /// (`myAmount − onchainClaimedAmount`). Pairs with the success `info!` in
-    /// `maybe_dispute_stale_close`. Operator-visible name:
-    /// `decdn_settlement_dispute_ok_total`.
-    pub settlement_dispute_ok: Counter,
-    /// A self-defense `disputeChannel` (#1586) did NOT land — the `send()`
-    /// errored, the receipt errored, or the tx reverted (most benignly a
-    /// `DisputeWindowClosed` race, or another party already ratcheted the
-    /// watermark to/above the node's). Best-effort: the close still settles at
-    /// whatever watermark stands, so this is a visibility signal, not a
-    /// stuck-settlement one. Pairs with the `warn!` in
-    /// `maybe_dispute_stale_close`. Kept distinct from `settlement_dispute_ok`
-    /// so a fire-vs-recovered ratio is computable. Operator-visible name:
-    /// `decdn_settlement_dispute_failures_total`.
-    pub settlement_dispute_failures: Counter,
-    /// `settleChannel` finalization-sweep passes that landed: the closed
-    /// channel cleared its dispute window and the provider's un-withdrawn
-    /// remainder was routed through the `FeeRouter` (a no-op when the channel
-    /// was already fully drawn via `withdraw`), and the pending-settle entry
-    /// was dropped (#810). The healthy terminal outcome of the seller
-    /// settlement lifecycle; a steady rate tracking closes means settlement is
-    /// landing. Distinct from `settlement_auto_triggered` (which counts only
-    /// the *`closeChannel`* that opens the window, a different lifecycle
-    /// stage). Operator-visible name: `decdn_settlement_finalize_ok_total`.
-    pub settlement_finalize_ok: Counter,
-    /// `settleChannel` finalization passes where `settleChannel().send()`
-    /// itself errored — an RPC timeout / network blip, not an on-chain
-    /// decision (#810). The pending entry is left in place and retried next
-    /// sweep, so a brief blip self-heals; a sustained rate means the RPC
-    /// endpoint is unhealthy and the provider's settled remainder is not being
-    /// routed. Operator-visible name:
-    /// `decdn_settlement_finalize_transient_send_total`.
-    pub settlement_finalize_transient_send: Counter,
-    /// `settleChannel` finalization passes where the submit succeeded but
-    /// `get_receipt()` errored before a receipt was observed (#810). Like
-    /// `..._transient_send` this is a transient RPC condition (the tx may well
-    /// have landed) and is retried next sweep; split from the send arm so an
-    /// operator can tell a submit-side from a receipt-side RPC fault. Operator-
-    /// visible name: `decdn_settlement_finalize_transient_receipt_total`.
-    pub settlement_finalize_transient_receipt: Counter,
-    /// `settleChannel` finalization passes whose receipt came back with
-    /// `status() == false` — an on-chain revert (#810). This is the RAW revert
-    /// count; `drop_pending_if_finalized` then re-reads the channel and the
-    /// outcome is broken out across the three `settlement_finalize_confirmed_*`
-    /// / `_restamped` / `_confirm_failed` counters below, so this total on its
-    /// own is NOT a "stuck settlement" signal — the benign co-settler race and
-    /// the dispute-extension re-stamp both land here. Distinct from the two
-    /// transient arms in that the revert is an on-chain decision, not an RPC
-    /// fault. Operator-visible name: `decdn_settlement_finalize_reverted_total`.
-    pub settlement_finalize_reverted: Counter,
-    /// Reverted `settleChannel` passes resolved as already-`Closed` on re-read:
-    /// a co-settler (typically the client claiming its refund) finalized the
-    /// channel first, so the obligation is genuinely retired and the pending
-    /// entry dropped (#810). Benign — together with `..._restamped` it accounts
-    /// for the reverts that need no action; only `..._confirm_failed` is the
-    /// stuck-settlement signal. Operator-visible name:
-    /// `decdn_settlement_finalize_confirmed_closed_total`.
-    pub settlement_finalize_confirmed_closed: Counter,
-    /// Reverted `settleChannel` passes resolved as still-`Closing` on re-read:
-    /// a `disputeChannel` extended `disputeDeadline` past the value stored at
-    /// close, so the sweep re-stamps the gate and retries after the new window
-    /// (#810). Also benign and self-healing; a steady rate just means disputes
-    /// are landing. Operator-visible name:
-    /// `decdn_settlement_finalize_restamped_total`.
-    pub settlement_finalize_restamped: Counter,
-    /// Reverted `settleChannel` passes that could NOT be resolved to a benign
-    /// terminal state, so the pending entry is kept for the next sweep (#810):
-    /// either the confirming `getChannel` re-read itself errored, or it
-    /// returned an unexpected non-terminal status (`Open` is unreachable for a
-    /// channel we closed, so seeing it means a contract/`channel_id`/reorg
-    /// anomaly). This is the genuinely-degraded signal the raw `..._reverted`
-    /// total cannot give on its own: a revert we cannot resolve. A sustained
-    /// rate (especially with a pending set that never drains) means settlement
-    /// is stuck and warrants investigation. Operator-visible name:
-    /// `decdn_settlement_finalize_confirm_failed_total`.
-    pub settlement_finalize_confirm_failed: Counter,
-    /// Pending-settle store writes the finalization path swallowed: a
-    /// `forget_pending` (after a landed or already-`Closed` settle) or a
-    /// `record_pending` re-stamp (after a dispute-extended revert) that
-    /// returned a `StoreError` (#810). The settlement itself is unaffected
-    /// on-chain — the cost is a redundant `settleChannel` next sweep (which
-    /// reverts and re-drops via the `Closed` path) or a stale gate — but a
-    /// non-zero rate flags a struggling `PendingSettleStore`, the same way
-    /// `watcher_persist_failures` does for the watcher. Operator-visible name:
-    /// `decdn_settlement_pending_persist_failures_total`.
-    pub settlement_pending_persist_failures: Counter,
     /// `decdn_staker_set_watcher_restarts_total` (#783): distinct drift
     /// windows the [`crate::dht::chain_staker_set`] watcher has entered —
     /// bumped once on the *transition* from a healthy cycle into the
@@ -1154,35 +980,6 @@ pub struct DecdnMetrics {
     /// experiencing sustained concurrency pressure. Visible name:
     /// `decdn_serve_stream_rejected_lane_at_capacity_total`.
     pub serve_stream_rejected_lane_at_capacity: Counter,
-    /// New delivery refused because the channel has a signed cooperative-close
-    /// waiver (ADR 003 §Cooperative close) — the node committed to settling at
-    /// the watermark and serves no further bytes. Wire-indistinguishable from
-    /// `unknown_lane` (signed as `NotFound`), so this counter is the only
-    /// place the distinction lives. Visible name:
-    /// `decdn_serve_stream_rejected_cooperative_close_signed_total`.
-    pub serve_stream_rejected_cooperative_close_signed: Counter,
-    /// A `CooperativeCloseRequest` was declined because its `client_signature`
-    /// did not recover to the channel's `client` (missing, malformed, or from
-    /// the wrong key). The node signs no waiver and does not freeze the channel.
-    /// The decline is wire-indistinguishable from the unknown-channel /
-    /// zero-voucher finish, so this server-side counter is the only place the
-    /// distinction lives — a rising value is the auth-bypass probing signal
-    /// (ADR 003 §Cooperative close). Visible name:
-    /// `decdn_cooperative_close_request_unauthorized_total`.
-    pub cooperative_close_request_unauthorized: Counter,
-    /// A cooperative-close waiver was signed for a channel that has an accepted
-    /// voucher but no stored `last_signature`, so the auth went out with an empty
-    /// `CooperativeCloseAuth::last_signature` echo (#1495). Reachable deterministically for a
-    /// **schema-v1 store record**, which never wrote that segment: `accept_voucher`
-    /// writes nonce and signature together, so `nonce > 0` with no signature can
-    /// only be a pre-v2 row. A client whose own watermark lags then cannot
-    /// reconcile and falls back to the slow `closeChannel` path with a voucher
-    /// that underpays this node. Wire-indistinguishable from a normal waiver, so
-    /// this counter is the only place the distinction lives — a non-zero value on
-    /// a long-lived node means its oldest channel rows predate the signature
-    /// segment. Visible name:
-    /// `decdn_cooperative_close_auth_no_echo_total`.
-    pub cooperative_close_auth_no_echo: Counter,
     /// Delivery refused because the requested bounded range
     /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
     /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
@@ -1774,40 +1571,6 @@ recorders! {
     buyer_pool_store_skipped_undecodable_records(count: usize)
         => buyer_pool_store_skipped_undecodable_records.inc_by(u64::try_from(count).unwrap_or(u64::MAX));
 
-    /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
-    /// reclaiming its deposit early (#972).
-    buyer_reconcile_settled => buyer_reconcile_settled.inc();
-
-    /// A cooperative close settled above our own persisted watermark, having
-    /// proved we signed it — our durable buyer record had lagged (#1495).
-    buyer_reconcile_watermark_healed => buyer_reconcile_watermark_healed.inc();
-
-    /// The reconcile sweep escalated an idle channel to a **unilateral**
-    /// `closeChannel` because the provider was unreachable for a cooperative
-    /// close — deregistered, or timing out repeatedly (#988/#989). The
-    /// timeout-shaped-unreachability bucket, distinct from
-    /// `buyer_unilateral_close_rpc_failure`.
-    buyer_unilateral_close_unreachable => buyer_unilateral_close_unreachable.inc();
-
-    /// A unilateral `closeChannel` did not secure the claim — the RPC
-    /// send/receipt errored or the tx reverted on-chain (#988/#989). An
-    /// infrastructure/on-chain fault, not provider unreachability.
-    buyer_unilateral_close_rpc_failure => buyer_unilateral_close_rpc_failure.inc();
-
-    /// A unilateral `closeChannel` landed, opening the dispute window for the
-    /// buyer settle sweep to reclaim the deposit early (#988).
-    buyer_unilateral_close_ok => buyer_unilateral_close_ok.inc();
-
-    /// A buyer `settleChannel` finalization landed, or re-read the channel as
-    /// already-`Closed` (a co-settler finalized first) — either way the buyer's
-    /// deposit refund is recovered (#988).
-    buyer_settle_ok => buyer_settle_ok.inc();
-
-    /// A buyer `settleChannel` finalization did not finalize this sweep and was
-    /// left for the next — a transient RPC fault, a dispute-extended re-stamp,
-    /// an unresolved revert, or a pending store-write failure (#988).
-    buyer_settle_deferred => buyer_settle_deferred.inc();
-
     /// A background low-water top-up (#1146) landed: a reused buyer channel below
     /// its 20% low-water mark was re-funded to the working deposit. Pairs with the
     /// `info!` in `spawn_refill_if_low`.
@@ -1823,80 +1586,11 @@ recorders! {
     /// `spawn_refill_if_low`.
     buyer_topup_failure => buyer_topup_failure.inc();
 
-    /// An auto-settlement trigger fired and the seller path `closeChannel`d a
-    /// channel to secure its un-redeemed balance on-chain (#742). Pairs with
-    /// the `info!` in `try_redeem`.
-    settlement_auto_triggered => settlement_auto_triggered.inc();
-
-    /// An auto-settlement trigger fired but the `closeChannel` did NOT secure
-    /// the balance — the submit failed or the receipt reverted/errored (#742).
-    /// Pairs with the `warn!` in `try_auto_settle_close`. Kept distinct from
-    /// `settlement_auto_triggered` so a fire-vs-secured ratio is computable.
-    settlement_auto_failure => settlement_auto_failures.inc();
-
-    /// A self-defense `disputeChannel` (#1586) landed: the node ratcheted a
-    /// stale close up to its own higher-nonce voucher, recovering the residual.
-    /// Pairs with the success `info!` in `maybe_dispute_stale_close`.
-    settlement_dispute_ok => settlement_dispute_ok.inc();
-
-    /// A self-defense `disputeChannel` (#1586) did not secure the residual — the
-    /// submit failed, the receipt errored, or the tx reverted (benignly on a
-    /// closed-window / already-higher-watermark race). Pairs with the `warn!` in
-    /// `maybe_dispute_stale_close`.
-    settlement_dispute_failure => settlement_dispute_failures.inc();
-
-    /// A `settleChannel` finalization sweep landed: the dispute window cleared,
-    /// the provider remainder routed through the `FeeRouter`, and the pending
-    /// entry was dropped (#810). Pairs with the success `info!` in `try_settle`.
-    settlement_finalize_ok => settlement_finalize_ok.inc();
-
-    /// A `settleChannel` finalization sweep could not submit — `send()` errored
-    /// on a transient RPC/network fault and the entry is retried next sweep
-    /// (#810). Pairs with the send-arm `warn!` in `try_settle`.
-    settlement_finalize_transient_send => settlement_finalize_transient_send.inc();
-
-    /// A `settleChannel` finalization sweep submitted but `get_receipt()`
-    /// errored before a receipt was seen — a transient RPC fault, retried next
-    /// sweep (#810). Pairs with the receipt-arm `warn!` in `try_settle`.
-    settlement_finalize_transient_receipt => settlement_finalize_transient_receipt.inc();
-
-    /// A `settleChannel` finalization sweep reverted on-chain
-    /// (`receipt.status() == false`, #810). Raw revert count; the cause is
-    /// classified afterward by `drop_pending_if_finalized` into the
-    /// `settlement_finalize_confirmed_closed` / `_restamped` / `_confirm_failed`
-    /// counters. Pairs with the revert-arm `warn!` in `try_settle`.
-    settlement_finalize_reverted => settlement_finalize_reverted.inc();
-
-    /// A reverted `settleChannel` re-read as already-`Closed`: a co-settler
-    /// finalized first, the obligation is retired (#810). The benign
-    /// co-settler-race case. Pairs with the `Closed`-arm `info!` in
-    /// `drop_pending_if_finalized`.
-    settlement_finalize_confirmed_closed => settlement_finalize_confirmed_closed.inc();
-
-    /// A reverted `settleChannel` re-read as still-`Closing`: a dispute
-    /// extended the window, the gate is re-stamped and retried (#810). Benign.
-    /// Pairs with the `Closing`-arm re-stamp in `drop_pending_if_finalized`.
-    settlement_finalize_restamped => settlement_finalize_restamped.inc();
-
-    /// A reverted `settleChannel` left unresolved: the confirming `getChannel`
-    /// re-read errored, or returned an unexpected non-terminal status, so the
-    /// entry is kept (#810) — the genuinely-degraded signal. Pairs with the
-    /// read-error and unexpected-status `warn!`s in `drop_pending_if_finalized`.
-    settlement_finalize_confirm_failed => settlement_finalize_confirm_failed.inc();
-
-    /// A finalization-path pending-settle store write (`forget_pending` or a
-    /// re-stamp `record_pending`) returned a `StoreError` and was swallowed
-    /// (#810). Pairs with the persist-failure `warn!` sites in
-    /// `forget_pending_logged` / `restamp_pending_logged`.
-    settlement_pending_persist_failure => settlement_pending_persist_failures.inc();
-
-    /// The settlement watcher hit a channel-lifecycle persist failure
-    /// (`register_open_channel` / `update_channel_deposit` / `forget_channel`,
-    /// #751), in `SettlementSink::apply` (`payment_settlement.rs`). Only the
-    /// `forget_channel` arm is swallowed, and it carries the sole per-site
-    /// `warn!` ("failed to forget settled channel"); the other arms return `Err`,
-    /// so their context surfaces in `multiplexed_poller::run`'s loop-level
-    /// `warn!` ("watcher RPC error; restarting after backoff") instead.
+    /// The settlement watcher failed to forget a reclaimed pool's lane state
+    /// (`forget_lane`) on a `PoolReclaimed` event, in `PoolSettlementSink`
+    /// (`payment_settlement.rs`). The failure is swallowed — logged with a
+    /// per-site `warn!` ("failed to forget reclaimed lane") and the cursor
+    /// advances — so it is a lane-store health signal, not a stuck settlement.
     watcher_persist_failure => watcher_persist_failures.inc();
 
     /// A lane-store background flush failed — the dirty in-memory set is
@@ -2008,19 +1702,6 @@ recorders! {
     /// too many concurrent same-lane streams in flight and the pool's
     /// refundable floor cannot cover the reserved cost of another.
     serve_stream_rejected_lane_at_capacity => serve_stream_rejected_lane_at_capacity.inc();
-
-    /// Record a `serve_stream` delivery refused because the channel has a signed
-    /// cooperative-close waiver (ADR 003 §Cooperative close).
-    serve_stream_rejected_cooperative_close_signed
-        => serve_stream_rejected_cooperative_close_signed.inc();
-
-    /// Record a `CooperativeCloseRequest` declined for a missing/invalid
-    /// channel-client signature (ADR 003 §Cooperative close auth-bypass fix).
-    cooperative_close_request_unauthorized => cooperative_close_request_unauthorized.inc();
-
-    /// A waiver was signed for a channel with an accepted voucher but no stored
-    /// signature to echo, so a lagging client cannot reconcile (#1495).
-    cooperative_close_auth_no_echo => cooperative_close_auth_no_echo.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
@@ -3152,7 +2833,6 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_lane_at_capacity_total",
-            "decdn_serve_stream_rejected_cooperative_close_signed_total",
             // Completed in #1520. These four always exported (the fields have
             // existed as long as their siblings) — what was missing was any
             // assertion pinning it, so a rename could have silently broken a
@@ -3161,10 +2841,6 @@ mod tests {
             "decdn_serve_stream_rejected_hash_denied_total",
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
-            "decdn_cooperative_close_request_unauthorized_total",
-            // #1495: the two otherwise-invisible cooperative-close paths.
-            "decdn_cooperative_close_auth_no_echo_total",
-            "decdn_buyer_reconcile_watermark_healed_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -3182,14 +2858,10 @@ mod tests {
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_lane_at_capacity();
-        metrics.serve_stream_rejected_cooperative_close_signed();
         metrics.serve_stream_rejected_range_not_satisfiable();
         metrics.serve_stream_rejected_hash_denied();
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();
-        metrics.cooperative_close_request_unauthorized();
-        metrics.cooperative_close_auth_no_echo();
-        metrics.buyer_reconcile_watermark_healed();
 
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -3221,203 +2893,6 @@ mod tests {
             has_metric_line(&text, "decdn_receipt_writes_dropped_total", 1),
             "expected one dropped-receipt event:\n{text}"
         );
-    }
-
-    #[test]
-    fn settlement_auto_counters_start_at_zero_and_increment() {
-        // #742. Both auto-settlement counters must be exposed at zero on a
-        // fresh registry (dashboards built before any close don't render
-        // `(no data)`) and increment independently — the success counter
-        // (`settlement_auto_triggered`) and the failure counter
-        // (`settlement_auto_failures`) are deliberately distinct so an operator
-        // can compute a fire-vs-secured ratio. The OpenMetrics encoder appends
-        // `_total`, so the exported names are the suffixed forms asserted here.
-        let metrics = Metrics::new();
-        let text = metrics.encode().unwrap();
-        for name in [
-            "decdn_settlement_auto_triggered_total",
-            "decdn_settlement_auto_failures_total",
-        ] {
-            assert!(
-                has_metric_line(&text, name, 0),
-                "settlement-auto counter {name} should start at zero:\n{text}"
-            );
-        }
-
-        metrics.settlement_auto_triggered();
-        metrics.settlement_auto_failure();
-        metrics.settlement_auto_failure();
-
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_settlement_auto_triggered_total", 1),
-            "expected 1 secured close:\n{text}"
-        );
-        assert!(
-            has_metric_line(&text, "decdn_settlement_auto_failures_total", 2),
-            "expected 2 failed closes:\n{text}"
-        );
-    }
-
-    #[test]
-    fn settlement_dispute_counters_start_at_zero_and_increment() {
-        // #1586. The self-defense-dispute counters: an ok counter (a stale
-        // close was ratcheted up) and a failure counter (the dispute did not
-        // land). Both must be exposed at zero on a fresh registry (dashboards
-        // built before any dispute don't render `(no data)`) and increment
-        // independently so an operator can compute a fire-vs-recovered ratio.
-        // The OpenMetrics encoder appends `_total`, so the exported names are
-        // the suffixed forms asserted here.
-        let metrics = Metrics::new();
-        let text = metrics.encode().unwrap();
-        for name in [
-            "decdn_settlement_dispute_ok_total",
-            "decdn_settlement_dispute_failures_total",
-        ] {
-            assert!(
-                has_metric_line(&text, name, 0),
-                "settlement-dispute counter {name} should start at zero:\n{text}"
-            );
-        }
-
-        metrics.settlement_dispute_ok();
-        metrics.settlement_dispute_failure();
-        metrics.settlement_dispute_failure();
-
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_settlement_dispute_ok_total", 1),
-            "expected 1 landed dispute:\n{text}"
-        );
-        assert!(
-            has_metric_line(&text, "decdn_settlement_dispute_failures_total", 2),
-            "expected 2 failed disputes:\n{text}"
-        );
-    }
-
-    #[test]
-    fn settlement_finalize_counters_start_at_zero_and_increment() {
-        // #810. The `settleChannel` finalization-sweep counters: four
-        // `try_settle` outcome arms (ok / two transient / raw reverted), three
-        // post-revert resolution counters bumped by `drop_pending_if_finalized`
-        // (confirmed_closed / restamped / confirm_failed), and one shared
-        // pending-store persist-failure counter. All must be exposed at zero on
-        // a fresh registry (dashboards built before any sweep don't render
-        // `(no data)`) and increment independently so an operator can tell a
-        // flaky-RPC condition (`transient_*`, self-healing) from a raw revert
-        // and its benign-vs-degraded resolution. The OpenMetrics encoder
-        // appends `_total`, so the exported names are the suffixed forms
-        // asserted here; re-naming a field to include `_total` would emit
-        // `..._total_total`.
-        let metrics = Metrics::new();
-        let text = metrics.encode().unwrap();
-        for name in [
-            "decdn_settlement_finalize_ok_total",
-            "decdn_settlement_finalize_transient_send_total",
-            "decdn_settlement_finalize_transient_receipt_total",
-            "decdn_settlement_finalize_reverted_total",
-            "decdn_settlement_finalize_confirmed_closed_total",
-            "decdn_settlement_finalize_restamped_total",
-            "decdn_settlement_finalize_confirm_failed_total",
-            "decdn_settlement_pending_persist_failures_total",
-        ] {
-            assert!(
-                has_metric_line(&text, name, 0),
-                "settlement-finalize counter {name} should start at zero:\n{text}"
-            );
-        }
-
-        // Distinct counts per counter so independence is observable (not a
-        // single shared bump): 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8.
-        metrics.settlement_finalize_ok();
-        for _ in 0..2 {
-            metrics.settlement_finalize_transient_send();
-        }
-        for _ in 0..3 {
-            metrics.settlement_finalize_transient_receipt();
-        }
-        for _ in 0..4 {
-            metrics.settlement_finalize_reverted();
-        }
-        for _ in 0..5 {
-            metrics.settlement_finalize_confirmed_closed();
-        }
-        for _ in 0..6 {
-            metrics.settlement_finalize_restamped();
-        }
-        for _ in 0..7 {
-            metrics.settlement_finalize_confirm_failed();
-        }
-        for _ in 0..8 {
-            metrics.settlement_pending_persist_failure();
-        }
-
-        let text = metrics.encode().unwrap();
-        for (name, want) in [
-            ("decdn_settlement_finalize_ok_total", 1),
-            ("decdn_settlement_finalize_transient_send_total", 2),
-            ("decdn_settlement_finalize_transient_receipt_total", 3),
-            ("decdn_settlement_finalize_reverted_total", 4),
-            ("decdn_settlement_finalize_confirmed_closed_total", 5),
-            ("decdn_settlement_finalize_restamped_total", 6),
-            ("decdn_settlement_finalize_confirm_failed_total", 7),
-            ("decdn_settlement_pending_persist_failures_total", 8),
-        ] {
-            assert!(
-                has_metric_line(&text, name, want),
-                "expected {name} == {want}:\n{text}"
-            );
-        }
-    }
-
-    #[test]
-    fn buyer_unilateral_close_and_settle_metrics_start_at_zero_and_increment() {
-        // #988/#989. Lock the operator-visible (suffixed) names so an alert on
-        // the timeout-vs-RPC-failure distinction stays stable, same posture as
-        // the seller settlement-finalize test above.
-        let metrics = Metrics::new();
-        let text = metrics.encode().unwrap();
-        for name in [
-            "decdn_buyer_unilateral_close_unreachable_total",
-            "decdn_buyer_unilateral_close_rpc_failure_total",
-            "decdn_buyer_unilateral_close_ok_total",
-            "decdn_buyer_settle_ok_total",
-            "decdn_buyer_settle_deferred_total",
-        ] {
-            assert!(
-                has_metric_line(&text, name, 0),
-                "buyer close/settle counter {name} should start at zero:\n{text}"
-            );
-        }
-
-        // Distinct counts so independence is observable: 1 / 2 / 3 / 4 / 5.
-        metrics.buyer_unilateral_close_unreachable();
-        for _ in 0..2 {
-            metrics.buyer_unilateral_close_rpc_failure();
-        }
-        for _ in 0..3 {
-            metrics.buyer_unilateral_close_ok();
-        }
-        for _ in 0..4 {
-            metrics.buyer_settle_ok();
-        }
-        for _ in 0..5 {
-            metrics.buyer_settle_deferred();
-        }
-
-        let text = metrics.encode().unwrap();
-        for (name, want) in [
-            ("decdn_buyer_unilateral_close_unreachable_total", 1),
-            ("decdn_buyer_unilateral_close_rpc_failure_total", 2),
-            ("decdn_buyer_unilateral_close_ok_total", 3),
-            ("decdn_buyer_settle_ok_total", 4),
-            ("decdn_buyer_settle_deferred_total", 5),
-        ] {
-            assert!(
-                has_metric_line(&text, name, want),
-                "expected {name} == {want}:\n{text}"
-            );
-        }
     }
 
     #[test]
