@@ -1842,14 +1842,19 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// has not carried it yet, and a rollover voucher when the chain is spent. Both
 /// advance the lane's claim by nothing (they re-assert a cumulative the node
 /// already holds), so they credit nothing, and the outstanding chunk stays
-/// outstanding. Three messages is the real worst case (re-anchor, roll, reveal);
-/// the fourth is slack.
+/// outstanding. Three messages is the real worst case for a well-behaved payer
+/// (re-anchor, roll, reveal); the rest is slack for a duplicate or out-of-order
+/// reveal, which is ordinary once several streams share one lane and which also
+/// credits nothing.
 ///
 /// The bound matters because without it a payer could hold a stream open
 /// indefinitely with a run of zero-credit vouchers, each one refreshing the read
 /// timeout while the delivered-but-unpaid balance never moves — the same shape
-/// of stall the non-empty-`ChunkData` floor closes on the delivery side.
-const MAX_PROOFS_PER_CHUNK: u32 = 4;
+/// of stall the non-empty-`ChunkData` floor closes on the delivery side. The
+/// exact value trades slack against how long that stall may run; every read
+/// inside it still carries its own timeout, so the bound is about liveness, not
+/// about capping any single wait.
+const MAX_PROOFS_PER_CHUNK: u32 = 8;
 
 /// One payment proof off the wire: a signed voucher, or a released hash-chain
 /// preimage (ADR 003 §Two payment resolutions).

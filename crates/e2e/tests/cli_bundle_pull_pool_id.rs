@@ -10,7 +10,7 @@
 //!
 //! `--provider-address` is passed alongside `--node-id` to pin every entry to
 //! this one node, so both entries share the same `(signer, provider)` lane. Each
-//! blob is under one voucher interval but their sum is over it, so the shared
+//! blob is under one chunk but their sum is over it, so the shared
 //! lane watermark crosses the 4 MiB `CHUNK_BYTES` boundary across the
 //! two entries — and the persisted watermark must be the EXACT aggregate wire
 //! bytes (monotone, never double-paid), the per-provider serialization holding
@@ -80,7 +80,7 @@ async fn run() -> anyhow::Result<()> {
     // Two distinct served blobs → a two-entry bundle. Fetching both on ONE pool is
     // the point: the second entry reuses the pool the first opened, serialized by
     // the per-provider voucher lane lock. The sizes are deliberate: each blob is
-    // under one voucher interval (so a single entry never crosses the boundary
+    // under one chunk (so a single entry never crosses the boundary
     // alone), but their aggregate is over it, so the shared lane watermark crosses
     // the 4 MiB `CHUNK_BYTES` boundary across the two entries.
     let blob_a = vec![0x41u8; 3 * 1024 * 1024];
@@ -98,7 +98,7 @@ async fn run() -> anyhow::Result<()> {
         .context("aggregate wire-byte overflow")?;
     anyhow::ensure!(
         wire_a < CHUNK_BYTES && wire_b < CHUNK_BYTES,
-        "each blob must stay under one voucher interval: a={wire_a}, b={wire_b}, \
+        "each blob must stay under one chunk: a={wire_a}, b={wire_b}, \
          interval={CHUNK_BYTES}"
     );
     anyhow::ensure!(

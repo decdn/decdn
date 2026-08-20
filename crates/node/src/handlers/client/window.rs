@@ -85,7 +85,7 @@ impl ClientHandler {
         // The floor-M guard, the response signature, and the serve/pull window
         // all price against the fixed voucher accounting interval.
         let chunk_bytes = CHUNK_BYTES;
-        // The pre-flight reservation is the ramp floor — one voucher interval. In-
+        // The pre-flight reservation is the ramp floor — one chunk. In-
         // stream exposure is bounded by the ramped credit window, which the serve
         // loop and the pull-leg `RampPacer` both enforce (#1669).
         let credit_floor = self.credit_window(chunk_bytes, 0);
@@ -459,7 +459,7 @@ impl ClientHandler {
         // The floor-M guard, the response signature, and the serve/pull window
         // price against the fixed voucher accounting interval.
         let chunk_bytes = CHUNK_BYTES;
-        // The pre-flight reservation is the ramp floor — one voucher interval, the
+        // The pre-flight reservation is the ramp floor — one chunk, the
         // same bound the peer twin computes. In-stream exposure is bounded by the
         // ramped credit window, which the serve loop and the pull-leg `RampPacer`
         // both enforce (#1669).

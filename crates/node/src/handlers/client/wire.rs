@@ -7,7 +7,7 @@ use super::{
 };
 
 impl ClientHandler {
-    /// Enqueue one audit receipt for a served-and-paid voucher interval (issues
+    /// Enqueue one audit receipt for a served-and-paid chunk (issues
     /// #248, #803). Called only after `apply_voucher` committed the payment to
     /// the fsynced channel store, so a dropped receipt is non-fatal — the
     /// payment stands regardless.

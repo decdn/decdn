@@ -291,7 +291,7 @@ fn topup_fetch_argv_with_deposits(
 // The test above bakes the pool's very FIRST voucher into `InsufficientDeposit`
 // on a fresh pool — no prior accepted voucher exists, so this is the shallowest
 // possible exercise of the reactive branch. This test drives the deeper case:
-// several whole voucher intervals get delivered AND ACCEPTED first, and only the
+// several whole chunks get delivered AND ACCEPTED first, and only the
 // NEXT one exhausts the deposit.
 //
 // Reaching the top-up path here depends on `genuine_exhaustion` (client-pull's
@@ -373,7 +373,7 @@ async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> 
     Ok(())
 }
 
-/// A deterministic blob spanning just over two whole 4 MiB voucher intervals
+/// A deterministic blob spanning just over two whole 4 MiB chunks
 /// (the daemon's default cadence), so two full intervals are delivered and
 /// accepted before a small partial third exhausts
 /// `MULTI_WORKING_DEPOSIT_MICRO_USDC`.
@@ -403,7 +403,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
-    // A blob spanning just over two whole 4 MiB voucher intervals, so two full
+    // A blob spanning just over two whole 4 MiB chunks, so two full
     // intervals get delivered and accepted before a small partial tail
     // exhausts the deposit.
     let blob = make_multi_interval_blob();
@@ -598,7 +598,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // LESS than one group of already-paid content; two groups of headroom above
     // `wire_floor` also covers the resumed leg's own left-boundary proof hashes
     // (~log2(groups) × 64 B) and the handful of per-voucher `ceil` roundings —
-    // and is still ~250× below a single re-paid 4 MiB voucher interval, which is
+    // and is still ~250× below a single re-paid 4 MiB chunk, which is
     // what a genuine double-pay would add.
     let one_group_cost = ceil_cost(decdn_bao_range::CHUNK_GROUP_BYTES);
     let ceiling = wire_floor.saturating_add(one_group_cost.saturating_mul(U256::from(2u64)));

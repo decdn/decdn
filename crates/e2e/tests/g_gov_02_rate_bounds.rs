@@ -342,7 +342,7 @@ async fn run() -> anyhow::Result<()> {
     // headroom on the under-payment side, so a future change to voucher pricing or
     // blob size would start clamping credited bytes and surface here first.
     //
-    // The `+1` tolerance is for the over-payment side only: each voucher interval
+    // The `+1` tolerance is for the over-payment side only: each chunk
     // prices its delta with `div_ceil`, so a different interval split could round
     // a micro-USDC up. The regression this leg exists to catch — selling at the
     // unclamped configured rate — is nowhere near the tolerance.

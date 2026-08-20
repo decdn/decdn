@@ -193,7 +193,7 @@ impl Pacer for WindowPacer {
                 // not group-aligned would let the open overshoot the window by up to
                 // one group. Flooring keeps `pulled_frontier - served_paid_frontier <=
                 // window_bytes` EXACT (ADR 037). `window_bytes` is always at least one
-                // voucher interval — orders of magnitude larger than a 16 KiB group —
+                // chunk — orders of magnitude larger than a 16 KiB group —
                 // so a healthy window never floors to zero; only a sub-group remainder
                 // (the window all but full) floors to 0 -> `Wait`, which is correct:
                 // never draw a fraction that `align_range` would round past the window.
@@ -217,7 +217,7 @@ impl Pacer for WindowPacer {
 /// served-paid frontier, so on the fused serve-miss path the upstream pull never
 /// runs further ahead of cleared client payment than the ramped credit window
 /// allows. With a nonzero divisor a non-paying client's request therefore fronts
-/// at most one interval (the floor) of speculative upstream spend, and the window
+/// at most one chunk (the floor) of speculative upstream spend, and the window
 /// widens only as the client pays; a divisor of `0` opens the full `credit_max`
 /// from the first byte, the same instant-ceiling behavior as the downstream window.
 #[derive(Debug, Clone, Copy)]

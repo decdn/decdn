@@ -498,7 +498,7 @@ mod tests {
     /// The framer must cut exactly what `slice::chunks(CHUNK_SIZE)` cut over the
     /// concatenated export — that equivalence is the whole safety argument for
     /// replacing the buffered iterator (#1132), because the client's cumulative
-    /// wire-byte accounting and the voucher intervals are defined over the frame
+    /// wire-byte accounting and the chunks are defined over the frame
     /// sequence.
     #[tokio::test]
     async fn framing_matches_the_buffered_chunk_iterator() -> anyhow::Result<()> {

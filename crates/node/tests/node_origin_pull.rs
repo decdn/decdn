@@ -67,7 +67,7 @@ use support::{
 
 const CHAIN_ID: u64 = 421_614;
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// 1.5 MiB → crosses one 1-MiB voucher interval plus a closing voucher.
+/// 1.5 MiB → crosses one 1 MiB chunk plus a closing voucher.
 const PAYLOAD_LEN: usize = 1_572_864;
 const RATE: u64 = 10;
 /// A strictly-cheaper quote than [`RATE`] so the stalling provider ranks #1 in
@@ -4439,8 +4439,8 @@ fn spawn_a_mid_stream_silent_server(
     })
 }
 
-/// A provider that opens honestly, delivers a FULL voucher interval, acks the
-/// voucher the buyer presents for it — and only THEN goes silent (#1145 review).
+/// A provider that opens honestly, delivers a FULL chunk, acks the proof the
+/// buyer presents for it — and only THEN goes silent (#1145 review).
 ///
 /// The distinction from [`serve_then_go_silent`] is the whole point. That one stays
 /// deliberately UNDER the voucher accounting interval, so no voucher round trip intrudes:
@@ -4470,10 +4470,9 @@ async fn serve_a_paid_interval_then_go_silent(
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
-    // Exactly one voucher interval: CHUNK_SIZE divides CHUNK_BYTES
-    // evenly, so this lands the buyer's unvouchered counter precisely on the
-    // interval boundary and it must present a voucher before it will take
-    // another byte.
+    // Exactly one chunk: CHUNK_SIZE divides CHUNK_BYTES evenly, so this lands
+    // the buyer's unproved counter precisely on the chunk boundary and it must
+    // present a proof before it will take another byte.
     // Honest bao bytes, for the reason `serve_then_go_silent` records: the buyer
     // verifies each chunk group as it decodes, so filler would end the pull as
     // corruption long before the voucher round trip this fixture is built around.
@@ -4568,9 +4567,9 @@ fn spawn_a_paid_then_silent_server(
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Result<()> {
-    // Advertise two voucher intervals but serve only the first one, so the buyer is
-    // left waiting for a remainder that never comes — with one interval already
-    // bought and acked.
+    // Advertise two chunks but serve only the first one, so the buyer is left
+    // waiting for a remainder that never comes — with one chunk already bought
+    // and acked.
     let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(2)).unwrap_or(usize::MAX);
     let payload = vec![0x7Du8; payload_len];
     let hash = Hash::new(&payload);
@@ -4646,9 +4645,8 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
          silent-but-paid upstream) when the cancellation dropped it"
     );
 
-    // The upstream acked one voucher interval before going quiet: nonce 1,
-    // CHUNK_BYTES of bytes, `ceil(CHUNK_BYTES × RATE / 1 MiB)`
-    // in amount. That is real USDC, and it must be on the buyer's books even though
+    // The upstream acked one chunk before going quiet: CHUNK_BYTES of bytes,
+    // `ceil(CHUNK_BYTES × RATE / 1 MiB)` in amount. That is real USDC, and it must be on the buyer's books even though
     // the pull that spent it never returned.
     //
     // The persist happens on the PULL THREAD, not on the dropped `fetch` future:
@@ -4890,7 +4888,7 @@ async fn serve_refusal(
 /// wall clock between consecutive `ChunkData` frames (#1134).
 ///
 /// The one shape no other fixture produces, and the regression guard for the
-/// whole bounds rewrite. [`serve_wire_paced`] paces by *voucher interval*, not by
+/// whole bounds rewrite. [`serve_wire_paced`] paces by *chunk*, not by
 /// time — it never sleeps — so before this, no test moved a transfer past
 /// `pull_timeout`, and the old whole-blob deadline (which capped a node's
 /// pullable blob size at roughly `pull_timeout × link speed`) could be
@@ -6105,7 +6103,7 @@ const SLOW_PULL_OPEN_BUDGET: Duration = Duration::from_secs(2);
 /// capped the blob size a node could pull through at roughly
 /// `pull_timeout × link speed` — at the 20 s default, anything needing more than
 /// ~20 s of transfer was simply unfetchable. No test caught that, because
-/// `serve_wire_paced` paces by voucher interval and never sleeps: nothing in the
+/// `serve_wire_paced` paces by chunk and never sleeps: nothing in the
 /// suite moved a transfer past the deadline at all.
 ///
 /// So: six 1 KiB frames with a 600 ms gap ⇒ ~3.6 s of streaming, against a 2 s
@@ -7945,7 +7943,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_delivery()
 -> Result<()> {
-    // Many 1-MiB voucher intervals, so plenty of re-check boundaries remain
+    // Many 1 MiB chunks, so plenty of re-check boundaries remain
     // after the deny-set flip lands. Kept under node A's 16 MiB engine cap.
     let payload = vec![0x6Bu8; 12 * 1024 * 1024];
     let hash = Hash::new(&payload);
@@ -8846,7 +8844,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     let upstream_bytes: u64 = log
         .last()
         .map_or(0, |(_, bytes, _)| u64::try_from(*bytes).unwrap_or(u64::MAX));
-    // What the leaf actually paid for: it acked exactly one 1-MiB voucher interval
+    // What the leaf actually paid for: it acked exactly one 1 MiB chunk
     // before dropping (asserted above), so the content it received is the concrete
     // stand-in for its paid frontier (~one window).
     let paid = outcome.received;
@@ -9048,7 +9046,7 @@ async fn read_voucher(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
 /// Like [`serve_wrong_bytes`], but serves `wire` (a bao verified-stream,
 /// possibly corrupted mid-way) with the REAL per-interval voucher pacing:
 /// `total_bytes` (the CONTENT size) is advertised separately from the wire
-/// length, and a voucher is read + acked at every voucher interval boundary of
+/// length, and a voucher is read + acked at every chunk boundary of
 /// wire bytes, matching the buyer's cadence — so a multi-interval serve never
 /// deadlocks on an unacked mid-stream voucher. When the buyer aborts (e.g. its
 /// tee rejects a corrupt group, #915), the next write/read here errors and the
@@ -9287,7 +9285,7 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -> Result<()> {
-    // #915 review: a corrupt group MID-stream — past the first voucher interval,
+    // #915 review: a corrupt group MID-stream — past the first chunk,
     // with plenty of wire still to come — kills the verifying decoder while the
     // node is still forwarding, so the failure surfaces mid-stream rather than at
     // the end. This is the dominant real-world corruption shape. It must be
@@ -9316,7 +9314,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         bytes::Bytes::from(ob.data),
     )?;
     // Strip the 8-byte LE size header (the wire is header-less) and corrupt one
-    // byte past the first voucher interval.
+    // byte past the first chunk.
     let mut wire = combined
         .get(8..)
         .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
@@ -9588,7 +9586,7 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x6F);
     // 1 MiB ceiling, below the 1.5 MiB blob, so the SIZE gate trips — but the
-    // deposit guard (ceiling = min_payment(one voucher interval, RATE)) passes
+    // deposit guard (ceiling = min_payment(one chunk, RATE)) passes
     // against the funded leaf, so we exercise step (4), not the step (1) deposit
     // guard.
     let max_blob_size_bytes = 1024 * 1024;
@@ -13033,7 +13031,7 @@ fn topup_log(opener: &FundingOpener) -> Result<Vec<(Address, U256)>> {
 }
 
 /// A blob that costs more than the initial deposit but less than the working one:
-/// three voucher intervals of content, so the pull is refused mid-blob with real
+/// three chunks of content, so the pull is refused mid-blob with real
 /// delivered bytes behind it rather than at the very first voucher.
 fn multi_interval_payload() -> Arc<Vec<u8>> {
     let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 3 + 777;
@@ -13516,7 +13514,7 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
 /// that did not count would keep funding-and-failing rather than ending after one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once() -> Result<()> {
-    // ~10 voucher intervals of wire, so the whole blob costs ~10x RATE. The initial
+    // ~10 chunks of wire, so the whole blob costs ~10x RATE. The initial
     // deposit funds two, and the top-up restores headroom to three more — enough for
     // real progress on the resumed leg, and still far short of the blob.
     let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 9 + 777;

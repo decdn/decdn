@@ -418,7 +418,7 @@ impl ClientFixture {
     /// stream bytes: `read_frame` consumes the varint length prefix.)
     ///
     /// Deliberately never pays, which bounds what it can see. The node streams
-    /// `StreamResponse` + every `ChunkData` up to the voucher interval and then
+    /// `StreamResponse` + every `ChunkData` up to the chunk and then
     /// blocks on payment, so for a sub-interval blob this captures **every
     /// message the node emits before it blocks** — but never `StreamEnd`,
     /// which is emitted only after a voucher arrives. The capture

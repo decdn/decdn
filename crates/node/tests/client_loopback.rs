@@ -935,7 +935,7 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
 }
 
 /// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), a stream that
-/// has paid nothing is served only the floor — one voucher interval — and then
+/// has paid nothing is served only the floor — one chunk — and then
 /// parks, exactly the pre-ramp stop-and-wait cadence. `credit_max` being large
 /// makes no difference at `paid = 0`: the window is `ramped_credit_window`
 /// clamped to the floor until payment clears it.
@@ -1365,7 +1365,7 @@ struct VoucherTotals {
 /// connection AND chooses when to pay: it sends the `StreamRequest`, reads the
 /// signed `StreamResponse` and every `ChunkData` of the whole blob, and stops
 /// there. `expected_wire` bytes is the whole delivery, so with a payload well
-/// under one voucher interval the server has exactly one (closing) voucher left
+/// under one chunk the server has exactly one (closing) voucher left
 /// to collect and is now parked reading it — the stall is a protocol-level
 /// rendezvous, not a race, and it holds until the test pays (well inside the
 /// handler's 10s `VOUCHER_READ_TIMEOUT`).
@@ -1933,7 +1933,7 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
 /// ADR 005 §Payment lanes and concurrent streams: two same-lane streams share
 /// ONE aggregate byte counter and ONE cumulative-voucher watermark. Two
 /// deliveries run on one `(pool_id, signer, provider)` lane — each blob is under
-/// a single voucher interval, so neither stream crosses the 4 MiB
+/// a single chunk, so neither stream crosses the 1 MiB
 /// `CHUNK_BYTES` boundary alone, but their combined wire bytes do — so
 /// the SHARED lane counter is what carries the crossing. Both serve legs sit
 /// parked at their closing voucher on the one lane, then settle in the REVERSE of
@@ -1943,7 +1943,7 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
 /// stream is paid first (#1689).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> anyhow::Result<()> {
-    // Each blob is under one voucher interval, so a single stream yields just one
+    // Each blob is under one chunk, so a single stream yields just one
     // (closing) voucher; their sum clears the interval, so only the shared lane
     // counter crosses the boundary — the aggregate-accounting path under test.
     // Each blob is under ONE chunk on its own, so neither crosses the boundary
@@ -1963,7 +1963,7 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
     // clears it (so the shared counter must).
     anyhow::ensure!(
         blob_a.wire_bytes < CHUNK_BYTES && blob_b.wire_bytes < CHUNK_BYTES,
-        "each blob must stay under one voucher interval: a={}, b={}, interval={}",
+        "each blob must stay under one chunk: a={}, b={}, chunk={}",
         blob_a.wire_bytes,
         blob_b.wire_bytes,
         CHUNK_BYTES,
@@ -2018,7 +2018,7 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
         blob_b.wire_bytes,
     );
 
-    // A's cumulative voucher is where the shared counter crosses the 4 MiB
+    // A's cumulative voucher is where the shared counter crosses the 1 MiB
     // boundary (from `wire_b` to `wire_b + wire_a`).
     let (_a_completed_at, after_a) = stalled_a.pay_and_finish(&fx.client_signer, after_b).await?;
     anyhow::ensure!(
@@ -2071,7 +2071,7 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
 async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
     // ramp floor and the test can settle it with a single closing voucher —
-    // the same shape it had when the floor was a 4 MiB voucher interval.
+    // the same shape it had when the floor was a 4 MiB chunk.
     let payload_a = vec![0x71u8; 512 * 1024];
     let payload_b = vec![0x82u8; 256 * 1024];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -2156,7 +2156,7 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
 async fn finished_stream_releases_its_lane_slot() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
     // ramp floor and the test can settle it with a single closing voucher —
-    // the same shape it had when the floor was a 4 MiB voucher interval.
+    // the same shape it had when the floor was a 4 MiB chunk.
     let payload_a = vec![0x71u8; 512 * 1024];
     let payload_b = vec![0x82u8; 256 * 1024];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -2297,7 +2297,7 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
 async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
     // ramp floor and the test can settle it with a single closing voucher —
-    // the same shape it had when the floor was a 4 MiB voucher interval.
+    // the same shape it had when the floor was a 4 MiB chunk.
     let payload_a = vec![0x71u8; 512 * 1024];
     let payload_b = vec![0x82u8; 256 * 1024];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -2368,7 +2368,7 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
 /// on the order concurrent same-lane streams pay in.
 #[tokio::test(flavor = "multi_thread")]
 async fn skip_ahead_voucher_on_a_concurrent_lane_is_accepted() -> anyhow::Result<()> {
-    // Both blobs sit under one voucher interval, so each stream has a single
+    // Both blobs sit under one chunk, so each stream has a single
     // closing voucher; their sizes differ so a skip-ahead cumulative cannot
     // coincidentally match the reconstructed per-stream value.
     let payload_a = vec![0x71u8; 512 * 1024];
@@ -2615,7 +2615,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// it must NOT reset to `None`.
 ///
 /// Induced deterministically by deposit exhaustion (no mock server): a blob one
-/// voucher interval plus a remainder needs two vouchers — a cumulative amount
+/// chunk plus a remainder needs two vouchers — a cumulative amount
 /// for the interval, then a larger cumulative amount for the close — but the
 /// channel deposit only clears the first. The node acks voucher 1 and rejects
 /// voucher 2 as over-deposit, so the fetch errors after one acked voucher.
@@ -2641,7 +2641,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// attempt to serve.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
-    // 6 MiB — crosses one 4 MiB voucher interval, leaving a closing remainder,
+    // 6 MiB — crosses one 4 MiB chunk, leaving a closing remainder,
     // so the transfer needs exactly two vouchers.
     let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -2776,7 +2776,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
 /// path stamped the lane state.
 #[tokio::test(flavor = "multi_thread")]
 async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
-    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → crosses a voucher interval
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → crosses a chunk
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let client_signer = Arc::new(PrivateKeySigner::random());
@@ -3583,15 +3583,15 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
 /// #327 boundary + #848 free-egress: a stream request for a channel the node has
 /// never persisted is refused *pre-serve* — the node signs `ok: false` with the
 /// delivery-side `NotFound` code and ships zero bytes. Previously it served up to
-/// one voucher interval (or the whole blob, if smaller) for free and only
+/// one chunk (or the whole blob, if smaller) for free and only
 /// rejected the voucher mid-stream with `VoucherRejected { WrongChannel }`. The
-/// 1.5 MiB blob (larger than the voucher interval) proves the gate fires
+/// 1.5 MiB blob (larger than the chunk) proves the gate fires
 /// independent of blob size — not just for sub-interval blobs. Asserting on the
 /// server's `StreamResponse` (rather than the buyer's error string) proves the
 /// success path was never entered: an `ok: true` would have streamed bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
-    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — would cross a voucher interval if served
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — would cross a chunk if served
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     // Empty store: the channel is unknown to the node.
@@ -3660,7 +3660,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 /// window's cost at `RATE_PER_MB`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
-    // 6 MiB — larger than one credit window (the fixed 4 MiB voucher interval).
+    // 6 MiB — larger than one credit window (the fixed 4 MiB chunk).
     let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
@@ -3752,13 +3752,13 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
 
 /// The `min(credit window, request span)` term of the #1516 gate. The gate
 /// reserves what the node can actually front before the first voucher, which for
-/// a sub-interval blob is the blob — not a whole voucher interval it will never
+/// a sub-interval blob is the blob — not a whole chunk it will never
 /// stream. Reserving a whole interval here would price this request far above
 /// the ~3 the transfer really costs, and refuse a deposit that comfortably
 /// covers it, turning a correctness fix into a regression for small blobs.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Result<()> {
-    let payload = vec![0x2Cu8; 262_144]; // 256 KiB — a fraction of one voucher interval
+    let payload = vec![0x2Cu8; 262_144]; // 256 KiB — a fraction of one chunk
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
     let signer = Arc::new(PrivateKeySigner::random());
@@ -3809,7 +3809,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
 }
 
 /// #1669: with the ramp enabled (a non-zero `credit_ramp_divisor`), the gate
-/// prices at `paid = 0` — the floor, one voucher interval — not the fully-ramped
+/// prices at `paid = 0` — the floor, one chunk — not the fully-ramped
 /// `credit_max` ceiling. A deposit that covers exactly the floor's cost clears
 /// the gate even though `credit_max` is configured far larger: unlike the
 /// pre-ramp flat window, a big ceiling no longer means the node fronts that much
@@ -3879,7 +3879,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
 /// gate only ever priced at the floor.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyhow::Result<()> {
-    const CREDIT_MAX: u64 = 8 * 1024 * 1024; // two voucher intervals — wider than the floor
+    const CREDIT_MAX: u64 = 8 * 1024 * 1024; // two chunks — wider than the floor
     let payload = vec![0x77u8; 12 * 1024 * 1024]; // larger than the ceiling, so the ceiling binds
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -3898,7 +3898,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         None,
     ))?;
 
-    // Pool remaining covers only the first 4 MiB voucher interval of the 8 MiB ceiling.
+    // Pool remaining covers only the first 4 MiB chunk of the 8 MiB ceiling.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
         cache,
@@ -6033,7 +6033,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
 /// The takedown is landed only once a voucher has been accepted, which is what
 /// makes this test exercise the mid-stream path rather than racing the open-time
 /// gate: a voucher proves the request was already admitted and bytes are
-/// flowing. The blob is sized to many voucher intervals so boundaries remain
+/// flowing. The blob is sized to many chunks so boundaries remain
 /// after the flip.
 #[tokio::test(flavor = "multi_thread")]
 async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {

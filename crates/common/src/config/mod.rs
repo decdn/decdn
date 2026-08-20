@@ -372,10 +372,10 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default downstream credit-window ceiling (ADR 003 §Credit window): 64 MiB. A
-/// stream's window ramps from one voucher interval toward this cap in proportion
-/// to what the stream has already paid; a fully-ramped high-bandwidth lane runs
+/// stream's window ramps from one chunk toward this cap in proportion to what
+/// the stream has already paid; a fully-ramped high-bandwidth lane runs
 /// link-bound within this bound, while a non-paying lane stays pinned at the
-/// interval floor. Node-local policy, floored to one interval by the serve loop.
+/// chunk floor. Node-local policy, floored to one chunk by the serve loop.
 pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
 /// Default ramp divisor (ADR 003 §Credit window): 2. The credit window is at most
 /// `paid / credit_ramp_divisor`, so the node's unbilled egress on a stream never
@@ -2659,7 +2659,7 @@ pub fn resolve_payment_into(
     // Downstream credit-window ceiling (ADR 003 §Credit window). Default 64 MiB;
     // no upper bound beyond the runtime deposit guard — a larger ceiling is more
     // unbilled egress the node fronts once a stream has ramped up, which the
-    // operator owns. Floored to one interval by the serve loop, so no lower
+    // operator owns. Floored to one chunk by the serve loop, so no lower
     // bound is enforced here.
     let credit_max = file
         .and_then(|p| p.credit_max.as_ref())

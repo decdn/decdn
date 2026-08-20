@@ -580,7 +580,7 @@ impl ClientHandler {
                 // from an offset) the billed size genuinely is unknowable pre-fill,
                 // so the window stands. Be clear about the residual that leaves:
                 // this guard prices at `paid = 0`, i.e. the ramp floor — one
-                // voucher interval (`CHUNK_BYTES`, a fixed 4 MiB) —
+                // chunk (`CHUNK_BYTES`, a fixed 4 MiB) —
                 // not the fully-ramped `credit_max` ceiling (64 MiB by default),
                 // since a cold request has confirmed no payment yet. A channel
                 // funded for the blob but not for a floor interval is refused

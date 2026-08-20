@@ -2308,7 +2308,7 @@ pub struct UpstreamPullHeader {
 /// downstream client's own decoder, not by a whole-blob re-hash) or
 /// [`Self::abort`].
 ///
-/// It pays the upstream per voucher interval *inside* `next_chunk` — identical
+/// It pays the upstream per chunk *inside* `next_chunk` — identical
 /// pacing to `stream_fetch` — but yields each chunk to the caller (which
 /// forwards it to the paying downstream client and tees it into the cache)
 /// instead of buffering the whole blob. This is what lets the serving node cap
