@@ -121,6 +121,11 @@ where
 /// and never trips; a source that has fully delivered (missing == 0) is left to
 /// `fill_gap`'s own completion, never tripped. A zero deadline disables the
 /// watchdog.
+///
+/// `missing_bytes` progress is checkpoint-granular — it advances only every 4
+/// MiB `INGEST_CHECKPOINT_BYTES` interval — so `unit_deadline` must sit
+/// comfortably above `4 MiB / min-expected-throughput` to avoid falsely
+/// reassigning a healthy-but-slow source mid-checkpoint.
 async fn watchdog<St>(store: &St, start: u64, len: u64, deadline: Duration)
 where
     St: IngestStore,
@@ -352,52 +357,91 @@ where
         };
         let (r_start, r_len) = (range.fetch_start(), range.fetch_len());
 
-        // Drive the owned range OUTSIDE the lock, racing it against a steal
-        // cancel and the stall watchdog. Dropping the `fill_gap` future on
-        // either leaves the store's checkpointed prefix intact.
-        let outcome = {
-            let fill = fill_gap(
-                store,
-                source,
-                pacer,
-                funder,
-                ctx,
-                ledger,
-                hash,
-                r_start,
-                r_len,
-                total_bytes,
-                drive,
-                &mut counters,
-                on_progress,
-                None,
-                None,
-            );
-            tokio::select! {
-                biased;
-                res = fill => match res {
-                    Ok(()) => UnitOutcome::Completed,
-                    // A fault drops this source; the remainder goes to a peer.
-                    Err(_) => UnitOutcome::Faulted,
-                },
-                () = cancelled(&handle) => UnitOutcome::Cancelled,
-                () = watchdog(store, r_start, r_len, unit_deadline) => UnitOutcome::Faulted,
-            }
-        };
+        // Present-bytes backstop (scheduling-independent invariant: "never fetch
+        // or pay for bytes already present"). Between a peer's `fill_gap`
+        // returning `Ok` and its `clear(i)`, that peer's `in_flight` still
+        // advertises its just-COMPLETED, already-PAID range as steal-eligible; on
+        // a multi-thread runtime this worker can `pick`/steal it in that window.
+        // Re-deriving the still-missing sub-ranges OFF-lock and driving ONLY
+        // those closes that window structurally — a stolen already-present range
+        // yields an empty set and is skipped, so `fill_gap` (which resumes from
+        // its paid frontier and would re-pull the whole span) never re-pays for a
+        // present byte. Interior holes never arise — a picked range is contiguous
+        // and delivered front-to-back — so this is normally one suffix gap or
+        // (for a stolen completed range) none.
+        let gaps =
+            contiguous_byte_ranges(&store.missing_ranges(r_start, r_len).await?, total_bytes);
+        if gaps.is_empty() {
+            work.lock().await.clear(i);
+            continue;
+        }
 
-        match outcome {
-            UnitOutcome::Completed => {
+        // Drive each still-missing gap OUTSIDE the lock, racing it against a steal
+        // cancel and the stall watchdog. Dropping the `fill_gap` future on either
+        // leaves the store's checkpointed prefix intact. `in_flight[i]` stays the
+        // whole picked range so a peer's steal-trim and this worker's
+        // `requeue_missing` (which recomputes the whole range's remainder) agree.
+        let mut terminal: Option<UnitOutcome> = None;
+        for (g_start, g_len) in gaps {
+            let outcome = {
+                let fill = fill_gap(
+                    store,
+                    source,
+                    pacer,
+                    funder,
+                    ctx,
+                    ledger,
+                    hash,
+                    g_start,
+                    g_len,
+                    total_bytes,
+                    drive,
+                    &mut counters,
+                    on_progress,
+                    None,
+                    None,
+                );
+                tokio::select! {
+                    biased;
+                    res = fill => match res {
+                        Ok(()) => UnitOutcome::Completed,
+                        // A fault drops this source; the remainder goes to a peer.
+                        Err(_) => UnitOutcome::Faulted,
+                    },
+                    () = cancelled(&handle) => UnitOutcome::Cancelled,
+                    () = watchdog(store, g_start, g_len, unit_deadline) => UnitOutcome::Faulted,
+                }
+            };
+            match outcome {
+                UnitOutcome::Completed => {}
+                other => {
+                    terminal = Some(other);
+                    break;
+                }
+            }
+        }
+
+        match terminal {
+            // Every gap filled: free the lane and pick again.
+            None => {
                 work.lock().await.clear(i);
             }
-            UnitOutcome::Cancelled => {
-                // Stolen: re-queue the trimmed remainder and stay live.
+            // Stolen: re-queue the trimmed remainder and stay live. The
+            // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
+            // re-billed here — resume is checkpoint-frontier via `missing_ranges`,
+            // a bounded (<= credit window + one 4 MiB INGEST_CHECKPOINT_BYTES),
+            // client-favorable gap identical to the existing single-source
+            // cross-invocation resume, deliberately NOT the single-source
+            // same-leg re-bill contract.
+            Some(UnitOutcome::Cancelled) => {
                 requeue_missing(store, work, i).await?;
             }
-            UnitOutcome::Faulted => {
-                // Stalled/faulted: re-queue for a different source, then stop.
+            // Stalled/faulted: re-queue for a different source, then stop.
+            Some(UnitOutcome::Faulted) => {
                 requeue_missing(store, work, i).await?;
                 break;
             }
+            Some(UnitOutcome::Completed) => {}
         }
     }
     Ok(())
@@ -819,6 +863,83 @@ mod tests {
              (fast={}, slow={}) for a {total}-byte blob",
             src_fast.delivered_bytes(),
             src_slow.delivered_bytes()
+        );
+        Ok(())
+    }
+
+    /// The multi-thread variant of the no-double-pay guard, deterministically
+    /// hitting the completed-but-uncleared window on a real 2-thread runtime.
+    /// `src_slow_finish` delivers its whole segment then stalls INSIDE `finish`,
+    /// so its completed range stays in `in_flight` (delivered, `fill_gap` not yet
+    /// returned) for the whole stall. `src_stealer` starts late, finishes its own
+    /// segment, and — with `pending` empty — steals that completed, fully-present
+    /// range. Without the present-bytes backstop the stealer re-opens and re-pays
+    /// the stolen tail (total fetched climbs past the blob size); the backstop
+    /// re-derives the still-missing sub-ranges (empty here) before driving, so the
+    /// stolen completed range is skipped and total fetched stays near the blob
+    /// size. This scenario also drives the store from two OS threads at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_steal_no_double_pay_on_multi_thread_runtime() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let total = data.len() as u64;
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        // Delivers its segment fast, then holds it completed-but-uncleared for
+        // 500 ms inside `finish` — the window a peer steals into.
+        let src_slow_finish = ScriptedSource::new(data.clone())?
+            .slow_finish(Duration::from_millis(500))
+            .paying(Arc::clone(&ledger));
+        // Starts 100 ms late so the other source is already parked in `finish`
+        // (its range delivered and present) by the time this one frees up and
+        // steals it.
+        let src_stealer = ScriptedSource::new(data.clone())?
+            .slow_to_start(Duration::from_millis(100))
+            .paying(Arc::clone(&ledger));
+        let root = src_slow_finish.root();
+        let (store, dir) = fresh_store(root, total);
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        multi_source_fetch(
+            &store,
+            &[&src_slow_finish, &src_stealer],
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(30),
+            },
+            None,
+        )
+        .await?;
+
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical on the multi-thread runtime"
+        );
+
+        let total_delivered = src_slow_finish.delivered_bytes() + src_stealer.delivered_bytes();
+        // The backstop makes this exactly the blob size (every present-range steal
+        // is skipped); the pre-fix code re-fetches the stolen tail, +8 MiB here.
+        // A 4 MiB slop sits cleanly between the two.
+        assert!(
+            total_delivered <= total + 4 * 1024 * 1024,
+            "a completed-but-uncleared range must not be re-fetched: delivered \
+             {total_delivered} (slow_finish={}, stealer={}) for a {total}-byte blob",
+            src_slow_finish.delivered_bytes(),
+            src_stealer.delivered_bytes(),
         );
         Ok(())
     }

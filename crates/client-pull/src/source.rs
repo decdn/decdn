@@ -382,6 +382,12 @@ mod doubles {
         /// forcing the steal path deterministically without wall-clock racing on
         /// per-byte timing.
         first_read_stall: Option<Duration>,
+        /// Delay injected inside `finish`, AFTER the range's bytes are fully
+        /// delivered but BEFORE `fill_gap` returns. Holds the completed range in
+        /// the scheduler's `in_flight` (delivered, not yet cleared) so a peer's
+        /// steal of an already-present range is deterministic — the exact
+        /// completed-but-uncleared window the present-bytes backstop must close.
+        finish_stall: Option<Duration>,
         /// Optional ledger to advance on a clean `finish`, modelling payment: a
         /// real pull pays vouchers for the WIRE bytes it drains, and the driver's
         /// completion is PAID-frontier based (`content_paid_frontier`), so a double
@@ -420,8 +426,19 @@ mod doubles {
                 opened: Arc::new(Mutex::new(Vec::new())),
                 delivered: Arc::new(AtomicU64::new(0)),
                 first_read_stall: None,
+                finish_stall: None,
                 ledger: None,
             })
+        }
+
+        /// Delay every `finish` by `stall` after its range is fully delivered,
+        /// holding the completed range in the scheduler's `in_flight` so a peer's
+        /// steal of an already-present range fires deterministically (see
+        /// [`finish_stall`](Self::finish_stall)).
+        #[must_use]
+        pub const fn slow_finish(mut self, stall: Duration) -> Self {
+            self.finish_stall = Some(stall);
+            self
         }
 
         /// Inject a one-time `stall` on the first read of every reader this
@@ -563,6 +580,11 @@ mod doubles {
 
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             Box::pin(async move {
+                // Hold the completed-but-unpaid range open (delivered, `fill_gap`
+                // not yet returned) so a peer can steal it while it is present.
+                if let Some(stall) = self.finish_stall {
+                    tokio::time::sleep(stall).await;
+                }
                 let Some(ledger) = &self.ledger else {
                     // Unpaid double: no channel, nothing to drain, no watermark.
                     return Ok(VoucherProgress::default());
