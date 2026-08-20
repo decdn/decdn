@@ -13,6 +13,7 @@ mod egress;
 mod resource_pressure;
 mod state;
 
+pub use egress::EgressMeter;
 pub use resource_pressure::{Params as ResourcePressureParams, ResourcePressure};
 
 /// Which serve tier a request falls into, resolved where `cache.has` is known.
