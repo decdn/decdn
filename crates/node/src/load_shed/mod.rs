@@ -13,6 +13,8 @@ mod egress;
 mod resource_pressure;
 mod state;
 
+pub use resource_pressure::{Params as ResourcePressureParams, ResourcePressure};
+
 /// Which serve tier a request falls into, resolved where `cache.has` is known.
 /// A hit is local — zero upstream cost, pure margin — so it is shed last; a
 /// miss fronts origin egress / upstream USDC and stresses disk and CPU, so it
