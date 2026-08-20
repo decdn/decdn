@@ -72,6 +72,7 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use decdn_bao_range::RangedStore;
 pub use driver::{PacingWait, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
@@ -80,7 +81,7 @@ pub use pacer::{
     BudgetPacer, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
 };
 pub use ranged_store::ClientRangedStore;
-pub use scheduler::{MultiSourceConfig, multi_source_fetch};
+pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
 
 #[cfg(any(test, feature = "test-util"))]

@@ -295,6 +295,10 @@ where
             on_progress,
             pacing_wait,
             served_paid,
+            // Single-source: the deposit gate uses this one lane's own committed
+            // amount (no aggregate view). The multi-source scheduler passes a
+            // shared summing reader here instead.
+            None,
         )
         .await?;
     }
@@ -345,6 +349,7 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
     served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    pool_spent: Option<&(dyn Fn() -> U256 + Send + Sync)>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -352,6 +357,17 @@ where
     P: Pacer,
     F: Funder,
 {
+    // Solvency basis for the deposit gate. On the single-source path (`None`) it
+    // is THIS lane's own committed amount — `deposit - own_committed`, unchanged.
+    // On the multi-source path a shared reader sums EVERY lane's committed amount,
+    // so each worker gates on `pool_deposit - aggregate_committed` — the true
+    // SHARED remaining toward the reserved floor, so concurrent lanes drawing on
+    // one pool cannot each independently believe the whole deposit is theirs (ADR
+    // 039 § Payment model: one deposit backs the whole set). It replaces ONLY the
+    // amount subtracted for the deposit gate — the per-leg paid-frontier math below
+    // still reads THIS lane's own `committed.bytes`.
+    let spent = move |own_amount: U256| pool_spent.map_or(own_amount, |f| f());
+
     // Per-open state; reset the moment an open succeeds. `awaiting_settle` is set
     // only right after a top-up, and consulted ONLY in the error-classification
     // path below: it gates the bounded settle-wait on an ACTUAL stale-resume
@@ -395,7 +411,7 @@ where
         let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 
         let committed = ledger.committed();
-        let remaining_deposit = locked_deposit(ctx)?.saturating_sub(committed.amount);
+        let remaining_deposit = locked_deposit(ctx)?.saturating_sub(spent(committed.amount));
 
         // Anchor the leg on the first pass at `gap_start` with the current committed
         // baseline (fresh / cross-invocation: `paid_wire == 0`, so the frontier is
@@ -601,7 +617,7 @@ where
                         let guard = ctx
                             .lock()
                             .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
-                        let remaining = guard.deposit.saturating_sub(committed.amount);
+                        let remaining = guard.deposit.saturating_sub(spent(committed.amount));
 
                         // 2. Desync heal (driver-owned, NOT a PaceDecision): an
                         //    authenticated bundle that ADVANCES our committed

@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alloy::primitives::U256;
 use decdn_bao_range::{AlignedRange, align_range};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -62,6 +63,43 @@ use crate::driver::{DriveConfig, DriveCounters, contiguous_byte_ranges, fill_gap
 use crate::segment::{initial_segments, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{Pacer, PoolContext, PoolLedger, ProgressCallback};
+
+/// One paid delivery lane in a multi-source fetch: a source paired with the
+/// `(ctx, ledger)` that pays IT — never shared across sources.
+///
+/// A voucher is scoped to one on-chain `provider` (ADR 039 § Payment model): the
+/// [`PoolContext::provider`](crate::PoolContext) it is signed against, and it is
+/// invalid if redeemed by any other node. And a [`PoolLedger`] tracks ONE
+/// `(signer, provider)` lane's cumulative watermark. So each admitted source —
+/// a distinct operator, by [`admit_sources`](crate::discovery::admit_sources)'s
+/// operator spread — carries its OWN `ctx` (built via
+/// [`PoolContext::with_provider`](crate::PoolContext::with_provider) for that
+/// source's provider and that lane's persisted prior cumulative) and its OWN
+/// `ledger` (seeded from the same lane's `Cumulative`). One shared pool DEPOSIT
+/// still backs every lane; the aggregate-solvency reader
+/// ([`multi_source_fetch`]) sums the lanes' committed so no lane over-draws it.
+pub struct SourceLane<'a, S> {
+    /// The paid source this lane fetches from.
+    pub source: &'a S,
+    /// The buyer context that pays this source — its `provider` is this lane's
+    /// payee, behind the shared `Arc<Mutex<..>>` so a reactive top-up's new
+    /// deposit is visible to this lane's next open.
+    pub ctx: Arc<Mutex<PoolContext>>,
+    /// This lane's voucher ledger, seeded from its persisted cumulative — the
+    /// per-`(signer, provider)` watermark, never shared with another lane.
+    pub ledger: Arc<PoolLedger>,
+}
+
+impl<S> std::fmt::Debug for SourceLane<'_, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The source is opaque and `PoolContext` guards a signing key, so print
+        // only the non-sensitive lane identity (its payee provider).
+        let provider = self.ctx.lock().ok().map(|c| c.provider);
+        f.debug_struct("SourceLane")
+            .field("provider", &provider)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Per-source interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
 /// that says the wakeup means "cancel", not a stale permit. The stealer sets
@@ -326,6 +364,7 @@ async fn run_worker<St, S, P, F>(
     work: &AsyncMutex<Work>,
     on_progress: Option<&ProgressCallback>,
     unit_deadline: Duration,
+    pool_spent: &(dyn Fn() -> U256 + Send + Sync),
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -400,6 +439,10 @@ where
                     on_progress,
                     None,
                     None,
+                    // Aggregate solvency: gate this lane on the SHARED pool's
+                    // remaining balance (deposit minus every lane's committed),
+                    // not this one lane's spend alone.
+                    Some(pool_spent),
                 );
                 tokio::select! {
                     biased;
@@ -448,9 +491,21 @@ where
 }
 
 /// Fetch `hash`'s request `[offset, offset+len)` by fanning it out across
-/// `sources`, all writing into the one shared `store` (spec §5.3). Splits the
-/// gap-set into bao-aligned segments, drives one worker per source, and lets a
-/// freed source steal the tail of the largest range still in flight.
+/// `lanes`, all writing into the one shared `store` (spec §5.3). Splits the
+/// gap-set into bao-aligned segments, drives one worker per lane, and lets a
+/// freed lane steal the tail of the largest range still in flight.
+///
+/// # Per-source payment (ADR 039 § Payment model)
+///
+/// Each [`SourceLane`] pays with its OWN `(ctx, ledger)`: a voucher is scoped to
+/// one on-chain provider and one `(signer, provider)` watermark, so lane `i`'s
+/// worker signs against `lanes[i].ctx.provider` and advances `lanes[i].ledger`
+/// alone. One shared pool DEPOSIT backs the whole set: every worker gates its
+/// draw on `pool_deposit - Σ lanes[j].ledger.committed()` (the aggregate reader
+/// built below), so concurrent lanes cannot each independently spend the whole
+/// deposit. The gate is evaluated at each `fill_gap` leg boundary; the hard
+/// backstop against a node redeeming past the deposit stays on-chain (the pool
+/// pays first-come up to its deposit), exactly as on the single-source path.
 ///
 /// Returns once every gap is filled (or a worker faults). Finalization is the
 /// caller's job — like [`crate::drive`], this only flushes the present record
@@ -458,17 +513,15 @@ where
 ///
 /// # Errors
 ///
-/// An empty `sources`, a fault from any worker's `fill_gap` (a terminal
+/// An empty `lanes`, a fault from any worker's `fill_gap` (a terminal
 /// source/store fault, or a `Refuse`), a segmentation alignment error, or an
 /// I/O failure flushing the present record.
 #[allow(clippy::too_many_arguments)]
 pub async fn multi_source_fetch<St, S, P, F>(
     store: &St,
-    sources: &[&S],
+    lanes: &[SourceLane<'_, S>],
     pacer: &P,
     funder: &F,
-    ctx: &Arc<Mutex<PoolContext>>,
-    ledger: &Arc<PoolLedger>,
     hash: [u8; 32],
     offset: u64,
     len: u64,
@@ -482,8 +535,8 @@ where
     P: Pacer,
     F: Funder,
 {
-    if sources.is_empty() {
-        anyhow::bail!("multi_source_fetch requires at least one source");
+    if lanes.is_empty() {
+        anyhow::bail!("multi_source_fetch requires at least one source lane");
     }
     let total_bytes = store.total_bytes();
 
@@ -498,32 +551,48 @@ where
 
     // At least one segment; `min` honors `max_sources`, `max(1)` guards a
     // degenerate `max_sources == 0` config from silently fetching nothing.
-    let k = ms.max_sources.min(sources.len()).max(1);
+    let k = ms.max_sources.min(lanes.len()).max(1);
     let segs = initial_segments(&gaps, k, total_bytes)?;
 
     let work = AsyncMutex::new(Work {
         pending: segs.into_iter().collect(),
-        in_flight: vec![None; sources.len()],
-        cancel: (0..sources.len())
+        in_flight: vec![None; lanes.len()],
+        cancel: (0..lanes.len())
             .map(|_| Arc::new(CancelHandle::new()))
             .collect(),
     });
 
-    let workers = sources.iter().enumerate().map(|(i, source)| {
+    // Shared aggregate-solvency reader: the sum, across EVERY lane, of the
+    // committed voucher amount — the pool's total spend so far. Each worker
+    // subtracts this from the shared deposit to size its own remaining balance,
+    // so no lane treats the whole deposit as its own. Cloning the `Arc<PoolLedger>`
+    // handles keeps the closure `'static`-free of the borrow on `lanes` and lets
+    // every worker share one reader.
+    let lane_ledgers: Vec<Arc<PoolLedger>> = lanes.iter().map(|l| Arc::clone(&l.ledger)).collect();
+    let pool_spent = move || {
+        lane_ledgers
+            .iter()
+            .map(|l| l.committed().amount)
+            .fold(U256::ZERO, U256::saturating_add)
+    };
+    let pool_spent: &(dyn Fn() -> U256 + Send + Sync) = &pool_spent;
+
+    let workers = lanes.iter().enumerate().map(|(i, lane)| {
         run_worker(
             i,
             store,
-            *source,
+            lane.source,
             pacer,
             funder,
-            ctx,
-            ledger,
+            &lane.ctx,
+            &lane.ledger,
             hash,
             total_bytes,
             drive,
             &work,
             on_progress,
             ms.unit_deadline,
+            pool_spent,
         )
     });
     futures_util::future::try_join_all(workers).await?;
@@ -563,9 +632,9 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::DepositOutcome;
 
-    use super::{MultiSourceConfig, multi_source_fetch};
+    use super::{MultiSourceConfig, SourceLane, multi_source_fetch};
     use crate::driver::DriveConfig;
-    use crate::pacer::BudgetPacer;
+    use crate::pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
     use crate::source::{FakeFunder, ScriptedSource};
     use crate::{ClientRangedStore, Cumulative, PoolContext, PoolLedger};
     use decdn_bao_range::RangedStore;
@@ -576,19 +645,41 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
-    /// A healthy buyer context: a huge deposit so the pacer never has to top up.
-    fn healthy_ctx() -> PoolContext {
+    /// A healthy buyer context paying `provider`, with `deposit` on the pool.
+    fn ctx_with(provider: u8, deposit: U256) -> PoolContext {
         let signer = PrivateKeySigner::random();
         PoolContext {
             pool_id: B256::ZERO,
-            provider: Address::repeat_byte(0xAB),
-            deposit: U256::from(u128::MAX),
+            provider: Address::repeat_byte(provider),
+            deposit,
             client_signer: Arc::new(signer),
             voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,
             capability: None,
+        }
+    }
+
+    /// A shared handle to a healthy buyer context (huge deposit so the pacer never
+    /// tops up) paying the given `provider`.
+    fn ctx_for(provider: u8) -> Arc<Mutex<PoolContext>> {
+        Arc::new(Mutex::new(ctx_with(provider, U256::from(u128::MAX))))
+    }
+
+    /// Build one paid lane: a `ScriptedSource` over `data` paying a fresh ledger,
+    /// with a context pinned to `provider`. Returns the source, its ledger, and a
+    /// closure that turns a borrow of the source into a [`SourceLane`] — the
+    /// source must outlive the lane, so the caller owns it.
+    fn lane(
+        source: &ScriptedSource,
+        ledger: Arc<PoolLedger>,
+        provider: u8,
+    ) -> SourceLane<'_, ScriptedSource> {
+        SourceLane {
+            source,
+            ctx: ctx_for(provider),
+            ledger,
         }
     }
 
@@ -603,25 +694,27 @@ mod tests {
     #[tokio::test]
     async fn two_sources_fetch_large_blob_byte_identical() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        // Both sources pay from the SAME pool/ledger (single deposit backs the
-        // whole set) and hold the whole blob.
-        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
-        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
+        // Each source pays its OWN lane (its own provider + ledger); one shared
+        // pool deposit backs both. Both hold the whole blob.
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
         let root = src_a.root();
         let total = src_a.total_bytes();
         let (store, dir) = fresh_store(root, total);
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
         multi_source_fetch(
             &store,
-            &[&src_a, &src_b],
+            &lanes,
             &pacer,
             &funder,
-            &ctx,
-            &ledger,
             root,
             0,
             total,
@@ -672,17 +765,15 @@ mod tests {
         let root = src.root();
         let total = src.total_bytes();
         let (store, dir) = fresh_store(root, total);
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let lanes = vec![lane(&src, Arc::clone(&ledger), 0xA1)];
         multi_source_fetch(
             &store,
-            &[&src],
+            &lanes,
             &pacer,
             &funder,
-            &ctx,
-            &ledger,
             root,
             0,
             total,
@@ -720,28 +811,30 @@ mod tests {
     #[tokio::test]
     async fn stalled_source_tail_is_reassigned_and_fetch_completes() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
         // src_a faults after 8 MiB of wire on any range longer than that; its
         // 32 MiB initial segment therefore delivers only a ~8 MiB prefix then
         // faults. src_b is healthy.
         let src_a = ScriptedSource::new(data.clone())?
             .with_fault_after(8 * 1024 * 1024, || anyhow::anyhow!("scripted stall"))
-            .paying(Arc::clone(&ledger));
-        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
         let root = src_a.root();
         let total = src_a.total_bytes();
         let (store, dir) = fresh_store(root, total);
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
         multi_source_fetch(
             &store,
-            &[&src_a, &src_b],
+            &lanes,
             &pacer,
             &funder,
-            &ctx,
-            &ledger,
             root,
             0,
             total,
@@ -801,27 +894,29 @@ mod tests {
     async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
         let total = data.len() as u64;
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let src_fast = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
+        let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_fast = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_fast));
         // Every leg the slow source opens stalls 200 ms before its first byte —
         // long enough that the fast source (only cooperative yields) always
         // finishes first and steals, deterministically forcing the steal path.
         let src_slow = ScriptedSource::new(data.clone())?
             .slow_to_start(Duration::from_millis(200))
-            .paying(Arc::clone(&ledger));
+            .paying(Arc::clone(&ledger_slow));
         let root = src_fast.root();
         let (store, dir) = fresh_store(root, total);
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let lanes = vec![
+            lane(&src_fast, Arc::clone(&ledger_fast), 0xA1),
+            lane(&src_slow, Arc::clone(&ledger_slow), 0xB2),
+        ];
         multi_source_fetch(
             &store,
-            &[&src_fast, &src_slow],
+            &lanes,
             &pacer,
             &funder,
-            &ctx,
-            &ledger,
             root,
             0,
             total,
@@ -882,31 +977,33 @@ mod tests {
     async fn forced_steal_no_double_pay_on_multi_thread_runtime() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
         let total = data.len() as u64;
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_finish = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_stealer = Arc::new(PoolLedger::new(Cumulative::default()));
         // Delivers its segment fast, then holds it completed-but-uncleared for
         // 500 ms inside `finish` — the window a peer steals into.
         let src_slow_finish = ScriptedSource::new(data.clone())?
             .slow_finish(Duration::from_millis(500))
-            .paying(Arc::clone(&ledger));
+            .paying(Arc::clone(&ledger_finish));
         // Starts 100 ms late so the other source is already parked in `finish`
         // (its range delivered and present) by the time this one frees up and
         // steals it.
         let src_stealer = ScriptedSource::new(data.clone())?
             .slow_to_start(Duration::from_millis(100))
-            .paying(Arc::clone(&ledger));
+            .paying(Arc::clone(&ledger_stealer));
         let root = src_slow_finish.root();
         let (store, dir) = fresh_store(root, total);
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let lanes = vec![
+            lane(&src_slow_finish, Arc::clone(&ledger_finish), 0xA1),
+            lane(&src_stealer, Arc::clone(&ledger_stealer), 0xB2),
+        ];
         multi_source_fetch(
             &store,
-            &[&src_slow_finish, &src_stealer],
+            &lanes,
             &pacer,
             &funder,
-            &ctx,
-            &ledger,
             root,
             0,
             total,
@@ -951,28 +1048,30 @@ mod tests {
     async fn all_sources_failing_errors_without_hang() -> anyhow::Result<()> {
         let data = blob(32 * 1024 * 1024);
         let total = data.len() as u64;
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
         let src_a = ScriptedSource::new(data.clone())?
             .with_fault_after(0, || anyhow::anyhow!("immediate fault a"))
-            .paying(Arc::clone(&ledger));
+            .paying(Arc::clone(&ledger_a));
         let src_b = ScriptedSource::new(data.clone())?
             .with_fault_after(0, || anyhow::anyhow!("immediate fault b"))
-            .paying(Arc::clone(&ledger));
+            .paying(Arc::clone(&ledger_b));
         let root = src_a.root();
         let (store, _dir) = fresh_store(root, total);
-        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
         let pacer = BudgetPacer::new();
 
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             multi_source_fetch(
                 &store,
-                &[&src_a, &src_b],
+                &lanes,
                 &pacer,
                 &funder,
-                &ctx,
-                &ledger,
                 root,
                 0,
                 total,
@@ -994,6 +1093,204 @@ mod tests {
         assert!(
             inner.is_err(),
             "all sources failing must surface as an error, not a false success"
+        );
+        Ok(())
+    }
+
+    /// Part A — per-provider payment lanes. Two sources with DISTINCT providers
+    /// each pay their OWN ledger: the fetch assembles byte-identical, and each
+    /// lane's cumulative advances INDEPENDENTLY, tracking exactly the wire that
+    /// source delivered (never the peer's). The pre-fix scheduler shared one
+    /// `ctx`/`ledger` for every source, so a second provider's bytes were paid on
+    /// the first provider's lane; here each lane's `committed().bytes` matches its
+    /// OWN source's delivered wire, proving the lanes are separate.
+    #[tokio::test]
+    async fn distinct_providers_each_pay_their_own_lane() -> anyhow::Result<()> {
+        let data = blob(64 * 1024 * 1024);
+        let total = data.len() as u64;
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        // Two DISTINCT on-chain providers — the operator spread `admit_sources`
+        // produces. Each lane carries its own ctx (its own `provider`) and ledger.
+        let lane_a = lane(&src_a, Arc::clone(&ledger_a), 0xA1);
+        let lane_b = lane(&src_b, Arc::clone(&ledger_b), 0xB2);
+        let provider_a = lane_a.ctx.lock().expect("ctx").provider;
+        let provider_b = lane_b.ctx.lock().expect("ctx").provider;
+        assert_ne!(
+            provider_a, provider_b,
+            "the two lanes must pay two DIFFERENT providers"
+        );
+
+        let lanes = vec![lane_a, lane_b];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical across two distinct-provider lanes"
+        );
+
+        // Each lane's ledger advanced INDEPENDENTLY, and each carries only its OWN
+        // ~half of the blob — NOT the pool total. A single shared ledger (the
+        // pre-fix bug, forced by the old one-ledger API) would have BOTH sources'
+        // `finish` advance the SAME cumulative to ~the whole blob's wire; two
+        // separate lanes each stay strictly below the whole blob, and together
+        // cover it.
+        let committed_a = ledger_a.committed();
+        let committed_b = ledger_b.committed();
+        assert!(
+            committed_a.amount > U256::ZERO && committed_b.amount > U256::ZERO,
+            "both lanes must have advanced their own cumulative: a={committed_a:?} b={committed_b:?}"
+        );
+        assert!(
+            committed_a.bytes < U256::from(total) && committed_b.bytes < U256::from(total),
+            "neither lane alone may bill the whole blob — a shared ledger would: \
+             a={committed_a:?} b={committed_b:?} total={total}"
+        );
+        assert!(
+            committed_a.bytes.saturating_add(committed_b.bytes) >= U256::from(total),
+            "the two independent lanes must together cover the whole blob: a={committed_a:?} \
+             b={committed_b:?} total={total}"
+        );
+        Ok(())
+    }
+
+    /// A [`Pacer`] that records the minimum `remaining_deposit` any `decide` saw,
+    /// then defers to [`BudgetPacer`]. Proves what balance the workers actually
+    /// gated on.
+    struct MinRemainingPacer {
+        inner: BudgetPacer,
+        min_remaining: Mutex<Option<U256>>,
+    }
+
+    impl Pacer for MinRemainingPacer {
+        fn decide(&self, s: &PaceState) -> PaceDecision {
+            if let Ok(mut g) = self.min_remaining.lock() {
+                *g = Some(g.map_or(s.remaining_deposit, |m| m.min(s.remaining_deposit)));
+            }
+            self.inner.decide(s)
+        }
+    }
+
+    /// Part B — shared-pool aggregate solvency. Two lanes draw on ONE pool
+    /// deposit `D`. Each worker's `remaining_deposit` is `D - Σ committed across
+    /// EVERY lane`, so the smallest balance any pacing decision saw drops below
+    /// `D - max(single-lane committed)` — the floor a per-lane gate (each lane
+    /// subtracting only its OWN spend) could never go under. That difference is
+    /// the whole point: without the aggregate reader each of the two lanes would
+    /// believe the entire deposit was its own.
+    #[tokio::test]
+    async fn concurrent_lanes_gate_on_the_shared_pool_balance() -> anyhow::Result<()> {
+        let data = blob(8 * 1024 * 1024);
+        let total = data.len() as u64;
+        // A pool deposit far above the ~8-unit blob cost, so the fetch always
+        // completes; the test reads the observed balances, not a refusal.
+        let deposit = U256::from(1_000u64);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = MinRemainingPacer {
+            inner: BudgetPacer::new(),
+            min_remaining: Mutex::new(None),
+        };
+
+        // Both lanes' ctxs carry the SAME shared pool deposit `D`.
+        let lanes = vec![
+            SourceLane {
+                source: &src_a,
+                ctx: Arc::new(Mutex::new(ctx_with(0xA1, deposit))),
+                ledger: Arc::clone(&ledger_a),
+            },
+            SourceLane {
+                source: &src_b,
+                ctx: Arc::new(Mutex::new(ctx_with(0xB2, deposit))),
+                ledger: Arc::clone(&ledger_b),
+            },
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await?;
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "the fetch still assembles byte-identical under the shared-solvency gate"
+        );
+
+        let committed_a = ledger_a.committed().amount;
+        let committed_b = ledger_b.committed().amount;
+        assert!(
+            committed_a > U256::ZERO && committed_b > U256::ZERO,
+            "both lanes must have paid, so the aggregate exceeds either lane alone"
+        );
+        let max_lane = committed_a.max(committed_b);
+        let aggregate = committed_a.saturating_add(committed_b);
+        let min_remaining = pacer
+            .min_remaining
+            .lock()
+            .expect("min lock")
+            .expect("at least one decide ran");
+
+        // The aggregate gate: the lowest balance a worker saw is `D - Σ committed`.
+        assert_eq!(
+            min_remaining,
+            deposit.saturating_sub(aggregate),
+            "a worker must have gated on the SHARED remaining (deposit minus every lane's spend)"
+        );
+        // And that is strictly below the per-lane floor `D - max_lane`, so a
+        // per-lane gate could never have produced it — proving aggregation.
+        assert!(
+            min_remaining < deposit.saturating_sub(max_lane),
+            "the shared gate must see less than a single lane's own remaining: \
+             min={min_remaining:?} per_lane_floor={:?}",
+            deposit.saturating_sub(max_lane)
         );
         Ok(())
     }

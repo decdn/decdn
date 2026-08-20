@@ -39,9 +39,10 @@ use decdn_client_pull::buyer_pool::{
 use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
-    BlobTooLargeClaim, BudgetPacer, ClientRangedStore, Cumulative, PeerSource, PoolContext,
-    ProgressCallback, PullDeadlines, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull, sign_client_binding,
+    BlobTooLargeClaim, BudgetPacer, ClientRangedStore, Cumulative, MultiSourceConfig, PeerSource,
+    PoolContext, PoolLedger, ProgressCallback, PullDeadlines, SourceLane, UpstreamRefused,
+    UpstreamVoucherRejected, VoucherProgress, multi_source_fetch, open_progressive_pull,
+    sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -56,6 +57,7 @@ use decdn_incentive::{
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
+use decdn_client_pull::RangedStore;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
@@ -765,6 +767,43 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         deadlines,
     };
 
+    // Multi-source fan-out (ADR 039): when enabled, the blob clears the size
+    // floor, and at least two operator-distinct holders are admissible, fetch it
+    // in parallel across a per-provider lane set. A `None` gate (kill switch off,
+    // too small, too few holders) falls through to the single-source loop below
+    // unchanged. Each lane pays its OWN provider on its OWN `(ctx, ledger)`; the
+    // scheduler gates every lane on the shared pool's remaining balance.
+    {
+        let (bar, on_progress) = delivery_progress();
+        let multi = try_multi_source_fetch(
+            &deps,
+            &args.common,
+            grant.as_ref(),
+            &signer,
+            &voucher_dom,
+            &candidates,
+            &relays,
+            hash,
+            &args.output,
+            Some(&on_progress),
+        )
+        .await;
+        bar.finish_and_clear();
+        match multi {
+            Ok(Some(bytes)) => {
+                println!("fetched {bytes} bytes -> {}", args.output.display());
+                return Ok(());
+            }
+            // Gate not met: run the single-source failover loop below.
+            Ok(None) => {}
+            // The parallel fetch engaged but failed; on the delegated path
+            // reconnect a terminal exhaustion to the owner remedy, same as the
+            // single-source path does.
+            Err(err) if grant.is_some() => return Err(annotate_delegated_exhaustion(err)),
+            Err(err) => return Err(err),
+        }
+    }
+
     // Provider failover (#1174, ADR 037 § Fallback): try each resolved candidate
     // in turn until one delivers the blob. All candidates draw on the ONE shared
     // pool (ADR 003) — each provider is a distinct lane, and a lane for a
@@ -909,16 +948,12 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
 /// exist to fan out across (one holder is exactly the single-source path,
 /// just with extra bookkeeping).
 ///
-/// Not yet called from `drive_fetch`/`bundle_pull`: see the Task 7 report
-/// (`.superpowers/sdd/2026-08-20-multi-source-parallel-fetch-plan/task-7-report.md`)
-/// for why wiring it in is blocked — `multi_source_fetch` takes exactly one
-/// shared `ctx`/`ledger`/`funder` for every source in the admitted set, but
-/// each admitted source is a DIFFERENT on-chain provider with its OWN
-/// `(signer, provider)` payment lane (ADR 039 § Payment model), so a single
-/// shared `PoolContext`/`PoolLedger` cannot correctly sign vouchers payable to
-/// more than one of them.
+/// Consumed by [`try_multi_source_fetch`], which builds one per-provider payment
+/// lane ([`SourceLane`]) per admitted candidate — each with its OWN
+/// `(signer, provider)` `PoolContext`/`PoolLedger` (ADR 039 § Payment model) —
+/// and calls [`multi_source_fetch`]; a `false` gate falls through to the
+/// single-source provider-failover loop unchanged.
 #[must_use]
-#[allow(dead_code)]
 pub(crate) const fn should_multi_source(
     enabled: bool,
     total_bytes: u64,
@@ -1182,6 +1217,276 @@ where
     })?;
 
     Ok(total_bytes)
+}
+
+/// One built payment lane for a multi-source fetch: the per-provider
+/// `PoolContext`/`PoolLedger` and the [`PeerSource`] that pays with them. Owns
+/// the `PeerSource` so the borrowed [`SourceLane`] the scheduler consumes can
+/// point at it; the `ctx`/`ledger` `Arc`s are cloned into that `SourceLane`.
+struct MultiLane<'a> {
+    provider: Address,
+    pool_id: PoolId,
+    /// The lane's persisted prior amount — the baseline
+    /// [`select_watermark`]/[`persist_watermark`] compute the advance against.
+    prior_amount: U256,
+    ctx: Arc<Mutex<PoolContext>>,
+    ledger: Arc<PoolLedger>,
+    source: PeerSource<'a>,
+}
+
+/// Build the target address for a discovered candidate: its `node_id` plus the
+/// first configured relay hint. Multi-source only runs on the auto-discovered
+/// set (never the single explicit `--node-id`/`--addr`), so no pinned IP applies.
+fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> EndpointAddr {
+    let mut target = EndpointAddr::new(candidate.node_id);
+    if let Some(url) = relays.first() {
+        target = target.with_relay_url(url.clone());
+    }
+    target
+}
+
+/// Build one [`MultiLane`] for `candidate`: open/reuse its per-provider pool,
+/// seed a ledger from that lane's persisted cumulative, and wrap a [`PeerSource`]
+/// over it. Mirrors the single-source per-candidate construction in `fetch()`'s
+/// failover loop, hoisted so the whole admitted set is built up front.
+#[allow(clippy::too_many_arguments)]
+async fn build_multi_lane<'a, P>(
+    deps: &DriveFetchDeps<'a, P>,
+    grant: Option<&CapabilityGrant>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    candidate: &NodeCandidate,
+    relays: &[RelayUrl],
+) -> anyhow::Result<MultiLane<'a>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let provider = candidate.eth_address;
+    let ctx = build_ctx_for_fetch(
+        grant,
+        deps.store,
+        deps.contract,
+        deps.rpc,
+        signer,
+        voucher_dom,
+        provider,
+        deps.self_address,
+        deps.chain,
+        deps.endpoint,
+    )
+    .await?;
+    let pool_id = ctx.pool_id;
+    let prior_amount = ctx.prior_amount;
+    // One ledger per lane, seeded from its persisted `(signer, provider)`
+    // cumulative so the first voucher continues the lane (a restart from zero is
+    // rejected as a regression) — the same seeding `drive_fetch` does per lane.
+    let ledger = Arc::new(PoolLedger::new(Cumulative {
+        bytes: ctx.prior_bytes_delivered,
+        amount: ctx.prior_amount,
+    }));
+    let target = multi_source_target(candidate, relays);
+    let ctx = Arc::new(Mutex::new(ctx));
+    let source = PeerSource::new(
+        deps.endpoint,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        deps.slash_dom,
+        provider,
+        deps.namespace_id,
+        deps.max_blob_bytes,
+        deps.max_rate_per_mb,
+        deps.deadlines,
+    );
+    Ok(MultiLane {
+        provider,
+        pool_id,
+        prior_amount,
+        ctx,
+        ledger,
+        source,
+    })
+}
+
+/// The multi-source engagement path (ADR 039). Returns `Ok(None)` when the
+/// engagement gate ([`should_multi_source`]) is not met — the caller then runs
+/// the single-source provider-failover loop unchanged. Returns `Ok(Some(bytes))`
+/// once the blob is fetched in parallel across the admitted set, or `Err` when
+/// the parallel fetch fails (the `.partial` store is left in place for a later
+/// resume, exactly like a single-source failure).
+///
+/// Each admitted candidate becomes its OWN payment lane ([`SourceLane`]) — its
+/// own on-chain provider, `PoolContext`, and `PoolLedger` — and every lane draws
+/// on the one shared pool deposit, gated on the aggregate remaining so no lane
+/// over-draws it (ADR 039 § Payment model). On completion each lane's voucher
+/// watermark is persisted independently.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn try_multi_source_fetch<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    common: &cli::ClientFetchArgs,
+    grant: Option<&CapabilityGrant>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    candidates: &[NodeCandidate],
+    relays: &[RelayUrl],
+    hash: [u8; 32],
+    output: &Path,
+    progress: Option<&ProgressCallback>,
+) -> anyhow::Result<Option<u64>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    // Spread the ranked candidate set across distinct operators (ADR 039 §5.2).
+    // A gate that cannot be met without a probe (kill switch off, or fewer than
+    // two admissible holders) short-circuits BEFORE any chain/network work.
+    let admissible = discovery::admit_sources(candidates.to_vec(), common.max_sources);
+    if !common.multi_source_enabled() || admissible.len() < 2 {
+        return Ok(None);
+    }
+    let Some((first_candidate, rest_candidates)) = admissible.split_first() else {
+        return Ok(None);
+    };
+
+    // Learn `total_bytes` from a throwaway header-only open against the first
+    // admitted holder — the same handshake `drive_fetch` performs (no voucher is
+    // signed, so it pays nothing). This also opens/reuses that holder's pool,
+    // which the lane built below reuses, so the probe is not wasted work.
+    let first = build_multi_lane(deps, grant, signer, voucher_dom, first_candidate, relays).await?;
+    let probe_target = multi_source_target(first_candidate, relays);
+    let (header, first_pull) = {
+        let ctx = first
+            .ctx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+            .clone();
+        open_progressive_pull(
+            deps.endpoint,
+            probe_target,
+            &ctx,
+            Arc::clone(&first.ledger),
+            deps.slash_dom,
+            first.provider,
+            hash,
+            deps.namespace_id,
+            0,
+            micros_now(),
+            deps.max_blob_bytes,
+            deps.max_rate_per_mb,
+            deps.deadlines,
+            0,
+        )
+        .await
+        .map_err(|err| match first.ctx.lock() {
+            Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+            Err(_) => err,
+        })?
+    };
+    let total_bytes = header.total_bytes;
+    drop(first_pull);
+
+    // The size gate: below the floor a single fast holder already saturates the
+    // downlink, so fan-out is pure overhead — fall through to single-source.
+    if !should_multi_source(
+        common.multi_source_enabled(),
+        total_bytes,
+        common.multi_source_min_bytes,
+        admissible.len(),
+    ) {
+        return Ok(None);
+    }
+
+    // Build the rest of the lanes (the first is already built + probed).
+    let mut lanes = vec![first];
+    for candidate in rest_candidates {
+        lanes.push(build_multi_lane(deps, grant, signer, voucher_dom, candidate, relays).await?);
+    }
+
+    // The `.partial` store beside `output`, keyed on `(hash, total_bytes)`; a
+    // prior partial resumes and only the missing ranges are re-pulled.
+    let (store_dir, stem) = ranged_store_location(output)?;
+    let ranged_store = ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
+        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", output.display()))?;
+
+    // One shared funder over the single pool (top-up escrows into the one deposit
+    // every lane draws on). The scheduler gates every lane on the aggregate
+    // remaining, so a reactive top-up heals the shared pool for all of them.
+    let funder = CliFunder {
+        contract: deps.contract,
+        rpc: deps.rpc,
+        store: deps.store,
+        owner: deps.self_address,
+        // Every lane shares one pool, so the funder tops up that pool regardless
+        // of which lane's exhaustion triggered it; the first lane's id names it.
+        pool_id: lanes.first().map_or(PoolId::ZERO, |l| l.pool_id),
+        token: deps.token,
+        payment_pool_addr: deps.chain.payment_pool,
+        max_approve: deps.chain.max_approve,
+    };
+    let pacer = BudgetPacer::new();
+    let drive_config = DriveConfig::cli(deps.chain.working_deposit);
+    let ms_config = MultiSourceConfig {
+        max_sources: common.max_sources,
+        unit_deadline: Duration::from_millis(common.unit_deadline_ms),
+    };
+
+    // Borrow each lane's owned `PeerSource` into a scheduler `SourceLane`, cloning
+    // its `ctx`/`ledger` handles. `lanes` outlives `source_lanes`.
+    let source_lanes: Vec<SourceLane<'_, PeerSource<'_>>> = lanes
+        .iter()
+        .map(|l| SourceLane {
+            source: &l.source,
+            ctx: Arc::clone(&l.ctx),
+            ledger: Arc::clone(&l.ledger),
+        })
+        .collect();
+
+    let fetch_result = multi_source_fetch(
+        &ranged_store,
+        &source_lanes,
+        &pacer,
+        &funder,
+        hash,
+        0,
+        total_bytes,
+        &drive_config,
+        &ms_config,
+        progress,
+    )
+    .await;
+
+    // Promote the assembled blob when the whole blob is present (mirrors
+    // `drive`'s own completion promotion, which `multi_source_fetch` leaves to the
+    // caller).
+    if fetch_result.is_ok() && ranged_store.is_complete().await.unwrap_or(false) {
+        ranged_store
+            .finalize()
+            .await
+            .map_err(|e| anyhow::anyhow!("finalize assembled blob {}: {e}", output.display()))?;
+    }
+
+    // Persist each lane's own voucher watermark: on success the committed
+    // watermark is safe; on an ambiguous failure settle HIGH per lane so a reuse
+    // never re-signs a spent lane state.
+    for l in &lanes {
+        let vprogress = select_watermark(
+            &fetch_result,
+            l.ledger.committed(),
+            l.ledger.settlement(),
+            l.prior_amount,
+        );
+        let lane = LaneKey {
+            pool_id: l.pool_id,
+            signer: deps.self_address,
+            provider: l.provider,
+        };
+        persist_watermark(deps.store, deps.self_address, l.pool_id, lane, &vprogress);
+    }
+
+    fetch_result.map_err(|err| match lanes.first().map(|l| l.ctx.lock()) {
+        Some(Ok(guard)) => annotate_unbound_cache_miss(err, &guard),
+        _ => err,
+    })?;
+    Ok(Some(total_bytes))
 }
 
 /// The CLI's [`Funder`]: a mid-fetch reactive top-up runs the same
