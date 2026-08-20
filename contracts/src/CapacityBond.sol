@@ -10,7 +10,6 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
-import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
 import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.sol";
@@ -21,6 +20,7 @@ import { ISlashJudgeEvidenceView } from "./interfaces/ISlashJudgeEvidenceView.so
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { BondMath } from "./BondMath.sol";
 import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
+import { DeclaredMbpsHistoryLib } from "./DeclaredMbpsHistoryLib.sol";
 
 /// @title CapacityBond — operator-registry contract
 /// @notice Custodies operator TOKEN bond, executes the escrow-on-slash flow
@@ -65,7 +65,6 @@ contract CapacityBond is
     EIP712
 {
     using SafeERC20 for IERC20;
-    using Checkpoints for Checkpoints.Trace208;
 
     // -----------------------------------------------------------------
     // Roles
@@ -710,8 +709,7 @@ contract CapacityBond is
         }
         uint256 old = declaredMbps[msg.sender];
         declaredMbps[msg.sender] = mbps;
-        // slither-disable-next-line unused-return
-        _declaredMbpsHistory[msg.sender].push(Time.timestamp(), uint208(mbps));
+        DeclaredMbpsHistoryLib.record(_declaredMbpsHistory, msg.sender, mbps);
         emit MbpsDeclared(msg.sender, old, mbps);
     }
 
@@ -918,8 +916,7 @@ contract CapacityBond is
         uint256 oldMbps = declaredMbps[msg.sender];
         if (oldMbps != 0) {
             delete declaredMbps[msg.sender];
-            // slither-disable-next-line unused-return
-            _declaredMbpsHistory[msg.sender].push(Time.timestamp(), 0);
+            DeclaredMbpsHistoryLib.record(_declaredMbpsHistory, msg.sender, 0);
             emit MbpsDeclared(msg.sender, oldMbps, 0);
         }
 
@@ -1416,12 +1413,7 @@ contract CapacityBond is
 
     /// @inheritdoc ICapacityBond
     function declaredMbpsAtEpoch(address operator, uint64 epoch) external view override returns (uint256) {
-        // End of `epoch` in seconds. `upperLookupRecent` returns the newest
-        // checkpoint at or before this instant, i.e. the tier the operator held
-        // when the epoch closed. `Time.timestamp()` is uint48, so the boundary
-        // fits uint48 for any epoch the Governor passes (bounded by real time).
-        uint48 epochEnd = uint48((uint256(epoch) + 1) * EPOCH_LENGTH - 1);
-        return _declaredMbpsHistory[operator].upperLookupRecent(epochEnd);
+        return DeclaredMbpsHistoryLib.atEpoch(_declaredMbpsHistory, operator, epoch, EPOCH_LENGTH);
     }
 
     /// @inheritdoc ICapacityBond
