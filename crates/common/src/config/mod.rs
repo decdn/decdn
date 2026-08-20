@@ -2698,7 +2698,7 @@ pub fn resolve_security_into(
     }
 }
 
-/// Resolve node-local load-shedding thresholds (spec §8).
+/// Resolve node-local load-shedding thresholds.
 pub fn resolve_load_shed(file: Option<&types::LoadShedConfig>) -> anyhow::Result<ResolvedLoadShed> {
     one_section(|bag| resolve_load_shed_into(file, bag))
 }

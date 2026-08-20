@@ -542,10 +542,11 @@ enum ServeRejectReason {
     /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire,
     /// see [`Self::wire_error`].
     LaneAtCapacity,
-    /// A cache-HIT serve shed under node overload (egress saturation). Distinct
-    /// from [`Self::LoadShedMiss`] for the per-reason metric ONLY — both
-    /// collapse to `NotFound` on the wire (see [`Self::wire_error`]) so a client
-    /// cannot read node load, and both are reputation-benign (a client scores
+    /// A cache-HIT serve shed under node overload — egress saturation, or this
+    /// client's fair-share cap while the node is pressured. Distinct from
+    /// [`Self::LoadShedMiss`] for the per-reason metric ONLY — both collapse to
+    /// `NotFound` on the wire (see [`Self::wire_error`]) so a client cannot
+    /// read node load, and both are reputation-benign (a client scores
     /// `NotFound` as no fault).
     LoadShedHit,
     /// A cache-MISS serve shed under node overload (concurrency pressure or

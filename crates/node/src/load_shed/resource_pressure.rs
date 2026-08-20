@@ -55,10 +55,9 @@ impl LoadShedPolicy for ResourcePressure {
     fn decide(&self, class: RequestClass, snap: &PressureSnapshot) -> ShedDecision {
         let pressured = self.update_pressure(snap.streams_in_flight);
 
-        // Per-client fairness engages ONLY under pressure (fairness invariant,
-        // spec §2.4): a client is capped for holding more than its share during
-        // real contention, never to reserve a slot for a client that might
-        // arrive.
+        // Per-client fairness engages ONLY under pressure (fairness invariant):
+        // a client is capped for holding more than its share during real
+        // contention, never to reserve a slot for a client that might arrive.
         if pressured
             && self.params.per_client_cap > 0
             && snap.client_streams_in_flight >= self.params.per_client_cap

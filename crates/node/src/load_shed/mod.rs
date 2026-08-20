@@ -13,7 +13,7 @@ mod egress;
 mod resource_pressure;
 mod state;
 
-pub use controller::{LoadShedController, egress_budget_bps};
+pub use controller::LoadShedController;
 pub use egress::EgressMeter;
 pub use resource_pressure::{Params as ResourcePressureParams, ResourcePressure};
 pub use state::{ShedSlot, ShedState};
@@ -30,7 +30,7 @@ pub enum RequestClass {
 
 /// One immutable read of live node pressure, sampled per admission. New
 /// signals are added as fields; a policy ignores fields it does not read, so
-/// the seam is additive (spec §5).
+/// the seam is additive.
 #[derive(Debug, Clone, Copy)]
 pub struct PressureSnapshot {
     /// Serve streams in flight across all clients.
@@ -73,7 +73,7 @@ pub trait LoadShedPolicy: Send + Sync {
     }
 }
 
-/// The `NoOp` policy: never sheds. A valid operator choice for a node that wants
+/// The no-op policy: never sheds. A valid operator choice for a node that wants
 /// no heuristic shedding. It is UNWISE under a real flood — the OS OOM-killer
 /// becomes the only backstop — but physical limits bind regardless, and the
 /// `ConnectionLimiter` task caps still apply beneath it, so the choice stays

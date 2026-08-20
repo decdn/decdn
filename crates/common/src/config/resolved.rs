@@ -562,7 +562,7 @@ pub enum LoadShedPolicyKind {
     AlwaysAdmit,
 }
 
-/// Resolved load-shedding thresholds (spec §8).
+/// Resolved load-shedding thresholds.
 #[derive(Debug, Clone)]
 pub struct ResolvedLoadShed {
     pub policy: LoadShedPolicyKind,

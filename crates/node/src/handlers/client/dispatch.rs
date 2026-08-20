@@ -406,7 +406,13 @@ impl ClientHandler {
                     .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
                 {
                     Ok(slot) => shed_slot = Some(slot),
-                    Err(_reason) => {
+                    Err(reason) => {
+                        tracing::debug!(
+                            ?reason,
+                            %hash,
+                            class = "hit",
+                            "load-shed refusing new serve"
+                        );
                         return self
                             .respond_error(
                                 &mut send,
@@ -431,12 +437,27 @@ impl ClientHandler {
                         )
                         .await;
                 }
+                // The shed gate runs before the channel-ownership refusal below,
+                // so an unbound / unknown-lane request can transiently hold a
+                // `ShedSlot` until that refusal returns it. This is bounded by
+                // the `ConnectionLimiter` global + per-source caps and is
+                // self-limiting: once the node is pressured, further such
+                // requests shed right here without acquiring a slot at all.
+                // Keeping the gate here — ahead of channel-ownership and any
+                // fill — preserves "shed before committing serve resources /
+                // before any origin spend".
                 match self
                     .shed
                     .try_admit(crate::load_shed::RequestClass::CacheMiss, client_node_id)
                 {
                     Ok(slot) => shed_slot = Some(slot),
-                    Err(_reason) => {
+                    Err(reason) => {
+                        tracing::debug!(
+                            ?reason,
+                            %hash,
+                            class = "miss",
+                            "load-shed refusing new serve"
+                        );
                         return self
                             .respond_error(
                                 &mut send,
