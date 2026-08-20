@@ -236,6 +236,10 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         // an epoch-0 slash isn't collapsed with the unslashed sentinel.
         uint64 slashed = slashStamp - 1;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
+        // Clamp identically to `_cappedServed` and `FeeRouter.bytesInWindow` so
+        // the slash window can never span more epochs than the byte window it
+        // must track, even if `windowEpochsAt` returns an out-of-bound value.
+        if (n > MAX_WINDOW_EPOCHS) n = MAX_WINDOW_EPOCHS;
         uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         // Upper-bound the slash epoch at `endEpoch` (the last fully-elapsed
         // epoch). A slash that happened AFTER the snapshot timepoint — or in the
@@ -253,7 +257,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         uint64 startEpoch = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
         uint256 epochSeconds = feeRouter.epochLength();
 
-        uint256 served;
+        uint256 served = 0;
         for (uint64 e = startEpoch; e <= endEpoch; e++) {
             uint256 epochBytes = feeRouter.bytesPerEpoch(account, e);
             // Max bytes the tier declared at epoch `e`'s close could deliver.
