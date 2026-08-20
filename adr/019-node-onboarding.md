@@ -166,6 +166,44 @@ A node satisfying all five criteria is ready to:
 - Accept `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment pools opened by clients and other nodes
 
+#### Criterion 1 is enforced, not advisory
+
+The node refuses every `StreamRequest` on `cdn/client/v1` while criterion 1 is
+false. The refusal happens before the node spends money or sends bytes.
+
+This rule protects the network, not the node. A node outside the active set
+cannot be slashed. `SlashJudge` finds an accused node through its on-chain
+binding. A node that sells bytes from outside the set therefore sells bytes that
+no penalty can cover. The node loses only income when it refuses. The network
+loses its only enforcement lever when it does not.
+
+The node reads criterion 1 from the same registry projection that gates DHT
+admission. That projection starts from a `getRegisteredNodes` enumeration at
+bring-up. It then follows the `CapacityBond` membership events, and it
+re-enumerates on a periodic backstop. One projection serves both consumers, so
+the serve gate and DHT admission always agree.
+
+The gate is live. An operator who completes Phase 2 against a daemon that is
+already running does not restart it. The registration event reaches the
+projection, and the node starts to sell within one poll interval.
+
+The gate is not a probe gate. A node that fails criterion 1 still answers
+`ProbeRequest` on `cdn/probe/v1`, because a probe is unpaid and is the canonical
+rate-discovery channel. The node also continues to *buy* bytes on its own
+cache-miss leg. The rule is "may not sell", not "may not participate".
+
+**Wire code.** The refusal signs `NotFound`, which is the same code as a cache
+miss. The two are deliberately indistinguishable. A distinct code would give any
+client a cheap oracle for which operators cannot currently sell. The operator
+sees the true cause in the `decdn_serve_stream_rejected_not_registered_total`
+counter and in the `registry_active` field of `decdn node health`. Both are
+local to the operator.
+
+**Diagnostics stay separate.** The bring-up binding self-check
+(§Operator Safety Obligations) keeps its advisory role. It tells the operator
+*which* problem they have — an unbound key, or a key that does not match the
+binding. The gate only decides whether the node may sell.
+
 **Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 active_nodes=12`) once all five criteria hold, so operators can confirm correct startup without grepping multiple log sources.
 
 ### NAT and Multiaddr Handling

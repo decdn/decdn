@@ -95,6 +95,23 @@ pub struct HealthResponse {
     /// `node_id`) and, more usefully, for [`BindingStatus::Mismatch`], where it
     /// names the key to restore. `None` for `Unbound` and `Unknown`.
     pub bound_node_id: Option<String>,
+    /// Whether this node is in the on-chain active-staker set right now, and so
+    /// whether it will accept paid delivery at all (ADR 019 §Phase 4, criterion
+    /// 1; #1030).
+    ///
+    /// Unlike [`Self::binding`], this is read LIVE on every poll — it is a
+    /// lookup in the registry projection the daemon already keeps current off
+    /// `CapacityBond` events, not a chain round trip — so an operator who has
+    /// just run `decdn setup` watches it flip to `true` without restarting the
+    /// daemon.
+    ///
+    /// `false` is the answer to "my node is up and healthy, why is it earning
+    /// nothing": every `cdn/client/v1` request is being refused as `NotFound`,
+    /// which is wire-indistinguishable from a cache miss. The cause is one of
+    /// never registered, registered under a key this process no longer holds
+    /// (see [`Self::binding`]), deregistered, ejected, bond below `minBond`, or
+    /// an unbonding request in flight.
+    pub registry_active: bool,
 }
 
 /// Request body for `admin_v1_evict` (issue #279).

@@ -8413,3 +8413,136 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     server_task_b.await?;
     Ok(())
 }
+
+/// ADR 019 §Phase 4, acceptance criterion 1 (#1030): a node that is NOT in the
+/// on-chain active-staker set must refuse paid delivery, even when it holds the
+/// blob and every other gate would pass.
+///
+/// This is the enforcement half of a rule the daemon previously only WARNED
+/// about at bring-up (`decdn_node::binding_check`). A node outside the active
+/// set is unslashable — `SlashJudge` resolves an accused node through its
+/// on-chain binding — so bytes it sells are bytes nobody can be punished for
+/// mis-serving. Before this gate such a node kept earning indefinitely.
+///
+/// The refusal is deliberately wire-indistinguishable from a cache miss, so the
+/// assertion that pins the CAUSE is the per-reason counter. Asserting only the
+/// error would pass just as happily if the blob were simply absent — which is
+/// why the blob is seeded and its presence checked first.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregistered_node_refuses_paid_delivery() -> anyhow::Result<()> {
+    let payload = b"bytes an unregistered node must not sell".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "the node must genuinely hold the blob, or a plain miss could explain the refusal"
+    );
+
+    let (store, signer, deposit) = seeded_store()?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        |deps| {
+            // An EMPTY set is the state of a node that was never registered —
+            // and, identically, of one whose key is no longer the bound one.
+            // The gate asks a single question about this node's own id, so one
+            // empty set models every way out of the active set.
+            deps.staker_set = Arc::new(decdn_node::dht::staker_set::ConfigStakerSet::empty());
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, signer, deposit);
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00e3,
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .ok_or_else(|| {
+        anyhow::anyhow!("an unregistered node must refuse paid delivery, but it served")
+    })?;
+
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_not_registered_total 1"
+        ),
+        "the refusal must be attributed to the registry gate — every reject reason \
+         collapses to `NotFound` on the wire, so this counter is the only place the \
+         cause is observable. Got: {err}"
+    );
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_serve_stream_rejected_cache_miss_total 0"),
+        "the gate must refuse BEFORE the availability check, not fall through to a miss"
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The positive control for [`unregistered_node_refuses_paid_delivery`]: the
+/// same request, the same handler wiring, and the node's own id present in the
+/// active set — it must serve.
+///
+/// Without this, a bug that refused EVERY request (a wrong id conversion, an
+/// inverted predicate) would leave the negative above green and look like
+/// working enforcement.
+#[tokio::test(flavor = "multi_thread")]
+async fn registered_node_serves_the_same_request() -> anyhow::Result<()> {
+    let payload = b"bytes an unregistered node must not sell".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, signer, deposit);
+    let bytes = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00e4,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    anyhow::ensure!(bytes.as_ref() == payload, "delivered bytes must match");
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_not_registered_total 0"
+        ),
+        "an active node must not trip the registry gate"
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}

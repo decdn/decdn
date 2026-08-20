@@ -223,6 +223,36 @@ impl ClientHandler {
                 .await;
         }
 
+        // ADR 019 §Phase 4, acceptance criterion 1 (#1030): this node MUST be
+        // active in the on-chain registry before it accepts a `StreamRequest`.
+        // Until #1030 the daemon only WARNED about this at bring-up
+        // (`crate::binding_check`), so a node that was never registered — or
+        // whose key was swapped out from under its binding — kept selling bytes
+        // while being unslashable, which is the one state the protocol's
+        // enforcement model cannot price.
+        //
+        // Deliberately BELOW the two denylist checks above: an unregistered node
+        // asked for a blacklisted hash must still answer `HashBlacklisted`, or a
+        // takedown's wire signal degrades to `NotFound` and ADR 011's distinct
+        // retry advice is lost. Compliance keeps priority over solvency.
+        //
+        // Deliberately ABOVE everything that follows: every path below this
+        // point either spends this node's money or sells its bytes.
+        //
+        // Reads the same live projection the DHT admission path uses, so a
+        // `decdn setup` run against an already-running daemon flips this gate
+        // within one poller tick — no restart.
+        if !self.staker_set.is_active(&self.self_staker_id) {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::NotRegistered,
+                    rate_per_mb,
+                )
+                .await;
+        }
+
         // Resolve the lane key early. The seller keys a lane by
         // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
         // the request, the signer from the verified client binding, the provider
