@@ -15,6 +15,7 @@ mod state;
 
 pub use egress::EgressMeter;
 pub use resource_pressure::{Params as ResourcePressureParams, ResourcePressure};
+pub use state::{ShedSlot, ShedState};
 
 /// Which serve tier a request falls into, resolved where `cache.has` is known.
 /// A hit is local — zero upstream cost, pure margin — so it is shed last; a
