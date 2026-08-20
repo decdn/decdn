@@ -64,6 +64,12 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
 /// keyspace is empty.
 const DISPATCH_GC_INTERVAL: Duration = Duration::from_mins(1);
 
+/// Sampling period for the load-shed controller's egress-bytes EWMA. One
+/// second keeps the `ResourcePressure` policy's egress-budget check
+/// responsive to short bursts, without sampling so often that the EWMA
+/// mostly reflects request-arrival jitter.
+const EGRESS_EWMA_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Interval between periodic GC sweeps of the DHT rate-limiter's per-IP
 /// and per-peer keyed maps (#645). 60s matches `DISPATCH_GC_INTERVAL` —
 /// the two limiters share the same operator mental model for keyspace
@@ -774,6 +780,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// threaded to the node-origin pull path for the region-latency penalty.
     registry_regions: Arc<std::sync::RwLock<std::collections::HashMap<crate::dht::NodeId, String>>>,
     client_handler: Arc<ClientHandler>,
+    /// Shared with the reload state (`attach_load_shed`) and the egress-EWMA
+    /// sampling tick spawned in [`spawn_background_tasks`], so all three see
+    /// the same live policy.
+    shed_controller: Arc<crate::load_shed::LoadShedController>,
     payment_service: PoolSettlementService<P>,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
@@ -1166,6 +1176,14 @@ async fn build_chain_and_handlers(
     // drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
+    // Overload-protection gate (load-shed): sheds new serves under resource
+    // pressure so in-flight streams stay fast. Bound to a named local, not
+    // inlined into the deps literal, so the reload section (`[load_shed]`,
+    // hot-reloadable via `RuntimeReloadState::attach_load_shed`) and the
+    // egress-EWMA sampling tick spawned in `spawn_background_tasks` both
+    // reach the SAME controller.
+    let shed_controller = crate::load_shed::LoadShedController::from_config(&cfg.load_shed);
+    reload_state.attach_load_shed(Some(Arc::clone(&shed_controller)));
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1185,6 +1203,7 @@ async fn build_chain_and_handlers(
         MAX_CLIENT_STREAMS,
         Arc::clone(&content_denylist),
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
+        Arc::clone(&shed_controller),
     );
     // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
     // gate persists a presented capability so the redeemer registers the signer
@@ -1369,6 +1388,7 @@ async fn build_chain_and_handlers(
         dht_routing,
         registry_regions,
         client_handler,
+        shed_controller,
         payment_service,
         blacklist_ready_rx,
         binding_report,
@@ -1384,6 +1404,7 @@ async fn build_chain_and_handlers(
 struct Background {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
+    egress_ewma_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
     origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
@@ -1496,6 +1517,20 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     "dispatch GC sweep complete"
                 );
             }
+        })
+    };
+
+    // Periodic load-shed egress-EWMA sample: folds the last interval's served
+    // bytes into the controller's smoothed rate and republishes it as the
+    // gauges the `ResourcePressure` policy's egress-budget check reads live
+    // from `try_admit`, and that operators watch via metrics.
+    let egress_ewma_stop_tx = {
+        let shed = Arc::clone(&ch.shed_controller);
+        let metrics = Arc::clone(&infra.node_metrics);
+        spawn_periodic(&mut tasks, "egress_ewma", EGRESS_EWMA_INTERVAL, move || {
+            let bps = shed.sample_egress(EGRESS_EWMA_INTERVAL.as_secs());
+            metrics.load_shed_egress_bps(i64::try_from(bps).unwrap_or(i64::MAX));
+            metrics.load_shed_pressure_active(shed.pressure_active());
         })
     };
 
@@ -2041,6 +2076,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     Ok(Background {
         metrics_stop_tx,
         dispatch_gc_stop_tx,
+        egress_ewma_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
         eviction_stop_tx,
@@ -2117,6 +2153,7 @@ pub async fn run(
     let handles = ShutdownHandles {
         metrics_stop_tx: bg.metrics_stop_tx,
         dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
+        egress_ewma_stop_tx: bg.egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
         origin_rescan_stop_tx: bg.origin_rescan_stop_tx,
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
@@ -2148,6 +2185,7 @@ pub async fn run(
 struct ShutdownHandles<P: Provider + Clone + 'static> {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
+    egress_ewma_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
@@ -2192,6 +2230,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let ShutdownHandles {
         metrics_stop_tx,
         dispatch_gc_stop_tx,
+        egress_ewma_stop_tx,
         buyer_bootstrap_stop_tx,
         origin_rescan_stop_tx,
         record_store_gc_stop_tx,
@@ -2232,6 +2271,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // through `JoinSet::join_next` during the drain phase below — no
     // operator-actionable signal to log at this seam.
     let _ = dispatch_gc_stop_tx.send(());
+    // Best-effort, same rationale as the dispatch-GC stop above: the egress
+    // EWMA tick only exits early on a panic, which surfaces through
+    // `JoinSet::join_next` during the drain phase below.
+    let _ = egress_ewma_stop_tx.send(());
     // Cancel a still-running buyer bootstrap and release the task's
     // process-lifetime hold on the service (#1109). Best-effort: on the
     // bootstrap-failed path the task already returned and dropped the receiver,
@@ -3629,6 +3672,7 @@ mod tests {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
+            load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),

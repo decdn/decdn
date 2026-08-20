@@ -393,8 +393,37 @@ impl ClientHandler {
         // but `Err` is a transient local store failure that must not masquerade
         // as a signed `NotFound` — a paying client would treat that as
         // authoritative and stop asking. Surface it as `InternalError` and log.
+        // The initial `None` is unread on every live path (both `Ok` arms below
+        // either shed and return or overwrite it, and `Err` returns too) — kept
+        // anyway so the slot's declared type and its `Drop`-at-fn-scope binding
+        // below read the same as the `lane_slot` admission guard above.
+        #[allow(unused_assignments)]
+        let mut shed_slot: Option<crate::load_shed::ShedSlot> = None;
         match self.cache.has(hash).await {
-            Ok(true) => {}
+            Ok(true) => {
+                match self
+                    .shed
+                    .try_admit(crate::load_shed::RequestClass::CacheHit, client_node_id)
+                {
+                    Ok(slot) => shed_slot = Some(slot),
+                    Err(reason) => {
+                        tracing::debug!(
+                            ?reason,
+                            %hash,
+                            class = "hit",
+                            "load-shed refusing new serve"
+                        );
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::LoadShedHit,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
+                }
+            }
             Ok(false) => {
                 // Eviction is sticky and authoritative — never pull-fill a
                 // hash an operator deliberately evicted (#279).
@@ -407,6 +436,37 @@ impl ClientHandler {
                             rate_per_mb,
                         )
                         .await;
+                }
+                // The shed gate runs before the channel-ownership refusal below,
+                // so an unbound / unknown-lane request can transiently hold a
+                // `ShedSlot` until that refusal returns it. This is bounded by
+                // the `ConnectionLimiter` global + per-source caps and is
+                // self-limiting: once the node is pressured, further such
+                // requests shed right here without acquiring a slot at all.
+                // Keeping the gate here — ahead of channel-ownership and any
+                // fill — preserves "shed before committing serve resources /
+                // before any origin spend".
+                match self
+                    .shed
+                    .try_admit(crate::load_shed::RequestClass::CacheMiss, client_node_id)
+                {
+                    Ok(slot) => shed_slot = Some(slot),
+                    Err(reason) => {
+                        tracing::debug!(
+                            ?reason,
+                            %hash,
+                            class = "miss",
+                            "load-shed refusing new serve"
+                        );
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::LoadShedMiss,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
                 // USDC egress is privileged: gate it on the request PROVING
@@ -765,6 +825,10 @@ impl ClientHandler {
                     .await;
             }
         }
+        // Held at fn scope so the slot lives across `deliver` / `serve_via_*` and
+        // releases its admission counters on every exit, including the boxed
+        // miss-serve return paths below.
+        let _shed_slot = shed_slot;
 
         // Size gate. An origin-tier range pull (#823) imported only a *partial*
         // blob, so `inspect`/`has` can't report the whole-blob size — but the

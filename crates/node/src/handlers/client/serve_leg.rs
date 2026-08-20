@@ -188,6 +188,7 @@ impl ClientHandler {
                     return Err(e);
                 }
                 delivered = delivered.saturating_add(clen);
+                self.shed.record_egress(clen);
                 unvouchered = unvouchered.saturating_add(clen);
                 if unvouchered >= interval_bytes {
                     pending.push_back(unvouchered);

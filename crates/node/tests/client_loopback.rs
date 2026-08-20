@@ -8413,3 +8413,184 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
     server_task_b.await?;
     Ok(())
 }
+
+/// End-to-end coverage for the load-shed gate's two `Err` branches in
+/// `serve_stream` (dispatch.rs): the cache-miss admission call refuses with
+/// `ServeRejectReason::LoadShedMiss`, and the cache-hit admission call refuses
+/// with `ServeRejectReason::LoadShedHit`. Both collapse to the same signed wire
+/// `NotFound` a paying client sees. The policy's own admit/shed arithmetic
+/// already has unit coverage in `load_shed::resource_pressure`; what these two
+/// tests add is proof the handler actually wires a shed `Err` into the exact
+/// on-wire refusal, through a real loopback connection and a real bound
+/// request.
+///
+/// Both tests pre-set the controller's counters before the client ever
+/// connects, so the shed decision is already fixed at admission time — no
+/// timing or concurrency race is involved.
+///
+/// A hash the node genuinely lacks: the request lands on the cache-miss
+/// admission call. The node's concurrency ceiling is pre-occupied by a held
+/// slot, so it is already at its one-slot high-water mark.
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_miss_refused_under_concurrency_pressure() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    // Concurrency high-water mark of 1: pre-occupying one slot before the
+    // client connects puts the node at capacity for every request that follows.
+    let shed = decdn_node::load_shed::LoadShedController::from_config(
+        &decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 0,
+            max_concurrent_serves_high: 1,
+            max_concurrent_serves_low: 0,
+            per_client_serve_cap: 0,
+        },
+    );
+    let held = shed
+        .try_admit(
+            decdn_node::load_shed::RequestClass::CacheHit,
+            B256::repeat_byte(0xAA),
+        )
+        .map_err(|reason| anyhow::anyhow!("pre-occupy the sole concurrency slot: {reason:?}"))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.shed = Arc::clone(&shed);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // A hash the empty cache never has: the cache-miss admission branch.
+    let miss_hash = Hash::new(b"load-shed test: never cached");
+    let refusal = open_expecting_refusal(&conn, *miss_hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "a cache-miss request must be shed while the node is at its concurrency ceiling"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    // Release the held slot only after the refusal is observed, so the shed
+    // decision above is provably driven by the pre-occupied slot.
+    drop(held);
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// A hash the node already has cached: the request lands on the cache-hit
+/// admission call. Concurrency never trips (the high/low water marks are far
+/// above anything this test does); only the egress ceiling is saturated, which
+/// `ResourcePressure` sheds regardless of the pressure latch (it also sheds
+/// hits, unlike the concurrency gate above).
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
+    let payload = b"load-shed test: a blob the node already has cached".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let shed = decdn_node::load_shed::LoadShedController::from_config(
+        &decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 1, // 1 Mbps = 125_000 B/s ceiling
+            max_concurrent_serves_high: 10_000,
+            max_concurrent_serves_low: 9_000,
+            per_client_serve_cap: 0,
+        },
+    );
+    // Pre-feed the egress meter over budget before the client ever connects,
+    // so the instant rate the handler samples at admission time is already
+    // fixed above the ceiling.
+    shed.record_egress(1_000_000);
+    let sampled = shed.sample_egress(1);
+    anyhow::ensure!(
+        sampled >= 125_000,
+        "instant egress rate must be at/above the 1 Mbps ceiling, got {sampled}"
+    );
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.shed = Arc::clone(&shed);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    let refusal = open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        !refusal.body.ok,
+        "a cache-hit request must be shed while measured egress is at the configured ceiling"
+    );
+    anyhow::ensure!(
+        matches!(
+            refusal.error,
+            Some(decdn_protocol::client::StreamError::NotFound)
+        ),
+        "expected the collapsed NotFound wire code, got {:?}",
+        refusal.error
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}

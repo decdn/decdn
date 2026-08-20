@@ -585,6 +585,37 @@ pub struct ResolvedSecurity {
     pub max_tracked_sources: usize,
 }
 
+/// Which load-shed policy the node runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadShedPolicyKind {
+    ResourcePressure,
+    AlwaysAdmit,
+}
+
+/// Resolved load-shedding thresholds.
+#[derive(Debug, Clone)]
+pub struct ResolvedLoadShed {
+    pub policy: LoadShedPolicyKind,
+    pub egress_budget_mbps: u64,
+    pub max_concurrent_serves_high: u32,
+    pub max_concurrent_serves_low: u32,
+    pub per_client_serve_cap: u32,
+}
+
+impl Default for ResolvedLoadShed {
+    /// Reuses the `DEFAULT_LOAD_SHED_*` resolver constants so hand-built
+    /// `ResolvedConfig`s in tests cannot drift from the production defaults.
+    fn default() -> Self {
+        Self {
+            policy: LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: super::DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS,
+            max_concurrent_serves_high: super::DEFAULT_LOAD_SHED_SERVES_HIGH,
+            max_concurrent_serves_low: super::DEFAULT_LOAD_SHED_SERVES_LOW,
+            per_client_serve_cap: super::DEFAULT_LOAD_SHED_PER_CLIENT_CAP,
+        }
+    }
+}
+
 /// Resolved download-receipt audit-log retention fields (#802).
 ///
 /// `max_file_bytes` is always within `[MIN_RECEIPT_MAX_FILE_BYTES,
@@ -628,6 +659,7 @@ pub struct ResolvedConfig {
     pub payment: ResolvedPayment,
     pub observability: ResolvedObservability,
     pub security: ResolvedSecurity,
+    pub load_shed: ResolvedLoadShed,
     pub dht: ResolvedDht,
     pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,

@@ -137,6 +137,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             per_source_burst: 200,
             max_tracked_sources: 4096,
         },
+        load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
         probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
