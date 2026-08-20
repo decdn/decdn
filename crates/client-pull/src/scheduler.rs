@@ -42,13 +42,26 @@
 //!   by exactly ONE source, not two. Without this the victim's already-running
 //!   `fill_gap` would keep paying to `end` (the Task-4 double-pay).
 //! - **Stall / fault.** A source with no verified progress within
-//!   `unit_deadline` (the watchdog trips), or whose `fill_gap` returns `Err`,
-//!   has the UN-fetched remainder of its range re-queued to `pending` for a
-//!   DIFFERENT source, and stops taking work. Verified bytes already stored are
-//!   never refetched.
+//!   `unit_deadline` (the watchdog trips), or whose `fill_gap` returns a
+//!   RETRYABLE `Err` ([`crate::retry_disposition`] ==
+//!   `RetryElsewhere`: a stall, a transport reset, a node-specific refusal), has
+//!   the UN-fetched remainder of its range re-queued to `pending` for a DIFFERENT
+//!   source, and stops taking work. Verified bytes already stored are never
+//!   refetched.
 //!
-//! If every source stops with the request still incomplete, the fetch returns
-//! an error rather than hanging.
+//! # Terminal faults — no pointless reassignment
+//!
+//! A `fill_gap` `Err` the classifier rules `Terminal` — a payment-layer voucher
+//! rejection, a drained shared pool ([`crate::PoolExhausted`]), an origin
+//! blacklist, or an over-cap blob — cannot be fixed by another lane: every lane
+//! draws the ONE shared pool, and the blob is the same size whoever holds it. So
+//! the worker propagates THAT typed error out of the set, which cancels the peer
+//! workers and fails `multi_source_fetch` with it — the CLI inspects the type to
+//! surface the correct owner-side remedy. The range is NOT reassigned.
+//!
+//! If every source stops with the request still incomplete without a terminal
+//! fault, the fetch returns a generic "all sources failed" error rather than
+//! hanging.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +76,7 @@ use crate::driver::{
     DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, contiguous_byte_ranges,
     drive_with_interval_flush, fill_gap,
 };
+use crate::retry::{RetryDisposition, retry_disposition};
 use crate::segment::{initial_segments, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{Pacer, PoolContext, PoolLedger, ProgressCallback};
@@ -199,8 +213,9 @@ enum UnitOutcome {
     /// A steal claimed this source's tail — re-queue the trimmed remainder and
     /// stay live (pick again).
     Cancelled,
-    /// The source stalled or faulted — re-queue the remainder for a DIFFERENT
-    /// source and stop taking work.
+    /// The source stalled or hit a RETRYABLE fault — re-queue the remainder for a
+    /// DIFFERENT source and stop taking work. A TERMINAL fault does not reach
+    /// here: the worker returns its typed error directly, aborting the fetch.
     Faulted,
 }
 
@@ -451,8 +466,24 @@ where
                     biased;
                     res = fill => match res {
                         Ok(()) => UnitOutcome::Completed,
-                        // A fault drops this source; the remainder goes to a peer.
-                        Err(_) => UnitOutcome::Faulted,
+                        // Classify the fault the same way the single-source
+                        // failover loop does. A TERMINAL fault — a payment-layer
+                        // voucher rejection, a drained shared pool
+                        // ([`PoolExhausted`]), an origin blacklist, or an
+                        // over-cap blob — cannot be fixed by reassigning the range
+                        // to another lane (every lane draws the ONE shared pool,
+                        // and the blob is the same size whoever holds it), so abort
+                        // the whole fetch with THAT typed error rather than
+                        // dropping each lane in turn and masking it as the generic
+                        // "all sources failed". `try_join_all` cancels the peer
+                        // workers, so the failed source's range is NOT reassigned.
+                        // A RETRYABLE fault (a stall, a transport reset, a
+                        // node-specific refusal) faults this one source: its
+                        // remainder is re-queued for a DIFFERENT lane.
+                        Err(e) => match retry_disposition(&e) {
+                            RetryDisposition::Terminal => return Err(e),
+                            RetryDisposition::RetryElsewhere => UnitOutcome::Faulted,
+                        },
                     },
                     () = cancelled(&handle) => UnitOutcome::Cancelled,
                     () = watchdog(store, g_start, g_len, unit_deadline) => UnitOutcome::Faulted,
@@ -516,9 +547,13 @@ where
 ///
 /// # Errors
 ///
-/// An empty `lanes`, a fault from any worker's `fill_gap` (a terminal
-/// source/store fault, or a `Refuse`), a segmentation alignment error, or an
-/// I/O failure flushing the present record.
+/// An empty `lanes`; a TERMINAL `fill_gap` fault propagated verbatim from a
+/// worker (a payment-layer rejection, a drained pool [`crate::PoolExhausted`], an
+/// origin blacklist, or an over-cap blob — see
+/// [`crate::retry_disposition`]); a segmentation alignment
+/// error; an I/O failure flushing the present record; or, if every source drops
+/// on RETRYABLE faults with the request still incomplete, a generic "all sources
+/// failed" error.
 #[allow(clippy::too_many_arguments)]
 pub async fn multi_source_fetch<St, S, P, F>(
     store: &St,
@@ -1108,6 +1143,102 @@ mod tests {
         assert!(
             inner.is_err(),
             "all sources failing must surface as an error, not a false success"
+        );
+        Ok(())
+    }
+
+    /// A TERMINAL fault aborts the whole fetch with THAT typed error and does NOT
+    /// reassign the failed source's range to a peer. `src_terminal` (lane 0) owns
+    /// the first segment and faults at byte 0 with a typed
+    /// [`UpstreamVoucherRejected`] — a payment-layer rejection the shared pool
+    /// hits against every provider, so no other lane can fix it. `src_peer`
+    /// (lane 1) is slow to start, so it is still on its OWN second segment when the
+    /// terminal fault cancels the worker set. The pre-fix scheduler folded every
+    /// `fill_gap` `Err` into `Faulted`, reassigning the range and ending as the
+    /// generic "all sources failed"; the fix propagates the typed error verbatim
+    /// (downcast-assertable) and leaves the failed segment unfetched.
+    #[tokio::test]
+    async fn terminal_fault_propagates_and_is_not_reassigned() -> anyhow::Result<()> {
+        use decdn_protocol::client::VoucherRejectReason;
+
+        let data = blob(64 * 1024 * 1024);
+        let total = data.len() as u64;
+        let ledger_terminal = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_peer = Arc::new(PoolLedger::new(Cumulative::default()));
+        // Lane 0 faults at its first byte with a typed payment rejection. A
+        // non-`SpendingCapExhausted` reason is used so the driver's exhaustion /
+        // reseed self-heal (which only fires on `SpendingCapExhausted`) does not
+        // intercept it — `fill_gap` returns it verbatim.
+        let src_terminal = ScriptedSource::new(data.clone())?
+            .with_fault_after(0, || {
+                anyhow::Error::new(crate::UpstreamVoucherRejected {
+                    reason: VoucherRejectReason::CapabilityExpired,
+                    bundle: None,
+                })
+            })
+            .paying(Arc::clone(&ledger_terminal));
+        // Lane 1 is healthy but slow to start, so the terminal fault cancels it
+        // before it could finish its own segment and steal lane 0's tail.
+        let src_peer = ScriptedSource::new(data.clone())?
+            .slow_to_start(Duration::from_secs(10))
+            .paying(Arc::clone(&ledger_peer));
+        let root = src_terminal.root();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let lanes = vec![
+            lane(&src_terminal, Arc::clone(&ledger_terminal), 0xA1),
+            lane(&src_peer, Arc::clone(&ledger_peer), 0xB2),
+        ];
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            multi_source_fetch(
+                &store,
+                &lanes,
+                &pacer,
+                &funder,
+                root,
+                0,
+                total,
+                &DriveConfig {
+                    working_deposit: U256::ZERO,
+                    max_settle_waits: 0,
+                    settle_backoff: Duration::from_millis(1),
+                },
+                &MultiSourceConfig {
+                    max_sources: 2,
+                    unit_deadline: Duration::from_secs(30),
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("a terminal fault must abort promptly, not hang");
+
+        // The typed error propagated — NOT the generic "all sources failed".
+        let err = result.expect_err("a terminal fault must fail the fetch");
+        assert!(
+            err.downcast_ref::<crate::UpstreamVoucherRejected>()
+                .is_some(),
+            "the terminal error must propagate verbatim, not be masked: {err:#}"
+        );
+
+        // Lane 0 delivered nothing (it faulted at byte 0) and its range was NOT
+        // reassigned: a region well inside lane 0's first segment is still entirely
+        // missing. A reassigning scheduler would have had the peer fill it.
+        assert_eq!(
+            src_terminal.delivered_bytes(),
+            0,
+            "the terminal source faulted before delivering a byte"
+        );
+        let probe = 16 * 1024 * 1024;
+        let missing =
+            crate::driver::contiguous_byte_ranges(&store.missing_ranges(0, probe).await?, total);
+        let missing_bytes: u64 = missing.iter().map(|(_, l)| *l).fold(0, u64::saturating_add);
+        assert_eq!(
+            missing_bytes, probe,
+            "the failed source's range must not be reassigned to a peer"
         );
         Ok(())
     }

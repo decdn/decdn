@@ -83,6 +83,39 @@ use crate::{
     UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
 };
 
+/// The shared pool cannot fund the next voucher: its remaining deposit is below
+/// the next voucher's cost and reactive top-up is disabled or exhausted (the
+/// pacer returned [`PaceDecision::Refuse`]).
+///
+/// Typed rather than a bare string so the failover classifier
+/// ([`crate::retry_disposition`]) can `downcast_ref` and rule it **terminal** for
+/// BOTH fetch paths: the pool is the same deposit against every provider (ADR
+/// 003), so reassigning the range to another lane — or failing over to another
+/// candidate — cannot fund it. The single-source path already ended the fetch on
+/// a refuse; the multi-source scheduler needs the typed shape to abort promptly
+/// instead of dropping every lane one by one and masking it as "all sources
+/// failed".
+#[derive(Debug)]
+pub struct PoolExhausted {
+    /// Start of the gap that could not be funded.
+    pub gap_start: u64,
+    /// Length of the gap that could not be funded.
+    pub gap_len: u64,
+}
+
+impl std::fmt::Display for PoolExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gap [{}, +{}) of blob cannot be funded: the remaining deposit cannot cover the \
+             next voucher and reactive top-up is disabled or exhausted",
+            self.gap_start, self.gap_len
+        )
+    }
+}
+
+impl std::error::Error for PoolExhausted {}
+
 /// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
 /// has advanced (so a re-decide has a chance of finding window room); the client
@@ -542,11 +575,7 @@ where
                 );
             }
             PaceDecision::Refuse => {
-                anyhow::bail!(
-                    "gap [{gap_start}, +{gap_len}) of blob cannot be funded: the remaining \
-                     deposit cannot cover the next voucher and reactive top-up is \
-                     disabled or exhausted"
-                );
+                return Err(anyhow::Error::new(PoolExhausted { gap_start, gap_len }));
             }
             PaceDecision::TopUp(additional) => {
                 match funder.top_up(additional).await? {
