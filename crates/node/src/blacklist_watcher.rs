@@ -117,6 +117,7 @@ use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
 use crate::content_deny::ContentDenylist;
 use crate::metrics::{Metrics, metric_hook};
+use crate::warming_allowance::WarmingAllowance;
 
 /// Page size for the swap-and-pop enumeration views. Bounded so one huge deny-set
 /// cannot ask for an unbounded array in a single `eth_call`; the paging loop keeps
@@ -543,6 +544,7 @@ struct BlacklistSink<P: Provider + Clone> {
     reads: ContractReads<P>,
     operator: Address,
     cache: CacheEngine,
+    warming: Arc<WarmingAllowance>,
     state: WatcherState,
     shutdown: CancellationToken,
     /// How often the batched re-enumeration + re-scope runs (the operator's
@@ -564,6 +566,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             &self.contract,
             self.operator,
             &self.cache,
+            &self.warming,
             &mut self.state,
             log,
         )
@@ -608,6 +611,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
                 &self.contract,
                 self.operator,
                 &self.cache,
+                &self.warming,
                 &mut self.state,
                 &self.shutdown,
             )
@@ -649,6 +653,7 @@ async fn rescan<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
+    warming: &Arc<WarmingAllowance>,
     state: &mut WatcherState,
     shutdown: &CancellationToken,
 ) -> RescanOutcome
@@ -666,7 +671,7 @@ where
                 failed,
             };
         }
-        match recheck(contract, operator, cache, state, hash).await {
+        match recheck(contract, operator, cache, warming, state, hash).await {
             Recheck::Evicted => evicted = evicted.saturating_add(1),
             Recheck::NoAction => {}
             Recheck::Failed => {
@@ -704,6 +709,7 @@ async fn handle_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
+    warming: &Arc<WarmingAllowance>,
     state: &mut WatcherState,
     log: Log,
 ) -> Result<bool>
@@ -711,9 +717,11 @@ where
     P: Provider + Clone,
 {
     match log.topic0() {
-        Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => {
-            Ok(on_blacklisted_log(contract, operator, cache, state, &log).await == Recheck::Failed)
-        }
+        Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => Ok(on_blacklisted_log(
+            contract, operator, cache, warming, state, &log,
+        )
+        .await
+            == Recheck::Failed),
         Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
             on_removed_log(contract, operator, cache, state, &log).await;
             Ok(false)
@@ -797,6 +805,7 @@ async fn on_blacklisted_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
+    warming: &Arc<WarmingAllowance>,
     state: &mut WatcherState,
     log: &Log,
 ) -> Recheck
@@ -807,7 +816,7 @@ where
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
             state.add_entry(event.region, hash);
-            recheck(contract, operator, cache, state, hash).await
+            recheck(contract, operator, cache, warming, state, hash).await
         }
         Err(err) => {
             warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log");
@@ -887,6 +896,7 @@ async fn recheck<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
+    warming: &Arc<WarmingAllowance>,
     state: &mut WatcherState,
     hash: Hash,
 ) -> Recheck
@@ -912,7 +922,7 @@ where
             // eviction that fails on a disk error still stops the serving, since
             // `CacheEngine::refuses` honors this set too.
             deny_hash(cache, hash);
-            if evict(cache, hash).await {
+            if evict(cache, warming, hash).await {
                 state.drop_hash(hash);
                 Recheck::Evicted
             } else {
@@ -961,10 +971,13 @@ where
 }
 
 /// Evict `hash` from the cache (durable + sticky). Returns `true` on success.
-async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
+async fn evict(cache: &CacheEngine, warming: &Arc<WarmingAllowance>, hash: Hash) -> bool {
     match cache.evict(hash).await {
         Ok(()) => {
             info!(%hash, "evicted blacklisted blob (ADR 011 compliance)");
+            // ADR 041: drop the warming tag for the evicted hash, so a later
+            // reuse of this slot can never credit a stale source's allowance.
+            warming.forget(*hash.as_bytes());
             true
         }
         Err(err) => {
@@ -995,6 +1008,7 @@ pub(crate) async fn bootstrap<P>(
     contract_addr: Address,
     operator: Address,
     cache: CacheEngine,
+    warming: Arc<WarmingAllowance>,
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
@@ -1043,8 +1057,15 @@ where
     // deny-set. This inline pass is not shutdown-interruptible, matching the boot
     // replay it replaces; the periodic re-scope on the sink IS.
     let boot_shutdown = CancellationToken::new();
-    let RescanOutcome { clean, failed } =
-        rescan(&contract, operator, &cache, &mut state, &boot_shutdown).await;
+    let RescanOutcome { clean, failed } = rescan(
+        &contract,
+        operator,
+        &cache,
+        &warming,
+        &mut state,
+        &boot_shutdown,
+    )
+    .await;
     if failed > 0 {
         metrics.blacklist_enforcement_failure(failed);
     }
@@ -1078,6 +1099,7 @@ where
             reads,
             operator,
             cache,
+            warming,
             state,
             shutdown: shutdown.clone(),
             rescan_interval: rescan_interval.max(Duration::from_secs(1)),
@@ -1663,6 +1685,7 @@ mod tests {
             },
             operator: Address::repeat_byte(0x22),
             cache,
+            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
             state: state(),
             shutdown: CancellationToken::new(),
             rescan_interval: Duration::from_secs(1),
@@ -1698,6 +1721,7 @@ mod tests {
             },
             operator: Address::repeat_byte(0x22),
             cache,
+            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
             state,
             shutdown: CancellationToken::new(),
             rescan_interval: Duration::from_secs(1),
@@ -1719,6 +1743,7 @@ mod tests {
             &sink.contract,
             sink.operator,
             &sink.cache,
+            &sink.warming,
             &mut sink.state,
             h,
         )
@@ -1732,6 +1757,48 @@ mod tests {
         assert!(
             sink.cache.is_evicted(h),
             "and the bytes still get reclaimed"
+        );
+        Ok(())
+    }
+
+    /// A governance takedown must forget the evicted hash's ADR 041 warming tag
+    /// (issue #1751 review), exactly like the eviction driver's own sweep does —
+    /// otherwise a re-admitted hash could spuriously credit a stale source's
+    /// allowance. Proven observably: a serve credit after the takedown must be a
+    /// no-op (the source stays exactly as drained as the speculative buy left
+    /// it), since `credit_serve` is a no-op once the hash has no known source.
+    #[tokio::test]
+    async fn takedown_forgets_the_warming_tag() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let mut sink = enforcing_sink(&[true], &metrics).await?;
+        let h = hash(0x57);
+        let source = [9u8; 32];
+        sink.state.add_entry(US, h);
+
+        // Tag the hash as speculatively bought from `source`, fully draining it.
+        sink.warming.debit_speculative(source, *h.as_bytes(), 1000);
+        assert!(
+            !sink.warming.available(source),
+            "the speculative buy must drain the source"
+        );
+
+        let outcome = recheck(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &sink.warming,
+            &mut sink.state,
+            h,
+        )
+        .await;
+        assert!(outcome == Recheck::Evicted);
+
+        // If the tag survived the takedown, this credit would refill `source`.
+        // With the tag forgotten, `credit_serve` is a documented no-op.
+        sink.warming.credit_serve(*h.as_bytes(), 600);
+        assert!(
+            !sink.warming.available(source),
+            "a credit against a forgotten tag must not resurrect the source's allowance"
         );
         Ok(())
     }
@@ -1752,6 +1819,7 @@ mod tests {
             &sink.contract,
             sink.operator,
             &sink.cache,
+            &sink.warming,
             &mut sink.state,
             h,
         )
@@ -1784,6 +1852,7 @@ mod tests {
                 &sink.contract,
                 sink.operator,
                 &sink.cache,
+                &sink.warming,
                 &mut sink.state,
                 h,
             )
@@ -1808,6 +1877,7 @@ mod tests {
             &sink.contract,
             sink.operator,
             &sink.cache,
+            &sink.warming,
             &mut sink.state,
             h,
         )
@@ -1845,6 +1915,7 @@ mod tests {
             &sink.contract,
             sink.operator,
             &sink.cache,
+            &sink.warming,
             &mut sink.state,
             h,
         )

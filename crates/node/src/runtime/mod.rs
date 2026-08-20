@@ -1349,6 +1349,7 @@ async fn build_chain_and_handlers(
         content_blacklist_addr,
         infra.eth_signer.address(),
         infra.cache.clone(),
+        Arc::clone(&warming),
         Arc::clone(&head),
         Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
         blacklist_ready_tx,
@@ -2105,7 +2106,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // `build_chain_and_handlers`. Surfacing it here too is what lets an
         // operator (or the G-NODE-07 journey) detect the unslashable state
         // without scraping the daemon's log for a WARN line.
-        .with_binding(ch.binding_report);
+        .with_binding(ch.binding_report)
+        // ADR 041: the SAME warming allowance the buy loop debits, the serve
+        // path credits, and the eviction driver forgets from, so
+        // `admin_v1_evict` can also drop a hash's provenance tag on removal.
+        .with_warming(Arc::clone(&ch.warming));
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
