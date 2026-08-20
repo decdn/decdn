@@ -20,7 +20,7 @@ Every source is a full holder that serves from its own store rather than pulling
 
 ## Decision
 
-A client fetching a blob above the multi-source size floor runs a **multi-source scheduler**: it admits a set of full holders, segments the byte range dynamically across them, verifies each segment against the content-hash root, and reassigns the unfinished remainder of a stalled or failed source's range to a different source. Each source is driven by an ordinary bounded `cdn/client/v1` stream. The mechanism adds **no new wire surface**: it is a client-side orchestration policy over the existing protocol, and the bounded `byte_len` request is the range-bounding mechanism it relies on.
+A client fetching a blob above the multi-source size floor runs a **multi-source scheduler**: it admits a set of full holders and **eagerly fans out** to all of them at once, opening every admitted source's stream up front rather than growing the set gradually. It segments the byte range dynamically across the fanned-out sources, verifies each segment against the content-hash root, and reassigns the unfinished remainder of a stalled or failed source's range to a different source. Each source is driven by an ordinary bounded `cdn/client/v1` stream. The mechanism adds **no new wire surface**: it is a client-side orchestration policy over the existing protocol, and the bounded `byte_len` request is the range-bounding mechanism it relies on.
 
 ### Engagement gate
 
