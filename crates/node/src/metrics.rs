@@ -412,6 +412,15 @@ pub struct DecdnMetrics {
     /// being withdrawn and warrants investigating the RPC / wallet. Operator-
     /// visible name: `decdn_redemption_failures_total`.
     pub redemption_failures: Counter,
+    /// Lanes the redeemer held or dropped for the pool's chain-observed
+    /// solvency (`pool_is_redeemable`, ADR 003): a drained `Open` pool is held
+    /// for a top-up, a drained or past-deadline `Closing` pool is dropped.
+    /// Counted once per skipped lane per planning pass. A sustained non-zero
+    /// rate means real unredeemed value is stuck behind pools this node can no
+    /// longer collect from — worth checking against `pool_deposit_usdc` for
+    /// which pools are dry. Operator-visible name:
+    /// `decdn_redemption_skipped_insolvent_total`.
+    pub redemption_skipped_insolvent: Counter,
     /// Buyer-side reclaim-sweep attempts (`try_reclaim`) that failed — a failed
     /// `getChannel`/`reclaimExpired` RPC, a receipt wait, an on-chain revert, or
     /// a failed store write when clearing the local record after a reclaim/drop
@@ -1556,6 +1565,14 @@ recorders! {
     /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
     /// (#751). Pairs with the `warn!` in `redeemer_loop`.
     redemption_failure => redemption_failures.inc();
+
+    /// A lane was held or dropped by `pool_is_redeemable` because its pool's
+    /// chain-observed solvency ruled it out this pass (ADR 003).
+    redemption_skipped_insolvent => redemption_skipped_insolvent.inc();
+
+    /// `n` lanes were held or dropped by `pool_is_redeemable` in one planning
+    /// pass (ADR 003); the batched form of `redemption_skipped_insolvent`.
+    redemption_skipped_insolvent_by(n: u64) => redemption_skipped_insolvent.inc_by(n);
 
     /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
     /// error, an on-chain revert, or a failed store write when clearing the local

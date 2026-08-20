@@ -47,6 +47,22 @@ use decdn_incentive::payment_pool::PaymentPool;
 /// sub-percent of a multi-GB blob, the core large-file workload.
 pub const POOL_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A pool's on-chain lifecycle, folded from the `PaymentPool` event log. `Open`
+/// pools accept top-ups and redemptions; a `Closing` pool accepts redemptions
+/// only until `deadline` (the on-chain dispute deadline), after which
+/// `redeemMany` reverts `PoolClosed`. A pool never returns to `Open` once
+/// `Closing`, and a `Closing` pool cannot be topped up, so its `remaining` only
+/// falls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Lifecycle {
+    #[default]
+    Open,
+    Closing {
+        /// Unix seconds after which redemption reverts `PoolClosed`.
+        deadline: u64,
+    },
+}
+
 /// The per-pool chain quantities the serve gates read.
 #[derive(Clone, Copy, Debug)]
 pub struct PoolStatus {
@@ -54,6 +70,8 @@ pub struct PoolStatus {
     pub owner: Address,
     /// `deposit − totalRedeemed`, the balance the floor-`M` guard reserves against.
     pub remaining: U256,
+    /// The pool's lifecycle: `Open`, or `Closing` with its dispute deadline.
+    pub lifecycle: Lifecycle,
 }
 
 /// A per-request source of [`PoolStatus`]. Trait so the handler holds it behind an
@@ -92,6 +110,9 @@ struct PoolEntry {
     /// `PoolRedeemed` (watcher retry / reorg rewind) folds only the positive
     /// advance and the total stays exact under replay.
     lanes: HashMap<(Address, Address), u64>,
+    /// The pool's lifecycle: `Open` by default, `Closing { deadline }` after a
+    /// `PoolCloseInitiated`. `PoolReclaimed` removes the whole entry.
+    lifecycle: Lifecycle,
 }
 
 impl PoolEntry {
@@ -99,6 +120,7 @@ impl PoolEntry {
         PoolStatus {
             owner: self.owner,
             remaining: U256::from(self.deposit.saturating_sub(self.total_redeemed)),
+            lifecycle: self.lifecycle,
         }
     }
 }
@@ -208,12 +230,29 @@ impl PoolProjection {
         });
     }
 
+    /// Apply a `PoolCloseInitiated(poolId, _, disputeDeadline)`: mark the pool
+    /// `Closing`. Skipped for a pool the projection has not opened — there is no
+    /// entry to serve, and reads fail open. A `Closing` pool keeps its
+    /// `remaining` and stays redeemable until `deadline`; `PoolReclaimed` later
+    /// removes it via `forget`.
+    pub fn record_closing(&self, pool_id: B256, deadline: u64) {
+        if !self.pools.load().contains_key(&pool_id) {
+            return;
+        }
+        self.update(|pools| {
+            if let Some(entry) = pools.get_mut(&pool_id) {
+                entry.lifecycle = Lifecycle::Closing { deadline };
+            }
+        });
+    }
+
     /// Apply a `PoolReclaimed(poolId, ..)`: the pool is `Closed` and its remainder
     /// refunded. Drop it — a later read returns `None` and the serve gate fails
-    /// open, exactly as for a pool the projection has not yet seen. The projection
-    /// tracks no `Closing` state: `redeem` stays callable until the dispute
-    /// deadline and the pool's `deposit − totalRedeemed` is still valid, so the
-    /// projection keeps serving that pool until the reclaim actually lands.
+    /// open, exactly as for a pool the projection has not yet seen. A
+    /// `PoolCloseInitiated` is folded by [`Self::record_closing`], which marks the
+    /// pool `Closing` but keeps it redeemable until the dispute deadline; `forget`
+    /// removes the whole entry, lifecycle included, once the reclaim actually
+    /// lands.
     pub fn forget(&self, pool_id: B256) {
         if !self.pools.load().contains_key(&pool_id) {
             return;
@@ -221,6 +260,12 @@ impl PoolProjection {
         self.update(|pools| {
             pools.remove(&pool_id);
         });
+    }
+
+    /// A non-blocking snapshot read for callers outside an async trait object.
+    #[must_use]
+    pub fn snapshot(&self, pool_id: B256) -> Option<PoolStatus> {
+        self.pools.load().get(&pool_id).map(PoolEntry::status)
     }
 }
 
@@ -358,5 +403,66 @@ mod tests {
         let c = view.cached_status(pool(1)).await.unwrap();
         assert_eq!(s.owner, c.owner);
         assert_eq!(s.remaining, c.remaining);
+    }
+
+    #[tokio::test]
+    async fn record_closing_sets_lifecycle_deadline() {
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(1_000u64));
+        view.record_closing(pool(1), 1_900_000_000);
+        let s = view.status(pool(1)).await.unwrap();
+        assert_eq!(
+            s.lifecycle,
+            Lifecycle::Closing {
+                deadline: 1_900_000_000
+            }
+        );
+        assert_eq!(
+            s.remaining,
+            U256::from(1_000u64),
+            "closing does not change remaining"
+        );
+    }
+
+    #[tokio::test]
+    async fn opened_pool_defaults_to_open_lifecycle() {
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(1_000u64));
+        assert_eq!(
+            view.status(pool(1)).await.unwrap().lifecycle,
+            Lifecycle::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn record_closing_unknown_pool_is_noop() {
+        let view = PoolProjection::new();
+        view.record_closing(pool(1), 1_900_000_000);
+        assert!(view.status(pool(1)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn redeemed_still_folds_after_closing() {
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(1_000u64));
+        view.record_closing(pool(1), 1_900_000_000);
+        view.record_redeemed(pool(1), addr(9), &[lane(addr(3), 400)]);
+        let s = view.status(pool(1)).await.unwrap();
+        assert_eq!(s.remaining, U256::from(600u64));
+        assert_eq!(
+            s.lifecycle,
+            Lifecycle::Closing {
+                deadline: 1_900_000_000
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_clears_closing_pool() {
+        let view = PoolProjection::new();
+        view.record_opened(pool(1), addr(7), U256::from(1_000u64));
+        view.record_closing(pool(1), 1_900_000_000);
+        view.forget(pool(1));
+        assert!(view.status(pool(1)).await.is_none());
     }
 }
