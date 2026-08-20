@@ -163,7 +163,7 @@ pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 /// per-fetch, not per-gap), plus the last upstream quote used to price the next
 /// voucher.
 #[derive(Debug, Clone, Copy)]
-struct DriveCounters {
+pub(crate) struct DriveCounters {
     /// Reactive top-ups spent so far — bounded by [`Funder::max_topups`].
     topups_used: u32,
     /// Desync-reseed retries spent so far — bounded by [`MAX_RESUME_ATTEMPTS`].
@@ -173,6 +173,18 @@ struct DriveCounters {
     /// gate open so the first draw always proceeds (an exhaustion can only follow
     /// an open).
     next_voucher_cost: U256,
+}
+
+impl DriveCounters {
+    /// Fresh per-fetch (single-source) or per-worker (multi-source) counters:
+    /// no top-ups or reseeds spent, and no priced voucher yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            topups_used: 0,
+            resume_attempts: 0,
+            next_voucher_cost: U256::ZERO,
+        }
+    }
 }
 
 /// Price the next voucher from an upstream header, the exact formula
@@ -264,11 +276,7 @@ where
     let missing = store.missing_ranges(offset, len).await?;
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
-    let mut counters = DriveCounters {
-        topups_used: 0,
-        resume_attempts: 0,
-        next_voucher_cost: U256::ZERO,
-    };
+    let mut counters = DriveCounters::new();
 
     for (gap_start, gap_len) in gaps {
         fill_gap(
@@ -321,7 +329,7 @@ where
 // terminal); splitting them out would separate those from the loop state they act
 // on.
 #[allow(clippy::too_many_lines)]
-async fn fill_gap<St, S, P, F>(
+pub(crate) async fn fill_gap<St, S, P, F>(
     store: &St,
     source: &S,
     pacer: &P,

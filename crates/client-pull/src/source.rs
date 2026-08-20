@@ -564,6 +564,14 @@ mod doubles {
 
     impl iroh_io::AsyncStreamReader for ScriptedReader {
         async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+            // Model a real network read's yield point. A synchronous in-memory
+            // reader never pends, so under the cooperative single-thread runtime
+            // the first-polled multi-source worker would drain every segment
+            // before a peer worker is ever polled — starving the fan-out. One
+            // yield per read lets concurrent workers interleave, exactly as I/O
+            // waits would. Behavior-neutral for the single-source driver tests
+            // (a yield only reschedules the same task).
+            tokio::task::yield_now().await;
             let take = self.wire.len().min(len);
             Ok(self.wire.split_to(take))
         }

@@ -2769,6 +2769,7 @@ dependencies = [
  "decdn-common",
  "decdn-incentive",
  "decdn-protocol",
+ "futures-util",
  "iroh",
  "iroh-io",
  "serde",

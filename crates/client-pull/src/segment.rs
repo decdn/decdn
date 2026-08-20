@@ -4,11 +4,6 @@
 //! to steal. Every returned range is chunk-group aligned so it is
 //! independently bao-verifiable.
 
-// The multi-source scheduler (spec §5.3) is the consumer of this module; it
-// wires `initial_segments`/`steal_split`/`MIN_SPLIT_SIZE` in. Until then
-// these are unreached from any call site.
-#![allow(dead_code)]
-
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, RangeVerifyError, align_range};
 
 /// Floor below which an idle source does not split/steal a remaining range —
