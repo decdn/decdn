@@ -207,10 +207,12 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
 /// Bounds memo memory under a random-hash probe flood.
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
 
-/// Default for `cache.relay_foreign_namespaces` (#1759): relay foreign
-/// content by default, preserving today's behavior. An operator flips this
-/// to `false` to run an origin-only node that serves and seeds only content
-/// its own backend holds.
+/// Fallback for `cache.relay_foreign_namespaces` (#1759) on a node with no
+/// origin configured. The resolver's effective default is role-derived, not
+/// this flat constant: an origin node (a backend is configured) defaults to
+/// origin-only (`false`) — an origin is not a general proxy — while a
+/// no-origin node is a pure relay edge and falls back to this `true`. An
+/// operator sets the field explicitly to override either default.
 pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
@@ -1762,7 +1764,10 @@ fn resolve_cache_into(
         .unwrap_or(false);
     let relay_foreign_namespaces = file
         .and_then(|c| c.relay_foreign_namespaces)
-        .unwrap_or(DEFAULT_RELAY_FOREIGN_NAMESPACES);
+        // Role-derived default: an origin node (a backend is configured) serves only
+        // its own namespace; a node with no origin is a pure relay edge and relays.
+        // Explicit config overrides either way.
+        .unwrap_or(origins.is_empty());
     let node_pull_probe_fanout = file
         .and_then(|c| c.node_pull_probe_fanout)
         .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
@@ -4535,6 +4540,64 @@ swap_pool_address = \"0xPool\"
             resolved.origins.is_empty(),
             "absent origin section must yield empty vec, got len {}",
             resolved.origins.len(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_defaults_false_with_origin() -> anyhow::Result<()> {
+        // Role-derived default (#1759): a node with an origin backend
+        // configured is an origin, not a general proxy — absent an explicit
+        // override it defaults to origin-only (`false`).
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            !resolved.relay_foreign_namespaces,
+            "a node with an origin configured must default to origin-only (relay_foreign_namespaces = false)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_defaults_true_without_origin() -> anyhow::Result<()> {
+        // Role-derived default (#1759): a node with no origin backend is a
+        // pure relay edge — its only function is relaying, so absent an
+        // explicit override it defaults to relay (`true`).
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig::default();
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.relay_foreign_namespaces,
+            "a node with no origin configured must default to relay (relay_foreign_namespaces = true)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_explicit_true_overrides_origin_default()
+    -> anyhow::Result<()> {
+        // Explicit config always wins: an origin node may opt back into
+        // relay to also earn relay revenue.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            relay_foreign_namespaces: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.relay_foreign_namespaces,
+            "an explicit relay_foreign_namespaces = true must override the origin-only default"
         );
         Ok(())
     }

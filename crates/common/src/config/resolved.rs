@@ -302,8 +302,12 @@ pub struct ResolvedCache {
     /// restart-required, so this is read once at bring-up.
     pub node_to_node_pull_through_enabled: bool,
     /// When `false`, the node serves and seeds only content its own backend
-    /// holds; a foreign hash is declined like a miss. Default `true` (relay
-    /// foreign namespaces). Node-local; `cache.*` is restart-required.
+    /// holds; a foreign hash is declined like a miss. The default is
+    /// role-derived: `false` (origin-only) when an origin backend is
+    /// configured — an origin is not a general proxy — and `true` (relay)
+    /// when no origin is configured, since a pure edge node's only function
+    /// is relaying. Explicit config overrides either default. Node-local;
+    /// `cache.*` is restart-required.
     pub relay_foreign_namespaces: bool,
     /// Providers probed before ranking on a node-to-node pull (#831). Default
     /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`].
