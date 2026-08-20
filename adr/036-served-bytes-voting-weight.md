@@ -14,7 +14,7 @@ Two effects follow, both bounded by one epoch (≤ 1 week):
 
 ## Context
 
-Declared capacity (`CapacityBond.declaredMbps × age_ramp`) is operator-asserted at registration and only loosely tied to actual delivery. Keying DAO vote weight on it would let a deeply-bonded but lightly-serving operator carry weight that does not reflect their real contribution to the network.
+Declared capacity (`CapacityBond.declaredMbps`) is operator-asserted at registration and only loosely tied to actual delivery. Keying DAO vote weight primarily on it would let a deeply-bonded but lightly-serving operator carry weight that does not reflect their real contribution to the network. But keying it purely on delivered bytes, with no reference to declared capacity, would let a lightly-bonded operator inflate its own weight by self-dealing byte volume — serving traffic to accounts it controls — without committing bonded capacity. Delivered bytes drive vote weight; declared capacity caps it per epoch.
 
 The on-chain raw material to fix this already exists. [ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter) populates `bytesPerEpoch[operator][epoch]` inline on every `routeSettlement`. This ADR makes that counter the canonical voting-weight source.
 
@@ -28,11 +28,14 @@ DAO vote weight is the trailing-window sum of an operator's served bytes, multip
 
 ```
 vote_weight(op, t) = min(
-    served_bytes_window(op, t),
+    capped_served_window(op, t),
     voteCapBps × total_bytes_window(t) / 10_000
 ) × age_ramp(op, t)
 
-served_bytes_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.bytesPerEpoch[op][e]
+capped_served_window(op, t) = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} min(
+    FeeRouter.bytesPerEpoch[op][e],
+    CapacityBond.declaredMbpsAtEpoch(op, e) × epochLength × 125_000
+)
 
 total_bytes_window(t)      = Σ_{e = endEpoch(t)-N+1 .. endEpoch(t)} FeeRouter.totalBytesPerEpoch[e]
 
@@ -48,9 +51,12 @@ N           = windowEpochs                               // default 13 (~1 quart
 
 Where `t` is the OpenZeppelin Governor timepoint (timestamp clock per ERC-6372, consistent with [ADR 009 § Production](009-governance.md#production-operator-weighted-dao-governance)).
 
+Each epoch's counted bytes are capped at what the tier the operator declared at that epoch's close could physically deliver: `declaredMbpsAtEpoch(op, e)` samples `CapacityBond`'s checkpointed `declaredMbps` history at `(e+1) × epochLength − 1`, the last instant of epoch `e`. `125_000 = 1e6 / 8` converts megabits/s to bytes/s, so `declaredMbpsAtEpoch(op, e) × epochLength × 125_000` is the maximum bytes the declared tier could deliver across the whole epoch. Because the cap reads checkpointed history rather than the live `declaredMbps` value, a later `declareMbps` call cannot raise the cap for epochs that have already elapsed.
+
 ### Behaviors that follow from the formula
 
 - **A registered operator with zero served bytes in the trailing window has zero vote.** The bond gates eligibility to vote; it does not directly grant weight.
+- **Declared capacity caps vote weight per epoch; it never grants weight.** An operator's counted bytes for epoch `e` cannot exceed what `declaredMbpsAtEpoch(op, e)` could physically deliver over that epoch. This is a deliberate consequence: an operator that declared zero capacity in an epoch contributes zero vote weight for that epoch, however many bytes it served.
 - **A fresh operator who serves heavily on day 1 still ramps in over `age_ramp_months`.** `age_ramp` is the tenure-buy-in defense; it stays defense-in-depth on top of bytes.
 - **Per-operator cap is computed against the bytes-weighted total at the same timepoint**, not against any historical or capacity-derived total. The cap clamp applies pre-multiplication by `age_ramp`.
 - **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(endEpoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
@@ -156,7 +162,7 @@ Defended by `age_ramp`. A fresh operator who bonds at `t=0` and serves the entir
 
 ### Slashed-but-still-voting
 
-Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than a `declaredMbps × age_ramp` mechanism, which would only reduce vote weight by the bond-reduction ratio.
+Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than relying on the declared-capacity cap alone, which would only reduce vote weight by the bond-reduction ratio.
 
 ### Concentration
 
