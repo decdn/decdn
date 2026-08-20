@@ -78,6 +78,15 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
     uint256 internal constant BPS_DENOMINATOR = 10_000;
     uint256 internal constant RAMP_SCALE = 1e18;
 
+    /// @dev Mbps (megabits/s) → bytes/s: `1e6 / 8`. Exact.
+    uint256 internal constant BYTES_PER_MBIT_SECOND = 125_000;
+
+    /// @dev Loop bound for the vote window. MUST equal
+    ///      `FeeRouter.WINDOW_EPOCHS_CEILING`; `windowEpochsAt` is governance-
+    ///      bounded to `[4, 26]`, this is the defensive ceiling on the on-chain
+    ///      loop (matches `FeeRouter.bytesInWindow`).
+    uint64 internal constant MAX_WINDOW_EPOCHS = 26;
+
     // -----------------------------------------------------------------
     // Errors / Events
     // -----------------------------------------------------------------
@@ -192,9 +201,10 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         return (total * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
     }
 
-    /// @dev ADR 036 § Formula. Returns 0 if the operator was slashed inside
-    ///      the trailing window; otherwise
-    ///      `min(served, voteCapBps × total / 10_000) × age_ramp / 1e18`.
+    /// @dev ADR 036 § Formula. Returns 0 if the operator was slashed inside the
+    ///      trailing window; otherwise `min(Σ_e min(bytesPerEpoch(e),
+    ///      declaredMbpsAtEpoch(e) × epochLength × 125_000), voteCapBps × total
+    ///      / 10_000) × age_ramp / 1e18`.
     function _getVotes(
         address account,
         uint256 timepoint,
@@ -236,10 +246,23 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
         if (!hasElapsed) return 0;
         uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
-        uint256 served = feeRouter.bytesInWindow(account, endEpoch, n);
+        if (n == 0) return 0;
+        if (n > MAX_WINDOW_EPOCHS) n = MAX_WINDOW_EPOCHS;
+        uint64 startEpoch = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
+        uint256 epochSeconds = feeRouter.epochLength();
+
+        uint256 served;
+        for (uint64 e = startEpoch; e <= endEpoch; e++) {
+            uint256 epochBytes = feeRouter.bytesPerEpoch(account, e);
+            // Max bytes the tier declared at epoch `e`'s close could deliver.
+            // Declared capacity caps delivery-based weight; it never grants it.
+            uint256 epochCap = capacityBond.declaredMbpsAtEpoch(account, e) * epochSeconds * BYTES_PER_MBIT_SECOND;
+            served += epochBytes < epochCap ? epochBytes : epochCap;
+        }
+
+        // Per-operator share cap (ADR 036) reads at the proposal snapshot, not
+        // live, so a setter change mid-vote does not shift weights.
         uint256 total = feeRouter.totalBytesInWindow(endEpoch, n);
-        // Read the per-operator cap at the proposal snapshot, not live, so
-        // a setter change mid-vote does not shift weights (I4).
         uint256 capBps = voteCapBpsAt(timepoint.toUint48());
         uint256 cap = (total * capBps) / BPS_DENOMINATOR;
         return served < cap ? served : cap;

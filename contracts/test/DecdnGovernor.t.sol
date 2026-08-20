@@ -93,6 +93,10 @@ contract DecdnGovernorTest is Test {
         uint64 e = _endEpoch();
         feeRouter.setBytes(op, e, served);
         feeRouter.setTotalBytes(e, total);
+        // Ample declared capacity so the ADR 036 per-epoch cap does not bind for
+        // the small byte fixtures these tests use; cap-binding is covered
+        // explicitly in the declared-capacity tests below.
+        bond.setDeclaredMbpsAtEpoch(op, e, 1000);
     }
 
     function test_getVotes_ramp() public {
@@ -406,5 +410,61 @@ contract DecdnGovernorTest is Test {
         bond.setSlashedAtEpoch(operator, 1);
 
         assertEq(gov.getVotes(operator, early), 0);
+    }
+
+    // ADR 036 § Formula — declared-capacity cap. `declaredMbps × epochLength ×
+    // 125_000` is the max bytes the declared line could deliver in an epoch.
+    // Short-epoch (1s) harness so the cap is hand-sized: 1 Mbps × 1 s × 125_000
+    // = 125_000 bytes. firstBondedAt = 1 (non-zero) + tp2 = 400 days ⇒ full ramp.
+    function test_getVotes_capsAtDeclaredCapacity_shortEpoch() public {
+        MockFeeRouter fr = new MockFeeRouter(WINDOW, 1);
+        MockCapacityBond cb = new MockCapacityBond();
+        DecdnGovernor g = new DecdnGovernor(IFeeRouter(address(fr)), ICapacityBond(address(cb)), timelock);
+
+        uint256 tp2 = 400 days; // full age ramp (horizon 180 days)
+        uint64 e = uint64(tp2) - 1; // epochLength 1s → last fully-elapsed epoch
+        cb.setFirstBondedAt(operator, 1); // non-zero sentinel → ramp not auto-zeroed
+
+        fr.setBytes(operator, e, 300_000); // served above the capacity cap
+        fr.setTotalBytes(e, 1_000_000_000); // 5% share cap = 50_000_000 ≫ served
+        cb.setDeclaredMbpsAtEpoch(operator, e, 1); // cap = 1 × 1 × 125_000 = 125_000
+
+        // min(served 300_000, capacityCap 125_000, shareCap 50_000_000) = 125_000.
+        assertEq(g.getVotes(operator, tp2), 125_000);
+    }
+
+    function test_getVotes_burstFair_onlyOverLineEpochClipped() public {
+        MockFeeRouter fr = new MockFeeRouter(WINDOW, 1);
+        MockCapacityBond cb = new MockCapacityBond();
+        DecdnGovernor g = new DecdnGovernor(IFeeRouter(address(fr)), ICapacityBond(address(cb)), timelock);
+
+        uint256 tp2 = 400 days;
+        uint64 end = uint64(tp2) - 1;
+        cb.setFirstBondedAt(operator, 1);
+
+        // Epoch `end`: 300k served, cap 125k → clipped to 125k.
+        fr.setBytes(operator, end, 300_000);
+        cb.setDeclaredMbpsAtEpoch(operator, end, 1); // 125_000
+        // Epoch `end-1`: 50k served, cap 125k → full 50k (under line, untouched).
+        fr.setBytes(operator, end - 1, 50_000);
+        cb.setDeclaredMbpsAtEpoch(operator, end - 1, 1);
+        fr.setTotalBytes(end, 1_000_000_000); // share cap non-binding
+
+        // 125_000 + 50_000 = 175_000; no cross-epoch penalty.
+        assertEq(g.getVotes(operator, tp2), 175_000);
+    }
+
+    function test_getVotes_zeroDeclaredCapacity_zeroWeight() public {
+        MockFeeRouter fr = new MockFeeRouter(WINDOW, 1);
+        MockCapacityBond cb = new MockCapacityBond();
+        DecdnGovernor g = new DecdnGovernor(IFeeRouter(address(fr)), ICapacityBond(address(cb)), timelock);
+
+        uint256 tp2 = 400 days;
+        uint64 e = uint64(tp2) - 1;
+        cb.setFirstBondedAt(operator, 1); // full ramp, so the ONLY zeroing cause is the cap
+        fr.setBytes(operator, e, 300_000);
+        fr.setTotalBytes(e, 1_000_000_000);
+        // No declared capacity anywhere in the window → cap 0 → weight 0.
+        assertEq(g.getVotes(operator, tp2), 0);
     }
 }
