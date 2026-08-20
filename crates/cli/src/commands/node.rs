@@ -128,6 +128,13 @@ fn write_health(w: &mut impl io::Write, resp: &HealthResponse) -> io::Result<()>
     if let Some(bound) = &resp.bound_node_id {
         writeln!(w, "bound_node_id={bound}")?;
     }
+    // Always printed (#1030). `false` is the answer to "the node is up and
+    // healthy, why is it earning nothing": it is absent from the on-chain
+    // registry, so it accrues no governance weight (its declared capacity caps
+    // credited bytes at zero) and peers have no reason to route to a node they
+    // cannot slash. Nothing on the wire says so — the node simply gets no
+    // requests — which is exactly why this line exists.
+    writeln!(w, "registry_active={}", resp.registry_active)?;
     Ok(())
 }
 
@@ -1250,12 +1257,21 @@ mod tests {
     use super::*;
 
     fn health_response(binding: BindingStatus, bound: Option<&str>) -> HealthResponse {
+        health_response_with_registry(binding, bound, true)
+    }
+
+    fn health_response_with_registry(
+        binding: BindingStatus,
+        bound: Option<&str>,
+        registry_active: bool,
+    ) -> HealthResponse {
         HealthResponse {
             node_id: "aa".repeat(32),
             uptime_s: 42,
             in_flight_streams: 0,
             binding,
             bound_node_id: bound.map(str::to_string),
+            registry_active,
         }
     }
 
@@ -1286,6 +1302,33 @@ mod tests {
         let s = health_lines(&health_response(BindingStatus::Mismatch, Some(&bound)));
         assert!(s.contains("binding=mismatch"), "{s}");
         assert!(s.contains(&format!("bound_node_id={bound}")), "{s}");
+    }
+
+    /// `registry_active` must print in BOTH states, for the same reason
+    /// `binding` does: a script grepping for the failure has to be able to tell
+    /// "checked, and this node cannot sell" from "the line is missing" (#1030).
+    /// The two fields are independent — a node can be correctly `bound` and
+    /// still be out of the active set (deregistered, ejected, unbonding, or
+    /// bond below `minBond`), which is exactly the case an operator misreads
+    /// without this line.
+    #[test]
+    fn health_prints_registry_active_in_both_states() {
+        let serving = health_lines(&health_response_with_registry(
+            BindingStatus::Bound,
+            Some(&"aa".repeat(32)),
+            true,
+        ));
+        assert!(serving.contains("registry_active=true"), "{serving}");
+
+        let idle = health_lines(&health_response_with_registry(
+            BindingStatus::Bound,
+            Some(&"aa".repeat(32)),
+            false,
+        ));
+        assert!(
+            idle.contains("registry_active=false"),
+            "a bound node that is out of the active set must still say so: {idle}"
+        );
     }
 
     /// `unknown` must print. Omitting the line for the not-checked case would

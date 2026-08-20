@@ -126,6 +126,27 @@ alloy::sol! {
         // distributes it 50% to the recorded challenger and 50% to the burn.
         function escrowedTotal() external view returns (uint256);
         function finalizeUnappealedSlash(uint256 slashId) external;
+        // Onboarding negatives (#1030, G-NODE-01). Declared so a reverted
+        // `registerNode` decodes to a *named* error rather than an opaque
+        // selector, and so `crate::assert::expect_revert_anyhow` can match on
+        // `E::SELECTOR` — compiler-checked against the ABI instead of a
+        // hand-copied hex literal. Same reasoning as the `PublisherRegistry`
+        // error block below.
+        //
+        // The ORDER these fire in is what the journey's negatives depend on:
+        // `registerNode` runs `_checkRegistrationPreconditions` (which raises
+        // `BondBelowMinimum`) BEFORE `_checkBindingOneToOne` (which raises
+        // `NodeIdAlreadyBound`), so an under-bonded impostor never reaches the
+        // binding guard.
+        error BondBelowMinimum(uint256 bond, uint256 required);
+        error BondBelowCurve(uint256 bond, uint256 required);
+        /// Someone else's address already owns this node id — the one-to-one
+        /// binding rule. `currentOwner` names the operator that holds it.
+        error NodeIdAlreadyBound(address currentOwner);
+        /// This address is already bound to a DIFFERENT node id. The mirror of
+        /// `NodeIdAlreadyBound`; declared alongside it so a negative that trips
+        /// the wrong half of `_checkBindingOneToOne` reports which half.
+        error AddressAlreadyBound(bytes32 currentNodeId);
     }
 
     /// `FeeRouter.bytesPerEpoch` — governance-canonical served-bytes counter

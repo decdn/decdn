@@ -166,7 +166,41 @@ A node satisfying all five criteria is ready to:
 - Accept `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment pools opened by clients and other nodes
 
-**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 active_nodes=12`) once all five criteria hold, so operators can confirm correct startup without grepping multiple log sources.
+#### How criterion 1 is enforced
+
+The daemon does **not** refuse paid delivery when criterion 1 is false. This is
+deliberate. The check would be a node reading its own registration status and
+choosing to stop selling. An operator who wants to sell without registering
+removes the check and rebuilds. A rule that only the honest party obeys is not
+an enforcement mechanism, and writing it into the daemon hides that fact.
+
+Criterion 1 is a readiness condition for the operator. It is not a permission
+the software grants itself.
+
+Two external mechanisms do the actual work, and both are already in place.
+
+**No governance weight.** Vote weight comes from `FeeRouter.bytesPerEpoch`,
+capped per epoch by the operator's declared capacity
+([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). An operator that never registered also never called `declareMbps`, so
+the cap is zero and every delivered byte credits zero weight. A slashed operator
+has its weight watermark reset the same way.
+
+**No counterparty.** A client selects an upstream. It should not select a node
+it cannot slash, because slashability is what backs the delivery promise. A node
+that is absent from the on-chain registry is absent from the set peers route
+through, so the traffic does not arrive.
+
+Both constraints sit outside the seller's process. Neither can be removed by
+patching the daemon.
+
+The bring-up binding self-check (§ Operator Safety Obligations) stays advisory
+for the same reason. It tells an operator that their node is unslashable, which
+is information they need. It does not gate anything.
+
+**Do not add a serve-side registration gate.** It reads as defence in depth and
+is not: it constrains only operators who were never the threat, and it adds a
+code path that must be maintained and tested for a condition the protocol
+already answers elsewhere.
 
 ### NAT and Multiaddr Handling
 

@@ -2156,7 +2156,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // ADR 041: the SAME warming allowance the buy loop debits, the serve
         // path credits, and the eviction driver forgets from, so
         // `admin_v1_evict` can also drop a hash's provenance tag on removal.
-        .with_warming(Arc::clone(&ch.warming));
+        .with_warming(Arc::clone(&ch.warming))
+        // Live ADR 019 §Phase 4 registry state (#1030). The same `Arc` the serve
+        // gate reads, so `decdn node health` cannot report a node as servable
+        // while `serve_stream` is refusing it — and an operator who has just run
+        // `decdn setup` sees `registry_active` flip without a restart.
+        .with_staker_set(Arc::clone(&ch.staker_set));
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");

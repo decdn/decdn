@@ -339,6 +339,18 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                     Err(err) => warn!(%err, "skipping undecodable UnbondingRequested log"),
                 }
             }
+            // The blacklist-ejection twin of `Reinstated` (#1030). `ejected` is a
+            // conjunct of `isActive`, so an ejection deactivates the operator
+            // exactly as an unbonding request does — but the event was missing
+            // from this OR-set, so an ejection only landed at the next
+            // `REGISTRY_RESYNC_INTERVAL` re-enumeration. Every consumer of the
+            // staker set was wrong for up to 15 minutes, DHT admission included.
+            Some(sig) if sig == CapacityBond::EjectedByBlacklist::SIGNATURE_HASH => {
+                match CapacityBond::EjectedByBlacklist::decode_log_data(&log.inner.data) {
+                    Ok(event) => self.on_operator_change(event.operator, false).await,
+                    Err(err) => warn!(%err, "skipping undecodable EjectedByBlacklist log"),
+                }
+            }
             _ => {
                 debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
             }
@@ -600,6 +612,7 @@ fn registry_route_topic0s() -> Vec<B256> {
         CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
         CapacityBond::Reinstated::SIGNATURE_HASH,
         CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+        CapacityBond::EjectedByBlacklist::SIGNATURE_HASH,
     ]
 }
 
@@ -625,8 +638,13 @@ mod tests {
     use super::*;
     use alloy::primitives::{Bytes, LogData};
 
-    /// The registry route watches exactly the five `CapacityBond`
+    /// The registry route watches exactly the six `CapacityBond`
     /// staker-membership events — no more, no fewer.
+    ///
+    /// `EjectedByBlacklist` is load-bearing and was absent until #1030: it is
+    /// the only event that reports a blacklist ejection, `ejected` is a conjunct
+    /// of `isActive`, and without it an ejected operator stayed in the active
+    /// set until the next 15-minute re-enumeration.
     #[test]
     fn route_topic0s_covers_every_staker_membership_event() {
         assert_eq!(
@@ -637,6 +655,7 @@ mod tests {
                 CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
                 CapacityBond::Reinstated::SIGNATURE_HASH,
                 CapacityBond::UnbondingRequested::SIGNATURE_HASH,
+                CapacityBond::EjectedByBlacklist::SIGNATURE_HASH,
             ]
         );
     }
@@ -820,6 +839,11 @@ mod tests {
         log_from(event.encode_log_data())
     }
 
+    fn ejected_by_blacklist_log(operator: Address) -> Log {
+        let event = CapacityBond::EjectedByBlacklist { operator };
+        log_from(event.encode_log_data())
+    }
+
     fn log_from(data: LogData) -> Log {
         Log {
             inner: alloy::primitives::Log {
@@ -1000,6 +1024,36 @@ mod tests {
         assert!(r.is_ok());
         assert!(is_active(&active, nid(1)), "nodeIdOf.active wins");
         assert_eq!(binding_of(bindings.as_ref(), nid(1)), Some(addr(9)));
+    }
+
+    /// The `Reinstated` twin, and the arm #1030 added. `ejected` is a conjunct
+    /// of `isActive`, so a blacklist ejection must deactivate immediately —
+    /// before #1030 this event was not in the route's OR-set at all, so an
+    /// ejected operator stayed servable (and DHT-admissible) for up to
+    /// `REGISTRY_RESYNC_INTERVAL`.
+    ///
+    /// `nodeIdOf` reports `active: false` here, matching what the event implies;
+    /// the binding survives, because an ejected operator may still be owed
+    /// payment on an open channel.
+    #[tokio::test]
+    async fn ejected_by_blacklist_deactivates_but_keeps_the_binding() {
+        let (mut s, active, bindings, _op, _regions, _m) =
+            sink(StubReads::new(Ok(Some((nid(1), false)))), true);
+        let _ = s.apply(registered_log(nid(1), addr(9))).await;
+        assert!(is_active(&active, nid(1)), "registered node starts active");
+
+        let r = s.apply(ejected_by_blacklist_log(addr(9))).await;
+
+        assert!(r.is_ok());
+        assert!(
+            !is_active(&active, nid(1)),
+            "a blacklist ejection must deactivate the operator"
+        );
+        assert_eq!(
+            binding_of(bindings.as_ref(), nid(1)),
+            Some(addr(9)),
+            "ejection must NOT clear the payout binding"
+        );
     }
 
     /// The canonical `nodeIdOf.active` beats what the event implies when a later

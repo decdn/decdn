@@ -466,7 +466,6 @@ impl ChainFixture {
         multiaddr: &str,
     ) -> anyhow::Result<()> {
         let op_addr = operator.address();
-        let node_id = B256::from_slice(node_secret.public().as_bytes());
         let min_bond: U256 = MIN_BOND_WEI.parse().context("parse min bond")?;
 
         self.fund_eth(op_addr, 100).await?;
@@ -492,6 +491,95 @@ impl ChainFixture {
             .await
             .context("bond receipt")?;
         crate::ensure_mined(&bond_receipt, "bond")?;
+
+        self.register_node_raw(operator, node_secret, region, multiaddr)
+            .await?;
+
+        anyhow::ensure!(
+            bond.isActive(op_addr)
+                .call()
+                .await
+                .context("read isActive")?,
+            "operator must be active after bond + registerNode"
+        );
+        Ok(())
+    }
+
+    /// Fund `operator` with gas and exactly `amount` TOKEN, then `approve` +
+    /// `bond` that whole amount. Returns once the bond is mined.
+    ///
+    /// The bond-only half of [`Self::onboard_operator`], for journeys that need
+    /// an operator at a *chosen* bond rather than at `minBond` (#1030). The
+    /// amount is deliberately not clamped: `bond()` itself has no floor — it
+    /// guards only `ZeroAmount` — and the whole point of the under-bonded
+    /// negative is that the floor is enforced downstream, at `registerNode`.
+    pub async fn fund_and_bond(
+        &self,
+        operator: &PrivateKeySigner,
+        amount: U256,
+    ) -> anyhow::Result<()> {
+        let op_addr = operator.address();
+        self.fund_eth(op_addr, 100).await?;
+        self.transfer_token(op_addr, amount).await?;
+
+        let op_provider = self.provider_for(operator);
+        let approve_receipt = Erc20::new(self.addrs.token, &op_provider)
+            .approve(self.addrs.capacity_bond, amount)
+            .send()
+            .await
+            .context("token.approve send")?
+            .get_receipt()
+            .await
+            .context("token.approve receipt")?;
+        crate::ensure_mined(&approve_receipt, "token.approve")?;
+
+        let bond_receipt = CapacityBond::new(self.addrs.capacity_bond, &op_provider)
+            .bond(amount)
+            .send()
+            .await
+            .context("bond send")?
+            .get_receipt()
+            .await
+            .context("bond receipt")?;
+        crate::ensure_mined(&bond_receipt, "bond")
+    }
+
+    /// Submit `registerNode` for `operator` with fully valid signatures, and
+    /// surface a revert instead of hiding it.
+    ///
+    /// The signing half of [`Self::onboard_operator`], split out so a journey
+    /// can drive `registerNode` on its own terms: as an arbitrary signer, at an
+    /// arbitrary bond, or against a node id someone else already owns (#1030).
+    /// `onboard_operator` is built on it, so the two can never disagree about
+    /// how a registration is signed.
+    ///
+    /// Funds nothing and bonds nothing — the caller sets up the on-chain
+    /// preconditions it wants to test. That is the point: `registerNode`'s
+    /// guards fire in a fixed order (`_checkRegistrationPreconditions` before
+    /// `_checkBindingOneToOne`), so a negative that under-funds its impostor
+    /// reverts on the bond floor and never reaches the binding rule it meant to
+    /// exercise.
+    ///
+    /// **Signatures are always real.** The EIP-712 binding signature is made
+    /// with `operator`'s eth key and the ed25519 ownership proof with
+    /// `node_secret`, both over the production digests, both at freshly-read
+    /// nonces. A negative built on this therefore proves the guard it names
+    /// fired — not that a malformed signature was rejected first.
+    ///
+    /// The error is the `anyhow`-wrapped `alloy::contract::Error`, so
+    /// [`crate::assert::expect_revert_anyhow`] can downcast it and match the
+    /// revert selector.
+    pub async fn register_node_raw(
+        &self,
+        operator: &PrivateKeySigner,
+        node_secret: &iroh::SecretKey,
+        region: &str,
+        multiaddr: &str,
+    ) -> anyhow::Result<()> {
+        let op_addr = operator.address();
+        let node_id = B256::from_slice(node_secret.public().as_bytes());
+        let op_provider = self.provider_for(operator);
+        let bond = CapacityBond::new(self.addrs.capacity_bond, &op_provider);
 
         // Nonces feed both signature digests (fresh operator/nodeId → 0, but
         // read them so a re-onboard converges rather than signing a stale nonce).
@@ -547,16 +635,7 @@ impl ChainFixture {
             .get_receipt()
             .await
             .context("registerNode receipt")?;
-        crate::ensure_mined(&register_receipt, "registerNode")?;
-
-        anyhow::ensure!(
-            bond.isActive(op_addr)
-                .call()
-                .await
-                .context("read isActive")?,
-            "operator must be active after bond + registerNode"
-        );
-        Ok(())
+        crate::ensure_mined(&register_receipt, "registerNode")
     }
 
     /// Fund a node operator as a paid **buyer** so its daemon can open an
