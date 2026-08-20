@@ -113,6 +113,14 @@ pub struct AdminState {
     /// [`BindingReport::unknown`] — the honest answer for a state that was
     /// never sampled, and the one the unit tests here construct.
     binding: BindingReport,
+    /// The SAME ADR 041 per-source warming allowance the buy loop debits, the
+    /// serve path credits, and the eviction driver forgets from, attached via
+    /// [`AdminState::with_warming`]. `admin_v1_evict` durably removes a blob
+    /// exactly like a governance takedown does, so it must also drop the
+    /// hash's `source_of` provenance tag — otherwise a re-admitted hash could
+    /// spuriously credit its old source. `None` (unit tests that don't wire
+    /// it) means the evict handler simply skips the forget.
+    warming: Option<Arc<crate::warming_allowance::WarmingAllowance>>,
     /// Live on-chain active-staker set, attached via
     /// [`AdminState::with_staker_set`] (#1030). `None` (unit tests, and any
     /// build with no chain wiring) reports `registry_active: false`: an unwired
@@ -325,6 +333,7 @@ impl AdminState {
             lanes: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
+            warming: None,
             staker_set: None,
         }
     }
@@ -398,6 +407,20 @@ impl AdminState {
     #[must_use]
     pub fn with_slash_detection(mut self, slash_detection: SlashStatusHandles) -> Self {
         self.slash_detection = Some(slash_detection);
+        self
+    }
+
+    /// Attach the shared ADR 041 warming allowance so `admin_v1_evict` can
+    /// forget an evicted hash's `source_of` provenance tag (issue #1751
+    /// review). The production runtime calls this once after `new` with the
+    /// SAME `Arc` the buy loop, serve path, and eviction driver share; without
+    /// it, an admin evict leaves the tag in place.
+    #[must_use]
+    pub fn with_warming(
+        mut self,
+        warming: Arc<crate::warming_allowance::WarmingAllowance>,
+    ) -> Self {
+        self.warming = Some(warming);
         self
     }
 }
@@ -504,6 +527,11 @@ impl AdminRpcServer for AdminRpcImpl {
                 .evict(hash)
                 .await
                 .map_err(|err| cache_error_to_rpc(&err))?;
+            // ADR 041: drop the warming tag for the evicted hash, so a later
+            // reuse of this slot can never credit a stale source's allowance.
+            if let Some(warming) = self.state.warming.as_ref() {
+                warming.forget(*hash.as_bytes());
+            }
         }
 
         Ok(EvictResponse {

@@ -296,9 +296,25 @@ mod sol_types {
             event RateBoundsUpdated(uint256 newDeliveryFloor);
         }
     }
+
+    alloy::sol! {
+        #[sol(rpc)]
+        contract FeeRouter {
+            /// Current fee split, as `[operator, buyback, treasury]` basis
+            /// points summing to `BPS_DENOMINATOR`. Mirrors
+            /// `contracts/src/FeeRouter.sol`.
+            function getShares() external view returns (uint256[3]);
+
+            /// Governance retuned the fee split. The fee-shares watcher
+            /// decodes the new split and stores the operator bucket into the
+            /// node's live cell so a governance retune reaches running nodes
+            /// without a restart.
+            event SharesUpdated(uint256[3] newShares);
+        }
+    }
 }
 
-pub use sol_types::PaymentPool;
+pub use sol_types::{FeeRouter, PaymentPool};
 
 /// Narrow a USDC amount, or a byte count, to the `uint64` the `PaymentPool`
 /// carries in its packed fields.

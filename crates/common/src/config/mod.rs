@@ -23,7 +23,8 @@ pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
     ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedTinyLfu,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
 
@@ -279,6 +280,24 @@ pub const TINYLFU_PROBATION_TARGET_PCT_BOUNDS: (u64, u64) = (1, 50);
 /// and stored but not currently consulted by the shipped sketch.
 pub const DEFAULT_TINYLFU_AGING_HALFLIFE_SEC: u64 = 600;
 
+/// Default `cache.serve_economics.policy` (ADR 041).
+pub const DEFAULT_SERVE_ECONOMICS_POLICY: &str = "margin";
+/// Default `cache.serve_economics.discount` (0.5), expressed in basis points.
+pub const DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS: u32 = 5000;
+/// Default `cache.serve_economics.n_max` (ADR 041).
+pub const DEFAULT_SERVE_ECONOMICS_N_MAX: u32 = 64;
+/// Default `cache.serve_economics.warming_budget` (ADR 041). $5 in USDC
+/// 6-decimal base units. The per-source net-P&L ledger is debited the full
+/// upstream buy cost on a speculative pull and credited the realized operator
+/// margin on each serve, so a one-hit blob nets the fee skim (~`0.4·P_sell`) as
+/// its lasting loss; on a $0.01/GB flat mesh this `$5` bounds roughly 1,250 GB of
+/// unrecovered one-hit warming per source before it drops to the profit floor.
+pub const DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET: u64 = 5_000_000;
+/// Default `cache.serve_economics.warming_refill` (ADR 041). ~$5/day: honest
+/// sources recover their allowance daily; sustained grief is bounded to
+/// ≤ $5/day/source. Base units/sec ≈ `5_000_000 / 86_400`.
+pub const DEFAULT_SERVE_ECONOMICS_WARMING_REFILL: u64 = 58;
+
 /// Default EIP-712 `chainId` for the `slash_sig` domain separator (ADR 014).
 /// Arbitrum Sepolia — the initial network target; matches the chain id bound
 /// on the runtime `PrivateKeySigner` (`decdn_incentive::eth_identity`). To
@@ -294,6 +313,12 @@ pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
 /// re-reads by the rate-bounds watcher (#1172, ADR 019 §3.1) — the safety-net
 /// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
 pub const DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC: u64 = 3600;
+
+/// Default seconds between authoritative `FeeRouter.getShares()` re-reads by
+/// the fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics) — the
+/// safety-net cadence alongside the `SharesUpdated` event subscription.
+/// Mirrors [`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`]'s one-hour cadence.
+pub const DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC: u64 = 3600;
 
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
@@ -1354,6 +1379,21 @@ fn resolve_blockchain_into(
          for the default (3600s)",
     );
 
+    let fee_shares_poll_interval_sec = file
+        .and_then(|b| b.fee_shares_poll_interval_sec)
+        .unwrap_or(DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC);
+    // Mirrors `rate_bounds_poll_interval_sec`: `0` would make the authoritative
+    // re-read run every tick (no throttle), hammering the RPC — the
+    // `SharesUpdated` event subscription is already the prompt path, so the
+    // re-read is a slow safety net. Reject rather than silently over-poll.
+    bag.check(
+        fee_shares_poll_interval_sec != 0,
+        "blockchain.fee_shares_poll_interval_sec",
+        "blockchain.fee_shares_poll_interval_sec must not be 0 — the \
+         authoritative getShares() re-read is a slow safety net; omit it \
+         for the default (3600s)",
+    );
+
     let origin_directory_positive_ttl_sec = file
         .and_then(|b| b.origin_directory_positive_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC);
@@ -1531,6 +1571,7 @@ fn resolve_blockchain_into(
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
         rate_bounds_poll_interval_sec,
+        fee_shares_poll_interval_sec,
         redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,
@@ -1868,6 +1909,54 @@ fn resolve_cache_into(
         .and_then(|t| t.aging_halflife_sec)
         .unwrap_or(DEFAULT_TINYLFU_AGING_HALFLIFE_SEC);
 
+    // Refuse-to-serve economics (ADR 041). Unknown policy names and
+    // out-of-range knobs are rejected here, at config load — never a silent
+    // fallback to the default.
+    let se_file = file.and_then(|c| c.serve_economics.as_ref());
+    let se_policy = se_file
+        .and_then(|s| s.policy.clone())
+        .unwrap_or_else(|| DEFAULT_SERVE_ECONOMICS_POLICY.to_string());
+    bag.check_with(
+        matches!(se_policy.as_str(), "off" | "margin"),
+        "cache.serve_economics.policy",
+        || format!("cache.serve_economics.policy ({se_policy}) must be \"off\" or \"margin\""),
+    );
+    let se_discount = se_file.and_then(|s| s.discount);
+    bag.check_with(
+        se_discount.is_none_or(|d| d > 0.0 && d <= 1.0),
+        "cache.serve_economics.discount",
+        || format!("cache.serve_economics.discount ({se_discount:?}) must be within (0.0, 1.0]"),
+    );
+    // Round to bps without float panics; the clamp (on the float, before the
+    // cast) defends the conversion even if validation above is bypassed, so
+    // the truncation/sign-loss casts below are always in `[1, 10_000]`.
+    let se_discount_bps = se_discount.map_or(DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS, |d| {
+        let bps = (d * 10_000.0).round().clamp(1.0, 10_000.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bps = bps as u32;
+        bps
+    });
+    let se_n_max = se_file
+        .and_then(|s| s.n_max)
+        .unwrap_or(DEFAULT_SERVE_ECONOMICS_N_MAX);
+    bag.check_with(se_n_max >= 1, "cache.serve_economics.n_max", || {
+        format!("cache.serve_economics.n_max ({se_n_max}) must be >= 1")
+    });
+    let se_warming_budget = se_file
+        .and_then(|s| s.warming_budget)
+        .unwrap_or(DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET);
+    bag.check_with(
+        se_warming_budget > 0,
+        "cache.serve_economics.warming_budget",
+        || format!("cache.serve_economics.warming_budget ({se_warming_budget}) must be > 0"),
+    );
+    // `warming_refill` may be 0: that disables time-based refill (allowance
+    // only resets on restart or via the serve-vindicated upgrade), which is
+    // a valid operator choice, not an error.
+    let se_warming_refill = se_file
+        .and_then(|s| s.warming_refill)
+        .unwrap_or(DEFAULT_SERVE_ECONOMICS_WARMING_REFILL);
+
     ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -1902,6 +1991,13 @@ fn resolve_cache_into(
             promotion_threshold: tinylfu_promotion_threshold,
             probation_target_pct: tinylfu_probation_target_pct,
             aging_halflife_sec: tinylfu_aging_halflife_sec,
+        },
+        serve_economics: ResolvedServeEconomics {
+            policy: se_policy,
+            discount_bps: se_discount_bps,
+            n_max: se_n_max,
+            warming_budget: se_warming_budget,
+            warming_refill: se_warming_refill,
         },
     }
 }
@@ -4329,6 +4425,71 @@ mod tests {
         assert!(
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
             "a 0 open budget must be rejected: no pull could ever complete its handshake"
+        );
+    }
+
+    /// Parse a `[cache...]` TOML snippet and resolve it into a [`ResolvedCache`],
+    /// the same round trip an operator's config file goes through.
+    fn resolve_from_toml(toml_str: &str) -> anyhow::Result<ResolvedCache> {
+        let file: FileConfig = toml::from_str(toml_str)?;
+        let cli = empty_cache_args();
+        resolve_cache(&cli, file.cache.as_ref(), Path::new("/data-dir"))
+    }
+
+    /// `[cache.serve_economics]` defaults to the `"margin"` policy (ADR 041) with
+    /// a 50% discount and an `n_max` of 64, even with no table present.
+    #[test]
+    fn serve_economics_defaults_to_margin() {
+        let resolved = resolve_from_toml("").expect("empty config resolves");
+        assert_eq!(resolved.serve_economics.policy, "margin");
+        assert_eq!(resolved.serve_economics.discount_bps, 5000);
+        assert_eq!(resolved.serve_economics.n_max, 64);
+        assert_eq!(resolved.serve_economics.warming_budget, 5_000_000);
+        assert_eq!(resolved.serve_economics.warming_refill, 58);
+    }
+
+    /// An unknown `cache.serve_economics.policy` name is a config error at load
+    /// time — never a silent fallback to `"margin"`.
+    #[test]
+    fn unknown_serve_economics_policy_is_rejected() {
+        let toml = "[cache.serve_economics]\npolicy = \"bogus\"\n";
+        let err = resolve_from_toml(toml).expect_err("unknown policy rejected");
+        assert!(err.to_string().contains("cache.serve_economics.policy"));
+    }
+
+    /// `discount` must fall within `(0.0, 1.0]`: `0.0` would give away
+    /// everything for free (defeating the margin gate) and anything above `1.0`
+    /// is not a discount.
+    #[test]
+    fn serve_economics_discount_out_of_range_is_rejected() {
+        for bad in ["0.0", "1.5"] {
+            let toml = format!("[cache.serve_economics]\ndiscount = {bad}\n");
+            assert!(
+                resolve_from_toml(&toml).is_err(),
+                "discount {bad} must be rejected"
+            );
+        }
+    }
+
+    /// `n_max = 0` is rejected rather than clamped: it would leave no room for
+    /// any speculative warming source.
+    #[test]
+    fn serve_economics_n_max_zero_is_rejected() {
+        let toml = "[cache.serve_economics]\nn_max = 0\n";
+        assert!(
+            resolve_from_toml(toml).is_err(),
+            "n_max = 0 must be rejected"
+        );
+    }
+
+    /// `warming_budget = 0` is rejected rather than silently disabling warming:
+    /// the operator must set `policy = \"off\"` to opt out explicitly.
+    #[test]
+    fn serve_economics_warming_budget_zero_is_rejected() {
+        let toml = "[cache.serve_economics]\nwarming_budget = 0\n";
+        assert!(
+            resolve_from_toml(toml).is_err(),
+            "warming_budget = 0 must be rejected"
         );
     }
 

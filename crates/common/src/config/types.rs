@@ -204,6 +204,14 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
     /// be `0` (that would poll every tick); rejected at config resolution.
     pub rate_bounds_poll_interval_sec: Option<u64>,
+    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
+    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). This is the
+    /// safety-net cadence *in addition to* the `SharesUpdated` event
+    /// subscription (which follows [`Self::event_poll_interval_ms`]); it
+    /// reconciles any log the event tail missed. Absent =>
+    /// [`super::DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
+    /// be `0` (that would poll every tick); rejected at config resolution.
+    pub fee_shares_poll_interval_sec: Option<u64>,
     /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
     /// early withdrawal). The node submits an on-chain redemption
     /// transaction for a chunk of lanes only once the aggregate un-redeemed
@@ -588,6 +596,10 @@ pub struct CacheConfig {
     /// [`Self::eviction_policy`] or [`Self::admission_policy`] is `"tinylfu"`;
     /// otherwise unused. Absent => every field defaults.
     pub tinylfu: Option<TinyLfuConfig>,
+    /// Refuse-to-serve economics tuning (ADR 041): the margin policy, its
+    /// discount, and per-source speculative-warming allowance. Absent =>
+    /// every field defaults.
+    pub serve_economics: Option<ServeEconomicsConfig>,
 }
 
 /// W-TinyLFU tuning knobs (ADR 040). See [`CacheConfig::tinylfu`].
@@ -612,6 +624,36 @@ pub struct TinyLfuConfig {
     /// Currently resolved and stored but not consulted — the shipped sketch
     /// ages via a fixed sample-count reset rather than a wall-clock half-life.
     pub aging_halflife_sec: Option<u64>,
+}
+
+/// Refuse-to-serve economics tuning knobs (ADR 041). See
+/// [`CacheConfig::serve_economics`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeEconomicsConfig {
+    /// Refuse-to-serve policy selector. `"off"` or `"margin"`. Absent =>
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_POLICY`] (`"margin"`). An
+    /// unrecognized name is rejected at config load rather than silently
+    /// falling back.
+    pub policy: Option<String>,
+    /// Discount applied to the sell price when deciding whether a
+    /// speculative pull clears its margin gate. Within `(0.0, 1.0]`. Absent
+    /// => [`crate::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS`] (5000,
+    /// i.e. `0.5`).
+    pub discount: Option<f64>,
+    /// Maximum number of concurrent speculative-warming sources. `>= 1`.
+    /// Absent => [`crate::config::DEFAULT_SERVE_ECONOMICS_N_MAX`] (64).
+    pub n_max: Option<u32>,
+    /// Per-source speculative-warming allowance, in payment base units.
+    /// `> 0`. Absent =>
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET`]
+    /// (5,000,000).
+    pub warming_budget: Option<u64>,
+    /// Per-source allowance refill rate, in payment base units per second.
+    /// `>= 0`; `0` disables time-based refill (allowance only resets on
+    /// restart or via the serve-vindicated upgrade). Absent =>
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL`] (58).
+    pub warming_refill: Option<u64>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

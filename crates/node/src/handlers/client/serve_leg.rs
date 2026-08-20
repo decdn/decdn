@@ -433,6 +433,10 @@ impl ClientHandler {
         // though the two legs run concurrently. One sighting per served blob, regardless
         // of range or interval count.
         self.cache.observe_hit(hash);
+        // ADR 041: credit the realized operator margin back to the source that
+        // speculatively warmed this blob (a no-op for an untagged / non-speculative
+        // hash), on the same clean-completion edge as the ADR 040 hit sighting.
+        self.credit_warming_serve(hash, delivered);
         Ok(())
     }
 }

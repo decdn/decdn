@@ -146,6 +146,12 @@ pub struct ResolvedBlockchain {
     /// `RateBoundsUpdated` event subscription. Defaults to 3600s
     /// (`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`); the resolver rejects `0`.
     pub rate_bounds_poll_interval_sec: u64,
+    /// Seconds between authoritative `FeeRouter.getShares()` re-reads by the
+    /// fee-shares watcher (ADR 041 / ADR 016 § Tunable Economics). Safety-net
+    /// cadence alongside the `SharesUpdated` event subscription. Defaults to
+    /// 3600s (`DEFAULT_FEE_SHARES_POLL_INTERVAL_SEC`); the resolver rejects
+    /// `0`.
+    pub fee_shares_poll_interval_sec: u64,
     /// Per-chunk redemption floor (base units, `µUSDC`). The seller
     /// settlement path submits an on-chain redemption transaction for a
     /// chunk of lanes only once the aggregate un-redeemed value across that
@@ -333,6 +339,9 @@ pub struct ResolvedCache {
     /// policy selector above is `"tinylfu"` — cheap to resolve and keeps this
     /// struct free of `Option`.
     pub tinylfu: ResolvedTinyLfu,
+    /// Refuse-to-serve economics tuning (ADR 041): the margin policy, its
+    /// discount, and per-source speculative-warming allowance.
+    pub serve_economics: ResolvedServeEconomics,
 }
 
 /// Resolved W-TinyLFU tuning knobs. See [`ResolvedCache::tinylfu`].
@@ -353,6 +362,31 @@ pub struct ResolvedTinyLfu {
     /// sample-count reset, not wall-clock aging). Default
     /// [`crate::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC`].
     pub aging_halflife_sec: u64,
+}
+
+/// Resolved refuse-to-serve economics tuning (ADR 041). See
+/// [`ResolvedCache::serve_economics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedServeEconomics {
+    /// Refuse-to-serve policy. `"off"` or `"margin"`. Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_POLICY`].
+    pub policy: String,
+    /// Discount applied to the sell price when deciding whether a
+    /// speculative pull clears its margin gate, in basis points. Validated
+    /// to `[1, 10_000]` (`5000` == `0.5`). Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS`].
+    pub discount_bps: u32,
+    /// Maximum number of concurrent speculative-warming sources. `>= 1`.
+    /// Default [`crate::config::DEFAULT_SERVE_ECONOMICS_N_MAX`].
+    pub n_max: u32,
+    /// Per-source speculative-warming allowance, in payment base units.
+    /// `> 0`. Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET`].
+    pub warming_budget: u64,
+    /// Per-source allowance refill rate, in payment base units per second.
+    /// `0` disables time-based refill. Default
+    /// [`crate::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL`].
+    pub warming_refill: u64,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

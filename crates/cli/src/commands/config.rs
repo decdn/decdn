@@ -193,6 +193,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  fee_shares_poll_interval_sec: {}",
+        resolved.blockchain.fee_shares_poll_interval_sec
+    )?;
+    writeln!(
+        w,
         "  redeem_threshold_micro_usdc: {}",
         resolved.blockchain.redeem_threshold_micro_usdc
     )?;
@@ -568,6 +573,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
 # rate_bounds_poll_interval_sec = 3600 # authoritative getRateBounds() re-read cadence, safety net beside the RateBoundsUpdated subscription (#1172); default 3600s, must be > 0
+# fee_shares_poll_interval_sec = 3600  # authoritative getShares() re-read cadence, safety net beside the SharesUpdated subscription (ADR 041); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
@@ -657,6 +663,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # promotion_threshold = 2                  # prior sightings before a probation member promotes to main
 # probation_target_pct = 10                # % of cache_size_mb the probation segment is capped to; bounds [1,50]
 # aging_halflife_sec = 600                 # reserved: not yet consulted by the shipped sketch (fixed sample-count reset)
+# [cache.serve_economics]                  # refuse-to-serve economics (ADR 041)
+# policy = "margin"                        # "off" or "margin"
+# discount = 0.5                           # (0.0, 1.0]; discount applied to the sell price for the margin gate
+# n_max = 64                               # max concurrent speculative-warming sources; >= 1
+# warming_budget = 5000000                 # per-source warming allowance, in payment base units; > 0
+# warming_refill = 58                      # per-source allowance refill rate, base units/sec; 0 disables time-based refill
 
 [payment]
 # rate_per_mb = 10
@@ -818,6 +830,7 @@ mod tests {
             rpc_watchdog_interval_sec,
             event_poll_interval_ms,
             rate_bounds_poll_interval_sec,
+            fee_shares_poll_interval_sec,
             redeem_threshold_micro_usdc,
             redeem_max_vouchers_per_tx,
             redeem_interval_secs,
@@ -878,6 +891,10 @@ mod tests {
                 rate_bounds_poll_interval_sec.is_none(),
             ),
             (
+                "fee_shares_poll_interval_sec =",
+                fee_shares_poll_interval_sec.is_none(),
+            ),
+            (
                 "redeem_threshold_micro_usdc =",
                 redeem_threshold_micro_usdc.is_none(),
             ),
@@ -935,6 +952,7 @@ mod tests {
             eviction_policy,
             admission_policy,
             tinylfu,
+            serve_economics,
         } = &config::types::CacheConfig::default();
         let cache = [
             ("cache_dir =", cache_dir.is_none()),
@@ -994,6 +1012,7 @@ mod tests {
             ("eviction_policy =", eviction_policy.is_none()),
             ("admission_policy =", admission_policy.is_none()),
             ("[cache.tinylfu]", tinylfu.is_none()),
+            ("[cache.serve_economics]", serve_economics.is_none()),
         ];
 
         let config::types::PaymentConfig {

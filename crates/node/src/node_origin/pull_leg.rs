@@ -58,13 +58,12 @@ use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
 use super::funder::{SETTLE_POLL_STEP, settle_wait_budget};
 use super::{
-    NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleOnDrop, bind_upstream_ctx,
-    cached_candidates, classify_pull_failure, discover, lane_ledger, now_micros, probe_and_rank,
-    record_outcome, record_pool_open_failure,
+    EconGate, NodeOrigin, NodeOriginDeps, PullMiss, PullOutcome, SettleOnDrop, bind_upstream_ctx,
+    cached_candidates, classify_pull_failure, discover, economic_ceiling, heat_of, lane_ledger,
+    mb_of, now_micros, probe_and_rank, record_outcome, record_pool_open_failure,
 };
 use crate::client_requester::{
-    PoolContext, PoolLedger, PullDeadlines, effective_rate_ceiling,
-    open_progressive_pull as open_progressive_upstream,
+    PoolContext, PoolLedger, PullDeadlines, open_progressive_pull as open_progressive_upstream,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
@@ -109,11 +108,16 @@ pub(crate) struct PullLegTarget {
     pub(crate) total_bytes: u64,
     /// The served client's namespace, threaded onto the pull (ADR 005), big-endian.
     namespace_id: [u8; 32],
-    /// The effective per-MB rate ceiling (lower of the probe rate and the config
-    /// ceiling), enforced by [`PeerSource`] before paying.
+    /// The effective per-MB rate ceiling (lower of the probe rate, the config
+    /// ceiling, and the ADR 041 buy cap), enforced by [`PeerSource`] before paying.
     rate_ceiling: u64,
     /// The open/stall stage bounds for each [`PeerSource`].
     deadlines: PullDeadlines,
+    /// ADR 041: this buy was priced above the amortized profit-guaranteed floor, so a
+    /// clean completion debits the source's warming allowance by the full buy cost.
+    speculative: bool,
+    /// The candidate's per-MB buy rate, for the speculative warming debit.
+    buy_rate_per_mb: u64,
 }
 
 /// The injected wait for [`RampPacer`]'s `Wait`: resolve once the serve leg's paid
@@ -337,6 +341,17 @@ impl NodeOrigin {
             debug!("node-origin: pull-leg candidate has no resolvable operator address; skipping");
             return Err(PullMiss::Clean);
         };
+        // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
+        // ceiling BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
+        let heat = heat_of(deps, hash_bytes);
+        let (econ_rate_ceiling, speculative) =
+            match economic_ceiling(deps, candidate.node_id, heat, candidate.rate_per_mb) {
+                EconGate::Allow {
+                    rate_ceiling,
+                    speculative,
+                } => (rate_ceiling, speculative),
+                EconGate::Skip => return Err(PullMiss::BelowMargin),
+            };
         let ctx = match deps
             .buyer
             .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
@@ -362,8 +377,8 @@ impl NodeOrigin {
             }
         };
         let ledger = lane_ledger(deps, provider_addr, &ctx);
-        let rate_ceiling =
-            effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb);
+        // Folds the candidate probe rate, the static ceiling, and the ADR 041 buy cap.
+        let rate_ceiling = econ_rate_ceiling;
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
 
         // The free header handshake: whole-tail open (`byte_offset == 0`,
@@ -418,6 +433,8 @@ impl NodeOrigin {
             namespace_id: namespace_bytes,
             rate_ceiling,
             deadlines,
+            speculative,
+            buy_rate_per_mb: candidate.rate_per_mb,
         })
     }
 }
@@ -477,6 +494,8 @@ pub(crate) async fn run_pull_leg(
         namespace_id,
         rate_ceiling,
         deadlines,
+        speculative,
+        buy_rate_per_mb,
     } = target;
 
     // Read the pool id + lane seed once (quick std-lock, never held across
@@ -624,6 +643,16 @@ pub(crate) async fn run_pull_leg(
     if !cancelled {
         match &result {
             Ok(()) => {
+                // ADR 041: a clean speculative pull debits the source's warming
+                // allowance by the full buy cost of the bytes this leg pulled (the
+                // gaps), accounted in whole MB at the candidate's buy rate.
+                if speculative {
+                    deps.config.warming.debit_speculative(
+                        *pk.as_bytes(),
+                        hash_bytes,
+                        buy_rate_per_mb.saturating_mul(mb_of(gap_bytes)),
+                    );
+                }
                 record_outcome(
                     deps,
                     pk,

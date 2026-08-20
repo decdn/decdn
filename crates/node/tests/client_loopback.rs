@@ -7793,6 +7793,97 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
     Ok(())
 }
 
+/// ADR 041: the buy-side serve-economics gate (the `margin` policy's buy
+/// ceiling + the per-source [`decdn_node::warming_allowance::WarmingAllowance`])
+/// lives ONLY on `NodeOrigin`'s peer-candidate relay path — the buy loop that
+/// decides what to pay ANOTHER node. It is never consulted on the own-namespace
+/// path: filling from this node's OWN configured origin is not a purchase, so
+/// there is nothing to gate.
+///
+/// The source's warming allowance is drained to fully spent and the operator
+/// fee share pinned at 0 bps before the fetch — settings that, under the
+/// `margin` policy, refuse EVERY peer-relay candidate at any positive quote —
+/// yet the own-origin fetch still serves the blob intact, proving the own-
+/// namespace path never reads either.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()> {
+    let payload = vec![0x9Eu8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+
+    // The most restrictive possible ADR 041 settings: an arbitrary source's
+    // warming allowance fully drained, and a 0 bps operator fee share (so even
+    // the amortized "safe" floor collapses to 0). If the own-origin path
+    // consulted either, this fetch would refuse.
+    let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+        1000, 0,
+    ));
+    warming.debit_speculative([0xAAu8; 32], [0xBBu8; 32], u64::MAX);
+    anyhow::ensure!(
+        !warming.available([0xAAu8; 32]),
+        "precondition: the source must read as fully spent"
+    );
+
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store.clone(),
+        RATE_PER_MB,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.warming = Arc::clone(&warming);
+            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(0);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx =
+        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 origin fetch (own-namespace path taken), got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
 /// #1115 control: the SAME setup WITHOUT a client binding is refused. An
 /// unauthenticated request fails `pull_authorized`, so the buffered pull-through
 /// never runs and the origin-only blob is a clean `CacheMiss` delivery refusal —

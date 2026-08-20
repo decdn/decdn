@@ -824,6 +824,7 @@ impl RuntimeReloadState {
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
+                fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
@@ -873,6 +874,13 @@ impl RuntimeReloadState {
                     probation_target_pct:
                         decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
                     aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+                },
+                serve_economics: decdn_common::config::ResolvedServeEconomics {
+                    policy: decdn_common::config::DEFAULT_SERVE_ECONOMICS_POLICY.to_string(),
+                    discount_bps: decdn_common::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS,
+                    n_max: decdn_common::config::DEFAULT_SERVE_ECONOMICS_N_MAX,
+                    warming_budget: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET,
+                    warming_refill: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL,
                 },
             },
             // Placeholder rate — `payment.*` is restart-required.
@@ -1195,6 +1203,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         eviction_policy,
         admission_policy,
         tinylfu,
+        serve_economics,
     } = c;
     cache_dir.is_some()
         || cache_size_mb.is_some()
@@ -1233,6 +1242,10 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || eviction_policy.is_some()
         || admission_policy.is_some()
         || tinylfu.is_some()
+        // Refuse-to-serve economics (ADR 041) is wired once at bring-up
+        // alongside the admission/eviction policy objects; changing it
+        // requires a restart.
+        || serve_economics.is_some()
 }
 
 /// Whether the file's `[observability]` section sets any field that a
@@ -1313,6 +1326,7 @@ mod tests {
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
+                fee_shares_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 redeem_max_vouchers_per_tx: 300,
                 redeem_interval_secs: 300,
@@ -1362,6 +1376,13 @@ mod tests {
                     probation_target_pct:
                         decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
                     aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+                },
+                serve_economics: decdn_common::config::ResolvedServeEconomics {
+                    policy: decdn_common::config::DEFAULT_SERVE_ECONOMICS_POLICY.to_string(),
+                    discount_bps: decdn_common::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS,
+                    n_max: decdn_common::config::DEFAULT_SERVE_ECONOMICS_N_MAX,
+                    warming_budget: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET,
+                    warming_refill: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL,
                 },
             },
             payment: ResolvedPayment {

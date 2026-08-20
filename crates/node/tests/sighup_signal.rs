@@ -71,6 +71,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 7000,
             rate_bounds_poll_interval_sec: 3600,
+            fee_shares_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
@@ -117,6 +118,13 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
                 promotion_threshold: decdn_common::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD,
                 probation_target_pct: decdn_common::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT,
                 aging_halflife_sec: decdn_common::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC,
+            },
+            serve_economics: decdn_common::config::ResolvedServeEconomics {
+                policy: decdn_common::config::DEFAULT_SERVE_ECONOMICS_POLICY.to_string(),
+                discount_bps: decdn_common::config::DEFAULT_SERVE_ECONOMICS_DISCOUNT_BPS,
+                n_max: decdn_common::config::DEFAULT_SERVE_ECONOMICS_N_MAX,
+                warming_budget: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET,
+                warming_refill: decdn_common::config::DEFAULT_SERVE_ECONOMICS_WARMING_REFILL,
             },
         },
         payment: ResolvedPayment {
