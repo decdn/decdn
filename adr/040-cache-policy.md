@@ -74,9 +74,13 @@ Three boundary rules keep the split clean:
   primitives and assigns them no meaning of its own; it stores the label
   admission chose and moves it when a plan says to. Policies hold no store
   handles.
-- The two traits are independent. `lru` eviction paired with `always`
-  admission is a valid, supported combination; `lru` ignores segment
-  membership and never promotes.
+- The two selectors are chosen independently, but `tinylfu` admission depends
+  on `tinylfu` eviction. Promotion out of probation and the probation cap both
+  live in `TinyLfuEviction::plan`; `lru` eviction ignores segment membership and
+  never promotes. So `tinylfu` admission paired with `lru` eviction sets
+  probation labels that are never promoted or capped — the node logs a warning
+  at bring-up for this inert combination. `lru` eviction with `always` admission
+  is the fully independent, supported default pairing.
 
 Reclaim is whole-blob only. `EvictionPlan.evict` is a list of hashes, not
 byte ranges. See [§ Whole-blob reclaim](#whole-blob-reclaim-range-eviction-is-upstream-gated).

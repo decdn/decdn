@@ -575,6 +575,23 @@ async fn build_infra(
             _ => Arc::new(decdn_cache::policy::LruEviction),
         };
 
+    // `tinylfu` admission only does useful work paired with `tinylfu` eviction:
+    // promotion out of probation and the probation cap both live in
+    // `TinyLfuEviction::plan`. With `lru` eviction the probation labels are set
+    // but never promoted or capped, and the estimator pays a per-serve cost for
+    // no effect. Warn rather than silently no-op (the resolver already rejects
+    // typos; this valid-but-inert combination deserves a heads-up).
+    if cfg.cache.admission_policy == "tinylfu" && cfg.cache.eviction_policy != "tinylfu" {
+        tracing::warn!(
+            admission_policy = %cfg.cache.admission_policy,
+            eviction_policy = %cfg.cache.eviction_policy,
+            "cache.admission_policy = \"tinylfu\" is inert unless cache.eviction_policy is \
+             also \"tinylfu\": probation admission relies on the tinylfu eviction policy to \
+             promote and cap probation members; under lru eviction the labels do nothing and \
+             the frequency estimator runs for no effect",
+        );
+    }
+
     let retry = cfg.cache.origin_retry;
     tracing::info!(
         cache_dir = %cfg.cache.cache_dir.display(),

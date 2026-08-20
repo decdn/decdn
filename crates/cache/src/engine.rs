@@ -2785,20 +2785,21 @@ impl CacheEngine {
 
         match outcome {
             Ok(_drained) => {
-                // ADR 040: consult the admission policy before protecting the
-                // partial import and record the chosen segment. Under the
-                // default `AlwaysAdmit` the segment is `Main`, so `set_segment`
-                // is a no-op and `protect_partial` below is unaffected —
-                // membership is pure in-memory metadata, no tag I/O.
+                // ADR 040: consult the admission policy, then label the segment
+                // only after `protect_partial` succeeds, so a failed protect
+                // leaves no stale membership entry for an unprotected blob. Under
+                // the default `AlwaysAdmit` the segment is `Main`, so
+                // `set_segment` is a no-op — membership is pure in-memory
+                // metadata, no tag I/O.
                 let admission_ctx = crate::policy::AdmissionContext {
                     hash,
                     known_size: Some(total_bytes),
                 };
                 let segment = self.admission_segment(&admission_ctx);
-                self.set_segment(hash, segment);
                 if let Err(e) = self.protect_partial(hash).await {
                     return Err((reader, e));
                 }
+                self.set_segment(hash, segment);
                 // The range's data is now cached; capture its outboard proof nodes
                 // into the serve leg's shared session (no-op when no serve leg reads
                 // beside this pull). Front-to-back admits union to the whole tree.
@@ -3048,10 +3049,12 @@ impl CacheEngine {
     /// request's own `observe`.
     pub fn observe_hit(&self, hash: Hash) {
         self.record_access(hash);
-        // `load_full` clones the Arc out and releases the guard before calling
-        // `observe`, so the estimator's own work never runs under the arc-swap
-        // read guard.
-        if let Some(est) = self.inner.frequency.load_full().as_ref() {
+        // Clone the estimator Arc out only when one is installed, dropping the
+        // arc-swap guard before calling `observe`. The default (no-estimator)
+        // path pays nothing — no clone, no refcount roundtrip — and the
+        // estimator's own work never runs under the read guard.
+        let est = (**self.inner.frequency.load()).clone();
+        if let Some(est) = est {
             est.observe(hash);
         }
     }

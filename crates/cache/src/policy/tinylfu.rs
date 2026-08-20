@@ -172,10 +172,6 @@ impl EvictionPolicy for TinyLfuEviction {
 
         EvictionPlan { evict, promote }
     }
-
-    fn on_access(&self, hash: Hash) {
-        self.freq.observe(hash);
-    }
 }
 
 #[cfg(test)]

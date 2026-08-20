@@ -76,13 +76,11 @@ pub struct EvictionPlan {
 }
 
 pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
-    /// The one sweep-time decision: what leaves, what graduates. Buffered
-    /// signals (see [`Self::on_access`]) are folded in here. `candidates` is
-    /// already stripped of pins/holds/deny by the engine.
+    /// The one sweep-time decision: what leaves, what graduates. A policy that
+    /// ranks by frequency reads the shared [`FrequencyEstimator`] directly — the
+    /// engine feeds that estimator on every serve. `candidates` is already
+    /// stripped of pins/holds/deny by the engine.
     fn plan(&self, ctx: &EvictionContext) -> EvictionPlan;
-
-    /// Optional per-access hook. Default no-op; `TinyLfu` forwards to its estimator.
-    fn on_access(&self, _hash: Hash) {}
 }
 
 /// Decayed frequency estimate shared by admission and eviction.
