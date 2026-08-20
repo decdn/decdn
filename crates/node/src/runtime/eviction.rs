@@ -1,13 +1,14 @@
-//! LRU cache-eviction driver loop (#1173, appendix-blob-cache-eviction.md
-//! § Eviction driver loop).
+//! Cache-eviction driver loop (#1173, ADR 040 §Whole-blob reclaim; range
+//! eviction is upstream-gated).
 //!
 //! A single async task, owned by the node wiring layer (per
 //! `appendix-poc-production-seams.md`), that enforces the `cache.cache_size_mb`
 //! ceiling the cache write path deliberately does not. It periodically measures
-//! on-disk footprint and, once over the high-water mark, releases
-//! least-recently-used blobs (via [`CacheEngine::release_for_eviction`], the
-//! soft-evict path that is *not* the durable operator-evict) down to the target
-//! mark, bounded by a per-sweep budget.
+//! on-disk footprint and, once over the high-water mark, releases the blobs the
+//! injected `EvictionPolicy` ranks for eviction (via
+//! [`CacheEngine::release_for_eviction`], the soft-evict path that is *not* the
+//! durable operator-evict) down to the target mark, bounded by a per-sweep
+//! budget.
 //!
 //! ## The driver's actuator is indirect — hence pending-reclaim accounting
 //!
@@ -111,23 +112,26 @@ const fn reconcile(state: &mut DriverState, raw: u64) -> u64 {
     raw.saturating_sub(state.pending_reclaim)
 }
 
-/// One budget-bounded eviction pass. Releases up to `budget` LRU candidates,
-/// oldest access first, stopping early once the projected effective footprint
-/// reaches `target_bytes`. Returns the number of bytes actually released (to be
-/// added to `pending_reclaim`).
+/// One budget-bounded eviction pass. Releases up to `budget` candidates in the
+/// order `policy` ranks them, stopping early once the projected effective
+/// footprint reaches `target_bytes`. Returns the number of bytes actually
+/// released (to be added to `pending_reclaim`).
 ///
 /// Emits `evictions_starved` when there is nothing left to evict while still
 /// over target — either because the candidate set is empty (everything pinned,
 /// operator-evicted, or probe-held, **or** a cold-started node whose in-memory
 /// access map has not been populated by traffic yet) or because a whole pass
 /// released nothing.
+#[allow(clippy::too_many_arguments)]
 async fn sweep(
     cache: &CacheEngine,
     metrics: &CacheMetrics,
     effective: u64,
     target_bytes: u64,
     budget: u64,
+    cache_bytes: u64,
     sizes: &HashMap<decdn_cache::Hash, u64>,
+    policy: &Arc<dyn decdn_cache::EvictionPolicy>,
 ) -> u64 {
     let candidates = cache.eviction_candidates();
     if candidates.is_empty() {
@@ -136,21 +140,28 @@ async fn sweep(
         return 0;
     }
 
-    let mut ordered: Vec<(decdn_cache::Hash, std::time::Instant)> =
-        candidates.into_inner().into_iter().collect();
-    ordered.sort_by_key(|(_, last)| *last); // oldest access first
+    // The policy owns the whole sweep decision (ADR 040): it ranks candidates,
+    // applies the target/budget stop conditions, and returns what to evict and
+    // what to promote. The driver is a dumb executor.
+    let segments = cache.segments_snapshot();
+    let plan = policy.plan(&decdn_cache::EvictionContext {
+        candidates: &candidates,
+        sizes,
+        segments: &segments,
+        total_bytes: effective,
+        target_bytes,
+        budget,
+        cache_bytes,
+    });
+
+    // Promotion is a pure in-memory segment move — no store I/O.
+    for (hash, seg) in plan.promote {
+        cache.set_segment(hash, seg);
+    }
 
     let mut freed: u64 = 0;
     let mut removed: u64 = 0;
-    for (hash, _) in ordered {
-        if effective.saturating_sub(freed) <= target_bytes {
-            break;
-        }
-        if removed >= budget {
-            // Budget spent for this tick; the latch keeps us evicting so the
-            // next tick resumes toward target.
-            break;
-        }
+    for hash in plan.evict {
         match cache.release_for_eviction(hash).await {
             // `Ok(0)` means nothing was released — the hash was pinned (the
             // documented defence-in-depth refusal) or carried no protecting tag.
@@ -182,13 +193,16 @@ async fn sweep(
 /// One driver tick: measure, refresh cache-health gauges, reconcile
 /// pending-reclaim against observed GC progress, apply the hysteresis latch, and
 /// (when latched over target) run one budget-bounded [`sweep`].
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     cache: &CacheEngine,
     metrics: &CacheMetrics,
     high_water_bytes: u64,
     target_bytes: u64,
     budget: u64,
+    cache_bytes: u64,
     state: &mut DriverState,
+    policy: &Arc<dyn decdn_cache::EvictionPolicy>,
 ) {
     // Exactly ONE store walk per tick: this snapshot is both the footprint
     // source and the sweep's per-hash size lookup, so `sweep` takes it by
@@ -234,7 +248,17 @@ async fn tick(
         state.evicting = true;
     }
 
-    let freed = sweep(cache, metrics, effective, target_bytes, budget, &sizes).await;
+    let freed = sweep(
+        cache,
+        metrics,
+        effective,
+        target_bytes,
+        budget,
+        cache_bytes,
+        &sizes,
+        policy,
+    )
+    .await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
 }
 
@@ -245,6 +269,7 @@ pub async fn run(
     cache: CacheEngine,
     metrics: Arc<CacheMetrics>,
     params: EvictionParams,
+    policy: Arc<dyn decdn_cache::EvictionPolicy>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let limit_bytes = params.cache_size_mb.saturating_mul(BYTES_PER_MB);
@@ -276,7 +301,9 @@ pub async fn run(
             high_water_bytes,
             target_bytes,
             params.per_sweep_budget,
+            limit_bytes,
             &mut state,
+            &policy,
         )
         .await;
     }
@@ -285,6 +312,25 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `payload` into an `Origin`-shaped on-disk layout (`<origin_dir>/<2-hex
+    /// shard>/<full-hex hash>`) so a [`decdn_cache::FilesystemOrigin`] pointed at
+    /// `origin_dir` can serve it. Shared by the Task 10 end-to-end policy tests
+    /// below — each needs several distinct one-off blobs.
+    fn write_origin_blob(
+        origin_dir: &std::path::Path,
+        payload: &[u8],
+    ) -> anyhow::Result<decdn_cache::Hash> {
+        let hash = decdn_cache::Hash::new(payload);
+        let hex = hash.to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let dir = origin_dir.join(shard);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(hex.as_str()), payload)?;
+        Ok(hash)
+    }
 
     #[test]
     fn pct_of_computes_thresholds() {
@@ -375,5 +421,351 @@ mod tests {
         // Only 100 of the 300 pending bytes get reclaimed this cycle.
         assert_eq!(reconcile(&mut state, 900), 700);
         assert_eq!(state.pending_reclaim, 200);
+    }
+
+    /// Proves `sweep` delegates victim ordering to the injected policy rather
+    /// than sorting inline. `NewestFirst` reverses LRU order, so with a
+    /// budget of 1 the most-recently-touched hash must be the one released —
+    /// the opposite of what the old inline oldest-first sort would pick.
+    #[tokio::test]
+    async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
+        #[derive(Debug)]
+        struct NewestFirst;
+        impl decdn_cache::EvictionPolicy for NewestFirst {
+            fn plan(&self, ctx: &decdn_cache::EvictionContext) -> decdn_cache::EvictionPlan {
+                let mut v: Vec<_> = ctx.candidates.iter().map(|(h, t)| (*h, *t)).collect();
+                v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+                let mut evict = Vec::new();
+                let mut freed = 0u64;
+                for (h, _) in v {
+                    if ctx.total_bytes.saturating_sub(freed) <= ctx.target_bytes {
+                        break;
+                    }
+                    if evict.len() as u64 >= ctx.budget {
+                        break;
+                    }
+                    freed = freed.saturating_add(ctx.sizes.get(&h).copied().unwrap_or(0));
+                    evict.push(h);
+                }
+                decdn_cache::EvictionPlan {
+                    evict,
+                    promote: Vec::new(),
+                }
+            }
+        }
+
+        let older_payload = b"eviction policy test: older blob";
+        let newer_payload = b"eviction policy test: newer blob";
+        let older_hash = decdn_cache::Hash::new(older_payload);
+        let newer_hash = decdn_cache::Hash::new(newer_payload);
+
+        let origin_dir = tempfile::tempdir()?;
+        for (hash, payload) in [(older_hash, older_payload), (newer_hash, newer_payload)] {
+            let hex = hash.to_hex();
+            let shard = hex
+                .get(..2)
+                .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+            let dir = origin_dir.path().join(shard);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(hex.as_str()), payload)?;
+        }
+
+        let cache_dir = tempfile::tempdir()?;
+        let origin =
+            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache = CacheEngine::open(
+            cache_dir.path(),
+            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await?;
+
+        // Touch older first, then newer, so the two access times are ordered.
+        let _ = cache.get(older_hash).await?;
+        let _ = cache.get(newer_hash).await?;
+
+        let sizes = cache.size_snapshot().await?;
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(NewestFirst);
+
+        // target_bytes = 0 keeps the sweep over target for the whole pass;
+        // budget = 1 stops it after exactly one release, so only the
+        // policy's first-ranked victim gets evicted.
+        sweep(&cache, &metrics, u64::MAX, 0, 1, u64::MAX, &sizes, &policy).await;
+
+        let remaining = cache.eviction_candidates();
+        assert!(
+            remaining.contains_key(&older_hash),
+            "older hash must survive — NewestFirst evicts the newer one first"
+        );
+        assert!(
+            !remaining.contains_key(&newer_hash),
+            "newer hash must be the one released under NewestFirst"
+        );
+        Ok(())
+    }
+
+    /// Task 10 (ADR 040 end-to-end coverage): `tinylfu` admission + eviction,
+    /// wired the way `crates/node/src/runtime/mod.rs` wires them — one shared
+    /// [`decdn_cache::policy::TinyLfuEstimator`] feeding both a
+    /// [`decdn_cache::policy::ProbationAdmission`] and the
+    /// [`decdn_cache::policy::TinyLfuEviction`] sweep policy. Admits many
+    /// distinct one-hit blobs (real `populate_local` misses through a real
+    /// `CacheEngine` + `FilesystemOrigin`), drives one real [`sweep`] under a
+    /// small `probation_target_pct`, and asserts the probation footprint the
+    /// sweep leaves behind is under the cap while a twice-requested blob has
+    /// graduated to `Main` — the observable [`CacheEngine::segment_of`] exposes.
+    #[tokio::test]
+    async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
+        use decdn_cache::Segment;
+        use decdn_cache::policy::{ProbationAdmission, TinyLfuEstimator, TinyLfuEviction};
+
+        let promotion_threshold: u32 = 2;
+        let probation_target_pct: u64 = 10;
+        let cache_bytes: u64 = 1_000;
+
+        let origin_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+
+        let mut cold_hashes = Vec::new();
+        for i in 0..20u32 {
+            let payload = format!("probation cap test: one-hit blob #{i}").into_bytes();
+            cold_hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
+        }
+        let hot_hash = write_origin_blob(origin_dir.path(), b"probation cap test: hot blob")?;
+
+        let origin =
+            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache = CacheEngine::open(
+            cache_dir.path(),
+            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await?;
+
+        let freq: std::sync::Arc<dyn decdn_cache::FrequencyEstimator> =
+            std::sync::Arc::new(TinyLfuEstimator::new(4096));
+        cache.set_frequency_estimator(freq.clone());
+        cache.set_admission_policy(std::sync::Arc::new(ProbationAdmission {
+            freq: freq.clone(),
+            promotion_threshold,
+        }));
+
+        // Each cold blob is one served miss: `populate_local` fills (admission
+        // reads estimate 0 < threshold, so Probation) and the paired serve emits
+        // the one sighting via `observe_hit` (estimate -> 1). ADR 040 splits the
+        // fill from the hit signal, so the test drives both, mirroring the real
+        // fill-then-serve path.
+        for hash in &cold_hashes {
+            cache.populate_local(*hash).await?;
+            cache.observe_hit(*hash);
+        }
+        // The hot blob is requested twice. First request: fill admits (estimate
+        // 0 < threshold) into Probation, serve observes (estimate -> 1). Second
+        // request: fill is a hit (no re-admission), serve observes (estimate ->
+        // 2), so the shared estimator now reads >= threshold for the sweep below
+        // to promote.
+        cache.populate_local(hot_hash).await?;
+        cache.observe_hit(hot_hash);
+        cache.populate_local(hot_hash).await?;
+        cache.observe_hit(hot_hash);
+
+        for hash in cold_hashes.iter().chain(std::iter::once(&hot_hash)) {
+            assert_eq!(
+                cache.segment_of(*hash),
+                Segment::Probation,
+                "first sight must land in probation"
+            );
+        }
+
+        let sizes = cache.size_snapshot().await?;
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(TinyLfuEviction::new(
+            freq.clone(),
+            promotion_threshold,
+            probation_target_pct,
+        ));
+
+        let effective: u64 = sizes.values().sum();
+        // target_bytes = u64::MAX keeps the sweep's global-target loop
+        // (phase 3) inert, so only the probation cap (phase 2) drives
+        // eviction here; a wide budget lets the whole cap overage clear in
+        // one sweep.
+        sweep(
+            &cache,
+            &metrics,
+            effective,
+            u64::MAX,
+            100,
+            cache_bytes,
+            &sizes,
+            &policy,
+        )
+        .await;
+
+        let probation_limit = cache_bytes
+            .saturating_mul(probation_target_pct)
+            .saturating_div(100);
+        let footprint = cache.segment_bytes(Segment::Probation, &sizes);
+        assert!(
+            footprint <= probation_limit,
+            "probation footprint {footprint} must drop under the cap {probation_limit}"
+        );
+        assert_eq!(
+            cache.segment_of(hot_hash),
+            Segment::Main,
+            "twice-requested blob must be promoted to Main"
+        );
+
+        Ok(())
+    }
+
+    /// Task 10: a hot blob primed with many requests must survive a sweep that
+    /// clears a whole burst of one-hit cold blobs, driven through the real
+    /// engine + [`sweep`] with `tinylfu` eviction (frequency-ranked, not
+    /// recency-ranked — an LRU policy would have evicted the hot blob here
+    /// since it was the least-recently-touched by wall-clock order once the
+    /// colds land after it).
+    #[tokio::test]
+    async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
+        use decdn_cache::policy::{TinyLfuEstimator, TinyLfuEviction};
+
+        let origin_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+
+        let hot_hash = write_origin_blob(origin_dir.path(), b"cold scan test: hot blob")?;
+        let mut cold_hashes = Vec::new();
+        for i in 0..10u32 {
+            let payload = format!("cold scan test: cold blob #{i}").into_bytes();
+            cold_hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
+        }
+
+        let origin =
+            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache = CacheEngine::open(
+            cache_dir.path(),
+            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await?;
+
+        let freq: std::sync::Arc<dyn decdn_cache::FrequencyEstimator> =
+            std::sync::Arc::new(TinyLfuEstimator::new(4096));
+        cache.set_frequency_estimator(freq.clone());
+        // Admission stays default (`AlwaysAdmit`) — this test exercises the
+        // eviction ranking, not the probation lifecycle.
+
+        // Prime the hot blob well past any cold blob's frequency: each request
+        // fills (first admits, the rest are hits) and the paired serve emits one
+        // sighting via `observe_hit`, bumping the shared estimator each time (ADR
+        // 040 splits fill from the hit signal).
+        for _ in 0..20 {
+            cache.populate_local(hot_hash).await?;
+            cache.observe_hit(hot_hash);
+        }
+        for hash in &cold_hashes {
+            cache.populate_local(*hash).await?;
+            cache.observe_hit(*hash);
+        }
+
+        let sizes = cache.size_snapshot().await?;
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> =
+            Arc::new(TinyLfuEviction::new(freq.clone(), 2, 100));
+
+        let effective: u64 = sizes.values().sum();
+        let hot_size = sizes.get(&hot_hash).copied().unwrap_or(0);
+        // Target = the hot blob's own size: least-frequent-first ranking
+        // must clear every cold blob before it ever reaches the hot one, and
+        // a budget spanning every candidate leaves no room for the sweep to
+        // stop early for the wrong reason.
+        sweep(
+            &cache,
+            &metrics,
+            effective,
+            hot_size,
+            (cold_hashes.len() + 1) as u64,
+            effective,
+            &sizes,
+            &policy,
+        )
+        .await;
+
+        let remaining = cache.eviction_candidates();
+        assert!(
+            remaining.contains_key(&hot_hash),
+            "hot blob must survive the cold scan"
+        );
+        for hash in &cold_hashes {
+            assert!(
+                !remaining.contains_key(hash),
+                "cold blob must be evicted under pressure"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Task 10: with the config defaults (`always` admission + `lru` eviction,
+    /// no `tinylfu` estimator wired at all) a real engine's sweep still matches
+    /// a golden least-recently-used sequence — the end-to-end guard that
+    /// selecting `tinylfu` elsewhere in this test module left the default path
+    /// behaviorally untouched (Stage A neutrality).
+    #[tokio::test]
+    async fn lru_default_unchanged() -> anyhow::Result<()> {
+        let origin_dir = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+
+        let a = write_origin_blob(origin_dir.path(), b"lru golden test: blob A")?;
+        let b = write_origin_blob(origin_dir.path(), b"lru golden test: blob B")?;
+        let c = write_origin_blob(origin_dir.path(), b"lru golden test: blob C")?;
+        let d = write_origin_blob(origin_dir.path(), b"lru golden test: blob D")?;
+
+        let origin =
+            std::sync::Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+        let cache = CacheEngine::open(
+            cache_dir.path(),
+            vec![origin as std::sync::Arc<dyn decdn_cache::Origin>],
+            16,
+        )
+        .await?;
+
+        // No frequency estimator, no custom admission policy: exactly the
+        // engine's out-of-the-box defaults.
+        let _ = cache.get(a).await?;
+        let _ = cache.get(b).await?;
+        let _ = cache.get(c).await?;
+        let _ = cache.get(d).await?;
+        // Re-access B: the golden recency order is now oldest-first A, C, D, B.
+        let _ = cache.get(b).await?;
+
+        let sizes = cache.size_snapshot().await?;
+        let metrics = CacheMetrics::default();
+        let policy: Arc<dyn decdn_cache::EvictionPolicy> = Arc::new(decdn_cache::LruEviction);
+        let effective: u64 = sizes.values().sum();
+
+        // budget = 2, target = 0: evicts exactly the two oldest-by-access —
+        // the golden LRU sequence this test guards end to end.
+        sweep(
+            &cache, &metrics, effective, 0, 2, effective, &sizes, &policy,
+        )
+        .await;
+
+        let remaining = cache.eviction_candidates();
+        assert!(
+            !remaining.contains_key(&a),
+            "oldest access must be evicted first"
+        );
+        assert!(
+            !remaining.contains_key(&c),
+            "second-oldest access must be evicted next"
+        );
+        assert!(
+            remaining.contains_key(&d),
+            "recently accessed D must survive"
+        );
+        assert!(remaining.contains_key(&b), "re-touched B must survive");
+
+        Ok(())
     }
 }

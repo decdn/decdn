@@ -454,9 +454,8 @@ pub struct CacheConfig {
     /// best-effort, so at capacity one arbitrary entry is dropped to admit a new
     /// answer (expired entries reclaimed first).
     pub origin_probe_memo_capacity: Option<u64>,
-    /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
-    /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
-    /// § Trigger and target). Absent =>
+    /// Cache eviction driver: percent of [`Self::cache_size_mb`] above which
+    /// the driver actively evicts (#1173, ADR 040). Absent =>
     /// [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`] (90). Hard bounds
     /// `[60, 95]`; set above the 25% probe-hold recommendation so a full hold
     /// budget plus in-flight writes don't trip it, below 95% for write
@@ -482,9 +481,9 @@ pub struct CacheConfig {
     ///
     /// **Cost note:** every tick measures the on-disk footprint, which walks the
     /// blob list and issues one `status()` per blob, plus an O(n) clone of the
-    /// pinned set — latched or not. (`appendix-blob-cache-eviction.md` describes
-    /// an idle tick as "one comparison plus a yield"; that assumed a cached
-    /// footprint this driver does not keep.) On a cache holding many blobs,
+    /// pinned set — latched or not. An idle tick is not free: the driver keeps
+    /// no cached footprint, so it re-measures on every tick (ADR 040). On a
+    /// cache holding many blobs,
     /// raise this to trade eviction latency for steady-state store load.
     pub eviction_tick_secs: Option<u64>,
     /// Maximum number of concurrently held (eviction-exempt) blobs for the
@@ -559,6 +558,44 @@ pub struct CacheConfig {
     /// this, and the derived outer deadline budgets that for EVERY candidate, so a second
     /// here is ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
     pub node_pull_stall_timeout_sec: Option<u64>,
+    /// Cache eviction policy selector (ADR 040). Absent =>
+    /// [`crate::config::DEFAULT_EVICTION_POLICY`] (`"lru"`). Must be `"lru"` or
+    /// `"tinylfu"`; an unrecognized name is rejected at config load rather than
+    /// silently falling back.
+    pub eviction_policy: Option<String>,
+    /// Cache admission policy selector (ADR 040). Absent =>
+    /// [`crate::config::DEFAULT_ADMISSION_POLICY`] (`"always"`). Must be
+    /// `"always"` or `"tinylfu"`; an unrecognized name is rejected at config
+    /// load rather than silently falling back.
+    pub admission_policy: Option<String>,
+    /// W-TinyLFU tuning knobs (ADR 040). Consulted whenever
+    /// [`Self::eviction_policy`] or [`Self::admission_policy`] is `"tinylfu"`;
+    /// otherwise unused. Absent => every field defaults.
+    pub tinylfu: Option<TinyLfuConfig>,
+}
+
+/// W-TinyLFU tuning knobs (ADR 040). See [`CacheConfig::tinylfu`].
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TinyLfuConfig {
+    /// Count-min sketch size in bytes, shared by admission and eviction.
+    /// Absent => [`crate::config::DEFAULT_TINYLFU_SKETCH_BYTES`] (262144).
+    /// Larger sketches reduce frequency-estimate collisions at the cost of
+    /// more resident memory.
+    pub sketch_bytes: Option<usize>,
+    /// Prior sightings a probation member needs before promotion to the main
+    /// segment. Absent => [`crate::config::DEFAULT_TINYLFU_PROMOTION_THRESHOLD`]
+    /// (2).
+    pub promotion_threshold: Option<u32>,
+    /// Percent of `cache.cache_size_mb` the probation segment is capped to.
+    /// Absent => [`crate::config::DEFAULT_TINYLFU_PROBATION_TARGET_PCT`] (10).
+    /// Hard bounds `[1, 50]`.
+    pub probation_target_pct: Option<u64>,
+    /// Reserved: half-life in seconds for aging the frequency sketch. Absent
+    /// => [`crate::config::DEFAULT_TINYLFU_AGING_HALFLIFE_SEC`] (600).
+    /// Currently resolved and stored but not consulted — the shipped sketch
+    /// ages via a fixed sample-count reset rather than a wall-clock half-life.
+    pub aging_halflife_sec: Option<u64>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

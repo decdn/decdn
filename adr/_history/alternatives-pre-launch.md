@@ -254,7 +254,7 @@ Source: [ADR 032 — SafetyReserve appeal-surface contract surface](032-safety-r
 
 ## Blob Cache Eviction Policy (appendix)
 
-Source: [Appendix: Blob Cache Eviction Policy](../appendix-blob-cache-eviction.md).
+Source: [ADR 040 — Pluggable Cache Admission and Eviction Policies](../040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies).
 
 - **LFU.** Rejected. Per-hash hit-counter bookkeeping grows without decay heuristics; counters are gameable by an attacker who repeatedly probes a low-value blob to keep it resident, wasting cache capacity on adversarial-popular content. LRU's "recently useful" proxy is robust enough for PoC scale and resists the same attack (the attacker must keep accessing the blob, paying per access — the cost defends the policy).
 - **Size-weighted (largest-first).** Rejected. Penalizes the legitimate large-blob use case (video, datasets) the network is designed for. A 1 GB blob would always evict before a 1 MB blob even when both are equally hot, defeating the purpose of a CDN cache for large content.
