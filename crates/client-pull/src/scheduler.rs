@@ -59,7 +59,10 @@ use alloy::primitives::U256;
 use decdn_bao_range::{AlignedRange, align_range};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
-use crate::driver::{DriveConfig, DriveCounters, contiguous_byte_ranges, fill_gap};
+use crate::driver::{
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, contiguous_byte_ranges,
+    drive_with_interval_flush, fill_gap,
+};
 use crate::segment::{initial_segments, steal_split};
 use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{Pacer, PoolContext, PoolLedger, ProgressCallback};
@@ -595,11 +598,23 @@ where
             pool_spent,
         )
     });
-    futures_util::future::try_join_all(workers).await?;
+    // Drive every worker to completion while a single periodic tick flushes the
+    // `.ranges` present record (spec §5.5). The workers are the sole work drivers
+    // and this interval owner is the sole periodic flush owner — no worker flushes,
+    // preserving the single-writer property. Without it a crash mid-fetch would
+    // leave `.ranges` at pre-session state and re-download (and re-pay for) the
+    // whole in-flight fan-out on resume; the interval bounds that loss to one
+    // `PRESENT_RECORD_FLUSH_INTERVAL`.
+    let workers = futures_util::future::try_join_all(workers);
+    drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
+        workers.await?;
+        Ok(())
+    })
+    .await?;
 
     // Single-writer flush point (spec §5.5): every worker has finished, so the
-    // in-memory present set is final — persist the `.ranges` record once, off
-    // the per-checkpoint hot path.
+    // in-memory present set is final — persist the `.ranges` record once more,
+    // off the per-checkpoint hot path.
     store.flush_present_record()?;
 
     // No worker hangs: they either fill their ranges or drop. If every source

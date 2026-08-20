@@ -159,6 +159,48 @@ pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
 /// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
 pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
+/// How often a fetch's single flush owner persists the `.ranges` present record
+/// while sources are still delivering. `ClientRangedStore::checkpoint` fsyncs
+/// data and outboard every ~4 MiB but no longer writes the record, so this
+/// interval bounds crash-loss of resume progress to at most one interval (spec
+/// §5.5): a killed fetch resumes from the last flushed frontier instead of
+/// refetching — and re-paying for — the whole in-flight download. 5 seconds
+/// mirrors the voucher-flush cadence.
+pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Drive `fut` (a fetch's whole gap/worker set) to completion while a single
+/// periodic tick flushes the store's `.ranges` present record every `interval`,
+/// so a crash mid-fetch costs at most one `interval` of resume progress (spec
+/// §5.5). `fut` is the SOLE work driver and this loop is the SOLE periodic flush
+/// owner — nothing inside `fut` flushes — which preserves the single-writer
+/// property `ClientRangedStore::checkpoint` relies on. Returns once `fut`
+/// resolves; the caller does the final flush.
+///
+/// `tokio::time::interval`'s first tick fires immediately, so it is consumed
+/// before the loop to avoid a redundant flush at start.
+pub(crate) async fn drive_with_interval_flush<St, Fut>(
+    store: &St,
+    interval: Duration,
+    fut: Fut,
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(fut);
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            // Prefer completion: if the work is done, finish rather than flush —
+            // the caller's final flush persists the terminal snapshot.
+            biased;
+            res = &mut fut => return res,
+            _ = tick.tick() => store.flush_present_record()?,
+        }
+    }
+}
+
 /// Fetch-wide counters that persist ACROSS the request's gaps (a top-up budget is
 /// per-fetch, not per-gap), plus the last upstream quote used to price the next
 /// voucher.
@@ -276,41 +318,46 @@ where
     let missing = store.missing_ranges(offset, len).await?;
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
-    let mut counters = DriveCounters::new();
+    // Fill every gap while a single periodic tick flushes the `.ranges` present
+    // record (spec §5.5, single-writer flush point). `ClientRangedStore::checkpoint`
+    // no longer persists the record per checkpoint, so without this interval flush
+    // a crash mid-fetch would leave `.ranges` at pre-session state and re-download
+    // (and re-pay for) the whole in-flight range on resume; the interval bounds
+    // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
+    // single-source path's sole periodic flush owner — `fill_gap` never flushes.
+    drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
+        let mut counters = DriveCounters::new();
+        for (gap_start, gap_len) in gaps {
+            fill_gap(
+                store,
+                source,
+                pacer,
+                funder,
+                ctx,
+                ledger,
+                hash,
+                gap_start,
+                gap_len,
+                total_bytes,
+                config,
+                &mut counters,
+                on_progress,
+                pacing_wait,
+                served_paid,
+                // Single-source: the deposit gate uses this one lane's own
+                // committed amount (no aggregate view). The multi-source
+                // scheduler passes a shared summing reader here instead.
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    })
+    .await?;
 
-    for (gap_start, gap_len) in gaps {
-        fill_gap(
-            store,
-            source,
-            pacer,
-            funder,
-            ctx,
-            ledger,
-            hash,
-            gap_start,
-            gap_len,
-            total_bytes,
-            config,
-            &mut counters,
-            on_progress,
-            pacing_wait,
-            served_paid,
-            // Single-source: the deposit gate uses this one lane's own committed
-            // amount (no aggregate view). The multi-source scheduler passes a
-            // shared summing reader here instead.
-            None,
-        )
-        .await?;
-    }
-
-    // Flush the store's in-memory present-range snapshot to its durable
-    // `.ranges` record now that every gap this drive filled has landed:
-    // `ClientRangedStore::checkpoint` no longer persists the record per
-    // checkpoint (spec §5.5, single-writer flush point), so the single-source
-    // path's resume durability depends on `drive` flushing here — a crash
-    // after this point loses at most the un-checkpointed tail of the LAST gap,
-    // exactly the durability window `ingest_stream`'s checkpoint cadence
-    // already bounds.
+    // Final flush now that every gap this drive filled has landed: persists the
+    // terminal `.ranges` snapshot (the interval owner above already bounded any
+    // mid-fetch crash-loss to one interval).
     store.flush_present_record()?;
 
     // Promote only when the WHOLE blob is present — `finalize` verifies and
@@ -1530,6 +1577,129 @@ mod tests {
             got.as_ref(),
             plaintext.as_slice(),
             "byte-exact after a window-paced, served-paid-gated drive"
+        );
+    }
+
+    /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
+    /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
+    /// a test observe the interval flush firing during a still-running fetch.
+    struct FlushCountingStore {
+        inner: ClientRangedStore,
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RangedStore for FlushCountingStore {
+        fn total_bytes(&self) -> u64 {
+            self.inner.total_bytes()
+        }
+        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.present_ranges()
+        }
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.missing_ranges(byte_offset, byte_len)
+        }
+        fn admit(
+            &self,
+            range: AlignedRange,
+            bao_bytes: Bytes,
+        ) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.inner.admit(range, bao_bytes)
+        }
+        fn read(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, Bytes> {
+            self.inner.read(byte_offset, byte_len)
+        }
+        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+            self.inner.is_complete()
+        }
+        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.inner.finalize()
+        }
+    }
+
+    impl crate::source::IngestStore for FlushCountingStore {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: crate::source::BaoRangeReader + 'a,
+        {
+            Box::pin(self.inner.ingest_stream(range, reader, on_progress))
+        }
+
+        fn flush_present_record(&self) -> std::io::Result<()> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.flush_present_record()
+        }
+    }
+
+    /// The interval flush persists resume progress MID-fetch, not only at
+    /// completion (spec §5.5): `drive_with_interval_flush` is raced against a
+    /// work future that stays pending for several short intervals, and the
+    /// store's `flush_present_record` must fire MORE THAN ONCE before the work
+    /// resolves — so a crash between the last flush and completion loses at most
+    /// one interval, never the whole in-flight fetch. It also pins the
+    /// single-writer property: only the interval owner flushes (the work future
+    /// never does), and the flushed record equals the durable checkpointed
+    /// prefix reopened from disk.
+    #[tokio::test]
+    async fn interval_flush_persists_progress_before_completion() {
+        let total = 8 * 1024 * 1024;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let dir = tmp_dir();
+        let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+        // Durably checkpoint a real, verified 4 MiB prefix into the store — the
+        // resume progress the interval flush must persist — without yet writing
+        // the `.ranges` record (checkpoint no longer does, spec §5.5).
+        let prefix = align_range(0, 4 * 1024 * 1024, total).expect("align prefix");
+        preadmit(&inner, &plaintext, &outboard, &prefix).await;
+
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = FlushCountingStore {
+            inner,
+            flushes: Arc::clone(&flushes),
+        };
+
+        // A work future that stays pending across several 20 ms intervals, so the
+        // interval owner flushes repeatedly before the work resolves.
+        let work = async {
+            tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+            Ok(())
+        };
+        super::drive_with_interval_flush(&store, std::time::Duration::from_millis(20), work)
+            .await
+            .expect("interval-flush wrapper completes when the work future resolves");
+
+        // MORE THAN ONCE while the work was still pending: the flush is periodic,
+        // not a single completion flush. (~6 ticks over 130 ms at 20 ms; assert a
+        // conservative floor to stay robust under CI scheduling jitter.)
+        let count = flushes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count > 1,
+            "the interval owner must flush more than once during a still-running \
+             fetch, got {count}"
+        );
+
+        // The interval flush is a REAL persist: reopening the store from disk
+        // recovers exactly the checkpointed 4 MiB prefix — a crash right here
+        // would resume from it, not refetch from zero.
+        let reopened = ClientRangedStore::open(dir.path(), "blob", root, total).expect("reopen");
+        let present = reopened.present_ranges().await.expect("present");
+        assert_eq!(
+            present,
+            prefix.chunk_ranges().clone(),
+            "the interval-flushed record must persist the checkpointed prefix"
         );
     }
 }
