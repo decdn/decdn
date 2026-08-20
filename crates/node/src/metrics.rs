@@ -848,6 +848,16 @@ pub struct DecdnMetrics {
     /// being probed for rate manipulation — the one refusal on this path that
     /// guards a slashable offense, so it earns a counter of its own.
     pub node_pull_rate_above_ceiling: Counter,
+    /// `decdn_serve_economics_refused_total` (ADR 041): candidates existed for a
+    /// cache-miss buy but every one quoted above this node's serve-economics buy
+    /// ceiling, so the buyer declined an unprofitable relay rather than paying for
+    /// bytes it cannot resell for a margin. Sibling of
+    /// [`Self::node_pull_rate_above_ceiling`]: a buyer-side policy decision, so it
+    /// does not tar the provider's reputation. The node still signs the client a
+    /// `NotFound` for this — the pricing floor never reaches the wire — so a
+    /// sustained rate is visible only here, and means this node's serve economics
+    /// (or the market it is buying into) are too tight to relay profitably.
+    pub serve_economics_refused: Counter,
     /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
     /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
     /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
@@ -1987,6 +1997,11 @@ recorders! {
     /// ceiling and the buyer refused before paying (#1375). A buyer-side policy
     /// decision, so it does not score the provider.
     node_pull_rate_above_ceiling => node_pull_rate_above_ceiling.inc();
+
+    /// A cache-miss buy had candidates but every one quoted above this node's
+    /// serve-economics buy ceiling, so the buyer declined an unprofitable relay
+    /// (ADR 041). A buyer-side policy decision, so it does not score the provider.
+    serve_economics_refused => serve_economics_refused.inc();
 
     /// Record a paid-delivery (`serve_stream`) request refused because the
     /// blob was evicted between probe and stream (#876).

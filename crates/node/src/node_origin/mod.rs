@@ -1177,9 +1177,14 @@ impl Origin for NodeOrigin {
 /// does not trip a breaker that describes the PEER origin's health; and the engine's
 /// chain walk lets any error outrank a `NotFound` from another origin, which is the
 /// precedence this fix wants.
+///
+/// A [`PullMiss::BelowMargin`] answers the same `NotFound` as [`PullMiss::Clean`]:
+/// this node's serve-economics buy ceiling is a local policy decision, not a fact
+/// about the content, and it must never reach the wire as a distinct code — that
+/// would let a client fingerprint this node's pricing floor by probing for it.
 fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
     match miss {
-        PullMiss::Clean => Ok(OriginFetch::NotFound),
+        PullMiss::Clean | PullMiss::BelowMargin => Ok(OriginFetch::NotFound),
         PullMiss::LocalFault => Err(OriginPullError::Permanent(anyhow::anyhow!(
             "node-origin: a LOCAL buyer-side fault hit at least one attempted candidate \
              and none delivered; this node cannot pay, so it refuses rather than signing \
@@ -1538,6 +1543,10 @@ pub enum PullMiss {
     /// VERIFY a signature we produced. Says nothing about whether the content
     /// exists.
     LocalFault,
+    /// Candidates existed but every one quoted above the serve-economics buy
+    /// ceiling; the node declined an unprofitable relay. Wire-identical to
+    /// [`Self::Clean`].
+    BelowMargin,
 }
 
 impl PullMiss {
@@ -1608,6 +1617,7 @@ impl PullMiss {
     const fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::LocalFault, _) | (_, Self::LocalFault) => Self::LocalFault,
+            (Self::BelowMargin, _) | (_, Self::BelowMargin) => Self::BelowMargin,
             (Self::Clean, Self::Clean) => Self::Clean,
         }
     }
@@ -3137,6 +3147,22 @@ mod tests {
             "a broken signer / encode / range is the one verdict that makes a `NotFound` a \
              false claim about the content"
         );
+    }
+
+    /// A [`PullMiss::BelowMargin`] answers the same wire code as [`PullMiss::Clean`]:
+    /// declining an unprofitable relay must not leak the serve-economics floor to the
+    /// client as a distinct signal (that would let a client infer this node's buy
+    /// ceiling by probing for the wire difference).
+    #[test]
+    fn below_margin_is_wire_identical_to_clean() {
+        assert!(matches!(
+            miss_answer(PullMiss::Clean),
+            Ok(OriginFetch::NotFound)
+        ));
+        assert!(matches!(
+            miss_answer(PullMiss::BelowMargin),
+            Ok(OriginFetch::NotFound)
+        ));
     }
 
     /// A local fault LATCHES across a walk: one candidate's fault is not erased by the next
