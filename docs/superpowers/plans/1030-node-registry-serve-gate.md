@@ -5,6 +5,23 @@ Worktree `.claude/worktrees/1030-node-registry-serve-gate`, branch
 All line anchors below are verified against that commit.
 
 ## Context
+> **Status: implemented.** This plan was executed on `feat/1030-node-registry-serve-gate`.
+> Three deviations from the plan as written, all found during implementation:
+>
+> - **`AdminState::new` kept `const fn`.** The plan predicted it would have to
+>   drop it. The new field is an `Option<Arc<dyn StakerSet>>`, and `None` is
+>   const-constructible, so only the `with_staker_set` builder is non-const.
+> - **`launch_configured` outgrew the 100-line clippy ceiling.** The
+>   onboard-or-fund branch is a free `provision_on_chain` function instead of
+>   being inline.
+> - **One extra file needed updating**: `crates/cli/tests/admin_rpc.rs` hand-builds
+>   the `admin_v1_health` JSON specifically so DTO drift fails a test. Adding
+>   `registry_active` broke it, exactly as that test intends.
+>
+> Everything else landed as planned, including the predicted trap at
+> `crates/node/tests/support/mod.rs` (`ConfigStakerSet::empty()` refuses all
+> delivery, so the fixture had to pass a set containing its own node id).
+
 
 Issue #1030 asks for an e2e journey covering the whole operator onboarding arc: a bare
 data dir → `decdn setup` (approve → `bond` → `declareMbps` → `registerNode`) → daemon
