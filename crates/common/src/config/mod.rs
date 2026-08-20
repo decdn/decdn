@@ -20,10 +20,10 @@ use crate::redact::redact_userinfo;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent, ResolvedDht,
-    ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe, ResolvedReceipts,
-    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
+    ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
+    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -122,6 +122,14 @@ const DEFAULT_PER_SOURCE_RATE_PER_SEC: f64 = 100.0;
 const DEFAULT_PER_SOURCE_BURST: u32 = 200;
 /// Default hard cap on tracked source entries in the keyed limiter.
 const DEFAULT_MAX_TRACKED_SOURCES: usize = 4096;
+/// Egress ceiling off unless the operator sets one.
+const DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS: u64 = 0;
+/// Load-shed concurrency high-water mark (start shedding misses at/above).
+const DEFAULT_LOAD_SHED_SERVES_HIGH: u32 = 256;
+/// Load-shed concurrency low-water mark (resume at/below).
+const DEFAULT_LOAD_SHED_SERVES_LOW: u32 = 192;
+/// Default per-client concurrent-serve cap under pressure.
+const DEFAULT_LOAD_SHED_PER_CLIENT_CAP: u32 = 32;
 /// Default sustained per-peer (`NodeId`) rate for `cdn/dht/v1` inbound
 /// (ADR 022 §DHT Rate Limiting). Conservative ceiling on adversarial load,
 /// not a steady-state target.
@@ -455,6 +463,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let observability =
         resolve_observability_into(&cli.observability, file.observability.as_ref(), &mut bag);
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
+    let load_shed = resolve_load_shed_into(file.load_shed.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
@@ -473,6 +482,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         payment,
         observability,
         security,
+        load_shed,
         dht,
         probe,
         receipts,
@@ -2685,6 +2695,53 @@ pub fn resolve_security_into(
         per_source_rate_per_sec,
         per_source_burst,
         max_tracked_sources,
+    }
+}
+
+/// Resolve node-local load-shedding thresholds (spec §8).
+pub fn resolve_load_shed(file: Option<&types::LoadShedConfig>) -> anyhow::Result<ResolvedLoadShed> {
+    one_section(|bag| resolve_load_shed_into(file, bag))
+}
+
+/// Bag-threading variant of [`resolve_load_shed`]. Shares a bag with other
+/// sections during startup ([`resolve_config`]) and SIGHUP reload
+/// (`runtime::reload`); see [`resolve_payment_into`] for the rationale.
+pub fn resolve_load_shed_into(
+    file: Option<&types::LoadShedConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedLoadShed {
+    let policy = match file.and_then(|c| c.policy.as_deref()) {
+        None | Some("resource-pressure") => LoadShedPolicyKind::ResourcePressure,
+        Some("always-admit") => LoadShedPolicyKind::AlwaysAdmit,
+        Some(other) => {
+            bag.push(
+                "load_shed.policy",
+                format!(
+                    "load_shed.policy must be \"resource-pressure\" or \"always-admit\", got {other:?}"
+                ),
+            );
+            LoadShedPolicyKind::ResourcePressure
+        }
+    };
+    let high = file
+        .and_then(|c| c.max_concurrent_serves_high)
+        .unwrap_or(DEFAULT_LOAD_SHED_SERVES_HIGH);
+    let low = file
+        .and_then(|c| c.max_concurrent_serves_low)
+        .unwrap_or(DEFAULT_LOAD_SHED_SERVES_LOW);
+    bag.check_with(high >= low, "load_shed.max_concurrent_serves_high", || {
+        format!("load_shed.max_concurrent_serves_high ({high}) must be >= _low ({low})")
+    });
+    ResolvedLoadShed {
+        policy,
+        egress_budget_mbps: file
+            .and_then(|c| c.egress_budget_mbps)
+            .unwrap_or(DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS),
+        max_concurrent_serves_high: high,
+        max_concurrent_serves_low: low,
+        per_client_serve_cap: file
+            .and_then(|c| c.per_client_serve_cap)
+            .unwrap_or(DEFAULT_LOAD_SHED_PER_CLIENT_CAP),
     }
 }
 
@@ -9897,6 +9954,41 @@ bind_port = 12345
                 < f64::EPSILON
         );
         assert_eq!(resolved.max_tracked_sources, DEFAULT_MAX_TRACKED_SOURCES);
+    }
+
+    // --- resolve_load_shed ----------------------------------------------------
+
+    #[test]
+    fn load_shed_defaults_are_resource_pressure() {
+        let r = resolve_load_shed(None).expect("defaults resolve");
+        assert_eq!(r.policy, LoadShedPolicyKind::ResourcePressure);
+        assert_eq!(r.egress_budget_mbps, DEFAULT_LOAD_SHED_EGRESS_BUDGET_MBPS);
+        assert!(r.max_concurrent_serves_high >= r.max_concurrent_serves_low);
+    }
+
+    #[test]
+    fn load_shed_rejects_high_below_low() {
+        let raw = types::LoadShedConfig {
+            max_concurrent_serves_high: Some(10),
+            max_concurrent_serves_low: Some(20),
+            ..Default::default()
+        };
+        assert!(
+            resolve_load_shed(Some(&raw)).is_err(),
+            "high < low must be a config error"
+        );
+    }
+
+    #[test]
+    fn load_shed_parses_always_admit() {
+        let raw = types::LoadShedConfig {
+            policy: Some("always-admit".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_load_shed(Some(&raw)).expect("parse").policy,
+            LoadShedPolicyKind::AlwaysAdmit
+        );
     }
 
     // --- resolve_dht: keyspace caps (#645) -----------------------------------

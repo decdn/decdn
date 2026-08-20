@@ -403,6 +403,7 @@ fn build_config(
             per_source_burst: 200,
             max_tracked_sources: 4096,
         },
+        load_shed: decdn_common::config::ResolvedLoadShed::default(),
         content: decdn_common::config::ResolvedContent::default(),
         dht: ResolvedDht::default(),
         probe: ResolvedProbe::default(),

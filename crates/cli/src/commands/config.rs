@@ -665,6 +665,13 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # per_source_burst = 200                    # per-source burst capacity; required > 0 when the rate is > 0
 # max_tracked_sources = 4096                # cap on tracked sources in the keyed limiter; 0 = unbounded
 
+[load_shed]
+# policy = "resource-pressure"              # "resource-pressure" (default) or "always-admit"
+# egress_budget_mbps = 0                    # serving egress budget in Mbps; 0 disables the egress ceiling
+# max_concurrent_serves_high = 256          # concurrency high-water mark; start shedding misses at/above
+# max_concurrent_serves_low = 192           # concurrency low-water mark; resume at/below
+# per_client_serve_cap = 32                 # per-client concurrent-serve cap under pressure; 0 disables
+
 [dht.rate_limit]
 # per_peer_rate_per_sec = 20.0              # per-peer (NodeId) sustained rate (ADR 022); 0.0 disables the layer
 # per_peer_burst = 40                       # per-peer burst capacity; required > 0 when the rate is > 0
@@ -732,6 +739,7 @@ mod tests {
             payment,
             observability,
             security,
+            load_shed,
             dht,
             probe,
             receipts,
@@ -749,6 +757,7 @@ mod tests {
             ("payment", payment.is_some()),
             ("observability", observability.is_some()),
             ("security", security.is_some()),
+            ("load_shed", load_shed.is_some()),
             ("dht", dht.is_some()),
             ("probe", probe.is_some()),
             ("receipts", receipts.is_some()),

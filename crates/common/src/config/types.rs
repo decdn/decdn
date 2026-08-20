@@ -28,6 +28,9 @@ pub struct FileConfig {
     pub observability: Option<ObservabilityConfig>,
     /// Connection rate-limiting settings.
     pub security: Option<SecurityConfig>,
+    /// Node-local load-shedding thresholds (overload protection). Absent
+    /// => the resolved defaults.
+    pub load_shed: Option<LoadShedConfig>,
     /// `cdn/dht/v1` Kademlia DHT settings (ADR 022). Absent => defaults
     /// from the ADR 022 §DHT Rate Limiting table.
     pub dht: Option<DhtConfig>,
@@ -853,6 +856,24 @@ pub struct SecurityConfig {
     /// baseline. Default: 4096. `0` makes the map unbounded — see the
     /// type-level docs for the operator-opt-in warning.
     pub max_tracked_sources: Option<usize>,
+}
+
+/// `[load_shed]` section — node-local load-shedding thresholds (overload
+/// protection). All fields optional; unset falls back to the resolved
+/// defaults.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadShedConfig {
+    /// `resource-pressure` (default) or `always-admit`.
+    pub policy: Option<String>,
+    /// Serving egress budget in Mbps; `0` disables the egress ceiling.
+    pub egress_budget_mbps: Option<u64>,
+    /// Concurrency high-water mark (start shedding misses at/above).
+    pub max_concurrent_serves_high: Option<u32>,
+    /// Concurrency low-water mark (resume at/below).
+    pub max_concurrent_serves_low: Option<u32>,
+    /// Per-client concurrent-serve cap, enforced only under pressure; `0` off.
+    pub per_client_serve_cap: Option<u32>,
 }
 
 /// `[dht]` section — `cdn/dht/v1` settings (ADR 022).
