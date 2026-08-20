@@ -542,6 +542,15 @@ enum ServeRejectReason {
     /// for the per-reason metric ONLY — both collapse to `NotFound` on the wire,
     /// see [`Self::wire_error`].
     LaneAtCapacity,
+    /// A cache-HIT serve shed under node overload (egress saturation). Distinct
+    /// from [`Self::LoadShedMiss`] for the per-reason metric ONLY — both
+    /// collapse to `NotFound` on the wire (see [`Self::wire_error`]) so a client
+    /// cannot read node load, and both are reputation-benign (a client scores
+    /// `NotFound` as no fault).
+    LoadShedHit,
+    /// A cache-MISS serve shed under node overload (concurrency pressure or
+    /// per-client fairness). See [`Self::LoadShedHit`].
+    LoadShedMiss,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
     HashDenied,
@@ -588,6 +597,8 @@ impl ServeRejectReason {
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
             | Self::LaneAtCapacity
+            | Self::LoadShedHit
+            | Self::LoadShedMiss
             | Self::RangeNotSatisfiable => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
@@ -720,6 +731,8 @@ pub struct ClientHandlerDeps {
     pub node_id: PublicKey,
     pub metrics: Arc<Metrics>,
     pub limiter: Arc<ConnectionLimiter>,
+    /// Overload-protection gate: sheds new serves under resource pressure.
+    pub shed: Arc<crate::load_shed::LoadShedController>,
     pub cache: CacheEngine,
     pub eth_signer: Arc<PrivateKeySigner>,
     pub slash_domain: Eip712Domain,
@@ -823,11 +836,13 @@ impl ClientHandlerDeps {
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
         pool_min_remaining_deposit: U256,
+        shed: Arc<crate::load_shed::LoadShedController>,
     ) -> Self {
         Self {
             node_id,
             metrics,
             limiter,
+            shed,
             cache,
             eth_signer,
             slash_domain,
@@ -861,6 +876,8 @@ pub struct ClientHandler {
     node_id: PublicKey,
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
+    /// Overload-protection gate: sheds new serves under resource pressure.
+    shed: Arc<crate::load_shed::LoadShedController>,
     cache: CacheEngine,
     eth_signer: Arc<PrivateKeySigner>,
     /// `SlashJudge` EIP-712 domain for `StreamResponse.slash_sig`.
@@ -1070,6 +1087,7 @@ impl ClientHandler {
             node_id: deps.node_id,
             metrics: deps.metrics,
             limiter: deps.limiter,
+            shed: deps.shed,
             cache: deps.cache,
             eth_signer: deps.eth_signer,
             slash_domain: deps.slash_domain,
@@ -1811,6 +1829,17 @@ impl BufferedVoucherReader {
     }
 }
 
+/// A load-shed controller that never sheds, for handler-layer tests that are
+/// not exercising the load-shed gate itself. Keeps every existing serve test
+/// admitting exactly as it did before the gate was wired in.
+#[cfg(test)]
+fn always_admit_shed() -> Arc<crate::load_shed::LoadShedController> {
+    crate::load_shed::LoadShedController::from_config(&decdn_common::config::ResolvedLoadShed {
+        policy: decdn_common::config::LoadShedPolicyKind::AlwaysAdmit,
+        ..Default::default()
+    })
+}
+
 /// Build a `ClientHandler` over an arbitrary [`PoolStateStore`] for the
 /// sibling-module tests (e.g. `voucher.rs`'s #527 durability tests need a
 /// fault-injecting store). Kept at module level (not inside `mod tests`) so a
@@ -1853,6 +1882,7 @@ pub(super) async fn handler_over_store(
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
         U256::ZERO,
+        always_admit_shed(),
     );
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
@@ -1908,9 +1938,47 @@ mod tests {
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             pool_min_remaining_deposit,
+            always_admit_shed(),
         );
         let handler = ClientHandler::new(deps).expect("handler");
         (Arc::new(handler), dir)
+    }
+
+    /// The load-shed controller sheds a cache-miss once the node is at its
+    /// configured concurrency ceiling, while a cache-hit for a DIFFERENT client
+    /// still rides — a hit is local, zero-upstream-cost margin, so it is shed
+    /// last (miss-before-hit). Exercises the controller directly at the wiring
+    /// boundary rather than standing up a full QUIC loopback.
+    #[tokio::test]
+    async fn miss_is_shed_when_node_at_capacity_but_hit_admitted() {
+        // Build a handler whose shed controller trips at 1 concurrent serve.
+        let cfg = decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 0,
+            max_concurrent_serves_high: 1,
+            max_concurrent_serves_low: 0,
+            per_client_serve_cap: 0,
+        };
+        let shed = crate::load_shed::LoadShedController::from_config(&cfg);
+        // Occupy the one slot.
+        let _held = shed
+            .try_admit(crate::load_shed::RequestClass::CacheHit, B256::ZERO)
+            .expect("first serve admits");
+        // A new miss is shed; a new hit rides (egress under budget).
+        assert!(
+            shed.try_admit(
+                crate::load_shed::RequestClass::CacheMiss,
+                B256::from([1u8; 32])
+            )
+            .is_err()
+        );
+        assert!(
+            shed.try_admit(
+                crate::load_shed::RequestClass::CacheHit,
+                B256::from([1u8; 32])
+            )
+            .is_ok()
+        );
     }
 
     /// The lane registry resolves independent lanes concurrently (#1731). Many
@@ -2310,6 +2378,7 @@ mod tests {
             16,
             Arc::new(crate::content_deny::ContentDenylist::empty()),
             U256::ZERO,
+            always_admit_shed(),
         );
         deps.capability_sink = Some(Arc::new(RecordingCapabilitySink {
             recorded: Arc::clone(&recorded),

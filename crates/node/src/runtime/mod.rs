@@ -1104,6 +1104,11 @@ async fn build_chain_and_handlers(
     // drives the service's redeemer loop.
     let (redeem_tx, redeem_rx) =
         tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
+    // Overload-protection gate (load-shed): sheds new serves under resource
+    // pressure so in-flight streams stay fast. Bound to a named local, not
+    // inlined into the deps literal, so the reload section and the egress
+    // sampling tick below can reach the SAME controller.
+    let shed_controller = crate::load_shed::LoadShedController::from_config(&cfg.load_shed);
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1123,6 +1128,7 @@ async fn build_chain_and_handlers(
         MAX_CLIENT_STREAMS,
         Arc::clone(&content_denylist),
         U256::from(cfg.blockchain.pool_min_remaining_deposit_micro_usdc),
+        Arc::clone(&shed_controller),
     );
     // Owner-signed capability intake (ADR 003 §Capability delegation): the serve
     // gate persists a presented capability so the redeemer registers the signer

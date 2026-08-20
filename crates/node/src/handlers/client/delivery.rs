@@ -259,6 +259,7 @@ impl ClientHandler {
                 self.write_message(send, &ClientMessage::ChunkData(frame))
                     .await?;
                 delivered = delivered.saturating_add(len);
+                self.shed.record_egress(len);
                 unvouchered = unvouchered.saturating_add(len);
                 if unvouchered >= interval_bytes {
                     pending.push_back(unvouchered);

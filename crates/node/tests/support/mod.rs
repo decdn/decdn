@@ -425,6 +425,14 @@ fn client_handler_deps(
         // No refundable-floor gate in the loopback fixtures: a seeded lane serves
         // from the first voucher regardless of the pool's remaining deposit.
         alloy::primitives::U256::ZERO,
+        // Never sheds: the loopback fixtures exercise the paid-delivery path
+        // itself, not overload protection.
+        decdn_node::load_shed::LoadShedController::from_config(
+            &decdn_common::config::ResolvedLoadShed {
+                policy: decdn_common::config::LoadShedPolicyKind::AlwaysAdmit,
+                ..Default::default()
+            },
+        ),
     )
 }
 
