@@ -15,10 +15,12 @@ import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 
 /// @title DecdnGovernor
 /// @notice Served-bytes-weighted on-chain governor (ADR 036). Vote weight is
-///         derived from `FeeRouter.bytesInWindow` × `age_ramp(firstBondedAt)`
-///         with a per-operator cap and a slash zero-out from
-///         `CapacityBond.slashedAtEpoch`. Proposals execute through a 48h
-///         `TimelockController`.
+///         derived from `FeeRouter.bytesPerEpoch` summed across epochs, with each
+///         epoch's bytes capped at the operator's declared capacity
+///         (`CapacityBond.declaredMbpsAtEpoch` × `epochLength` × 125_000), then
+///         bounded by the `voteCapBps` share cap and scaled by `age_ramp(firstBondedAt)`.
+///         Weight is zeroed if the operator is slashed in-window. Proposals execute
+///         through a 48h `TimelockController`.
 /// @dev    `VotingEscrow` and `IVotes`/IERC-5805 are intentionally NOT used —
 ///         voting weight is derived from `FeeRouter` epoch accounting, not
 ///         from per-account checkpoint structures. See ADR 036 § Formula.
