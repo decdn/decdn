@@ -848,6 +848,8 @@ impl RuntimeReloadState {
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_negative_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
@@ -858,6 +860,7 @@ impl RuntimeReloadState {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
@@ -1175,6 +1178,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         gc_interval_sec,
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
+        origin_probe_negative_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,
@@ -1184,6 +1188,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
+        relay_foreign_namespaces,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
@@ -1207,6 +1212,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         // Live-origin probe memo (#1130 pt3) is built once at bring-up, so any
         // of its knobs changing needs a restart.
         || origin_probe_ttl_sec.is_some()
+        || origin_probe_negative_ttl_sec.is_some()
         || origin_probe_timeout_ms.is_some()
         || origin_probe_memo_capacity.is_some()
         || eviction_high_water_pct.is_some()
@@ -1216,6 +1222,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || max_probe_holds.is_some()
         || stake_lane_reserved_holds.is_some()
         || node_to_node_pull_through_enabled.is_some()
+        || relay_foreign_namespaces.is_some()
         || node_pull_probe_fanout.is_some()
         || node_pull_timeout_sec.is_some()
         || node_pull_stall_timeout_sec.is_some()
@@ -1330,6 +1337,8 @@ mod tests {
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_negative_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
@@ -1340,6 +1349,7 @@ mod tests {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:

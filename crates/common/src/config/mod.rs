@@ -199,6 +199,13 @@ pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 /// probe-hold horizon.
 pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
 
+/// Default TTL in seconds for a memoised `Absent` live-origin probe answer.
+/// Short on purpose: it bounds how long a stale `Absent` can hide
+/// newly-available own content from a probe, while a random-hash flood never
+/// repeats a hash within any window so the short TTL barely changes flood
+/// cost.
+pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
+
 /// Default per-probe ceiling in milliseconds on the live-origin
 /// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the probe hot
 /// path; on overrun the probe answers `has_blob: false` and memoises the miss.
@@ -207,6 +214,14 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
 /// Default cap on distinct hashes in the live-origin probe memo (#1130 pt3).
 /// Bounds memo memory under a random-hash probe flood.
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
+
+/// Fallback for `cache.relay_foreign_namespaces` (#1759) on a node with no
+/// origin configured. The resolver's effective default is role-derived, not
+/// this flat constant: an origin node (a backend is configured) defaults to
+/// origin-only (`false`) — an origin is not a general proxy — while a
+/// no-origin node is a pure relay edge and falls back to this `true`. An
+/// operator sets the field explicitly to override either default.
+pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
 /// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
@@ -1654,6 +1669,9 @@ fn resolve_cache_into(
     let origin_probe_ttl_sec = file
         .and_then(|c| c.origin_probe_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TTL_SEC);
+    let origin_probe_negative_ttl_sec = file
+        .and_then(|c| c.origin_probe_negative_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
     let origin_probe_timeout_ms = file
         .and_then(|c| c.origin_probe_timeout_ms)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
@@ -1754,6 +1772,12 @@ fn resolve_cache_into(
     let node_to_node_pull_through_enabled = file
         .and_then(|c| c.node_to_node_pull_through_enabled)
         .unwrap_or(false);
+    let relay_foreign_namespaces = file
+        .and_then(|c| c.relay_foreign_namespaces)
+        // Role-derived default: an origin node (a backend is configured) serves only
+        // its own namespace; a node with no origin is a pure relay edge and relays.
+        // Explicit config overrides either way.
+        .unwrap_or(origins.is_empty());
     let node_pull_probe_fanout = file
         .and_then(|c| c.node_pull_probe_fanout)
         .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
@@ -1857,6 +1881,7 @@ fn resolve_cache_into(
         gc_interval_sec,
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
+        origin_probe_negative_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,
@@ -1866,6 +1891,7 @@ fn resolve_cache_into(
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
+        relay_foreign_namespaces,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
@@ -4571,6 +4597,64 @@ swap_pool_address = \"0xPool\"
             resolved.origins.is_empty(),
             "absent origin section must yield empty vec, got len {}",
             resolved.origins.len(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_defaults_false_with_origin() -> anyhow::Result<()> {
+        // Role-derived default (#1759): a node with an origin backend
+        // configured is an origin, not a general proxy — absent an explicit
+        // override it defaults to origin-only (`false`).
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            !resolved.relay_foreign_namespaces,
+            "a node with an origin configured must default to origin-only (relay_foreign_namespaces = false)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_defaults_true_without_origin() -> anyhow::Result<()> {
+        // Role-derived default (#1759): a node with no origin backend is a
+        // pure relay edge — its only function is relaying, so absent an
+        // explicit override it defaults to relay (`true`).
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig::default();
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.relay_foreign_namespaces,
+            "a node with no origin configured must default to relay (relay_foreign_namespaces = true)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_relay_foreign_namespaces_explicit_true_overrides_origin_default()
+    -> anyhow::Result<()> {
+        // Explicit config always wins: an origin node may opt back into
+        // relay to also earn relay revenue.
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            origin: Some(types::OriginConfig::Http {
+                url: "https://origin.example/".to_string(),
+                decompress: None,
+            }),
+            relay_foreign_namespaces: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.relay_foreign_namespaces,
+            "an explicit relay_foreign_namespaces = true must override the origin-only default"
         );
         Ok(())
     }

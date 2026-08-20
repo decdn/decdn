@@ -133,6 +133,9 @@ impl ClientHandler {
                 self.metrics.serve_stream_rejected_chain_hash_denied();
             }
             ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
+            ServeRejectReason::ForeignNamespaceDeclined => {
+                self.metrics.serve_stream_rejected_foreign_declined();
+            }
         }
         let error = reason.wire_error();
         let body = StreamResponseBody {

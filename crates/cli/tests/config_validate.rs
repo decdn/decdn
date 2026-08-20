@@ -367,6 +367,8 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             gc_interval_sec: 300,
             fs_rescan_interval_sec: 60,
             origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+            origin_probe_negative_ttl_sec:
+                decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
             origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
             origin_probe_memo_capacity: decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
             eviction_high_water_pct: 90,
@@ -376,6 +378,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
             stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             node_to_node_pull_through_enabled: false,
+            relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
             node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             node_pull_stall_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC,

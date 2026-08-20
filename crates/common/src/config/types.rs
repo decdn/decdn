@@ -436,15 +436,22 @@ pub struct CacheConfig {
     /// it). Shorter intervals pick up new files faster at the cost of more
     /// directory-walk + `size()` I/O per minute.
     pub fs_rescan_interval_sec: Option<u64>,
-    /// TTL, in seconds, for a memoised live-origin probe answer (#1130 pt3).
-    /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A probe for
-    /// a hash absent from the `fs`-enumeration ∪ pins index falls back to a live
-    /// `HEAD`/`HeadObject` against the http/s3 origin; the answer — present-with-
-    /// size OR absent — is cached for this long so a non-pinned bucket object is
-    /// discoverable without a per-probe origin round-trip. Caching the negative
-    /// is what blunts a random-hash probe flood. Shorter TTLs track origin
-    /// deletions faster at the cost of more `HEAD` traffic.
+    /// TTL, in seconds, for a memoised positive live-origin probe answer (#1130
+    /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A
+    /// probe for a hash absent from the `fs`-enumeration ∪ pins index falls back
+    /// to a live `HEAD`/`HeadObject` against the http/s3 origin; a present-with-
+    /// size answer is cached for this long so a non-pinned bucket object is
+    /// discoverable without a per-probe origin round-trip on every probe.
+    /// Shorter TTLs track origin deletions faster at the cost of more `HEAD`
+    /// traffic. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
     pub origin_probe_ttl_sec: Option<u64>,
+    /// TTL, in seconds, for a memoised negative (absent) live-origin probe
+    /// answer (#1130 pt3). Absent =>
+    /// [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`] (2). Caching the
+    /// negative answer is what blunts a random-hash probe flood; keeping this
+    /// TTL short bounds how long a stale `Absent` can hide newly-available own
+    /// content from a probe.
+    pub origin_probe_negative_ttl_sec: Option<u64>,
     /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
     /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
     /// (2000). A slow origin must never stall the probe hot path; on timeout the
@@ -523,6 +530,12 @@ pub struct CacheConfig {
     /// behind a valid, pool-bound client so an unpaid request cannot drive
     /// egress.
     pub node_to_node_pull_through_enabled: Option<bool>,
+    /// When `false`, the node serves and seeds only content its own backend
+    /// holds; a foreign hash is declined like a miss. Absent resolves to a
+    /// role-derived default: `false` (origin-only) when an origin backend is
+    /// configured, `true` (relay) when none is. Set this explicitly to
+    /// override either default. Node-local; `cache.*` is restart-required.
+    pub relay_foreign_namespaces: Option<bool>,
     /// Number of discovered providers to probe before ranking on a
     /// node-to-node pull (#831). Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`] (5). Higher widens

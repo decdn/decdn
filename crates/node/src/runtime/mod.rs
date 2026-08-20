@@ -988,6 +988,7 @@ async fn build_chain_and_handlers(
         slash_domain.clone(),
         rate_bounds.clone(),
         stake_lane_policy,
+        cfg.cache.relay_foreign_namespaces,
     ));
 
     // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
@@ -1235,6 +1236,8 @@ async fn build_chain_and_handlers(
     // Hint the settlement service on each accepted voucher so a lane's accrued
     // claim is planned into a chunk promptly rather than waiting the self-tick.
     client_deps.redeem_hint = Some(redeem_tx.clone());
+    // Origin-only policy (#1759): backend-authoritative own/foreign decision.
+    client_deps.relay_foreign_namespaces = cfg.cache.relay_foreign_namespaces;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1674,14 +1677,22 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // the logged count honest and coalesces a hash that is both stored and
     // origin-held into one jitter draw. On a store list-error we still seed the
     // origin-held set — announce degrades only for the store half.
+    //
+    // Under the origin-only policy (`relay_foreign_namespaces == false`) the
+    // store union is skipped: the store may still hold leftover foreign
+    // content from before the toggle was set, and seeding it would announce
+    // blobs the serve gate now declines. Own content is unaffected — it lives
+    // in `origin_held_hashes()` regardless of the toggle.
     let mut cold_start_set: std::collections::HashSet<decdn_cache::Hash> =
         infra.cache.origin_held_hashes().into_iter().collect();
-    match infra.cache.iter_hashes().await {
-        Ok(hashes) => cold_start_set.extend(hashes),
-        Err(err) => tracing::warn!(
-            error = %err,
-            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
-        ),
+    if cfg.cache.relay_foreign_namespaces {
+        match infra.cache.iter_hashes().await {
+            Ok(hashes) => cold_start_set.extend(hashes),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
+            ),
+        }
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
         cold_start_set
@@ -2914,6 +2925,7 @@ async fn build_cache(
     // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
     engine.set_origin_probe_config(
         std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
+        std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
         std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
         usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
     );
@@ -3626,6 +3638,8 @@ mod tests {
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_negative_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
@@ -3636,6 +3650,7 @@ mod tests {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:

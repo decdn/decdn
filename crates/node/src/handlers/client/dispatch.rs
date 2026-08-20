@@ -223,6 +223,52 @@ impl ClientHandler {
                 .await;
         }
 
+        // Origin-only policy (#1759). When the operator opts out of foreign
+        // relay, the own/foreign decision is backend-authoritative: the request's
+        // `namespace_id` is a routing hint, not a trust anchor (ADR 002), so the
+        // node asks its OWN backend — a memoized `HEAD`/`HeadObject` — whether it
+        // holds the object named by this content hash. The probe is memoized
+        // (short negative TTL), so a foreign-hash flood costs at most one
+        // backend round-trip per hash per negative-TTL window. Above the
+        // cache-hit branch on purpose: a foreign blob already sitting in this
+        // node's cache (e.g. seeded by an earlier relay) is still declined, so
+        // the policy is categorical rather than "foreign misses only".
+        //
+        // Three-way outcome (#1766): `Present` is own content and falls through
+        // to the normal serve path. `Absent` (a genuine 404, or no origin
+        // configured at all) is a real foreign-content answer, declined under
+        // its own reason so the operator's metrics separate policy declines
+        // from real cache misses. `Fault` (a transport error or a timed-out
+        // `HEAD`) is NOT an absence — signing an authoritative `NotFound` would
+        // tell a paying client this node's own content is gone and would hide
+        // the operator's backend outage — so it surfaces as `InternalError`
+        // instead, matching the store-fault handling on the `has()` path below.
+        if !self.relay_foreign_namespaces {
+            match self.cache.origin_probe_presence(hash).await {
+                decdn_cache::OriginPresence::Present(_) => {}
+                decdn_cache::OriginPresence::Absent => {
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::ForeignNamespaceDeclined,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+                decdn_cache::OriginPresence::Fault => {
+                    return self
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::InternalError,
+                            rate_per_mb,
+                        )
+                        .await;
+                }
+            }
+        }
+
         // Resolve the lane key early. The seller keys a lane by
         // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
         // the request, the signer from the verified client binding, the provider
