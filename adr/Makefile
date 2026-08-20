@@ -75,7 +75,7 @@ BOOK_SRCS := \
   _build/part-6-governance.md \
   009-governance.md 036-served-bytes-voting-weight.md 016-contract-interactions.md \
   _build/part-7-operations.md \
-  019-node-onboarding.md 040-cache-policy.md \
+  019-node-onboarding.md 040-cache-policy.md 041-refuse-to-serve.md \
   _build/part-8-supporting.md \
   013-schema-evolution.md 017-privacy.md \
   _build/part-9-appendices.md \

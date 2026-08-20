@@ -103,10 +103,11 @@ The governance model that sets the parameters earlier chapters consume, and the 
 
 ### Chapter 7 — Operations
 
-The operator-facing onboarding flow that takes a bare server through staking, registration, and accepting paid delivery, and the node-local cache policy that governs what an onboarded node keeps on disk.
+The operator-facing onboarding flow that takes a bare server through staking, registration, and accepting paid delivery, the node-local cache policy that governs what an onboarded node keeps on disk, and the node-local economics gate that decides when relaying a cache miss is worth it.
 
 1. [ADR 019 — Node Onboarding and Bootstrapping Flow](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
 2. [ADR 040 — Pluggable Cache Admission and Eviction Policies](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)
+3. [ADR 041 — Refuse-to-Serve Economics](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)
 
 ### Chapter 8 — Supporting infrastructure
 
