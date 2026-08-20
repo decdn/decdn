@@ -55,6 +55,9 @@ pub mod provider;
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
 pub mod ranged_store;
 pub mod rtt_map;
+/// Pure segmentation and tail-steal helpers for the multi-source scheduler
+/// (spec §5.3): no I/O, no async.
+mod segment;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
 // module's own links (`ResponseDecoder`, `resume_offset`, …) would go unresolved

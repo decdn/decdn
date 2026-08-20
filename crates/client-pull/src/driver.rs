@@ -187,7 +187,7 @@ fn voucher_cost(header: &UpstreamPullHeader) -> U256 {
 /// ranges it covers, in ascending order, clamping the final boundary to
 /// `total_bytes` (the ragged last group). Each entry is `(start, len)` with
 /// `len > 0`.
-fn contiguous_byte_ranges(ranges: &ChunkRanges, total_bytes: u64) -> Vec<(u64, u64)> {
+pub(crate) fn contiguous_byte_ranges(ranges: &ChunkRanges, total_bytes: u64) -> Vec<(u64, u64)> {
     let boundaries = ranges.boundaries();
     let mut out = Vec::new();
     let mut it = boundaries.iter();
