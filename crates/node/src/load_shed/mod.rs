@@ -13,6 +13,7 @@ mod egress;
 mod resource_pressure;
 mod state;
 
+pub use controller::{LoadShedController, egress_budget_bps};
 pub use egress::EgressMeter;
 pub use resource_pressure::{Params as ResourcePressureParams, ResourcePressure};
 pub use state::{ShedSlot, ShedState};
