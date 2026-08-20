@@ -108,6 +108,10 @@ contract DecdnGovernorDelegationTest is Test {
         for (uint64 e = 180; e <= 205; e++) {
             feeRouter.setBytes(op, e, perOp);
             feeRouter.setTotalBytes(e, PER_TOTAL);
+            // Ample declared capacity so the ADR 036 per-epoch cap does not
+            // bind for these fixtures; cap-binding is covered explicitly in
+            // DecdnGovernor.t.sol's declared-capacity tests.
+            bond.setDeclaredMbpsAtEpoch(op, e, 1000);
         }
     }
 

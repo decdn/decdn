@@ -23,7 +23,7 @@ pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
     ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
 
@@ -93,6 +93,12 @@ const DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX: u64 = 300;
 /// hourly expiry sweep so accrued earnings are withdrawn promptly without
 /// leaning on the advisory per-voucher hints (#327, #751).
 const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
+/// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
+/// node's only defense against an owner's grace-window close — it must run several
+/// times inside the 48h grace floor so accrued vouchers redeem before the owner
+/// can `reclaim`. 6h leaves 8× headroom for tx landing and retries. An operator
+/// who wants a laxer cadence to shave gas builds from source or opens an issue.
+const MAX_REDEEM_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// Default pool-open and refill-target deposit every top-up restores the pool
 /// balance toward: 10 USDC (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics
 /// recommends a 10 USDC practical minimum (gas overhead ~2.3%); it is a
@@ -220,7 +226,7 @@ pub const DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC: u64 = 30;
 pub const DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY: usize = 4096;
 
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
-/// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
+/// (#1173, ADR 040). Above this
 /// fraction the driver actively evicts.
 pub const DEFAULT_EVICTION_HIGH_WATER_PCT: u64 = 90;
 /// Hard bounds `[60, 95]` for [`DEFAULT_EVICTION_HIGH_WATER_PCT`].
@@ -241,6 +247,22 @@ pub const EVICTION_PER_SWEEP_BUDGET_BOUNDS: (u64, u64) = (1, 256);
 pub const DEFAULT_EVICTION_TICK_SECS: u64 = 1;
 /// Hard bounds `[1, 60]` for [`DEFAULT_EVICTION_TICK_SECS`].
 pub const EVICTION_TICK_SECS_BOUNDS: (u64, u64) = (1, 60);
+
+/// Default `cache.eviction_policy` (ADR 040). Reproduces pre-ADR-040 behavior.
+pub const DEFAULT_EVICTION_POLICY: &str = "lru";
+/// Default `cache.admission_policy` (ADR 040). Reproduces pre-ADR-040 behavior.
+pub const DEFAULT_ADMISSION_POLICY: &str = "always";
+/// Default `cache.tinylfu.sketch_bytes` (ADR 040).
+pub const DEFAULT_TINYLFU_SKETCH_BYTES: usize = 262_144;
+/// Default `cache.tinylfu.promotion_threshold` (ADR 040).
+pub const DEFAULT_TINYLFU_PROMOTION_THRESHOLD: u32 = 2;
+/// Default `cache.tinylfu.probation_target_pct` (ADR 040).
+pub const DEFAULT_TINYLFU_PROBATION_TARGET_PCT: u64 = 10;
+/// Hard bounds `[1, 50]` for [`DEFAULT_TINYLFU_PROBATION_TARGET_PCT`].
+pub const TINYLFU_PROBATION_TARGET_PCT_BOUNDS: (u64, u64) = (1, 50);
+/// Default `cache.tinylfu.aging_halflife_sec` (ADR 040). Reserved: resolved
+/// and stored but not currently consulted by the shipped sketch.
+pub const DEFAULT_TINYLFU_AGING_HALFLIFE_SEC: u64 = 600;
 
 /// Default EIP-712 `chainId` for the `slash_sig` domain separator (ADR 014).
 /// Arbitrum Sepolia — the initial network target; matches the chain id bound
@@ -1411,6 +1433,21 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
+    // The sweep is the only thing that redeems this node's vouchers before an
+    // owner's grace-window close lets them `reclaim`. It must run several times
+    // inside the 48h grace floor, so cap the interval at 6h — a laxer cadence
+    // risks forfeiting real earnings on a pool that closes between sweeps.
+    bag.check_with(
+        redeem_interval_secs <= MAX_REDEEM_INTERVAL_SECS,
+        "blockchain.redeem_interval_secs",
+        || {
+            format!(
+                "blockchain.redeem_interval_secs must be <= {MAX_REDEEM_INTERVAL_SECS} (6h): the \
+                 redeem sweep must run well inside the 48h grace window to secure vouchers \
+                 before an owner can reclaim a closing pool"
+            )
+        },
+    );
 
     let redeem_max_vouchers_per_tx = file
         .and_then(|b| b.redeem_max_vouchers_per_tx)
@@ -1624,7 +1661,7 @@ fn resolve_cache_into(
         .and_then(|c| c.origin_probe_memo_capacity)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY);
 
-    // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
+    // LRU eviction driver knobs (#1173, ADR 040). Each
     // is range-checked against its structural bounds; the target/high-water
     // hysteresis gap is a cross-field invariant enforced after both resolve.
     let eviction_high_water_pct = file
@@ -1747,6 +1784,66 @@ fn resolve_cache_into(
          upstream as stalled on the first read, scoring every honest peer as \
          unreachable)",
     );
+    // Cache admission/eviction policy selectors (ADR 040). Unknown names are
+    // rejected here, at config load — never a silent fallback to the default
+    // policy, which would mask an operator typo behind quietly-unchanged
+    // behavior.
+    let eviction_policy = file
+        .and_then(|c| c.eviction_policy.clone())
+        .unwrap_or_else(|| DEFAULT_EVICTION_POLICY.to_string());
+    bag.check_with(
+        matches!(eviction_policy.as_str(), "lru" | "tinylfu"),
+        "cache.eviction_policy",
+        || format!("cache.eviction_policy ({eviction_policy}) must be \"lru\" or \"tinylfu\""),
+    );
+    let admission_policy = file
+        .and_then(|c| c.admission_policy.clone())
+        .unwrap_or_else(|| DEFAULT_ADMISSION_POLICY.to_string());
+    bag.check_with(
+        matches!(admission_policy.as_str(), "always" | "tinylfu"),
+        "cache.admission_policy",
+        || format!("cache.admission_policy ({admission_policy}) must be \"always\" or \"tinylfu\""),
+    );
+
+    let tinylfu_file = file.and_then(|c| c.tinylfu.as_ref());
+    let tinylfu_sketch_bytes = tinylfu_file
+        .and_then(|t| t.sketch_bytes)
+        .unwrap_or(DEFAULT_TINYLFU_SKETCH_BYTES);
+    let tinylfu_promotion_threshold = tinylfu_file
+        .and_then(|t| t.promotion_threshold)
+        .unwrap_or(DEFAULT_TINYLFU_PROMOTION_THRESHOLD);
+    // `promotion_threshold` counts prior sightings before a probation member
+    // admits to `Main`; zero is nonsensical — it would make admission
+    // always-`Main` and promote everything, defeating probationary admission.
+    // Reject it at load, never clamp (ADR 040 §Probationary admission).
+    bag.check_with(
+        tinylfu_promotion_threshold >= 1,
+        "cache.tinylfu.promotion_threshold",
+        || {
+            format!(
+                "cache.tinylfu.promotion_threshold ({tinylfu_promotion_threshold}) must be >= 1"
+            )
+        },
+    );
+    let tinylfu_probation_target_pct = tinylfu_file
+        .and_then(|t| t.probation_target_pct)
+        .unwrap_or(DEFAULT_TINYLFU_PROBATION_TARGET_PCT);
+    bag.check_with(
+        (TINYLFU_PROBATION_TARGET_PCT_BOUNDS.0..=TINYLFU_PROBATION_TARGET_PCT_BOUNDS.1)
+            .contains(&tinylfu_probation_target_pct),
+        "cache.tinylfu.probation_target_pct",
+        || {
+            format!(
+                "cache.tinylfu.probation_target_pct ({tinylfu_probation_target_pct}) must be \
+                 within [{}, {}]",
+                TINYLFU_PROBATION_TARGET_PCT_BOUNDS.0, TINYLFU_PROBATION_TARGET_PCT_BOUNDS.1
+            )
+        },
+    );
+    let tinylfu_aging_halflife_sec = tinylfu_file
+        .and_then(|t| t.aging_halflife_sec)
+        .unwrap_or(DEFAULT_TINYLFU_AGING_HALFLIFE_SEC);
+
     ResolvedCache {
         cache_dir,
         cache_size_mb,
@@ -1772,6 +1869,14 @@ fn resolve_cache_into(
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
+        eviction_policy,
+        admission_policy,
+        tinylfu: ResolvedTinyLfu {
+            sketch_bytes: tinylfu_sketch_bytes,
+            promotion_threshold: tinylfu_promotion_threshold,
+            probation_target_pct: tinylfu_probation_target_pct,
+            aging_halflife_sec: tinylfu_aging_halflife_sec,
+        },
     }
 }
 
@@ -4081,6 +4186,108 @@ mod tests {
         assert_eq!(resolved.eviction_target_pct, 80);
         assert_eq!(resolved.eviction_per_sweep_budget, 16);
         assert_eq!(resolved.eviction_tick_secs, 1);
+    }
+
+    /// Defaults keep the pre-ADR-040 behavior: LRU eviction, unconditional
+    /// admission. Operators who never touch the new knobs see no change.
+    #[test]
+    fn defaults_are_always_lru() {
+        let cli = empty_cache_args();
+        let resolved =
+            resolve_cache(&cli, None, Path::new("/data-dir")).expect("defaults must resolve");
+        assert_eq!(resolved.admission_policy, "always");
+        assert_eq!(resolved.eviction_policy, "lru");
+    }
+
+    /// `[cache.tinylfu]` defaults apply once `eviction_policy = "tinylfu"` is
+    /// selected, even with no `[cache.tinylfu]` table present.
+    #[test]
+    fn tinylfu_defaults_resolve() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            eviction_policy: Some("tinylfu".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+            .expect("tinylfu eviction policy must resolve");
+        assert_eq!(resolved.eviction_policy, "tinylfu");
+        assert_eq!(resolved.tinylfu.promotion_threshold, 2);
+        assert_eq!(resolved.tinylfu.probation_target_pct, 10);
+        assert_eq!(resolved.tinylfu.sketch_bytes, 262_144);
+        assert_eq!(resolved.tinylfu.aging_halflife_sec, 600);
+    }
+
+    /// An unknown `cache.eviction_policy` name is a config error at load time —
+    /// never a silent fallback to `lru`.
+    #[test]
+    fn unknown_eviction_policy_is_rejected() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            eviction_policy: Some("nonsense".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+            .expect_err("unknown eviction policy name must be rejected");
+        assert!(
+            err.to_string().contains("cache.eviction_policy"),
+            "error must name cache.eviction_policy: {err}"
+        );
+    }
+
+    /// An unknown `cache.admission_policy` name is a config error at load time —
+    /// never a silent fallback to `always`.
+    #[test]
+    fn unknown_admission_policy_is_rejected() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            admission_policy: Some("nonsense".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_cache(&cli, Some(&toml), Path::new("/data-dir"))
+            .expect_err("unknown admission policy name must be rejected");
+        assert!(
+            err.to_string().contains("cache.admission_policy"),
+            "error must name cache.admission_policy: {err}"
+        );
+    }
+
+    /// `probation_target_pct` has a hard bound `[1, 50]` — a value outside it is
+    /// a governance error the resolver must catch, not clamp.
+    #[test]
+    fn resolve_cache_rejects_out_of_range_probation_target_pct() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            eviction_policy: Some("tinylfu".to_string()),
+            tinylfu: Some(types::TinyLfuConfig {
+                probation_target_pct: Some(51),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "probation_target_pct above the [1, 50] bound must be rejected"
+        );
+    }
+
+    /// `promotion_threshold` must be `>= 1`: zero would admit everything straight
+    /// to `Main` and defeat probationary admission, so the resolver rejects it
+    /// rather than clamping (ADR 040 §Probationary admission).
+    #[test]
+    fn resolve_cache_rejects_zero_promotion_threshold() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            eviction_policy: Some("tinylfu".to_string()),
+            tinylfu: Some(types::TinyLfuConfig {
+                promotion_threshold: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "promotion_threshold = 0 must be rejected"
+        );
     }
 
     /// A zero open budget abandons every upstream before its handshake can finish,
@@ -8572,6 +8779,62 @@ swap_pool_address = \"0xPool\"
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
         assert_eq!(resolved.redeem_interval_secs, DEFAULT_REDEEM_INTERVAL_SECS);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_redeem_interval_above_grace_margin() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS + 1),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem interval exceeds the 6h cap");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_interval_secs"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_accepts_redeem_interval_at_grace_margin() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.redeem_interval_secs, MAX_REDEEM_INTERVAL_SECS);
         Ok(())
     }
 

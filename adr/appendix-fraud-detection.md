@@ -20,7 +20,7 @@ This is fundamentally an informational layer, not a paid service or a protocol p
 
 A node protects its own earnings without any external actor:
 
-1. **In-process redemption monitor** ([ADR 003](003-payments.md#adr-003-payment-model)). A lightweight thread in the node binary watches the chain for `PoolCloseInitiated` events on pools it holds vouchers against and redeems its highest voucher per lane before the grace window closes. Handles the common online case.
+1. **Periodic redeem sweep** ([ADR 003](003-payments.md#adr-003-payment-model)). The node redeems its outstanding vouchers on a fixed interval, capped well inside the grace window, so a pool that closes between sweeps is still swept before the owner can `reclaim`. It watches no close event — any interval short of the window suffices. Handles the common online case.
 2. **Expiry margin.** A node stops serving a signer before the capability's `expiry`, so it always holds redeemable vouchers with time to redeem.
 
 Because `redeem` is provider-only (`provider == msg.sender`), no third party could redeem a node's lane even if it wanted to — self-protection is the only path, and it is fully in the node's own hands. A node offline for the full grace window forfeits its unredeemed vouchers; this is a node-operations failure mode, not a protocol gap.
@@ -39,6 +39,6 @@ A protocol decision establishes a participant role with a defined wire interface
 
 ## Cross-ADR Impact
 
-- [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — redemption and grace-window close, the in-process redemption monitor, self-routing skim
+- [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — redemption and grace-window close, the periodic redeem sweep, self-routing skim
 - [ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — the wash-trading-as-vote-buying cost model the analysis informs
 - [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — gas-cost context

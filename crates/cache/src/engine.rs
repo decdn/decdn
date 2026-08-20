@@ -194,8 +194,9 @@ struct Inner {
     /// admission and every `eviction_candidates` call (no background task).
     ///
     /// Like [`Self::pinned`] this only blocks *LRU* eviction — an explicit
-    /// operator [`CacheEngine::evict`] still wins (ADR
-    /// appendix-blob-cache-eviction.md §4: DMCA always wins), enforced
+    /// operator [`CacheEngine::evict`] still wins (ADR 040 §Pinning, durable
+    /// operator-evict, and the probe-hold stay engine-enforced: DMCA always
+    /// wins), enforced
     /// because [`CacheEngine::try_probe_hold`] gates on [`CacheEngine::has`]
     /// which already
     /// honors the evicted set.
@@ -207,6 +208,24 @@ struct Inner {
     /// sufficient and avoids threading the value through every `open_*`
     /// constructor and its many test call sites.
     max_probe_holds: AtomicUsize,
+    /// Optional shared frequency signal (ADR 040). `None` for the `lru`/`always`
+    /// default — the observe call is skipped, so recency-only pays nothing.
+    frequency: ArcSwap<Option<Arc<dyn crate::policy::FrequencyEstimator>>>,
+    /// Admission policy consulted at store-time (ADR 040). Always present —
+    /// defaults to [`crate::policy::AlwaysAdmit`] (store to
+    /// [`crate::policy::Segment::Main`]), so behavior is unchanged until an
+    /// operator selects a different policy. `ArcSwap<Arc<dyn Trait>>` rather
+    /// than `ArcSwap<dyn Trait>`: the latter needs `RefCnt: Sized`, which
+    /// `arc-swap` 1.9.2 does not give a `dyn` trait object.
+    admission: ArcSwap<Arc<dyn crate::policy::AdmissionPolicy>>,
+    /// Generic `hash -> Segment` membership the engine tracks with no meaning
+    /// attached (ADR 040 §1). Admission stores the label it chose; the eviction
+    /// policy reads and moves it at the sweep. Pure in-memory metadata — the
+    /// blob's normal commit tag still provides GC protection, so no tag I/O is
+    /// tied to it. Only non-default (`Probation`) entries are stored; an absent
+    /// hash reads back as [`crate::policy::Segment::Main`], so under the default
+    /// `AlwaysAdmit` (always `Main`) the map stays empty and inert.
+    segments: Mutex<HashMap<Hash, crate::policy::Segment>>,
     /// Append-only file holding lowercase-hex evicted hashes, one per line.
     /// Loaded on [`CacheEngine::open`]; appended to (with `fsync`) on every
     /// successful [`CacheEngine::evict`]. Lives at `<cache_dir>/evicted.log`.
@@ -482,6 +501,12 @@ impl EvictionCandidates {
     pub fn into_inner(self) -> HashMap<Hash, Instant> {
         self.0
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn from_map_for_test(map: HashMap<Hash, Instant>) -> Self {
+        Self(map)
+    }
 }
 
 impl<'a> IntoIterator for &'a EvictionCandidates {
@@ -709,7 +734,7 @@ async fn gc_protect_inner(
         // - `access_times` is mixed: it recovers where a lost update is
         //   durability-relevant (`evict`, the LRU delete path) and skips on
         //   the read/observability paths (`last_accessed`,
-        //   `access_times_snapshot`, `eviction_candidates`, `touch`). That
+        //   `access_times_snapshot`, `eviction_candidates`, `record_access`). That
         //   split is a gap, not a design — a poisoned `access_times` makes
         //   `eviction_candidates` return empty, which stops LRU eviction
         //   and fills the disk. Tracked separately from #1517.
@@ -1021,6 +1046,11 @@ impl CacheEngine {
                 evicted: Mutex::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
+                frequency: ArcSwap::from_pointee(None),
+                admission: ArcSwap::from_pointee(
+                    Arc::new(crate::policy::AlwaysAdmit) as Arc<dyn crate::policy::AdmissionPolicy>
+                ),
+                segments: Mutex::new(HashMap::new()),
                 evicted_log_path,
                 retry_policy,
                 metrics,
@@ -1617,6 +1647,11 @@ impl CacheEngine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
 
         // Disk reclaim (#860): serving has already stopped via the logical
         // set above, but a successfully pulled-through blob carries a named
@@ -1651,8 +1686,7 @@ impl CacheEngine {
             }
         }
         // Operator-evict (DMCA/corruption) counter — distinct from the LRU
-        // `evictions` counter the eviction driver bumps (#1173,
-        // appendix-blob-cache-eviction.md § Observability). Bumped after the
+        // `evictions` counter the eviction driver bumps (#1173, ADR 040). Bumped after the
         // durable append + logical-set commit succeeded above, so the count
         // tracks takedowns that actually stopped serving.
         if let Some(m) = &self.inner.metrics {
@@ -1816,6 +1850,106 @@ impl CacheEngine {
         self.inner.max_probe_holds.store(max, Ordering::Relaxed);
     }
 
+    /// Install the shared frequency estimator. Called once at bring-up when a
+    /// `tinylfu` policy is selected; absent otherwise.
+    pub fn set_frequency_estimator(&self, est: Arc<dyn crate::policy::FrequencyEstimator>) {
+        self.inner.frequency.store(Arc::new(Some(est)));
+    }
+
+    /// Install the admission policy consulted at store-time (ADR 040). Called
+    /// once at bring-up when a non-default policy is selected; otherwise the
+    /// engine keeps [`crate::policy::AlwaysAdmit`].
+    pub fn set_admission_policy(&self, policy: Arc<dyn crate::policy::AdmissionPolicy>) {
+        self.inner.admission.store(Arc::new(policy));
+    }
+
+    /// Consult the admission policy for `ctx`, mapping its verdict onto a
+    /// [`crate::policy::Segment`]. `PassThrough` is reserved (spec §3) — no
+    /// shipped policy returns it yet, and no pass-through-without-storing leg
+    /// exists, so it is treated as `Store { Probation }` until one does.
+    fn admission_segment(&self, ctx: &crate::policy::AdmissionContext) -> crate::policy::Segment {
+        match self.inner.admission.load().admit(ctx) {
+            crate::policy::AdmissionDecision::Store { segment } => segment,
+            crate::policy::AdmissionDecision::PassThrough => crate::policy::Segment::Probation,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn admission_segment_for_test(
+        &self,
+        ctx: &crate::policy::AdmissionContext,
+    ) -> crate::policy::Segment {
+        self.admission_segment(ctx)
+    }
+
+    /// Set `hash`'s generic segment membership (ADR 040 §1). Pure in-memory
+    /// metadata — the blob's commit tag still protects it from GC, so this does
+    /// no tag I/O. [`crate::policy::Segment::Main`] is the absent default, so
+    /// setting `Main` removes any entry; under `AlwaysAdmit` (always `Main`)
+    /// this is a no-op and the map stays empty.
+    pub fn set_segment(&self, hash: Hash, segment: crate::policy::Segment) {
+        let mut guard = self
+            .inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match segment {
+            crate::policy::Segment::Main => {
+                guard.remove(&hash);
+            }
+            crate::policy::Segment::Probation => {
+                guard.insert(hash, segment);
+            }
+        }
+    }
+
+    /// Read `hash`'s segment membership; an untracked hash is
+    /// [`crate::policy::Segment::Main`].
+    #[must_use]
+    pub fn segment_of(&self, hash: Hash) -> crate::policy::Segment {
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&hash)
+            .copied()
+            .unwrap_or(crate::policy::Segment::Main)
+    }
+
+    /// Sum the sizes of the members of `seg`, using `sizes` for per-hash bytes.
+    /// For `Main` (the untracked default) this sums every hash in `sizes` not
+    /// present in the segment map.
+    #[must_use]
+    pub fn segment_bytes(&self, seg: crate::policy::Segment, sizes: &HashMap<Hash, u64>) -> u64 {
+        let guard = self
+            .inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        sizes
+            .iter()
+            .filter(|(h, _)| {
+                guard
+                    .get(*h)
+                    .copied()
+                    .unwrap_or(crate::policy::Segment::Main)
+                    == seg
+            })
+            .fold(0u64, |acc, (_, sz)| acc.saturating_add(*sz))
+    }
+
+    /// Snapshot the generic segment membership for the sweep's
+    /// [`crate::policy::EvictionContext`]. Only non-default (`Probation`)
+    /// entries are present.
+    #[must_use]
+    pub fn segments_snapshot(&self) -> HashMap<Hash, crate::policy::Segment> {
+        self.inner
+            .segments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Attempt to take (or refresh) a probe-triggered eviction hold on
     /// `hash` for [`crate::probe_hold::PROBE_HOLD_DURATION`] (ADR 005
     /// §Probe-triggered eviction hold).
@@ -1846,7 +1980,8 @@ impl CacheEngine {
     /// `probe_holds` lock**, closing the TOCTOU window where a concurrent
     /// [`Self::evict`] (DMCA takedown) could land between the initial
     /// [`Self::has`] check and granting the hold — a takedown always wins
-    /// (ADR appendix-blob-cache-eviction.md §4).
+    /// (ADR 040 §Pinning, durable operator-evict, and the probe-hold stay
+    /// engine-enforced).
     pub async fn try_probe_hold(&self, hash: Hash) -> CacheResult<ProbeHoldOutcome> {
         // `has` returns false for operator-evicted hashes too. This stays
         // *before* the `max == 0` check below so an absent/evicted blob is a
@@ -1945,7 +2080,7 @@ impl CacheEngine {
     /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
     pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
         if self.has(hash).await? {
-            self.touch(hash);
+            self.observe_hit(hash);
             let bytes = self.read_local(hash).await?;
             if let Some(m) = &self.inner.metrics {
                 m.hits.inc();
@@ -2015,7 +2150,7 @@ impl CacheEngine {
                 }
             }
         };
-        self.touch(hash);
+        self.observe_hit(hash);
         if let Some(m) = &self.inner.metrics {
             m.bytes_returned
                 .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
@@ -2077,7 +2212,9 @@ impl CacheEngine {
     /// skips the `Peer` origin.
     async fn populate_inner(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
         if self.has(hash).await? {
-            self.touch(hash);
+            // Recency only — a fill is not a hit sighting. The paired serve
+            // emits the one `observe` through `observe_hit` (ADR 040).
+            self.record_access(hash);
             return Ok(());
         }
         // Logical-eviction guard (#279): never re-pull a deliberately evicted
@@ -2122,11 +2259,24 @@ impl CacheEngine {
                     // never read back out of the store (#1132). The wrapper
                     // returns `()`, so there is nothing here to drop by accident.
                     self.pull_through_fill(hash, local_only).await?;
+                    // ADR 040: consult the admission policy now that the fill
+                    // succeeded and record the chosen segment. Under the default
+                    // `AlwaysAdmit` the segment is `Main`, so `set_segment` is a
+                    // no-op and the tag path below is unaffected — membership is
+                    // pure in-memory metadata, no tag I/O.
+                    let admission_ctx = crate::policy::AdmissionContext {
+                        hash,
+                        known_size: None,
+                    };
+                    let segment = self.admission_segment(&admission_ctx);
+                    self.set_segment(hash, segment);
                     break;
                 }
             }
         }
-        self.touch(hash);
+        // Recency only — the fill's admission read above already consulted the
+        // estimate; the paired serve emits the one hit sighting (ADR 040).
+        self.record_access(hash);
         Ok(())
     }
 
@@ -2635,9 +2785,21 @@ impl CacheEngine {
 
         match outcome {
             Ok(_drained) => {
+                // ADR 040: consult the admission policy, then label the segment
+                // only after `protect_partial` succeeds, so a failed protect
+                // leaves no stale membership entry for an unprotected blob. Under
+                // the default `AlwaysAdmit` the segment is `Main`, so
+                // `set_segment` is a no-op — membership is pure in-memory
+                // metadata, no tag I/O.
+                let admission_ctx = crate::policy::AdmissionContext {
+                    hash,
+                    known_size: Some(total_bytes),
+                };
+                let segment = self.admission_segment(&admission_ctx);
                 if let Err(e) = self.protect_partial(hash).await {
                     return Err((reader, e));
                 }
+                self.set_segment(hash, segment);
                 // The range's data is now cached; capture its outboard proof nodes
                 // into the serve leg's shared session (no-op when no serve leg reads
                 // beside this pull). Front-to-back admits union to the whole tree.
@@ -2821,7 +2983,8 @@ impl CacheEngine {
     ///
     /// A third filter layer (after pinned, before the LRU sort) drops any
     /// hash under an active probe-triggered eviction hold (#318, ADR 005
-    /// §Probe-triggered eviction hold; appendix-blob-cache-eviction.md §4:
+    /// §Probe-triggered eviction hold; ADR 040 §Pinning, durable operator-evict,
+    /// and the probe-hold stay engine-enforced:
     /// "a held hash is invisible to the LRU driver until the hold
     /// expires"). The held set is swept of expired entries here too, so a
     /// node with no probe traffic still releases stale holds.
@@ -2871,8 +3034,36 @@ impl CacheEngine {
         EvictionCandidates(map)
     }
 
-    /// Record an access for `hash` at the current instant.
-    fn touch(&self, hash: Hash) {
+    /// Emit the hit signal for `hash`: bump its LRU recency AND forward one
+    /// sighting to the shared frequency estimator (ADR 040 §Hit signal). This is
+    /// the one hit sighting a served or `get` request produces.
+    ///
+    /// Every client-facing serve chokepoint calls this exactly once per served
+    /// request — [`crate::CacheEngine::get`] on its own path, and the `node`
+    /// crate's `deliver` / `serve_leg` on the paid serve paths. The fill paths
+    /// ([`Self::populate`], [`Self::admit_bao_stream`]) deliberately do NOT emit
+    /// it; they only record recency, so a miss that fills and then serves counts
+    /// as ONE sighting (the serve's), never two. This also
+    /// preserves the admission ordering invariant: a fill reads the frequency
+    /// estimate for its admission decision before the paired serve emits this
+    /// request's own `observe`.
+    pub fn observe_hit(&self, hash: Hash) {
+        self.record_access(hash);
+        // Clone the estimator Arc out only when one is installed, dropping the
+        // arc-swap guard before calling `observe`. The default (no-estimator)
+        // path pays nothing — no clone, no refcount roundtrip — and the
+        // estimator's own work never runs under the read guard.
+        let est = (**self.inner.frequency.load()).clone();
+        if let Some(est) = est {
+            est.observe(hash);
+        }
+    }
+
+    /// Record an access for `hash` at the current instant — LRU recency only, no
+    /// frequency observe. The fill paths use this so the blob becomes an eviction
+    /// candidate without counting as a hit sighting; the paired serve emits the
+    /// one sighting through [`Self::observe_hit`].
+    fn record_access(&self, hash: Hash) {
         if let Ok(mut guard) = self.inner.access_times.lock() {
             guard.insert(hash, Instant::now());
         }
@@ -2959,6 +3150,11 @@ impl CacheEngine {
         };
         self.inner
             .access_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
+        self.inner
+            .segments
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&hash);
@@ -4989,6 +5185,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observe_hit_forwards_to_frequency_estimator() -> anyhow::Result<()> {
+        use crate::policy::FrequencyEstimator;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Counter(AtomicU32);
+        impl FrequencyEstimator for Counter {
+            fn observe(&self, _h: Hash) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn estimate(&self, _h: Hash) -> u32 {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello frequency";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let counter = Arc::new(Counter::default());
+        engine.set_frequency_estimator(counter.clone());
+
+        let _ = engine.get(hash).await?;
+
+        anyhow::ensure!(counter.estimate(hash) >= 1, "observe should fire on access");
+        Ok(())
+    }
+
+    /// ADR 040 serve-hit signal: the fill path emits NO hit sighting (so a
+    /// fill-and-serve miss never double-counts), and each served request emits
+    /// exactly one sighting through the serve chokepoint's
+    /// [`CacheEngine::observe_hit`]. A hot RESIDENT blob served repeatedly must
+    /// therefore accumulate frequency and become promotable — the case that was
+    /// inverted before serve paths emitted the signal.
+    #[tokio::test]
+    async fn serve_hit_signal_fires_once_per_serve_and_promotes_a_hot_resident_blob()
+    -> anyhow::Result<()> {
+        use crate::policy::{FrequencyEstimator, ProbationAdmission, Segment, TinyLfuEstimator};
+
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hot resident blob";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+
+        let promotion_threshold = 3u32;
+        let freq: Arc<dyn FrequencyEstimator> = Arc::new(TinyLfuEstimator::new(4096));
+        engine.set_frequency_estimator(freq.clone());
+        engine.set_admission_policy(Arc::new(ProbationAdmission {
+            freq: freq.clone(),
+            promotion_threshold,
+        }));
+
+        // Fill as a miss. The fill path reads the estimate for admission (0 ->
+        // Probation) but must NOT emit the hit signal, so estimate stays 0 — this
+        // is what keeps a fill-and-serve miss at one sighting, not two.
+        engine.populate_local(hash).await?;
+        anyhow::ensure!(
+            freq.estimate(hash) == 0,
+            "the fill alone must not observe (no double-count with the serve)"
+        );
+        anyhow::ensure!(
+            engine.segment_of(hash) == Segment::Probation,
+            "first sight lands in probation"
+        );
+
+        // Serve the resident blob repeatedly. Each served request is exactly one
+        // sighting via the serve chokepoint's `observe_hit`.
+        for i in 1..=promotion_threshold {
+            engine.observe_hit(hash);
+            anyhow::ensure!(
+                freq.estimate(hash) == i,
+                "each serve must be exactly one sighting"
+            );
+        }
+        anyhow::ensure!(
+            freq.estimate(hash) >= promotion_threshold,
+            "a hot resident blob served repeatedly must become promotable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_admission_is_main_segment() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"hello admission";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        let ctx = crate::policy::AdmissionContext {
+            hash,
+            known_size: None,
+        };
+        assert_eq!(
+            engine.admission_segment_for_test(&ctx),
+            crate::policy::Segment::Main
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn access_times_snapshot_contains_accessed_hash() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let payload = b"hello snapshot";
@@ -6639,7 +6947,7 @@ mod tests {
         )
         .await?;
         let _ = engine.get(hash).await?;
-        engine.touch(hash); // make it an LRU candidate
+        engine.observe_hit(hash); // make it an LRU candidate
 
         // Inject an already-expired hold directly (the real 35s duration is
         // impractical to sleep, and std `Instant` ignores tokio time pause).

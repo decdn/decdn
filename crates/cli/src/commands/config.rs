@@ -643,6 +643,13 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall timeout, so every ranked upstream can be tried before falling back (#831, #859)
 # node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
+# eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
+# admission_policy = "always"              # ADR 040: "always" or "tinylfu"; restart-required
+# [cache.tinylfu]                          # W-TinyLFU tuning (ADR 040); consulted only when eviction_policy or admission_policy above is "tinylfu"
+# sketch_bytes = 262144                    # count-min sketch size, shared by admission and eviction
+# promotion_threshold = 2                  # prior sightings before a probation member promotes to main
+# probation_target_pct = 10                # % of cache_size_mb the probation segment is capped to; bounds [1,50]
+# aging_halflife_sec = 600                 # reserved: not yet consulted by the shipped sketch (fixed sample-count reset)
 
 [payment]
 # rate_per_mb = 10
@@ -916,6 +923,9 @@ mod tests {
             node_pull_probe_fanout,
             node_pull_timeout_sec,
             node_pull_stall_timeout_sec,
+            eviction_policy,
+            admission_policy,
+            tinylfu,
         } = &config::types::CacheConfig::default();
         let cache = [
             ("cache_dir =", cache_dir.is_none()),
@@ -964,6 +974,9 @@ mod tests {
                 "node_pull_stall_timeout_sec =",
                 node_pull_stall_timeout_sec.is_none(),
             ),
+            ("eviction_policy =", eviction_policy.is_none()),
+            ("admission_policy =", admission_policy.is_none()),
+            ("[cache.tinylfu]", tinylfu.is_none()),
         ];
 
         let config::types::PaymentConfig {
