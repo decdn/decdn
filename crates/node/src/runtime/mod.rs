@@ -1275,6 +1275,10 @@ async fn build_chain_and_handlers(
     // Hint the settlement service on each accepted voucher so a lane's accrued
     // claim is planned into a chunk promptly rather than waiting the self-tick.
     client_deps.redeem_hint = Some(redeem_tx.clone());
+    // ADR 041 serve-credit inputs: the SAME warming allowance the buy loop debits
+    // and the eviction path forgets, plus the live operator fee-share cell.
+    client_deps.warming = Arc::clone(&warming);
+    client_deps.operator_shares = operator_shares.clone();
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1644,6 +1648,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             infra.node_metrics.cache_metrics(),
             params,
             infra.eviction_policy.clone(),
+            // ADR 041: the SAME warming allowance the buy loop debits and the serve
+            // path credits — the driver forgets an evicted hash's tag.
+            Arc::clone(&ch.warming),
             eviction_stop_rx,
         ));
         eviction_stop_tx

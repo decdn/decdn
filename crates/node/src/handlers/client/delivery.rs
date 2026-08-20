@@ -439,6 +439,10 @@ impl ClientHandler {
         // read on the miss paths that reach `deliver`. This is what makes a hot RESIDENT
         // blob — served here on every hit — accumulate frequency and become promotable.
         self.cache.observe_hit(hash);
+        // ADR 041: credit the realized operator margin back to the source that
+        // speculatively warmed this blob (a no-op for an untagged / non-speculative
+        // hash), on the same clean-completion edge as the ADR 040 hit sighting.
+        self.credit_warming_serve(hash, delivered);
         Ok(())
     }
 }

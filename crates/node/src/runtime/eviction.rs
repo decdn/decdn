@@ -132,6 +132,7 @@ async fn sweep(
     cache_bytes: u64,
     sizes: &HashMap<decdn_cache::Hash, u64>,
     policy: &Arc<dyn decdn_cache::EvictionPolicy>,
+    warming: &Arc<crate::warming_allowance::WarmingAllowance>,
 ) -> u64 {
     let candidates = cache.eviction_candidates();
     if candidates.is_empty() {
@@ -173,6 +174,9 @@ async fn sweep(
                 freed = freed.saturating_add(sizes.get(&hash).copied().unwrap_or(0));
                 removed = removed.saturating_add(1);
                 metrics.evictions.inc();
+                // ADR 041: drop the warming tag for the evicted hash, so a later
+                // reuse of this slot can never credit a stale source's allowance.
+                warming.forget(*hash.as_bytes());
             }
             Err(err) => {
                 tracing::warn!(%hash, %err, "eviction driver: release_for_eviction failed; skipping hash");
@@ -203,6 +207,7 @@ async fn tick(
     cache_bytes: u64,
     state: &mut DriverState,
     policy: &Arc<dyn decdn_cache::EvictionPolicy>,
+    warming: &Arc<crate::warming_allowance::WarmingAllowance>,
 ) {
     // Exactly ONE store walk per tick: this snapshot is both the footprint
     // source and the sweep's per-hash size lookup, so `sweep` takes it by
@@ -257,6 +262,7 @@ async fn tick(
         cache_bytes,
         &sizes,
         policy,
+        warming,
     )
     .await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
@@ -270,6 +276,7 @@ pub async fn run(
     metrics: Arc<CacheMetrics>,
     params: EvictionParams,
     policy: Arc<dyn decdn_cache::EvictionPolicy>,
+    warming: Arc<crate::warming_allowance::WarmingAllowance>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let limit_bytes = params.cache_size_mb.saturating_mul(BYTES_PER_MB);
@@ -304,6 +311,7 @@ pub async fn run(
             limit_bytes,
             &mut state,
             &policy,
+            &warming,
         )
         .await;
     }
@@ -491,7 +499,19 @@ mod tests {
         // target_bytes = 0 keeps the sweep over target for the whole pass;
         // budget = 1 stops it after exactly one release, so only the
         // policy's first-ranked victim gets evicted.
-        sweep(&cache, &metrics, u64::MAX, 0, 1, u64::MAX, &sizes, &policy).await;
+        let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
+        sweep(
+            &cache,
+            &metrics,
+            u64::MAX,
+            0,
+            1,
+            u64::MAX,
+            &sizes,
+            &policy,
+            &warming,
+        )
+        .await;
 
         let remaining = cache.eviction_candidates();
         assert!(
@@ -591,6 +611,7 @@ mod tests {
         // (phase 3) inert, so only the probation cap (phase 2) drives
         // eviction here; a wide budget lets the whole cap overage clear in
         // one sweep.
+        let warming = Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0));
         sweep(
             &cache,
             &metrics,
@@ -600,6 +621,7 @@ mod tests {
             cache_bytes,
             &sizes,
             &policy,
+            &warming,
         )
         .await;
 
@@ -688,6 +710,7 @@ mod tests {
             effective,
             &sizes,
             &policy,
+            &Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
         )
         .await;
 
@@ -747,7 +770,15 @@ mod tests {
         // budget = 2, target = 0: evicts exactly the two oldest-by-access —
         // the golden LRU sequence this test guards end to end.
         sweep(
-            &cache, &metrics, effective, 0, 2, effective, &sizes, &policy,
+            &cache,
+            &metrics,
+            effective,
+            0,
+            2,
+            effective,
+            &sizes,
+            &policy,
+            &Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
         )
         .await;
 
