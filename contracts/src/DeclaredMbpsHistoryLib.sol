@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
+import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /// @title DeclaredMbpsHistoryLib
 /// @notice Holds the per-operator `declaredMbps` checkpoint history for
@@ -17,6 +18,7 @@ import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 ///         argument resolves to `CapacityBond`'s slots.
 library DeclaredMbpsHistoryLib {
     using Checkpoints for Checkpoints.Trace208;
+    using SafeCast for uint256;
 
     /// @notice Appends a checkpoint of `mbps` at the current block timestamp
     ///         to `operator`'s history in `history`. Called on every
@@ -24,7 +26,7 @@ library DeclaredMbpsHistoryLib {
     ///         `mbps == 0`).
     function record(mapping(address => Checkpoints.Trace208) storage history, address operator, uint256 mbps) public {
         // slither-disable-next-line unused-return
-        history[operator].push(Time.timestamp(), uint208(mbps));
+        history[operator].push(Time.timestamp(), mbps.toUint208());
     }
 
     /// @notice Returns the `declaredMbps` tier `operator` held at the close
@@ -41,7 +43,7 @@ library DeclaredMbpsHistoryLib {
         // checkpoint at or before this instant. `Time.timestamp()` is
         // uint48, so the boundary fits uint48 for any epoch the Governor
         // passes (bounded by real time).
-        uint48 epochEnd = uint48((uint256(epoch) + 1) * epochLength - 1);
+        uint48 epochEnd = ((uint256(epoch) + 1) * epochLength - 1).toUint48();
         return history[operator].upperLookupRecent(epochEnd);
     }
 }
