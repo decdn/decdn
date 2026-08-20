@@ -2188,4 +2188,35 @@ contract CapacityBondTest is Test {
         bond.setUnbondingPeriod(8 days);
         vm.stopPrank();
     }
+
+    function test_declaredMbpsAtEpoch_keepsPerEpochHistory() public {
+        uint64 el = bond.EPOCH_LENGTH();
+
+        // Declare 1000 Mbps during epoch 100.
+        vm.warp(uint256(el) * 100 + 5);
+        _bondForMbps(1000);
+        vm.prank(operator);
+        bond.declareMbps(1000);
+
+        // Sampled at end of epoch 100 → 1000; the epoch before the declaration → 0.
+        assertEq(bond.declaredMbpsAtEpoch(operator, 100), 1000, "epoch100");
+        assertEq(bond.declaredMbpsAtEpoch(operator, 99), 0, "epoch99 not retroactive");
+
+        // Lower to 500 during epoch 105 (bond already covers the smaller tier).
+        vm.warp(uint256(el) * 105 + 5);
+        vm.prank(operator);
+        bond.declareMbps(500);
+
+        assertEq(bond.declaredMbpsAtEpoch(operator, 105), 500, "epoch105 new value");
+        assertEq(bond.declaredMbpsAtEpoch(operator, 104), 1000, "epoch104 keeps old value");
+        assertEq(bond.declaredMbpsAtEpoch(operator, 100), 1000, "epoch100 unchanged");
+
+        // Release the tier during epoch 110 (operator is not a registered node).
+        vm.warp(uint256(el) * 110 + 5);
+        vm.prank(operator);
+        bond.declareMbps(0);
+
+        assertEq(bond.declaredMbpsAtEpoch(operator, 110), 0, "epoch110 released to 0");
+        assertEq(bond.declaredMbpsAtEpoch(operator, 109), 500, "epoch109 keeps 500");
+    }
 }
