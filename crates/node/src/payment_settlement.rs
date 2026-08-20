@@ -73,7 +73,7 @@ use crate::chain_events::resumable_watcher::{Checkpoint, ColdStart, CursorStart,
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::PoolProjection;
+use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
 /// delays a redemption until the next voucher or self-tick sweep), so a bounded
@@ -908,6 +908,54 @@ fn chunk_redemptions(
         .collect()
 }
 
+/// Redemption policy: whether a lane whose pool has this `status` is worth
+/// submitting now. Fails OPEN on an unknown pool (`None`) — a projection gap
+/// (cold start, reorg, an unfolded event) must never hold a lane and strand real
+/// money; only a positive zero-`remaining` holds. A drained `Open` pool is held
+/// (a top-up re-drives it); a drained `Closing` pool is dropped (it cannot be
+/// topped up, so `remaining == 0` is irreversible); a funded `Closing` pool is
+/// redeemable only before its deadline, past which `redeemMany` reverts
+/// `PoolClosed`.
+// `plan_lanes` does not call this yet — the solvency gate lands as a separate
+// call site. Pure and unit-tested standalone in the meantime.
+#[allow(dead_code)]
+fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
+    match status {
+        None => true,
+        Some(s) => {
+            if s.remaining.is_zero() {
+                return false;
+            }
+            match s.lifecycle {
+                Lifecycle::Open => true,
+                Lifecycle::Closing { deadline } => now < deadline,
+            }
+        }
+    }
+}
+
+/// Split candidate lanes into the ones whose pool can pay now and a count of the
+/// ones held/dropped by [`pool_is_redeemable`]. A pool absent from `snapshot` is
+/// `None` (fail open).
+#[allow(dead_code)]
+fn partition_redeemable(
+    states: Vec<LaneState>,
+    snapshot: &HashMap<PoolId, Option<PoolStatus>>,
+    now: u64,
+) -> (Vec<LaneState>, usize) {
+    let mut kept = Vec::with_capacity(states.len());
+    let mut skipped = 0usize;
+    for st in states {
+        let pool_status = snapshot.get(&st.pool_id).copied().flatten();
+        if pool_is_redeemable(pool_status, now) {
+            kept.push(st);
+        } else {
+            skipped += 1;
+        }
+    }
+    (kept, skipped)
+}
+
 /// Whether a lane's observed registration is still live at `now`. `0`
 /// (unknown/unregistered) and any past expiry are "not registered" — the safe
 /// direction is to re-read rather than skip a possibly-absent registration.
@@ -1513,6 +1561,78 @@ fn is_oversize_send_err(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn status(remaining: u64, lifecycle: Lifecycle) -> PoolStatus {
+        PoolStatus {
+            owner: Address::from([1u8; 20]),
+            remaining: U256::from(remaining),
+            lifecycle,
+        }
+    }
+
+    #[test]
+    fn unknown_pool_fails_open() {
+        assert!(pool_is_redeemable(None, 1_000));
+    }
+
+    #[test]
+    fn open_funded_is_redeemable() {
+        assert!(pool_is_redeemable(
+            Some(status(500, Lifecycle::Open)),
+            1_000
+        ));
+    }
+
+    #[test]
+    fn open_drained_is_held() {
+        assert!(!pool_is_redeemable(Some(status(0, Lifecycle::Open)), 1_000));
+    }
+
+    #[test]
+    fn closing_drained_is_dropped() {
+        assert!(!pool_is_redeemable(
+            Some(status(0, Lifecycle::Closing { deadline: 2_000 })),
+            1_000
+        ));
+    }
+
+    #[test]
+    fn closing_funded_before_deadline_is_redeemable() {
+        assert!(pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            1_999
+        ));
+    }
+
+    #[test]
+    fn closing_funded_at_or_after_deadline_is_dropped() {
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            2_000
+        ));
+        assert!(!pool_is_redeemable(
+            Some(status(500, Lifecycle::Closing { deadline: 2_000 })),
+            2_500
+        ));
+    }
+
+    #[test]
+    fn partition_keeps_redeemable_and_counts_skips() {
+        // pool 1: open+funded (keep), pool 2: open+drained (skip), pool 3: unknown (keep, fail open)
+        let s1 = signed_lane_state(1, 10, 20);
+        let s2 = signed_lane_state(2, 11, 20);
+        let s3 = signed_lane_state(3, 12, 20);
+        let mut snap: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
+        snap.insert(s1.pool_id, Some(status(500, Lifecycle::Open)));
+        snap.insert(s2.pool_id, Some(status(0, Lifecycle::Open)));
+        // s3's pool intentionally absent from snap -> None -> fail open
+        let (kept, skipped) = partition_redeemable(vec![s1.clone(), s2, s3.clone()], &snap, 1_000);
+        let kept_pools: Vec<_> = kept.iter().map(|st| st.pool_id).collect();
+        assert_eq!(skipped, 1);
+        assert!(kept_pools.contains(&s1.pool_id));
+        assert!(kept_pools.contains(&s3.pool_id));
+        assert_eq!(kept.len(), 2);
+    }
 
     /// Build a [`PlannedLane`] for a given pool/signer, with an optional
     /// capability registration, for `group_by_pool` tests.
