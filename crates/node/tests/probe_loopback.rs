@@ -113,6 +113,58 @@ async fn cache_with_two_blobs(
     Ok((cache, ha, hb, cache_dir))
 }
 
+/// Open a cache whose STORE holds two blobs pulled through a single fs
+/// origin, then removes `foreign_payload`'s object from that origin (leaving
+/// only `own_payload` servable) and refreshes the origin-held index. Models
+/// the origin-only policy's target shape: a store hit for content this node's
+/// own origin can no longer serve (#1759).
+async fn cache_with_own_and_foreign(
+    own_payload: &[u8],
+    foreign_payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    Hash,
+    Hash,
+    tempfile::TempDir,
+    tempfile::TempDir,
+)> {
+    let origin_dir = tempfile::tempdir()?;
+    for payload in [own_payload, foreign_payload] {
+        let hex = Hash::new(payload).to_hex();
+        let shard = hex
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let dir = origin_dir.path().join(shard);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(hex.as_str()), payload)?;
+    }
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let (own_hash, foreign_hash) = (Hash::new(own_payload), Hash::new(foreign_payload));
+    let _ = cache.get(own_hash).await?; // populate the local store
+    let _ = cache.get(foreign_hash).await?;
+
+    // Remove the foreign object from the fs origin: the store still holds it
+    // (pulled above), but this node's own origin can no longer serve it — the
+    // "store hit outside this node's own origin" shape the origin-only policy
+    // must not advertise.
+    let hex = foreign_hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    std::fs::remove_file(origin_dir.path().join(shard).join(hex.as_str()))?;
+    cache.rescan_origins().await;
+
+    Ok((cache, own_hash, foreign_hash, origin_dir, cache_dir))
+}
+
 /// Parse the integer value of an `OpenMetrics` counter/gauge line
 /// (`<name> <value>`) out of the encoded exposition text. Returns `None` if
 /// the metric is absent — distinct from `Some(0)` so a missing counter is
@@ -177,6 +229,9 @@ fn build_handler_with_probe_limiter(
         // No stake-lane reservation for the general-purpose builder; the
         // dedicated reservation tests use `build_handler_with_lane` (#757).
         None,
+        // Relay foreign namespaces by default; the origin-only policy test
+        // uses `build_handler_origin_only` (#1759).
+        true,
     ));
     (handler, signer, domain)
 }
@@ -211,6 +266,36 @@ fn build_handler_with_lane(
         domain.clone(),
         decdn_node::rate_bounds::RateBounds::new(0),
         Some(policy),
+        true,
+    ));
+    (handler, signer, domain)
+}
+
+/// Build a `ProbeHandler` with `relay_foreign_namespaces = false` (ADR 002
+/// origin-only node policy, #1759): the handler advertises backend-held
+/// content only, regardless of what the store happens to hold.
+#[allow(clippy::too_many_arguments)]
+fn build_handler_origin_only(
+    server_id: iroh::PublicKey,
+    rate: u64,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let domain = test_slash_domain();
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        rate,
+        Arc::clone(metrics),
+        limiter,
+        permissive_probe_rate_limiter(metrics),
+        cache,
+        Arc::clone(&signer),
+        domain.clone(),
+        decdn_node::rate_bounds::RateBounds::new(0),
+        None,
+        false,
     ));
     (handler, signer, domain)
 }
@@ -1084,6 +1169,62 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
     );
     anyhow::ensure!(resp.body.hash == *hash.as_bytes(), "hash echoed");
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// Origin-only node policy (ADR 002, #1759): with `relay_foreign_namespaces
+/// = false`, the probe handler advertises exactly what its own backend
+/// holds. A store hit for content outside the node's own origin — leftover
+/// from before the toggle, or seeded some other way — must NOT be
+/// advertised, because the serve gate now declines it and an advertise/decline
+/// mismatch is the reputation hazard this policy closes. Own (fs-origin-held)
+/// content is still advertised.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
+    let own_payload = b"origin-only: own fs-origin content";
+    let foreign_payload = b"origin-only: leftover store content, now foreign";
+    let (cache, own_hash, foreign_hash, _origin_tmp, _cache_tmp) =
+        cache_with_own_and_foreign(own_payload, foreign_payload).await?;
+
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _signer, _domain) = build_handler_origin_only(
+        fresh_key().public(),
+        7,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+    );
+
+    let foreign_req = ProbeRequest {
+        hash: *foreign_hash.as_bytes(),
+        timestamp_us: 1,
+    };
+    let foreign_resp = run_one_probe(fresh_key(), Arc::clone(&handler), foreign_req).await?;
+    anyhow::ensure!(
+        !foreign_resp.body.has_blob,
+        "origin-only node must not advertise a store hit outside its own origin"
+    );
+    anyhow::ensure!(
+        foreign_resp.total_bytes.is_none(),
+        "a non-advertised hash must carry no total_bytes hint, got {:?}",
+        foreign_resp.total_bytes
+    );
+
+    let own_req = ProbeRequest {
+        hash: *own_hash.as_bytes(),
+        timestamp_us: 2,
+    };
+    let own_resp = run_one_probe(fresh_key(), handler, own_req).await?;
+    anyhow::ensure!(
+        own_resp.body.has_blob,
+        "origin-only node must still advertise its own backend-held content"
+    );
+    anyhow::ensure!(
+        own_resp.total_bytes == Some(own_payload.len() as u64),
+        "own content's total_bytes should report the backend size, got {:?}",
+        own_resp.total_bytes
+    );
+
     Ok(())
 }
 

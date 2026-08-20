@@ -143,6 +143,7 @@ async fn spawn_probe_server(
         domain.clone(),
         decdn_node::rate_bounds::RateBounds::new(0),
         None, // no stake-lane reservation (#757)
+        true, // relay foreign namespaces (default; #1759)
     ));
     let router = Router::builder(ep.clone())
         .accept(ALPN_PROBE, handler)

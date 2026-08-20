@@ -916,6 +916,7 @@ async fn build_chain_and_handlers(
         slash_domain.clone(),
         rate_bounds.clone(),
         stake_lane_policy,
+        cfg.cache.relay_foreign_namespaces,
     ));
 
     // `cdn/dht/v1` handler (ADR 022 / #320). FindNode + FindValue +
@@ -1578,14 +1579,22 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // the logged count honest and coalesces a hash that is both stored and
     // origin-held into one jitter draw. On a store list-error we still seed the
     // origin-held set — announce degrades only for the store half.
+    //
+    // Under the origin-only policy (`relay_foreign_namespaces == false`) the
+    // store union is skipped: the store may still hold leftover foreign
+    // content from before the toggle was set, and seeding it would announce
+    // blobs the serve gate now declines. Own content is unaffected — it lives
+    // in `origin_held_hashes()` regardless of the toggle.
     let mut cold_start_set: std::collections::HashSet<decdn_cache::Hash> =
         infra.cache.origin_held_hashes().into_iter().collect();
-    match infra.cache.iter_hashes().await {
-        Ok(hashes) => cold_start_set.extend(hashes),
-        Err(err) => tracing::warn!(
-            error = %err,
-            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
-        ),
+    if cfg.cache.relay_foreign_namespaces {
+        match infra.cache.iter_hashes().await {
+            Ok(hashes) => cold_start_set.extend(hashes),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
+            ),
+        }
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
         cold_start_set
