@@ -23,6 +23,7 @@ pub mod content_deny;
 pub mod dht;
 pub mod dispatch;
 pub mod handlers;
+pub mod load_shed;
 pub mod metrics;
 pub(crate) mod net;
 pub mod node_origin;

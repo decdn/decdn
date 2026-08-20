@@ -1046,6 +1046,17 @@ pub struct DecdnMetrics {
     /// otherwise keep a multi-GB blob flowing for minutes after the order took
     /// effect, which is the slashable one.
     pub serve_stream_terminated_takedown: Counter,
+    /// `decdn_serve_stream_rejected_load_shed_hit_total`: cache-hit serves shed
+    /// under node overload (egress saturation).
+    pub serve_stream_rejected_load_shed_hit: Counter,
+    /// `decdn_serve_stream_rejected_load_shed_miss_total`: cache-miss serves shed
+    /// under node overload (concurrency pressure or per-client fairness).
+    pub serve_stream_rejected_load_shed_miss: Counter,
+    /// `decdn_load_shed_egress_bps`: current measured egress EWMA, bytes/sec.
+    pub load_shed_egress_bps: Gauge,
+    /// `decdn_load_shed_pressure_active`: 1 while the load-shed policy considers
+    /// the node pressured, else 0.
+    pub load_shed_pressure_active: Gauge,
 
     // ---- Uniform watcher liveness + panic surface (#1316, #1320) ----
     //
@@ -1757,6 +1768,20 @@ recorders! {
     /// Record an in-flight delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
     serve_stream_terminated_takedown => serve_stream_terminated_takedown.inc();
+
+    /// Record a `serve_stream` cache-hit request refused by the load-shed policy
+    /// (egress saturation).
+    serve_stream_rejected_load_shed_hit => serve_stream_rejected_load_shed_hit.inc();
+
+    /// Record a `serve_stream` cache-miss request refused by the load-shed policy
+    /// (concurrency pressure or per-client fairness).
+    serve_stream_rejected_load_shed_miss => serve_stream_rejected_load_shed_miss.inc();
+
+    /// Record the current measured egress EWMA, bytes/sec.
+    load_shed_egress_bps(bps: i64) => load_shed_egress_bps.set(bps);
+
+    /// Record whether the load-shed policy considers the node pressured (1 for yes, 0 for no).
+    load_shed_pressure_active(active: bool) => load_shed_pressure_active.set(i64::from(active));
 
     /// The window-paced serve loop paused the upstream pull at the ramped credit
     /// window to wait for the downstream voucher to clear (#856, #1669).
@@ -2906,6 +2931,26 @@ mod tests {
                 "reject counter {name} should read exactly 1 after one bump:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn load_shed_metrics_appear_in_scrape() {
+        let metrics = Metrics::new();
+        metrics.serve_stream_rejected_load_shed_hit();
+        metrics.serve_stream_rejected_load_shed_miss();
+        metrics.load_shed_egress_bps(1_234);
+        metrics.load_shed_pressure_active(true);
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.contains("decdn_serve_stream_rejected_load_shed_hit_total 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("decdn_serve_stream_rejected_load_shed_miss_total 1"),
+            "{text}"
+        );
+        assert!(text.contains("decdn_load_shed_egress_bps 1234"), "{text}");
+        assert!(text.contains("decdn_load_shed_pressure_active 1"), "{text}");
     }
 
     #[test]

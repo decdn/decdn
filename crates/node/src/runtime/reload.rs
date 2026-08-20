@@ -64,8 +64,9 @@ use anyhow::Context;
 use decdn_common::cli::common::LogLevel;
 use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
-    ConfigErrorBag, FileConfig, ResolvedObservability, ResolvedSecurity, load_file_config,
-    parse_pinned_hashes, resolve_observability_into, resolve_security_into,
+    ConfigErrorBag, FileConfig, ResolvedLoadShed, ResolvedObservability, ResolvedSecurity,
+    load_file_config, parse_pinned_hashes, resolve_load_shed_into, resolve_observability_into,
+    resolve_security_into,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -543,6 +544,65 @@ impl ReloadableSection for SecuritySection {
     }
 }
 
+// ----- load shed -----------------------------------------------------------
+
+/// Reloadable `[load_shed]` section: resolves the config block into a
+/// buffer, then swaps the live `LoadShedController`'s policy on
+/// `infallible_swap`.
+struct LoadShedSection {
+    /// Optional handle to the live `LoadShedController`. Same lifecycle
+    /// rules as `SecuritySection::limiter` — populated via
+    /// [`RuntimeReloadState::attach_load_shed`] before the select loop.
+    controller: std::sync::Mutex<Option<Arc<crate::load_shed::LoadShedController>>>,
+    buf: std::sync::Mutex<Option<ResolvedLoadShed>>,
+}
+
+impl ReloadableSection for LoadShedSection {
+    fn name(&self) -> &'static str {
+        "load_shed"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+    }
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+        let resolved = resolve_load_shed_into(file.load_shed.as_ref(), bag);
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(resolved);
+        }
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let load_shed_attached = if let Ok(g) = self.controller.lock() {
+            if let Some(ctrl) = g.as_ref() {
+                ctrl.reload(&resolved);
+                true
+            } else {
+                false
+            }
+        } else {
+            tracing::error!(
+                section = self.name(),
+                "controller mutex poisoned in infallible_swap; load-shed swap skipped"
+            );
+            false
+        };
+        tracing::info!(
+            section = self.name(),
+            load_shed_attached,
+            policy = ?resolved.policy,
+            egress_budget_mbps = resolved.egress_budget_mbps,
+            max_concurrent_serves_high = resolved.max_concurrent_serves_high,
+            max_concurrent_serves_low = resolved.max_concurrent_serves_low,
+            per_client_serve_cap = resolved.per_client_serve_cap,
+            "config reload section applied"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RuntimeReloadState
 // ---------------------------------------------------------------------------
@@ -563,11 +623,12 @@ pub struct RuntimeReloadState {
     pinned: Arc<PinnedHashesSection>,
     security: Arc<SecuritySection>,
     content: Arc<ContentSection>,
+    load_shed: Arc<LoadShedSection>,
     /// Iteration order for the three-phase reload: `log_level`,
-    /// `pinned_hashes`, `security`, then `content`. The order matters for
-    /// reproducibility (operator-visible tracing event order) and for the
-    /// rollback-boundary contract documented on the trait — moving
-    /// `log_level` earlier or later would change which pre-`log_level`
+    /// `pinned_hashes`, `security`, `content`, then `load_shed`. The order
+    /// matters for reproducibility (operator-visible tracing event order)
+    /// and for the rollback-boundary contract documented on the trait —
+    /// moving `log_level` earlier or later would change which pre-`log_level`
     /// commits survive a setter failure.
     sections: Vec<Arc<dyn ReloadableSection>>,
     /// Serialises concurrent reloads. A SIGHUP racing an `admin_v1_reload`
@@ -624,23 +685,29 @@ impl RuntimeReloadState {
             engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
         });
+        let load_shed = Arc::new(LoadShedSection {
+            controller: std::sync::Mutex::new(None),
+            buf: std::sync::Mutex::new(None),
+        });
         // Registration order sets the commit order: log_level,
-        // pinned_hashes, security, content. The order matters for
-        // reproducibility (operator-visible tracing event order) and for
-        // the rollback-boundary contract documented on the trait — moving
-        // log_level later or earlier would change which pre-log_level
-        // commits survive a setter failure.
+        // pinned_hashes, security, content, load_shed. The order matters
+        // for reproducibility (operator-visible tracing event order) and
+        // for the rollback-boundary contract documented on the trait —
+        // moving log_level later or earlier would change which
+        // pre-log_level commits survive a setter failure.
         let sections: Vec<Arc<dyn ReloadableSection>> = vec![
             Arc::clone(&log_level) as _,
             Arc::clone(&pinned) as _,
             Arc::clone(&security) as _,
             Arc::clone(&content) as _,
+            Arc::clone(&load_shed) as _,
         ];
         Self {
             log_level,
             pinned,
             security,
             content,
+            load_shed,
             sections,
             reload_lock: std::sync::Mutex::new(()),
         }
@@ -686,6 +753,23 @@ impl RuntimeReloadState {
                     "runtime reload limiter mutex poisoned during attach; recovering inner state"
                 );
                 *poisoned.into_inner() = limiter;
+            }
+        }
+    }
+
+    /// Attach the live `LoadShedController` after it's been built. Same
+    /// shape as [`Self::attach_limiter`]: must be called before the SIGHUP
+    /// select loop, supports `None` for tests, recovers from a poisoned
+    /// mutex by replacing the inner state.
+    pub fn attach_load_shed(&self, controller: Option<Arc<crate::load_shed::LoadShedController>>) {
+        match self.load_shed.controller.lock() {
+            Ok(mut guard) => *guard = controller,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload load-shed controller mutex poisoned during attach; \
+                     recovering inner state"
+                );
+                *poisoned.into_inner() = controller;
             }
         }
     }
@@ -814,6 +898,7 @@ impl RuntimeReloadState {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
+            load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
@@ -1301,6 +1386,7 @@ mod tests {
                 per_source_burst: 200,
                 max_tracked_sources: 4096,
             },
+            load_shed: decdn_common::config::ResolvedLoadShed::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
@@ -2370,5 +2456,68 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         assert!(observability_has_restart_required_field(&with_metrics));
+    }
+
+    /// SIGHUP with a `[load_shed]` block swaps the live controller's policy:
+    /// a controller pinned to `resource-pressure` with a single-slot high
+    /// water mark sheds a second concurrent miss, and after reloading to
+    /// `always-admit` the same shape of request admits.
+    #[tokio::test]
+    async fn load_shed_section_swaps_policy_on_reload() {
+        let start = decdn_common::config::ResolvedLoadShed {
+            policy: decdn_common::config::LoadShedPolicyKind::ResourcePressure,
+            egress_budget_mbps: 0,
+            max_concurrent_serves_high: 1,
+            max_concurrent_serves_low: 0,
+            per_client_serve_cap: 0,
+        };
+        let controller = crate::load_shed::LoadShedController::from_config(&start);
+        // Occupy the single slot so ResourcePressure would shed a new miss.
+        let _held = controller
+            .try_admit(
+                crate::load_shed::RequestClass::CacheHit,
+                alloy::primitives::B256::ZERO,
+            )
+            .unwrap();
+        assert!(
+            controller
+                .try_admit(
+                    crate::load_shed::RequestClass::CacheMiss,
+                    alloy::primitives::B256::from([1u8; 32])
+                )
+                .is_err(),
+            "a full slot must shed a new miss under resource-pressure"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "[load_shed]\npolicy = \"always-admit\"\n");
+        let initial = seed_resolved(42, LogLevel::Info);
+        let (setter, _captured) = recording_setter();
+        let state = RuntimeReloadState::new(
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            &initial,
+            setter,
+        );
+        state.attach_load_shed(Some(Arc::clone(&controller)));
+
+        state.reload(&path).await.unwrap();
+
+        // Now always-admit: the previously-shed miss admits.
+        assert!(
+            controller
+                .try_admit(
+                    crate::load_shed::RequestClass::CacheMiss,
+                    alloy::primitives::B256::from([2u8; 32])
+                )
+                .is_ok(),
+            "reload to always-admit must let a previously-shed miss through"
+        );
     }
 }
