@@ -13355,6 +13355,10 @@ async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once()
 /// with a caller-chosen ADR 041 serve-economics policy, operator fee-share, base
 /// sell rate, and a SHARED [`decdn_node::warming_allowance::WarmingAllowance`] the
 /// test seeds/spends before the miss. Live probe + fresh caches, single provider.
+/// `frequency_estimator` lets a test pin the `margin` policy's heat input
+/// directly (standing in for HC-1's real observe-on-serve signal) instead of
+/// driving real traffic to raise it; `None` reads cold (heat 0) like production
+/// with no admission/eviction policy consuming an estimator.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
 async fn build_origin_economics(
     ep_b: &iroh::Endpoint,
@@ -13368,6 +13372,7 @@ async fn build_origin_economics(
     operator_bps: u16,
     sell_rate_base: u64,
     warming: Arc<decdn_node::warming_allowance::WarmingAllowance>,
+    frequency_estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let stakers = ConfigStakerSet::new(providers.iter().copied().collect());
     let mut dir = HashMap::new();
@@ -13404,7 +13409,7 @@ async fn build_origin_economics(
             own_region: None,
             serve_economics,
             operator_shares: decdn_node::fee_shares::OperatorShares::new(operator_bps),
-            frequency_estimator: None,
+            frequency_estimator,
             sell_rate_bounds: decdn_node::rate_bounds::RateBounds::new(0),
             sell_rate_base,
             warming,
@@ -13534,6 +13539,7 @@ async fn drive_miss_single_candidate(
         op_bps,
         sell,
         Arc::clone(&warming),
+        None,
     )
     .await;
 
@@ -13586,5 +13592,803 @@ async fn above_market_is_refused_even_when_warm() -> Result<()> {
         matches!(outcome, Err(PullMiss::BelowMargin)),
         "an above-market quote must refuse even when warm, got {outcome:?}"
     );
+    Ok(())
+}
+
+// ===========================================================================
+// ADR 041 — integration + adversarial coverage (Task 9).
+// ===========================================================================
+
+/// A frequency estimator pinned to one fixed value, so a test can drive the
+/// `margin` policy's heat input directly (`N̂ = clamp(round(discount·heat), 1,
+/// n_max)`) rather than having to generate enough real observe-on-serve traffic
+/// (HC-1) to earn it. Standing in for "heat is already this high", not a
+/// production shortcut — HC-1 itself (heat rises only from real serves) is
+/// untouched by this fixture.
+#[derive(Debug)]
+struct FixedHeat(u32);
+
+impl decdn_cache::FrequencyEstimator for FixedHeat {
+    fn observe(&self, _hash: Hash) {}
+
+    fn estimate(&self, _hash: Hash) -> u32 {
+        self.0
+    }
+}
+
+/// Like [`drive_miss_single_candidate`] but the candidate's `cdn/probe/v1`
+/// quote (`probe_quote`) and its real, signed `StreamResponse` quote
+/// (`response_quote`) DIFFER — a bait-and-switch. The candidate ranks and is
+/// admitted on its cheap probe quote; only once the channel is open does the
+/// real (expensive) quote land. Returns the flattened pull outcome plus B's
+/// metrics, so a test can distinguish a pre-open `BelowMargin` skip from a
+/// mid-pull `RateAboveCeiling` abort.
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn drive_miss_bait_and_switch(
+    probe_quote: u64,
+    response_quote: u64,
+    sell: u64,
+    op_bps: u16,
+) -> Result<(std::result::Result<(), PullMiss>, Arc<Metrics>)> {
+    let payload = vec![0xC2u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: the real ClientHandler quotes/charges `response_quote`; the
+    // SEPARATE hand-rolled probe responder (below) advertises `probe_quote`.
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let pool_id = B256::repeat_byte(0xE2);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        response_quote,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        probe_quote,
+    );
+
+    // --- Node B: dial-only endpoint hosting the economics NodeOrigin. ---------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+
+    let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+        1_000_000_000,
+        0,
+    ));
+    let serve_economics = Arc::new(decdn_node::serve_economics::MarginPolicy::new(5000, 64))
+        as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded,
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, _engine, _engine_tmp) = build_origin_economics(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+        serve_economics,
+        op_bps,
+        sell,
+        Arc::clone(&warming),
+        None,
+    )
+    .await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?;
+
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
+    Ok((outcome.map(|_| ()), b_metrics))
+}
+
+/// HC-2: a candidate that ranks cheap on its `cdn/probe/v1` quote, then
+/// bait-and-switches to a real `StreamResponse` quote above the buyer's ADR 041
+/// ceiling, must have its leg aborted via `RateAboveCeiling` — the composed
+/// `rate_ceiling` (the lower of the probe quote and the economic buy cap) is
+/// pull-commit enforcement, not just a ranking-time filter.
+///
+/// `sell = 1000`, `op_bps = 6000`, the fixture's default `discount = 0.5, n_max =
+/// 64`, cold (heat 0) → `amortized = 600`; a fresh source is warm, so `max_buy =
+/// max(1000, 600) = 1000`. The probe quote (500) clears that ceiling and is NOT
+/// itself above the amortized floor, so the candidate is admitted non-
+/// speculatively with `rate_ceiling = min(500, 1000) = 500` (the probe rate is
+/// the binding bound here). The real quote (700) exceeds it — the abort.
+///
+/// This is deliberately distinct from `above_market_is_refused_even_when_warm`:
+/// that candidate never opens a channel at all (`BelowMargin`, a pre-open skip
+/// on the PROBE quote alone). Here the candidate IS admitted — its probe quote
+/// clears the gate — and the abort only fires once the real quote lands.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn bait_and_switch_above_ceiling_aborts_the_leg() -> Result<()> {
+    let (outcome, metrics) = drive_miss_bait_and_switch(500, 700, 1000, 6000).await?;
+    anyhow::ensure!(
+        outcome.is_err(),
+        "a bait-and-switch above the ceiling must miss, got {outcome:?}"
+    );
+    anyhow::ensure!(
+        !matches!(outcome, Err(PullMiss::BelowMargin)),
+        "the candidate must be ADMITTED (its probe quote clears the gate) and abort \
+         mid-pull on the real quote, not be pre-emptively skipped as BelowMargin, got {outcome:?}"
+    );
+    assert_counter(&metrics, "node_pull_rate_above_ceiling_total", 1)?;
+    Ok(())
+}
+
+/// Attack A (over-market loss bound): a malicious upstream quotes AT the
+/// `margin` policy's amortized ceiling itself, with `heat` pinned (via
+/// [`FixedHeat`], standing in for HC-1's real observe-on-serve signal) so `N̂ =
+/// n_max`. At exactly that price the buy is NOT flagged speculative — the quote
+/// sits AT the amortized floor, not above it — so the warming allowance is
+/// never touched by this buy at all. That untracked zone is exactly what this
+/// test bounds directly against the real ledger, rather than against
+/// `WarmingAllowance` state that the attack never reaches.
+///
+/// Only ONE resale is realized (one downstream client fetch), so the buyer's
+/// measured loss — what B paid A minus the operator margin B recovered on that
+/// one resale — must not exceed `(operator_bps / 10_000) · P_sell · (n_max − 1)`
+/// per whole MB of wire delivered: the gap between paying for `n_max` expected
+/// resales (the heat-implied justification for the price) and recovering the
+/// margin of just one.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
+async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
+    const N_MAX: u32 = 64;
+    const DISCOUNT_BPS: u32 = 5000;
+    // round(0.5 * 128) == 64 == N_MAX: pins N_hat exactly at the clamp ceiling.
+    const HEAT: u32 = 128;
+    const OP_BPS: u16 = 6000;
+    const SELL: u64 = 1000;
+    // amortized = op_bps * n_max * sell / 10_000 — the ceiling a malicious
+    // upstream can quote AT without ever tripping the speculative flag.
+    const QUOTE_A: u64 = (OP_BPS as u64) * (N_MAX as u64) * SELL / 10_000;
+    const LEDGER_DEPOSIT: u64 = 1_000_000_000;
+
+    let payload = vec![0xADu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: the malicious upstream, quoting the ceiling exactly. -------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let ab_pool_id = B256::repeat_byte(0xA9);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        ab_pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(LEDGER_DEPOSIT),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let a_metrics = Arc::new(Metrics::new());
+    let a_limiter = permissive_limiter(&a_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &a_metrics,
+        a_limiter,
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        QUOTE_A,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        QUOTE_A,
+    );
+
+    // --- Node B: buys via NodeOrigin with heat pinned to N_MAX. -------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+        LEDGER_DEPOSIT,
+        0,
+    ));
+    let serve_economics = Arc::new(decdn_node::serve_economics::MarginPolicy::new(
+        DISCOUNT_BPS,
+        N_MAX,
+    )) as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
+    let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let buyer = Arc::new(StubOpener {
+        pool_id: ab_pool_id,
+        deposit: U256::from(LEDGER_DEPOSIT),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::clone(&recorded),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, engine, _engine_tmp) = build_origin_economics(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+        serve_economics,
+        OP_BPS,
+        SELL,
+        Arc::clone(&warming),
+        Some(Arc::new(FixedHeat(HEAT)) as Arc<dyn decdn_cache::FrequencyEstimator>),
+    )
+    .await;
+
+    // `Origin::fetch` (not `open_progressive_pull`, which only opens the header
+    // and hands back a caller-driven stream) runs the FULL buffered buy and
+    // admits the bytes into B's cache — needed here so the downstream resale
+    // below actually has something to serve.
+    let bought = tokio::time::timeout(
+        Duration::from_secs(20),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("origin fetch never returned"))?
+    .map_err(|e| anyhow::anyhow!("origin fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(bought, OriginFetch::AlreadyAdmitted),
+        "the attack quotes AT the ceiling; the gate must admit it, got {bought:?}"
+    );
+    anyhow::ensure!(
+        engine.get(hash).await?.as_ref() == payload.as_slice(),
+        "B's cache must hold the bought bytes"
+    );
+
+    // --- Downstream: ONE real client resells the blob at market. ------------
+    let b_eth = Arc::new(PrivateKeySigner::random());
+    let client_signer = Arc::new(PrivateKeySigner::random());
+    let b_pool_id = B256::repeat_byte(0xB9);
+    let store_b = Arc::new(MemoryPoolStateStore::new());
+    let b_lane = decdn_incentive::LaneKey {
+        pool_id: b_pool_id,
+        signer: client_signer.address(),
+        provider: b_eth.address(),
+    };
+    store_b.record(&LaneState::hydrate(
+        b_pool_id,
+        client_signer.address(),
+        b_eth.address(),
+        U256::from(LEDGER_DEPOSIT),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let handler_b = build_handler_full_configured(
+        b_id,
+        &b_eth,
+        &b_metrics,
+        permissive_limiter(&b_metrics),
+        engine,
+        store_b.clone() as Arc<dyn PoolStateStore>,
+        SELL,
+        &domains,
+        0,
+        16,
+        |deps| {
+            deps.warming = Arc::clone(&warming);
+            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(OP_BPS);
+        },
+    )?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
+    let binding = decdn_node::client_requester::sign_client_binding(
+        &client_signer,
+        B256::from(*client_id.as_bytes()),
+        &binding_dom(),
+    )?;
+    let ctx_client_to_b = PoolContext {
+        pool_id: b_pool_id,
+        provider: b_eth.address(),
+        deposit: U256::from(LEDGER_DEPOSIT),
+        client_signer: Arc::clone(&client_signer),
+        voucher_domain: voucher_dom(),
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+        client_binding: Some(binding),
+        capability: None,
+    };
+    let got = decdn_node::client_requester::stream_fetch(
+        &client_ep,
+        target_b,
+        &ctx_client_to_b,
+        &slash_domain(),
+        b_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00a1_0001,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(got.as_ref() == payload.as_slice(), "resale bytes mismatch");
+
+    // --- Measure: what B paid A, vs. the margin it recovered on the resale. --
+    let paid_out = progress_log(&recorded)?
+        .last()
+        .copied()
+        .map(|(_, _, amount)| amount)
+        .ok_or_else(|| anyhow::anyhow!("B never recorded a payment to A"))?;
+    let paid_in = store_b
+        .get(b_lane)?
+        .ok_or_else(|| anyhow::anyhow!("B<->client lane vanished"))?
+        .last_amount();
+    let margin_recovered = paid_in.saturating_mul(U256::from(OP_BPS)) / U256::from(10_000u64);
+    let loss = paid_out.saturating_sub(margin_recovered);
+
+    let wire = support::bao_wire_len_whole(total_bytes);
+    let mb_wire = wire.div_ceil(MB_BYTES);
+    let bound = U256::from(OP_BPS) * U256::from(SELL) * U256::from(u64::from(N_MAX) - 1)
+        / U256::from(10_000u64)
+        * U256::from(mb_wire);
+    anyhow::ensure!(
+        loss <= bound,
+        "Attack A loss bound violated: paid_out {paid_out}, paid_in {paid_in}, margin \
+         recovered {margin_recovered}, measured loss {loss} > bound {bound} \
+         (op_bps/10_000 * sell * (n_max-1) * {mb_wire} MB)"
+    );
+    // Sanity: the attack IS lossy — else the bound above is vacuous.
+    anyhow::ensure!(
+        loss > U256::ZERO,
+        "the attack must be genuinely lossy for the bound above to mean anything, \
+         got paid_out {paid_out}, margin_recovered {margin_recovered}"
+    );
+
+    shutdown([], [&client_ep, &ep_b, &ep_a]).await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// One ADR 041 Attack-B cycle: source `a_sk` (its identity persists across
+/// calls that clone the same key in, so its warming bucket persists too) holds
+/// a blob distinguished by `salt` (distinct content ⇒ distinct hash and pool
+/// ids), quoted at `quote`. B buys it through `NodeOrigin` sharing `warming`
+/// with the caller, then — only if the buy was admitted — serves it downstream
+/// to `serves` distinct one-shot clients from the SAME cache (no re-buy: the
+/// blob is already admitted).
+///
+/// Returns `(admitted, metrics)`: `admitted` is whether the buy was let
+/// through (`Origin::fetch`'s `OriginFetch::AlreadyAdmitted`); a refused buy
+/// skips serving (there is nothing bought to serve). `Origin::fetch` collapses
+/// `PullMiss::BelowMargin` and a clean miss to the same wire-identical
+/// `NotFound`, so a caller that needs to confirm a refusal was specifically the
+/// ADR 041 gate (not e.g. an unrelated transport fault) reads `metrics`'
+/// `serve_economics_refused_total` back.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::expect_used,
+    clippy::too_many_lines
+)]
+async fn attack_b_attempt(
+    a_sk: iroh::SecretKey,
+    salt: u8,
+    quote: u64,
+    sell: u64,
+    op_bps: u16,
+    discount_bps: u32,
+    n_max: u32,
+    warming: &Arc<decdn_node::warming_allowance::WarmingAllowance>,
+    serves: u32,
+) -> Result<(bool, Arc<Metrics>)> {
+    const LEDGER_DEPOSIT: u64 = 1_000_000_000;
+    let payload = vec![salt; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let ab_pool_id = B256::repeat_byte(salt);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        ab_pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(LEDGER_DEPOSIT),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+    ))?;
+    let a_metrics = Arc::new(Metrics::new());
+    let a_limiter = permissive_limiter(&a_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &a_metrics,
+        a_limiter,
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        quote,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        quote,
+    );
+
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, addr_b) = local_endpoint(b_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let serve_economics = Arc::new(decdn_node::serve_economics::MarginPolicy::new(
+        discount_bps,
+        n_max,
+    )) as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
+    let buyer = Arc::new(StubOpener {
+        pool_id: ab_pool_id,
+        deposit: U256::from(LEDGER_DEPOSIT),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn PoolOpener>;
+    let (origin, engine, _engine_tmp) = build_origin_economics(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+        serve_economics,
+        op_bps,
+        sell,
+        Arc::clone(warming),
+        None,
+    )
+    .await;
+
+    // `Origin::fetch` (not `open_progressive_pull`) runs the full buffered buy
+    // and admits the bytes into B's cache, needed so a refused-vs-admitted
+    // flood attempt can go on to actually serve downstream when admitted.
+    // Whether a refusal was specifically the ADR 041 gate (`BelowMargin`, wire-
+    // identical to a clean miss) is read back from `serve_economics_refused`,
+    // since `Origin::fetch`'s `OriginFetch` collapses both to `NotFound`.
+    let bought = tokio::time::timeout(
+        Duration::from_secs(20),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("origin fetch never returned"))?
+    .map_err(|e| anyhow::anyhow!("origin fetch: {e}"))?;
+    let admitted = matches!(bought, OriginFetch::AlreadyAdmitted);
+
+    if admitted && serves > 0 {
+        let b_eth = Arc::new(PrivateKeySigner::random());
+        let store_b = Arc::new(MemoryPoolStateStore::new());
+        let mut lanes = Vec::new();
+        for i in 0..serves {
+            let client_signer = Arc::new(PrivateKeySigner::random());
+            let mut pool_id_bytes = [0u8; 32];
+            pool_id_bytes[0] = salt;
+            pool_id_bytes[1] = u8::try_from(i).unwrap_or(0xFF);
+            let pool_id = B256::from(pool_id_bytes);
+            store_b.record(&LaneState::hydrate(
+                pool_id,
+                client_signer.address(),
+                b_eth.address(),
+                U256::from(LEDGER_DEPOSIT),
+                0,
+                U256::ZERO,
+                U256::ZERO,
+                None,
+            ))?;
+            lanes.push((pool_id, client_signer));
+        }
+        let handler_b = build_handler_full_configured(
+            b_id,
+            &b_eth,
+            &b_metrics,
+            permissive_limiter(&b_metrics),
+            engine,
+            store_b as Arc<dyn PoolStateStore>,
+            sell,
+            &domains,
+            0,
+            16,
+            |deps| {
+                deps.warming = Arc::clone(warming);
+                deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(op_bps);
+            },
+        )?;
+        let task_b = spawn_server(ep_b.clone(), handler_b);
+        for (i, (pool_id, client_signer)) in lanes.into_iter().enumerate() {
+            let client_sk = fresh_key();
+            let client_id = client_sk.public();
+            let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+            let target_b = EndpointAddr::new(b_id).with_ip_addr(addr_b);
+            let binding = decdn_node::client_requester::sign_client_binding(
+                &client_signer,
+                B256::from(*client_id.as_bytes()),
+                &binding_dom(),
+            )?;
+            let ctx = PoolContext {
+                pool_id,
+                provider: b_eth.address(),
+                deposit: U256::from(LEDGER_DEPOSIT),
+                client_signer: Arc::clone(&client_signer),
+                voucher_domain: voucher_dom(),
+                prior_bytes_delivered: U256::ZERO,
+                prior_amount: U256::ZERO,
+                client_binding: Some(binding),
+                capability: None,
+            };
+            let got = decdn_node::client_requester::stream_fetch(
+                &client_ep,
+                target_b,
+                &ctx,
+                &slash_domain(),
+                b_eth.address(),
+                *hash.as_bytes(),
+                0,
+                0x00b0_0000u64
+                    .saturating_add(u64::from(salt) * 0x100)
+                    .saturating_add(i as u64),
+                Duration::from_secs(20),
+            )
+            .await?;
+            anyhow::ensure!(
+                got.as_ref() == payload.as_slice(),
+                "resale #{i} bytes mismatch"
+            );
+            shutdown([], [&client_ep]).await;
+        }
+        shutdown([], [&ep_b, &ep_a]).await;
+        task_a.await?;
+        task_b.await?;
+        return Ok((admitted, b_metrics));
+    }
+
+    shutdown([task_a.abort_handle()], [&ep_b, &ep_a]).await;
+    Ok((admitted, b_metrics))
+}
+
+/// Attack B (per-source dud-flood bound + vindication): (a) flooding distinct
+/// at-market one-hit blobs from ONE source drains its warming allowance after
+/// the FIRST dud — a buy debited at the full market price, netted against just
+/// one downstream serve's margin, is already negative — so every FURTHER
+/// at-market cold buy from that same source refuses `BelowMargin` rather than
+/// buying: the loss never compounds past one dud's worth. A second, independent
+/// source is completely untouched by the first source's flood. (b) A blob
+/// re-served at least twice from a source nets positive and refunds the
+/// allowance (serve-vindicated), so an honest, popular source keeps warming.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn attack_b_dud_flood_is_bounded_and_vindication_works() -> Result<()> {
+    const N_MAX: u32 = 64;
+    const DISCOUNT_BPS: u32 = 5000;
+    const OP_BPS: u16 = 6000;
+    const SELL: u64 = 1000;
+    // heat 0 -> n_hat 1 -> amortized 600; a market quote of 1000 sits ABOVE the
+    // amortized floor, so a fresh (warm) source's buy is flagged speculative and
+    // debited the full buy cost — the regime this attack lives in.
+    const QUOTE_MARKET: u64 = 1000;
+
+    let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+        1_000_000_000,
+        0,
+    ));
+
+    // Source A: the first buy is a dud — bought at market, served exactly once.
+    let src1_sk = fresh_key();
+    let src1_id_bytes = *src1_sk.public().as_bytes();
+    let (first_admitted, _) = attack_b_attempt(
+        src1_sk.clone(),
+        0xB1,
+        QUOTE_MARKET,
+        SELL,
+        OP_BPS,
+        DISCOUNT_BPS,
+        N_MAX,
+        &warming,
+        1,
+    )
+    .await?;
+    anyhow::ensure!(
+        first_admitted,
+        "the first (dud) at-market buy from a fresh source must be admitted"
+    );
+    anyhow::ensure!(
+        !warming.available(src1_id_bytes),
+        "one dud (bought at market, served once) must already drain the source below \
+         available — the buy debit outweighs a single serve's margin credit"
+    );
+
+    // Flood: further distinct cold blobs from the SAME source refuse BelowMargin
+    // at the amortized floor rather than buying — the loss never compounds.
+    for salt in [0xB2u8, 0xB3u8] {
+        let (flood_admitted, flood_metrics) = attack_b_attempt(
+            src1_sk.clone(),
+            salt,
+            QUOTE_MARKET,
+            SELL,
+            OP_BPS,
+            DISCOUNT_BPS,
+            N_MAX,
+            &warming,
+            0,
+        )
+        .await?;
+        anyhow::ensure!(
+            !flood_admitted,
+            "a further at-market cold buy from a spent source must refuse (salt {salt:#x})"
+        );
+        assert_counter(&flood_metrics, "serve_economics_refused_total", 1)?;
+    }
+
+    // An independent second source: untouched by A's flood.
+    let src2_sk = fresh_key();
+    let src2_id_bytes = *src2_sk.public().as_bytes();
+    anyhow::ensure!(
+        warming.available(src2_id_bytes),
+        "an independent source must read available before it is ever touched"
+    );
+    let (second_admitted, _) = attack_b_attempt(
+        src2_sk,
+        0xC1,
+        QUOTE_MARKET,
+        SELL,
+        OP_BPS,
+        DISCOUNT_BPS,
+        N_MAX,
+        &warming,
+        0,
+    )
+    .await?;
+    anyhow::ensure!(
+        second_admitted,
+        "a second source's allowance must be untouched by another source's flood"
+    );
+
+    // (b) Vindication: a THIRD source, bought once and served TWICE, nets
+    // positive and stays warm.
+    let src3_sk = fresh_key();
+    let src3_id_bytes = *src3_sk.public().as_bytes();
+    let (vindicated_admitted, _) = attack_b_attempt(
+        src3_sk,
+        0xD1,
+        QUOTE_MARKET,
+        SELL,
+        OP_BPS,
+        DISCOUNT_BPS,
+        N_MAX,
+        &warming,
+        2,
+    )
+    .await?;
+    anyhow::ensure!(vindicated_admitted, "the vindication buy must be admitted");
+    anyhow::ensure!(
+        warming.available(src3_id_bytes),
+        "a blob re-served >= 2x must refund the source's allowance and keep it warming"
+    );
+
     Ok(())
 }
