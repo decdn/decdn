@@ -899,6 +899,35 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     }
 }
 
+/// The multi-source engagement gate (ADR 039): whether a fetch should fan out
+/// across several holders via [`decdn_client_pull::multi_source_fetch`] rather
+/// than the single-source failover loop above.
+///
+/// All three conditions must hold: the kill switch (`--multi-source`) is on,
+/// the blob clears the size floor (fanning out a small blob only adds lane
+/// overhead for no parallelism win), and at least two admissible holders
+/// exist to fan out across (one holder is exactly the single-source path,
+/// just with extra bookkeeping).
+///
+/// Not yet called from `drive_fetch`/`bundle_pull`: see the Task 7 report
+/// (`.superpowers/sdd/2026-08-20-multi-source-parallel-fetch-plan/task-7-report.md`)
+/// for why wiring it in is blocked — `multi_source_fetch` takes exactly one
+/// shared `ctx`/`ledger`/`funder` for every source in the admitted set, but
+/// each admitted source is a DIFFERENT on-chain provider with its OWN
+/// `(signer, provider)` payment lane (ADR 039 § Payment model), so a single
+/// shared `PoolContext`/`PoolLedger` cannot correctly sign vouchers payable to
+/// more than one of them.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) const fn should_multi_source(
+    enabled: bool,
+    total_bytes: u64,
+    min_bytes: u64,
+    admissible: usize,
+) -> bool {
+    enabled && total_bytes > min_bytes && admissible >= 2
+}
+
 /// Whether a failed delivery attempt should fall over to the next candidate
 /// provider (#1174, ADR 037 § Fallback), or end the fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1651,6 +1680,11 @@ mod tests {
             proxy_warming: false,
             proxy_warming_rtt_threshold_ms: 150,
             proxy_warming_margin_ms: 30,
+            multi_source: false,
+            no_multi_source: false,
+            max_sources: 4,
+            multi_source_min_bytes: 67_108_864,
+            unit_deadline_ms: 10_000,
             chain_id: None,
             keystore: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
@@ -1666,6 +1700,17 @@ mod tests {
 
     fn config(body: &str) -> FileConfig {
         toml::from_str(body).expect("parse test config")
+    }
+
+    /// The pure multi-source engagement gate (#1760-series follow-on): engage
+    /// only when the kill switch is on, the blob clears the size floor, and at
+    /// least two admissible holders exist to fan out across.
+    #[test]
+    fn engagement_gate_requires_enabled_size_and_two_holders() {
+        assert!(should_multi_source(true, 100 << 20, 64 << 20, 2));
+        assert!(!should_multi_source(false, 100 << 20, 64 << 20, 4)); // kill switch
+        assert!(!should_multi_source(true, 10 << 20, 64 << 20, 4)); // below size gate
+        assert!(!should_multi_source(true, 100 << 20, 64 << 20, 1)); // one holder
     }
 
     fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
