@@ -1267,6 +1267,15 @@ pub struct DecdnMetrics {
     /// one while the node keeps signing quotes against stale, economically
     /// load-bearing bounds. Alert on this gauge going stale.
     pub rate_bounds_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_fee_shares_watcher_last_tick_timestamp_seconds`: Unix time of the
+    /// fee-shares watcher's last successful poll tick. Load-bearing for the
+    /// same reason as `rate_bounds_watcher_last_tick_timestamp_seconds`: the
+    /// watcher's `getShares()` poll failure and undecodable-log paths both
+    /// return `Ok` by design, so a watcher stuck in RPC backoff — or dead — is
+    /// otherwise indistinguishable from a healthy one while the node keeps
+    /// signing quotes against a stale operator fee share. Alert on this gauge
+    /// going stale.
+    pub fee_shares_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_slash_watcher_task_panicked_total` (#1316): the slash watcher task
     /// unwound on a panic. Bumped from a `Drop` guard in `multiplexed_poller::run`
     /// — the only thing that still runs on the unwind, since nothing awaits the
@@ -1281,6 +1290,9 @@ pub struct DecdnMetrics {
     /// `decdn_rate_bounds_watcher_task_panicked_total` (#1172): the rate-bounds
     /// watcher task unwound on a panic. Any non-zero value is a bug in this node.
     pub rate_bounds_watcher_task_panicked: Counter,
+    /// `decdn_fee_shares_watcher_task_panicked_total`: the fee-shares watcher
+    /// task unwound on a panic. Any non-zero value is a bug in this node.
+    pub fee_shares_watcher_task_panicked: Counter,
     /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
     /// payment-settlement watcher task unwound on a panic.
     pub settlement_watcher_task_panicked: Counter,
@@ -2258,6 +2270,11 @@ recorders! {
     /// failure paths deliberately return `Ok`, so this gauge is the only signal
     /// that it is still polling.
     rate_bounds_watcher_tick => rate_bounds_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the fee-shares watcher's liveness gauge. See `slash_watcher_tick`;
+    /// this one matters because the fee-shares watcher's failure paths
+    /// deliberately return `Ok`, so this gauge is the only signal that it is
+    /// still polling.
+    fee_shares_watcher_tick => fee_shares_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
 
     /// Record that the slash watcher task unwound on a panic (#1316). Bumped from
     /// the `Drop` guard in `multiplexed_poller::run` via the `on_task_panic` hook.
@@ -2268,6 +2285,8 @@ recorders! {
     blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
     /// Record that the rate-bounds watcher task unwound on a panic (#1172).
     rate_bounds_watcher_task_panicked => rate_bounds_watcher_task_panicked.inc();
+    /// Record that the fee-shares watcher task unwound on a panic.
+    fee_shares_watcher_task_panicked => fee_shares_watcher_task_panicked.inc();
     /// Record that the payment-settlement watcher task unwound on a panic (#1316).
     settlement_watcher_task_panicked => settlement_watcher_task_panicked.inc();
 

@@ -23,6 +23,7 @@ pub mod content_deny;
 pub mod dht;
 pub mod dispatch;
 pub mod fee_shares;
+pub mod fee_shares_watcher;
 pub mod handlers;
 pub mod metrics;
 pub(crate) mod net;
