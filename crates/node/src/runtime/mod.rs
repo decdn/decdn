@@ -2808,6 +2808,7 @@ async fn build_cache(
     // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
     engine.set_origin_probe_config(
         std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
+        std::time::Duration::from_secs(cfg.cache.origin_probe_negative_ttl_sec),
         std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
         usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
     );
@@ -3520,6 +3521,8 @@ mod tests {
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
                 origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_negative_ttl_sec:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
                 origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
                 origin_probe_memo_capacity:
                     decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,

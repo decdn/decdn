@@ -251,11 +251,15 @@ pub struct ResolvedCache {
     /// one). Default [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`] when the
     /// TOML section omits the field.
     pub fs_rescan_interval_sec: u64,
-    /// TTL in seconds for a memoised live-origin probe answer (#1130 pt3).
-    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
+    /// TTL in seconds for a memoised positive live-origin probe answer (#1130
+    /// pt3). Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
     /// per-probe `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
     /// objects the enumeration index cannot see.
     pub origin_probe_ttl_sec: u64,
+    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`]. The
+    /// negative-answer TTL for the origin-probe memo — the bound on how long a
+    /// stale `Absent` can hide newly-available own content.
+    pub origin_probe_negative_ttl_sec: u64,
     /// Per-probe live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
     /// off the probe hot path.

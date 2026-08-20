@@ -369,6 +369,8 @@ fn build_config(
             gc_interval_sec: 0,
             fs_rescan_interval_sec: 0,
             origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+            origin_probe_negative_ttl_sec:
+                decdn_common::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
             origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
             origin_probe_memo_capacity: decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
             eviction_high_water_pct: 90,

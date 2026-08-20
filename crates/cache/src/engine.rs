@@ -1295,8 +1295,15 @@ impl CacheEngine {
     /// runtime wiring and swaps the memo wholesale (dropping any warm entries) —
     /// the same "set once, no threading through every test constructor" pattern
     /// as [`Self::set_max_probe_holds`].
-    pub fn set_origin_probe_config(&self, ttl: Duration, timeout: Duration, capacity: usize) {
-        *self.probe_memo_lock() = OriginProbeMemo::new(ttl, timeout, capacity);
+    pub fn set_origin_probe_config(
+        &self,
+        positive_ttl: Duration,
+        negative_ttl: Duration,
+        timeout: Duration,
+        capacity: usize,
+    ) {
+        *self.probe_memo_lock() =
+            OriginProbeMemo::new(positive_ttl, negative_ttl, timeout, capacity);
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -4565,7 +4572,12 @@ mod tests {
         let engine =
             CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
         // Tight timeout so the 400 ms origin overruns it.
-        engine.set_origin_probe_config(Duration::from_secs(15), Duration::from_millis(20), 16);
+        engine.set_origin_probe_config(
+            Duration::from_secs(15),
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            16,
+        );
 
         assert_eq!(
             engine.origin_probe_size(hash).await,

@@ -185,6 +185,13 @@ pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 /// probe-hold horizon.
 pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
 
+/// Default TTL in seconds for a memoised `Absent` live-origin probe answer.
+/// Short on purpose: it bounds how long a stale `Absent` can hide
+/// newly-available own content from a probe, while a random-hash flood never
+/// repeats a hash within any window so the short TTL barely changes flood
+/// cost.
+pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
+
 /// Default per-probe ceiling in milliseconds on the live-origin
 /// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the probe hot
 /// path; on overrun the probe answers `has_blob: false` and memoises the miss.
@@ -1607,6 +1614,9 @@ fn resolve_cache_into(
     let origin_probe_ttl_sec = file
         .and_then(|c| c.origin_probe_ttl_sec)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TTL_SEC);
+    let origin_probe_negative_ttl_sec = file
+        .and_then(|c| c.origin_probe_negative_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
     let origin_probe_timeout_ms = file
         .and_then(|c| c.origin_probe_timeout_ms)
         .unwrap_or(DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
@@ -1750,6 +1760,7 @@ fn resolve_cache_into(
         gc_interval_sec,
         fs_rescan_interval_sec,
         origin_probe_ttl_sec,
+        origin_probe_negative_ttl_sec,
         origin_probe_timeout_ms,
         origin_probe_memo_capacity,
         eviction_high_water_pct,
