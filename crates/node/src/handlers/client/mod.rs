@@ -549,8 +549,8 @@ enum ServeRejectReason {
     /// read node load, and both are reputation-benign (a client scores
     /// `NotFound` as no fault).
     LoadShedHit,
-    /// A cache-MISS serve shed under node overload (concurrency pressure or
-    /// per-client fairness). See [`Self::LoadShedHit`].
+    /// A cache-MISS serve shed under node overload — concurrency pressure,
+    /// per-client fairness, or egress saturation. See [`Self::LoadShedHit`].
     LoadShedMiss,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).

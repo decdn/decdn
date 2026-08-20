@@ -38,6 +38,11 @@ fn build_policy(cfg: &ResolvedLoadShed) -> Arc<dyn LoadShedPolicy> {
 /// The serve path's load-shed handle: a swappable policy over live meters.
 #[allow(missing_debug_implementations)]
 pub struct LoadShedController {
+    // `ArcSwap<Arc<dyn LoadShedPolicy>>` (not `ArcSwap<dyn LoadShedPolicy>`): arc-swap's
+    // `RefCnt` blanket impl `impl<T> RefCnt for Arc<T>` bounds `T: Sized`, so
+    // `Arc<dyn LoadShedPolicy>` does not implement `RefCnt`. Storing the trait object
+    // as the sized `Arc<dyn ...>` pointee is the supported form; `.load()` derefs
+    // through both `Arc`s to the trait object.
     policy: ArcSwap<Arc<dyn LoadShedPolicy>>,
     state: Arc<ShedState>,
     egress: Arc<EgressMeter>,
@@ -69,7 +74,9 @@ impl LoadShedController {
         }
     }
 
-    /// Feed delivered wire bytes into the egress meter (delivery hot path).
+    /// Feed delivered bytes into the egress meter (delivery hot path). `bytes`
+    /// is the per-chunk length also added to the billed `delivered` counter —
+    /// the bao-stream content plus interleaved proof, not the full QUIC frame.
     pub fn record_egress(&self, bytes: u64) {
         self.egress.record(bytes);
     }

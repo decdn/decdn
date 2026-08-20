@@ -1,16 +1,18 @@
 //! A lock-free rolling egress meter. Delivery loops call [`EgressMeter::record`]
-//! with each frame's wire length; a periodic task calls [`EgressMeter::sample`]
-//! once per fixed interval to fold the bytes delivered since the last sample
-//! into an exponentially-weighted bytes/sec rate that the load-shed policy and
-//! the metrics gauge read.
+//! with each delivered chunk's byte length (the bao-stream content plus
+//! interleaved proof — the same quantity billed as `delivered`, not the full
+//! QUIC frame); a periodic task calls [`EgressMeter::sample`] once per fixed
+//! interval to fold the bytes delivered since the last sample into an
+//! exponentially-weighted bytes/sec rate that the load-shed policy and the
+//! metrics gauge read.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cumulative delivered wire bytes plus the last computed EWMA rate. All state
+/// Cumulative delivered bytes plus the last computed EWMA rate. All state
 /// is atomic, so `record` stays off any lock on the hot delivery path.
 #[derive(Debug, Default)]
 pub struct EgressMeter {
-    /// Monotonic total wire bytes delivered.
+    /// Monotonic total delivered bytes.
     cumulative: AtomicU64,
     /// `cumulative` as of the last `sample` — the baseline for the next delta.
     last_sample_cumulative: AtomicU64,
@@ -26,7 +28,8 @@ impl EgressMeter {
         Self::default()
     }
 
-    /// Add `bytes` of delivered wire to the running total. Called per frame.
+    /// Add `bytes` of delivered content to the running total. Called per chunk
+    /// with the same length billed as `delivered` (bao content plus proof).
     pub fn record(&self, bytes: u64) {
         self.cumulative.fetch_add(bytes, Ordering::Relaxed);
     }
