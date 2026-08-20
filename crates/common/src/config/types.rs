@@ -528,6 +528,10 @@ pub struct CacheConfig {
     /// behind a valid, pool-bound client so an unpaid request cannot drive
     /// egress.
     pub node_to_node_pull_through_enabled: Option<bool>,
+    /// When `false`, the node serves and seeds only content its own backend
+    /// holds; a foreign hash is declined like a miss. Default `true` (relay
+    /// foreign namespaces). Node-local; `cache.*` is restart-required.
+    pub relay_foreign_namespaces: Option<bool>,
     /// Number of discovered providers to probe before ranking on a
     /// node-to-node pull (#831). Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`] (5). Higher widens

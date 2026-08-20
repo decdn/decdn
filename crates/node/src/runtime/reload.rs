@@ -776,6 +776,7 @@ impl RuntimeReloadState {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:
@@ -1093,6 +1094,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
+        relay_foreign_namespaces,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
@@ -1123,6 +1125,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || max_probe_holds.is_some()
         || stake_lane_reserved_holds.is_some()
         || node_to_node_pull_through_enabled.is_some()
+        || relay_foreign_namespaces.is_some()
         || node_pull_probe_fanout.is_some()
         || node_pull_timeout_sec.is_some()
         || node_pull_stall_timeout_sec.is_some()
@@ -1242,6 +1245,7 @@ mod tests {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:

@@ -265,6 +265,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     } else {
         writeln!(w, "  node_to_node_pull:        disabled")?;
     }
+    if resolved.cache.relay_foreign_namespaces {
+        writeln!(w, "  relay_foreign_namespaces: true")?;
+    } else {
+        writeln!(w, "  relay_foreign_namespaces: false (origin-only node)")?;
+    }
     writeln!(
         w,
         "  rate_per_mb:              {}",
@@ -641,6 +646,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
+# relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); false = origin-only node, foreign hashes decline like a miss
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall timeout, so every ranked upstream can be tried before falling back (#831, #859)
 # node_pull_stall_timeout_sec = 20         # per-upstream INACTIVITY timeout while streaming (#1134); the clock resets on every byte, so it trips only on a silent upstream — not on a large blob or a slow link. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults)
@@ -906,6 +912,7 @@ mod tests {
             max_probe_holds,
             stake_lane_reserved_holds,
             node_to_node_pull_through_enabled,
+            relay_foreign_namespaces,
             node_pull_probe_fanout,
             node_pull_timeout_sec,
             node_pull_stall_timeout_sec,
@@ -954,6 +961,10 @@ mod tests {
             (
                 "node_to_node_pull_through_enabled =",
                 node_to_node_pull_through_enabled.is_none(),
+            ),
+            (
+                "relay_foreign_namespaces =",
+                relay_foreign_namespaces.is_none(),
             ),
             ("node_pull_probe_fanout =", node_pull_probe_fanout.is_none()),
             ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),

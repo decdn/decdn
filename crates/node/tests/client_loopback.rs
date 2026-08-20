@@ -7387,6 +7387,222 @@ async fn spawn_pull_through_server(
     Ok((target, server_eth.address(), server_ep, server_task))
 }
 
+/// Spawn a `ClientHandler` server with `relay_foreign_namespaces = false`
+/// (#1759): an origin-only node. Reactive fs-origin pull-through
+/// (`ClientHandlerDeps.pull_through`) is wired the same as
+/// [`spawn_pull_through_server`] so a hash the backend genuinely holds can
+/// still be served; the only difference is the origin-only gate.
+async fn spawn_origin_only_server(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.relay_foreign_namespaces = false;
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth.address(), server_ep, server_task))
+}
+
+/// Build a cache holding a blob that the local STORE has already accepted (a
+/// past import) but whose backing filesystem origin no longer exists — the
+/// backend genuinely does not hold it anymore, so a fresh
+/// `CacheEngine::origin_probe_size` reads `None` (a transport error against
+/// the now-deleted origin directory) even though `cache.has` is `true`. Used
+/// to prove the origin-only gate (#1759) sits ABOVE the cache-hit branch: a
+/// foreign hash already sitting in the store is still declined.
+async fn cache_with_foreign_blob_imported(
+    payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    Arc<CacheMetrics>,
+    tempfile::TempDir,
+)> {
+    let hash = decdn_cache::Hash::new(payload);
+    let origin_dir = tempfile::tempdir()?;
+    let hex = hash.to_hex();
+    let shard = hex
+        .get(..2)
+        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+    let dir = origin_dir.path().join(shard);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(hex.as_str()), payload)?;
+
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
+    let cache_metrics = Arc::new(CacheMetrics::default());
+    let cache = CacheEngine::open_full(
+        cache_dir.path(),
+        vec![origin as Arc<dyn decdn_cache::Origin>],
+        16,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&cache_metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    let _ = cache.get(hash).await?; // pulls into the local store now
+    anyhow::ensure!(
+        cache.has(hash).await?,
+        "precondition: the blob must be in the local store"
+    );
+    // Drop the fs origin directory: the backend no longer holds the object,
+    // even though the store already imported it.
+    drop(origin_dir);
+    Ok((cache, hash, cache_metrics, cache_dir))
+}
+
+/// #1759: an origin-only node declines a hash its own backend does not hold,
+/// even for a request carrying a valid client binding — the gate is
+/// backend-authoritative, not a binding/authorization check.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
+    // Backend holds `payload`/`hash`; we request a DIFFERENT (foreign) hash.
+    let payload = vec![0x11u8; 64 * 1024];
+    let (cache, _own_hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let foreign_hash = decdn_cache::Hash::from([0x9Au8; 32]);
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let res = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *foreign_hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await;
+    anyhow::ensure!(res.is_err(), "origin-only node must decline a foreign hash");
+
+    // Declined BEFORE any origin egress / discovery.
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "foreign decline must not touch the origin, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1759 control: an origin-only node still serves a hash its own backend
+/// holds — the gate refuses only foreign content, not everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
+    let payload = vec![0x22u8; 64 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch for own-backend hash"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 1,
+        "expected exactly 1 origin fetch to fill the own-backend hash, got {}",
+        cache_metrics.origin_fetches.get()
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1759: the gate is categorical — it sits ABOVE the cache-hit branch, so a
+/// foreign hash already sitting in the store (imported by an earlier relay,
+/// say) is still declined once the backend no longer holds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::Result<()> {
+    let payload = vec![0x33u8; 32 * 1024];
+    let (cache, foreign_hash, cache_metrics, _cache_tmp) =
+        cache_with_foreign_blob_imported(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+
+    // Baseline AFTER setup's own origin fetch (from importing the blob into the
+    // store), so the assertion below isolates fetches caused by THIS request.
+    let baseline_fetches = cache_metrics.origin_fetches.get();
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+
+    let res = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *foreign_hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await;
+    anyhow::ensure!(
+        res.is_err(),
+        "origin-only node must decline a foreign hash even when it is already cached"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == baseline_fetches,
+        "the cache-hit gate must not touch the origin, got {} beyond baseline {}",
+        cache_metrics.origin_fetches.get(),
+        baseline_fetches
+    );
+
+    shutdown([], [&client_ep, &server_ep]).await;
+    server_task.await?;
+    Ok(())
+}
+
 /// #1115: a direct client fetch that sends the ADR 005 client identity binding
 /// authorizes reactive origin pull-through — with the blob present only in the
 /// node's filesystem origin (an empty local store), the miss populates from the

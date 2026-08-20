@@ -223,6 +223,26 @@ impl ClientHandler {
                 .await;
         }
 
+        // Origin-only policy (#1759). When the operator opts out of foreign
+        // relay, the own/foreign decision is backend-authoritative: the request's
+        // `namespace_id` is a routing hint, not a trust anchor (ADR 002), so the
+        // node asks its OWN backend — a memoized `HEAD`/`HeadObject` — whether it
+        // holds the object named by this content hash. `Some` (Present) means own
+        // content and falls through to the normal serve path; `None` (Absent, a
+        // 404, an unknown size, a transport error, or a timeout) means foreign,
+        // and it is declined like any miss, before any discovery, lane
+        // accounting, or spend. The probe is memoized (short negative TTL), so a
+        // foreign-hash flood costs at most one backend round-trip per hash per
+        // negative-TTL window. Above the cache-hit branch on purpose: a foreign
+        // blob already sitting in this node's cache (e.g. seeded by an earlier
+        // relay) is still declined, so the policy is categorical rather than
+        // "foreign misses only".
+        if !self.relay_foreign_namespaces && self.cache.origin_probe_size(hash).await.is_none() {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::CacheMiss, rate_per_mb)
+                .await;
+        }
+
         // Resolve the lane key early. The seller keys a lane by
         // `(pool_id, bound_signer, this operator)` (brief §E1): `pool_id` from
         // the request, the signer from the verified client binding, the provider

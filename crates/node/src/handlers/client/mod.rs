@@ -791,6 +791,11 @@ pub struct ClientHandlerDeps {
     /// drop. `None` (the default and in tests) keeps the floor accounting in-memory
     /// only.
     pub floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+    /// Origin-only policy (#1759). When `false`, `serve_stream` declines any
+    /// hash its own backend does not hold — including a cache HIT for a
+    /// foreign hash — before any discovery, lane accounting, or spend. `true`
+    /// (the default) preserves today's relay behavior.
+    pub relay_foreign_namespaces: bool,
 }
 
 impl std::fmt::Debug for ClientHandlerDeps {
@@ -852,6 +857,7 @@ impl ClientHandlerDeps {
             idle_timeout: None,
             pool_recheck_interval: None,
             floor_loss_store: None,
+            relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
         }
     }
 }
@@ -999,6 +1005,10 @@ pub struct ClientHandler {
     /// [`crate::pool_view::POOL_RECHECK_INTERVAL`]; a shorter value is set at
     /// construction via [`ClientHandlerDeps`] only by tests.
     pool_recheck_interval: Option<Duration>,
+    /// Origin-only policy (#1759), set at construction via
+    /// [`ClientHandlerDeps::relay_foreign_namespaces`]. Read by the gate at the
+    /// top of `serve_stream`.
+    relay_foreign_namespaces: bool,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -1099,6 +1109,7 @@ impl ClientHandler {
             deposit_refusal_suppressed: AtomicU64::new(0),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
+            relay_foreign_namespaces: deps.relay_foreign_namespaces,
         })
     }
 

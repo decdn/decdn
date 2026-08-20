@@ -1154,6 +1154,8 @@ async fn build_chain_and_handlers(
     // Hint the settlement service on each accepted voucher so a lane's accrued
     // claim is planned into a chunk promptly rather than waiting the self-tick.
     client_deps.redeem_hint = Some(redeem_tx.clone());
+    // Origin-only policy (#1759): backend-authoritative own/foreign decision.
+    client_deps.relay_foreign_namespaces = cfg.cache.relay_foreign_namespaces;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -3533,6 +3535,7 @@ mod tests {
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
+                relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
                 node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_timeout_sec:

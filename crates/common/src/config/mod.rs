@@ -201,6 +201,12 @@ pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
 /// Bounds memo memory under a random-hash probe flood.
 pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
 
+/// Default for `cache.relay_foreign_namespaces` (#1759): relay foreign
+/// content by default, preserving today's behavior. An operator flips this
+/// to `false` to run an origin-only node that serves and seeds only content
+/// its own backend holds.
+pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
+
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
 /// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
 /// origin-set staleness (there is no event tail); 5 min matches the negative
@@ -1717,6 +1723,9 @@ fn resolve_cache_into(
     let node_to_node_pull_through_enabled = file
         .and_then(|c| c.node_to_node_pull_through_enabled)
         .unwrap_or(false);
+    let relay_foreign_namespaces = file
+        .and_then(|c| c.relay_foreign_namespaces)
+        .unwrap_or(DEFAULT_RELAY_FOREIGN_NAMESPACES);
     let node_pull_probe_fanout = file
         .and_then(|c| c.node_pull_probe_fanout)
         .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
@@ -1770,6 +1779,7 @@ fn resolve_cache_into(
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
+        relay_foreign_namespaces,
         node_pull_probe_fanout,
         node_pull_timeout_sec,
         node_pull_stall_timeout_sec,
