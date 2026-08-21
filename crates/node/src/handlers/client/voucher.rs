@@ -571,7 +571,7 @@ impl ClientHandler {
     /// The pinned-signer gate — a bundle leaks a lane's private watermark, so
     /// only a request that recovers to `state.signer` may pull it, otherwise
     /// anyone who guessed the chain-derivable `pool_id` could — is enforced by
-    /// the caller: [`Self::commit_one_voucher`] recovers and verifies the signer
+    /// the caller: [`Self::commit_one_proof`] recovers and verifies the signer
     /// against `state.signer` OUTSIDE the per-lane lock before this runs (#1735).
     /// A voucher that recovers to a different address is rejected as `WrongSigner`
     /// and never reaches here, so re-recovering under the lock would only re-do
@@ -623,7 +623,7 @@ mod tests {
 
     /// A well-formed voucher verifies against a fresh lane and advances the
     /// candidate state to the voucher's cumulative amount/bytes — the pure,
-    /// no-I/O half of [`super::ClientHandler::commit_one_voucher`]. The
+    /// no-I/O half of [`super::ClientHandler::commit_one_proof`]. The
     /// read→verify→record path over real streams (durability included) is
     /// covered end to end by the `client_loopback` integration family.
     #[tokio::test]

@@ -115,6 +115,12 @@ impl PoolSession {
         );
         self.ctx.prior_bytes_delivered = bytes_delivered;
         self.ctx.prior_amount = amount;
+        // Carry the lane's chain epoch forward too. Every fetch on this session
+        // builds a fresh ledger from `ctx`, so a stale counter re-derives the
+        // seed the previous fetch already used — and the node, still holding
+        // that root at a non-zero frontier, treats every reveal under it as
+        // already covered. The delivery then stalls with nothing crediting it.
+        self.ctx.prior_epoch = self.ctx.prior_epoch.max(progress.next_epoch());
         Ok(())
     }
 }

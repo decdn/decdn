@@ -66,7 +66,9 @@ pub mod source;
 
 pub use driver::{PacingWait, drive};
 pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released};
-pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer};
+pub use pacer::{
+    BudgetPacer, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
+};
 pub use ranged_store::ClientRangedStore;
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
 

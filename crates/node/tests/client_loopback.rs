@@ -4166,7 +4166,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
 
 /// A `PoolStateStore` that hydrates its seeded channels (so vouchers reach
 /// the apply path) but fails every `record` — exercises the store-record
-/// failure path in [`ClientHandler::commit_one_voucher`].
+/// failure path in [`ClientHandler::commit_one_proof`].
 #[derive(Debug)]
 struct FailingRecordStore {
     inner: MemoryPoolStateStore,
@@ -4194,7 +4194,7 @@ impl PoolStateStore for FailingRecordStore {
 
 /// A `record` failure is now a hard serve fault, not a clean in-band rejection:
 /// the buffered lane store's `record` is expected to fail only on a poisoned
-/// mutex (ADR 003 §Off-chain voucher state persistence), so `commit_one_voucher`
+/// mutex (ADR 003 §Off-chain voucher state persistence), so `commit_one_proof`
 /// treats it as a fault and aborts the stream rather than writing a `StreamError`
 /// frame — the client sees a transport-level failure, and the store never
 /// observes the advanced watermark.

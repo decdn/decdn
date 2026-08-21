@@ -23,6 +23,24 @@
 
 use alloy::primitives::U256;
 use decdn_bao_range::CHUNK_GROUP_BYTES;
+use decdn_protocol::client::CHUNK_BYTES;
+
+/// The smallest pull window that keeps the fused serve-miss loop live.
+///
+/// [`RampPacer`] paces the pull in CONTENT bytes against
+/// [`PaceState::served_paid_frontier`], which
+/// [`content_paid_frontier`](crate::sink::content_paid_frontier) derives from PAID
+/// WIRE by flooring to a chunk-group boundary; [`WindowPacer`] then floors its own
+/// room to whole groups. Two group-sized roundings therefore sit between what the
+/// client has paid for and what the pull may fetch next, while the client releases
+/// its next proof only once a whole [`CHUNK_BYTES`] of WIRE has arrived.
+///
+/// A window of exactly one chunk loses more to those roundings than the wire's
+/// interleaved proof bytes hand back, so the pull parks with the client short of
+/// the chunk it must complete to pay — a payment that can then never come. Carrying
+/// both roundings on top of the chunk closes that gap at every window size, because
+/// the ramp only ever widens the window above this floor.
+pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 2 * CHUNK_GROUP_BYTES;
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a
 /// [`Pacer`] needs and nothing it must fetch. Plain `Copy` data so a decision is
@@ -243,7 +261,8 @@ impl Pacer for RampPacer {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
     use super::{
-        BudgetPacer, CHUNK_GROUP_BYTES, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
+        BudgetPacer, CHUNK_BYTES, CHUNK_GROUP_BYTES, PULL_WINDOW_FLOOR, PaceDecision, PaceState,
+        Pacer, RampPacer, WindowPacer,
     };
     use alloy::primitives::U256;
 
@@ -474,5 +493,49 @@ mod tests {
         s.served_paid_frontier = 32 * CHUNK_GROUP_BYTES;
         s.pulled_frontier = floor;
         assert!(matches!(pacer.decide(&s), PaceDecision::Draw { .. }));
+    }
+
+    /// The liveness invariant `PULL_WINDOW_FLOOR` exists to hold: a pull window
+    /// must clear one payment chunk by BOTH group roundings that separate paid
+    /// wire from drawable content — `content_paid_frontier`'s floor to a group
+    /// boundary, and `WindowPacer`'s floor of its own room to whole groups.
+    ///
+    /// Modelled at the worst case for each: the served-paid frontier lags the
+    /// client's true paid position by a full group, and the room the pacer grants
+    /// loses another. What survives must still be a whole chunk, or the client can
+    /// never complete the chunk whose payment would widen the window.
+    #[test]
+    fn the_pull_window_floor_clears_one_chunk_after_both_group_roundings() {
+        let survives = PULL_WINDOW_FLOOR - 2 * CHUNK_GROUP_BYTES;
+        assert!(
+            survives >= CHUNK_BYTES,
+            "a {PULL_WINDOW_FLOOR}-byte floor leaves only {survives} bytes after both \
+             roundings, short of the {CHUNK_BYTES}-byte chunk the client must complete \
+             to pay — the pull would park forever"
+        );
+    }
+
+    /// The same invariant, exercised through the pacer rather than by arithmetic:
+    /// with the window at the floor and the pull parked exactly one chunk past a
+    /// group-lagged paid frontier, the pacer must still grant a draw. A window of
+    /// exactly one chunk does not, which is the deadlock this floor removes.
+    #[test]
+    fn at_the_floor_a_pull_one_chunk_ahead_may_still_draw() {
+        let pacer = RampPacer {
+            divisor: 2,
+            floor: PULL_WINDOW_FLOOR,
+            credit_max: 64 * CHUNK_BYTES,
+        };
+        let mut s = healthy();
+        s.requested_bytes = 64 * CHUNK_BYTES;
+        // The frontier the serve leg publishes trails the client's real paid
+        // position by up to one group (`content_paid_frontier` floors to one).
+        s.served_paid_frontier = 0;
+        s.pulled_frontier = CHUNK_BYTES;
+        assert!(
+            matches!(pacer.decide(&s), PaceDecision::Draw { .. }),
+            "the pull must be able to feed the client past the chunk boundary it \
+             pays at, or neither side can move"
+        );
     }
 }

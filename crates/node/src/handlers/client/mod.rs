@@ -129,7 +129,7 @@ struct LaneDeliveryState {
     active_streams: Arc<AtomicU32>,
     /// Wall-clock (Unix milliseconds) of the last accepted voucher on this lane,
     /// or `0` when this process has accepted none since it hydrated the lane
-    /// (issue #1733). Stamped by [`ClientHandler::commit_one_voucher`] under the
+    /// (issue #1733). Stamped by [`ClientHandler::commit_one_proof`] under the
     /// per-lane lock it already holds — a field write, not a separate global
     /// mutex — and read back by [`LaneActivityClock::ages`] for the admin
     /// "seconds since last voucher" readout. Best-effort liveness bookkeeping:
@@ -1706,7 +1706,7 @@ impl ClientHandler {
 }
 
 /// Terminal disposition of one voucher collected by
-/// [`ClientHandler::commit_one_voucher`].
+/// [`ClientHandler::commit_one_proof`].
 enum VoucherStop {
     /// Verified and advanced in memory; keep serving. `credited_bytes` is the
     /// watermark-capped wire bytes to advance the serve loop's `paid` by (rule
@@ -1818,22 +1818,6 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
     }
 }
 
-/// Cancellation-safe, buffered reader for `cdn/client/v1` voucher frames. Owns
-/// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
-/// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
-/// frame stays buffered for the next call.
-///
-/// [`read_frame`] is built on `read_exact` and is NOT cancellation-safe — a
-/// `timeout` firing mid-frame would drop already-consumed bytes and desync the
-/// stream. Reading instead via the cancel-safe [`tokio::io::AsyncReadExt::read`]
-/// into an owned buffer, then splitting whole frames off it with
-/// [`decdn_protocol::framing::parse_frame`], keeps every byte. Borrows the
-/// `RecvStream` per call so the caller retains it for stream teardown.
-///
-/// All voucher reads on a given stream MUST go through ONE instance: it may read
-/// ahead (buffering the next pipelined voucher, #1486) while the current one is
-/// verified and recorded, and a second reader on the same `RecvStream` would
-/// lose those buffered bytes.
 /// How many proofs the recoup phase will read for ONE outstanding chunk before
 /// it gives up.
 ///
@@ -1871,6 +1855,22 @@ pub(super) enum Proof {
     Preimage(decdn_protocol::client::ChunkPreimage),
 }
 
+/// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
+/// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
+/// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
+/// frame stays buffered for the next call.
+///
+/// [`read_frame`] is built on `read_exact` and is NOT cancellation-safe — a
+/// `timeout` firing mid-frame would drop already-consumed bytes and desync the
+/// stream. Reading instead via the cancel-safe [`tokio::io::AsyncReadExt::read`]
+/// into an owned buffer, then splitting whole frames off it with
+/// [`decdn_protocol::framing::parse_frame`], keeps every byte. Borrows the
+/// `RecvStream` per call so the caller retains it for stream teardown.
+///
+/// All proof reads on a given stream MUST go through ONE instance: it may read
+/// ahead (buffering the next pipelined proof, #1486) while the current one is
+/// verified and recorded, and a second reader on the same `RecvStream` would
+/// lose those buffered bytes.
 #[derive(Default)]
 pub(super) struct BufferedProofReader {
     /// Unconsumed bytes read from the stream, at a frame boundary or partway

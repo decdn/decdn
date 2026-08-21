@@ -107,7 +107,8 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///      authorized key `redeem` validates against; `provider` binds it to
     ///      a single payee, so one node cannot redeem another node's voucher.
     bytes32 public constant VOUCHER_TYPEHASH = keccak256(
-        "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,bytes32 chainRoot,uint256 chunkPrice)"
+        "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,"
+        "uint256 bytesDelivered,bytes32 chainRoot,uint256 chunkPrice)"
     );
 
     /// @notice The EIP-712 domain separator this contract's capabilities and

@@ -1453,10 +1453,12 @@ where
         signer: self_address,
         provider,
     };
-    let (prior_bytes, prior_amount) = store
+    let (prior_bytes, prior_amount, prior_epoch) = store
         .get_by_pool_id(pool_id)?
         .and_then(|state| state.lane_progress(lane))
-        .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
+        .map_or((U256::ZERO, U256::ZERO, 0), |p| {
+            (p.last_bytes, p.last_amount, p.next_epoch)
+        });
 
     // A transient state carrying the informational pool facts the context reads
     // (`pool_id`, `deposit`); it is not persisted (the delegate owns no pool row).
@@ -1470,6 +1472,7 @@ where
     let state = BuyerPoolState::new(pool_id, pool.owner, token, U256::from(pool.deposit));
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
+        .with_chain_epoch(prior_epoch)
         .with_capability(signed_capability);
     attach_client_binding(ctx, chain, endpoint, signer)
 }
@@ -1526,9 +1529,11 @@ where
             signer: self_address,
             provider,
         };
-        let (prior_bytes, prior_amount) = state
+        let (prior_bytes, prior_amount, prior_epoch) = state
             .lane_progress(lane)
-            .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
+            .map_or((U256::ZERO, U256::ZERO, 0), |p| {
+                (p.last_bytes, p.last_amount, p.next_epoch)
+            });
 
         // Auto-refill a live pool whose remaining deposit has run low, so a
         // sustained series of fetches isn't stranded by a spent-down deposit.
@@ -1587,6 +1592,8 @@ where
         return Ok(
             PoolContext::for_pool(&state, Arc::clone(signer), voucher_domain.clone())
                 .with_provider(provider, prior_bytes, prior_amount)
+                .with_chain_epoch(prior_epoch)
+                .with_chain_epoch(prior_epoch)
                 .with_capability(capability),
         );
     }

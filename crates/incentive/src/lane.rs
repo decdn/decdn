@@ -392,18 +392,24 @@ impl LaneState {
     /// - A lane holding **no signature yet** adopts this voucher as its anchor.
     ///
     /// That last one is what makes the chain redeemable at all. A claim is a
-    /// signed anchor extended by a frontier, so a lane that installed a root
-    /// without keeping the signature that committed it would hold a frontier it
-    /// could prove but never submit. The anchor is only adopted when there is
-    /// none: a lane with a signature is already at or above this voucher's
-    /// cumulative, by the branch that got us here.
+    /// signed anchor extended by a frontier, and the contract rebuilds the
+    /// EIP-712 digest from BOTH halves — so the chain fields and the signature
+    /// have to come from the same voucher. Installing a root beside an older
+    /// voucher's signature yields a claim that recovers the wrong signer and
+    /// reverts `InvalidVoucherSignature` at redemption.
     ///
-    /// A non-advancing voucher never *retires* a live chain. It has not paid for
-    /// the frontier that chain has proved, so it has no authority to end it —
-    /// and retiring one would strand every sibling stream still metering against
-    /// it. A genuine rollover always advances the money (its `amount` folds the
-    /// retired chain's frontier in), so it goes through [`Self::advance_presigned`]
-    /// instead, where the fold and the retirement are decided together.
+    /// That pairing is what bounds this method. It adopts a **new** root only
+    /// when the incoming voucher re-asserts the lane's own watermark exactly, so
+    /// taking it as the anchor regresses nothing, and only when the live chain
+    /// has proved **nothing**: a chain at index 0 is worth exactly its anchor,
+    /// which this voucher's own signature already covers, so retiring it strands
+    /// no value. A chain with reveals under it is worth more than its anchor, and
+    /// a voucher that did not pay for that difference has no authority to end it.
+    ///
+    /// A genuine rollover always advances the money — its `amount` folds the
+    /// retired chain's frontier in — so it goes through
+    /// [`Self::advance_presigned`] instead, where the fold and the retirement are
+    /// decided together.
     ///
     /// Returns `None` when nothing changed, so the caller can skip a needless
     /// store write.
@@ -413,27 +419,44 @@ impl LaneState {
         if chain_root.is_zero() {
             return None;
         }
-        let same_root = self.chain.chain_root == chain_root;
-        if !same_root && !self.chain.chain_root.is_zero() {
-            return None;
-        }
-        let refresh_price = self.chain.chunk_price != signed.voucher.chunk_price;
-        let adopt_anchor = self.last_signature.is_none();
-        if same_root && !refresh_price && !adopt_anchor {
-            return None;
+        let mut next = self.clone();
+        if self.chain.chain_root == chain_root {
+            // Same epoch re-asserted. The price is restated by every voucher
+            // naming the root, and the first such voucher on a lane that holds
+            // no signature yet becomes its anchor.
+            let refresh_price = self.chain.chunk_price != signed.voucher.chunk_price;
+            let adopt_anchor = self.last_signature.is_none();
+            if !refresh_price && !adopt_anchor {
+                return None;
+            }
+            next.chain.chunk_price = signed.voucher.chunk_price;
+            if adopt_anchor {
+                next.last_amount = signed.voucher.amount;
+                next.last_bytes_delivered = signed.voucher.bytes_delivered;
+                next.last_signature = Some(signed.signature.as_bytes());
+            }
+            return Some(next);
         }
 
-        let mut next = self.clone();
-        if same_root {
-            next.chain.chunk_price = signed.voucher.chunk_price;
-        } else {
-            next.chain = LaneChain::opened(chain_root, signed.voucher.chunk_price);
+        // A NEW root. This is not a corner case: a lane whose previous transfer
+        // closed on a rollover sits at index 0 under the retired root, and the
+        // next transfer's opening voucher re-asserts the same cumulative while
+        // naming a fresh one. Refusing would leave the lane metering a root the
+        // payer has abandoned, and every reveal that followed would fold nothing.
+        if self.chain.verified_index > 0 {
+            return None;
         }
-        if adopt_anchor {
-            next.last_amount = signed.voucher.amount;
-            next.last_bytes_delivered = signed.voucher.bytes_delivered;
-            next.last_signature = Some(signed.signature.as_bytes());
+        // The root and the signature that commits it are adopted together or not
+        // at all, so the voucher must stand exactly at the lane's watermark.
+        // Anything else is a stale voucher, and taking its anchor would walk the
+        // watermark backwards.
+        if signed.voucher.amount != self.last_amount
+            || signed.voucher.bytes_delivered != self.last_bytes_delivered
+        {
+            return None;
         }
+        next.chain = LaneChain::opened(chain_root, signed.voucher.chunk_price);
+        next.last_signature = Some(signed.signature.as_bytes());
         Some(next)
     }
 
@@ -1627,6 +1650,90 @@ mod tests {
         anyhow::ensure!(
             claim.bytes_value() == U256::from(255u64) * U256::from(crate::chain::CHUNK_BYTES)
         );
+        Ok(())
+    }
+
+    /// A second transfer on a lane whose previous one closed on a rollover
+    /// opens a fresh epoch through the ALREADY-SATISFIED path: the opening
+    /// voucher re-asserts the cumulative the lane already holds, so it advances
+    /// no money, but it still has to install the root it names. Refusing would
+    /// leave the lane metering the abandoned root, and every reveal that
+    /// followed would fold nothing — the delivery stalls with the node holding
+    /// a chain the payer no longer has a seed for.
+    #[test]
+    fn a_non_advancing_voucher_replaces_a_chain_that_proved_nothing() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+
+        // A fresh root at the SAME cumulative — nothing was metered under the
+        // old one, so there is nothing to lose by retiring it.
+        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
+        let opening =
+            build_metering(signer.address(), 1_000, 0, next_root, PRICE).sign(&signer, &domain)?;
+        let adopted = state
+            .adopt_chain(&opening)
+            .ok_or_else(|| anyhow::anyhow!("an unproved chain must yield to a fresh root"))?;
+        anyhow::ensure!(adopted.chain().chain_root == next_root);
+        anyhow::ensure!(adopted.chain().verified_index == 0);
+        // The root and the signature MUST come from the same voucher: the
+        // contract rebuilds the digest from both, so a claim pairing a fresh
+        // root with the previous voucher's signature recovers the wrong signer
+        // and reverts `InvalidVoucherSignature` on-chain.
+        let claim = adopted
+            .strongest_claim()
+            .ok_or_else(|| anyhow::anyhow!("an adopted anchor is a claim"))?;
+        let rebuilt = SignedVoucher {
+            voucher: Voucher {
+                pool_id: POOL_ID,
+                signer: signer.address(),
+                provider: PROVIDER,
+                amount: claim.amount,
+                bytes_delivered: claim.bytes_delivered,
+                chain_root: claim.chain.chain_root,
+                chunk_price: claim.chain.chunk_price,
+            },
+            signature: alloy::primitives::Signature::from_raw(&claim.signature)
+                .map_err(|e| anyhow::anyhow!("claim signature is malformed: {e}"))?,
+        };
+        rebuilt.verify_signer(signer.address(), &domain)?;
+
+        // And the new epoch meters for real.
+        let (next, applied) = adopted.advance_preimage(
+            next_root,
+            1,
+            crate::chain::preimage_at(B256::repeat_byte(0x6E), 1),
+        )?;
+        anyhow::ensure!(applied.advanced());
+        anyhow::ensure!(next.owed() == U256::from(1_000 + PRICE));
+        Ok(())
+    }
+
+    /// The other side of that rule: a chain with reveals under it is worth more
+    /// than its anchor, and a voucher that did not pay for the difference has no
+    /// authority to retire it. Otherwise a stale or replayed voucher could strand
+    /// a frontier the node has already proved.
+    #[test]
+    fn a_non_advancing_voucher_cannot_retire_a_proved_chain() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (proved, _) = state.advance_preimage(root(), 4, reveal(4))?;
+
+        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
+        let stale =
+            build_metering(signer.address(), 1_000, 0, next_root, PRICE).sign(&signer, &domain)?;
+        anyhow::ensure!(
+            proved.adopt_chain(&stale).is_none(),
+            "a proved frontier must survive a voucher that paid nothing for it"
+        );
+        anyhow::ensure!(proved.owed() == U256::from(1_000 + 4 * PRICE));
         Ok(())
     }
 

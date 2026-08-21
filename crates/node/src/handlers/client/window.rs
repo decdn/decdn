@@ -90,6 +90,13 @@ impl ClientHandler {
         // loop and the pull-leg `RampPacer` both enforce (#1669).
         let credit_floor = self.credit_window(chunk_bytes, 0);
 
+        // The pull leg paces in CONTENT bytes while the client pays in WIRE bytes,
+        // and two chunk-group roundings sit between the two (see
+        // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
+        // the reservation and the serve loop, which both meter in wire and need no
+        // such allowance.
+        let pacing_floor = credit_floor.max(decdn_client_pull::PULL_WINDOW_FLOOR);
+
         // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
         // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
         // when the pool's on-chain remaining (`getPool.deposit − totalRedeemed`)
@@ -309,7 +316,7 @@ impl ClientHandler {
                             pull_offset,
                             pull_len,
                             credit_ramp_divisor,
-                            credit_floor,
+                            pacing_floor,
                             credit_max,
                             Arc::clone(&session),
                             cancel,
@@ -465,6 +472,13 @@ impl ClientHandler {
         // both enforce (#1669).
         let credit_floor = self.credit_window(chunk_bytes, 0);
 
+        // The pull leg paces in CONTENT bytes while the client pays in WIRE bytes,
+        // and two chunk-group roundings sit between the two (see
+        // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
+        // the reservation and the serve loop, which both meter in wire and need no
+        // such allowance.
+        let pacing_floor = credit_floor.max(decdn_client_pull::PULL_WINDOW_FLOOR);
+
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
         // pool's on-chain remaining minus the refundable floor `M` cannot cover
@@ -604,7 +618,7 @@ impl ClientHandler {
                             pull_offset,
                             pull_len,
                             credit_ramp_divisor,
-                            credit_floor,
+                            pacing_floor,
                             credit_max,
                             total_bytes,
                             Arc::clone(&session),

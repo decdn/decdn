@@ -7815,10 +7815,14 @@ async fn spawn_node_a(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
-    // 1.5x the pacing window (which floors at `CHUNK_BYTES`, ADR 003
+    // 1.5x the pacing window (which floors at `PULL_WINDOW_FLOOR`, ADR 003
     // §Credit window), so the pull crosses exactly one window boundary and pauses
-    // once, with a real remainder left to resume.
-    let payload_len = usize::try_from(CHUNK_BYTES.saturating_mul(3) / 2).unwrap_or(usize::MAX);
+    // once, with a real remainder left to resume. The window — not `CHUNK_BYTES` —
+    // is what sets the span boundary: the pull leg paces in CONTENT while the
+    // client pays in WIRE, so its floor clears a chunk by both group roundings that
+    // separate the two.
+    let window = decdn_node::client_requester::PULL_WINDOW_FLOOR;
+    let payload_len = usize::try_from(window.saturating_mul(3) / 2).unwrap_or(usize::MAX);
     let payload = vec![0xCDu8; payload_len];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
@@ -7895,9 +7899,9 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     // independently, so the two legs' summed payment is more than a single
     // cumulative ceiling over the whole wire would be.
     let leg1_wire =
-        u64::try_from(honest_bao_wire_range(&payload, 0, CHUNK_BYTES)?.len()).unwrap_or(u64::MAX);
+        u64::try_from(honest_bao_wire_range(&payload, 0, window)?.len()).unwrap_or(u64::MAX);
     let leg2_wire =
-        u64::try_from(honest_bao_wire_range(&payload, CHUNK_BYTES, 0)?.len()).unwrap_or(u64::MAX);
+        u64::try_from(honest_bao_wire_range(&payload, window, 0)?.len()).unwrap_or(u64::MAX);
     let expected_wire = leg1_wire.saturating_add(leg2_wire);
     let per_leg_amount = |wire: u64| -> U256 {
         let mut amount = U256::ZERO;
