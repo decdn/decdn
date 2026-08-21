@@ -871,14 +871,24 @@ async fn run_e2e() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?
         .clone();
 
-    // Re-deliver the same blob on the identical lane, continuing the ledger
-    // from the first delivery's on-chain cumulative totals. No `capability` is
-    // attached this time — the lane already registered on its first delivery,
-    // so a second sweep must resolve the redemption purely from the persisted
-    // `registered_until` watermark rather than a fresh capability grant.
+    // Re-deliver the same blob on the identical lane, continuing the ledger from
+    // the first delivery's cumulative totals as the NODE holds them, not as the
+    // chain shows them. The two differ: a delivery settles over several
+    // redemptions now — the chain meter advances a chunk at a time and the closing
+    // sealed voucher folds the tail — so the on-chain watermark above is whatever
+    // the first redeem to land happened to carry, a prefix of the delivery. A
+    // payer that resumed from a prefix would open its next chain behind the lane's
+    // own watermark, and the node would refuse to anchor it. A real buyer never
+    // has this problem: it resumes from its OWN ledger, which is what
+    // `LaneState::owed` mirrors here.
+    //
+    // No `capability` is attached this time — the lane already registered on its
+    // first delivery, so a second sweep must resolve the redemption purely from
+    // the persisted `registered_until` watermark rather than a fresh capability
+    // grant.
     let second_ctx = PoolContext {
-        prior_bytes_delivered: U256::from(watermark_after_first.bytesDelivered),
-        prior_amount: U256::from(watermark_after_first.amount),
+        prior_bytes_delivered: lane_after_first.owed_bytes(),
+        prior_amount: lane_after_first.owed(),
         capability: None,
         ..ctx.clone()
     };
