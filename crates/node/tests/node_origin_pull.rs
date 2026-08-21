@@ -13665,6 +13665,8 @@ async fn drive_miss_single_candidate(
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -13727,6 +13729,7 @@ async fn drive_miss_single_candidate(
         as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -13860,6 +13863,8 @@ async fn drive_miss_bait_and_switch(
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -13917,6 +13922,7 @@ async fn drive_miss_bait_and_switch(
         as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -14036,6 +14042,8 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let a_limiter = permissive_limiter(&a_metrics);
@@ -14094,6 +14102,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
     )) as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: ab_pool_id,
         deposit: U256::from(LEDGER_DEPOSIT),
         signer: Arc::clone(&b_buyer),
@@ -14156,6 +14165,8 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let handler_b = build_handler_full_configured(
         b_id,
@@ -14185,6 +14196,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         &binding_dom(),
     )?;
     let ctx_client_to_b = PoolContext {
+        prior_epoch: 0,
         pool_id: b_pool_id,
         provider: b_eth.address(),
         deposit: U256::from(LEDGER_DEPOSIT),
@@ -14298,6 +14310,8 @@ async fn attack_b_attempt(
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
+        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let a_limiter = permissive_limiter(&a_metrics);
@@ -14350,6 +14364,7 @@ async fn attack_b_attempt(
         n_max,
     )) as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let buyer = Arc::new(StubOpener {
+        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: ab_pool_id,
         deposit: U256::from(LEDGER_DEPOSIT),
         signer: Arc::clone(&b_buyer),
@@ -14407,6 +14422,8 @@ async fn attack_b_attempt(
                 U256::ZERO,
                 U256::ZERO,
                 None,
+                decdn_incentive::LaneChain::NONE,
+                None,
             ))?;
             lanes.push((pool_id, client_signer));
         }
@@ -14438,6 +14455,7 @@ async fn attack_b_attempt(
                 &binding_dom(),
             )?;
             let ctx = PoolContext {
+                prior_epoch: 0,
                 pool_id,
                 provider: b_eth.address(),
                 deposit: U256::from(LEDGER_DEPOSIT),
