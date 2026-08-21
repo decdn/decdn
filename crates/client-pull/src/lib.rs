@@ -229,8 +229,8 @@ impl PoolContext {
     /// Derive this payer's master chain secret from its voucher signing key.
     ///
     /// Deterministic, so a restart reproduces every live chain with no secret
-    /// kept on disk. Costs one signature per lane setup, against the one per
-    /// 4 MiB the chain replaces.
+    /// kept on disk. Costs one signature per lane setup — negligible against a
+    /// chain that then meters 255 chunks without another.
     ///
     /// # Errors
     ///

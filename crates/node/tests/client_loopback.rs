@@ -2070,8 +2070,7 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
 #[tokio::test(flavor = "multi_thread")]
 async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
-    // ramp floor and the test can settle it with a single closing voucher —
-    // the same shape it had when the floor was a 4 MiB chunk.
+    // ramp floor and the test settles it with a single closing voucher.
     let payload_a = vec![0x71u8; 512 * 1024];
     let payload_b = vec![0x82u8; 256 * 1024];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -2155,8 +2154,7 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
 #[tokio::test(flavor = "multi_thread")]
 async fn finished_stream_releases_its_lane_slot() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
-    // ramp floor and the test can settle it with a single closing voucher —
-    // the same shape it had when the floor was a 4 MiB chunk.
+    // ramp floor and the test settles it with a single closing voucher.
     let payload_a = vec![0x71u8; 512 * 1024];
     let payload_b = vec![0x82u8; 256 * 1024];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -2296,8 +2294,7 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     // Each blob stays inside ONE chunk of wire, so the whole delivery rides the
-    // ramp floor and the test can settle it with a single closing voucher —
-    // the same shape it had when the floor was a 4 MiB chunk.
+    // ramp floor and the test settles it with a single closing voucher.
     let payload_a = vec![0x71u8; 512 * 1024];
     let payload_b = vec![0x82u8; 256 * 1024];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -2641,8 +2638,8 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// attempt to serve.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
-    // 6 MiB — crosses one 4 MiB chunk, leaving a closing remainder,
-    // so the transfer needs exactly two vouchers.
+    // 6 MiB — several whole chunks plus a closing remainder, so the transfer
+    // meters a run of reveals and then settles the tail with a signature.
     let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -3660,7 +3657,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 /// window's cost at `RATE_PER_MB`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
-    // 6 MiB — larger than one credit window (the fixed 4 MiB chunk).
+    // 6 MiB — larger than one credit window (the ramp floor, one chunk).
     let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let window_cost = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
@@ -3835,7 +3832,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
         None,
     ))?;
 
-    // Pool remaining exactly covers the one-interval floor, not the 64 MiB ceiling.
+    // Pool remaining exactly covers the one-chunk floor, not the 64 MiB ceiling.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, _server_eth, server_ep, server_task, _metrics) = spawn_handler_server_with_pool(
         cache,
@@ -3898,7 +3895,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         None,
     ))?;
 
-    // Pool remaining covers only the first 4 MiB chunk of the 8 MiB ceiling.
+    // Pool remaining covers only the first chunk of the 8 MiB ceiling.
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, _server_eth, server_ep, server_task, metrics) = spawn_handler_server_with_pool(
         cache,

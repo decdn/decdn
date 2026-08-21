@@ -330,17 +330,17 @@ fn topup_fetch_argv_with_deposits(
 //     refundable floor `M` (default 1 USDC) covers the reserved CREDIT WINDOW.
 //     The gate prices a cold, unbounded request at `paid = 0` (ADR 003
 //     §Credit window, #1669), which the ramp collapses to its floor — exactly
-//     ONE fixed 4 MiB voucher accounting interval
-//     (`decdn_protocol::client::CHUNK_BYTES`); at `MULTI_RATE_PER_MB`
-//     that floor costs 4 * 2_000_000 = 8 USDC, so the deposit must clear
-//     8 USDC + M = 9 USDC just to open. 18 USDC clears this with room to spare.
+//     ONE chunk (`decdn_protocol::client::CHUNK_BYTES`, 1 MiB); at
+//     `MULTI_RATE_PER_MB` that floor costs 1 * 2_000_000 = 2 USDC, so the
+//     deposit must clear 2 USDC + M = 3 USDC just to open. 18 USDC clears this
+//     with room to spare.
 //   * Yet it must stay below the whole ~9 MiB blob's cost (~19 USDC) so a later
 //     voucher exhausts it mid-stream and the reactive top-up fires.
 //
-// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 8), two whole 4 MiB
-// intervals are delivered and accepted (cumulative 16 USDC ≤ 18), and the
-// partial third — the blob is just over two intervals — is the one that
-// genuinely exhausts the deposit. It also stays clear of the reuse-time
+// 18 USDC threads both: the stream opens (18 − 1 = 17 ≥ 2), nine whole chunks
+// are delivered and metered (cumulative 18 USDC), and the partial tail — the
+// blob is just over nine chunks — is the one that genuinely exhausts the
+// deposit. It also stays clear of the reuse-time
 // low-water auto-refill (#1103): this test pre-opens and pre-records the pool,
 // and on the CLI's one invocation the pool's full 18 USDC remaining sits above
 // the low-water trigger (working / LOW_WATER_DIVISOR = 3.6 USDC), so no
@@ -373,10 +373,9 @@ async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> 
     Ok(())
 }
 
-/// A deterministic blob spanning just over two whole 4 MiB chunks
-/// (the daemon's default cadence), so two full intervals are delivered and
-/// accepted before a small partial third exhausts
-/// `MULTI_WORKING_DEPOSIT_MICRO_USDC`.
+/// A deterministic blob spanning just over nine whole `CHUNK_BYTES` chunks, so
+/// nine full chunks are delivered and metered before a small partial tail
+/// exhausts `MULTI_WORKING_DEPOSIT_MICRO_USDC`.
 fn make_multi_interval_blob() -> Vec<u8> {
     let mut v = vec![0u8; 9 * 1024 * 1024 + 777];
     let mut x: u32 = 0x2468_ac13;
@@ -403,9 +402,8 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
-    // A blob spanning just over two whole 4 MiB chunks, so two full
-    // intervals get delivered and accepted before a small partial tail
-    // exhausts the deposit.
+    // A blob spanning just over nine whole chunks, so nine full chunks get
+    // delivered and metered before a small partial tail exhausts the deposit.
     let blob = make_multi_interval_blob();
     let blob_hash = Hash::new(&blob);
     let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
@@ -598,8 +596,8 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // LESS than one group of already-paid content; two groups of headroom above
     // `wire_floor` also covers the resumed leg's own left-boundary proof hashes
     // (~log2(groups) × 64 B) and the handful of per-voucher `ceil` roundings —
-    // and is still ~250× below a single re-paid 4 MiB chunk, which is
-    // what a genuine double-pay would add.
+    // and is still far below a single re-paid chunk, which is what a genuine
+    // double-pay would add.
     let one_group_cost = ceil_cost(decdn_bao_range::CHUNK_GROUP_BYTES);
     let ceiling = wire_floor.saturating_add(one_group_cost.saturating_mul(U256::from(2u64)));
 
@@ -654,23 +652,23 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // verified on-disk prefix, `set_len` zero-extending the partial, and the whole-file
 // hash check failing a fetch that was already paid for.
 //
-// Sizing, at `TWO_TOPUP_RATE_PER_MB` and the daemon's default 4 MiB voucher
-// interval, so exactly two reactive top-ups are needed:
+// Sizing, at `TWO_TOPUP_RATE_PER_MB` and the protocol's fixed `CHUNK_BYTES`
+// quantum, so exactly two reactive top-ups are needed:
 //
 //   * The node's pre-serve deposit gate (#1518) refuses to serve unless headroom
 //     covers the reserved credit window. For a cold, unbounded request the ramp
-//     (ADR 003 §Credit window, #1669) prices at `paid = 0`, its floor — one 4 MiB
-//     interval, 4 * 2_000_000 = 8_000_000 µUSDC at the quoted rate. So the
-//     deposit must clear that floor (plus `M`), or the resumed open after a
-//     top-up is refused instead of served. 16M clears it with headroom — the
-//     number below is driven by the delivery arithmetic, not by this floor.
-//   * Vouchers accumulate 8_000_000 µUSDC per whole 4 MiB interval. Starting at a
-//     16_000_000 deposit: vouchers 1-2 are accepted (cumulative 8M, then exactly
-//     16M — the gate is `>`, so an exact match still clears), and voucher 3 (24M)
-//     exhausts it. Each top-up restores headroom to the full 16_000_000 working
-//     deposit, buying two more intervals. A ~20 MiB blob costs ~40_300_000 µUSDC
-//     of wire, which lands strictly between the deposit plus one top-up (32M — so
-//     a second top-up IS required) and the deposit plus two top-ups (48M — so two
+//     (ADR 003 §Credit window, #1669) prices at `paid = 0`, its floor — one
+//     chunk, 1 * 2_000_000 = 2_000_000 µUSDC at the quoted rate. So the deposit
+//     must clear that floor (plus `M`), or the resumed open after a top-up is
+//     refused instead of served. 16M clears it with headroom — the number below
+//     is driven by the delivery arithmetic, not by this floor.
+//   * The claim accumulates 2_000_000 µUSDC per whole chunk, so a 16_000_000
+//     deposit buys eight chunks before the ninth exhausts it. Each top-up
+//     restores headroom to the full 16_000_000 working deposit, buying eight
+//     more. The quantum sets only the granularity of that walk; what decides the
+//     top-up COUNT is the total: a ~20 MiB blob costs ~40_300_000 µUSDC of wire,
+//     which lands strictly between the deposit plus one top-up (32M — so a
+//     second top-up IS required) and the deposit plus two top-ups (48M — so two
 //     suffice, inside the `MAX_TOPUP_ATTEMPTS` budget of 3).
 //
 // The money bound is the same two-sided WIRE band the single-top-up test uses, and
@@ -681,9 +679,9 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // left-boundary proof hashes.
 
 const TWO_TOPUP_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, as above
-// Must clear the ramp-floor 4 MiB credit window at the rate above
-// (8_000_000 µUSDC) — sized well above that floor for the delivery
-// arithmetic explained above.
+// Must clear the ramp-floor one-chunk credit window at the rate above
+// (2_000_000 µUSDC) — sized well above that floor for the delivery arithmetic
+// explained above.
 const TWO_TOPUP_WORKING_MICRO_USDC: u64 = 16_000_000;
 /// Just over 20 MiB: costs more than the deposit plus one top-up (forcing a
 /// SECOND top-up) and less than the deposit plus two top-ups (so two are enough).
@@ -889,9 +887,9 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
         .wire_len();
     let wire_floor = ceil_cost(whole_wire);
     // Two conservative resumes, each re-fetching strictly under one 16 KiB chunk
-    // group, plus each resumed leg's left-boundary proof path and the per-voucher
+    // group, plus each resumed leg's left-boundary proof path and the per-proof
     // `ceil` roundings. Four groups of headroom covers all of it and is still far
-    // below the 8_000_000 a single re-paid 4 MiB interval would add.
+    // below the 2_000_000 a single re-paid chunk would add.
     let one_group_cost = ceil_cost(decdn_bao_range::CHUNK_GROUP_BYTES);
     let ceiling = wire_floor.saturating_add(one_group_cost.saturating_mul(U256::from(4u64)));
 
@@ -914,7 +912,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     anyhow::ensure!(
         settled_amount <= ceiling,
         "double-pay across two top-ups: settled {settled_amount} µUSDC against a whole-blob WIRE cost of \
-         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid 4 MiB interval would add 8000000"
+         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid chunk would add 2000000"
     );
 
     // Both top-ups landed on-chain and are reflected locally. Each one restores

@@ -402,7 +402,7 @@ impl ClientHandler {
             // on-chain redeem is the backstop), exactly like the admission gate and
             // the takedown funder resolution.
             //
-            // The check runs on a WALL-CLOCK cadence, not at every 4 MiB voucher
+            // The check runs on a WALL-CLOCK cadence, not at every chunk
             // boundary: the projection only advances as the settlement watcher
             // folds redeem events, so re-reading it faster than that returns the
             // same value (wasted `pool_floor` lock reads on the fastest streams),

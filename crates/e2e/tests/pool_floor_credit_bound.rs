@@ -88,11 +88,13 @@ use iroh::{Endpoint, EndpointAddr};
 /// `render_config`). Left untouched — no `set_rate_per_mb` round trip is
 /// needed since the budget below is derived from this exact value.
 const RATE_PER_MB: u64 = 10;
-/// A blob just over one ramp-floor interval (4 MiB): large enough that a
-/// withheld lane is capped by the credit-window floor itself (delivered ==
-/// reserved bytes, so the accumulator folds exactly one floor's worth of
-/// `dead_charge` on disconnect), never by running out of content early — see
-/// the module doc on why an under-floor blob would under-count the fold.
+/// A blob comfortably past one ramp-floor chunk
+/// (`decdn_protocol::client::CHUNK_BYTES`): large enough that a withheld lane
+/// is capped by the credit-window floor itself (delivered == reserved bytes, so
+/// the accumulator folds exactly one floor's worth of `dead_charge` on
+/// disconnect), never by running out of content early — see the module doc on
+/// why an under-floor blob would under-count the fold. Only the lower bound is
+/// load-bearing; the margin above it costs nothing but transfer time.
 const BLOB_BYTES: usize = 4 * 1024 * 1024 + 65_536;
 /// Owner-delegated finite spend cap on each delegate capability — far above
 /// one floor's cost so it never itself binds; the pool deposit (not this cap)

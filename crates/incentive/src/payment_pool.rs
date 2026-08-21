@@ -132,8 +132,8 @@ mod sol_types {
             /// contract recovers with `ecrecover`, not ERC-1271. Field order
             /// is part of the ABI tuple; do not rearrange.
             ///
-            /// `PayWord` adds three words, for 8 words / 256 calldata bytes per
-            /// lane (ADR 003 §Voucher signatures are compact). `chainMeter`
+            /// The three chain words bring a lane to 8 words / 256 calldata
+            /// bytes (ADR 003 §Voucher signatures are compact). `chainMeter`
             /// is the packing that keeps it at 8 rather than 9:
             ///
             /// ```text

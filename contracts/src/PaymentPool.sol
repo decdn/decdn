@@ -450,8 +450,8 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     ///         one capability it gives up — a voucher signer must be an EOA
     ///         (see `_verifyVoucher`).
     ///
-    ///         `PayWord` adds three words, for **8 words / 256 calldata bytes**
-    ///         per lane (ADR 003 §Voucher signatures are compact). `chainRoot`
+    ///         The three chain words bring a lane to **8 words / 256 calldata
+    ///         bytes** (ADR 003 §Voucher signatures are compact). `chainRoot`
     ///         is the chain head the signer committed, `preimage` is the
     ///         released value being redeemed, and `chainMeter` packs
     ///         `chunkPrice` and `chainIndex` into one word so the struct stays

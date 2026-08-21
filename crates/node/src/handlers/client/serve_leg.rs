@@ -381,7 +381,7 @@ impl ClientHandler {
             // pull leg when this returns, bounding the upstream spend just as the
             // takedown and no-progress exits do.
             //
-            // The check runs on a WALL-CLOCK cadence, not at every 4 MiB voucher
+            // The check runs on a WALL-CLOCK cadence, not at every chunk
             // boundary: the projection only advances as the settlement watcher
             // folds redeem events, so re-reading it faster than that returns the
             // same value (wasted `pool_floor` lock reads on the fastest streams),

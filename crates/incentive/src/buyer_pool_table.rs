@@ -827,11 +827,10 @@ mod tests {
     /// by `(signer, provider)` for a deterministic encoding regardless of
     /// `HashMap` iteration order.
     ///
-    /// `next_epoch` was appended to the lane row for `PayWord` (ADR 003 §One
-    /// chain per lane). That is a deliberate, UNVERSIONED break — deCDN is
-    /// pre-launch with no deployed store to stay compatible with, so
-    /// `BUYER_SUPPORTED_SCHEMA_VERSION` does not bump; the golden simply moves
-    /// with it, which is exactly the tripwire firing as designed.
+    /// The lane row carries `next_epoch` (ADR 003 §One chain per lane), and the
+    /// golden pins it with a non-zero value: a zero would encode to the same
+    /// byte whether the field were read, defaulted, or absent, and prove
+    /// nothing.
     const GOLDEN_RECORD_HEX: &str = concat!(
         "01",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // pool_id

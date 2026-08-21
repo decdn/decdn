@@ -2303,11 +2303,10 @@ contract PaymentPoolTest is Test {
         // Tolerance covers toolchain/compiler-version gas drift without
         // masking a real regression.
         //
-        // Re-pinned for `PayWord` (was 507,093): every lane now carries three
-        // more calldata words and runs `_resolveClaim`. These lanes are all
-        // SEALED vouchers — zero root, zero preimage, zero meter — so the walk
-        // is empty and the added words are pure zero bytes, which is the
-        // cooperative path a finalized delivery actually redeems.
+        // Every lane carries the three chain words and runs `_resolveClaim`.
+        // These lanes are all SEALED vouchers — zero root, zero preimage, zero
+        // meter — so the walk is empty and the three words are pure zero bytes,
+        // which is the cooperative path a finalized delivery actually redeems.
         assertApproxEqAbs(gasUsed, 515_619, 5000, "redeemMany gas for N vouchers drifted from the pinned figure");
     }
 
@@ -2322,8 +2321,8 @@ contract PaymentPoolTest is Test {
         // Pins the per-call gas cited by `DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`'s
         // doc comment (crates/common/src/config/mod.rs): N+1 = 550,993 gas.
         // Tolerance covers toolchain/compiler-version gas drift without
-        // masking a real regression. Re-pinned for `PayWord` (was 541,614);
-        // see `test_redeemMany_gas_NVouchers` for what moved.
+        // masking a real regression. See `test_redeemMany_gas_NVouchers` for
+        // what the per-lane figure covers.
         assertApproxEqAbs(gasUsed, 550_993, 5000, "redeemMany gas for N+1 vouchers drifted from the pinned figure");
     }
 
@@ -2381,7 +2380,6 @@ contract PaymentPoolTest is Test {
         // Pinned from an actual `forge test -vv` run on this branch. Includes
         // N owner-signed capability registrations plus N cold voucher
         // settlements in one call.
-        // Re-pinned for `PayWord` (was 795,817).
         assertApproxEqAbs(
             gasUsed, 804_352, 8000, "redeemMany gas for first-time N vouchers drifted from the pinned figure"
         );
@@ -2400,7 +2398,6 @@ contract PaymentPoolTest is Test {
         assertLt(gasUsed, 3_000_000, "sanity ceiling on a small fixed-N batch");
         emit log_named_uint("redeemMany gas, first-time N+1 vouchers", gasUsed);
         // Pinned from an actual `forge test -vv` run on this branch.
-        // Re-pinned for `PayWord` (was 859,221).
         assertApproxEqAbs(
             gasUsed, 868_611, 8000, "redeemMany gas for first-time N+1 vouchers drifted from the pinned figure"
         );

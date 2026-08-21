@@ -10,11 +10,11 @@
 //!
 //! `--provider-address` is passed alongside `--node-id` to pin every entry to
 //! this one node, so both entries share the same `(signer, provider)` lane. Each
-//! blob is under one chunk but their sum is over it, so the shared
-//! lane watermark crosses the 4 MiB `CHUNK_BYTES` boundary across the
-//! two entries — and the persisted watermark must be the EXACT aggregate wire
-//! bytes (monotone, never double-paid), the per-provider serialization holding
-//! that the two same-lane pulls do not race the cumulative counter (#1689).
+//! blob is under one `CHUNK_BYTES` of wire but their sum is over it, so the
+//! shared lane watermark crosses a chunk boundary only across the two entries —
+//! and the persisted watermark must be the EXACT aggregate wire bytes (monotone,
+//! never double-paid), the per-provider serialization holding that the two
+//! same-lane pulls do not race the cumulative counter (#1689).
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH`:
@@ -79,12 +79,12 @@ async fn run() -> anyhow::Result<()> {
 
     // Two distinct served blobs → a two-entry bundle. Fetching both on ONE pool is
     // the point: the second entry reuses the pool the first opened, serialized by
-    // the per-provider voucher lane lock. The sizes are deliberate: each blob is
-    // under one chunk (so a single entry never crosses the boundary
-    // alone), but their aggregate is over it, so the shared lane watermark crosses
-    // the 4 MiB `CHUNK_BYTES` boundary across the two entries.
-    let blob_a = vec![0x41u8; 3 * 1024 * 1024];
-    let blob_b = vec![0x42u8; 2 * 1024 * 1024];
+    // the per-provider lane lock. The sizes are deliberate: each blob's wire
+    // length is under one `CHUNK_BYTES`, so a single entry never crosses the
+    // boundary alone, while their aggregate is over it — the shared lane
+    // watermark crosses a chunk boundary only across the two entries.
+    let blob_a = vec![0x41u8; 768 * 1024];
+    let blob_b = vec![0x42u8; 512 * 1024];
     let hash_a = Hash::new(&blob_a);
     let hash_b = Hash::new(&blob_b);
 
@@ -99,11 +99,11 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(
         wire_a < CHUNK_BYTES && wire_b < CHUNK_BYTES,
         "each blob must stay under one chunk: a={wire_a}, b={wire_b}, \
-         interval={CHUNK_BYTES}"
+         chunk={CHUNK_BYTES}"
     );
     anyhow::ensure!(
         aggregate_wire > CHUNK_BYTES,
-        "the two entries must aggregate past one interval: {aggregate_wire} <= \
+        "the two entries must aggregate past one chunk: {aggregate_wire} <= \
          {CHUNK_BYTES}"
     );
     let (node, hashes) =
@@ -192,8 +192,8 @@ async fn run() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no lane progress recorded for provider {provider_addr}"))?;
     // The shared lane watermark is the EXACT aggregate wire bytes of both entries —
     // not zero, not one entry's, and not double-counted. Since each entry is under
-    // one interval and their sum is over it, this pins the cumulative accounting
-    // across the 4 MiB boundary: the second same-lane pull resumed from the first's
+    // one chunk and their sum is over it, this pins the cumulative accounting
+    // across a chunk boundary: the second same-lane pull resumed from the first's
     // cumulative watermark rather than racing or restarting it.
     anyhow::ensure!(
         progress.last_bytes == U256::from(aggregate_wire),
