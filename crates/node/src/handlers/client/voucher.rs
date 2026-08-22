@@ -359,19 +359,24 @@ impl ClientHandler {
             {
                 Ok(advanced) => advanced,
                 Err(e) => {
-                    drop(guard);
+                    let Ok(reason) = voucher_reject_reason(&e) else {
+                        drop(guard);
+                        return Err(anyhow::anyhow!(
+                            "advance_preimage touches no store; unexpected RetrySignal"
+                        ));
+                    };
                     // A hash-chain mismatch is terminal and carries no watermark
                     // bundle: a preimage has no signature of its own, and a payment
-                    // watermark cannot repair a wrong seed or a wrong chain.
-                    let reason = match voucher_reject_reason(&e) {
-                        Ok(reason) => reason,
-                        Err(RetrySignal) => {
-                            return Err(anyhow::anyhow!(
-                                "advance_preimage touches no store; unexpected RetrySignal"
-                            ));
-                        }
-                    };
-                    self.write_reject(send, reason, None).await?;
+                    // watermark cannot repair a wrong seed or a wrong chain. But this
+                    // path can also raise `SpendingCapExhausted`, when the reveal
+                    // would push the claim past the capability's cap — and that one
+                    // IS recoverable, by exactly the route a voucher takes: the payer
+                    // reads the bundle, raises the cap, and resumes. So ask the same
+                    // gate the voucher path asks rather than assuming; it answers
+                    // `None` for every chain-specific reason on its own.
+                    let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
+                    drop(guard);
+                    self.write_reject(send, reason, bundle).await?;
                     return Ok(VoucherStop::Rejected);
                 }
             };
@@ -408,8 +413,20 @@ impl ClientHandler {
         // amount is the lane's new total claim — the same number a voucher's
         // receipt carries, so the audit log reads uniformly across both proof
         // kinds.
+        //
+        // The byte figure is `credited_bytes`, not this stream's `delta_bytes`,
+        // for the same reason the voucher path logs it: the two diverge. A reveal
+        // walks from the LANE's frontier, so one arriving ahead of a sibling's
+        // covers every index between and pays for more than one stream's delta,
+        // while `credit_advance` caps it below the delta whenever the watermark
+        // does not reach that far. `credited_bytes` is what the lane actually
+        // charged for, which is what an audit log must say (#248/#803). Gated the
+        // same way, so a reveal that advanced the frontier but credited nothing
+        // against the cap logs no payment.
         let amount = u64::try_from(next_state.owed()).unwrap_or(u64::MAX);
-        self.record_receipt(hash, delta_bytes, client_node_id, amount);
+        if credited_bytes > 0 {
+            self.record_receipt(hash, credited_bytes, client_node_id, amount);
+        }
         if let Some(tx) = self.redeem_hint.as_ref()
             && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(lane_key)
         {

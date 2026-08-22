@@ -40,14 +40,35 @@ impl Cumulative {
 }
 
 impl From<&WatermarkBundle> for Cumulative {
-    /// Decode a wallet-less resume bundle's `u64` totals (issue #1481) into
-    /// the same shape [`PoolLedger`] tracks. Infallible — `U256::from`
-    /// cannot fail on a `u64` — so a caller can re-seed directly from a
-    /// bundle without a `Result`.
+    /// Decode a wallet-less resume bundle (issue #1481) into the full lane claim
+    /// it represents, in the shape [`PoolLedger`] tracks.
+    ///
+    /// **This folds the chain half.** A bundle reports two things: the signed
+    /// anchor the node last accepted, and the frontier its chain has proved on
+    /// top of that anchor. Decoding only the anchor would throw away
+    /// `verified_index` chunks the node already holds preimages for — and the
+    /// resuming signer would then re-sign from the anchor, open a fresh root
+    /// beside a frontier the node is still metering, and watch every reveal that
+    /// followed fold nothing (the node keeps the old root: a chain with reveals
+    /// under it is worth more than the anchor a lagging voucher offers for it).
+    /// So the fold is not an optimisation; it is what makes a resume converge.
+    ///
+    /// It is the same fold a rollover performs — `amount + verified_index ×
+    /// chunk_price`, `bytes + verified_index × CHUNK_BYTES` — and the node's
+    /// `watermark_bundle_for_reject` documents it as the signer's side of the
+    /// bargain (ADR 005 §Watermark bundle). A bundle carrying no chain
+    /// (`verified_index == 0`, the sealed or never-metered case) folds nothing
+    /// and decodes to the anchor alone.
+    ///
+    /// Infallible: the fold is computed in `U256`, so the `u64` inputs cannot
+    /// overflow it and a caller can re-seed from a bundle without a `Result`.
     fn from(bundle: &WatermarkBundle) -> Self {
+        let proved = U256::from(bundle.verified_index);
         Self {
-            bytes: U256::from(bundle.bytes_delivered),
-            amount: U256::from(bundle.amount),
+            bytes: U256::from(bundle.bytes_delivered)
+                .saturating_add(proved.saturating_mul(U256::from(CHUNK_BYTES))),
+            amount: U256::from(bundle.amount)
+                .saturating_add(proved.saturating_mul(U256::from(bundle.chunk_price))),
         }
     }
 }
@@ -667,15 +688,30 @@ impl PoolLedger {
     /// monotonicity is the ledger's invariant to keep.
     #[must_use]
     pub fn reseed(&self, cum: Cumulative) -> bool {
-        let mut pipeline = self.pipeline();
-        if cum.amount <= pipeline.committed.plus(pipeline.accrued).amount {
-            return false;
+        {
+            let mut pipeline = self.pipeline();
+            if cum.amount <= pipeline.committed.plus(pipeline.accrued).amount {
+                return false;
+            }
+            pipeline.committed = cum;
+            pipeline.accrued = Cumulative::default();
+            pipeline.prev = None;
+            pipeline.prev_accrued = Cumulative::default();
+            pipeline.armed = None;
         }
-        pipeline.committed = cum;
-        pipeline.accrued = Cumulative::default();
-        pipeline.prev = None;
-        pipeline.prev_accrued = Cumulative::default();
-        pipeline.armed = None;
+        // Retire the live chain, for the same reason a folding voucher must roll:
+        // `cum` came from a bundle and therefore already folds that bundle's
+        // `verified_index` into its amount. Keeping the epoch would leave the next
+        // voucher re-committing a root whose frontier the new anchor has absorbed,
+        // and the node would count those chunks twice — once in the amount, once
+        // again under the root it never retired. The next `EpochAction::Open`
+        // draws a fresh chain against the healed anchor.
+        //
+        // Sequenced after the pipeline borrow ends rather than nested inside it:
+        // the two guards are independent and this keeps them from ever being held
+        // together, which is what makes the no-deadlock argument in the field docs
+        // hold without reasoning about order.
+        *self.epoch() = None;
         true
     }
 
@@ -828,6 +864,91 @@ mod tests {
             Cumulative::default(),
             "an explicitly rejected voucher must not advance what we persist"
         );
+        Ok(())
+    }
+
+    /// A lane for the metered tests below: a real (if arbitrary) identity, so
+    /// `open_epoch` can derive seeds and the ledger actually holds a chain.
+    fn metered_ledger(seed: Cumulative) -> PoolLedger {
+        PoolLedger::new(
+            LaneKey {
+                pool_id: B256::repeat_byte(0x11),
+                signer: alloy::primitives::Address::repeat_byte(0x22),
+                provider: alloy::primitives::Address::repeat_byte(0x33),
+            },
+            B256::repeat_byte(0x44),
+            0,
+            seed,
+        )
+    }
+
+    /// The bundle decodes to the lane's FULL claim, not just its signed anchor.
+    ///
+    /// A node that rejects mid-chain reports an anchor plus the frontier its chain
+    /// has proved on top. A signer that re-seeded from the anchor alone would open
+    /// a fresh root beside a frontier the node is still metering, and every reveal
+    /// after that would fold nothing — the resume would never converge. The fold
+    /// is the node's documented side of the bargain (ADR 005 §Watermark bundle).
+    #[test]
+    fn a_bundle_decodes_with_its_proved_frontier_folded_in() {
+        let bundle = WatermarkBundle {
+            chain_root: [0x9Au8; 32],
+            verified_index: 3,
+            tip: [0x9Bu8; 32],
+            chunk_price: 10,
+            amount: 50,
+            bytes_delivered: 5_000,
+            last_signature: vec![0xCDu8; 65],
+        };
+        let cum = Cumulative::from(&bundle);
+        assert_eq!(
+            cum.amount,
+            U256::from(80u64),
+            "50 anchored + 3 chunks proved at 10 each"
+        );
+        assert_eq!(
+            cum.bytes,
+            U256::from(5_000u64) + U256::from(3u64) * U256::from(CHUNK_BYTES),
+            "the byte axis folds the same three chunks"
+        );
+    }
+
+    /// Re-seeding retires the live chain, because the cumulative it installs has
+    /// already folded that chain's frontier. Keeping it would leave the next
+    /// voucher re-committing a root the new anchor absorbed, and the node would
+    /// count those chunks twice — the same double-count the fold-must-roll rule
+    /// prevents on the issue path.
+    #[tokio::test]
+    async fn reseeding_retires_the_chain_whose_frontier_it_folded() -> anyhow::Result<()> {
+        let ledger = metered_ledger(Cumulative::default());
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        let opened = ledger
+            .epoch_id()
+            .ok_or_else(|| anyhow::anyhow!("Open draws a chain"))?;
+
+        let bundle = WatermarkBundle {
+            chain_root: [0x9Au8; 32],
+            verified_index: 2,
+            tip: [0x9Bu8; 32],
+            chunk_price: 10,
+            amount: 500,
+            bytes_delivered: 5_000,
+            last_signature: vec![0xCDu8; 65],
+        };
+        assert!(ledger.reseed(Cumulative::from(&bundle)));
+        assert_eq!(
+            ledger.epoch_id(),
+            None,
+            "the folded chain must not survive the reseed"
+        );
+
+        // And the chain drawn next is a genuinely new one, not the retired id.
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        assert_ne!(ledger.epoch_id(), Some(opened));
         Ok(())
     }
 

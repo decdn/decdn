@@ -1593,7 +1593,6 @@ where
             PoolContext::for_pool(&state, Arc::clone(signer), voucher_domain.clone())
                 .with_provider(provider, prior_bytes, prior_amount)
                 .with_chain_epoch(prior_epoch)
-                .with_chain_epoch(prior_epoch)
                 .with_capability(capability),
         );
     }

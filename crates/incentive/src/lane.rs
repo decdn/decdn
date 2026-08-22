@@ -509,12 +509,36 @@ impl LaneState {
         };
 
         let mut next = self.clone();
+        // The value this reveal advances its own claim to — anchor plus the
+        // frontier it just proved. `chain_slot` matched one of the two, so one of
+        // these arms always runs.
+        let mut claimed = U256::ZERO;
         if root == self.chain.chain_root {
             next.chain.verified_index = index;
             next.chain.tip = preimage;
+            claimed = self.last_amount.saturating_add(next.chain.accrued());
         } else if let Some(kept) = next.retained.as_mut() {
             kept.chain.verified_index = index;
             kept.chain.tip = preimage;
+            claimed = kept.value();
+        }
+
+        // The capability's spending cap binds the CLAIM, not the signature, so a
+        // reveal answers for it exactly as a voucher does
+        // ([`Self::advance_presigned`]). A chain extends the claim without a new
+        // signature, so a cap enforced on the voucher axis alone is one the chain
+        // walks straight past — the node would go on crediting deliveries against
+        // a claim the on-chain `redeem` will not pay, and eat the difference.
+        //
+        // Refusing here is also what keeps the payer's recovery working: the reason
+        // maps to `SpendingCapExhausted`, which is watermark-gated, so the reject
+        // carries the bundle the payer needs to raise the cap and resume — the same
+        // route an over-cap voucher already takes.
+        if claimed > self.cap {
+            return Err(PoolError::CapExceeded {
+                cap: self.cap,
+                got: claimed,
+            });
         }
         Ok((next, applied))
     }
@@ -1734,6 +1758,103 @@ mod tests {
             "a proved frontier must survive a voucher that paid nothing for it"
         );
         anyhow::ensure!(proved.owed() == U256::from(1_000 + 4 * PRICE));
+        Ok(())
+    }
+
+    /// The escape from that rule, and the one a resuming payer must take.
+    ///
+    /// A node that rejects mid-chain reports its anchor AND the frontier its chain
+    /// has proved, and the payer's side of the bargain is to fold
+    /// `verified_index × chunk_price` into the amount it re-signs (ADR 005
+    /// §Watermark bundle). A voucher that does fold is no longer stale: it pays
+    /// for every chunk the frontier proved, so it may retire the chain and open a
+    /// fresh one — and this is the ONLY way out, since a payer that re-signed the
+    /// anchor alone would be refused by the test above and every reveal it sent
+    /// afterwards would name a root the lane never adopted.
+    #[test]
+    fn a_voucher_that_folds_the_proved_frontier_may_open_a_fresh_chain() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (proved, _) = state.advance_preimage(root(), 4, reveal(4))?;
+        let folded_amount = 1_000 + 4 * PRICE;
+        anyhow::ensure!(proved.owed() == U256::from(folded_amount));
+
+        // Exactly what `Cumulative::from(&WatermarkBundle)` now hands a resuming
+        // payer: the anchor with the frontier folded in, under a fresh root.
+        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
+        let resumed = build_metering(
+            signer.address(),
+            folded_amount,
+            4 * crate::chain::CHUNK_BYTES,
+            next_root,
+            PRICE,
+        )
+        .sign(&signer, &domain)?;
+        let (healed, _) = proved.advance_presigned(&resumed)?;
+
+        anyhow::ensure!(
+            healed.chain().chain_root == next_root,
+            "a folding voucher installs the chain it names"
+        );
+        anyhow::ensure!(
+            healed.chain().verified_index == 0,
+            "the fresh chain starts at its own root, with nothing proved under it"
+        );
+        anyhow::ensure!(
+            healed.owed() == U256::from(folded_amount),
+            "the fold is exact: retiring the old chain strands none of its value \
+             and duplicates none of it either"
+        );
+        Ok(())
+    }
+
+    /// A reveal answers for the capability's spending cap exactly as a voucher
+    /// does. Without this the chain would be a way around the cap: it advances the
+    /// claim with no new signature, so a cap checked only when a voucher arrives is
+    /// one the chain walks straight past — and the contract clamps payment at
+    /// `cap - spent` rather than reverting, so the node would deliver bytes it can
+    /// never collect for and simply eat the difference.
+    #[test]
+    fn a_reveal_past_the_spending_cap_is_refused() -> anyhow::Result<()> {
+        let (signer, _, domain, store) = fixture();
+        // A cap two chunks above the anchor, so the third reveal is the one that
+        // cannot be paid for.
+        let anchor = 1_000u64;
+        let cap = U256::from(anchor + 2 * PRICE);
+        let mut state = LaneState::hydrate(
+            POOL_ID,
+            signer.address(),
+            PROVIDER,
+            cap,
+            0,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            LaneChain::NONE,
+            None,
+        );
+        state.apply_voucher(
+            &build_metering(signer.address(), anchor, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+
+        let (at_cap, _) = state.advance_preimage(root(), 2, reveal(2))?;
+        anyhow::ensure!(
+            at_cap.owed() == cap,
+            "a reveal landing exactly ON the cap is still payable"
+        );
+        anyhow::ensure!(
+            matches!(
+                at_cap.advance_preimage(root(), 3, reveal(3)),
+                Err(PoolError::CapExceeded { .. })
+            ),
+            "the reveal that would cross the cap must be refused, not credited"
+        );
         Ok(())
     }
 

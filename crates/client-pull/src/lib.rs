@@ -357,13 +357,13 @@ impl std::fmt::Debug for PoolContext {
 /// paid (#852).
 ///
 /// [`stream_fetch_tracked`] drives the pull through a one-shot [`PoolLedger`]
-/// seeded from the lane's prior cumulative state, then copies the ledger's
-/// committed cumulative back into this watermark (`set_from_cumulative`) before
-/// returning — so it always holds the **absolute** cumulative totals of the last
-/// presumed-accepted voucher (not per-stream deltas), exactly the
-/// `(bytes_delivered, amount)` pair the buyer-pool lane record expects. Because
-/// the copy-back runs on every return path (including the `Err`/timeout arms),
-/// the latest totals survive a mid-stream failure or a paid-but-corrupt delivery.
+/// seeded from the lane's prior cumulative state, then copies that ledger back
+/// into this watermark ([`VoucherProgress::from_ledger`]) before returning — so it
+/// always holds the **absolute** cumulative totals of the last presumed-accepted
+/// voucher (not per-stream deltas), exactly the `(bytes_delivered, amount)` pair
+/// the buyer-pool lane record expects, plus the lane's chain epoch. Because the
+/// copy-back runs on every return path (including the `Err`/timeout arms), the
+/// latest totals survive a mid-stream failure or a paid-but-corrupt delivery.
 ///
 /// **Implicit acceptance.** The watermark tracks vouchers the upstream is
 /// presumed to have accepted — continued delivery is acceptance (ADR 005), so a
@@ -416,10 +416,6 @@ impl VoucherProgress {
             next_epoch: ledger.next_epoch_id(),
             ..Self::from_cumulative(ledger.settlement(), prior_amount)
         }
-    }
-
-    fn set_from_cumulative(&mut self, cum: Cumulative, prior_amount: U256) {
-        *self = Self::from_cumulative(cum, prior_amount);
     }
 
     /// The hash-chain epoch this lane's next chain opens at.
@@ -1392,13 +1388,21 @@ pub async fn stream_fetch_tracked_with_progress(
         ),
     )
     .await;
-    // Copy the acked watermark back into `progress` on EVERY return path (Ok, Err,
-    // timeout) BEFORE returning, so the latest acked totals survive a mid-stream
-    // failure or a paid-but-corrupt delivery (#852). The ledger advances `committed`
-    // only after an ack, so it is exactly the last acked cumulative. A completed pull
-    // has read the ack for every voucher it sent (the closing ack precedes `StreamEnd`
-    // on the wire), so `committed` carries the whole transfer here.
-    progress.set_from_cumulative(ledger.committed(), ctx.prior_amount);
+    // Copy the watermark back into `progress` on EVERY return path (Ok, Err,
+    // timeout) BEFORE returning, so the latest totals survive a mid-stream failure
+    // or a paid-but-corrupt delivery (#852).
+    //
+    // Read the whole ledger, not just a cumulative. Two things ride on that. The
+    // epoch: `VoucherProgress::from_cumulative` cannot see one and reports `0`,
+    // which the store's max-merge then ignores — so a caller persisting
+    // `next_epoch()` would never advance it, and a retry after an unclean death
+    // would re-derive the seed of a chain the node still meters, releasing
+    // preimages at indices it has already covered. And the cumulative: `settlement`
+    // rather than `committed`, matching the two sibling persist paths
+    // (`UpstreamPull::progress`, the `node_origin` drop guard) — a voucher left
+    // armed by an ambiguous send is owed, and the error arm here is exactly where
+    // that happens. On the `Ok` arm nothing is armed, so the two agree.
+    *progress = VoucherProgress::from_ledger(&ledger, ctx.prior_amount);
     result
 }
 
@@ -2830,17 +2834,25 @@ impl StreamMeter {
     ) -> anyhow::Result<()> {
         if ledger.epoch_id().is_none() && open == EpochAction::Open {
             send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?;
+            // Re-read rather than reuse the pre-send `None`: the send is what
+            // opened the epoch, so only the ledger knows which one.
             self.anchored_epoch = ledger.epoch_id();
             return Ok(());
         }
-        let live = ledger.epoch_id();
-        if live.is_some() && self.anchored_epoch != live {
-            // A sibling rolled the lane, or this is our first reveal on an epoch
-            // a sibling opened. Re-anchoring costs one signature per stream per
-            // rollover and nothing else: the voucher carries the same cumulative
-            // the node already holds, which it treats as already-satisfied.
+        if ledger.epoch_id().is_some() && self.anchored_epoch != ledger.epoch_id() {
+            // A sibling rolled the lane, or this is our first reveal on an epoch a
+            // sibling opened. Either way this stream must name the chain before it
+            // can reveal against it (ADR 003 §Concurrent Streams, Rule 1).
+            //
+            // The send can itself roll the lane: `issue` escalates any voucher with
+            // outstanding accrual to a rollover, because a voucher that folds must
+            // also roll. So read the epoch AFTER the send — a value read before it
+            // can already be the retired one, and storing that would leave
+            // `anchored_epoch` permanently behind, re-anchoring on every single
+            // chunk and collapsing the chain's whole point into a signature plus a
+            // fresh keccak ladder per chunk.
             send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Keep).await?;
-            self.anchored_epoch = live;
+            self.anchored_epoch = ledger.epoch_id();
         }
         Ok(())
     }
