@@ -448,7 +448,7 @@ jobs:
       - name: Download coverage baseline
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v21
+        uses: dawidd6/action-download-artifact@v23
         with:
           workflow: ci.yml
           branch: main
@@ -1127,7 +1127,7 @@ jobs:
         if: github.event_name == 'pull_request'
         continue-on-error: true
         # SHA-pinned (v21); rebind would require a deliberate ref change.
-        uses: dawidd6/action-download-artifact@b6e2e70617bc3265edd6dab6c906732b2f1ae151
+        uses: dawidd6/action-download-artifact@57aa996fc1713cc1579039614f4645a7f4841fd4
         with:
           workflow: ci.yml
           branch: main
