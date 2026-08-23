@@ -148,7 +148,7 @@ async fn run() -> anyhow::Result<()> {
     // content total plus ~0.4% proof overhead.
     //
     // The figure observable at read time sits in `[content_bytes, wire_bytes]`.
-    // The client pays a cumulative voucher at each `VOUCHER_INTERVAL_BYTES`
+    // The client pays a cumulative voucher at each `CHUNK_BYTES`
     // boundary (each ≥ the node's `redeem_threshold_micro_usdc`, so each redeems) plus a
     // final closing voucher for the last partial group. That closing delta is the
     // ~8 KiB of trailing proof — far below the redeem threshold — so whether it

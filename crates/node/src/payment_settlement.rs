@@ -914,10 +914,27 @@ fn plan_lane(
         return Ok(None);
     }
     let key = st.key();
-    let Some(sig_bytes) = st.last_signature() else {
+    // The lane's claim: its latest signature PLUS the frontier the chain has
+    // proved on top of it.
+    //
+    // That sum is a real choice rather than a formality. A lane's worth is
+    // `amount + verified_index × chunk_price`, so counting only the signed
+    // cumulative would understate it by up to one whole chain — a lane sitting
+    // on 200 unredeemed reveals and no fresh signature would look worthless to
+    // the redemption floor and never be swept.
+    //
+    // There is only ever one claim to weigh. A rollover that folded less than
+    // the frontier it retires is refused outright (ADR 003 §Rollover), so the
+    // lane never holds a retired voucher worth more than its live one.
+    //
+    // In the cooperative case the strongest claim is always a signed voucher at
+    // index 0 — every rollover and every close emits one whose `amount` already
+    // folds the chain it retires — so a finalized delivery submits a zero index,
+    // a zero preimage, and walks nothing on-chain.
+    let Some(claim) = st.live_claim() else {
         return Ok(None);
     };
-    let owed = st.last_amount();
+    let owed = claim.value();
     if owed.is_zero() {
         return Ok(None);
     }
@@ -946,14 +963,25 @@ fn plan_lane(
         RegistrationStatus::Registered | RegistrationStatus::Fetched(_) => None,
     };
 
-    let (r, vs) =
-        compact_voucher_signature(sig_bytes).context("compact the lane's voucher signature")?;
+    let (r, vs) = compact_voucher_signature(&claim.signature)
+        .context("compact the lane's voucher signature")?;
     let voucher = PaymentPool::LaneVoucher {
         signer: key.signer,
-        cumulative: to_pool_u64(owed, "voucher cumulative")?,
-        bytesDelivered: to_pool_u64(st.last_bytes_delivered(), "voucher bytes delivered")?,
+        // The claim's SIGNED anchor, not its extended value: the contract
+        // rebuilds the EIP-712 digest from these, then re-derives the extension
+        // itself from the chain fields below. Submitting the extended value here
+        // would recover the wrong signer.
+        cumulative: to_pool_u64(claim.amount, "voucher cumulative")?,
+        bytesDelivered: to_pool_u64(claim.bytes_delivered, "voucher bytes delivered")?,
         r,
         vs,
+        chainRoot: claim.chain.chain_root,
+        // The deepest preimage this node has verified. At index 0 the root is
+        // its own preimage, so a settlement voucher needs no chain state at all.
+        preimage: claim.chain.tip,
+        chainMeter: claim
+            .chain_meter()
+            .context("pack the lane's chainMeter word")?,
     };
     Ok(Some(PlannedLane {
         pool_id: key.pool_id,
@@ -1600,6 +1628,11 @@ mod tests {
                 bytesDelivered: 0,
                 r: B256::ZERO,
                 vs: B256::ZERO,
+                // A sealed settlement voucher: the cooperative shape, which
+                // walks nothing on-chain and compresses to almost no calldata.
+                chainRoot: B256::ZERO,
+                preimage: B256::ZERO,
+                chainMeter: U256::ZERO,
             },
             register: reg,
         }
@@ -1943,6 +1976,7 @@ mod tests {
             U256::from(1_000u64),
             U256::from(1_048_576u64),
             Some(sig_with_v(0)),
+            decdn_incentive::LaneChain::NONE,
         )
     }
 

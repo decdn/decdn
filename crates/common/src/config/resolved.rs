@@ -509,8 +509,8 @@ pub struct ResolvedPayment {
     /// the rate-bounds watcher keeps it current. Default `0`.
     pub delivery_floor: u64,
     /// Credit-window ceiling in bytes (ADR 003 §Credit window). The per-stream
-    /// window ramps toward this cap as the stream pays; floored at one voucher
-    /// accounting interval ([`decdn_protocol::client::VOUCHER_INTERVAL_BYTES`]).
+    /// window ramps toward this cap as the stream pays; floored at one chunk
+    /// ([`decdn_protocol::client::CHUNK_BYTES`], the payment quantum).
     /// See [`crate::config::DEFAULT_CREDIT_MAX`].
     pub credit_max: u64,
     /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.

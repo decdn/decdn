@@ -2,8 +2,9 @@
 //!
 //! Serves the revenue path: a payer opens one bidirectional QUIC stream per
 //! blob, the node answers with a signed [`StreamResponse`], then streams
-//! [`ChunkData`], collecting a cumulative payment `Voucher` at each
-//! `VOUCHER_INTERVAL_BYTES` boundary and pausing only when the unpaid balance
+//! [`ChunkData`], collecting one hash-chain preimage per delivered
+//! `CHUNK_BYTES` chunk — with a signed `Voucher` to open a chain, to roll one,
+//! and to settle a sub-chunk residual — and pausing only when the unpaid balance
 //! (`delivered − paid`) reaches the credit window — so delivery pipelines
 //! several intervals ahead of payment rather than stopping at each one — and
 //! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
@@ -45,8 +46,8 @@ use decdn_protocol::client::{
     StreamResponseBody, VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, VOUCHER_INTERVAL_BYTES, decode_message,
-    encode_message, is_unknown_variant, read_frame, write_frame,
+    ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_message,
+    is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -129,7 +130,7 @@ struct LaneDeliveryState {
     active_streams: Arc<AtomicU32>,
     /// Wall-clock (Unix milliseconds) of the last accepted voucher on this lane,
     /// or `0` when this process has accepted none since it hydrated the lane
-    /// (issue #1733). Stamped by [`ClientHandler::commit_one_voucher`] under the
+    /// (issue #1733). Stamped by [`ClientHandler::commit_one_proof`] under the
     /// per-lane lock it already holds — a field write, not a separate global
     /// mutex — and read back by [`LaneActivityClock::ages`] for the admin
     /// "seconds since last voucher" readout. Best-effort liveness bookkeeping:
@@ -211,6 +212,7 @@ impl LaneActivityClock {
                 U256::ZERO,
                 U256::ZERO,
                 None,
+                decdn_incentive::LaneChain::NONE,
             );
             map.insert(
                 key,
@@ -421,7 +423,7 @@ impl FloorReservation {
     /// the amount that was reserved. Matches release to the reserved size at any
     /// `credit_ramp_divisor`: with the ramp disabled the reservation is the full
     /// `credit_max`, so release must wait for that much to be paid rather than a
-    /// single voucher interval. Idempotent (delegates to [`Self::release_live_repaid`]).
+    /// single chunk. Idempotent (delegates to [`Self::release_live_repaid`]).
     fn release_if_repaid(&self, paid_micro: U256) {
         if paid_micro >= self.reserved {
             self.release_live_repaid();
@@ -792,11 +794,11 @@ pub struct ClientHandlerDeps {
     /// `DEFAULT_CREDIT_MAX` (64 MiB); the runtime sets it from
     /// `payment.credit_max`. The SAME ceiling paces the pull leg's upstream
     /// speculative spend on a cache-miss pull (`RampPacer`, #1669), so the
-    /// upstream and downstream ramps never diverge. Floored at one interval so
+    /// upstream and downstream ramps never diverge. Floored at one chunk so
     /// the serve loop can always make progress.
     pub credit_max: u64,
     /// Ramp divisor for the credit window (ADR 003 §Credit window): the window is
-    /// `paid / credit_ramp_divisor`, floored at one interval and capped at
+    /// `paid / credit_ramp_divisor`, floored at one chunk and capped at
     /// `credit_max`. Defaults to `DEFAULT_CREDIT_RAMP_DIVISOR` (2); the runtime
     /// sets it from `payment.credit_ramp_divisor`. `0` opens the full ceiling
     /// immediately.
@@ -1304,6 +1306,7 @@ impl ClientHandler {
             U256::ZERO,
             U256::ZERO,
             None,
+            decdn_incentive::LaneChain::NONE,
         );
         if let Err(e) = self.register_lane(lane).await {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
@@ -1702,7 +1705,7 @@ impl ClientHandler {
 }
 
 /// Terminal disposition of one voucher collected by
-/// [`ClientHandler::commit_one_voucher`].
+/// [`ClientHandler::commit_one_proof`].
 enum VoucherStop {
     /// Verified and advanced in memory; keep serving. `credited_bytes` is the
     /// watermark-capped wire bytes to advance the serve loop's `paid` by (rule
@@ -1814,7 +1817,44 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
     }
 }
 
-/// Cancellation-safe, buffered reader for `cdn/client/v1` voucher frames. Owns
+/// How many proofs the recoup phase will read for ONE outstanding chunk before
+/// it gives up.
+///
+/// A chunk is paid by exactly one reveal, but the payer may legitimately send
+/// housekeeping vouchers ahead of it — the epoch's root voucher when this stream
+/// has not carried it yet, and a rollover voucher when the chain is spent. Both
+/// advance the lane's claim by nothing (they re-assert a cumulative the node
+/// already holds), so they credit nothing, and the outstanding chunk stays
+/// outstanding. Three messages is the real worst case for a well-behaved payer
+/// (re-anchor, roll, reveal); the rest is slack for a duplicate or out-of-order
+/// reveal, which is ordinary once several streams share one lane and which also
+/// credits nothing.
+///
+/// The bound matters because without it a payer could hold a stream open
+/// indefinitely with a run of zero-credit vouchers, each one refreshing the read
+/// timeout while the delivered-but-unpaid balance never moves — the same shape
+/// of stall the non-empty-`ChunkData` floor closes on the delivery side. The
+/// exact value trades slack against how long that stall may run; every read
+/// inside it still carries its own timeout, so the bound is about liveness, not
+/// about capping any single wait.
+const MAX_PROOFS_PER_CHUNK: u32 = 8;
+
+/// One payment proof off the wire: a signed voucher, or a released hash-chain
+/// preimage (ADR 003 §Two payment resolutions).
+///
+/// The two resolve different things and cost differently, which is why the
+/// protocol keeps both rather than making either do the other's work. A
+/// **voucher** settles any residual exactly, down to one token base unit, and
+/// costs one signature. A **preimage** settles whole chunks past the anchor and
+/// costs one keccak — no signature, no acknowledgement, nothing to persist
+/// before the node sends the next chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Proof {
+    Voucher(decdn_protocol::client::Voucher),
+    Preimage(decdn_protocol::client::ChunkPreimage),
+}
+
+/// Cancellation-safe, buffered reader for `cdn/client/v1` payment-proof frames. Owns
 /// a byte buffer that PERSISTS across [`Self::read`] calls, so a `read` future
 /// cancelled by the outer [`VOUCHER_READ_TIMEOUT`] loses no bytes: any partial
 /// frame stays buffered for the next call.
@@ -1826,42 +1866,47 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
 /// [`decdn_protocol::framing::parse_frame`], keeps every byte. Borrows the
 /// `RecvStream` per call so the caller retains it for stream teardown.
 ///
-/// All voucher reads on a given stream MUST go through ONE instance: it may read
-/// ahead (buffering the next pipelined voucher, #1486) while the current one is
+/// All proof reads on a given stream MUST go through ONE instance: it may read
+/// ahead (buffering the next pipelined proof, #1486) while the current one is
 /// verified and recorded, and a second reader on the same `RecvStream` would
 /// lose those buffered bytes.
 #[derive(Default)]
-pub(super) struct BufferedVoucherReader {
+pub(super) struct BufferedProofReader {
     /// Unconsumed bytes read from the stream, at a frame boundary or partway
     /// into the next frame's header/body.
     buf: Vec<u8>,
 }
 
-impl BufferedVoucherReader {
-    /// Read one framed [`ClientMessage::Voucher`], filling the buffer
-    /// incrementally. **Cancellation-safe:** if the returned future is dropped
-    /// (a gather `timeout` elapsed), bytes already read stay in `self.buf` for
-    /// the next call — no frame is torn.
-    pub(super) async fn read(
-        &mut self,
-        recv: &mut RecvStream,
-    ) -> anyhow::Result<decdn_protocol::client::Voucher> {
+impl BufferedProofReader {
+    /// Read one framed payment proof — a [`ClientMessage::Voucher`] or a
+    /// [`ClientMessage::ChunkPreimage`] — filling the buffer incrementally.
+    /// **Cancellation-safe:** if the returned future is dropped (a gather
+    /// `timeout` elapsed), bytes already read stay in `self.buf` for the next
+    /// call — no frame is torn.
+    ///
+    /// These two variants are the entire payer→node vocabulary after the
+    /// opening `StreamRequest`, so this is the one place every proof passes
+    /// through. Anything else on this stream is a protocol error.
+    pub(super) async fn read(&mut self, recv: &mut RecvStream) -> anyhow::Result<Proof> {
         loop {
             if let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
-                .map_err(|e| anyhow::anyhow!("voucher frame parse failed: {e}"))?
+                .map_err(|e| anyhow::anyhow!("proof frame parse failed: {e}"))?
             {
                 let total = header_len.saturating_add(payload_len);
                 let payload = self
                     .buf
                     .get(header_len..total)
-                    .ok_or_else(|| anyhow::anyhow!("voucher frame bounds out of range"))?;
+                    .ok_or_else(|| anyhow::anyhow!("proof frame bounds out of range"))?;
                 let decoded = decode_message::<ClientMessage>(payload);
                 // Consume the frame's bytes regardless of decode outcome so a
                 // single bad frame cannot wedge the buffer.
                 let result = match decoded {
-                    Ok((ClientMessage::Voucher(v), _)) => Ok(v),
-                    Ok((_, _)) => Err(anyhow::anyhow!("expected ClientMessage::Voucher")),
-                    Err(e) => Err(anyhow::anyhow!("voucher decode failed: {e}")),
+                    Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
+                    Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
+                    Ok((_, _)) => Err(anyhow::anyhow!(
+                        "expected ClientMessage::Voucher or ClientMessage::ChunkPreimage"
+                    )),
+                    Err(e) => Err(anyhow::anyhow!("proof decode failed: {e}")),
                 };
                 self.buf.drain(..total);
                 return result;
@@ -1874,9 +1919,9 @@ impl BufferedVoucherReader {
             let mut scratch = [0u8; 4096];
             let n = AsyncReadExt::read(recv, &mut scratch)
                 .await
-                .map_err(|e| anyhow::anyhow!("voucher stream read failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("proof stream read failed: {e}"))?;
             if n == 0 {
-                anyhow::bail!("voucher stream closed mid-frame");
+                anyhow::bail!("proof stream closed mid-frame");
             }
             let chunk = scratch
                 .get(..n)
@@ -2071,6 +2116,7 @@ mod tests {
                 U256::ZERO,
                 U256::ZERO,
                 None,
+                decdn_incentive::LaneChain::NONE,
             );
             register.push(tokio::spawn(
                 async move { handler.register_lane(state).await },
@@ -2172,6 +2218,7 @@ mod tests {
                     U256::ZERO,
                     U256::ZERO,
                     None,
+                    decdn_incentive::LaneChain::NONE,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,
@@ -2749,6 +2796,7 @@ mod tests {
                     U256::ZERO,
                     U256::ZERO,
                     None,
+                    decdn_incentive::LaneChain::NONE,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,

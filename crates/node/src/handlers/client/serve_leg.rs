@@ -37,10 +37,12 @@
 use decdn_cache::{FillSession, NodeRangedStore};
 use decdn_client_pull::sink::content_paid_frontier;
 
+use super::MAX_PROOFS_PER_CHUNK;
+use super::voucher::StreamAnchor;
 use super::{
-    Arc, B256, BufferedVoucherReader, ChunkData, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256,
-    VOUCHER_INTERVAL_BYTES, VecDeque, VoucherRejectReason, VoucherStop,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ChunkData, ClientHandler, ClientMessage,
+    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream,
+    U256, VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -108,10 +110,10 @@ impl ClientHandler {
         };
         let offset = offset.min(end);
 
-        let interval_bytes = VOUCHER_INTERVAL_BYTES;
-        // Backpressure bound, floored at one interval so the loop can always make
-        // progress (deliver a full interval, then recoup its voucher).
-        let window = window.max(interval_bytes);
+        let chunk_bytes = CHUNK_BYTES;
+        // Backpressure bound, floored at one chunk so the loop can always make
+        // progress (deliver a full chunk, then recoup the proof that pays it).
+        let window = window.max(chunk_bytes);
 
         // The in-flight takedown re-check (ADR 011) keys on the pool FUNDER (the
         // pool owner, `getPool.owner`), resolved from the cached pool-view. `None`
@@ -132,7 +134,13 @@ impl ClientHandler {
         // One buffered voucher reader for the whole stream: every read goes
         // through it so a pipelined voucher buffered ahead of the current one is
         // not lost.
-        let mut reader = BufferedVoucherReader::default();
+        let mut reader = BufferedProofReader::default();
+        // This stream's chain anchor — which epoch it has been told about, so a
+        // bare reveal arriving on it can be placed (ADR 003 §Concurrent
+        // Streams, Rule 1). Per stream and in memory only: a restart drops the
+        // streams, and the lane's durable record keeps the strongest claim's
+        // chain state.
+        let mut anchor = StreamAnchor::default();
 
         // The coherent whole-range bao encoder (ADR 038): ONE verified stream for
         // `R`, produced incrementally — leaf data awaited from the cache the pull
@@ -190,7 +198,7 @@ impl ClientHandler {
                 delivered = delivered.saturating_add(clen);
                 self.shed.record_egress(clen);
                 unvouchered = unvouchered.saturating_add(clen);
-                if unvouchered >= interval_bytes {
+                if unvouchered >= chunk_bytes {
                     pending.push_back(unvouchered);
                     unvouchered = 0;
                 }
@@ -224,82 +232,105 @@ impl ClientHandler {
                 ));
             }
 
-            // --- recoup phase: recoup each completed interval with one voucher.
-            // The voucher advances the in-memory lane watermark; the background
-            // flush persists it (ADR 003 §Off-chain voucher state persistence). ---
+            // --- recoup phase: collect proofs until each completed chunk is
+            // paid for. The proof advances the in-memory lane watermark; the
+            // background flush persists it (ADR 003 §Off-chain voucher state
+            // persistence). ---
+            //
+            // The delta stays queued until something actually credits it: the
+            // payer may send this stream's root voucher, or a rollover voucher,
+            // ahead of the reveal that pays, and neither credits anything.
+            // `MAX_PROOFS_PER_CHUNK` bounds that — see the twin loop in
+            // `deliver` for the full reasoning.
             let collected_any = !pending.is_empty();
-            while let Some(delta) = pending.pop_front() {
-                let stop = match self
-                    .commit_one_voucher(
-                        send,
-                        recv,
-                        &mut reader,
-                        hash,
-                        lane_key,
-                        Some(lane),
-                        client_node_id,
-                        rate_per_mb,
-                        delta,
-                    )
-                    .await
-                {
-                    Ok(stop) => stop,
-                    Err(e) => {
-                        // Transport drop or underpayment bail (#856/#857): meter the
-                        // abandon, then propagate so the caller drops the pull leg.
-                        self.metrics.node_pull_through_client_abandoned();
-                        return Err(e);
-                    }
-                };
-                match stop {
-                    VoucherStop::Continue { credited_bytes } => {
-                        // Advance `paid` by the watermark-capped credit (rule #1): a
-                        // benign already-satisfied voucher raises the watermark by
-                        // nothing, so it credits nothing here and cannot reopen the
-                        // credit window for bytes the lane has not settled.
-                        credited_this_iter = credited_this_iter.saturating_add(credited_bytes);
-                        paid = paid.saturating_add(credited_bytes);
-                        // Publish the PAID CONTENT frontier for the pull leg's
-                        // `WindowPacer`, mapping paid WIRE back into content space (the
-                        // largest chunk-group boundary provably inside the paid wire
-                        // prefix — conservative, so the pull never overshoots its
-                        // window). One contiguous delivery from `offset`, so `offset`
-                        // is the single fetch-start.
-                        let served = content_paid_frontier(offset, total_bytes, paid);
-                        // `fetch_max`, not `store`: N observers advance the SHARED
-                        // frontier and the pull's `WindowPacer` binds on the
-                        // MAX-over-observers paid frontier (DECISION-B), so a slower
-                        // observer must not regress a faster one. Behavior-preserving
-                        // for N=1 (a single contiguous delivery is already monotone,
-                        // so `fetch_max == store`).
-                        session
-                            .served_frontier()
-                            .fetch_max(served, Ordering::Relaxed);
-                        session.served_advanced().notify_waiters();
-                        // Under partial-overlap coalescing this serve leg is fed by
-                        // more than its own pull: each attached sibling pull produces
-                        // the OVERLAP this leg also consumes and bills. The sibling's
-                        // `served_paid` is a contiguous paid PREFIX, but this leg
-                        // consumes a SUFFIX of the sibling's covered range (starting at
-                        // `offset`) — so it may only EXTEND the sibling's frontier INTO
-                        // the overlap, never claim the sibling's `[start, offset)`
-                        // prefix, which only the sibling's OWN observers pay for. Guard
-                        // on the sibling having itself already cleared up to `offset`:
-                        // only then is this leg's payment a sound prefix extension (each
-                        // overlap byte is fetched once and recouped by the fastest of
-                        // its shared observers — DECISION-B). Without the guard a fast
-                        // overlap payer would relax the sibling pull's window over bytes
-                        // no one has paid for. Empty in the common N=1 case.
-                        for extra in also_pace {
-                            if extra.served_frontier().load(Ordering::Relaxed) >= offset {
-                                extra.served_frontier().fetch_max(served, Ordering::Relaxed);
-                                extra.served_advanced().notify_waiters();
+            'chunk: while let Some(&delta) = pending.front() {
+                let mut attempts = 0u32;
+                loop {
+                    let stop = match self
+                        .commit_one_proof(
+                            send,
+                            recv,
+                            &mut reader,
+                            &mut anchor,
+                            hash,
+                            lane_key,
+                            Some(lane),
+                            client_node_id,
+                            rate_per_mb,
+                            delta,
+                        )
+                        .await
+                    {
+                        Ok(stop) => stop,
+                        Err(e) => {
+                            // Transport drop or underpayment bail (#856/#857): meter the
+                            // abandon, then propagate so the caller drops the pull leg.
+                            self.metrics.node_pull_through_client_abandoned();
+                            return Err(e);
+                        }
+                    };
+                    match stop {
+                        VoucherStop::Continue { credited_bytes: 0 } => {
+                            attempts = attempts.saturating_add(1);
+                            if attempts >= MAX_PROOFS_PER_CHUNK {
+                                self.metrics.node_pull_through_client_abandoned();
+                                anyhow::bail!(
+                                    "payer sent {attempts} proofs that credited nothing for one \
+                                 outstanding chunk"
+                                );
                             }
                         }
-                    }
-                    VoucherStop::Rejected => {
-                        self.metrics.node_pull_through_client_abandoned();
-                        return Ok(());
+                        VoucherStop::Continue { credited_bytes } => {
+                            pending.pop_front();
+                            // Advance `paid` by the watermark-capped credit (rule #1): a
+                            // benign already-satisfied voucher raises the watermark by
+                            // nothing, so it credits nothing here and cannot reopen the
+                            // credit window for bytes the lane has not settled.
+                            credited_this_iter = credited_this_iter.saturating_add(credited_bytes);
+                            paid = paid.saturating_add(credited_bytes);
+                            // Publish the PAID CONTENT frontier for the pull leg's
+                            // `WindowPacer`, mapping paid WIRE back into content space (the
+                            // largest chunk-group boundary provably inside the paid wire
+                            // prefix — conservative, so the pull never overshoots its
+                            // window). One contiguous delivery from `offset`, so `offset`
+                            // is the single fetch-start.
+                            let served = content_paid_frontier(offset, total_bytes, paid);
+                            // `fetch_max`, not `store`: N observers advance the SHARED
+                            // frontier and the pull's `WindowPacer` binds on the
+                            // MAX-over-observers paid frontier (DECISION-B), so a slower
+                            // observer must not regress a faster one. Behavior-preserving
+                            // for N=1 (a single contiguous delivery is already monotone,
+                            // so `fetch_max == store`).
+                            session
+                                .served_frontier()
+                                .fetch_max(served, Ordering::Relaxed);
+                            session.served_advanced().notify_waiters();
+                            // Under partial-overlap coalescing this serve leg is fed by
+                            // more than its own pull: each attached sibling pull produces
+                            // the OVERLAP this leg also consumes and bills. The sibling's
+                            // `served_paid` is a contiguous paid PREFIX, but this leg
+                            // consumes a SUFFIX of the sibling's covered range (starting at
+                            // `offset`) — so it may only EXTEND the sibling's frontier INTO
+                            // the overlap, never claim the sibling's `[start, offset)`
+                            // prefix, which only the sibling's OWN observers pay for. Guard
+                            // on the sibling having itself already cleared up to `offset`:
+                            // only then is this leg's payment a sound prefix extension (each
+                            // overlap byte is fetched once and recouped by the fastest of
+                            // its shared observers — DECISION-B). Without the guard a fast
+                            // overlap payer would relax the sibling pull's window over bytes
+                            // no one has paid for. Empty in the common N=1 case.
+                            for extra in also_pace {
+                                if extra.served_frontier().load(Ordering::Relaxed) >= offset {
+                                    extra.served_frontier().fetch_max(served, Ordering::Relaxed);
+                                    extra.served_advanced().notify_waiters();
+                                }
+                            }
+                            continue 'chunk;
+                        }
+                        VoucherStop::Rejected => {
+                            self.metrics.node_pull_through_client_abandoned();
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -313,7 +344,7 @@ impl ClientHandler {
                 // amount reserved (the ramp-floor credit this stream fronts). Matching
                 // release to the reserved µUSDC keeps it correct at any
                 // `credit_ramp_divisor` — with the ramp disabled the reservation is the
-                // full `credit_max`, so release waits for that much paid, not one interval.
+                // full `credit_max`, so release waits for that much paid, not one chunk.
                 res.release_if_repaid(decdn_incentive::min_payment(paid, rate_per_mb));
                 // Keep the drop-time reconcile honest with the CURRENT unpaid balance: on
                 // an un-repaid stream `Drop` folds `min(reserved, this)` into `dead_charge`.
@@ -350,7 +381,7 @@ impl ClientHandler {
             // pull leg when this returns, bounding the upstream spend just as the
             // takedown and no-progress exits do.
             //
-            // The check runs on a WALL-CLOCK cadence, not at every 4 MiB voucher
+            // The check runs on a WALL-CLOCK cadence, not at every chunk
             // boundary: the projection only advances as the settlement watcher
             // folds redeem events, so re-reading it faster than that returns the
             // same value (wasted `pool_floor` lock reads on the fastest streams),

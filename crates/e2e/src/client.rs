@@ -115,6 +115,10 @@ impl PoolSession {
         );
         self.ctx.prior_bytes_delivered = bytes_delivered;
         self.ctx.prior_amount = amount;
+        // The cumulative is all there is to carry. Every fetch on this session
+        // builds a fresh ledger from `ctx`, and a fresh ledger draws a fresh
+        // chain — so what the next fetch needs from this one is the money owed,
+        // which its first voucher folds into the amount it signs.
         Ok(())
     }
 }
@@ -418,7 +422,7 @@ impl ClientFixture {
     /// stream bytes: `read_frame` consumes the varint length prefix.)
     ///
     /// Deliberately never pays, which bounds what it can see. The node streams
-    /// `StreamResponse` + every `ChunkData` up to the voucher interval and then
+    /// `StreamResponse` + every `ChunkData` up to the chunk and then
     /// blocks on payment, so for a sub-interval blob this captures **every
     /// message the node emits before it blocks** — but never `StreamEnd`,
     /// which is emitted only after a voucher arrives. The capture

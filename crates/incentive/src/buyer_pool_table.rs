@@ -813,6 +813,11 @@ mod tests {
     /// Postcard encoding of [`golden_state`] (schema v1). Two lanes, sorted
     /// by `(signer, provider)` for a deterministic encoding regardless of
     /// `HashMap` iteration order.
+    ///
+    /// The lane row is the two cumulatives and nothing else. A chain hangs off
+    /// the anchor in its own opening voucher (ADR 003 §One chain per lane), so
+    /// `last_amount` already says which chain the lane resumes on — there is no
+    /// counter here to keep, and none to get wrong.
     const GOLDEN_RECORD_HEX: &str = concat!(
         "01",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
@@ -1175,7 +1180,7 @@ mod tests {
                 ghost.pool_id,
                 ghost_lane,
                 U256::from(1u64),
-                U256::from(1u64)
+                U256::from(1u64),
             )? == AdvanceOutcome::UnknownPool
         );
         anyhow::ensure!(
@@ -1206,7 +1211,7 @@ mod tests {
                 absent.pool_id,
                 absent_lane,
                 U256::from(1u64),
-                U256::from(1u64)
+                U256::from(1u64),
             )? == AdvanceOutcome::UnknownPool,
             "advance_progress on an absent row of an existing table"
         );
@@ -1222,7 +1227,7 @@ mod tests {
                 OTHER_POOL,
                 lane,
                 U256::from(99u64),
-                U256::from(99u64)
+                U256::from(99u64),
             )? == AdvanceOutcome::PoolMismatch
         );
         anyhow::ensure!(
@@ -1263,7 +1268,7 @@ mod tests {
                 s.pool_id,
                 lane,
                 U256::from(1u64),
-                U256::from(1u64)
+                U256::from(1u64),
             )? == AdvanceOutcome::UnknownPool
         );
         anyhow::ensure!(table_absent(&db)?, "advance_progress created the table");

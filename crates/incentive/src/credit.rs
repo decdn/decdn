@@ -2,8 +2,8 @@
 
 /// The ramped delivery credit window (ADR 003 §Credit window): the unbilled
 /// egress a node fronts on a stream grows in proportion to what the stream has
-/// already paid, floored at one voucher interval (`floor`) so the loop can always
-/// deliver a full interval and recoup it, and capped at `credit_max`. A `divisor`
+/// already paid, floored at one chunk (`floor`) so the loop can always deliver
+/// a full chunk and recoup it, and capped at `credit_max`. A `divisor`
 /// of `0` opens the full `credit_max` from the first byte. The window is a pure
 /// function of this stream's own `paid` bytes, so a non-paying stream stays pinned
 /// at the floor and a paying stream ramps to the ceiling. The node's unbilled
@@ -24,7 +24,7 @@ pub fn ramped_credit_window(divisor: u64, floor: u64, credit_max: u64, paid: u64
 mod tests {
     use super::ramped_credit_window;
 
-    const FLOOR: u64 = 4 * 1024 * 1024; // one 4 MiB interval
+    const FLOOR: u64 = 1024 * 1024; // one 1 MiB chunk
     const MAX: u64 = 64 * 1024 * 1024;
 
     #[test]
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn window_is_paid_over_divisor_once_it_clears_the_floor() {
-        // paid 32 MiB, divisor 2 -> 16 MiB, above the 4 MiB floor.
+        // paid 32 MiB, divisor 2 -> 16 MiB, above the 1 MiB floor.
         assert_eq!(
             ramped_credit_window(2, FLOOR, MAX, 32 * 1024 * 1024),
             16 * 1024 * 1024
@@ -43,8 +43,11 @@ mod tests {
 
     #[test]
     fn window_is_pinned_to_floor_until_paid_exceeds_divisor_times_floor() {
-        // paid 4 MiB, divisor 2 -> 2 MiB, below floor -> floor.
-        assert_eq!(ramped_credit_window(2, FLOOR, MAX, 4 * 1024 * 1024), FLOOR);
+        // paid 1 MiB, divisor 2 -> 512 KiB, below the floor -> floor.
+        assert_eq!(ramped_credit_window(2, FLOOR, MAX, 1024 * 1024), FLOOR);
+        // And exactly AT `divisor × floor` the ramp still ties the floor, so
+        // the clamp — not the ratio — is what decides the boundary.
+        assert_eq!(ramped_credit_window(2, FLOOR, MAX, 2 * 1024 * 1024), FLOOR);
     }
 
     #[test]

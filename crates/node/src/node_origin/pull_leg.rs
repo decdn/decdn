@@ -360,22 +360,23 @@ impl NodeOrigin {
             Ok(ctx) => ctx,
             Err(err) => return Err(record_pool_open_failure(deps, provider_addr, &err)),
         };
-        let ctx = match bind_upstream_ctx(deps, ctx) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                let verdict =
-                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return Err(PullMiss::for_verdict(verdict));
-            }
+        // Every setup fault from here to the header handshake classifies the
+        // same way: it is ours, not the candidate's, so it folds into the walk
+        // as a miss without scoring the peer. Deriving this lane's chain master
+        // is one of them — it is a signing operation, so a remote or hardware
+        // signer can refuse it.
+        let local_miss = |err: &anyhow::Error| {
+            PullMiss::for_verdict(classify_pull_failure(
+                deps,
+                pk,
+                provider_addr,
+                hash_bytes,
+                None,
+                err,
+            ))
         };
-        let deadlines = match deps.config.deadlines() {
-            Ok(deadlines) => deadlines,
-            Err(err) => {
-                let verdict =
-                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return Err(PullMiss::for_verdict(verdict));
-            }
-        };
+        let ctx = bind_upstream_ctx(deps, ctx).map_err(|err| local_miss(&err))?;
+        let deadlines = deps.config.deadlines().map_err(|err| local_miss(&err))?;
         let ledger = lane_ledger(deps, provider_addr, &ctx);
         // Folds the candidate probe rate, the static ceiling, and the ADR 041 buy cap.
         let rate_ceiling = econ_rate_ceiling;
@@ -747,6 +748,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
         voucher_domain: decdn_incentive::voucher_domain(0, Address::ZERO),
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
+        // No chain either: rate 0 means nothing is ever metered on this leg.
         client_binding: None,
         capability: None,
     }

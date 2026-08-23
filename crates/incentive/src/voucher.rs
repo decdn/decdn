@@ -25,12 +25,21 @@
 //!
 //! ```text
 //! Voucher(bytes32 poolId,address signer,address provider,
-//!         uint256 amount,uint256 bytesDelivered)
+//!         uint256 amount,uint256 bytesDelivered,
+//!         bytes32 chainRoot,uint256 chunkPrice)
 //! ```
 //!
 //! There is no nonce: `amount` is the sole monotone ordering and replay key —
 //! a voucher whose `amount` is no greater than the highest already accepted is
 //! stale (ADR 003 §Voucher ordering).
+//!
+//! `amount` is the settlement anchor and `chain_root` heads the optional
+//! `PayWord` hash chain that advances it between signatures, so redemption
+//! resolves both as `claimed = amount + chain_index × chunk_price` (ADR 003
+//! §Hash-chain metering (`PayWord`); the chain primitive lives in
+//! [`crate::chain`]). Neither `chain_length` nor `chunk_bytes` is signed —
+//! both are protocol constants, so signing them would pay calldata for values
+//! every party already holds.
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};
@@ -64,6 +73,8 @@ mod sol_types {
             address provider;
             uint256 amount;
             uint256 bytesDelivered;
+            bytes32 chainRoot;
+            uint256 chunkPrice;
         }
     }
 }
@@ -97,10 +108,21 @@ pub struct Voucher {
     /// The provider node this voucher pays — a capability voucher is scoped to
     /// one provider and is invalid if redeemed against another.
     pub provider: Address,
-    /// Cumulative payment in token base units (`µUSDC` for `USDC`).
+    /// Cumulative payment in token base units (`µUSDC` for `USDC`). The
+    /// settlement anchor a hash chain extends.
     pub amount: U256,
     /// Cumulative bytes delivered against this lane.
     pub bytes_delivered: U256,
+    /// Head of the hash chain this voucher opens —
+    /// [`crate::chain::root_from_seed`] of the payer's per-lane seed. Zero
+    /// **seals** the voucher at exactly `amount`: nothing hashes to zero, so no
+    /// index above 0 can redeem against it (ADR 003 §The sealed voucher).
+    pub chain_root: B256,
+    /// What one chunk of delivery adds over `amount`, in token base units.
+    /// Signed so the claim arithmetic is fixed at signing time; the floor clamp
+    /// at redemption still reads the live `deliveryFloor`. Zero on a sealed
+    /// voucher, which meters no chunk.
+    pub chunk_price: U256,
 }
 
 impl Voucher {
@@ -111,6 +133,8 @@ impl Voucher {
             provider: self.provider,
             amount: self.amount,
             bytesDelivered: self.bytes_delivered,
+            chainRoot: self.chain_root,
+            chunkPrice: self.chunk_price,
         }
     }
 
@@ -226,6 +250,8 @@ mod tests {
             provider: address!("00000000000000000000000000000000000000b2"),
             amount: U256::from(10_000_000u64), // 10 USDC at 6 decimals
             bytes_delivered: U256::from(1_048_576u64), // 1 MB
+            chain_root: B256::repeat_byte(0xA7),
+            chunk_price: U256::from(10u64), // one chunk == one MB at 10 µUSDC/MB
         }
     }
 
@@ -443,7 +469,7 @@ mod tests {
         // Canonical EIP-712 type-string per ADR 003 §EIP-712 Voucher
         // Signature. Single space between Solidity type and field name; no
         // other whitespace; fields in declaration order.
-        let canonical: &[u8] = b"Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered)";
+        let canonical: &[u8] = b"Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,bytes32 chainRoot,uint256 chunkPrice)";
         let expected = keccak256(canonical);
         let actual = VoucherSol::eip712_type_hash(&sample_voucher().to_sol());
         anyhow::ensure!(
@@ -506,6 +532,8 @@ mod tests {
             provider: address!("00000000000000000000000000000000000000b2"),
             amount: U256::from(1_000_000u64),
             bytes_delivered: U256::from(1_048_576u64),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         };
         let domain = voucher_domain(
             421_614,
@@ -604,14 +632,20 @@ mod prop_tests {
             any_address(),
             any_u256(),
             any_u256(),
+            any_b256(),
+            any_u256(),
         )
             .prop_map(
-                |(pool_id, signer, provider, amount, bytes_delivered)| Voucher {
-                    pool_id,
-                    signer,
-                    provider,
-                    amount,
-                    bytes_delivered,
+                |(pool_id, signer, provider, amount, bytes_delivered, chain_root, chunk_price)| {
+                    Voucher {
+                        pool_id,
+                        signer,
+                        provider,
+                        amount,
+                        bytes_delivered,
+                        chain_root,
+                        chunk_price,
+                    }
                 },
             )
     }
@@ -667,12 +701,16 @@ mod prop_tests {
             other_provider in any_address(),
             other_amount in any_u256(),
             other_bytes in any_u256(),
+            other_root in any_b256(),
+            other_price in any_u256(),
         ) {
             prop_assume!(other_pool != voucher.pool_id);
             prop_assume!(other_signer != voucher.signer);
             prop_assume!(other_provider != voucher.provider);
             prop_assume!(other_amount != voucher.amount);
             prop_assume!(other_bytes != voucher.bytes_delivered);
+            prop_assume!(other_root != voucher.chain_root);
+            prop_assume!(other_price != voucher.chunk_price);
 
             let domain = voucher_domain(chain_id, verifying);
             let base = voucher.signing_hash(&domain);
@@ -691,6 +729,17 @@ mod prop_tests {
 
             let with_bytes = Voucher { bytes_delivered: other_bytes, ..voucher.clone() };
             prop_assert_ne!(with_bytes.signing_hash(&domain), base, "bytes_delivered not bound");
+
+            // The two PayWord fields carry real money: `chain_root` decides
+            // which released preimages extend this voucher at all, and
+            // `chunk_price` decides what each one is worth. An unbound
+            // `chunk_price` would let a payer re-price every metered chunk
+            // after the fact against a signature the node already accepted.
+            let with_root = Voucher { chain_root: other_root, ..voucher.clone() };
+            prop_assert_ne!(with_root.signing_hash(&domain), base, "chain_root not bound");
+
+            let with_price = Voucher { chunk_price: other_price, ..voucher.clone() };
+            prop_assert_ne!(with_price.signing_hash(&domain), base, "chunk_price not bound");
         }
 
         /// The domain is binding: a voucher signed under one `(chain_id,

@@ -2,18 +2,57 @@
 //!
 //! The lane store buffers `record()` in memory and the durability half runs on
 //! a background flush timer (ADR 003 §Off-chain voucher state persistence), so
-//! the serve loop advances one voucher at a time — nothing to amortize into a
-//! batch. [`ClientHandler::commit_one_voucher`] reads one voucher, verifies it
+//! the serve loop advances one proof at a time — nothing to amortize into a
+//! batch. [`ClientHandler::commit_one_proof`] reads one proof, verifies it
 //! under the per-lane lock, and records it; a pre-redeem flush covers the
 //! settlement path.
+//!
+//! A proof is one of two things, and they cost very differently (ADR 003 §Two
+//! payment resolutions). A **voucher** is signed: it settles any residual
+//! exactly, and costs an `ecrecover` on this path. A **`ChunkPreimage`** is not:
+//! it advances the lane's claim by one whole chunk for the price of a single
+//! keccak, with no signature to recover and nothing to acknowledge. That
+//! asymmetry is the point of the hash chain — signatures become O(1) per
+//! transfer plus one per rollover, rather than one per metering interval.
 
 use super::{
-    Arc, B256, BufferedVoucherReader, ClientHandler, DEFAULT_TOLERANCE_BPS, Hash,
-    LaneDeliveryState, LaneKey, LaneState, Mutex, Ordering, RateError, RecvStream, RetrySignal,
-    SendStream, SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop,
-    WatermarkBundle, unix_millis, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    Arc, B256, BufferedProofReader, ClientHandler, DEFAULT_TOLERANCE_BPS, Hash, LaneDeliveryState,
+    LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream, RetrySignal, SendStream,
+    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop, WatermarkBundle,
+    unix_millis, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
+
+/// One stream's hash-chain anchor: the `chain_root` it has been told about
+/// (ADR 003 §Concurrent Streams, Rule 1).
+///
+/// A released preimage is a bare 33 bytes — it names no chain. Its worth comes
+/// entirely from the voucher whose `chain_root` it satisfies, so the node needs
+/// something per stream to place it against. This is that something, and it is
+/// deliberately **per stream** rather than lane-wide: the payer sends the new
+/// root voucher on every active stream at a rollover, so a fast stream that has
+/// already adopted the new root cannot invalidate a slower sibling still
+/// finishing the old one. QUIC orders within a stream, so each stream reads its
+/// own old-chain reveals against its own old root.
+///
+/// A lane-wide reading would also not be *decidable*: "has this lane been told
+/// about a chain" has no useful answer when one stream has and another has not.
+/// Per stream, it does.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct StreamAnchor {
+    /// The root this stream has carried a voucher for, or `None` if it has
+    /// carried none — or if the last one it carried was sealed.
+    root: Option<B256>,
+}
+
+impl StreamAnchor {
+    /// Re-anchor to whatever an accepted voucher committed. A sealed voucher
+    /// (`chain_root == 0`) clears the anchor: it meters nothing, so a reveal
+    /// arriving afterwards on this stream would have no chain to belong to.
+    fn adopt(&mut self, chain_root: B256) {
+        self.root = (!chain_root.is_zero()).then_some(chain_root);
+    }
+}
 
 /// A voucher that passed the node-side verify half, carrying the advanced
 /// candidate state, its cumulative byte watermark, and the receipt amount.
@@ -42,6 +81,30 @@ enum VerifyStop {
     Bail(String),
 }
 
+/// Whether a voucher's signed `chunk_price` is the price this node quoted
+/// (ADR 003 §Chunk Cadence).
+///
+/// `chunk_price` is signed by the **payer**, and a released preimage carries no
+/// price of its own — its whole value is inherited from the voucher that opened
+/// the chain. A voucher signed at the governance floor against a node quoting
+/// ten times that would meter every later chunk at a tenth of the quote, and no
+/// per-tick moment would reveal it. So this is a plain equality check rather
+/// than a tolerance band: a node's rate is fixed for its lifecycle rather than
+/// hot-reloaded, and there is nothing here for rounding to explain away.
+///
+/// A **sealed** voucher meters no chunk and MUST carry a zero price. That is
+/// what keeps `chain_root == 0 ⟺ chunk_price == 0` true on both sides of the
+/// wire, and it is why nothing downstream — here or on-chain — needs a branch
+/// on the zero root.
+fn chunk_price_matches_quote(wire: &decdn_protocol::client::Voucher, rate_per_mb: u64) -> bool {
+    let expected = if wire.chain_root == [0u8; 32] {
+        0
+    } else {
+        rate_per_mb
+    };
+    wire.chunk_price == expected
+}
+
 /// Rule #1 credit cap: advance a lane's `paid_credited` by at most the amount the
 /// watermark advanced, and return the wire bytes to credit the serve loop's `paid`.
 /// A benign already-satisfied voucher (watermark unchanged, `paid_credited` already at
@@ -66,11 +129,12 @@ impl ClientHandler {
     /// §Off-chain voucher state persistence). Acceptance is implicit: no positive
     /// message is written; the caller keeps delivering.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn commit_one_voucher(
+    pub(super) async fn commit_one_proof(
         &self,
         send: &mut SendStream,
         recv: &mut RecvStream,
-        reader: &mut BufferedVoucherReader,
+        reader: &mut BufferedProofReader,
+        anchor: &mut StreamAnchor,
         hash: Hash,
         lane_key: LaneKey,
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
@@ -86,14 +150,40 @@ impl ClientHandler {
             return Ok(VoucherStop::Rejected);
         };
 
-        // (1) READ one wire voucher (blocking under VOUCHER_READ_TIMEOUT) WITHOUT
+        // (1) READ one proof (blocking under VOUCHER_READ_TIMEOUT) WITHOUT
         // holding the per-lane lock — a network read must not block same-lane
         // streams. The reader is cancellation-safe.
-        let wire = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
+        let proof = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("voucher read timed out after {VOUCHER_READ_TIMEOUT:?}")
+                anyhow::anyhow!("proof read timed out after {VOUCHER_READ_TIMEOUT:?}")
             })??;
+
+        let wire = match proof {
+            Proof::Voucher(wire) => wire,
+            Proof::Preimage(preimage) => {
+                return self
+                    .commit_one_preimage(
+                        send,
+                        anchor,
+                        hash,
+                        lane_key,
+                        lane,
+                        client_node_id,
+                        preimage,
+                        delta_bytes,
+                    )
+                    .await;
+            }
+        };
+
+        // (1b) The node MUST check the price it is being paid before it meters
+        // anything against this voucher (ADR 003 §Chunk Cadence).
+        if !chunk_price_matches_quote(&wire, rate_per_mb) {
+            self.write_reject(send, VoucherRejectReason::ChunkPriceMismatch, None)
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        }
 
         // (2) RECOVER + verify the signature WITHOUT holding the per-lane lock.
         // The `ecrecover` is the most expensive op on the serve path, and
@@ -165,6 +255,10 @@ impl ClientHandler {
         // only failure path and is treated as a serve fault.
         guard.state = verified.next_state.clone();
         guard.bytes_delivered_cumulative = verified.new_bytes;
+        // This stream now knows which chain the payer is metering against, so a
+        // bare reveal arriving on it afterwards is placeable. A sealed voucher
+        // clears the anchor instead — it opens no chain to reveal against.
+        anchor.adopt(B256::from(wire.chain_root));
         // Rule #1 cap: credit paid headroom by at most the amount the watermark
         // advanced. `paid_credited` is monotone and bounded by the settled
         // watermark, so a benign already-satisfied voucher (watermark unchanged)
@@ -189,9 +283,150 @@ impl ClientHandler {
         drop(guard);
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
-        self.record_receipt(hash, delta_bytes, client_node_id, verified.amount);
+        //
+        // Only a proof that actually CREDITED bytes gets a receipt. Under
+        // `PayWord` a stream sends an anchor voucher before its first reveal of
+        // an epoch, and that voucher re-asserts a cumulative the lane already
+        // holds — it is already-satisfied, it credits nothing, and logging it
+        // would put a payment in the audit log that never happened.
+        if credited_bytes > 0 {
+            self.record_receipt(hash, credited_bytes, client_node_id, verified.amount);
+        }
         // Hint the settlement service that this lane's accrued claim advanced
         // (#749/#327). Best-effort: an absent sender or a full channel just skips.
+        if let Some(tx) = self.redeem_hint.as_ref()
+            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(lane_key)
+        {
+            self.metrics.redeem_hint_dropped();
+        }
+        Ok(VoucherStop::Continue { credited_bytes })
+    }
+
+    /// Accept ONE released hash-chain preimage: place it against this stream's
+    /// anchor, fold it into the lane under the per-lane lock, and record the
+    /// advance (ADR 003 §Hash-chain metering).
+    ///
+    /// This is the cheap tick the whole design exists for. There is no
+    /// signature to recover, no acknowledgement to write, and nothing durable to
+    /// commit before the next chunk goes out — the cost is one keccak per step
+    /// walked, and a duplicate or out-of-order reveal costs not even that.
+    /// Acceptance is implicit, exactly as for a voucher: the node simply keeps
+    /// delivering.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_one_preimage(
+        &self,
+        send: &mut SendStream,
+        anchor: &mut StreamAnchor,
+        hash: Hash,
+        lane_key: LaneKey,
+        lane: &Arc<Mutex<LaneDeliveryState>>,
+        client_node_id: B256,
+        preimage: decdn_protocol::client::ChunkPreimage,
+        delta_bytes: u64,
+    ) -> anyhow::Result<VoucherStop> {
+        // Index 0 names the root and resolves to the voucher's own `amount`, so
+        // it proves nothing the voucher does not already say and never travels
+        // the wire. There is no over-long check to make on the other side: the
+        // index is a `u8` and `MAX_CHAIN_LENGTH` is 255, so an index past the end
+        // of the chain cannot be encoded — a stronger guarantee than a runtime
+        // comparison.
+        if preimage.index == 0 {
+            self.write_reject(send, VoucherRejectReason::ChainIndexZero, None)
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        }
+        // Rule 1: a reveal on a stream that carries no anchor cannot be placed,
+        // because a bare preimage does not name its chain. Not fatal — the payer
+        // sends this epoch's root voucher on this stream and resends, and the
+        // resend is free because an at-or-below-watermark voucher is
+        // already-satisfied rather than rejected.
+        let Some(root) = anchor.root else {
+            self.write_reject(send, VoucherRejectReason::UnanchoredPreimage, None)
+                .await?;
+            return Ok(VoucherStop::Rejected);
+        };
+
+        let mut guard = lane.lock().await;
+        // Rule 2, under the lock for the same reason the voucher path is: the
+        // frontier this walks from is the frontier it advances, and two streams
+        // reading the same frontier and both advancing would lose one reveal.
+        // The walk itself is `index − verified` keccaks, bounded at 255 by the
+        // index type, and zero for a reveal at or below the frontier.
+        let (next_state, applied) =
+            match guard
+                .state
+                .advance_preimage(root, preimage.index, B256::from(preimage.preimage))
+            {
+                Ok(advanced) => advanced,
+                Err(e) => {
+                    let Ok(reason) = voucher_reject_reason(&e) else {
+                        drop(guard);
+                        return Err(anyhow::anyhow!(
+                            "advance_preimage touches no store; unexpected RetrySignal"
+                        ));
+                    };
+                    // A hash-chain mismatch is terminal and carries no watermark
+                    // bundle: a preimage has no signature of its own, and a payment
+                    // watermark cannot repair a wrong seed or a wrong chain. But this
+                    // path can also raise `SpendingCapExhausted`, when the reveal
+                    // would push the claim past the capability's cap — and that one
+                    // IS recoverable, by exactly the route a voucher takes: the payer
+                    // reads the bundle, raises the cap, and resumes. So ask the same
+                    // gate the voucher path asks rather than assuming; it answers
+                    // `None` for every chain-specific reason on its own.
+                    let bundle = Self::watermark_bundle_for_reject(reason, &guard.state);
+                    drop(guard);
+                    self.write_reject(send, reason, bundle).await?;
+                    return Ok(VoucherStop::Rejected);
+                }
+            };
+
+        // A reveal that advanced nothing — at or below the frontier, or naming a
+        // superseded epoch — is benign, exactly like an already-satisfied
+        // voucher: nothing is recorded, nothing is credited, and delivery
+        // continues. Placement is by index rather than arrival order, so a fast
+        // stream skipping ahead of a slow one is ordinary, not a fault.
+        if !applied.advanced() {
+            drop(guard);
+            return Ok(VoucherStop::Continue { credited_bytes: 0 });
+        }
+
+        let owed_bytes = next_state.owed_bytes();
+        guard.state = next_state.clone();
+        guard.bytes_delivered_cumulative = owed_bytes;
+        // The same rule #1 cap the voucher path uses, against the CHAIN-EXTENDED
+        // frontier: a reveal is what pays for these bytes, so they are as settled
+        // as a signature's.
+        let (new_credited, credited_bytes) =
+            credit_advance(guard.paid_credited, delta_bytes, owed_bytes)?;
+        guard.paid_credited = new_credited;
+        if let Err(e) = self.channel_state_store.record(&next_state) {
+            drop(guard);
+            return Err(anyhow::anyhow!("lane store record failed: {e}"));
+        }
+        guard
+            .last_voucher_at
+            .store(unix_millis(), Ordering::Relaxed);
+        drop(guard);
+
+        // Post-acceptance bookkeeping, off the durability path. The receipt
+        // amount is the lane's new total claim — the same number a voucher's
+        // receipt carries, so the audit log reads uniformly across both proof
+        // kinds.
+        //
+        // The byte figure is `credited_bytes`, not this stream's `delta_bytes`,
+        // for the same reason the voucher path logs it: the two diverge. A reveal
+        // walks from the LANE's frontier, so one arriving ahead of a sibling's
+        // covers every index between and pays for more than one stream's delta,
+        // while `credit_advance` caps it below the delta whenever the watermark
+        // does not reach that far. `credited_bytes` is what the lane actually
+        // charged for, which is what an audit log must say (#248/#803). Gated the
+        // same way, so a reveal that advanced the frontier but credited nothing
+        // against the cap logs no payment.
+        let amount = u64::try_from(next_state.owed()).unwrap_or(u64::MAX);
+        if credited_bytes > 0 {
+            self.record_receipt(hash, credited_bytes, client_node_id, amount);
+        }
         if let Some(tx) = self.redeem_hint.as_ref()
             && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(lane_key)
         {
@@ -279,6 +514,13 @@ impl ClientHandler {
                 // floor before signing (`wire.rs::clamped_rate`) — is not a
                 // reason to stop the stream. The advertised-rate check above
                 // still protects this node's per-delta revenue at its own quote.
+                // The byte watermark this voucher settles is the CHAIN-EXTENDED
+                // one: a rollover voucher's own `bytes_delivered` already folds
+                // the retired chain in, but a voucher that merely re-asserts the
+                // live root leaves the frontier's reveals on top of it. Reading
+                // the signed half alone would leave the node's credit accounting
+                // a whole chain behind the money it is owed.
+                let new_bytes = next_state.owed_bytes().max(new_bytes);
                 Ok(VerifiedVoucher {
                     next_state,
                     new_bytes,
@@ -299,8 +541,14 @@ impl ClientHandler {
                         None,
                     ));
                 }
+                // Already-satisfied on the money axis — but the voucher may
+                // still be this lane's FIRST root voucher, whose `amount` is the
+                // cumulative the lane already holds because nothing has been
+                // metered yet. Install the chain it names, or the reveals that
+                // follow would fold nothing.
+                let next_state = state.adopt_chain(signed).unwrap_or_else(|| state.clone());
                 Ok(VerifiedVoucher {
-                    next_state: state.clone(),
+                    next_state,
                     new_bytes: cumulative_bytes,
                     amount: wire.amount,
                 })
@@ -340,7 +588,7 @@ impl ClientHandler {
     /// The pinned-signer gate — a bundle leaks a lane's private watermark, so
     /// only a request that recovers to `state.signer` may pull it, otherwise
     /// anyone who guessed the chain-derivable `pool_id` could — is enforced by
-    /// the caller: [`Self::commit_one_voucher`] recovers and verifies the signer
+    /// the caller: [`Self::commit_one_proof`] recovers and verifies the signer
     /// against `state.signer` OUTSIDE the per-lane lock before this runs (#1735).
     /// A voucher that recovers to a different address is rejected as `WrongSigner`
     /// and never reaches here, so re-recovering under the lock would only re-do
@@ -357,9 +605,19 @@ impl ClientHandler {
             return None;
         }
         let last_signature = state.last_signature()?;
+        let chain = state.chain();
         Some(WatermarkBundle {
             amount: u64::try_from(state.last_amount()).ok()?,
             bytes_delivered: u64::try_from(state.last_bytes_delivered()).ok()?,
+            // The chain half of the watermark. Without it a re-seeding signer
+            // would drop the frontier: it would re-sign from `amount` alone and
+            // discard `verified_index` chunks the node has already proved. With
+            // it, the signer folds `verified_index × chunk_price` back in — the
+            // same fold a rollover does (ADR 005 §Watermark bundle).
+            chain_root: chain.chain_root.into(),
+            verified_index: chain.verified_index,
+            tip: chain.tip.into(),
+            chunk_price: u64::try_from(chain.chunk_price).ok()?,
             last_signature: last_signature.to_vec(),
         })
     }
@@ -382,7 +640,7 @@ mod tests {
 
     /// A well-formed voucher verifies against a fresh lane and advances the
     /// candidate state to the voucher's cumulative amount/bytes — the pure,
-    /// no-I/O half of [`super::ClientHandler::commit_one_voucher`]. The
+    /// no-I/O half of [`super::ClientHandler::commit_one_proof`]. The
     /// read→verify→record path over real streams (durability included) is
     /// covered end to end by the `client_loopback` integration family.
     #[tokio::test]
@@ -415,6 +673,7 @@ mod tests {
             U256::ZERO,
             U256::ZERO,
             None,
+            decdn_incentive::LaneChain::NONE,
         );
         let lane = Arc::new(Mutex::new(LaneDeliveryState {
             state: seed,
@@ -437,6 +696,8 @@ mod tests {
             provider,
             amount,
             bytes_delivered: new_bytes,
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(&signer_key, &domain)
         .expect("sign voucher");
@@ -444,6 +705,8 @@ mod tests {
             signature: signed_voucher.signature.as_bytes().to_vec(),
             amount: u64::try_from(amount).expect("amount fits u64 in this test"),
             bytes_delivered: u64::try_from(new_bytes).expect("bytes fit u64 in this test"),
+            chain_root: [0u8; 32],
+            chunk_price: 0,
         };
 
         let snapshot = lane.lock().await.state.clone();
@@ -538,6 +801,7 @@ mod tests {
             high_amount,
             U256::from(two_mb),
             Some([9u8; 65]),
+            decdn_incentive::LaneChain::NONE,
         );
 
         // A LOWER cumulative voucher: 1 MB. Signed correctly by the lane signer.
@@ -549,6 +813,8 @@ mod tests {
             provider,
             amount: low_amount,
             bytes_delivered: U256::from(one_mb),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(&signer_key, &domain)
         .expect("sign low voucher");
@@ -556,6 +822,8 @@ mod tests {
             signature: signed_low.signature.as_bytes().to_vec(),
             amount: u64::try_from(low_amount).expect("amount fits u64 in this test"),
             bytes_delivered: one_mb,
+            chain_root: [0u8; 32],
+            chunk_price: 0,
         };
 
         // verify against the high watermark; the sibling's watermark already
@@ -607,6 +875,7 @@ mod tests {
             amount,
             U256::from(one_mb),
             Some([9u8; 65]),
+            decdn_incentive::LaneChain::NONE,
         );
         // Same amount, but claims 2 MB of bytes.
         let two_mb = one_mb * 2;
@@ -616,6 +885,8 @@ mod tests {
             provider,
             amount,
             bytes_delivered: U256::from(two_mb),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(&signer_key, &domain)
         .expect("sign divergent voucher");
@@ -623,6 +894,8 @@ mod tests {
             signature: divergent_voucher.signature.as_bytes().to_vec(),
             amount: u64::try_from(amount).expect("amount fits u64 in this test"),
             bytes_delivered: two_mb,
+            chain_root: [0u8; 32],
+            chunk_price: 0,
         };
 
         let err = super::ClientHandler::verify_voucher(
@@ -672,6 +945,7 @@ mod tests {
             U256::ZERO,
             U256::ZERO,
             None,
+            decdn_incentive::LaneChain::NONE,
         );
 
         // A well-formed, monotone voucher — but SIGNED BY THE WRONG KEY. Its
@@ -686,6 +960,8 @@ mod tests {
             provider,
             amount,
             bytes_delivered: U256::from(one_mb),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(&wrong_key, &domain)
         .expect("sign with the wrong key");
@@ -745,6 +1021,7 @@ mod tests {
             U256::ZERO,
             U256::ZERO,
             None,
+            decdn_incentive::LaneChain::NONE,
         );
 
         let mk = |bytes: u64| {
@@ -755,6 +1032,8 @@ mod tests {
                 provider,
                 amount,
                 bytes_delivered: U256::from(bytes),
+                chain_root: B256::ZERO,
+                chunk_price: U256::ZERO,
             }
             .sign(&signer_key, &domain)
             .expect("sign voucher")

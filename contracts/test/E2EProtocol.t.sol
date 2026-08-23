@@ -50,8 +50,9 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
 
     bytes32 internal constant CAPABILITY_TYPEHASH =
         keccak256("Capability(address signer,uint256 spendingCap,bytes32 poolId,uint64 expiry)");
-    bytes32 internal constant VOUCHER_TYPEHASH =
-        keccak256("Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered)");
+    bytes32 internal constant VOUCHER_TYPEHASH = keccak256(
+        "Voucher(bytes32 poolId,address signer,address provider,uint256 amount,uint256 bytesDelivered,bytes32 chainRoot,uint256 chunkPrice)"
+    );
 
     function setUp() public {
         owner = vm.addr(OWNER_PK);
@@ -128,7 +129,14 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         (bytes32 vr, bytes32 vvs) = _voucherSig(poolId, signer, operator, SETTLE_AMOUNT, SETTLE_BYTES, SIGNER_PK);
         PaymentPool.LaneVoucher[] memory vouchers = new PaymentPool.LaneVoucher[](1);
         vouchers[0] = PaymentPool.LaneVoucher({
-            signer: signer, cumulative: SETTLE_AMOUNT, bytesDelivered: SETTLE_BYTES, r: vr, vs: vvs
+            signer: signer,
+            cumulative: SETTLE_AMOUNT,
+            bytesDelivered: SETTLE_BYTES,
+            r: vr,
+            vs: vvs,
+            chainRoot: bytes32(0),
+            preimage: bytes32(0),
+            chainMeter: 0
         });
         PaymentPool.PoolBatch[] memory batches = new PaymentPool.PoolBatch[](1);
         batches[0] = PaymentPool.PoolBatch({ poolId: poolId, capabilities: caps, vouchers: vouchers });
@@ -198,7 +206,12 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         uint64 bytesDelivered,
         uint256 pk
     ) internal view returns (bytes32, bytes32) {
-        bytes32 structHash = keccak256(abi.encode(VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered));
+        // The cooperative close: a sealed voucher (zero root, zero price)
+        // settling exactly `amount`, which is the shape a finalized delivery
+        // actually redeems (ADR 003 §The chain walk is fallback-only).
+        bytes32 structHash = keccak256(
+            abi.encode(VOUCHER_TYPEHASH, poolId, signer_, provider_, amount, bytesDelivered, bytes32(0), uint256(0))
+        );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(address(d.paymentPool)), structHash));
         (uint8 v, bytes32 r, bytes32 sv) = vm.sign(pk, digest);
         return (r, bytes32(uint256(sv) | (uint256(v - 27) << 255)));

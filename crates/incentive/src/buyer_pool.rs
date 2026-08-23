@@ -819,7 +819,7 @@ mod tests {
                 other_pool,
                 lane,
                 U256::from(99u64),
-                U256::from(99u64)
+                U256::from(99u64),
             )? == AdvanceOutcome::PoolMismatch
         );
         anyhow::ensure!(
@@ -833,7 +833,7 @@ mod tests {
 
         // Unknown owner → UnknownPool, no write.
         anyhow::ensure!(
-            store.advance_progress(unknown, s.pool_id, lane, U256::from(1u64), U256::from(1u64))?
+            store.advance_progress(unknown, s.pool_id, lane, U256::from(1u64), U256::from(1u64),)?
                 == AdvanceOutcome::UnknownPool
         );
         anyhow::ensure!(

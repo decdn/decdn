@@ -342,17 +342,23 @@ async fn run() -> anyhow::Result<()> {
     // headroom on the under-payment side, so a future change to voucher pricing or
     // blob size would start clamping credited bytes and surface here first.
     //
-    // The `+1` tolerance is for the over-payment side only: each voucher interval
+    // The `+1` tolerance is for the over-payment side only: each chunk
     // prices its delta with `div_ceil`, so a different interval split could round
     // a micro-USDC up. The regression this leg exists to catch — selling at the
     // unclamped configured rate — is nowhere near the tolerance.
-    let (amount, billed_bytes) =
-        settled_amount_and_bytes(&chain, paid.pool_id, client.address(), node.operator_addr())
-            .await?;
-    assert!(
-        u128::from(billed_bytes) >= 2 * MIB as u128,
-        "the settled voucher must cover the whole blob, got {billed_bytes} billed bytes"
-    );
+    // A lane settles in MORE than one redemption: the chain meter advances a chunk
+    // at a time and the closing sealed voucher folds the sub-chunk tail, so the
+    // first claim to reach the chain carries only a prefix of the blob. The price
+    // below is a property of the WHOLE sale, so wait for the settled watermark to
+    // cover it rather than reading whatever the first redemption happened to leave.
+    let (amount, billed_bytes) = poll(Duration::from_secs(120), || async {
+        let (amount, billed) =
+            settled_amount_and_bytes(&chain, paid.pool_id, client.address(), node.operator_addr())
+                .await?;
+        Ok((u128::from(billed) >= 2 * MIB as u128).then_some((amount, billed)))
+    })
+    .await?
+    .context("the settled voucher never covered the whole blob")?;
     let implied_rate = U256::from(amount) * U256::from(BYTES_PER_MB) / U256::from(billed_bytes);
     assert!(
         (U256::from(NEW_FLOOR)..=U256::from(NEW_FLOOR + 1)).contains(&implied_rate),

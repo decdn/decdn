@@ -347,6 +347,8 @@ mod tests {
             provider: address!("00000000000000000000000000000000000000b2"),
             amount: cap.spending_cap,
             bytes_delivered: U256::from(1u64),
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         };
         anyhow::ensure!(
             cap.signing_hash(&domain) != voucher.signing_hash(&domain),

@@ -50,6 +50,7 @@ fn make_state(pool_id: B256, signer: &PrivateKeySigner) -> LaneState {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
     )
 }
 
@@ -66,6 +67,8 @@ fn signed_voucher(
         provider: PROVIDER,
         amount: U256::from(amount),
         bytes_delivered: U256::from(bytes_delivered),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
     };
     Ok(v.sign(signer, domain)?)
 }
@@ -319,6 +322,7 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
     );
     let state_b = LaneState::hydrate(
         pool_b,
@@ -329,6 +333,7 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
     );
 
     // Drive 50 monotonic vouchers per lane concurrently. Each task runs its
@@ -351,6 +356,8 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
                     provider: PROVIDER,
                     amount: U256::from(i) * U256::from(100u64),
                     bytes_delivered: U256::from(i) * U256::from(1_024u64),
+                    chain_root: B256::ZERO,
+                    chunk_price: U256::ZERO,
                 }
                 .sign(&signer_a, &domain_a)?;
                 state.apply_voucher(&v, &domain_a, &*store_a)?;
@@ -370,6 +377,8 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
                     provider: PROVIDER,
                     amount: U256::from(i) * U256::from(200u64),
                     bytes_delivered: U256::from(i) * U256::from(2_048u64),
+                    chain_root: B256::ZERO,
+                    chunk_price: U256::ZERO,
                 }
                 .sign(&signer_b, &domain_b)?;
                 state.apply_voucher(&v, &domain_b, &*store_b)?;
@@ -446,6 +455,7 @@ fn truncated_file_refuses_to_start() -> anyhow::Result<()> {
             U256::ZERO,
             U256::ZERO,
             None,
+            decdn_incentive::LaneChain::NONE,
         ))?;
     }
     let path = dir.path().join("lanes.redb");

@@ -154,7 +154,7 @@ async fn run_two_clients_coalesce() -> anyhow::Result<()> {
 
     // The multi-MB blob under test: seeded into the fs origin (with its `{H}.obao4`
     // outboard) but NOT the cache, so the first fetch is a real own-origin miss and
-    // the streaming/coalescing path is exercised over many voucher intervals.
+    // the streaming/coalescing path is exercised over many chunks.
     let blob = make_blob(256 * CHUNK_GROUP + 123);
     let hash = node.seed_origin_blob_with_outboard(&blob)?;
 

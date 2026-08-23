@@ -59,7 +59,7 @@ use support::{
 
 const CHAIN_ID: u64 = 421_614;
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// 1.5 MiB → crosses one 1-MiB voucher interval plus a closing voucher, so each
+/// 1.5 MiB → crosses one 1 MiB chunk plus a closing voucher, so each
 /// hop's lane advances through two vouchers (mirrors `client_loopback.rs`).
 const PAYLOAD_LEN: usize = 1_572_864;
 /// Distinct per-hop rates: A charges B `RATE_A`, B charges the client `RATE_B`.
@@ -159,6 +159,7 @@ fn seed_lane(
         U256::ZERO,
         U256::ZERO,
         None,
+        decdn_incentive::LaneChain::NONE,
     ))?;
     Ok(())
 }
@@ -650,7 +651,7 @@ async fn lying_upstream(
 
     // The wrong bytes, streamed in `CHUNK_SIZE` chunks like the real handler (the
     // requester rejects any chunk over the ceiling). `served` stays under one
-    // voucher interval, so exactly one closing voucher flows.
+    // chunk, so exactly one closing voucher flows.
     for chunk in served.chunks(decdn_protocol::CHUNK_SIZE) {
         write_client_msg(
             &mut send,
@@ -697,7 +698,7 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     let honest = vec![0x11u8; 4096];
     let requested_hash = decdn_cache::Hash::new(&honest);
     // ...vs. what the lying upstream actually serves (different content, sized
-    // under one voucher interval).
+    // under one chunk).
     let served = vec![0x22u8; 2048];
     anyhow::ensure!(
         decdn_cache::Hash::new(&served) != requested_hash,

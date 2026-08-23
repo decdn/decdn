@@ -46,8 +46,8 @@ use decdn_incentive::store::{
     PoolStateStore, StoreError,
 };
 use decdn_incentive::{
-    AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneKey, LaneState,
-    PoolId,
+    AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneChain, LaneKey,
+    LaneState, PoolId,
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,20 @@ struct StoredLaneState {
     cap: [u8; 32],
     expiry: u64,
     registered_until: u64,
+    /// The lane's live hash-chain epoch, flattened (ADR 003 §Off-chain voucher
+    /// state persistence). `tip` is the preimage **bytes** at `verified_index`,
+    /// not just the depth: only the payer can produce a value at a given depth,
+    /// so a node that kept the index alone would hold an unprovable claim after
+    /// a restart — in exactly the abandonment case the chain exists to cover.
+    ///
+    /// Chain state is **frontier**, so the #1672 durability split covers it
+    /// unchanged: losing it on a crash forfeits at most the chunks metered
+    /// since the lane's last signature, which is the node's own un-signed tail
+    /// and the safe direction to lose.
+    chain_root: [u8; 32],
+    chunk_price: [u8; 32],
+    verified_index: u8,
+    tip: [u8; 32],
 }
 
 impl From<&LaneState> for StoredLaneState {
@@ -247,8 +261,33 @@ impl From<&LaneState> for StoredLaneState {
             cap: state.cap.to_be_bytes(),
             expiry: state.expiry,
             registered_until: state.registered_until,
+            chain_root: state.chain().chain_root.into(),
+            chunk_price: state.chain().chunk_price.to_be_bytes(),
+            verified_index: state.chain().verified_index,
+            tip: state.chain().tip.into(),
         }
     }
+}
+
+/// Narrow an on-disk length-prefixed signature to the in-memory
+/// `Option<[u8; 65]>`: empty → `None`, exactly 65 bytes → `Some`, any other
+/// length → [`StoreError::Corrupt`] (a malformed record we must not silently
+/// submit to the on-chain `PaymentPool.redeemMany`).
+fn decode_signature(
+    bytes: &[u8],
+    pool_id: B256,
+    what: &str,
+) -> Result<Option<[u8; 65]>, StoreError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let len = bytes.len();
+    Ok(Some(<[u8; 65]>::try_from(bytes).map_err(|_| {
+        StoreError::Corrupt {
+            pool_id: Some(pool_id),
+            detail: format!("stored {what} signature is {len} bytes, expected 0 or 65"),
+        }
+    })?))
 }
 
 impl StoredLaneState {
@@ -271,17 +310,7 @@ impl StoredLaneState {
                 supported: SUPPORTED_SCHEMA_VERSION,
             });
         }
-        let last_signature: Option<[u8; 65]> = if self.signature.is_empty() {
-            None
-        } else {
-            let len = self.signature.len();
-            Some(
-                <[u8; 65]>::try_from(self.signature).map_err(|_| StoreError::Corrupt {
-                    pool_id: Some(pool_id),
-                    detail: format!("stored voucher signature is {len} bytes, expected 0 or 65"),
-                })?,
-            )
-        };
+        let last_signature = decode_signature(&self.signature, pool_id, "voucher")?;
         let mut state = LaneState::hydrate(
             pool_id,
             signer,
@@ -291,6 +320,12 @@ impl StoredLaneState {
             U256::from_be_bytes(self.last_amount),
             U256::from_be_bytes(self.last_bytes_delivered),
             last_signature,
+            LaneChain {
+                chain_root: B256::from(self.chain_root),
+                chunk_price: U256::from_be_bytes(self.chunk_price),
+                verified_index: self.verified_index,
+                tip: B256::from(self.tip),
+            },
         );
         state.registered_until = self.registered_until;
         Ok(state)
@@ -1380,6 +1415,7 @@ mod tests {
             U256::from(byte) * U256::from(1_000u64),
             U256::from(byte) * U256::from(1_024u64),
             Some([byte; 65]),
+            LaneChain::NONE,
         )
     }
 
@@ -1401,6 +1437,7 @@ mod tests {
             U256::from(1_234u64),
             U256::from(4_096u64),
             Some([0xABu8; 65]),
+            LaneChain::NONE,
         )
     }
 
@@ -1564,6 +1601,7 @@ mod tests {
             base.last_amount(),
             base.last_bytes_delivered(),
             base.last_signature().copied(),
+            LaneChain::NONE,
         );
         store.record(&base)?;
         store.record(&sibling)?;
@@ -1693,12 +1731,7 @@ mod tests {
         let key_bytes = lane_key_bytes(&s.key());
         let forward = StoredLaneState {
             schema_version: SUPPORTED_SCHEMA_VERSION + 1,
-            last_amount: s.last_amount().to_be_bytes(),
-            last_bytes_delivered: s.last_bytes_delivered().to_be_bytes(),
-            signature: s.last_signature().map_or_else(Vec::new, |x| x.to_vec()),
-            cap: s.cap.to_be_bytes(),
-            expiry: s.expiry,
-            registered_until: s.registered_until,
+            ..StoredLaneState::from(&s)
         };
         let encoded = postcard::to_allocvec(&forward)?;
         {
@@ -1982,6 +2015,7 @@ mod tests {
             U256::from(bytes),
             U256::from(bytes),
             Some([signer_byte; 65]),
+            LaneChain::NONE,
         )
     }
 

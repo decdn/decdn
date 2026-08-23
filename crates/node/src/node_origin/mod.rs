@@ -2275,8 +2275,7 @@ impl Drop for SettleOnDrop {
         // voucher still on the wire, which is what we actually owe (#1122). Settling at
         // `committed` there re-signs a spent cumulative on the next reuse, which the
         // upstream rejects as a regression — stranding lane progress.
-        let progress =
-            VoucherProgress::from_cumulative(self.ledger.settlement(), self.prior_amount);
+        let progress = VoucherProgress::from_ledger(&self.ledger, self.prior_amount);
         persist_buyer_progress(deps, self.provider_addr, self.pool_id, &progress);
     }
 }
@@ -2590,16 +2589,33 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 /// row for is not what needs reclaiming.
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
     match reason {
-        VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
-            PullVerdict::OurLocalFault
-        }
+        // Our own signing or metering is broken, and it hits every candidate.
+        // `BadPreimage` and `ChainIndexZero` belong here for the same reason
+        // a bad signature does: both mean this node released a proof no upstream
+        // can accept — a wrong seed, a wrong chain, or an index that never
+        // travels the wire — so suppressing the peer would blame the wrong party
+        // and hide a buyer-side bug. `ChunkPriceMismatch` is the same shape: we
+        // signed a price that is not the rate this node was quoted.
+        VoucherRejectReason::BadSignature
+        | VoucherRejectReason::WrongSigner
+        | VoucherRejectReason::BadPreimage
+        | VoucherRejectReason::ChainIndexZero
+        | VoucherRejectReason::ChunkPriceMismatch => PullVerdict::OurLocalFault,
+
         // Our OWN buyer pool, not the upstream — retry, do not suppress the peer.
         // `PoolExhausted` says the pool WE fund the upstream from can no longer cover
         // further credit; it is a statement about us, so every upstream returns it and
         // routing it to `OurDeadLane` would walk the candidate list suppressing each
         // healthy peer for an hour, outliving any top-up. The remedy is a top-up of our
         // pool (see `genuine_exhaustion`) and a retry, so keep the peer and try again.
-        VoucherRejectReason::PoolExhausted => PullVerdict::OurVoucherRetryable(reason),
+        // Not fatal, and not the peer's fault: this stream had not carried the
+        // current epoch's `chain_root` voucher before its first reveal. The fix
+        // is to re-anchor and resend, which is what a retry does — and the
+        // resend costs nothing, because an at-or-below-watermark voucher is
+        // already-satisfied rather than rejected.
+        VoucherRejectReason::PoolExhausted | VoucherRejectReason::UnanchoredPreimage => {
+            PullVerdict::OurVoucherRetryable(reason)
+        }
         // Terminal for THIS lane while the pool row is still worth keeping. The signer's
         // cap is spent (`SpendingCapExhausted`) or its capability expired
         // (`CapabilityExpired`), our accounting drifted

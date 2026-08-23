@@ -7,9 +7,9 @@ use alloy::primitives::U256;
 use crate::node_origin::PullLegTarget;
 
 use super::{
-    Arc, B256, ClientHandler, ClientMessage, FillOutcome, FloorReservation, Hash,
+    Arc, B256, CHUNK_BYTES, ClientHandler, ClientMessage, FillOutcome, FloorReservation, Hash,
     LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
-    StreamRequest, StreamResponseBody, VOUCHER_INTERVAL_BYTES, WINDOW_PULL_FALLBACK_DEADLINE,
+    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 impl ClientHandler {
@@ -84,11 +84,18 @@ impl ClientHandler {
         //
         // The floor-M guard, the response signature, and the serve/pull window
         // all price against the fixed voucher accounting interval.
-        let interval_bytes = VOUCHER_INTERVAL_BYTES;
-        // The pre-flight reservation is the ramp floor — one voucher interval. In-
+        let chunk_bytes = CHUNK_BYTES;
+        // The pre-flight reservation is the ramp floor — one chunk. In-
         // stream exposure is bounded by the ramped credit window, which the serve
         // loop and the pull-leg `RampPacer` both enforce (#1669).
-        let credit_floor = self.credit_window(interval_bytes, 0);
+        let credit_floor = self.credit_window(chunk_bytes, 0);
+
+        // The pull leg paces in CONTENT bytes while the client pays in WIRE bytes,
+        // and two chunk-group roundings sit between the two (see
+        // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
+        // the reservation and the serve loop, which both meter in wire and need no
+        // such allowance.
+        let pacing_floor = credit_floor.max(decdn_client_pull::PULL_WINDOW_FLOOR);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the pull-through
         // twin of the `dispatch.rs` direct-serve gate. Refuse the speculative pull
@@ -309,7 +316,7 @@ impl ClientHandler {
                             pull_offset,
                             pull_len,
                             credit_ramp_divisor,
-                            credit_floor,
+                            pacing_floor,
                             credit_max,
                             Arc::clone(&session),
                             cancel,
@@ -458,12 +465,19 @@ impl ClientHandler {
         //
         // The floor-M guard, the response signature, and the serve/pull window
         // price against the fixed voucher accounting interval.
-        let interval_bytes = VOUCHER_INTERVAL_BYTES;
-        // The pre-flight reservation is the ramp floor — one voucher interval, the
+        let chunk_bytes = CHUNK_BYTES;
+        // The pre-flight reservation is the ramp floor — one chunk, the
         // same bound the peer twin computes. In-stream exposure is bounded by the
         // ramped credit window, which the serve loop and the pull-leg `RampPacer`
         // both enforce (#1669).
-        let credit_floor = self.credit_window(interval_bytes, 0);
+        let credit_floor = self.credit_window(chunk_bytes, 0);
+
+        // The pull leg paces in CONTENT bytes while the client pays in WIRE bytes,
+        // and two chunk-group roundings sit between the two (see
+        // `PULL_WINDOW_FLOOR`). Its window therefore floors one chunk HIGHER than
+        // the reservation and the serve loop, which both meter in wire and need no
+        // such allowance.
+        let pacing_floor = credit_floor.max(decdn_client_pull::PULL_WINDOW_FLOOR);
 
         // Pre-flight floor-M guard (shared-payment-pool model) — the own-origin
         // twin of the peer path and of `dispatch.rs`. Refuse the serve when the
@@ -578,6 +592,8 @@ impl ClientHandler {
             let cancel = serve_session.cancel_token().clone();
             let credit_ramp_divisor = self.credit_ramp_divisor;
             let credit_max = self.credit_max;
+            // The unpaid local-origin leg: a throwaway ledger that never signs
+            // and never meters, because `BackendSource` quotes rate 0.
             let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
                 decdn_client_pull::Cumulative::default(),
             ));
@@ -602,7 +618,7 @@ impl ClientHandler {
                             pull_offset,
                             pull_len,
                             credit_ramp_divisor,
-                            credit_floor,
+                            pacing_floor,
                             credit_max,
                             total_bytes,
                             Arc::clone(&session),

@@ -80,7 +80,9 @@ use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
     Capability, SignedCapability, bind_node_id_domain, floor_micro, voucher_domain,
 };
-use decdn_protocol::client::{ClientMessage, StreamError, StreamRequestExt, WireCapability};
+use decdn_protocol::client::{
+    CHUNK_BYTES, ClientMessage, StreamError, StreamRequestExt, WireCapability,
+};
 use decdn_protocol::{ALPN_CLIENT, StreamRequest, encode_stream_request};
 use iroh::{Endpoint, EndpointAddr};
 
@@ -88,11 +90,13 @@ use iroh::{Endpoint, EndpointAddr};
 /// `render_config`). Left untouched — no `set_rate_per_mb` round trip is
 /// needed since the budget below is derived from this exact value.
 const RATE_PER_MB: u64 = 10;
-/// A blob just over one ramp-floor interval (4 MiB): large enough that a
-/// withheld lane is capped by the credit-window floor itself (delivered ==
-/// reserved bytes, so the accumulator folds exactly one floor's worth of
-/// `dead_charge` on disconnect), never by running out of content early — see
-/// the module doc on why an under-floor blob would under-count the fold.
+/// A blob comfortably past one ramp-floor chunk
+/// (`decdn_protocol::client::CHUNK_BYTES`): large enough that a withheld lane
+/// is capped by the credit-window floor itself (delivered == reserved bytes, so
+/// the accumulator folds exactly one floor's worth of `dead_charge` on
+/// disconnect), never by running out of content early — see the module doc on
+/// why an under-floor blob would under-count the fold. Only the lower bound is
+/// load-bearing; the margin above it costs nothing but transfer time.
 const BLOB_BYTES: usize = 4 * 1024 * 1024 + 65_536;
 /// Owner-delegated finite spend cap on each delegate capability — far above
 /// one floor's cost so it never itself binds; the pool deposit (not this cap)
@@ -134,7 +138,7 @@ async fn pool_floor_credit_bound_holds_across_distinct_lanes_and_a_real_miss() -
 /// journey never overrides it, so the daemon serves under the exact same
 /// value production ships. One ramp-floor at [`RATE_PER_MB`] is
 /// `floor_micro(RATE_PER_MB)`: at cold start (`paid == 0`) the ramped credit
-/// window always collapses to exactly one `VOUCHER_INTERVAL_BYTES` interval
+/// window always collapses to exactly one `CHUNK_BYTES` interval
 /// regardless of `credit_max`/`credit_ramp_divisor` (ADR 003 §Credit window),
 /// so every lane below reserves — and, once withheld, folds — exactly this
 /// amount into the pool's `dead_charge` accumulator
@@ -145,8 +149,13 @@ async fn pool_floor_credit_bound_holds_across_distinct_lanes_and_a_real_miss() -
 fn deposit_micro_usdc() -> U256 {
     let m = U256::from(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
     let floor = floor_micro(RATE_PER_MB);
-    // Slack well under one floor: two floors fit, a third never does.
-    let slack = U256::from(20u64);
+    // Slack under one floor, and derived from it rather than fixed: a withheld
+    // lane folds slightly MORE than the floor, because the deliver phase checks
+    // the window before each frame and so overshoots it by the one frame that
+    // crosses. Half a floor absorbs that overshoot twice over while staying well
+    // inside a third floor, so two lanes clear and the third cannot — at any
+    // floor size.
+    let slack = (floor / U256::from(2u64)).max(U256::from(1u64));
     m + floor * U256::from(2u64) + slack
 }
 
@@ -162,6 +171,12 @@ async fn run() -> anyhow::Result<()> {
         .try_init();
 
     let chain = ChainFixture::launch().await?;
+
+    // The ramp floor a withheld lane is capped at, in the `usize` the
+    // delivered-byte counters use. This — not a fraction of `BLOB_BYTES` — is
+    // what a withheld lane's delivery is measured against: the blob is
+    // deliberately much larger, so only the floor can explain where a lane parks.
+    let floor_bytes = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX);
 
     // A HIT blob (warmed into the node's cache at launch) and a MISS blob
     // (written only into the node's opaque origin backend, never touching the
@@ -274,9 +289,10 @@ async fn run() -> anyhow::Result<()> {
         ),
     };
     anyhow::ensure!(
-        lane1_bytes >= BLOB_BYTES / 2,
-        "lane 1 delivered only {lane1_bytes} bytes before parking — too little to have been \
-         capped by the ramp-floor credit window rather than by something else entirely"
+        lane1_bytes >= floor_bytes,
+        "lane 1 delivered only {lane1_bytes} bytes before parking — short of the \
+         {floor_bytes}-byte ramp floor, so something other than the credit window \
+         capped it"
     );
 
     // Lane 2 (distinct delegate signer, MISS): the pool is already known to
@@ -295,10 +311,10 @@ async fn run() -> anyhow::Result<()> {
         ),
     };
     anyhow::ensure!(
-        lane2_bytes >= BLOB_BYTES / 2,
+        lane2_bytes >= floor_bytes,
         "lane 2 (the real cache-miss lane) delivered only {lane2_bytes} bytes before parking — \
-         too little to have been capped by the ramp-floor credit window rather than by \
-         something else entirely (e.g. a degenerate near-instant refusal)"
+         short of the {floor_bytes}-byte ramp floor, so something other than the credit \
+         window capped it (e.g. a degenerate near-instant refusal)"
     );
 
     // Lane 3 (a THIRD distinct delegate signer, HIT — same blob as lane 1, so

@@ -49,6 +49,7 @@ pub mod buyer_pool_table;
 pub mod capability;
 pub mod capability_grant;
 pub mod capacity_bond;
+pub mod chain;
 pub mod client_bridge;
 pub mod content_blacklist;
 pub mod erc20;
@@ -83,13 +84,19 @@ pub use buyer_pool::{
 };
 pub use capability::{Capability, CapabilityError, SignedCapability};
 pub use capability_grant::{CapabilityGrant, GrantError, GrantOwnerError};
+pub use chain::{
+    CHUNK_BYTES, ChainMeterError, MAX_CHAIN_LENGTH, pack_chain_meter, preimage_at, random_seed,
+    root_from_seed, verify_forward,
+};
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
 };
 pub use credit::ramped_credit_window;
 pub use erc20::Erc20;
-pub use lane::{LaneKey, LaneState, PoolError, PoolId, VoucherApplied};
+pub use lane::{
+    LaneChain, LaneKey, LaneState, PoolError, PoolId, PreimageApplied, RedeemClaim, VoucherApplied,
+};
 pub use pool_open_error::{PoolOpenFailureReason, is_erc20_allowance_shortfall};
 pub use probe_sig::{
     ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION,

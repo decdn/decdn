@@ -96,7 +96,7 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 ///   operator dashboards show; it is reconstructed from the 32-byte big-endian
 ///   wire amount.
 ///
-/// `size` is the byte count covered by *this* voucher interval (the newly
+/// `size` is the byte count covered by *this* payment proof (the newly
 /// delivered, now-paid bytes), and `timestamp_secs` is the node's wall-clock
 /// Unix time (seconds) at acceptance.
 ///
@@ -129,7 +129,7 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 pub struct DownloadReceipt {
     /// BLAKE3 content hash of the delivered blob, lower-hex (64 chars).
     hash: String,
-    /// Bytes covered by this voucher interval (the newly paid delivery).
+    /// Bytes covered by this payment proof (the newly paid delivery).
     size: u64,
     /// iroh `NodeId` of the paying client, lower-hex (64 chars).
     client_node_id: String,
@@ -177,7 +177,7 @@ impl DownloadReceipt {
         &self.hash
     }
 
-    /// Bytes covered by this voucher interval (the newly paid delivery).
+    /// Bytes covered by this payment proof (the newly paid delivery).
     #[must_use]
     pub const fn size(&self) -> u64 {
         self.size

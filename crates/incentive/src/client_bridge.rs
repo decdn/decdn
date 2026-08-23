@@ -2,10 +2,12 @@
 //! state machine.
 //!
 //! The protocol crate ([`decdn_protocol::Voucher`]) is crypto-free: a wire
-//! voucher carries `{signature, amount, bytes_delivered}`, with `amount` and
+//! voucher carries `{signature, amount, bytes_delivered, chain_root,
+//! chunk_price}`, with `amount` and
 //! `bytes_delivered` as `u64` cumulative totals matching the contract's
 //! on-chain `uint64` storage. Validating it against a lane requires the full
-//! EIP-712 typed data `{pool_id, signer, provider, amount, bytes_delivered}`
+//! EIP-712 typed data `{pool_id, signer, provider, amount, bytes_delivered,
+//! chain_root, chunk_price}`
 //! — and `pool_id`, `signer`, and `provider` are **not** on the wire (ADR 005
 //! §Voucher wire format). They come from stream context: `pool_id` from the
 //! signed `StreamRequest`, `signer` the capability key, and `provider` this
@@ -31,8 +33,8 @@ use crate::voucher::{SignedVoucher, Voucher, VoucherError};
 ///
 /// `pool_id`, `signer`, and `provider` are not carried on the wire — the node
 /// supplies `pool_id` from the originating `StreamRequest`, `signer` from the
-/// registered capability, and `provider` from its own identity. `amount` and
-/// `bytes_delivered` ride the wire.
+/// registered capability, and `provider` from its own identity. `amount`,
+/// `bytes_delivered`, `chain_root` and `chunk_price` ride the wire.
 ///
 /// # Errors
 ///
@@ -57,6 +59,8 @@ pub fn wire_voucher_to_signed(
             provider,
             amount: U256::from(wire.amount),
             bytes_delivered: U256::from(wire.bytes_delivered),
+            chain_root: B256::from(wire.chain_root),
+            chunk_price: U256::from(wire.chunk_price),
         },
         signature,
     })
@@ -68,19 +72,24 @@ pub fn wire_voucher_to_signed(
 ///
 /// # Errors
 ///
-/// Returns [`WireVoucherError::ValueExceedsWireWidth`] if `amount` or
-/// `bytes_delivered` exceeds `u64::MAX` — the on-chain pool caps both at
-/// `uint64`, so such a voucher is unredeemable; it is refused rather than
-/// truncated.
+/// Returns [`WireVoucherError::ValueExceedsWireWidth`] if `amount`,
+/// `bytes_delivered` or `chunk_price` exceeds `u64::MAX` — the on-chain pool
+/// caps all three at `uint64` (`chunk_price` rides inside the packed
+/// `chainMeter` word), so such a voucher is unredeemable; it is refused rather
+/// than truncated.
 pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, WireVoucherError> {
     let amount = u64::try_from(signed.voucher.amount)
         .map_err(|_| WireVoucherError::ValueExceedsWireWidth)?;
     let bytes_delivered = u64::try_from(signed.voucher.bytes_delivered)
         .map_err(|_| WireVoucherError::ValueExceedsWireWidth)?;
+    let chunk_price = u64::try_from(signed.voucher.chunk_price)
+        .map_err(|_| WireVoucherError::ValueExceedsWireWidth)?;
     Ok(WireVoucher {
         signature: signed.signature.as_bytes().to_vec(),
         amount,
         bytes_delivered,
+        chain_root: signed.voucher.chain_root.into(),
+        chunk_price,
     })
 }
 
@@ -90,6 +99,14 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, Wir
 /// **Exhaustive, no wildcard (ADR 005 §Mirror obligation).** A new `PoolError`
 /// variant breaks this match at compile time, forcing a coordinated update of
 /// [`VoucherRejectReason`] and the retry-semantics table.
+///
+/// `BadPreimage` bridges too — the hash-chain walk is a lane-state check like
+/// the monotonicity guards, so it belongs in the same taxonomy. The other three
+/// chain reasons have no `PoolError` counterpart by design:
+/// `ChainIndexZero` and `UnanchoredPreimage` are decided against the
+/// *per-stream* anchor, and `ChunkPriceMismatch` against the node's own quoted
+/// rate — none of which the lane-scoped validation enum can see, so the
+/// `cdn/client/v1` handler raises those directly.
 ///
 /// [`PoolError::Store`] is the only transient failure: in-memory state did not
 /// advance, so it returns [`RetrySignal`] rather than a permanent reason. The
@@ -104,6 +121,7 @@ pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReaso
         PoolError::AmountRegression { .. } => Ok(VoucherRejectReason::AmountRegression),
         PoolError::BytesRegression { .. } => Ok(VoucherRejectReason::BytesRegression),
         PoolError::CapExceeded { .. } => Ok(VoucherRejectReason::SpendingCapExhausted),
+        PoolError::BadPreimage { .. } => Ok(VoucherRejectReason::BadPreimage),
         PoolError::Signature(VoucherError::InvalidSignature) => {
             Ok(VoucherRejectReason::BadSignature)
         }
@@ -165,6 +183,8 @@ mod tests {
             provider: PROVIDER,
             amount: U256::from(10_000u64),
             bytes_delivered,
+            chain_root: B256::repeat_byte(0xA7),
+            chunk_price: U256::from(10u64),
         }
         .sign(&signer, &domain)?;
 
@@ -183,6 +203,8 @@ mod tests {
             signature: vec![0u8; 10],
             amount: 0u64,
             bytes_delivered: 0u64,
+            chain_root: [0u8; 32],
+            chunk_price: 0u64,
         };
         let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
             .err()
@@ -204,6 +226,8 @@ mod tests {
             signature,
             amount: 0u64,
             bytes_delivered: 0u64,
+            chain_root: [0u8; 32],
+            chunk_price: 0u64,
         };
         let err = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER)
             .err()
@@ -222,6 +246,8 @@ mod tests {
             provider: PROVIDER,
             amount: U256::from(0x0102_0304u64),
             bytes_delivered: U256::ZERO,
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(&signer, &domain)?;
 
@@ -244,6 +270,8 @@ mod tests {
             provider: PROVIDER,
             amount: U256::from(u64::MAX) + U256::from(1u64),
             bytes_delivered: U256::ZERO,
+            chain_root: B256::ZERO,
+            chunk_price: U256::ZERO,
         }
         .sign(&signer, &domain)?;
 
@@ -350,14 +378,18 @@ mod prop_tests {
 
     proptest! {
         /// `signed → wire → signed` reproduces the signed voucher exactly when
-        /// the off-wire context (`pool_id`, `signer`, `provider`,
-        /// `bytes_delivered`) is re-supplied — proving the `U256 ↔ u64`
-        /// narrowing/widening is lossless across the whole `u64` range.
+        /// the off-wire context (`pool_id`, `signer`, `provider`) is
+        /// re-supplied — proving the `U256 ↔ u64` narrowing/widening is
+        /// lossless across the whole `u64` range, for `chunk_price` as much as
+        /// for the two cumulatives, and that `chain_root` survives the
+        /// `B256 ↔ [u8; 32]` hop untouched.
         #[test]
         fn wire_round_trip_is_lossless(
             pool_id in proptest::array::uniform32(any::<u8>()).prop_map(B256::from),
             amount in any::<u64>().prop_map(U256::from),
             bytes_delivered in any::<u64>().prop_map(U256::from),
+            chain_root in proptest::array::uniform32(any::<u8>()).prop_map(B256::from),
+            chunk_price in any::<u64>().prop_map(U256::from),
             signer in any_signer(),
         ) {
             let domain = voucher_domain(421_614, VERIFYING);
@@ -367,6 +399,8 @@ mod prop_tests {
                 provider: PROVIDER,
                 amount,
                 bytes_delivered,
+                chain_root,
+                chunk_price,
             }
                 .sign(&signer, &domain)
                 .unwrap();
@@ -374,6 +408,8 @@ mod prop_tests {
             let wire = signed_to_wire_voucher(&signed).unwrap();
             prop_assert_eq!(wire.amount, u64::try_from(amount).unwrap());
             prop_assert_eq!(wire.bytes_delivered, u64::try_from(bytes_delivered).unwrap());
+            prop_assert_eq!(B256::from(wire.chain_root), chain_root);
+            prop_assert_eq!(wire.chunk_price, u64::try_from(chunk_price).unwrap());
 
             let rebuilt =
                 wire_voucher_to_signed(&wire, pool_id, signer.address(), PROVIDER)
@@ -394,6 +430,8 @@ mod prop_tests {
                 signature: signature.clone(),
                 amount,
                 bytes_delivered: 0u64,
+                chain_root: [0u8; 32],
+                chunk_price: 0u64,
             };
             let result = wire_voucher_to_signed(&wire, B256::ZERO, PROVIDER, PROVIDER);
             if signature.len() != decdn_protocol::VOUCHER_SIG_LEN {

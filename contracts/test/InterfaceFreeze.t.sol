@@ -18,7 +18,7 @@ contract PaymentPoolInterfaceFreezeTest is Test {
             PaymentPool.redeemMany.selector,
             bytes4(
                 keccak256(
-                    "redeemMany((bytes32,(address,uint64,uint64,bytes)[],(address,uint64,uint64,bytes32,bytes32)[])[])"
+                    "redeemMany((bytes32,(address,uint64,uint64,bytes)[],(address,uint64,uint64,bytes32,bytes32,bytes32,bytes32,uint256)[])[])"
                 )
             ),
             "redeemMany"

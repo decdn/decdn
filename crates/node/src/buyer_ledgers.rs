@@ -44,6 +44,11 @@ impl BuyerLedgers {
     /// The ledger to issue this pull's vouchers through: the live one for `key`, or a fresh
     /// one seeded from `seed` if there is none.
     ///
+    /// `seed` is the lane's persisted cumulative and the only state a fresh ledger inherits.
+    /// A hash chain draws its own secret when it opens and is never reopened across a restart
+    /// (ADR 003 §Resumption folds), so there is nothing else here for a caller to supply and
+    /// nothing for a stale row to contradict.
+    ///
     /// An existing entry for the SAME lane wins over `seed`, and that precedence is the
     /// whole point. `seed` comes from the persisted row that `open_or_reuse_pool` read; a
     /// concurrent pull holding the live ledger may already have issued vouchers the row does
