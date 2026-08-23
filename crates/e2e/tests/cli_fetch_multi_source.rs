@@ -170,9 +170,14 @@ async fn run() -> anyhow::Result<()> {
     let out = client_dir.path().join("blob.bin");
     let args = fetch_argv(&chain, &blob_hash, client_dir.path(), &keystore, &out);
 
-    let before_a = billed_bytes(client_dir.path(), holder_a.operator_addr())?;
-    let before_b = billed_bytes(client_dir.path(), holder_b.operator_addr())?;
-    run_fetch_until_ready(client_dir.path(), &args).await?;
+    let (before_a, before_b) = run_fetch_until_both_lanes_bill(
+        client_dir.path(),
+        &args,
+        &out,
+        holder_a.operator_addr(),
+        holder_b.operator_addr(),
+    )
+    .await?;
 
     // (1) Byte-identical output.
     let got = std::fs::read(&out).context("read output")?;
@@ -285,12 +290,36 @@ fn distinct_pool_ids(
         .collect())
 }
 
-/// Run `decdn fetch`, retrying until the nodes' chain watchers have observed
-/// the freshly-opened pool (`decdn fetch` has no internal retry for that
-/// race).
-async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
+/// Run `decdn fetch` until ONE invocation bills BOTH holders, returning the
+/// per-operator billed-bytes baselines that invocation started from.
+///
+/// The nodes' chain watchers observe the freshly-opened pool asynchronously, and
+/// a holder whose watcher has not caught up refuses the stream pre-serve. The
+/// fetch SURVIVES that: a retryable refusal on one lane falls back to
+/// single-source failover (ADR 039 § Failure handling), so `decdn fetch` exits 0
+/// having been served by the other holder alone. Exit status is therefore not a
+/// readiness signal for this journey — the thing to wait for is one invocation
+/// that bills both lanes.
+///
+/// Requiring both within a SINGLE invocation is what keeps the assertion honest:
+/// a loop that merely accumulated payments across attempts would pass on two
+/// single-source fetches that each paid a different holder, which is exactly the
+/// non-parallelized case this journey exists to rule out. Each attempt starts
+/// from a clean slate (output and `.partial` set removed) so a resumed fetch
+/// cannot bill one lane for a remainder the previous attempt left.
+async fn run_fetch_until_both_lanes_bill(
+    data_dir: &std::path::Path,
+    args: &[String],
+    out: &std::path::Path,
+    op_a: alloy::primitives::Address,
+    op_b: alloy::primitives::Address,
+) -> anyhow::Result<(u64, u64)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
+        reset_fetch_artifacts(out)?;
+        let before_a = billed_bytes(data_dir, op_a)?;
+        let before_b = billed_bytes(data_dir, op_b)?;
+
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
             .arg("fetch")
             .args(args)
@@ -298,19 +327,54 @@ async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> a
             .await
             .context("spawn decdn fetch")?;
         if output.status.success() {
-            return Ok(());
+            let billed_a = billed_bytes(data_dir, op_a)?.saturating_sub(before_a);
+            let billed_b = billed_bytes(data_dir, op_b)?.saturating_sub(before_b);
+            if billed_a > 0 && billed_b > 0 {
+                return Ok((before_a, before_b));
+            }
+            tracing::debug!(
+                billed_a,
+                billed_b,
+                "fetch succeeded on one lane only; retrying after watcher catch-up:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            tracing::debug!(
+                "fetch not ready; retrying after watcher catch-up:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn fetch never succeeded; last stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tracing::debug!(
-            "fetch not ready; retrying after watcher catch-up:\n{}",
+            "no single `decdn fetch` billed both holders; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
+}
+
+/// Remove the output and every `.partial` artifact beside it, so the next fetch
+/// attempt starts from an empty gap set rather than resuming the previous one.
+fn reset_fetch_artifacts(out: &std::path::Path) -> anyhow::Result<()> {
+    let stem = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("output has no usable file name")?
+        .to_string();
+    let dir = out.parent().context("output has no parent directory")?;
+    for path in [
+        out.to_path_buf(),
+        dir.join(format!("{stem}.partial")),
+        dir.join(format!("{stem}.partial.obao4")),
+        dir.join(format!("{stem}.partial.ranges")),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+    Ok(())
 }
 
 /// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` via
