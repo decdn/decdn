@@ -2,7 +2,6 @@ target/
 .git/
 contracts/
 adr/
-.devcontainer/
 .github/
 *.md
 !README.md

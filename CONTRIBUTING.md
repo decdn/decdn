@@ -2,133 +2,56 @@
 
 ## Development Environment
 
-This repo uses a VS Code devcontainer with a firewall-isolated environment. The container runs as the `node` user.
+deCDN builds with a native toolchain and works with any editor. Install the prerequisites below, then clone and build.
 
 ### Prerequisites
 
-| Requirement | Windows | macOS | Linux |
-|---|---|---|---|
-| Docker | [Docker Desktop](https://docs.docker.com/desktop/install/windows-install/) (WSL2 backend) | [Docker Desktop](https://docs.docker.com/desktop/install/mac-install/) | [Docker Engine](https://docs.docker.com/engine/install/) |
-| Editor | [VS Code](https://code.visualstudio.com/) | VS Code | VS Code |
-| Extension | [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) | Dev Containers | Dev Containers |
-| API Key | `ANTHROPIC_API_KEY` set on host | `ANTHROPIC_API_KEY` set on host | `ANTHROPIC_API_KEY` set on host |
+| Tool | Why | Install |
+|---|---|---|
+| [rustup](https://rustup.rs) | `rust-toolchain.toml` pins Rust `1.95.0` with `rustfmt` and `clippy`; a rustup-managed `cargo` installs and selects that pin on first invocation | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| `cargo-nextest` | the test runner this repo and CI use instead of `cargo test` | `cargo install --locked cargo-nextest` |
+| `cargo-deny` | license + advisory audit; both a pre-commit hook and a CI gate | `cargo install --locked cargo-deny` |
+| [pre-commit](https://pre-commit.com/) | runs the commit- and push-stage gates | `pipx install pre-commit` |
+| [Foundry](https://book.getfoundry.sh) (`forge`, `anvil`) | contract build/test/fmt hooks and the Anvil e2e journeys; CI pins `v1.7.1` | `curl -L https://foundry.paradigm.xyz \| bash` then `foundryup -i v1.7.1` |
+| A C compiler (`cc`) + `make` | `ring` and `aws-lc-sys` compile C sources during `cargo build`, and rustc needs `cc` to link; `make` also drives the `adr-book-list` and `adr-ref-hygiene` hooks via `make -C adr` | system package manager (`build-essential` on Debian/Ubuntu); `cmake` is optional but lets `aws-lc-sys` skip its slower cc-only fallback |
+| [`gh`](https://cli.github.com/) | issue and PR workflow | system package manager |
 
-#### Platform Notes
+Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
 
-- **Windows**: Docker Desktop must use the WSL2 backend. Enable it in Docker Desktop Settings > General > "Use the WSL 2 based engine".
-- **macOS (Apple Silicon)**: The container runs natively on arm64. Only enable Rosetta in Docker Desktop if you encounter compatibility issues with specific packages.
-- **Linux**: Your user must be in the `docker` group (`sudo usermod -aG docker $USER`) or use rootless Docker.
+Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`).
 
-## Quick Start
-
-### 1. Set Your API Key
-
-**Linux / macOS** (add to `~/.bashrc`, `~/.zshrc`, or `~/.profile`):
+### Clone and Build
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-**Windows PowerShell** (persistent, user-level):
-
-```powershell
-[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "sk-ant-...", "User")
-```
-
-**Windows cmd** (persistent, user-level):
-
-```cmd
-setx ANTHROPIC_API_KEY "sk-ant-..."
-```
-
-Restart your terminal after setting the variable.
-
-### 2. Clone and Open
-
-```bash
-git clone git@github.com:thiras/decdn.git
+git clone --recurse-submodules git@github.com:decdn/decdn.git
 cd decdn
-code .
+pre-commit install --hook-type pre-commit --hook-type pre-push
+cargo build
 ```
 
-### 3. Reopen in Container
+`--recurse-submodules` matters: `contracts/lib/` is four git submodules (forge-std, openzeppelin-contracts, solady, crypto-lib), and every `forge` command fails without them. An existing clone catches up with `git submodule update --init --recursive`.
 
-When VS Code detects the `.devcontainer/` folder, it will prompt:
+Both hook types matter too: `.pre-commit-config.yaml` sets no `default_install_hook_types`, so a bare `pre-commit install` wires the commit stage only and the `forge build` / `forge test` push gates never fire.
 
-> **Folder contains a Dev Container configuration file. Reopen folder to develop in a container.**
+The first build downloads the pinned toolchain and compiles the full dependency graph, so expect a few minutes. Later builds are incremental.
 
-Click **Reopen in Container**. Or open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and run:
-
-```text
-Dev Containers: Reopen in Container
-```
-
-The first build takes a few minutes (Rust toolchain + dependencies). Subsequent starts reuse the cached image.
-
-### 4. Verify
-
-Inside the container terminal:
+### Verify
 
 ```bash
-claude --version       # Claude Code CLI
-rustc --version        # Rust compiler
-cargo --version        # Cargo package manager
-[ -n "$ANTHROPIC_API_KEY" ] && echo "Key is set" || echo "Key is missing"
+rustc --version            # 1.95.0
+cargo nextest --version
+cargo deny --version
+pre-commit --version
+forge --version            # 1.7.1
+anvil --version            # the e2e journeys need it
 ```
-
-## What's Included
-
-| Tool | Purpose |
-|---|---|
-| Rust (stable) | Compiler, cargo, rust-analyzer, cargo-watch, cargo-nextest |
-| Claude Code | Anthropic's AI coding assistant CLI |
-| git + git-delta | Version control with enhanced diffs |
-| zsh + Powerlevel10k | Shell with prompt theme, fzf, git integration |
-| gh | GitHub CLI |
-| iptables + ipset | Container firewall (auto-configured on start) |
-| Node.js 20 | Runtime for Claude Code |
-
-### VS Code Extensions (Auto-Installed)
-
-- `anthropic.claude-code` — Claude Code
-- `rust-lang.rust-analyzer` — Rust language server (clippy on save)
-- `eamodio.gitlens` — Git history and blame
-
-## Authentication
-
-The `ANTHROPIC_API_KEY` environment variable is forwarded from your host machine into the container via `devcontainer.json`:
-
-```json
-"containerEnv": {
-  "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}"
-}
-```
-
-The key is never baked into the image or committed to the repo. Each team member sets their own key on their host.
-
-## Running Claude Code Unattended
-
-The container's firewall isolation enables safe use of `--dangerously-skip-permissions` for long-running, unattended sessions:
-
-```bash
-claude --dangerously-skip-permissions
-```
-
-This bypasses all permission prompts, allowing Claude to read/write files, run commands, and operate autonomously within the container.
-
-**Safety considerations:**
-
-- The firewall restricts network access to only whitelisted domains (see below)
-- The container is isolated from your host filesystem (except the mounted workspace)
-- Only use this with trusted repositories — a malicious project could exfiltrate data accessible within the container
-- Monitor Claude's activities, especially during initial use
 
 ## Pre-commit Hooks
 
-The repo uses [pre-commit](https://pre-commit.com/) to enforce formatting, linting, and supply chain checks before each commit. The devcontainer runs `pre-commit install` automatically on creation.
+The repo uses [pre-commit](https://pre-commit.com/) to enforce formatting, linting, and supply chain checks before each commit.
 
 ```bash
-pre-commit install                # one-time setup (done automatically in devcontainer)
+pre-commit install --hook-type pre-commit --hook-type pre-push   # one-time setup
 pre-commit run --all-files        # run all hooks manually
 ```
 
@@ -312,7 +235,7 @@ Notes and common snags:
 
 ## Rust Toolchain
 
-`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo` (what the devcontainer ships), the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
+`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo`, the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
 
 Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. When accepting a Dependabot toolchain bump, update those two files in the same PR (and `Cargo.toml`'s `rust-version` if MSRV is moving in lockstep) so developer machines and CI stay aligned.
 
@@ -481,131 +404,3 @@ Mirror [`crates/node/tests/probe_loopback.rs`](crates/node/tests/probe_loopback.
 - **Anti-panic policy** (see [Code Style](#code-style)): no `unwrap`, `expect`, `panic!`, or `arr[i]` indexing. The handler runs on every accepted connection — a panic crashes one task per connection and risks leaking handler state through the `JoinSet`.
 - **ADR cross-references in module docs**: every handler module's doc-comment header should name the ALPN it serves and the ADR section that defines its message format and error codes (see the `probe.rs` header for the pattern).
 - **Variant-order discipline**: when adding fields, follow [ADR 013](adr/013-schema-evolution.md) — append-only for Tier 1, frozen-body split for signed payloads. Don't reorder existing variants.
-
-## Firewall and Security
-
-On container start, `init-firewall.sh` configures a default-deny iptables firewall.
-
-**Whitelisted domains** (HTTPS/TCP):
-
-| Category | Domains |
-|---|---|
-| **Anthropic** | `api.anthropic.com`, `sentry.io`, `statsig.anthropic.com`, `statsig.com` |
-| **GitHub** | Dynamic IP ranges from `api.github.com/meta` (web, API, git) |
-| **npm** | `registry.npmjs.org` |
-| **VS Code** | `marketplace.visualstudio.com`, `vscode.blob.core.windows.net`, `update.code.visualstudio.com` |
-| **Rust** | `crates.io`, `static.crates.io`, `index.crates.io`, `static.rust-lang.org` |
-| **Ethereum** | `sepolia-rollup.arbitrum.io`, `arb-sepolia.g.alchemy.com` |
-
-**Infrastructure rules** (always allowed):
-
-| Rule | Scope | Purpose |
-|---|---|---|
-| DNS (UDP/TCP 53) | Docker resolver (`127.0.0.11`) only | Name resolution — restricted to prevent direct external DNS access |
-| SSH (TCP 22) | Whitelisted IPs only | Git over SSH to GitHub — not open to arbitrary hosts |
-| Localhost | `lo` interface | Inter-process communication |
-| Host gateway | Single gateway IP | Docker host ↔ container communication |
-
-All other outbound traffic is rejected.
-
-### Adding a New Domain
-
-Edit `.devcontainer/init-firewall.sh` and add the domain to either the `CRITICAL_DOMAINS` array (must resolve or container fails to start) or the `OPTIONAL_DOMAINS` array (best-effort):
-
-```bash
-CRITICAL_DOMAINS=(
-    ...
-    "your-critical-domain.example.com"
-)
-
-OPTIONAL_DOMAINS=(
-    ...
-    "your-optional-domain.example.com"
-)
-```
-
-Rebuild the container image for the change to take effect (the script is copied during build, then executed on every container start).
-
-## Persistent Volumes
-
-These volumes survive container rebuilds:
-
-| Volume | Path in container | Contents |
-|---|---|---|
-| `decdn-bashhistory-*` | `/commandhistory` | Shell history |
-| `decdn-claude-config-*` | `/home/node/.claude` | Claude Code config and session data |
-| `decdn-cargo-registry-*` | `/home/node/.cargo/registry` | Downloaded crate sources and indices |
-
-Your workspace files are bind-mounted from the host, so they always persist.
-
-## Customization
-
-### Add a VS Code Extension
-
-Edit `.devcontainer/devcontainer.json`:
-
-```json
-"extensions": [
-  "anthropic.claude-code",
-  "rust-lang.rust-analyzer",
-  "eamodio.gitlens",
-  "your-publisher.your-extension"
-]
-```
-
-### Change the Timezone
-
-The container inherits your host's `TZ` environment variable. To override, set it before opening:
-
-```bash
-export TZ="Europe/Istanbul"
-```
-
-Or change the default in `devcontainer.json` build args.
-
-### Add System Packages
-
-Edit the `apt-get install` block in `.devcontainer/Dockerfile` and rebuild.
-
-## Troubleshooting
-
-### "Reopen in Container" Doesn't Appear
-
-Ensure the Dev Containers extension is installed. Open Command Palette and search for "Dev Containers: Reopen in Container".
-
-### Container Build Fails
-
-```bash
-# Build manually to see full output
-docker build -f .devcontainer/Dockerfile .devcontainer/
-```
-
-### `ANTHROPIC_API_KEY` is Empty Inside the Container
-
-The key must be set in your host shell **before** opening VS Code. Verify on your host:
-
-```bash
-echo $ANTHROPIC_API_KEY   # Linux/macOS
-$env:ANTHROPIC_API_KEY    # PowerShell
-echo %ANTHROPIC_API_KEY%  # cmd
-```
-
-If set but not visible, restart VS Code — it reads environment variables at launch.
-
-### Firewall Blocks a Domain You Need
-
-Check which domain is blocked:
-
-```bash
-curl -v https://the-domain.com 2>&1 | head -20
-```
-
-Add it to `init-firewall.sh` and rebuild the container image (the script is copied during build).
-
-### Slow First Build on Apple Silicon
-
-Compiling Rust dev tools (`cargo-watch`, `cargo-nextest`) from source takes longer on arm64. The first build may take 5-10 minutes. Subsequent starts reuse cached layers.
-
-### Docker Not Running (Windows)
-
-Ensure Docker Desktop is running and the WSL2 backend is active. If using WSL2, run `wsl --update` to ensure it's current.

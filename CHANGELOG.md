@@ -1352,6 +1352,15 @@ since project inception and will roll into the first tagged release.
   full set and `adr/architecture.md` for the living overview.
 - `CONTRIBUTING.md` with build / lint / test commands and pre-commit setup.
 
+### Removed
+
+- **The VS Code devcontainer (`.devcontainer/`).** The container image and its
+  firewall init script are gone, and most of CONTRIBUTING.md went with them. No
+  CI job built the image, so nothing shipped depended on it; contributors now
+  install a native toolchain per the rewritten
+  [Development Environment](CONTRIBUTING.md#development-environment) section.
+  Contributor tooling only — no runtime, wire, config, or ABI impact.
+
 ### Security
 
 - `ruint` → 1.20.0 (RUSTSEC-2026-0220: `Uint::overflowing_shl`/`overflowing_shr`
