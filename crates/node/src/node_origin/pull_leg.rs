@@ -377,7 +377,7 @@ impl NodeOrigin {
         };
         let ctx = bind_upstream_ctx(deps, ctx).map_err(|err| local_miss(&err))?;
         let deadlines = deps.config.deadlines().map_err(|err| local_miss(&err))?;
-        let ledger = lane_ledger(deps, provider_addr, &ctx).map_err(|err| local_miss(&err))?;
+        let ledger = lane_ledger(deps, provider_addr, &ctx);
         // Folds the candidate probe rate, the static ceiling, and the ADR 041 buy cap.
         let rate_ceiling = econ_rate_ceiling;
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
@@ -1079,7 +1079,7 @@ mod local_pull_leg_tests {
     }
 
     fn fresh_ledger() -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::unmetered(Cumulative::default()))
+        Arc::new(PoolLedger::new(Cumulative::default()))
     }
 
     /// Build an engine over one `FakeOrigin` in `mode`, plus the root/outboard/total

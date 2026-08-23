@@ -85,8 +85,8 @@ pub use buyer_pool::{
 pub use capability::{Capability, CapabilityError, SignedCapability};
 pub use capability_grant::{CapabilityGrant, GrantError, GrantOwnerError};
 pub use chain::{
-    CHUNK_BYTES, ChainMeterError, MAX_CHAIN_LENGTH, derive_seed, master_secret, pack_chain_meter,
-    preimage_at, root_from_seed, verify_forward,
+    CHUNK_BYTES, ChainMeterError, MAX_CHAIN_LENGTH, pack_chain_meter, preimage_at, random_seed,
+    root_from_seed, verify_forward,
 };
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,

@@ -32,13 +32,22 @@
 //!
 //! A released preimage is a **bearer proof**: it names no payee, and its
 //! binding to one comes entirely from the voucher whose `chain_root` it
-//! satisfies. So a signer MUST derive an independent seed and root for every
-//! `(pool_id, signer, provider)` lane, and MUST NOT reuse one across providers,
-//! pools, or its own sibling signers — reuse lets a second node claim chunks it
-//! never delivered, and the payer pays twice for one tick (ADR 003 §Cross-lane
-//! preimage spend). [`derive_seed`] is that defence: it is domain-separated on
-//! the full lane triple plus the epoch, so two lanes are non-inter-derivable to
-//! anyone without the payer's signing key.
+//! satisfies. So a payer MUST NOT commit one root on two lanes — reuse lets a
+//! second node claim chunks it never delivered, and the payer pays twice for
+//! one tick (ADR 003 §Cross-lane preimage spend).
+//!
+//! [`random_seed`] is that defence, and it keeps no state to get wrong: every
+//! chain draws 32 fresh bytes from the OS, so two chains share a root only with
+//! probability 2⁻²⁵⁶ — on one lane or across every lane a payer holds. Reuse
+//! stops being a rule to enforce and becomes an outcome the draw does not
+//! produce.
+//!
+//! A seed lives in memory for the life of its chain and is never written down,
+//! never derived from the signing key, and never reproduced. Nothing needs to
+//! reproduce one: a chain is only ever extended by the process that drew it,
+//! because crossing a process or device boundary FOLDS the frontier the node
+//! proved into a fresh signed amount and opens a fresh chain (ADR 003
+//! §Resumption folds).
 //!
 //! There is deliberately **no node-side check** for root reuse: the reuse pays
 //! the node, so a rejection rule protects nobody who would choose to run it,
@@ -46,20 +55,9 @@
 //! the node has ever seen.
 
 use alloy::primitives::{B256, U256, keccak256};
-use alloy::signers::SignerSync;
-
-use crate::lane::LaneKey;
+use rand::Rng;
 
 pub use decdn_protocol::client::{CHUNK_BYTES, MAX_CHAIN_LENGTH};
-
-/// Domain tag for the once-per-process master-secret digest. Signing this,
-/// rather than a bare constant, is what binds every chain a payer opens to the
-/// key that pays for it.
-const MASTER_TAG: &[u8] = b"decdn/payword/master/v1";
-
-/// Domain tag prefixed to every per-lane seed preimage, so a seed can never
-/// collide with any other keccak preimage this crate builds.
-const SEED_TAG: &[u8] = b"decdn/payword/seed/v1";
 
 /// Hash `value` forward exactly `steps` times.
 ///
@@ -144,110 +142,34 @@ pub enum ChainMeterError {
     PriceExceedsWireWidth,
 }
 
-/// Derive this payer's master chain secret from its voucher signing key, once
-/// per process.
+/// Draw the seed for one chain: 32 fresh bytes from the OS CSPRNG.
 ///
-/// The signature is over a fixed domain digest and secp256k1 ECDSA signing is
-/// deterministic (RFC 6979), so the same key reproduces the same master secret
-/// across restarts with nothing kept on disk. Every lane seed hangs off this,
-/// so a payer that has its key has its chains, and a payer that does not has
-/// neither.
+/// A seed is drawn when the chain opens, held in memory for as long as the
+/// chain meters, and dropped with it. Two draws collide only with probability
+/// 2⁻²⁵⁶, so the one-root-per-lane rule the scheme rests on holds by the draw
+/// rather than by any state kept correct between draws — across a payer's
+/// lanes, and across the successive chains of one lane (ADR 003 §One chain per
+/// lane).
 ///
-/// # Errors
-///
-/// Propagates a signer failure (a remote or hardware signer refusing the
-/// request); a local key cannot fail here.
-pub fn master_secret<S: SignerSync>(signer: &S) -> Result<B256, alloy::signers::Error> {
-    let sig = signer.sign_hash_sync(&keccak256(MASTER_TAG))?;
-    Ok(keccak256(sig.as_bytes()))
-}
-
-/// Derive the seed for one `(pool_id, signer, provider)` lane at one chain:
-/// `keccak256(SEED_TAG ‖ master ‖ pool_id ‖ signer ‖ provider ‖ anchor ‖ price)`.
-///
-/// Domain-separated on the whole lane triple, so two lanes under one master are
-/// independent and neither is derivable from the other without the master.
-///
-/// # Why the anchor is the epoch
-///
-/// A chain is identified by the signed voucher that opens it, through that
-/// voucher's cumulative `anchor` amount. The lane's cumulative is monotone for
-/// its whole life, and rolling a chain is DEFINED as folding its frontier into a
-/// new signed amount — so the anchor already counts epochs, and counts them in a
-/// number the protocol maintains for free and both sides can always read.
-///
-/// That makes the double-pay this derivation exists to prevent unrepresentable
-/// rather than merely guarded against. Released preimages are bearer proofs and
-/// redemption prices them as `amount + index × chunk_price`, so recommitting a
-/// root beside an amount that already folded its frontier would pay for those
-/// chunks twice. But the fold is exactly what moves the amount — `A → A + k·p`
-/// for `k ≥ 1` — so every post-fold chain derives a different seed, always. The
-/// `(anchor, root)` pairing is rigid; there is no state to keep correct.
-///
-/// Re-deriving at an UNCHANGED anchor is not a collision but chain resumption:
-/// the anchor is unchanged precisely because nothing was folded, so the same
-/// root is the one the node is still metering, and the payer continues from
-/// `verified_index + 1`. A chain reopened at its own anchor with nothing
-/// released is a no-op — no preimage below the root exists to replay.
-///
-/// # Why the price is in the derivation
-///
-/// A reveal is priced by the voucher that redeems it, not by the voucher that
-/// committed the chain. If a chain opened at `A` with price `p₁` releases `k`,
-/// and a later voucher carries the SAME anchor with `p₂ > p₁` — a reprice that
-/// folded nothing — the same root under the higher price would redeem those `k`
-/// old preimages for `k·(p₂ − p₁)` extra. Binding the price closes that
-/// structurally: a reprice is simply a different chain.
-///
-/// # What this rests on, and the one thing it gives up
-///
-/// Lane-cumulative monotonicity and `pool_id` never being reused — both already
-/// load-bearing for cumulative-voucher replay safety. `anchor` MUST be the
-/// amount in the chain's own opening voucher, not a live in-memory figure; the
-/// voucher is what both sides can point at.
-///
-/// The cost: a RETIRED chain whose opening anchor is forgotten can never be
-/// re-derived. A small counter space could be scanned; `U256` amounts cannot. No
-/// flow needs a retired chain's seed — its frontier is folded into a signed
-/// amount by the act of retiring it — so this is recorded rather than solved.
-///
-/// Nothing is persisted either way: the seed is reproduced on demand from the
-/// signing key and the anchor, so no chain secret is ever written to disk.
+/// Nothing reproduces a seed, and nothing needs to. Re-opening a chain across a
+/// process or device boundary is never how a payer resumes: it folds the
+/// frontier the node proved into a signed amount and opens a fresh chain
+/// instead, which needs the signing key and no secret at rest at all (ADR 003
+/// §Resumption folds).
 #[must_use]
-pub fn derive_seed(master: B256, lane: &LaneKey, anchor: U256, chunk_price: U256) -> B256 {
-    let mut preimage = Vec::with_capacity(SEED_TAG.len() + 32 + 32 + 20 + 20 + 32 + 32);
-    preimage.extend_from_slice(SEED_TAG);
-    preimage.extend_from_slice(master.as_slice()); // bytes32 → 32
-    preimage.extend_from_slice(lane.pool_id.as_slice()); // bytes32 → 32
-    preimage.extend_from_slice(lane.signer.as_slice()); // address → 20
-    preimage.extend_from_slice(lane.provider.as_slice()); // address → 20
-    preimage.extend_from_slice(&anchor.to_be_bytes::<32>()); // uint256 → 32 BE
-    preimage.extend_from_slice(&chunk_price.to_be_bytes::<32>()); // uint256 → 32 BE
-    keccak256(preimage)
+pub fn random_seed() -> B256 {
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    B256::from(seed)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // tests
 mod tests {
-    use alloy::primitives::{Address, address};
-    use alloy::signers::local::PrivateKeySigner;
-
     use super::{
-        B256, CHUNK_BYTES, LaneKey, MAX_CHAIN_LENGTH, U256, derive_seed, keccak256, master_secret,
-        pack_chain_meter, preimage_at, root_from_seed, verify_forward,
+        B256, CHUNK_BYTES, MAX_CHAIN_LENGTH, U256, keccak256, pack_chain_meter, preimage_at,
+        random_seed, root_from_seed, verify_forward,
     };
-
-    const POOL: B256 = B256::repeat_byte(0x11);
-    const SIGNER: Address = address!("00000000000000000000000000000000000000AA");
-    const PROVIDER: Address = address!("00000000000000000000000000000000000000BB");
-
-    fn lane(pool: B256, signer: Address, provider: Address) -> LaneKey {
-        LaneKey {
-            pool_id: pool,
-            signer,
-            provider,
-        }
-    }
 
     fn seed() -> B256 {
         B256::repeat_byte(0x42)
@@ -349,117 +271,21 @@ mod tests {
         }
     }
 
-    /// ADR 003 §One chain per lane: every component of the lane triple, the
-    /// anchor, and the price must move the seed. If any did not, two chains would
-    /// share a root and a released preimage would pay for a tick twice.
+    /// ADR 003 §One chain per lane: successive chains never share a root. Two
+    /// draws colliding is a 2⁻²⁵⁶ event, so this is the whole of the reuse
+    /// defence — there is no derivation input to get wrong and no counter to
+    /// have persisted.
     #[test]
-    fn every_lane_component_the_anchor_and_the_price_move_the_seed() {
-        const A: U256 = U256::from_limbs([1_000, 0, 0, 0]);
-        const P: U256 = U256::from_limbs([10, 0, 0, 0]);
-        let master = B256::repeat_byte(0x99);
-        let base = derive_seed(master, &lane(POOL, SIGNER, PROVIDER), A, P);
-        let others = [
-            derive_seed(
-                master,
-                &lane(B256::repeat_byte(0x12), SIGNER, PROVIDER),
-                A,
-                P,
-            ),
-            derive_seed(
-                master,
-                &lane(
-                    POOL,
-                    address!("00000000000000000000000000000000000000AB"),
-                    PROVIDER,
-                ),
-                A,
-                P,
-            ),
-            derive_seed(
-                master,
-                &lane(
-                    POOL,
-                    SIGNER,
-                    address!("00000000000000000000000000000000000000BC"),
-                ),
-                A,
-                P,
-            ),
-            // The anchor: a fold moves it, so a post-fold chain is a new chain.
-            derive_seed(master, &lane(POOL, SIGNER, PROVIDER), A + P, P),
-            // The price: a reprice at an unchanged anchor is a new chain too, or
-            // the old preimages would redeem at the new rate.
-            derive_seed(master, &lane(POOL, SIGNER, PROVIDER), A, P + P),
-            derive_seed(B256::repeat_byte(0x98), &lane(POOL, SIGNER, PROVIDER), A, P),
-        ];
-        for (i, other) in others.into_iter().enumerate() {
-            assert_ne!(base, other, "variant {i} collided with the base seed");
+    fn successive_draws_commit_disjoint_roots() {
+        let mut roots = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let seed = random_seed();
+            assert_ne!(seed, B256::ZERO, "a draw of all zeros is not a real seed");
+            assert!(
+                roots.insert(root_from_seed(seed)),
+                "two draws committed the same root"
+            );
         }
-    }
-
-    /// The resumption property, which is what the anchor buys over a counter:
-    /// re-deriving at an UNCHANGED anchor reproduces the SAME chain. The anchor is
-    /// unchanged exactly when nothing was folded, so that chain is the one the
-    /// node is still metering and the payer picks up where it left off — no
-    /// counter to have persisted, and nothing to have got wrong.
-    #[test]
-    fn an_unchanged_anchor_re_derives_the_same_chain() {
-        const A: U256 = U256::from_limbs([1_000, 0, 0, 0]);
-        const P: U256 = U256::from_limbs([10, 0, 0, 0]);
-        let master = B256::repeat_byte(0x99);
-        let lane = lane(POOL, SIGNER, PROVIDER);
-        assert_eq!(
-            root_from_seed(derive_seed(master, &lane, A, P)),
-            root_from_seed(derive_seed(master, &lane, A, P))
-        );
-    }
-
-    /// Two lanes under one master produce disjoint roots — the property that
-    /// makes a released preimage worthless outside the one node entitled to it.
-    #[test]
-    fn sibling_lanes_commit_disjoint_roots() {
-        let master = B256::repeat_byte(0x99);
-        let anchor = U256::from(1_000u64);
-        let price = U256::from(10u64);
-        let a = root_from_seed(derive_seed(
-            master,
-            &lane(POOL, SIGNER, PROVIDER),
-            anchor,
-            price,
-        ));
-        let b = root_from_seed(derive_seed(
-            master,
-            &lane(
-                POOL,
-                SIGNER,
-                address!("00000000000000000000000000000000000000BC"),
-            ),
-            anchor,
-            price,
-        ));
-        assert_ne!(a, b);
-    }
-
-    /// The restart property: the master is a deterministic function of the key
-    /// alone, so a payer that reloads its key reproduces every live chain
-    /// without having stored a single secret.
-    #[test]
-    fn the_master_secret_is_reproducible_from_the_key_alone() {
-        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x07)).unwrap();
-        let first = master_secret(&signer).unwrap();
-        let reloaded = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x07)).unwrap();
-        assert_eq!(first, master_secret(&reloaded).unwrap());
-
-        let lane = lane(POOL, SIGNER, PROVIDER);
-        assert_eq!(
-            derive_seed(first, &lane, U256::from(3u64), U256::from(10u64)),
-            derive_seed(
-                master_secret(&reloaded).unwrap(),
-                &lane,
-                U256::from(3u64),
-                U256::from(10u64)
-            )
-        );
     }
 
     /// The packed word's layout, at the boundaries that matter: the index is
@@ -503,14 +329,5 @@ mod tests {
     #[test]
     fn a_sealed_meter_is_the_zero_word() {
         assert_eq!(pack_chain_meter(U256::ZERO, 0).unwrap(), U256::ZERO);
-    }
-
-    /// A different key is a different payer, and must share no chain with the
-    /// first.
-    #[test]
-    fn a_different_key_yields_a_different_master() {
-        let a = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x07)).unwrap();
-        let b = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x08)).unwrap();
-        assert_ne!(master_secret(&a).unwrap(), master_secret(&b).unwrap());
     }
 }

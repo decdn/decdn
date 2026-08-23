@@ -103,7 +103,7 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, Wir
 /// `BadPreimage` bridges too — the hash-chain walk is a lane-state check like
 /// the monotonicity guards, so it belongs in the same taxonomy. The other three
 /// chain reasons have no `PoolError` counterpart by design:
-/// `ChainIndexTooLarge` and `UnanchoredPreimage` are decided against the
+/// `ChainIndexZero` and `UnanchoredPreimage` are decided against the
 /// *per-stream* anchor, and `ChunkPriceMismatch` against the node's own quoted
 /// rate — none of which the lane-scoped validation enum can see, so the
 /// `cdn/client/v1` handler raises those directly.

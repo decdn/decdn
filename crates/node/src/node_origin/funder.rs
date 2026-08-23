@@ -304,7 +304,7 @@ mod tests {
     /// A lane ledger whose committed spend is `committed` — the amount already
     /// vouchered, which `deposit - committed` is the spendable headroom over.
     fn test_ledger(committed: U256) -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::unmetered(decdn_client_pull::Cumulative {
+        Arc::new(PoolLedger::new(decdn_client_pull::Cumulative {
             bytes: U256::ZERO,
             amount: committed,
         }))

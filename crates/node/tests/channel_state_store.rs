@@ -51,7 +51,6 @@ fn make_state(pool_id: B256, signer: &PrivateKeySigner) -> LaneState {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     )
 }
 
@@ -324,7 +323,6 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     );
     let state_b = LaneState::hydrate(
         pool_b,
@@ -336,7 +334,6 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     );
 
     // Drive 50 monotonic vouchers per lane concurrently. Each task runs its
@@ -459,7 +456,6 @@ fn truncated_file_refuses_to_start() -> anyhow::Result<()> {
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         ))?;
     }
     let path = dir.path().join("lanes.redb");

@@ -914,22 +914,24 @@ fn plan_lane(
         return Ok(None);
     }
     let key = st.key();
-    // The STRONGEST claim this lane holds, not simply its latest signature.
+    // The lane's claim: its latest signature PLUS the frontier the chain has
+    // proved on top of it.
     //
-    // Two things make that a real choice rather than a formality. First, a
-    // lane's worth is `amount + verified_index × chunk_price`: counting only the
-    // signed cumulative would understate it by up to one whole chain, so a lane
-    // sitting on 200 unredeemed reveals and no fresh signature would look
-    // worthless to the redemption floor and never be swept. Second, a payer that
-    // under-folded a rollover leaves the RETIRED voucher as the better claim,
-    // and `strongest_claim` is what keeps redeeming that one (ADR 003
-    // §Rollover).
+    // That sum is a real choice rather than a formality. A lane's worth is
+    // `amount + verified_index × chunk_price`, so counting only the signed
+    // cumulative would understate it by up to one whole chain — a lane sitting
+    // on 200 unredeemed reveals and no fresh signature would look worthless to
+    // the redemption floor and never be swept.
+    //
+    // There is only ever one claim to weigh. A rollover that folded less than
+    // the frontier it retires is refused outright (ADR 003 §Rollover), so the
+    // lane never holds a retired voucher worth more than its live one.
     //
     // In the cooperative case the strongest claim is always a signed voucher at
     // index 0 — every rollover and every close emits one whose `amount` already
     // folds the chain it retires — so a finalized delivery submits a zero index,
     // a zero preimage, and walks nothing on-chain.
-    let Some(claim) = st.strongest_claim() else {
+    let Some(claim) = st.live_claim() else {
         return Ok(None);
     };
     let owed = claim.value();
@@ -1975,7 +1977,6 @@ mod tests {
             U256::from(1_048_576u64),
             Some(sig_with_v(0)),
             decdn_incentive::LaneChain::NONE,
-            None,
         )
     }
 

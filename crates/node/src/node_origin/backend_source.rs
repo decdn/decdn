@@ -343,7 +343,7 @@ mod tests {
     }
 
     fn fresh_ledger() -> Arc<PoolLedger> {
-        Arc::new(PoolLedger::unmetered(Cumulative::default()))
+        Arc::new(PoolLedger::new(Cumulative::default()))
     }
 
     /// (a) Full-miss whole-blob: `BackendSource::open` yields wire that a fresh

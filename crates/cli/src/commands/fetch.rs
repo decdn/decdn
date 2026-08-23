@@ -1035,7 +1035,7 @@ where
     // the first voucher continues at `prior_amount` (a restart-from-zero would
     // be rejected as a regression). Shared (`Arc`) with the driver and source;
     // the watermark to persist afterwards is read straight back off it.
-    let ledger = Arc::new(ctx.new_ledger()?);
+    let ledger = Arc::new(ctx.new_ledger());
 
     // Learn the whole-blob size before constructing the ranged store: the store is
     // keyed on `(root, total_bytes)`, and the signed `StreamResponse` header is the

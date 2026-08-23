@@ -160,7 +160,6 @@ fn seed_lane(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     Ok(())
 }

@@ -696,7 +696,7 @@ impl Voucher {
 /// protocol error — index 0 names `chain_root` and is the settlement case at
 /// redemption, so it proves nothing the voucher does not already say. It is
 /// rejected **in band** by the delivery handler as
-/// [`VoucherRejectReason::ChainIndexTooLarge`] rather than at decode, so the
+/// [`VoucherRejectReason::ChainIndexZero`] rather than at decode, so the
 /// payer learns why instead of seeing an opaque stream close. An index above
 /// [`MAX_CHAIN_LENGTH`] cannot be encoded at all: the walk is bounded at 255
 /// hashes by the type, which is stronger than a runtime comparison.
@@ -715,7 +715,7 @@ impl ChunkPreimage {
     /// Always `Ok`. Both fields are fixed-width, so a decoded `ChunkPreimage`
     /// has no shape to check — and the one value invariant (`index != 0`) is
     /// deliberately **not** enforced here: it must surface as an in-band
-    /// [`VoucherRejectReason::ChainIndexTooLarge`] from the delivery handler,
+    /// [`VoucherRejectReason::ChainIndexZero`] from the delivery handler,
     /// which holds the stream it has to answer on. Validating it here would
     /// collapse that reason into a decode failure and close the stream mute.
     ///
@@ -886,7 +886,7 @@ impl StreamError {
 /// `cdn/client/v1` handler: [`Self::CapabilityExpired`] fires when the signer's
 /// capability has passed its expiry; [`Self::PoolExhausted`] fires when the
 /// pool's remaining deposit can no longer fund further credit; and the four
-/// hash-chain reasons ([`Self::BadPreimage`], [`Self::ChainIndexTooLarge`],
+/// hash-chain reasons ([`Self::BadPreimage`], [`Self::ChainIndexZero`],
 /// [`Self::UnanchoredPreimage`], [`Self::ChunkPriceMismatch`]) are raised where
 /// the handler holds the per-stream chain anchor a validation enum cannot see.
 /// Variant order is frozen — new handler-direct reasons append at the end.
@@ -942,11 +942,11 @@ pub enum VoucherRejectReason {
     /// wire — index 0 names `chain_root` and is the settlement case at
     /// redemption. A payer bug; do not retry.
     ///
-    /// The other half of the name needs no check: the wire index is a `u8` and
-    /// [`MAX_CHAIN_LENGTH`] is 255, so an index past the end of the chain
-    /// cannot be encoded. A chain that has run out of indices is not this
-    /// reason — the payer rolls to a fresh `chain_root` first.
-    ChainIndexTooLarge,
+    /// Zero is the whole of it. There is no over-large index to report: the wire
+    /// index is a `u8` and [`MAX_CHAIN_LENGTH`] is 255, so an index past the end
+    /// of the chain cannot be encoded. A chain that has run out of indices is
+    /// not this reason either — the payer rolls to a fresh `chain_root` first.
+    ChainIndexZero,
     /// A [`ChunkPreimage`] arrived on a stream that holds no chain anchor, so
     /// the node cannot name the chain the reveal belongs to (ADR 003
     /// §Concurrent Streams, Rule 1). Per-stream and therefore decidable, which
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     /// `index == 0` decodes cleanly and passes `validate()`. The rejection is
-    /// the delivery handler's, in band as `ChainIndexTooLarge` — if this ever
+    /// the delivery handler's, in band as `ChainIndexZero` — if this ever
     /// starts failing at decode, the payer loses the reason and sees only a
     /// closed stream.
     #[test]
@@ -1389,7 +1389,7 @@ mod tests {
             VoucherRejectReason::CapabilityExpired,
             VoucherRejectReason::PoolExhausted,
             VoucherRejectReason::BadPreimage,
-            VoucherRejectReason::ChainIndexTooLarge,
+            VoucherRejectReason::ChainIndexZero,
             VoucherRejectReason::UnanchoredPreimage,
             VoucherRejectReason::ChunkPriceMismatch,
         ]

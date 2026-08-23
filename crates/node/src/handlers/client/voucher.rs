@@ -331,7 +331,7 @@ impl ClientHandler {
         // of the chain cannot be encoded — a stronger guarantee than a runtime
         // comparison.
         if preimage.index == 0 {
-            self.write_reject(send, VoucherRejectReason::ChainIndexTooLarge, None)
+            self.write_reject(send, VoucherRejectReason::ChainIndexZero, None)
                 .await?;
             return Ok(VoucherStop::Rejected);
         }
@@ -674,7 +674,6 @@ mod tests {
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         );
         let lane = Arc::new(Mutex::new(LaneDeliveryState {
             state: seed,
@@ -803,7 +802,6 @@ mod tests {
             U256::from(two_mb),
             Some([9u8; 65]),
             decdn_incentive::LaneChain::NONE,
-            None,
         );
 
         // A LOWER cumulative voucher: 1 MB. Signed correctly by the lane signer.
@@ -878,7 +876,6 @@ mod tests {
             U256::from(one_mb),
             Some([9u8; 65]),
             decdn_incentive::LaneChain::NONE,
-            None,
         );
         // Same amount, but claims 2 MB of bytes.
         let two_mb = one_mb * 2;
@@ -949,7 +946,6 @@ mod tests {
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         );
 
         // A well-formed, monotone voucher — but SIGNED BY THE WRONG KEY. Its
@@ -1026,7 +1022,6 @@ mod tests {
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         );
 
         let mk = |bytes: u64| {

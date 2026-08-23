@@ -136,8 +136,8 @@ The meter is therefore ~1 MiB-grained. That is four times finer than the 4 MiB v
 
 A released preimage is a **bearer proof**. It names no payee. Its binding to a payee comes entirely from the voucher whose `chain_root` it satisfies. Two rules follow, and both bind the **payer**:
 
-- A signer **MUST** derive an independent, well-seeded random `chain_root` for every `(pool_id, signer, provider)` lane.
-- A signer **MUST NOT** reuse a root across providers, across pools, or across its own sibling signers. Two chains **MUST NOT** be derivable from each other.
+- A signer **MUST** draw an independent, well-seeded random seed for every chain it opens.
+- A signer **MUST NOT** reuse a root across providers, across pools, across its own sibling signers, or across the successive chains of one lane.
 
 The reason is direct. One root in two vouchers makes every preimage released to the first provider a valid extension of the second provider's voucher. The second node then claims chunks it never delivered, and the payer pays twice for one tick. Per-lane watermarks bound each claim independently, but they cannot see the collision: each claim is valid under its own signature, and the contract never holds the two together.
 
@@ -145,13 +145,29 @@ The reason is direct. One root in two vouchers makes every preimage released to 
 
 The chain's scope is the **lane**, not the stream. Concurrent streams on one lane share one root and one index — see [Concurrent Streams](#concurrent-streams).
 
-**The seed comes from the anchor, so the payer keeps no chain state.** A signer derives the seed as `keccak256(TAG ‖ master ‖ pool_id ‖ signer ‖ provider ‖ anchor ‖ chunk_price)`, where `master` comes from its own signing key and `anchor` is the cumulative `amount` in the chain's own opening voucher. The lane's cumulative is monotone for its whole life, and rolling a chain is defined as folding its frontier into a new signed amount, so the anchor already counts chains — in a number the protocol maintains and both sides can read.
+**The seed is 32 random bytes, held only in memory.** A signer draws it when the chain opens, keeps it for as long as the chain meters, and drops it with the chain. Two draws collide with probability 2⁻²⁵⁶, so both rules above hold by the draw itself. Reuse is not a rule the payer enforces against its own state; it is an outcome the draw does not produce.
 
-This makes the reuse the two rules forbid unrepresentable rather than merely forbidden. The fold is exactly what moves the amount, from `A` to `A + k × chunk_price` for `k ≥ 1`, so every chain that follows a fold derives a different seed. The `(anchor, root)` pair is rigid. Re-deriving at an *unchanged* anchor is not a collision but chain resumption: the anchor is unchanged precisely because nothing was folded, so the root is the one the node still meters and the payer continues at `verified_index + 1`.
+There is no derivation, no master secret, and no counter — and therefore nothing to persist, nothing to synchronize between devices, and no secret at rest. A payer that holds its signing key holds everything a lane needs.
 
-`chunk_price` is in the derivation for a related reason. A reveal is priced by the voucher that redeems it. A chain opened at `A` with price `p₁` that releases `k` chunks, followed by a voucher at the same anchor with a higher `p₂`, would let those `k` old preimages redeem at the higher price. Binding the price makes a reprice a different chain.
+This rests on one rule, stated next: a chain is only ever extended by the process that drew it.
 
-The payer therefore persists nothing for the chain: no counter, no seed, no root. Its lane record already holds the cumulative, and the signing key reproduces the rest. The cost is that a **retired** chain whose opening anchor is forgotten can never be re-derived. Nothing needs one — retiring a chain is what folds its frontier into a signed amount.
+#### Resumption folds
+
+**A payer never restarts a chain it no longer holds in memory.** Crossing a process boundary, a device boundary, or a self-heal from a node's watermark bundle all take the same route: fold the frontier the node proved into a fresh signed `amount`, and open a fresh chain on a fresh seed.
+
+The fold is the rollover fold ([Chain length and rollover](#chain-length-and-rollover)) with the frontier read from the node rather than from local state: `amount_old + verified_index × chunk_price`, `bytes_old + verified_index × CHUNK_BYTES`. It needs the signing key and nothing else, which is exactly what a resuming payer has.
+
+**The frontier a payer folds MUST be one it can prove.** A watermark bundle's `verified_index` is a number the node writes and no signature covers, so a payer that folded it unchecked would sign for chunks a lying node never delivered. The bundle carries the antidote: `tip`, the deepest preimage the node was actually handed. Preimages are unforgeable, so a payer MUST accept `verified_index` only when
+
+```
+keccak^verified_index(tip) == chain_root
+```
+
+against the `chain_root` covered by its own signature on the bundle's anchor voucher. Local hashing, no round trip. Without the check the fold is an unauthenticated invoice; with it, `verified_index` is provable delivery depth.
+
+Within a live process the rule does not apply, and must not: a sibling stream joining a lane whose chain the payer still holds re-anchors to that chain with a zero-delta voucher instead of folding, because folding there would supersede the siblings' in-flight reveals ([Concurrent Streams](#concurrent-streams)). The rule is: if the seed is in memory, join the chain; if it is not, fold.
+
+The cost of always folding is one signature and one fresh ladder per boundary crossing. What it buys is that a chain never has to be reconstructed — which is why the seed can be random, why nothing is stored, and why a second device holding the same key needs no shared state at all.
 
 #### Chain length and rollover
 
@@ -166,6 +182,8 @@ Index `0` is **not a dead slot**. It is the settlement case, and it pays: it res
 **Rollover.** A payer rolls a chain when it exhausts it, and may roll earlier at its own discretion. The fold is the same either way and is stated in terms of the frontier actually reached, never a flat 255: the new voucher's `amount` is `amount_old + verified_index × chunk_price` and its `bytes_delivered` is `bytes_old + verified_index × CHUNK_BYTES`, with a fresh independent `chain_root`. The index resets to 0.
 
 Both directions of that equality matter. Folding **less** than `verified_index` discards value the node has already proved, because adopting the new root retires the old chain. Folding **more** makes the payer sign for chunks it has not received, which is the one thing [Credit Window](#credit-window) promises it never does. One signature per 255 MiB keeps signatures O(1) per transfer at any transfer size.
+
+**An under-folding rollover is rejected, not salvaged.** A node that receives one refuses the voucher outright: nothing is adopted, nothing is displaced, and the lane's claim is exactly as strong after the rejection as before. The rejection is watermark-gated, so it carries the bundle that states the frontier the payer owes, and the payer folds correctly and continues. No honest payer reaches this — a payer serializes its own issuance, and a voucher that folds must also roll, so the folded amount covers the frontier by construction — which is why the loud answer is the right one: it surfaces a payer bug instead of silently continuing on a weaker claim.
 
 ### Credit Window
 
@@ -269,7 +287,7 @@ See [ADR 005 — Payment lanes and concurrent streams](005-protocol.md#payment-l
 
 **The chain walk is fallback-only, not a per-redeem tax.** A sweep redeems the **strongest claim** it holds on a lane — the maximum over the latest signed voucher at index 0 and any retired voucher extended by the deepest preimage the node still holds. In the cooperative path the strongest claim is always a signed voucher: each rollover emits one whose `amount` already folds in the chain it retires, and the close emits the zero-root voucher. Both redeem at `chainIndex = 0` and walk nothing. The un-rolled tail since the last rollover defers to the next rollover or close, and cumulative `claimed − paid` loses none of it. A node walks a preimage only when the payer vanishes mid-chain and the node claims that sub-rollover tail — at most once per abandoned stream, capped at one chain — which is the case where the alternative is collecting nothing. Amortized across all deliveries, the walk adds a negligible amount of gas. What PayWord genuinely adds to every redemption is calldata, not compute; [Chain walk and redemption cost](#chain-walk-and-redemption-cost) prices both.
 
-**Rollover is safe because payment is cumulative — provided the fold is right.** A signer ends a chain by signing the next voucher with `cumulative` set to the frontier that chain actually reached (`amount_old + verified_index × chunkPrice`), plus a fresh `chainRoot`. A node that has verified a deeper index than the new voucher folds in keeps redeeming the *retired* voucher with its preimage, because that is then the stronger claim. No on-chain sequencing rule is needed. If the node redeems the old voucher and then the new one, the new one's `desired = claimed − w.amount` is already net of the old payment; a node that redeems only the new voucher collects the same total. Redeeming a superseded chain after a newer one computes `paid == 0` and is skipped.
+**Rollover is safe because payment is cumulative — provided the fold is right.** A signer ends a chain by signing the next voucher with `cumulative` set to the frontier that chain actually reached (`amount_old + verified_index × chunkPrice`), plus a fresh `chainRoot`. A node that is offered a voucher folding *less* than the index it has verified refuses it ([Chain length and rollover](#chain-length-and-rollover)), so it never has to hold a retired chain alongside a live one: the lane meters exactly one chain, and the only way a chain is retired is by a signature that already paid for everything it proved. Redemption needs no on-chain sequencing rule either way — payment is `claimed − paid`, so redeeming a superseded chain after a newer one computes `paid == 0` and is skipped.
 
 **The sharded register.** Two mappings, both written lazily on first touch:
 
@@ -322,7 +340,7 @@ Some reasons map to an on-chain redemption revert the node avoids by rejecting e
 | `CapabilityExpired` | the signer's capability has passed its `expiry` | redemption gates on `expiry` from `authorized[poolId][signer]` — an expired capability pays `0` and is skipped |
 | `PoolExhausted` | the pool's remaining deposit, minus the refundable floor `M` and already-committed concurrent floor credit, can no longer fund further credit | none on-chain — a node-side mid-stream solvency stop, not a voucher defect |
 | `BadPreimage` | the released value does not hash to the lane's verified tip in `index − verified` steps | redemption reverts `BadPreimage` — a preimage that does not reach `chainRoot` is caller error, not transient state |
-| `ChainIndexTooLarge` | `index == 0` on the wire — index 0 is the redeem-time settlement case and carries no chunk | none on-chain — `chainIndex = 0` is the *normal* settlement path and never reverts. The index is a `u8` on the wire and a `uint8` extracted from `chainMeter` on-chain, so `index > MAX_CHAIN_LENGTH` cannot be encoded at either layer and needs no runtime check. The reserved span of the packed word is a different matter: redemption reverts `ChainMeterReservedNonZero` on a non-zero byte there ([Voucher signatures are compact, and their signers are EOAs](#voucher-signatures-are-compact-and-their-signers-are-eoas)) |
+| `ChainIndexZero` | `index == 0` on the wire — index 0 is the redeem-time settlement case and carries no chunk | none on-chain — `chainIndex = 0` is the *normal* settlement path and never reverts. The index is a `u8` on the wire and a `uint8` extracted from `chainMeter` on-chain, so `index > MAX_CHAIN_LENGTH` cannot be encoded at either layer and needs no runtime check. The reserved span of the packed word is a different matter: redemption reverts `ChainMeterReservedNonZero` on a non-zero byte there ([Voucher signatures are compact, and their signers are EOAs](#voucher-signatures-are-compact-and-their-signers-are-eoas)) |
 | `UnanchoredPreimage` | a preimage arrived on a stream before that stream carried the epoch's `chain_root` voucher | none on-chain — the node cannot name the chain the reveal belongs to, so it cannot verify it (see [Concurrent Streams](#concurrent-streams)) |
 | `ChunkPriceMismatch` | the voucher's `chunk_price` is not the node's quoted `rate_per_mb` (metering vouchers), or is non-zero on a sealed voucher | none on-chain — the contract settles whatever price the signer signed, so the node must refuse the under-priced voucher before it meters against it |
 
@@ -417,7 +435,7 @@ A signer reuses one `chain_root` across two providers. Every preimage it release
 
 **The payer causes it, and the payer pays for it.** A preimage is a bearer proof: it names no payee, and its binding comes entirely from the voucher whose root it satisfies. Under a shared root, A hands preimage `k` to B, and B redeems at index `k` having delivered a fraction of those chunks. The signer pays for chunks it never received, bounded only by `MAX_CHAIN_LENGTH × chunk_price` per extra lane and ultimately by its own `cap`. This removes the zero-exposure property of the [Credit Window](#credit-window).
 
-**No node can see it, and the contract cannot either.** A node sees only its own lane and cannot know another voucher shares its root. The contract never holds two vouchers together, so both claims are valid under their own signatures. The defence is therefore structural and payer-side: a signer MUST derive an independent seed and root for every `(pool_id, signer, provider)` lane, so a preimage's bearer scope is exactly the one node already entitled to it ([One chain per lane](#one-chain-per-lane)).
+**No node can see it, and the contract cannot either.** A node sees only its own lane and cannot know another voucher shares its root. The contract never holds two vouchers together, so both claims are valid under their own signatures. The defence is therefore structural and payer-side: every chain opens on its own random seed, so a preimage's bearer scope is exactly the one node already entitled to it ([One chain per lane](#one-chain-per-lane)).
 
 **There is no node-side backstop, by design.** A node that accepts a reused root is the party the reuse *pays*, so a rejection rule protects nobody who would choose to run it — and enforcing it needs an unbounded, never-expiring set of every root the node has ever seen. The protocol therefore states no such rule and defines no reject reason for it. The payer's seed derivation is the whole defence, which is honest about where the loss falls: on the payer.
 

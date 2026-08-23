@@ -540,7 +540,6 @@ mod tests {
             U256::from(4_096u64),
             Some([0xABu8; 65]),
             crate::lane::LaneChain::NONE,
-            None,
         )
     }
 
@@ -614,7 +613,6 @@ mod tests {
             s.last_bytes_delivered(),
             s.last_signature().copied(),
             crate::lane::LaneChain::NONE,
-            None,
         );
         store.record(&advanced)?;
         let all = store.load_all()?;

@@ -106,17 +106,6 @@ pub struct LaneState {
     /// advancing it outside the validated path would forge payment. Read via
     /// [`Self::chain`].
     chain: LaneChain,
-    /// A retired epoch kept because it is still the **stronger** claim.
-    ///
-    /// A payer that rolls a chain is supposed to fold the frontier the node
-    /// actually proved into the new voucher's `amount`. One that folds *less*
-    /// than that would otherwise make the node lose the difference, since
-    /// adopting the new root retires the old chain. So when a rollover would
-    /// regress the lane's total, the outgoing claim is retained here and the
-    /// redeem planner keeps submitting it — no on-chain sequencing rule is
-    /// needed, because payment is cumulative and the weaker claim simply pays
-    /// `0` (ADR 003 §Rollover). Read via [`Self::retained`].
-    retained: Option<RedeemClaim>,
 }
 
 /// One metering epoch's hash-chain state on a lane (ADR 003 §Hash-chain
@@ -260,7 +249,6 @@ impl LaneState {
         last_bytes_delivered: U256,
         last_signature: Option<[u8; 65]>,
         chain: LaneChain,
-        retained: Option<RedeemClaim>,
     ) -> Self {
         Self {
             pool_id,
@@ -273,7 +261,6 @@ impl LaneState {
             last_bytes_delivered,
             last_signature,
             chain,
-            retained,
         }
     }
 
@@ -315,13 +302,6 @@ impl LaneState {
         self.chain
     }
 
-    /// A retired-but-stronger claim held over an under-folding rollover, if
-    /// any. See the [field invariant](Self).
-    #[must_use]
-    pub const fn retained(&self) -> Option<RedeemClaim> {
-        self.retained
-    }
-
     /// The live epoch expressed as a redeemable claim: the last accepted
     /// voucher's anchor plus the frontier verified under its root. `None` until
     /// a voucher has been accepted (there is no signature to submit).
@@ -335,21 +315,6 @@ impl LaneState {
         })
     }
 
-    /// The strongest claim this lane holds — the maximum by value over the live
-    /// epoch and any retained one. This is what the redeem planner submits.
-    ///
-    /// It is a **maximum, never a sum**: a rollover voucher already folds the
-    /// retired chain into its own `amount`, so adding the two would count those
-    /// chunks twice (ADR 003 §Concurrent Streams).
-    #[must_use]
-    pub fn strongest_claim(&self) -> Option<RedeemClaim> {
-        match (self.live_claim(), self.retained) {
-            (Some(live), Some(kept)) if kept.value() > live.value() => Some(kept),
-            (Some(live), _) => Some(live),
-            (None, kept) => kept,
-        }
-    }
-
     /// The byte frontier the lane's strongest claim covers — its signed
     /// cumulative extended by the chunks the chain has proved. Zero on a lane
     /// holding no claim.
@@ -360,8 +325,7 @@ impl LaneState {
     /// credit accounting a whole chain behind the money it is owed.
     #[must_use]
     pub fn owed_bytes(&self) -> U256 {
-        self.strongest_claim()
-            .map_or(U256::ZERO, |c| c.bytes_value())
+        self.live_claim().map_or(U256::ZERO, |c| c.bytes_value())
     }
 
     /// What this lane is **owed**: the value of its strongest claim, or zero if
@@ -372,7 +336,7 @@ impl LaneState {
     /// against (ADR 003 §Tracking owed vs. paid).
     #[must_use]
     pub fn owed(&self) -> U256 {
-        self.strongest_claim().map_or(U256::ZERO, |c| c.value())
+        self.live_claim().map_or(U256::ZERO, |c| c.value())
     }
 
     /// Adopt a chain from a voucher that did **not** advance the money — the
@@ -385,11 +349,11 @@ impl LaneState {
     /// still has to install the chain, or the reveals that follow would name a
     /// root the lane never learned and fold nothing.
     ///
-    /// Three narrow things happen here, and nothing else:
+    /// Two narrow things happen here, and nothing else:
     ///
     /// - A lane metering **nothing** adopts the incoming root and price.
-    /// - A lane already metering **that same root** refreshes its price.
-    /// - A lane holding **no signature yet** adopts this voucher as its anchor.
+    /// - A lane holding **no signature yet** adopts this voucher as its anchor,
+    ///   with the root and price that voucher carries.
     ///
     /// That last one is what makes the chain redeemable at all. A claim is a
     /// signed anchor extended by a frontier, and the contract rebuilds the
@@ -397,6 +361,19 @@ impl LaneState {
     /// have to come from the same voucher. Installing a root beside an older
     /// voucher's signature yields a claim that recovers the wrong signer and
     /// reverts `InvalidVoucherSignature` at redemption.
+    ///
+    /// That pairing is also why a re-asserting voucher CANNOT restate the price.
+    /// The price is half the claim — redemption resolves `amount + index ×
+    /// chunk_price` and rebuilds the EIP-712 digest from the price it is handed —
+    /// so moving it under a signature that covered the old one yields a claim
+    /// that recovers the wrong signer, and `redeemMany` reverts
+    /// `InvalidVoucherSignature` for every lane in the batch, not just this one.
+    /// An already-satisfied voucher pays for nothing, so it has no authority to
+    /// reprice the frontier the lane already proved: the lane keeps metering at
+    /// the price its own anchor was signed at. A payer that wants a new price
+    /// rolls, and a rollover advances the money and goes through
+    /// [`Self::advance_presigned`], where the price and the signature that covers
+    /// it are adopted together.
     ///
     /// That pairing is what bounds this method. It adopts a **new** root only
     /// when the incoming voucher re-asserts the lane's own watermark exactly, so
@@ -421,20 +398,19 @@ impl LaneState {
         }
         let mut next = self.clone();
         if self.chain.chain_root == chain_root {
-            // Same epoch re-asserted. The price is restated by every voucher
-            // naming the root, and the first such voucher on a lane that holds
-            // no signature yet becomes its anchor.
-            let refresh_price = self.chain.chunk_price != signed.voucher.chunk_price;
-            let adopt_anchor = self.last_signature.is_none();
-            if !refresh_price && !adopt_anchor {
+            // Same epoch re-asserted. The only thing that can change is the
+            // anchor, and only on a lane that holds no signature yet — the first
+            // such voucher becomes the anchor, bringing its own price with it.
+            // A lane that already has a signature takes nothing from this
+            // voucher: adopting its price alone would pair a price with a
+            // signature that never covered it (see above).
+            if self.last_signature.is_some() {
                 return None;
             }
             next.chain.chunk_price = signed.voucher.chunk_price;
-            if adopt_anchor {
-                next.last_amount = signed.voucher.amount;
-                next.last_bytes_delivered = signed.voucher.bytes_delivered;
-                next.last_signature = Some(signed.signature.as_bytes());
-            }
+            next.last_amount = signed.voucher.amount;
+            next.last_bytes_delivered = signed.voucher.bytes_delivered;
+            next.last_signature = Some(signed.signature.as_bytes());
             return Some(next);
         }
 
@@ -490,10 +466,10 @@ impl LaneState {
         preimage: B256,
     ) -> Result<(Self, PreimageApplied), PoolError> {
         let Some(target) = self.chain_slot(root) else {
-            return Ok((self.clone(), PreimageApplied::SUPERSEDED));
+            return Ok((self.clone(), PreimageApplied::ZERO));
         };
         if index <= target.verified_index {
-            return Ok((self.clone(), PreimageApplied::ALREADY_COVERED));
+            return Ok((self.clone(), PreimageApplied::ZERO));
         }
         if !crate::chain::verify_forward(preimage, index - target.verified_index, target.tip) {
             return Err(PoolError::BadPreimage {
@@ -509,19 +485,11 @@ impl LaneState {
         };
 
         let mut next = self.clone();
-        // The value this reveal advances its own claim to — anchor plus the
-        // frontier it just proved. `chain_slot` matched one of the two, so one of
-        // these arms always runs.
-        let mut claimed = U256::ZERO;
-        if root == self.chain.chain_root {
-            next.chain.verified_index = index;
-            next.chain.tip = preimage;
-            claimed = self.last_amount.saturating_add(next.chain.accrued());
-        } else if let Some(kept) = next.retained.as_mut() {
-            kept.chain.verified_index = index;
-            kept.chain.tip = preimage;
-            claimed = kept.value();
-        }
+        next.chain.verified_index = index;
+        next.chain.tip = preimage;
+        // The value this reveal advances the lane's claim to — the signed anchor
+        // plus the frontier it just proved.
+        let claimed = self.last_amount.saturating_add(next.chain.accrued());
 
         // The capability's spending cap binds the CLAIM, not the signature, so a
         // reveal answers for it exactly as a voucher does
@@ -543,22 +511,18 @@ impl LaneState {
         Ok((next, applied))
     }
 
-    /// Which tracked epoch, if any, `root` names. The live chain first; then a
-    /// retained one, so a slower sibling stream still finishing the previous
-    /// epoch keeps advancing the claim that epoch backs.
+    /// The tracked epoch `root` names, if it is the one the lane meters against.
+    ///
+    /// A lane tracks exactly one chain. A reveal naming any other root is real
+    /// but worthless: the epoch it extends was superseded by a signature that
+    /// folded a frontier at least as deep, which is the only way a chain is ever
+    /// retired here (a rollover that folded LESS is refused outright — see
+    /// [`Self::advance_presigned`]).
     ///
     /// A zero `root` never matches: it is the sealed sentinel, and nothing
     /// hashes to zero, so no reveal can extend it.
     fn chain_slot(&self, root: B256) -> Option<LaneChain> {
-        if root.is_zero() {
-            return None;
-        }
-        if root == self.chain.chain_root {
-            return Some(self.chain);
-        }
-        self.retained
-            .filter(|kept| kept.chain.chain_root == root)
-            .map(|kept| kept.chain)
+        (!root.is_zero() && root == self.chain.chain_root).then_some(self.chain)
     }
 
     /// Validate `signed` against this lane's invariants and, on success, durably
@@ -716,21 +680,25 @@ impl LaneState {
         let amount_delta = signed.voucher.amount - self.last_amount;
         let bytes_delta = signed.voucher.bytes_delivered - self.last_bytes_delivered;
 
-        // A voucher carrying a DIFFERENT root retires the live epoch. Two things
-        // follow, and both are about not losing money the node already proved.
+        // A voucher carrying a DIFFERENT root retires the live epoch, and the
+        // rule that makes that safe is that its `amount` must FOLD the frontier
+        // the retired chain proved. One that folds less is refused here, before
+        // anything is adopted: it would sign for fewer chunks than the node holds
+        // preimages for, and adopting the new root would discard the difference.
         //
-        // First, if the outgoing epoch's frontier is worth more than the new
-        // voucher's `amount`, the payer under-folded: it signed for less than
-        // the chunks the node holds preimages for. Adopting the new root would
-        // discard that difference, so the outgoing claim is retained and the
-        // redeem planner keeps submitting it (ADR 003 §Rollover). Redeeming the
-        // retired claim and then the new one collects the same total either
-        // way — on-chain payment is `claimed − paid`.
+        // Refusing rather than salvaging is deliberate. No honest payer can reach
+        // this: issuance is serialized under the payer's own lock, and a voucher
+        // that folds must also roll, so the folded amount covers the frontier by
+        // construction. What is left is a buggy or malicious payer, and for those
+        // the loud answer is the useful one — the reason is watermark-gated, so
+        // the rejection carries the bundle that states the fold the payer owes,
+        // and nothing is accepted, nothing displaced, and the lane's claim is
+        // exactly as strong afterwards as before.
         //
-        // Second, the new epoch starts at index 0 with the root as its own tip,
-        // so a claim at exactly the new `amount` walks nothing. A voucher that
-        // repeats the SAME root is not a rollover at all (a re-send, or a
-        // mid-epoch amount bump), and MUST leave the frontier where it is.
+        // A voucher that repeats the SAME root is not a rollover at all (a
+        // re-send, or a mid-epoch amount bump), and MUST leave the frontier where
+        // it is; the new epoch starts at index 0 with the root as its own tip, so
+        // a claim at exactly the new `amount` walks nothing.
         if signed.voucher.chain_root == self.chain.chain_root {
             // Same epoch: the price is re-asserted by every voucher that names
             // the root, and the handler has already refused a price that is not
@@ -740,9 +708,9 @@ impl LaneState {
             if let Some(live) = self.live_claim()
                 && live.value() > signed.voucher.amount
             {
-                next.retained = Some(match next.retained {
-                    Some(kept) if kept.value() > live.value() => kept,
-                    _ => live,
+                return Err(PoolError::AmountRegression {
+                    last: live.value(),
+                    got: signed.voucher.amount,
                 });
             }
             next.chain = LaneChain::opened(signed.voucher.chain_root, signed.voucher.chunk_price);
@@ -808,16 +776,12 @@ pub struct PreimageApplied {
 }
 
 impl PreimageApplied {
-    /// The reveal was at or below the tracked frontier: already covered, and
-    /// nothing was hashed to find that out.
-    pub const ALREADY_COVERED: Self = Self {
-        amount_delta: U256::ZERO,
-        bytes_delta: U256::ZERO,
-    };
-
-    /// The reveal named an epoch the lane no longer tracks — a signature has
-    /// since folded a frontier at least as deep. Real, but worth nothing.
-    pub const SUPERSEDED: Self = Self {
+    /// The reveal advanced nothing. Two cases reach it and callers treat them
+    /// identically, because the answer is the same in both: the reveal was at or
+    /// below the tracked frontier (already covered, and nothing was hashed to
+    /// find that out), or it named an epoch the lane no longer tracks (real, but
+    /// superseded by a signature that folded a frontier at least as deep).
+    pub const ZERO: Self = Self {
         amount_delta: U256::ZERO,
         bytes_delta: U256::ZERO,
     };
@@ -861,8 +825,12 @@ pub enum PoolError {
     /// voucher scoped to one provider redeemed against another.
     #[error("voucher provider {got} does not match expected {expected}")]
     WrongProvider { expected: Address, got: Address },
-    /// Cumulative amount did not strictly increase — a stale or replayed
-    /// voucher. `amount` is the sole ordering key (there is no nonce).
+    /// Cumulative amount did not cover what the lane already holds — a stale or
+    /// replayed voucher, or a rollover that folded less than the frontier its
+    /// retiring chain proved. `amount` is the sole ordering key (there is no
+    /// nonce), and `last` is what the amount had to beat: the signed watermark
+    /// on the ordering check, and the lane's full claim (anchor plus proved
+    /// frontier) on the fold check.
     #[error("voucher amount {got} not greater than last accepted {last}")]
     AmountRegression { last: U256, got: U256 },
     /// Cumulative bytes delivered went down.
@@ -920,7 +888,6 @@ mod tests {
             U256::ZERO,
             None,
             LaneChain::NONE,
-            None,
         );
         assert_eq!(st.registered_until, 0, "hydrate seeds unknown");
         let mut with_reg = st.clone();
@@ -991,7 +958,6 @@ mod tests {
             U256::ZERO,
             None,
             LaneChain::NONE,
-            None,
         );
         let domain = voucher_domain(CHAIN_ID, VERIFYING);
         let store = MemoryPoolStateStore::new();
@@ -1037,7 +1003,8 @@ mod tests {
     }
 
     const PRICE: u64 = 10;
-    /// The payer's per-lane seed, standing in for `chain::derive_seed`.
+    /// A payer's chain seed, fixed here so the ladder is reproducible in tests;
+    /// a real one is drawn by `chain::random_seed`.
     const SEED: B256 = B256::repeat_byte(0x5E);
 
     fn root() -> B256 {
@@ -1524,21 +1491,21 @@ mod tests {
         let (rolled, _) = state_at_3.advance_presigned(&folded)?;
 
         anyhow::ensure!(rolled.owed() == owed_before, "the fold must lose nothing");
-        anyhow::ensure!(
-            rolled.retained().is_none(),
-            "nothing to retain on a correct fold"
-        );
         anyhow::ensure!(rolled.chain().chain_root == next_root);
         anyhow::ensure!(rolled.chain().verified_index == 0);
         Ok(())
     }
 
     /// ADR 003 §Rollover: a payer that folds LESS than the frontier the node
-    /// proved would otherwise make the node lose the difference, because
-    /// adopting the new root retires the old chain. The outgoing claim is kept
-    /// instead, and stays the one the node redeems.
+    /// proved is REFUSED. Adopting the new root would retire the old chain and
+    /// discard the difference, so the voucher is rejected before anything is
+    /// adopted and the lane's claim is exactly as strong afterwards as before.
+    ///
+    /// The reason is watermark-gated, so the rejection carries the bundle that
+    /// tells the payer the fold it owes — a rejection with its own recovery
+    /// route, on a path no honest payer can reach.
     #[test]
-    fn an_under_folded_rollover_retains_the_stronger_claim() -> anyhow::Result<()> {
+    fn an_under_folded_rollover_is_refused() -> anyhow::Result<()> {
         let (signer, mut state, domain, store) = fixture();
         state.apply_voucher(
             &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
@@ -1558,48 +1525,41 @@ mod tests {
             PRICE,
         )
         .sign(&signer, &domain)?;
-        let (rolled, _) = state_at_9.advance_presigned(&stingy)?;
 
-        anyhow::ensure!(rolled.owed() == owed_before, "the node must lose nothing");
-        let kept = rolled
-            .retained()
-            .ok_or_else(|| anyhow::anyhow!("the outgoing claim must be retained"))?;
-        anyhow::ensure!(kept.chain.chain_root == root());
-        anyhow::ensure!(kept.chain.verified_index == 9);
-        anyhow::ensure!(kept.chain.tip == reveal(9));
-        let strongest = rolled
-            .strongest_claim()
-            .ok_or_else(|| anyhow::anyhow!("a lane with a signature has a claim"))?;
-        anyhow::ensure!(strongest == kept, "the retired claim is the stronger one");
+        anyhow::ensure!(
+            matches!(
+                state_at_9.advance_presigned(&stingy),
+                Err(PoolError::AmountRegression { last, got })
+                    if last == owed_before && got == U256::from(1_000 + 2 * PRICE)
+            ),
+            "an under-folding rollover must be refused, naming the fold it owed"
+        );
+        anyhow::ensure!(
+            state_at_9.owed() == owed_before,
+            "and the lane must be untouched by the refusal"
+        );
+        anyhow::ensure!(state_at_9.chain().chain_root == root());
+        anyhow::ensure!(state_at_9.chain().verified_index == 9);
         Ok(())
     }
 
-    /// A slower sibling stream still finishing the retired epoch keeps
-    /// advancing the claim that epoch backs — that is what "a rollover cannot
-    /// strand a sibling mid-chain" means in state terms.
+    /// The refusal is watermark-gated, which is what makes it recoverable: the
+    /// wire reason a rejected under-fold maps to is the one the node attaches a
+    /// resume bundle to, so the payer learns the frontier it has to fold.
     #[test]
-    fn a_retained_epoch_still_accepts_deeper_reveals() -> anyhow::Result<()> {
-        let (signer, mut state, domain, store) = fixture();
-        state.apply_voucher(
-            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-            &domain,
-            &store,
-        )?;
-        let (state_at_9, _) = state.advance_preimage(root(), 9, reveal(9))?;
-        let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
-        let (rolled, _) = state_at_9.advance_presigned(
-            &build_metering(signer.address(), 1_000 + 2 * PRICE, 0, next_root, PRICE)
-                .sign(&signer, &domain)?,
-        )?;
-
-        let (deeper, applied) = rolled.advance_preimage(root(), 12, reveal(12))?;
-        anyhow::ensure!(applied.amount_delta() == U256::from(3 * PRICE));
-        anyhow::ensure!(deeper.owed() == U256::from(1_000 + 12 * PRICE));
-        anyhow::ensure!(
-            deeper.chain().verified_index == 0,
-            "the LIVE epoch is untouched by a retired epoch's reveal"
+    fn the_under_fold_refusal_carries_a_resume_bundle() {
+        let reason = crate::client_bridge::voucher_reject_reason(&PoolError::AmountRegression {
+            last: U256::from(1_090u64),
+            got: U256::from(1_020u64),
+        });
+        assert_eq!(
+            reason,
+            Ok(decdn_protocol::client::VoucherRejectReason::AmountRegression)
         );
-        Ok(())
+        assert!(
+            decdn_protocol::client::VoucherRejectReason::AmountRegression.is_watermark_gated(),
+            "the payer cannot fold correctly without the bundle that states the frontier"
+        );
     }
 
     /// A reveal naming an epoch the lane no longer tracks is real but worth
@@ -1618,8 +1578,6 @@ mod tests {
             &build_metering(signer.address(), 1_000 + 3 * PRICE, 0, next_root, PRICE)
                 .sign(&signer, &domain)?,
         )?;
-        anyhow::ensure!(rolled.retained().is_none());
-
         let (after, applied) = rolled.advance_preimage(root(), 4, reveal(4))?;
         anyhow::ensure!(!applied.advanced());
         anyhow::ensure!(after.owed() == rolled.owed());
@@ -1668,7 +1626,7 @@ mod tests {
         anyhow::ensure!(applied.amount_delta() == U256::from(255 * PRICE));
         anyhow::ensure!(deep.owed() == U256::from(1_000 + 255 * PRICE));
         let claim = deep
-            .strongest_claim()
+            .live_claim()
             .ok_or_else(|| anyhow::anyhow!("expected a claim"))?;
         anyhow::ensure!(claim.value() == deep.owed());
         anyhow::ensure!(
@@ -1708,7 +1666,7 @@ mod tests {
         // root with the previous voucher's signature recovers the wrong signer
         // and reverts `InvalidVoucherSignature` on-chain.
         let claim = adopted
-            .strongest_claim()
+            .live_claim()
             .ok_or_else(|| anyhow::anyhow!("an adopted anchor is a claim"))?;
         let rebuilt = SignedVoucher {
             voucher: Voucher {
@@ -1733,6 +1691,58 @@ mod tests {
         )?;
         anyhow::ensure!(applied.advanced());
         anyhow::ensure!(next.owed() == U256::from(1_000 + PRICE));
+        Ok(())
+    }
+
+    /// A re-asserting voucher must not move the price out from under the
+    /// signature that covers it.
+    ///
+    /// The trigger is ordinary: the node's quoted rate changes, and a payer
+    /// re-states the live root at the new price. The voucher passes the quote
+    /// check and signature recovery, and lands on the already-satisfied path. If
+    /// the price were refreshed in place, the lane would then pair the OLD
+    /// voucher's signature with the NEW price — and redemption rebuilds the
+    /// EIP-712 digest from both, so it recovers the wrong signer and reverts
+    /// `InvalidVoucherSignature`. That is a revert, not a zero-pay skip, so every
+    /// `redeemMany` batch carrying this lane fails wholesale and the node can
+    /// never collect the anchor at all.
+    #[test]
+    fn a_re_asserting_voucher_cannot_reprice_the_lane() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        state.apply_voucher(
+            &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        let (proved, _) = state.advance_preimage(root(), 4, reveal(4))?;
+
+        // The same root, re-asserted at a higher price after a quote move.
+        let repriced =
+            build_metering(signer.address(), 1_000, 0, root(), PRICE * 2).sign(&signer, &domain)?;
+        anyhow::ensure!(
+            proved.adopt_chain(&repriced).is_none(),
+            "an already-satisfied voucher pays for nothing and may not reprice the frontier"
+        );
+
+        // The claim the lane still holds is redeemable: its price is the one its
+        // own signature was taken over.
+        let claim = proved
+            .live_claim()
+            .ok_or_else(|| anyhow::anyhow!("a lane with a signature has a claim"))?;
+        let rebuilt = SignedVoucher {
+            voucher: Voucher {
+                pool_id: POOL_ID,
+                signer: signer.address(),
+                provider: PROVIDER,
+                amount: claim.amount,
+                bytes_delivered: claim.bytes_delivered,
+                chain_root: claim.chain.chain_root,
+                chunk_price: claim.chain.chunk_price,
+            },
+            signature: alloy::primitives::Signature::from_raw(&claim.signature)
+                .map_err(|e| anyhow::anyhow!("claim signature is malformed: {e}"))?,
+        };
+        rebuilt.verify_signer(signer.address(), &domain)?;
         Ok(())
     }
 
@@ -1835,7 +1845,6 @@ mod tests {
             U256::ZERO,
             None,
             LaneChain::NONE,
-            None,
         );
         state.apply_voucher(
             &build_metering(signer.address(), anchor, 0, root(), PRICE).sign(&signer, &domain)?,
@@ -1863,7 +1872,7 @@ mod tests {
     #[test]
     fn a_lane_with_no_voucher_holds_no_claim() {
         let (_, state, _, _) = fixture();
-        assert!(state.strongest_claim().is_none());
+        assert!(state.live_claim().is_none());
         assert_eq!(state.owed(), U256::ZERO);
     }
 }

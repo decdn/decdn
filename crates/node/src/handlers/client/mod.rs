@@ -2,8 +2,9 @@
 //!
 //! Serves the revenue path: a payer opens one bidirectional QUIC stream per
 //! blob, the node answers with a signed [`StreamResponse`], then streams
-//! [`ChunkData`], collecting a cumulative payment `Voucher` at each
-//! `VOUCHER_INTERVAL_BYTES` boundary and pausing only when the unpaid balance
+//! [`ChunkData`], collecting one hash-chain preimage per delivered
+//! `CHUNK_BYTES` chunk — with a signed `Voucher` to open a chain, to roll one,
+//! and to settle a sub-chunk residual — and pausing only when the unpaid balance
 //! (`delivered − paid`) reaches the credit window — so delivery pipelines
 //! several intervals ahead of payment rather than stopping at each one — and
 //! finishing with [`ClientMessage::StreamEnd`]. A delivery fault rides in the
@@ -212,7 +213,6 @@ impl LaneActivityClock {
                 U256::ZERO,
                 None,
                 decdn_incentive::LaneChain::NONE,
-                None,
             );
             map.insert(
                 key,
@@ -1307,7 +1307,6 @@ impl ClientHandler {
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         );
         if let Err(e) = self.register_lane(lane).await {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
@@ -2118,7 +2117,6 @@ mod tests {
                 U256::ZERO,
                 None,
                 decdn_incentive::LaneChain::NONE,
-                None,
             );
             register.push(tokio::spawn(
                 async move { handler.register_lane(state).await },
@@ -2221,7 +2219,6 @@ mod tests {
                     U256::ZERO,
                     None,
                     decdn_incentive::LaneChain::NONE,
-                    None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,
@@ -2800,7 +2797,6 @@ mod tests {
                     U256::ZERO,
                     None,
                     decdn_incentive::LaneChain::NONE,
-                    None,
                 ),
                 bytes_delivered_cumulative: U256::ZERO,
                 paid_credited: U256::ZERO,

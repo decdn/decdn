@@ -748,14 +748,7 @@ impl NodeOrigin {
                 return Err(PullMiss::for_verdict(verdict));
             }
         };
-        let ledger = match lane_ledger(deps, provider_addr, &ctx) {
-            Ok(ledger) => ledger,
-            Err(err) => {
-                let verdict =
-                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return Err(PullMiss::for_verdict(verdict));
-            }
-        };
+        let ledger = lane_ledger(deps, provider_addr, &ctx);
         let stream_guard = deps.metrics.outbound_stream_guard();
         match open_progressive_upstream(
             &deps.endpoint,
@@ -1843,19 +1836,18 @@ fn lane_ledger(
     deps: &NodeOriginDeps,
     provider_addr: Address,
     ctx: &PoolContext,
-) -> anyhow::Result<Arc<PoolLedger>> {
-    Ok(deps.ledgers.get_or_seed(
+) -> Arc<PoolLedger> {
+    deps.ledgers.get_or_seed(
         decdn_incentive::LaneKey {
             pool_id: ctx.pool_id,
             signer: ctx.client_signer.address(),
             provider: provider_addr,
         },
-        ctx.chain_master()?,
         Cumulative {
             bytes: ctx.prior_bytes_delivered,
             amount: ctx.prior_amount,
         },
-    ))
+    )
 }
 
 /// Attempt a single paid pull from one candidate: resolve its operator address,
@@ -1958,13 +1950,7 @@ async fn pull_from_candidate(
             return Err(PullMiss::for_verdict(verdict));
         }
     };
-    let ledger = match lane_ledger(deps, provider_addr, &ctx) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            let verdict = classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-            return Err(PullMiss::for_verdict(verdict));
-        }
-    };
+    let ledger = lane_ledger(deps, provider_addr, &ctx);
 
     // Streaming is bounded by INACTIVITY, with no overall wall-clock cap (#1134).
     //
@@ -2604,7 +2590,7 @@ const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
     match reason {
         // Our own signing or metering is broken, and it hits every candidate.
-        // `BadPreimage` and `ChainIndexTooLarge` belong here for the same reason
+        // `BadPreimage` and `ChainIndexZero` belong here for the same reason
         // a bad signature does: both mean this node released a proof no upstream
         // can accept — a wrong seed, a wrong chain, or an index that never
         // travels the wire — so suppressing the peer would blame the wrong party
@@ -2613,7 +2599,7 @@ const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
         VoucherRejectReason::BadSignature
         | VoucherRejectReason::WrongSigner
         | VoucherRejectReason::BadPreimage
-        | VoucherRejectReason::ChainIndexTooLarge
+        | VoucherRejectReason::ChainIndexZero
         | VoucherRejectReason::ChunkPriceMismatch => PullVerdict::OurLocalFault,
 
         // Our OWN buyer pool, not the upstream — retry, do not suppress the peer.

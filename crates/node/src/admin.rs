@@ -1904,7 +1904,6 @@ mod tests {
             U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         )
     }
 

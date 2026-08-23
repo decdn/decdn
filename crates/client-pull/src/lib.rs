@@ -3,9 +3,10 @@
 //!
 //! `stream_fetch` performs one full delivery exchange against a remote node:
 //! it sends a [`StreamRequest`], validates and verifies the signed
-//! [`StreamResponse`], receives `ChunkData` while paying cumulative vouchers
-//! at each `VOUCHER_INTERVAL_BYTES` boundary, and returns the assembled blob on
-//! `StreamEnd`. It is the receive-side call site for the #252 rule (reject a
+//! [`StreamResponse`], receives `ChunkData` while releasing one hash-chain
+//! preimage per delivered `CHUNK_BYTES` chunk (plus a signed voucher to open a
+//! chain, to roll one, and to settle a sub-chunk residual), and returns the
+//! assembled blob on `StreamEnd`. It is the receive-side call site for the #252 rule (reject a
 //! `rate_per_mb == 0` response) and the `slash_sig` verification obligation
 //! (ADR 014 §1).
 //!
@@ -65,7 +66,9 @@ pub mod sink;
 pub mod source;
 
 pub use driver::{PacingWait, drive};
-pub use ledger::{ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released};
+pub use ledger::{
+    ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
+};
 pub use pacer::{
     BudgetPacer, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
 };
@@ -211,38 +214,20 @@ impl PoolContext {
         }
     }
 
-    /// Derive this payer's master chain secret from its voucher signing key.
+    /// The ledger for this lane, seeded from its persisted cumulative and
+    /// nothing else.
     ///
-    /// Deterministic, so a restart reproduces every live chain with no secret
-    /// kept on disk. Costs one signature per lane setup — negligible against a
-    /// chain that then meters 255 chunks without another.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a signer failure.
-    pub fn chain_master(&self) -> anyhow::Result<B256> {
-        decdn_incentive::chain::master_secret(self.client_signer.as_ref()).map_err(|e| {
-            anyhow::anyhow!("chain master derivation failed: {e}").context(LocalPullFault)
+    /// A chain is never resumed across a restart — the resume folds the
+    /// frontier the node proved into a signed amount and opens a fresh chain
+    /// (ADR 003 §Resumption folds) — so there is no chain secret to reproduce
+    /// here, no counter to read back, and nothing that could have been
+    /// persisted wrong. What carries across an invocation is the money owed.
+    #[must_use]
+    pub fn new_ledger(&self) -> PoolLedger {
+        PoolLedger::new(Cumulative {
+            bytes: self.prior_bytes_delivered,
+            amount: self.prior_amount,
         })
-    }
-
-    /// The ledger seed for this lane: its persisted cumulative, and nothing
-    /// else. A chain hangs off the anchor its opening voucher carries, so the
-    /// cumulative already says which chain the lane resumes on — there is no
-    /// separate counter to read back, and none to have persisted.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a signer failure from [`Self::chain_master`].
-    pub fn new_ledger(&self) -> anyhow::Result<PoolLedger> {
-        Ok(PoolLedger::new(
-            self.lane(),
-            self.chain_master()?,
-            Cumulative {
-                bytes: self.prior_bytes_delivered,
-                amount: self.prior_amount,
-            },
-        ))
     }
 
     /// Attach an ADR 005 client identity binding so this context's
@@ -345,7 +330,7 @@ impl std::fmt::Debug for PoolContext {
 /// into this watermark ([`VoucherProgress::from_ledger`]) before returning — so it
 /// always holds the **absolute** cumulative totals of the last presumed-accepted
 /// voucher (not per-stream deltas), exactly the `(bytes_delivered, amount)` pair
-/// the buyer-pool lane record expects, plus the lane's chain epoch. Because the
+/// the buyer-pool lane record expects. Because the
 /// copy-back runs on every return path (including the `Err`/timeout arms), the
 /// latest totals survive a mid-stream failure or a paid-but-corrupt delivery.
 ///
@@ -1323,7 +1308,7 @@ pub async fn stream_fetch_tracked_with_progress(
     // One-shot ledger seeded from the channel's prior cumulative state. A single
     // (non-shared) pull owns its ledger; concurrent shared-channel pulls use
     // `stream_fetch_shared` with a caller-owned ledger instead.
-    let ledger = ctx.new_ledger()?;
+    let ledger = ctx.new_ledger();
     let result = with_hard_cap(
         deadlines.hard_cap,
         fetch_inner(
@@ -1349,14 +1334,9 @@ pub async fn stream_fetch_tracked_with_progress(
     // timeout) BEFORE returning, so the latest totals survive a mid-stream failure
     // or a paid-but-corrupt delivery (#852).
     //
-    // Read the whole ledger, not just a cumulative. Two things ride on that. The
-    // epoch: `VoucherProgress::from_cumulative` cannot see one and reports `0`,
-    // which the store's max-merge then ignores — so a caller persisting
-    // `next_epoch()` would never advance it, and a retry after an unclean death
-    // would re-derive the seed of a chain the node still meters, releasing
-    // preimages at indices it has already covered. And the cumulative: `settlement`
-    // rather than `committed`, matching the two sibling persist paths
-    // (`UpstreamPull::progress`, the `node_origin` drop guard) — a voucher left
+    // Read it from the LEDGER rather than a copied-back cumulative, so the figure
+    // is `settlement` and not `committed` — matching the two sibling persist paths
+    // (`UpstreamPull::progress`, the `node_origin` drop guard). A voucher left
     // armed by an ambiguous send is owed, and the error arm here is exactly where
     // that happens. On the `Ok` arm nothing is armed, so the two agree.
     *progress = VoucherProgress::from_ledger(&ledger, ctx.prior_amount);
@@ -1736,12 +1716,16 @@ pub fn voucher_signed_by(
 /// Extract a resumable, AUTHENTICATED [`WatermarkBundle`] from a pull error, or `None` if the
 /// error is not an `UpstreamVoucherRejected`, its reason is not
 /// [`VoucherRejectReason::is_watermark_gated`], it carries no bundle, the bundle fails
-/// [`WatermarkBundle::validate`] (malformed `last_signature` length), or — the security-critical
-/// check — `last_signature` does not recover to this client's OWN voucher-signing address over
-/// the bundle's `amount`/`nonce`/`bytes_delivered`.
+/// [`WatermarkBundle::validate`] (malformed `last_signature` length), or either of the two
+/// security-critical checks fails: `last_signature` must recover to this client's OWN
+/// voucher-signing address over the bundle's anchor and chain section, and the bundle's `tip`
+/// must PROVE its `verified_index`, by hashing forward to the root that signature covers.
 ///
-/// That last check is [`voucher_signed_by`]; see its doc for why acting on an unverified watermark
-/// is a channel-draining hole rather than a robustness nicety.
+/// Both halves of the bundle are folded into money a resuming signer signs, so both have to be
+/// evidence. The anchor half is the client's own signature ([`voucher_signed_by`]; see its doc
+/// for why acting on an unverified watermark is a channel-draining hole rather than a robustness
+/// nicety). The chain half carries no signature at all, which is what makes the tip check the
+/// only thing standing between an inflated `verified_index` and a client that signs it.
 pub fn resumable_watermark<'a>(
     err: &'a anyhow::Error,
     ctx: &PoolContext,
@@ -1763,13 +1747,44 @@ pub fn resumable_watermark<'a>(
         chain_root: B256::from(bundle.chain_root),
         chunk_price: U256::from(bundle.chunk_price),
     };
-    voucher_signed_by(
+    if !voucher_signed_by(
         &claimed,
         &bundle.last_signature,
         ctx.client_signer.address(),
         &ctx.voucher_domain,
-    )
-    .then_some(bundle)
+    ) {
+        return None;
+    }
+    frontier_is_proved(bundle).then_some(bundle)
+}
+
+/// Whether the bundle's `tip` proves the `verified_index` it reports:
+/// `keccak^verified_index(tip) == chain_root`.
+///
+/// A bundle reports two things and the resuming signer folds BOTH into the amount it re-signs.
+/// The anchor half is covered by the client's own signature. The chain half is covered by
+/// nothing — `verified_index` is a number the node writes, and the signature it echoes is over a
+/// voucher that contains no index. A node that reported 255 where the client released 3 would
+/// otherwise collect `252 × chunk_price` for chunks it never delivered, from a client that signed
+/// for them itself.
+///
+/// The tip closes that, and it is the only thing that can: a preimage is unforgeable, so the
+/// deepest one the node can present is the deepest one it was actually GIVEN, and hashing it
+/// forward to a root the client's own signature commits to turns `verified_index` from a claim
+/// into a proof. The walk is `verified_index` keccaks against local state — no signer, no round
+/// trip.
+///
+/// `verified_index == 0` folds nothing, so it needs no proof and carries no tip (the node sends
+/// all-zero). That is the never-metered and sealed case, and the only one where an all-zero tip
+/// is legitimate.
+#[must_use]
+fn frontier_is_proved(bundle: &WatermarkBundle) -> bool {
+    bundle.verified_index == 0
+        || decdn_incentive::chain::verify_forward(
+            B256::from(bundle.tip),
+            bundle.verified_index,
+            B256::from(bundle.chain_root),
+        )
 }
 
 /// True iff `err` is a `SpendingCapExhausted` voucher rejection that the buyer's OWN ledger
@@ -2144,7 +2159,7 @@ async fn receive_and_pay(
             // voucher and surfaces the typed payment fault (with the self-heal
             // bundle), any other `StreamError` is a mid-stream refusal.
             ClientMessage::StreamError(e) => {
-                return Err(voucher_rejection(ledger, e));
+                return Err(voucher_rejection(ledger, &meter, e));
             }
             ClientMessage::StreamEnd => break,
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
@@ -2594,7 +2609,9 @@ impl UpstreamPull {
                 // A mid-stream `StreamError` is either a `VoucherRejected` (our
                 // payment fault, with the self-heal bundle) or a refusal; both
                 // surface as errors.
-                ClientMessage::StreamError(e) => Err(voucher_rejection(&self.ledger, e)),
+                ClientMessage::StreamError(e) => {
+                    Err(voucher_rejection(&self.ledger, &self.meter, e))
+                }
                 ClientMessage::StreamEnd => {
                     self.ended = true;
                     Ok(None)
@@ -2635,7 +2652,7 @@ impl UpstreamPull {
                 // for a late `VoucherRejected` / other `StreamError`, which still
                 // surfaces as an error.
                 ClientMessage::StreamError(e) => {
-                    return Err(voucher_rejection(&self.ledger, e));
+                    return Err(voucher_rejection(&self.ledger, &self.meter, e));
                 }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
@@ -2715,7 +2732,7 @@ async fn send_voucher(
     rate_per_mb: u64,
     delta_bytes: u64,
     epoch: EpochAction,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Cumulative> {
     anyhow::ensure!(
         !ctx.provider.is_zero(),
         "voucher provider is not pinned (Address::ZERO) — call PoolContext::with_provider \
@@ -2726,7 +2743,6 @@ async fn send_voucher(
             sign_and_write_voucher(send, ctx, next, chain)
         })
         .await
-        .map(|_sent| ())
 }
 
 /// Sign one voucher over `next`/`chain` with the pool context's key and write it
@@ -2775,26 +2791,36 @@ struct StreamMeter {
     /// The chain this stream has already carried the root voucher for, named by
     /// its root. `None` until it has anchored to anything.
     anchored_root: Option<B256>,
+    /// The last proof THIS stream claimed money with, so a `VoucherRejected`
+    /// read here rewinds that proof and not whatever a sibling stream has done
+    /// on the lane since (see [`PoolLedger::resolve_reject`]). `None` before the
+    /// stream has claimed anything, and left alone by a re-anchor — which claims
+    /// nothing and so has nothing to rewind.
+    last_proof: Option<StreamProof>,
 }
 
 impl StreamMeter {
     /// Ensure this stream has told the node which chain its reveals belong to,
-    /// sending the epoch's root voucher first if it has not.
+    /// opening a chain if the lane meters none, and sending that chain's root
+    /// voucher first if this stream has not carried it.
     ///
-    /// `open` distinguishes the two callers: a stream about to release a reveal
-    /// needs a chain to exist (`EpochAction::Open`), while one merely settling a
-    /// residual commits to whatever the lane already meters against, opening
-    /// nothing.
+    /// Called from one place — a stream about to release a reveal, which is the
+    /// only thing that needs a chain to exist. Residual settlement commits to
+    /// whatever the lane already meters against and goes straight to
+    /// [`send_voucher`].
     async fn anchor(
         &mut self,
         send: &mut SendStream,
         ctx: &PoolContext,
         ledger: &PoolLedger,
         rate_per_mb: u64,
-        open: EpochAction,
     ) -> anyhow::Result<()> {
-        if ledger.chain_root().is_none() && open == EpochAction::Open {
-            send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?;
+        if ledger.chain_root().is_none() {
+            self.last_proof = Some(StreamProof::Voucher {
+                amount: send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open)
+                    .await?
+                    .amount,
+            });
             // Re-read rather than reuse the pre-send `None`: the send is what
             // opened the chain, so only the ledger knows which one.
             self.anchored_root = ledger.chain_root();
@@ -2842,8 +2868,7 @@ impl StreamMeter {
         // roll that follows opens a chain with index 1 available by
         // construction. A third pass would mean the ledger contradicted itself.
         for attempt in 0..2u8 {
-            self.anchor(&mut *send, ctx, ledger, rate_per_mb, EpochAction::Open)
-                .await?;
+            self.anchor(&mut *send, ctx, ledger, rate_per_mb).await?;
             // Reborrow per iteration: the closure takes the stream by unique
             // reference for the duration of the send, and the loop needs it back.
             let wire = &mut *send;
@@ -2860,14 +2885,30 @@ impl StreamMeter {
                 })
                 .await?
             {
-                Metered::Released(_) => return Ok(()),
+                Metered::Released(released) => {
+                    self.last_proof = Some(StreamProof::Reveal {
+                        chain_root: released.chain_root,
+                        index: released.index,
+                    });
+                    return Ok(());
+                }
                 Metered::Exhausted if attempt == 0 => {
                     // Roll. The new voucher's `amount` already folds this
                     // chain's frontier — every reveal advanced the committed
                     // cumulative as it went — so the fold is the frontier
                     // actually reached, never a flat 255 (ADR 003 §Rollover).
-                    send_voucher(&mut *send, ctx, ledger, rate_per_mb, 0, EpochAction::Roll)
-                        .await?;
+                    self.last_proof = Some(StreamProof::Voucher {
+                        amount: send_voucher(
+                            &mut *send,
+                            ctx,
+                            ledger,
+                            rate_per_mb,
+                            0,
+                            EpochAction::Roll,
+                        )
+                        .await?
+                        .amount,
+                    });
                     self.anchored_root = ledger.chain_root();
                 }
                 Metered::Exhausted => {
@@ -2882,8 +2923,18 @@ impl StreamMeter {
     ///
     /// A preimage always advances the claim by a *whole* chunk, so a partial
     /// trailing chunk cannot be priced by one — it settles through a signature,
-    /// exact to one token base unit. The voucher re-asserts the live root rather
-    /// than sealing the lane, so sibling streams keep metering against it.
+    /// exact to one token base unit.
+    ///
+    /// It asks for [`EpochAction::Keep`], and usually does not get it. Any
+    /// transfer that released at least one reveal has accrual outstanding, and a
+    /// voucher that folds must also roll ([`PoolLedger::issue`]) — so the typical
+    /// close retires the chain and opens a fresh one, and a sibling stream's
+    /// in-flight reveals under the old root land as superseded and re-anchor.
+    /// That is the correct trade and not an oversight: the fold is what makes the
+    /// residual exact, and a folded frontier must never coexist with the root
+    /// that proved it. `Keep` is what a transfer smaller than one whole chunk
+    /// gets — nothing accrued, nothing to fold — and there it commits the sealed
+    /// section, since such a lane never opened a chain at all.
     async fn settle_residual(
         &mut self,
         send: &mut SendStream,
@@ -2892,15 +2943,18 @@ impl StreamMeter {
         rate_per_mb: u64,
         residual_bytes: u64,
     ) -> anyhow::Result<()> {
-        send_voucher(
-            send,
-            ctx,
-            ledger,
-            rate_per_mb,
-            residual_bytes,
-            EpochAction::Keep,
-        )
-        .await?;
+        self.last_proof = Some(StreamProof::Voucher {
+            amount: send_voucher(
+                send,
+                ctx,
+                ledger,
+                rate_per_mb,
+                residual_bytes,
+                EpochAction::Keep,
+            )
+            .await?
+            .amount,
+        });
         self.anchored_root = ledger.chain_root();
         Ok(())
     }
@@ -2936,7 +2990,7 @@ impl StreamMeter {
 /// the loop surfaces. There is no positive ack in the pool model — continued
 /// delivery is acceptance (ADR 005) — so this handles only the rejection slot.
 ///
-/// A `VoucherRejected` is OUR payment-side fault: rewind the rejected voucher
+/// A `VoucherRejected` is OUR payment-side fault: rewind the proof `meter` last sent
 /// (known-not-taken, so it must not be settled optimistically) and carry its typed
 /// reason — plus the wallet-less-resume `bundle` (#1481) — so the orchestrator can
 /// exonerate the provider (#857) and `fetch_inner` can self-heal from an
@@ -2944,10 +2998,19 @@ impl StreamMeter {
 /// OTHER `StreamError` is the upstream refusing mid-stream; carry the typed wire
 /// code as [`UpstreamRefused`] so an honest `Overloaded`/`NotFound` peer is scored
 /// on its real code rather than the `Unreachable` catch-all (#1145 review).
-fn voucher_rejection(ledger: &PoolLedger, error: StreamError) -> anyhow::Error {
+fn voucher_rejection(
+    ledger: &PoolLedger,
+    meter: &StreamMeter,
+    error: StreamError,
+) -> anyhow::Error {
     match error {
         StreamError::VoucherRejected { reason, bundle } => {
-            ledger.resolve_reject();
+            // Rewind the proof THIS stream sent. The lane is shared, so the proof
+            // it last issued may belong to a sibling; naming ours is what keeps
+            // the rejection from un-committing a voucher the node accepted.
+            if let Some(proof) = meter.last_proof {
+                ledger.resolve_reject(proof);
+            }
             anyhow::Error::new(UpstreamVoucherRejected { reason, bundle })
         }
         other => anyhow::Error::new(UpstreamRefused::mid_stream(other)),
@@ -3317,6 +3380,117 @@ mod tests {
             chunk_price: 0,
             last_signature: voucher_signature.signature.as_bytes().to_vec(),
         })
+    }
+
+    /// A metered bundle: the same seven-field voucher, but committing a real chain root and
+    /// echoing the frontier the node claims under it. `released` is the depth the client
+    /// actually gave the node; `claimed` is the depth the node reports. An honest node sets
+    /// them equal.
+    fn metered_bundle(
+        pool_id: alloy::primitives::B256,
+        provider: alloy::primitives::Address,
+        signer: &alloy::signers::local::PrivateKeySigner,
+        domain: &alloy::dyn_abi::Eip712Domain,
+        seed: alloy::primitives::B256,
+        released: u8,
+        claimed: u8,
+    ) -> anyhow::Result<WatermarkBundle> {
+        let chain_root = decdn_incentive::chain::root_from_seed(seed);
+        let amount = U256::from(500u64);
+        let bytes_delivered = U256::from(4096u64);
+        let voucher_signature = Voucher {
+            pool_id,
+            signer: signer.address(),
+            provider,
+            amount,
+            bytes_delivered,
+            chain_root,
+            chunk_price: U256::from(10u64),
+        }
+        .sign(signer, domain)
+        .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}"))?;
+        Ok(WatermarkBundle {
+            amount: u64::try_from(amount)?,
+            bytes_delivered: u64::try_from(bytes_delivered)?,
+            chain_root: chain_root.into(),
+            verified_index: claimed,
+            // The deepest preimage the node was actually handed. It cannot fabricate a deeper
+            // one, so this is the whole of what it can prove.
+            tip: decdn_incentive::chain::preimage_at(seed, released).into(),
+            chunk_price: 10,
+            last_signature: voucher_signature.signature.as_bytes().to_vec(),
+        })
+    }
+
+    /// The chain half of a bundle is covered by NO signature: `verified_index` is a number the
+    /// node writes, and the voucher whose signature it echoes carries no index. So a node can
+    /// claim any depth it likes — and the resuming client folds `verified_index × chunk_price`
+    /// into the amount it re-signs. Here the client released 3 chunks and the node reports 255;
+    /// without the tip check the client would sign away 252 chunks it never received.
+    #[test]
+    fn resumable_watermark_rejects_a_frontier_the_tip_does_not_prove() -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+
+        let bundle = metered_bundle(
+            channel_id,
+            token,
+            &our_signer,
+            &domain,
+            B256::repeat_byte(0x5E),
+            3,
+            255,
+        )?;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::AmountRegression,
+            bundle: Some(bundle),
+        });
+
+        anyhow::ensure!(
+            resumable_watermark(&err, &ctx).is_none(),
+            "a bundle claiming a depth its tip does not reach must never be folded into money"
+        );
+        Ok(())
+    }
+
+    /// The positive twin: the node reports exactly the depth it was given, its tip hashes
+    /// forward to the root the client's own signature commits to, and the frontier is folded.
+    #[test]
+    fn resumable_watermark_accepts_a_frontier_the_tip_proves() -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+
+        let bundle = metered_bundle(
+            channel_id,
+            token,
+            &our_signer,
+            &domain,
+            B256::repeat_byte(0x5E),
+            3,
+            3,
+        )?;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::AmountRegression,
+            bundle: Some(bundle),
+        });
+
+        let got = resumable_watermark(&err, &ctx)
+            .ok_or_else(|| anyhow::anyhow!("a genuinely proved frontier must be resumable"))?;
+        // 500 + 3 × 10: the anchor plus the three chunks the tip proves.
+        anyhow::ensure!(Cumulative::from(got).amount == U256::from(530u64));
+        Ok(())
     }
 
     /// The security property this module exists to guard (post-review-round-2, #1481 §5): a

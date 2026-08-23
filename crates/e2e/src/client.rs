@@ -115,11 +115,10 @@ impl PoolSession {
         );
         self.ctx.prior_bytes_delivered = bytes_delivered;
         self.ctx.prior_amount = amount;
-        // Carry the lane's chain epoch forward too. Every fetch on this session
-        // builds a fresh ledger from `ctx`, so a stale counter re-derives the
-        // seed the previous fetch already used — and the node, still holding
-        // that root at a non-zero frontier, treats every reveal under it as
-        // already covered. The delivery then stalls with nothing crediting it.
+        // The cumulative is all there is to carry. Every fetch on this session
+        // builds a fresh ledger from `ctx`, and a fresh ledger draws a fresh
+        // chain — so what the next fetch needs from this one is the money owed,
+        // which its first voucher folds into the amount it signs.
         Ok(())
     }
 }

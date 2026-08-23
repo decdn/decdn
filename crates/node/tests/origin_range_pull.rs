@@ -108,7 +108,6 @@ async fn handler_over_http_origin(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let cache_dir = tempfile::tempdir()?;
@@ -1369,7 +1368,6 @@ async fn handler_two_channels_over_http_origin(
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         ))?;
     }
 

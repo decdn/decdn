@@ -594,7 +594,7 @@ impl ClientHandler {
             let credit_max = self.credit_max;
             // The unpaid local-origin leg: a throwaway ledger that never signs
             // and never meters, because `BackendSource` quotes rate 0.
-            let ledger = Arc::new(decdn_client_pull::PoolLedger::unmetered(
+            let ledger = Arc::new(decdn_client_pull::PoolLedger::new(
                 decdn_client_pull::Cumulative::default(),
             ));
             let source = crate::node_origin::BackendSource::new(

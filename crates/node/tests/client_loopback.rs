@@ -155,7 +155,6 @@ fn fresh_lane(signer: Address, cap: U256) -> LaneState {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     )
 }
 
@@ -316,7 +315,6 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -729,7 +727,7 @@ async fn a_preimage_at_index_zero_is_refused() -> anyhow::Result<()> {
     read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
     open_chain(&mut send, &signer, chain_root(), RATE_PER_MB, U256::ZERO, 0).await?;
     release(&mut send, 0).await?;
-    expect_reject(&mut recv, VoucherRejectReason::ChainIndexTooLarge).await?;
+    expect_reject(&mut recv, VoucherRejectReason::ChainIndexZero).await?;
 
     conn.close(0u32.into(), b"done");
     shutdown([], [&client_ep, &server_ep]).await;
@@ -1302,7 +1300,6 @@ async fn idle_fixture_with_cache(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -2085,7 +2082,6 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
@@ -2169,7 +2165,6 @@ async fn finished_stream_releases_its_lane_slot() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
@@ -2241,7 +2236,6 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
@@ -2309,7 +2303,6 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
 
@@ -2547,7 +2540,6 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -2657,7 +2649,6 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -2787,7 +2778,6 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -2890,7 +2880,6 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3035,7 +3024,6 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3142,7 +3130,6 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3230,7 +3217,6 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3344,7 +3330,6 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3438,7 +3423,6 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3524,7 +3508,6 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -3673,7 +3656,6 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining sits one base unit under the floor's cost. A large
@@ -3769,7 +3751,6 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     let (target, server_eth, server_ep, server_task, metrics) =
@@ -3827,7 +3808,6 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     // Pool remaining exactly covers the one-chunk floor, not the 64 MiB ceiling.
@@ -3890,7 +3870,6 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     // Pool remaining covers only the first chunk of the 8 MiB ceiling.
@@ -3961,7 +3940,6 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
         U256::from(9_961_472u64),
         Some([0x22; 65]),
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Gross deposit 100, but the pool has only 5 remaining after prior redeems —
@@ -4040,7 +4018,6 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining 5 covers the ~0.4 MiB tail (cost 4) but not the whole blob.
@@ -4113,7 +4090,6 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining exactly equals the floor's cost — the `>=` boundary.
@@ -4214,7 +4190,6 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store: Arc<dyn PoolStateStore> = Arc::new(FailingRecordStore { inner });
 
@@ -4297,7 +4272,6 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     );
     expired.expiry = 1;
     store.record(&expired)?;
@@ -4365,7 +4339,6 @@ fn seeded_store() -> anyhow::Result<(Arc<dyn PoolStateStore>, Arc<PrivateKeySign
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     Ok((store, signer, deposit))
 }
@@ -4613,7 +4586,6 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         ))?;
     }
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
@@ -4746,7 +4718,6 @@ async fn setup_recheck_holder_and_driven(
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         ))?;
     }
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
@@ -6340,7 +6311,6 @@ fn delegate_signer_store() -> anyhow::Result<DelegateSignerFixture> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     Ok((store, funder, delegate))
 }
@@ -6726,7 +6696,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
     // ONE channel context, ONE shared ledger seeded fresh (all `prior_* == ZERO`),
     // shared across both concurrent pulls via `Arc`.
     let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
-    let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let server_addr = server_eth.address();
     let sd = slash_domain();
     let (ra, rb) = tokio::join!(
@@ -6820,7 +6790,6 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();
@@ -6904,7 +6873,6 @@ async fn register_lane_is_idempotent_and_preserves_watermark() -> anyhow::Result
         U256::from(2_048u64),
         Some([0x11; 65]),
         decdn_incentive::LaneChain::NONE,
-        None,
     );
     store.record(&advanced)?;
 
@@ -7275,7 +7243,6 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining sits one base unit under the window's cost.
@@ -7356,7 +7323,6 @@ async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Pool remaining exactly equals the window's cost — the funded boundary.
@@ -7430,7 +7396,6 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         U256::from(1_048_575_488u64),
         Some([0x33; 65]),
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let store_dyn: Arc<dyn PoolStateStore> = store.clone();
     // Gross deposit 10 USDC, but only 5 remaining after prior redeems — well
@@ -7496,7 +7461,6 @@ async fn a_refused_request_clamps_the_rate_exactly_once() -> anyhow::Result<()> 
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
 
     let server_sk = fresh_key();

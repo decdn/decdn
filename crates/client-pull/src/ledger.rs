@@ -9,7 +9,6 @@
 use std::future::Future;
 
 use alloy::primitives::{B256, U256};
-use decdn_incentive::LaneKey;
 use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH};
 use decdn_protocol::MB_BYTES;
 use decdn_protocol::client::WatermarkBundle;
@@ -62,6 +61,13 @@ impl From<&WatermarkBundle> for Cumulative {
     ///
     /// Infallible: the fold is computed in `U256`, so the `u64` inputs cannot
     /// overflow it and a caller can re-seed from a bundle without a `Result`.
+    ///
+    /// It is also unauthenticated, and deliberately so — this is arithmetic, not
+    /// a trust boundary. `verified_index` is a number the node writes and no
+    /// signature covers, so a bundle reaches this conversion only through
+    /// `resumable_watermark`, which proves the anchor against the client's own
+    /// signature and the frontier against the bundle's `tip` before any of it
+    /// becomes money. Do not fold a bundle that has not been through that gate.
     fn from(bundle: &WatermarkBundle) -> Self {
         let proved = U256::from(bundle.verified_index);
         Self {
@@ -91,9 +97,16 @@ fn next_voucher(cur: &Cumulative, delta_bytes: u64, rate_per_mb: u64) -> Cumulat
 /// One lane's live hash-chain epoch: the payer half of the `PayWord` meter
 /// (ADR 003 §Hash-chain metering).
 ///
-/// The seed is **derived, never stored** — `chain::derive_seed(master, lane,
-/// epoch)` reproduces it from the payer's signing key, so a restart resumes the
-/// same chain with no secret at rest and only `epoch` persisted.
+/// The seed is **drawn, never stored and never reproduced** — 32 fresh bytes at
+/// open, held here for as long as the chain meters and dropped with it. Two
+/// chains therefore share a root only with probability 2⁻²⁵⁶, which is the
+/// whole of the no-reuse property: there is no derivation input to bind, no
+/// counter to persist, and nothing secret at rest.
+///
+/// A chain never outlives the process that drew it. Resumption after a restart
+/// folds the frontier the node proved into a signed amount and opens a fresh
+/// chain (ADR 003 §Resumption folds), so re-deriving an old seed is not a
+/// capability this type gives up — it is one nothing asks for.
 ///
 /// The whole 256-entry ladder is materialised at open. One pass of
 /// `MAX_CHAIN_LENGTH` keccaks fills it (`preimages[255] = seed`, each earlier
@@ -115,8 +128,8 @@ struct ChainEpoch {
 }
 
 impl ChainEpoch {
-    fn open(lane: &LaneKey, master: B256, anchor: U256, chunk_price: U256) -> Self {
-        let seed = decdn_incentive::chain::derive_seed(master, lane, anchor, chunk_price);
+    fn open(chunk_price: U256) -> Self {
+        let seed = decdn_incentive::chain::random_seed();
         let mut preimages = Box::new([B256::ZERO; 256]);
         let mut acc = seed;
         // Walk down from the seed at index 255 to the root at index 0, so the
@@ -167,14 +180,18 @@ struct Pipeline {
     /// The accrual as of the previous signature, so a rejection rewinds both
     /// halves of the claim together.
     prev_accrued: Cumulative,
-    /// Which kind of proof most recently went out on this lane, so a rejection
-    /// rewinds the thing that was actually refused.
+    /// The proof most recently put on the wire for this lane, identified — not
+    /// merely classified — so a rejection rewinds the thing that was actually
+    /// refused and nothing else.
     ///
     /// A rejection names no proof. Under the chain the lane emits two kinds and
     /// they rewind differently — a refused voucher un-commits the anchor, a
     /// refused reveal only takes back one chunk of accrual — so guessing wrong
     /// walks the anchor backwards below what the node accepted, and every later
-    /// voucher then regresses. See [`PoolLedger::resolve_reject`].
+    /// voucher then regresses. And the lane is shared: a rejection is read on
+    /// the stream it arrived on, while a sibling may have issued since, so the
+    /// KIND alone is not enough to tell whether the refused proof is still the
+    /// one this field holds. See [`PoolLedger::resolve_reject`].
     last_proof: Option<LastProof>,
     /// The highest voucher whose send SUCCEEDED — presumed accepted, because
     /// continued delivery IS acceptance (ADR 005: only rejection is signalled).
@@ -211,16 +228,46 @@ enum Displaced {
     Replaced(Option<ChainEpoch>),
 }
 
-/// Which kind of proof last went out, and what undoing it costs.
+/// Which proof last went out, named exactly, and what undoing it costs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LastProof {
-    /// A signed voucher. Rewinding it restores the previous anchor and hands
-    /// back the accrual that voucher folded.
-    Voucher,
-    /// One released preimage, worth `chunk_price` on the money axis and one
-    /// `CHUNK_BYTES` on the byte axis. Rewinding it takes back exactly that and
-    /// leaves the signed anchor alone.
-    Reveal { chunk_price: U256 },
+    /// A signed voucher, named by the cumulative it claims. Rewinding it
+    /// restores the previous anchor and hands back the accrual that voucher
+    /// folded.
+    Voucher { amount: U256 },
+    /// One released preimage, named by its chain and depth, and worth
+    /// `chunk_price` on the money axis and one `CHUNK_BYTES` on the byte axis.
+    /// Rewinding it takes back exactly that and leaves the signed anchor alone.
+    Reveal {
+        chain_root: B256,
+        index: u8,
+        chunk_price: U256,
+    },
+}
+
+/// The proof one stream put on the wire, in the terms that identify it on the
+/// lane — what a stream must hand [`PoolLedger::resolve_reject`] to say which
+/// proof the rejection it just read was for.
+///
+/// Both names are unique on a lane by construction: issuance is serialized, so
+/// cumulative amounts strictly increase and no two vouchers share one, and a
+/// chain's indices strictly deepen so no two reveals share a `(root, index)`.
+/// That is what lets the ledger tell "the proof I am being told about is still
+/// the last thing this lane did" from "a sibling has moved on since".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamProof {
+    /// A signed voucher claiming this cumulative amount.
+    Voucher {
+        /// The `amount` the voucher was signed over.
+        amount: U256,
+    },
+    /// A preimage released at this depth on this chain.
+    Reveal {
+        /// The chain the reveal extends, named by its root.
+        chain_root: B256,
+        /// The depth released.
+        index: u8,
+    },
 }
 
 /// What a voucher should do with the lane's hash chain.
@@ -229,6 +276,11 @@ enum LastProof {
 /// cumulative `amount` is the settlement anchor, and the chain is an optional
 /// extension that advances that anchor without another signature. So every
 /// voucher makes exactly one of these three statements about it.
+///
+/// There is no "seal" statement, because sealing is not a decision a caller
+/// makes: [`Self::Keep`] on a lane that meters nothing already commits
+/// [`ChainCommit::SEALED`], which is every voucher a sub-chunk transfer ever
+/// sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EpochAction {
     /// Commit to whatever the lane already meters against — the live epoch's
@@ -247,11 +299,6 @@ pub enum EpochAction {
     /// exhausts a chain, and may roll earlier at its own discretion; either way
     /// the fold is the frontier actually reached, never a flat 255.
     Roll,
-    /// Meter nothing: a **sealed** voucher, with a zero root at a zero price.
-    /// This is the cooperative close, and the only thing that settles a partial
-    /// trailing chunk — a preimage always advances the claim by a whole chunk,
-    /// so a residual smaller than one needs a signature to be exact.
-    Seal,
 }
 
 /// The chain section a voucher signs: what the payer commits to, and what the
@@ -284,8 +331,8 @@ pub struct Released {
     pub index: u8,
     /// The chain it belongs to, named by its root — so a caller can tell whether
     /// the stream it is sending on has already carried that chain's root voucher.
-    /// The root IS the chain's identity: it is derived from the anchor the chain
-    /// hangs off, so a fresh chain always has a fresh root.
+    /// The root IS the chain's identity: each chain draws its own secret, so a
+    /// fresh chain always has a fresh root.
     pub chain_root: B256,
 }
 
@@ -345,19 +392,21 @@ pub struct PoolLedger {
     /// Locked AFTER `epoch` wherever both are taken, which is the only order
     /// either is ever acquired in.
     retired: std::sync::Mutex<Displaced>,
-    /// Lane identity and the payer's master secret, together the derivation
-    /// inputs every epoch on this lane is drawn from. Held rather than passed
-    /// per call so a rollover needs no cooperation from the caller.
-    lane: LaneKey,
-    master: B256,
 }
 
 impl PoolLedger {
     /// Build a ledger seeded from the lane's persisted cumulative state (the
     /// last voucher issued on earlier streams/invocations). Pass
-    /// `Cumulative::default()` for a brand-new lane.
+    /// `Cumulative::default()` for a brand-new lane, and for the unpaid legs —
+    /// the node's own-origin `BackendSource` quotes rate 0, so it never prices,
+    /// signs, or meters anything.
+    ///
+    /// The cumulative is the only seed there is. A chain draws its own secret at
+    /// open and is never resumed across a restart, so this constructor takes no
+    /// lane identity and no key material: what the ledger inherits from a
+    /// previous process is the money it owes, never the chain it owed it under.
     #[must_use]
-    pub fn new(lane: LaneKey, master: B256, seed: Cumulative) -> Self {
+    pub fn new(seed: Cumulative) -> Self {
         Self {
             issuance: Mutex::new(()),
             pipeline: std::sync::Mutex::new(Pipeline {
@@ -370,31 +419,7 @@ impl PoolLedger {
             }),
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
-            lane,
-            master,
         }
-    }
-
-    /// A ledger for a lane that meters **nothing**: no identity, no master, no
-    /// chain.
-    ///
-    /// The unpaid legs use this — the node's own-origin `BackendSource` quotes
-    /// rate 0, so it never prices, signs, or meters anything, and a real lane
-    /// identity would be a fiction. Callers MUST NOT drive
-    /// [`EpochAction::Open`] or [`EpochAction::Roll`] through it: with a zero
-    /// master every lane would derive the same seed, which is precisely the
-    /// cross-lane reuse this module's seed derivation exists to prevent.
-    #[must_use]
-    pub fn unmetered(seed: Cumulative) -> Self {
-        Self::new(
-            LaneKey {
-                pool_id: B256::ZERO,
-                signer: alloy::primitives::Address::ZERO,
-                provider: alloy::primitives::Address::ZERO,
-            },
-            B256::ZERO,
-            seed,
-        )
     }
 
     /// Lock the pipeline, recovering the inner value on poison. A poisoned lock
@@ -499,14 +524,8 @@ impl PoolLedger {
         } else {
             EpochAction::Roll
         };
-        // Compute the voucher BEFORE drawing the chain it commits. A chain is
-        // seeded from the anchor its own opening voucher carries, and on a
-        // rollover that anchor is the FOLDED figure — the outgoing frontier
-        // absorbed into this voucher's amount. Seeding from the pre-fold number
-        // would tie the new chain to the retired one's anchor, which is exactly
-        // the (amount, root) pair that must never repeat.
         let next = next_voucher(&frontier, delta_bytes, rate_per_mb);
-        let commit = self.commit_epoch(epoch, rate_per_mb, next.amount);
+        let commit = self.commit_epoch(epoch, rate_per_mb);
         self.pipeline().armed = Some(next);
         // Send. On ANY error the voucher stays armed and the anchor does not
         // advance: a send failure is as ambiguous as a drop, so `settlement`
@@ -524,7 +543,9 @@ impl PoolLedger {
             pipeline.committed = next;
             pipeline.accrued = Cumulative::default();
             pipeline.armed = None;
-            pipeline.last_proof = Some(LastProof::Voucher);
+            pipeline.last_proof = Some(LastProof::Voucher {
+                amount: next.amount,
+            });
         }
         Ok(next)
     }
@@ -576,19 +597,16 @@ impl PoolLedger {
     /// Callers hold the issuance lock, which is what makes "read the epoch,
     /// maybe replace it, report it" one indivisible step against the concurrent
     /// streams sharing this lane.
-    fn commit_epoch(&self, action: EpochAction, rate_per_mb: u64, anchor: U256) -> ChainCommit {
+    fn commit_epoch(&self, action: EpochAction, rate_per_mb: u64) -> ChainCommit {
         let mut slot = self.epoch();
         // What this voucher puts in the chain slot, or `None` to leave it alone.
-        // A sealed voucher meters no chunk, so its whole chain section is zero,
-        // and dropping the chain is what retires it: a preimage released under
-        // the old root extends nothing once the node has adopted a zero root.
+        // A lane holding no chain reports `ChainCommit::SEALED` either way, which
+        // is what makes the sealed shape something the ledger arrives at rather
+        // than something a caller asks for.
         let replacement = match action {
-            EpochAction::Seal => Some(None),
             EpochAction::Keep => None,
             EpochAction::Open if slot.is_some() => None,
-            EpochAction::Open | EpochAction::Roll => {
-                Some(Some(self.open_epoch(rate_per_mb, anchor)))
-            }
+            EpochAction::Open | EpochAction::Roll => Some(Some(open_epoch(rate_per_mb))),
         };
         // Record what this voucher displaced — including "nothing", so a rejected
         // voucher that left the chain alone does not restore some earlier one.
@@ -601,25 +619,6 @@ impl PoolLedger {
                 chain_root: live.root(),
                 chunk_price: live.chunk_price,
             })
-    }
-
-    /// Draw the next chain on this lane, seeded from the anchor its own opening
-    /// voucher will carry.
-    ///
-    /// Each chain gets an independent seed from the lane triple plus that anchor
-    /// and price, so no two chains this payer opens — across providers, pools, or
-    /// its own sibling signers — are derivable from each other. That is the whole
-    /// defence against the cross-lane preimage spend, and it is payer-side by
-    /// design: reuse costs the payer and pays the node, so no node-side rule
-    /// would protect anyone who chose to run without it (ADR 003 §One chain per
-    /// lane).
-    ///
-    /// `anchor` is the amount of the voucher that commits this root, which is why
-    /// the caller computes the voucher BEFORE asking for the chain: a rollover
-    /// folds the outgoing frontier into that amount, and it is the folded figure —
-    /// not the pre-fold one — that must seed the chain replacing it.
-    fn open_epoch(&self, rate_per_mb: u64, anchor: U256) -> ChainEpoch {
-        ChainEpoch::open(&self.lane, self.master, anchor, U256::from(rate_per_mb))
     }
 
     /// Lock the epoch slot, recovering the inner value on poison — same reason
@@ -733,7 +732,11 @@ impl PoolLedger {
                 .accrued
                 .bytes
                 .saturating_add(U256::from(CHUNK_BYTES));
-            pipeline.last_proof = Some(LastProof::Reveal { chunk_price: price });
+            pipeline.last_proof = Some(LastProof::Reveal {
+                chain_root: released.chain_root,
+                index: released.index,
+                chunk_price: price,
+            });
         }
         Ok(Metered::Released(released))
     }
@@ -789,25 +792,46 @@ impl PoolLedger {
         true
     }
 
-    /// Resolve the most-recent proof as explicitly REJECTED, undoing exactly what
-    /// that proof claimed. Called by the receive loop when a
-    /// `StreamError::VoucherRejected` arrives. A rejection is the upstream
-    /// declaring it never took the proof, so — unlike an ambiguous failure — it
-    /// must not be settled optimistically (that would inflate our cumulative for
-    /// bytes the upstream refused to be paid for).
+    /// Resolve `rejected` — the proof this stream just read a `VoucherRejected`
+    /// for — as explicitly refused, undoing exactly what that proof claimed.
+    /// Called by the receive loop. A rejection is the upstream declaring it never
+    /// took the proof, so — unlike an ambiguous failure — it must not be settled
+    /// optimistically (that would inflate our cumulative for bytes the upstream
+    /// refused to be paid for).
     ///
-    /// Returns `false` if there was nothing to rewind — a spurious rejection.
+    /// Returns `false` if there was nothing to rewind: a spurious rejection, or
+    /// one for a proof the lane has already moved past.
     ///
-    /// # Why the proof KIND decides the rewind
+    /// # Why the caller names the proof
     ///
-    /// The wire rejection names no proof, and under the chain a lane emits two
-    /// kinds. A refused VOUCHER un-commits the anchor. A refused REVEAL must not:
-    /// the anchor it extends was accepted, and the last voucher may be many
-    /// chunks back. Rewinding `committed → prev` on a refused reveal un-commits a
-    /// voucher the node is still holding, and the payer's anchor then sits
-    /// permanently below the node's — every voucher it signs afterwards regresses,
-    /// and a re-anchor states a cumulative the node passed long ago. So the rewind
-    /// follows `last_proof`, not the arrival of a rejection.
+    /// The wire rejection names nothing, and a lane emits two kinds of proof that
+    /// rewind differently. A refused VOUCHER un-commits the anchor. A refused
+    /// REVEAL must not: the anchor it extends was accepted, and the last voucher
+    /// may be many chunks back. Rewinding `committed → prev` on a refused reveal
+    /// un-commits a voucher the node is still holding, and the payer's anchor then
+    /// sits permanently below the node's — every voucher it signs afterwards
+    /// regresses, and a re-anchor states a cumulative the node passed long ago.
+    ///
+    /// Reading the KIND off the lane is not enough, because the lane is shared.
+    /// A rejection is read on the stream that earned it, and a sibling stream
+    /// issuing in the meantime replaces what the lane last did: a reveal refused
+    /// on stream A, arriving after stream B's rollover was accepted, would find a
+    /// Voucher in the slot and un-commit B's ACCEPTED anchor — the exact
+    /// permanent divergence the kind-split exists to prevent. So the stream hands
+    /// back the proof it sent, by name, and the rewind happens only while that
+    /// proof is still the last thing the lane did.
+    ///
+    /// # Why a stale rejection rewinds nothing
+    ///
+    /// It is not merely the safe answer, it is the right one. For the lane to
+    /// have moved on, a later proof must have been ACCEPTED — the node keeps
+    /// delivering, and continued delivery is acceptance. A later voucher folded
+    /// the refused reveal's accrual into a signed amount the node took, and a
+    /// later reveal proved a depth that pays for every chunk below it. Either
+    /// way the money the rejection would claw back is money the node has since
+    /// been granted by a proof it did not refuse. Taking it back would put the
+    /// payer's anchor below the node's, which is the failure this whole method
+    /// is shaped to avoid.
     ///
     /// A rejected reveal gives back exactly one chunk of accrual AND the index it
     /// released. Both, because the index is the accounting: a claim is
@@ -816,16 +840,18 @@ impl PoolLedger {
     /// the node prices the gap, the payer never accrued it, and the two diverge by
     /// exactly one chunk from then on. Re-releasing the rewound depth is safe: the
     /// node refused it, so it holds no preimage at that index.
-    ///
-    /// The voucher arm assumes the rejected voucher is the LATEST committed one:
-    /// the one-step `committed → prev` rewind is exact for the inline-await
-    /// receive loop, which issues at most one armed voucher at a time and learns
-    /// of its rejection before issuing the next.
-    pub fn resolve_reject(&self) -> bool {
+    pub fn resolve_reject(&self, rejected: StreamProof) -> bool {
         let mut pipeline = self.pipeline();
-        pipeline.armed = None;
-        match pipeline.last_proof.take() {
-            Some(LastProof::Reveal { chunk_price }) => {
+        match (rejected, pipeline.last_proof) {
+            (
+                StreamProof::Reveal { chain_root, index },
+                Some(LastProof::Reveal {
+                    chain_root: last_root,
+                    index: last_index,
+                    chunk_price,
+                }),
+            ) if chain_root == last_root && index == last_index => {
+                pipeline.last_proof = None;
                 pipeline.accrued.amount = pipeline.accrued.amount.saturating_sub(chunk_price);
                 pipeline.accrued.bytes = pipeline
                     .accrued
@@ -834,47 +860,81 @@ impl PoolLedger {
                 drop(pipeline);
                 // Give the index back too — see the doc above. Sequenced after the
                 // pipeline guard is released so the two locks are never held
-                // together, as in `reseed`.
-                if let Some(live) = self.epoch().as_mut() {
+                // together, as in `reseed`. Guarded on the root as well: a sibling
+                // that rolled between the release and this rewind left a different
+                // chain in the slot, whose index this reveal never advanced.
+                if let Some(live) = self.epoch().as_mut()
+                    && live.root() == chain_root
+                {
                     live.released = live.released.saturating_sub(1);
                 }
                 true
             }
-            Some(LastProof::Voucher) => match pipeline.prev.take() {
-                Some(prev) => {
-                    // Rewind BOTH halves. The rejected voucher folded whatever had
-                    // accrued at the time it was signed, so restoring the anchor
-                    // without giving that accrual back would silently forget chunks
-                    // the node has already been shown preimages for.
-                    //
-                    // The fold comes back ON TOP of whatever has accrued SINCE —
-                    // reveals released after that signature are still released, and
-                    // a released preimage cannot be taken back. Overwriting with
-                    // `prev_accrued` alone would drop them, and the payer would
-                    // then believe it owes less than the node can already redeem.
-                    pipeline.committed = prev;
-                    pipeline.accrued = pipeline
-                        .accrued
-                        .plus(std::mem::take(&mut pipeline.prev_accrued));
-                    drop(pipeline);
-                    // Put back the chain this voucher displaced. A rejected
-                    // rollover already swapped the chain in — the voucher had to
-                    // carry the new root to be signed — so leaving it would have
-                    // the payer metering a chain the node refused, whose reveals
-                    // fold nothing on a lane still tracking the old root.
-                    let mut epoch = self.epoch();
-                    if let Displaced::Replaced(chain) =
-                        std::mem::replace(&mut *self.retired(), Displaced::Nothing)
-                    {
-                        *epoch = chain;
-                    }
-                    true
+            (
+                StreamProof::Voucher { amount },
+                Some(LastProof::Voucher {
+                    amount: last_amount,
+                }),
+            ) if amount == last_amount => {
+                pipeline.last_proof = None;
+                // The voucher went out and committed, so it is not also armed —
+                // a successful `issue` disarms. Clear it only if this rejection
+                // names the armed voucher instead, which is the ambiguous send
+                // the upstream has now explicitly refused.
+                let Some(prev) = pipeline.prev.take() else {
+                    return false;
+                };
+                // Rewind BOTH halves. The rejected voucher folded whatever had
+                // accrued at the time it was signed, so restoring the anchor
+                // without giving that accrual back would silently forget chunks
+                // the node has already been shown preimages for.
+                //
+                // The fold comes back ON TOP of whatever has accrued SINCE —
+                // reveals released after that signature are still released, and
+                // a released preimage cannot be taken back. Overwriting with
+                // `prev_accrued` alone would drop them, and the payer would
+                // then believe it owes less than the node can already redeem.
+                pipeline.committed = prev;
+                pipeline.accrued = pipeline
+                    .accrued
+                    .plus(std::mem::take(&mut pipeline.prev_accrued));
+                drop(pipeline);
+                // Put back the chain this voucher displaced. A rejected
+                // rollover already swapped the chain in — the voucher had to
+                // carry the new root to be signed — so leaving it would have
+                // the payer metering a chain the node refused, whose reveals
+                // fold nothing on a lane still tracking the old root.
+                let mut epoch = self.epoch();
+                if let Displaced::Replaced(chain) =
+                    std::mem::replace(&mut *self.retired(), Displaced::Nothing)
+                {
+                    *epoch = chain;
                 }
-                None => false,
-            },
-            None => false,
+                true
+            }
+            // The refused voucher never committed: its send was ambiguous, so the
+            // anchor never advanced and disarming IS the whole rewind.
+            (StreamProof::Voucher { amount }, _)
+                if pipeline.armed.is_some_and(|armed| armed.amount == amount) =>
+            {
+                pipeline.armed = None;
+                true
+            }
+            _ => false,
         }
     }
+}
+
+/// Draw the next chain, priced at the node's quoted rate.
+///
+/// Each chain gets its own 32-byte secret from the OS, so no two chains this
+/// payer opens — across providers, pools, its own sibling signers, or the
+/// successive chains of one lane — share a root. That is the whole defence
+/// against the cross-lane preimage spend, and it is payer-side by design: reuse
+/// costs the payer and pays the node, so no node-side rule would protect anyone
+/// who chose to run without it (ADR 003 §One chain per lane).
+fn open_epoch(rate_per_mb: u64) -> ChainEpoch {
+    ChainEpoch::open(U256::from(rate_per_mb))
 }
 
 #[cfg(test)]
@@ -890,7 +950,7 @@ mod tests {
     /// at the exact sum of the 100-byte deltas and never more.
     #[tokio::test]
     async fn concurrent_issue_is_monotonic_and_exact() -> anyhow::Result<()> {
-        let ledger = Arc::new(PoolLedger::unmetered(Cumulative::default()));
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let mut handles = Vec::new();
         for _ in 0..50u32 {
             let l = Arc::clone(&ledger);
@@ -925,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_does_not_commit() -> anyhow::Result<()> {
-        let ledger = PoolLedger::unmetered(Cumulative::default());
+        let ledger = PoolLedger::new(Cumulative::default());
         let result = ledger
             .issue(100, 10, EpochAction::Keep, |_signed, _chain| async {
                 anyhow::bail!("send lost")
@@ -944,7 +1004,7 @@ mod tests {
     /// of. Settle low and the deposit is stranded; settle high and it is honoured.
     #[tokio::test]
     async fn a_pull_dropped_inside_the_send_settles_at_the_voucher_it_sent() {
-        let ledger = PoolLedger::unmetered(Cumulative::default());
+        let ledger = PoolLedger::new(Cumulative::default());
         let dropped = tokio::time::timeout(
             Duration::from_millis(20),
             ledger.issue(100, 10, EpochAction::Keep, |_next, _chain| {
@@ -973,14 +1033,17 @@ mod tests {
     /// keeping it, so — with nothing else in flight — settlement falls back.
     #[tokio::test]
     async fn a_rejected_voucher_is_not_settled_optimistically() -> anyhow::Result<()> {
-        let ledger = PoolLedger::unmetered(Cumulative::default());
+        let ledger = PoolLedger::new(Cumulative::default());
         // Issue + successful send: committed advances to the voucher.
-        ledger
+        let sent = ledger
             .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
             .await?;
         assert_eq!(ledger.committed().bytes, U256::from(100u64));
         // The upstream rejects it (arrived as a mid-stream VoucherRejected).
-        assert!(ledger.resolve_reject(), "the committed voucher is rewound");
+        assert!(
+            ledger.resolve_reject(voucher_proof(sent)),
+            "the committed voucher is rewound"
+        );
         assert_eq!(
             ledger.settlement(),
             Cumulative::default(),
@@ -989,18 +1052,30 @@ mod tests {
         Ok(())
     }
 
-    /// A lane for the metered tests below: a real (if arbitrary) identity, so
-    /// `open_epoch` can derive seeds and the ledger actually holds a chain.
+    /// A ledger for the metered tests below. Identical to any other — a chain
+    /// draws its own secret, so metering needs no identity and no key material.
     fn metered_ledger(seed: Cumulative) -> PoolLedger {
-        PoolLedger::new(
-            LaneKey {
-                pool_id: B256::repeat_byte(0x11),
-                signer: alloy::primitives::Address::repeat_byte(0x22),
-                provider: alloy::primitives::Address::repeat_byte(0x33),
-            },
-            B256::repeat_byte(0x44),
-            seed,
-        )
+        PoolLedger::new(seed)
+    }
+
+    /// Name the voucher a successful `issue` just put on the wire, the way the
+    /// issuing stream does.
+    fn voucher_proof(sent: Cumulative) -> StreamProof {
+        StreamProof::Voucher {
+            amount: sent.amount,
+        }
+    }
+
+    /// Name the reveal a successful `meter` just put on the wire, the way the
+    /// releasing stream does.
+    fn reveal_proof(metered: Metered) -> anyhow::Result<StreamProof> {
+        match metered {
+            Metered::Released(released) => Ok(StreamProof::Reveal {
+                chain_root: released.chain_root,
+                index: released.index,
+            }),
+            Metered::Exhausted => anyhow::bail!("the epoch was exhausted; nothing was released"),
+        }
     }
 
     /// A rejected REVEAL must not touch the signed anchor.
@@ -1020,11 +1095,14 @@ mod tests {
             .await?;
         let anchor = ledger.committed();
         ledger.meter(|_r| async { Ok(()) }).await?;
-        ledger.meter(|_r| async { Ok(()) }).await?;
+        let second = ledger.meter(|_r| async { Ok(()) }).await?;
         let two_reveals = ledger.committed();
         assert!(two_reveals.amount > anchor.amount);
 
-        assert!(ledger.resolve_reject(), "a released reveal is rewindable");
+        assert!(
+            ledger.resolve_reject(reveal_proof(second)?),
+            "a released reveal is rewindable"
+        );
         assert_eq!(
             ledger.committed().amount,
             two_reveals.amount - U256::from(10u64),
@@ -1062,10 +1140,12 @@ mod tests {
         ledger
             .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
             .await?;
+        let mut last = None;
         for _ in 0..3u8 {
-            ledger.meter(|_r| async { Ok(()) }).await?;
+            last = Some(ledger.meter(|_r| async { Ok(()) }).await?);
         }
-        assert!(ledger.resolve_reject());
+        let third = last.ok_or_else(|| anyhow::anyhow!("no reveal was released"))?;
+        assert!(ledger.resolve_reject(reveal_proof(third)?));
 
         let next = std::sync::Mutex::new(None);
         ledger
@@ -1081,6 +1161,51 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Some(3),
             "the refused depth is released again, not skipped"
+        );
+        Ok(())
+    }
+
+    /// A rejection is rewound against the proof it was FOR, not against whatever
+    /// the lane did last.
+    ///
+    /// One `PoolLedger` is shared by every stream on a lane (`stream_fetch_shared`,
+    /// the node's `BuyerLedgers`), and a rejection is read on the stream that
+    /// earned it — so the two can interleave: stream A releases a reveal, stream B
+    /// rolls and its voucher is ACCEPTED, and only then does A read the rejection
+    /// for its reveal. Keyed to the lane's last proof, that rejection would find a
+    /// voucher in the slot and un-commit B's accepted anchor, leaving the payer
+    /// permanently below the node's watermark — every later voucher regresses, and
+    /// the accrual B folded is re-added on top of an anchor that never advanced.
+    #[tokio::test]
+    async fn a_stale_rejection_cannot_uncommit_a_siblings_accepted_voucher() -> anyhow::Result<()> {
+        let ledger = metered_ledger(Cumulative::default());
+        ledger
+            .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+            .await?;
+        // Stream A releases a reveal.
+        let a_reveal = ledger.meter(|_r| async { Ok(()) }).await?;
+        // Stream B rolls; the node accepts the rollover (continued delivery IS
+        // acceptance), so the lane's anchor is now B's.
+        ledger
+            .issue(0, 10, EpochAction::Roll, |_n, _c| async { Ok(()) })
+            .await?;
+        let accepted = ledger.committed();
+        let live = ledger.chain_root();
+
+        // Only now does A read the rejection for its reveal.
+        assert!(
+            !ledger.resolve_reject(reveal_proof(a_reveal)?),
+            "a proof the lane has moved past rewinds nothing"
+        );
+        assert_eq!(
+            ledger.committed(),
+            accepted,
+            "B's accepted anchor must survive A's stale rejection"
+        );
+        assert_eq!(
+            ledger.chain_root(),
+            live,
+            "and the chain B opened must stay live"
         );
         Ok(())
     }
@@ -1101,12 +1226,12 @@ mod tests {
         let live = ledger.chain_root();
         ledger.meter(|_r| async { Ok(()) }).await?;
 
-        ledger
+        let rolled = ledger
             .issue(0, 10, EpochAction::Roll, |_n, _c| async { Ok(()) })
             .await?;
         assert_ne!(ledger.chain_root(), live, "the roll drew a fresh chain");
 
-        assert!(ledger.resolve_reject());
+        assert!(ledger.resolve_reject(voucher_proof(rolled)));
         assert_eq!(
             ledger.chain_root(),
             live,
@@ -1129,10 +1254,10 @@ mod tests {
             .await?;
         let live = ledger.chain_root();
         // A residual voucher: `Keep`, with nothing accrued, so it displaces nothing.
-        ledger
+        let residual = ledger
             .issue(100, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
             .await?;
-        assert!(ledger.resolve_reject());
+        assert!(ledger.resolve_reject(voucher_proof(residual)));
         assert_eq!(
             ledger.chain_root(),
             live,
@@ -1240,7 +1365,7 @@ mod tests {
         // The caller's local ledger thinks it is at amount 10 (a wallet-less
         // delegate that never persisted the true watermark), but the node's true
         // watermark — echoed on the gated reject — is amount 50.
-        let ledger = PoolLedger::unmetered(Cumulative {
+        let ledger = PoolLedger::new(Cumulative {
             bytes: U256::from(1000u64),
             amount: U256::from(10u64),
         });
@@ -1292,7 +1417,7 @@ mod tests {
             bytes: U256::from(5000u64),
             amount: U256::from(50u64),
         };
-        let ledger = PoolLedger::unmetered(committed);
+        let ledger = PoolLedger::new(committed);
         ledger
             .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
             .await?;
@@ -1358,7 +1483,7 @@ mod tests {
             },
             || anyhow::anyhow!("connection reset by peer"),
         ] {
-            let ledger = PoolLedger::unmetered(Cumulative::default());
+            let ledger = PoolLedger::new(Cumulative::default());
             let result = ledger
                 .issue(
                     100,
@@ -1382,7 +1507,7 @@ mod tests {
     /// not re-sign the same cumulative — which the upstream may already hold.
     #[tokio::test]
     async fn a_later_issue_builds_on_an_armed_voucher() -> anyhow::Result<()> {
-        let ledger = PoolLedger::unmetered(Cumulative::default());
+        let ledger = PoolLedger::new(Cumulative::default());
         let stalled = ledger
             .issue(100, 10, EpochAction::Keep, |_next, _chain| async {
                 Err(anyhow::Error::new(PullStalled {
@@ -1407,7 +1532,7 @@ mod tests {
     /// watermark is the running cumulative, never ahead of what was delivered.
     #[tokio::test]
     async fn a_sequence_of_issues_stays_ordered_and_exact() -> anyhow::Result<()> {
-        let ledger = PoolLedger::unmetered(Cumulative::default());
+        let ledger = PoolLedger::new(Cumulative::default());
         for expected in 1..=100u64 {
             let sent = ledger
                 .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })

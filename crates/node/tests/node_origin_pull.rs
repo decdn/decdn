@@ -1133,7 +1133,6 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -1251,7 +1250,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -1403,7 +1401,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -2274,7 +2271,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -2474,7 +2470,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -2723,7 +2718,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -3906,7 +3900,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&a_metrics);
@@ -5909,7 +5902,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&a_metrics);
@@ -6210,7 +6202,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_n = Arc::new(Metrics::new());
     let handler_n = build_handler_full(
@@ -6253,7 +6244,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let handler_a = build_handler_full(
@@ -6768,7 +6758,6 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -6897,7 +6886,6 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -7030,7 +7018,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -7197,7 +7184,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -7631,7 +7617,6 @@ async fn build_node_b_with_leaves(
             U256::ZERO,
             None,
             decdn_incentive::LaneChain::NONE,
-            None,
         ))?;
         pool_status_map.insert(
             *leaf_channel_id,
@@ -7719,7 +7704,6 @@ async fn spawn_node_a(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -9683,7 +9667,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -9899,7 +9882,6 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -10030,7 +10012,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -10189,7 +10170,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -10668,7 +10648,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_h_side = Arc::new(Metrics::new());
     let limiter_h = permissive_limiter(&metrics_h_side);
@@ -10816,7 +10795,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -10990,7 +10968,6 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -11255,7 +11232,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_h_side = Arc::new(Metrics::new());
     let limiter_h = permissive_limiter(&metrics_h_side);
@@ -11827,7 +11803,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_h_side = Arc::new(Metrics::new());
     let limiter_h = permissive_limiter(&metrics_h_side);
@@ -12171,7 +12146,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
@@ -13611,7 +13585,6 @@ async fn drive_miss_single_candidate(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -13808,7 +13781,6 @@ async fn drive_miss_bait_and_switch(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -13986,7 +13958,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let a_limiter = permissive_limiter(&a_metrics);
@@ -14108,7 +14079,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let handler_b = build_handler_full_configured(
         b_id,
@@ -14252,7 +14222,6 @@ async fn attack_b_attempt(
         U256::ZERO,
         None,
         decdn_incentive::LaneChain::NONE,
-        None,
     ))?;
     let a_metrics = Arc::new(Metrics::new());
     let a_limiter = permissive_limiter(&a_metrics);
@@ -14363,7 +14332,6 @@ async fn attack_b_attempt(
                 U256::ZERO,
                 None,
                 decdn_incentive::LaneChain::NONE,
-                None,
             ))?;
             lanes.push((pool_id, client_signer));
         }
