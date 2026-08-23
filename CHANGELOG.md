@@ -1354,6 +1354,15 @@ since project inception and will roll into the first tagged release.
 
 ### Removed
 
+- **GitHub Agentic Workflows (gh-aw) and the Agentic Triage workflow.** The
+  `issue-triage` workflow (`.md` source and generated `.lock.yml`), `aw.json`,
+  `.github/aw/actions-lock.json`, the `agentic-workflows` Copilot agent file,
+  `.github/mcp.json`, and the gh-aw-only `.gitattributes` are deleted. The
+  `agentic-lock` CI job, its `agentic` paths filter, its `ci-success` entries,
+  the `copilot-setup-steps` workflow, and the `github/gh-aw-actions` Dependabot
+  ignore block go with them. Repository automation only — no runtime, wire,
+  config, or ABI impact.
+
 - **The VS Code devcontainer (`.devcontainer/`).** The container image and its
   firewall init script are gone, and most of CONTRIBUTING.md went with them. No
   CI job built the image, so nothing shipped depended on it; contributors now
