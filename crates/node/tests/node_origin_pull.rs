@@ -131,15 +131,6 @@ struct StubOpener {
     /// the row is gone. A test can therefore tell a channel that was *recorded* as
     /// retired from one that actually stopped being reused.
     retired: Arc<Mutex<Vec<(Address, B256)>>>,
-    /// The hash-chain epoch each provider's lane will next open at, mirroring
-    /// what the store-backed service persists (ADR 003 §One chain per lane).
-    ///
-    /// Modelled rather than stubbed to zero because a stale counter is not a
-    /// harmless simplification: re-opening an epoch the upstream has already
-    /// seen re-releases preimages it has already credited, and every one of
-    /// them pays nothing — so the reuse path would wedge exactly as it would in
-    /// production against a store that forgot this field.
-    epochs: Arc<Mutex<std::collections::HashMap<Address, u64>>>,
 }
 
 #[async_trait]
@@ -173,18 +164,7 @@ impl PoolOpener for StubOpener {
             .find(|(provider, ..)| *provider == provider_addr)
             .filter(|_| !was_retired)
             .map_or((U256::ZERO, U256::ZERO), |(_, b, a)| (*b, *a));
-        let prior_epoch = if was_retired {
-            0
-        } else {
-            self.epochs
-                .lock()
-                .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?
-                .get(&provider_addr)
-                .copied()
-                .unwrap_or(0)
-        };
         Ok(PoolContext {
-            prior_epoch,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: self.deposit,
@@ -203,7 +183,6 @@ impl PoolOpener for StubOpener {
         pool_id: B256,
         bytes_delivered: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<()> {
         // The orchestrator must persist progress against the pool it pulled
         // on — i.e. the id from the `PoolContext` it just opened/reused.
@@ -213,16 +192,6 @@ impl PoolOpener for StubOpener {
             "record_progress pool_id {pool_id} != opened pool {}",
             self.pool_id
         );
-        // The epoch counter settles high: it only ever moves forward, so a
-        // straggler reporting an older value must not walk it back.
-        {
-            let mut epochs = self
-                .epochs
-                .lock()
-                .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?;
-            let slot = epochs.entry(provider_addr).or_insert(0);
-            *slot = (*slot).max(next_epoch);
-        }
         self.recorded
             .lock()
             .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
@@ -315,7 +284,6 @@ impl PoolOpener for WedgedOpener {
             });
         }
         Ok(PoolContext {
-            prior_epoch: 0,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: self.deposit,
@@ -334,7 +302,6 @@ impl PoolOpener for WedgedOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
-        _next_epoch: u64,
     ) -> Result<()> {
         Ok(())
     }
@@ -348,7 +315,6 @@ impl PoolOpener for FailingRecordOpener {
         _budget: Duration,
     ) -> Result<PoolContext> {
         Ok(PoolContext {
-            prior_epoch: 0,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: self.deposit,
@@ -367,7 +333,6 @@ impl PoolOpener for FailingRecordOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
-        _next_epoch: u64,
     ) -> Result<()> {
         anyhow::bail!("simulated buyer-pool store write failure")
     }
@@ -579,7 +544,6 @@ async fn provisioned_origin_with_deadlines(
 ) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(buyer_signer),
@@ -622,7 +586,6 @@ async fn provisioned_origin_with_ceiling(
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(buyer_signer),
@@ -1505,7 +1468,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     .await?;
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -2387,7 +2349,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -2851,7 +2812,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
 
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3333,7 +3293,6 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let retired = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3491,7 +3450,6 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x5A),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -3596,7 +3554,6 @@ impl PoolOpener for FailingOpener {
         _pool_id: B256,
         _bytes_delivered: U256,
         _amount: U256,
-        _next_epoch: u64,
     ) -> Result<()> {
         Ok(())
     }
@@ -3755,7 +3712,6 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x5D),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -4006,7 +3962,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -4607,7 +4562,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xD2),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -4988,7 +4942,6 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xE8),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5084,7 +5037,6 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xE9),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5205,7 +5157,6 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xD1),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5326,7 +5277,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x7E),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5453,7 +5403,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x8B),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5569,7 +5518,6 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x4D),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5678,7 +5626,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0xA1),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -5803,7 +5750,6 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x9C),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6021,7 +5967,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     addr_map.insert(a_dht, a_eth.address());
 
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6154,7 +6099,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x51),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6358,7 +6302,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     addr_map.insert(n_dht, n_eth.address());
     addr_map.insert(a_dht, a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6511,7 +6454,6 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x6B),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -6654,7 +6596,6 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x4E),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -7142,7 +7083,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     let (_providers, addr_map) = one_provider(a_dht, a_eth.address());
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -8995,6 +8935,9 @@ struct ScriptedLane {
     anchor: U256,
     price: U256,
     index: u8,
+    /// The root the lane meters against. Tracked because it is what decides
+    /// whether an incoming voucher retires the frontier or merely re-states it.
+    root: B256,
 }
 
 impl ScriptedLane {
@@ -9009,13 +8952,27 @@ impl ScriptedLane {
     /// A voucher that merely re-asserts the live root advances nothing — that is
     /// the per-stream re-anchor every stream sends before its first reveal of an
     /// epoch, and a real node treats it as already-satisfied.
+    ///
+    /// Which is precisely why the frontier turns on the ROOT, not on the mere
+    /// arrival of a voucher. Only a voucher naming a DIFFERENT root retires the
+    /// live chain, and its amount has folded that chain's frontier in as the price
+    /// of doing so; one re-stating the live root leaves the frontier where it was.
+    /// Resetting the index on every voucher would let a re-anchor erase chunks the
+    /// payer has already revealed and paid for, collapsing the lane's claim back
+    /// to its anchor — see `LaneState::advance_presigned`, whose rule this mirrors.
     fn apply(&mut self, proof: &ClientMessage) -> bool {
         let before = self.claim();
         match proof {
             ClientMessage::Voucher(v) => {
-                self.anchor = U256::from(v.amount);
+                let root = B256::from(v.chain_root);
+                if root != self.root {
+                    self.root = root;
+                    self.index = 0;
+                }
+                // An already-satisfied voucher does not move the node's watermark,
+                // so take the high-water mark rather than whatever this one carries.
+                self.anchor = self.anchor.max(U256::from(v.amount));
                 self.price = U256::from(v.chunk_price);
-                self.index = 0;
             }
             ClientMessage::ChunkPreimage(p) => {
                 self.index = self.index.max(p.index);
@@ -9781,7 +9738,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10130,7 +10086,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let b_buyer2 = Arc::clone(&b_buyer);
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: b_buyer2,
@@ -10288,7 +10243,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10460,7 +10414,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     addr_map.insert(n2_dht, n2_eth.address());
 
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x3B),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10646,7 +10599,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     addr_map.insert(h_dht, h_eth.address());
 
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -10925,7 +10877,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     addr_map.insert(n_dht, n_eth.address());
     addr_map.insert(a_dht, a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11252,7 +11203,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     addr_map.insert(h_dht, h_eth.address());
 
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11535,7 +11485,6 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     addr_map.insert(n2_dht, n2_eth.address());
 
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x7C),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11725,7 +11674,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*n_id.as_bytes()), n_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x2F),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -11942,7 +11890,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     addr_map.insert(a_dht, a_eth.address());
     addr_map.insert(h_dht, h_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -12293,7 +12240,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let mut addr_map = HashMap::new();
     addr_map.insert(a_dht, a_eth.address());
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -12545,10 +12491,6 @@ struct FundingOpener {
     topups: Arc<Mutex<Vec<(Address, U256)>>>,
     /// Whether a top-up actually adds headroom. `false` models a refusal.
     funds: bool,
-    /// The hash-chain epoch each provider's lane will next open at, mirroring
-    /// what the store-backed service persists (ADR 003 §One chain per lane).
-    /// Modelled for the same reason as [`StubOpener::epochs`].
-    epochs: Arc<Mutex<std::collections::HashMap<Address, u64>>>,
 }
 
 #[async_trait]
@@ -12568,15 +12510,7 @@ impl PoolOpener for FundingOpener {
             .find(|(provider, ..)| *provider == provider_addr)
             .map_or((U256::ZERO, U256::ZERO), |(_, b, a)| (*b, *a));
         drop(recorded);
-        let prior_epoch = self
-            .epochs
-            .lock()
-            .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?
-            .get(&provider_addr)
-            .copied()
-            .unwrap_or(0);
         Ok(PoolContext {
-            prior_epoch,
             pool_id: self.pool_id,
             provider: provider_addr,
             deposit: read_deposit(&self.deposit)?,
@@ -12595,23 +12529,12 @@ impl PoolOpener for FundingOpener {
         pool_id: B256,
         bytes_delivered: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<()> {
         anyhow::ensure!(
             pool_id == self.pool_id,
             "record_progress pool_id {pool_id} != opened pool {}",
             self.pool_id
         );
-        // The epoch counter settles high: it only ever moves forward, so a
-        // straggler reporting an older value must not walk it back.
-        {
-            let mut epochs = self
-                .epochs
-                .lock()
-                .map_err(|_| anyhow::anyhow!("epochs lock poisoned"))?;
-            let slot = epochs.entry(provider_addr).or_insert(0);
-            *slot = (*slot).max(next_epoch);
-        }
         self.recorded
             .lock()
             .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
@@ -12771,13 +12694,29 @@ async fn settle_voucher(
     // rollover), and neither advances the claim.
     for _ in 0..4u8 {
         let proof = read_proof(recv).await?;
-        let (advanced, claim) = {
-            let mut lane = lane
+        // Evaluate against a COPY first. A rejected proof must leave the lane
+        // exactly as it found it — the real node stages a candidate and discards it
+        // on refusal (`stage_voucher_rejects_without_advancing_candidate`), and a
+        // fixture that kept the amount of a voucher it just refused would credit
+        // the payer with money the upstream declined to be paid.
+        let (advanced, claim, candidate) = {
+            let lane = lane
                 .lock()
                 .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))?;
-            let advanced = lane.apply(&proof);
-            (advanced, lane.claim())
+            let mut candidate = *lane;
+            let advanced = candidate.apply(&proof);
+            (advanced, candidate.claim(), candidate)
         };
+        eprintln!(
+            "DIAG proof={} adv={advanced} claim={claim} dep={}",
+            match &proof {
+                ClientMessage::Voucher(v) =>
+                    format!("V(amt={},root={:02x})", v.amount, v.chain_root[0]),
+                ClientMessage::ChunkPreimage(p) => format!("P(idx={})", p.index),
+                _ => "?".to_string(),
+            },
+            read_deposit(deposit)?
+        );
         // The deposit has to cover the CHAIN-EXTENDED claim, not just the signed
         // anchor — a reveal spends real money without a signature.
         if claim > read_deposit(deposit)? {
@@ -12792,6 +12731,9 @@ async fn settle_voucher(
             .map_err(|e| anyhow::anyhow!("write rejection: {e}"))?;
             return Ok(false);
         }
+        *lane
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scripted lane lock poisoned"))? = candidate;
         if advanced {
             return Ok(true);
         }
@@ -12980,7 +12922,6 @@ async fn top_up_fixture_multi_rep(
     let metrics = Arc::new(Metrics::new());
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let opener = Arc::new(FundingOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: B256::repeat_byte(0x15),
         deposit,
         ceiling,
@@ -13733,7 +13674,6 @@ async fn drive_miss_single_candidate(
         as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -13926,7 +13866,6 @@ async fn drive_miss_bait_and_switch(
         as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
@@ -14106,7 +14045,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
     )) as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: ab_pool_id,
         deposit: U256::from(LEDGER_DEPOSIT),
         signer: Arc::clone(&b_buyer),
@@ -14200,7 +14138,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         &binding_dom(),
     )?;
     let ctx_client_to_b = PoolContext {
-        prior_epoch: 0,
         pool_id: b_pool_id,
         provider: b_eth.address(),
         deposit: U256::from(LEDGER_DEPOSIT),
@@ -14368,7 +14305,6 @@ async fn attack_b_attempt(
         n_max,
     )) as Arc<dyn decdn_node::serve_economics::ServeEconomicsPolicy>;
     let buyer = Arc::new(StubOpener {
-        epochs: Arc::new(std::collections::HashMap::new().into()),
         pool_id: ab_pool_id,
         deposit: U256::from(LEDGER_DEPOSIT),
         signer: Arc::clone(&b_buyer),
@@ -14459,7 +14395,6 @@ async fn attack_b_attempt(
                 &binding_dom(),
             )?;
             let ctx = PoolContext {
-                prior_epoch: 0,
                 pool_id,
                 provider: b_eth.address(),
                 deposit: U256::from(LEDGER_DEPOSIT),

@@ -145,6 +145,14 @@ The reason is direct. One root in two vouchers makes every preimage released to 
 
 The chain's scope is the **lane**, not the stream. Concurrent streams on one lane share one root and one index — see [Concurrent Streams](#concurrent-streams).
 
+**The seed comes from the anchor, so the payer keeps no chain state.** A signer derives the seed as `keccak256(TAG ‖ master ‖ pool_id ‖ signer ‖ provider ‖ anchor ‖ chunk_price)`, where `master` comes from its own signing key and `anchor` is the cumulative `amount` in the chain's own opening voucher. The lane's cumulative is monotone for its whole life, and rolling a chain is defined as folding its frontier into a new signed amount, so the anchor already counts chains — in a number the protocol maintains and both sides can read.
+
+This makes the reuse the two rules forbid unrepresentable rather than merely forbidden. The fold is exactly what moves the amount, from `A` to `A + k × chunk_price` for `k ≥ 1`, so every chain that follows a fold derives a different seed. The `(anchor, root)` pair is rigid. Re-deriving at an *unchanged* anchor is not a collision but chain resumption: the anchor is unchanged precisely because nothing was folded, so the root is the one the node still meters and the payer continues at `verified_index + 1`.
+
+`chunk_price` is in the derivation for a related reason. A reveal is priced by the voucher that redeems it. A chain opened at `A` with price `p₁` that releases `k` chunks, followed by a voucher at the same anchor with a higher `p₂`, would let those `k` old preimages redeem at the higher price. Binding the price makes a reprice a different chain.
+
+The payer therefore persists nothing for the chain: no counter, no seed, no root. Its lane record already holds the cumulative, and the signing key reproduces the rest. The cost is that a **retired** chain whose opening anchor is forgotten can never be re-derived. Nothing needs one — retiring a chain is what folds its frontier into a signed amount.
+
 #### Chain length and rollover
 
 `chain_length` is not a voucher field. The chain index is a `u8`, so the index space is `0..=255` — 256 slots, exactly one byte. Index 0 names the root and resolves to the voucher's own `amount`: the base voucher is payable on its own, and that base may already fold in a whole retired chain through the rollover fold. Indices `1..=255` are the chain's **incremental** range — each adds one `chunk_price` over that anchor. `MAX_CHAIN_LENGTH = 255` is the highest index, so at 1 MiB per chunk a chain adds up to 255 MiB over its anchor.

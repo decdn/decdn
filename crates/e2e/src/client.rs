@@ -120,7 +120,6 @@ impl PoolSession {
         // seed the previous fetch already used — and the node, still holding
         // that root at a non-zero frontier, treats every reveal under it as
         // already covered. The delivery then stalls with nothing crediting it.
-        self.ctx.prior_epoch = self.ctx.prior_epoch.max(progress.next_epoch());
         Ok(())
     }
 }

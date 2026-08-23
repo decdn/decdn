@@ -109,7 +109,6 @@ fn hop_domains() -> HandlerDomains {
 /// `provider` on `pool_id`.
 fn fresh_context(pool_id: B256, provider: Address, signer: Arc<PrivateKeySigner>) -> PoolContext {
     PoolContext {
-        prior_epoch: 0,
         pool_id,
         provider,
         deposit: U256::from(DEPOSIT_MICRO_USDC),

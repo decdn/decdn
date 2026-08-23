@@ -134,13 +134,6 @@ pub struct PoolContext {
     pub prior_bytes_delivered: U256,
     /// Cumulative amount paid on this lane before this stream.
     pub prior_amount: U256,
-    /// The hash-chain epoch this lane's next chain opens at (ADR 003
-    /// §Hash-chain metering). Persisted alongside the two cumulatives; the seed
-    /// itself never is, because it is derived from `client_signer` on demand.
-    /// A restart that resumed at a stale counter would re-open a root the node
-    /// has already seen, so this is the one piece of chain state that has to
-    /// survive.
-    pub prior_epoch: u64,
     /// Optional ADR 005 client identity binding (address + `BindNodeId`
     /// signature over the requester's own iroh `NodeId`, see
     /// [`sign_client_binding`]). Attached to every `cdn/client/v1` request's
@@ -186,7 +179,6 @@ impl PoolContext {
             voucher_domain,
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
-            prior_epoch: 0,
             client_binding: None,
             capability: None,
         }
@@ -205,15 +197,6 @@ impl PoolContext {
         self.provider = provider;
         self.prior_bytes_delivered = prior_bytes_delivered;
         self.prior_amount = prior_amount;
-        self
-    }
-
-    /// Resume this lane's hash chain at `epoch` — the counter the lane's next
-    /// chain opens at, read back from the buyer's persisted lane row. Defaults
-    /// to `0`, which is correct for a lane that has never metered.
-    #[must_use]
-    pub const fn with_chain_epoch(mut self, epoch: u64) -> Self {
-        self.prior_epoch = epoch;
         self
     }
 
@@ -243,8 +226,10 @@ impl PoolContext {
         })
     }
 
-    /// The ledger seed for this lane: its persisted cumulative plus the epoch
-    /// its next chain opens at.
+    /// The ledger seed for this lane: its persisted cumulative, and nothing
+    /// else. A chain hangs off the anchor its opening voucher carries, so the
+    /// cumulative already says which chain the lane resumes on — there is no
+    /// separate counter to read back, and none to have persisted.
     ///
     /// # Errors
     ///
@@ -253,7 +238,6 @@ impl PoolContext {
         Ok(PoolLedger::new(
             self.lane(),
             self.chain_master()?,
-            self.prior_epoch,
             Cumulative {
                 bytes: self.prior_bytes_delivered,
                 amount: self.prior_amount,
@@ -379,11 +363,6 @@ pub struct VoucherProgress {
     amount: U256,
     /// Whether the watermark moved past the lane's seed on this stream.
     advanced: bool,
-    /// The hash-chain epoch this lane's next chain opens at (ADR 003 §One chain
-    /// per lane). Persisted alongside the two cumulatives so a restart never
-    /// re-opens a root the node has already seen; the seed itself is derived on
-    /// demand and never written down.
-    next_epoch: u64,
 }
 
 impl VoucherProgress {
@@ -402,39 +381,17 @@ impl VoucherProgress {
             bytes_delivered: cum.bytes,
             amount: cum.amount,
             advanced: cum.amount > prior_amount,
-            next_epoch: 0,
         }
     }
 
-    /// The same watermark, read from a live ledger so it carries that lane's
-    /// chain epoch as well as its cumulatives. Prefer this wherever a ledger is
-    /// in hand: [`Self::from_cumulative`] cannot see the epoch and reports `0`,
-    /// which the store's max-merge then ignores.
+    /// The same watermark, read from a live ledger.
+    ///
+    /// Prefer this wherever a ledger is in hand: it reads
+    /// [`PoolLedger::settlement`] rather than a copied-back cumulative, so a
+    /// voucher left armed by an ambiguous send is still reported as owed.
     #[must_use]
     pub fn from_ledger(ledger: &PoolLedger, prior_amount: U256) -> Self {
-        Self {
-            next_epoch: ledger.next_epoch_id(),
-            ..Self::from_cumulative(ledger.settlement(), prior_amount)
-        }
-    }
-
-    /// The hash-chain epoch this lane's next chain opens at.
-    #[must_use]
-    pub const fn next_epoch(&self) -> u64 {
-        self.next_epoch
-    }
-
-    /// Stamp the lane's chain epoch onto this watermark.
-    ///
-    /// The epoch settles HIGH on every outcome, unlike the two cumulatives: a
-    /// conservative choice there costs at most a re-signed voucher, but a
-    /// conservative choice here re-opens an epoch the node has already seen and
-    /// re-releases preimages it has already credited — every one of which would
-    /// pay nothing.
-    #[must_use]
-    pub const fn with_epoch(mut self, next_epoch: u64) -> Self {
-        self.next_epoch = next_epoch;
-        self
+        Self::from_cumulative(ledger.settlement(), prior_amount)
     }
 
     /// The cumulative `(bytes_delivered, amount)` to persist via the lane record,
@@ -2765,32 +2722,36 @@ async fn send_voucher(
          before signing"
     );
     ledger
-        .issue(
-            delta_bytes,
-            rate_per_mb,
-            epoch,
-            |next: Cumulative, chain: ChainCommit| async move {
-                let signed = Voucher {
-                    pool_id: ctx.pool_id,
-                    signer: ctx.client_signer.address(),
-                    provider: ctx.provider,
-                    amount: next.amount,
-                    bytes_delivered: next.bytes,
-                    chain_root: chain.chain_root,
-                    chunk_price: chain.chunk_price,
-                }
-                .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
-                .map_err(|e| {
-                    anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault)
-                })?;
-                let wire_voucher = signed_to_wire_voucher(&signed).map_err(|e| {
-                    anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault)
-                })?;
-                write_message(send, &ClientMessage::Voucher(wire_voucher)).await
-            },
-        )
+        .issue(delta_bytes, rate_per_mb, epoch, |next, chain| {
+            sign_and_write_voucher(send, ctx, next, chain)
+        })
         .await
         .map(|_sent| ())
+}
+
+/// Sign one voucher over `next`/`chain` with the pool context's key and write it
+/// to `send` — the body both [`send_voucher`] and [`PoolLedger::reanchor`] hand to
+/// the ledger, so the two differ only in which cumulative the ledger hands back.
+async fn sign_and_write_voucher(
+    send: &mut SendStream,
+    ctx: &PoolContext,
+    next: Cumulative,
+    chain: ChainCommit,
+) -> anyhow::Result<()> {
+    let signed = Voucher {
+        pool_id: ctx.pool_id,
+        signer: ctx.client_signer.address(),
+        provider: ctx.provider,
+        amount: next.amount,
+        bytes_delivered: next.bytes,
+        chain_root: chain.chain_root,
+        chunk_price: chain.chunk_price,
+    }
+    .sign(ctx.client_signer.as_ref(), &ctx.voucher_domain)
+    .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault))?;
+    let wire_voucher = signed_to_wire_voucher(&signed)
+        .map_err(|e| anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault))?;
+    write_message(send, &ClientMessage::Voucher(wire_voucher)).await
 }
 
 /// One stream's view of the lane's hash chain (ADR 003 §Concurrent Streams).
@@ -2811,9 +2772,9 @@ async fn send_voucher(
 /// invalidate a slower sibling still finishing the old one.
 #[derive(Debug, Default)]
 struct StreamMeter {
-    /// The epoch id this stream has already carried the root voucher for.
-    /// `None` until it has anchored to anything.
-    anchored_epoch: Option<u64>,
+    /// The chain this stream has already carried the root voucher for, named by
+    /// its root. `None` until it has anchored to anything.
+    anchored_root: Option<B256>,
 }
 
 impl StreamMeter {
@@ -2832,27 +2793,33 @@ impl StreamMeter {
         rate_per_mb: u64,
         open: EpochAction,
     ) -> anyhow::Result<()> {
-        if ledger.epoch_id().is_none() && open == EpochAction::Open {
+        if ledger.chain_root().is_none() && open == EpochAction::Open {
             send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Open).await?;
             // Re-read rather than reuse the pre-send `None`: the send is what
-            // opened the epoch, so only the ledger knows which one.
-            self.anchored_epoch = ledger.epoch_id();
+            // opened the chain, so only the ledger knows which one.
+            self.anchored_root = ledger.chain_root();
             return Ok(());
         }
-        if ledger.epoch_id().is_some() && self.anchored_epoch != ledger.epoch_id() {
-            // A sibling rolled the lane, or this is our first reveal on an epoch a
+        if ledger.chain_root().is_some() && self.anchored_root != ledger.chain_root() {
+            // A sibling rolled the lane, or this is our first reveal on a chain a
             // sibling opened. Either way this stream must name the chain before it
             // can reveal against it (ADR 003 §Concurrent Streams, Rule 1).
             //
-            // The send can itself roll the lane: `issue` escalates any voucher with
-            // outstanding accrual to a rollover, because a voucher that folds must
-            // also roll. So read the epoch AFTER the send — a value read before it
-            // can already be the retired one, and storing that would leave
-            // `anchored_epoch` permanently behind, re-anchoring on every single
-            // chunk and collapsing the chain's whole point into a signature plus a
-            // fresh keccak ladder per chunk.
-            send_voucher(send, ctx, ledger, rate_per_mb, 0, EpochAction::Keep).await?;
-            self.anchored_epoch = ledger.epoch_id();
+            // This must NOT go through `send_voucher`: every voucher the ledger
+            // issues folds the chain's accrual, and a voucher that folds must also
+            // roll — so re-anchoring that way would retire the chain it meant to
+            // join, strand every sibling's in-flight reveals under the retired
+            // root, and buy a signature plus a fresh keccak ladder each time.
+            // `reanchor` re-states the signed anchor under the live root instead,
+            // folding nothing.
+            //
+            // Take the root `reanchor` reports, not one read before the send: the
+            // lane's live chain is only knowable while the issuance lock is held,
+            // and storing a stale root would leave this stream re-anchoring on
+            // every chunk.
+            self.anchored_root = ledger
+                .reanchor(|anchor, chain| sign_and_write_voucher(send, ctx, anchor, chain))
+                .await?;
         }
         Ok(())
     }
@@ -2901,7 +2868,7 @@ impl StreamMeter {
                     // actually reached, never a flat 255 (ADR 003 §Rollover).
                     send_voucher(&mut *send, ctx, ledger, rate_per_mb, 0, EpochAction::Roll)
                         .await?;
-                    self.anchored_epoch = ledger.epoch_id();
+                    self.anchored_root = ledger.chain_root();
                 }
                 Metered::Exhausted => {
                     anyhow::bail!("hash chain still exhausted after a rollover")
@@ -2934,7 +2901,7 @@ impl StreamMeter {
             EpochAction::Keep,
         )
         .await?;
-        self.anchored_epoch = ledger.epoch_id();
+        self.anchored_root = ledger.chain_root();
         Ok(())
     }
 
@@ -3232,7 +3199,6 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let domain = decdn_incentive::bind_node_id_domain(1, Address::ZERO);
         let ctx = PoolContext {
-            prior_epoch: 0,
             pool_id: B256::ZERO,
             provider: Address::ZERO,
             deposit: U256::ZERO,
@@ -3304,7 +3270,6 @@ mod tests {
         domain: &alloy::dyn_abi::Eip712Domain,
     ) -> PoolContext {
         PoolContext {
-            prior_epoch: 0,
             pool_id,
             provider,
             deposit: U256::ZERO,

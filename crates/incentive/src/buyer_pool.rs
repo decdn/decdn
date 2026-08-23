@@ -52,15 +52,6 @@ pub struct BuyerLaneProgress {
     pub last_amount: U256,
     /// Cumulative bytes paid for as of the most-recently-signed voucher.
     pub last_bytes: U256,
-    /// The hash-chain epoch this lane's **next** chain opens at (ADR 003
-    /// §One chain per lane). `0` on a lane that has never metered.
-    ///
-    /// This is the only piece of chain state the payer persists. The seed is
-    /// derived from the signing key on demand, so nothing secret is written to
-    /// disk — but the counter must survive, because re-opening an epoch the
-    /// node has already seen would re-release preimages it has already
-    /// credited, and every one of them would pay nothing.
-    pub next_epoch: u64,
 }
 
 /// Buyer-held state for one pool, fanned out across every `(signer,
@@ -170,7 +161,6 @@ impl BuyerPoolState {
         lane: LaneKey,
         bytes: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<(), BuyerProgressError> {
         if let Some(existing) = self.lanes.get(&lane) {
             if bytes < existing.last_bytes {
@@ -188,17 +178,11 @@ impl BuyerPoolState {
                 });
             }
         }
-        // The epoch counter is a MAXIMUM, not an overwrite. Concurrent pulls on
-        // one lane share a ledger but report progress independently, so a
-        // straggler reporting an older counter must not walk it back — that
-        // would re-open a chain the node has already seen.
-        let recorded_epoch = self.lanes.get(&lane).map_or(0, |e| e.next_epoch);
         self.lanes.insert(
             lane,
             BuyerLaneProgress {
                 last_amount: amount,
                 last_bytes: bytes,
-                next_epoch: next_epoch.max(recorded_epoch),
             },
         );
         Ok(())
@@ -393,7 +377,6 @@ pub trait BuyerPoolStore: Send + Sync {
         lane: LaneKey,
         bytes: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<AdvanceOutcome, StoreError>;
 
     /// Atomically add `additional` to the committed deposit for `owner`'s
@@ -529,7 +512,6 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
         lane: LaneKey,
         bytes: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<AdvanceOutcome, StoreError> {
         let mut guard = self
             .inner
@@ -544,7 +526,7 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
         let Some(state) = guard.pools.get_mut(&pool_id) else {
             return Ok(AdvanceOutcome::UnknownPool);
         };
-        match state.advance_lane(lane, bytes, amount, next_epoch) {
+        match state.advance_lane(lane, bytes, amount) {
             Ok(()) => Ok(AdvanceOutcome::Advanced),
             Err(err) => Ok(AdvanceOutcome::Regressed(err)),
         }
@@ -601,7 +583,7 @@ mod tests {
             provider: address!("00000000000000000000000000000000000000b2"),
         };
         // Ignore: fresh state, cannot regress.
-        let _ = state.advance_lane(lane, U256::from(4_096u64), U256::from(1_234u64), 0);
+        let _ = state.advance_lane(lane, U256::from(4_096u64), U256::from(1_234u64));
         state
     }
 
@@ -672,19 +654,18 @@ mod tests {
             provider: address!("00000000000000000000000000000000000000b1"),
         };
         // First advance from an untouched lane.
-        s.advance_lane(lane, U256::from(1_000u64), U256::from(10u64), 0)?;
+        s.advance_lane(lane, U256::from(1_000u64), U256::from(10u64))?;
         anyhow::ensure!(
             s.lane_progress(lane)
                 == Some(BuyerLaneProgress {
-                    next_epoch: 0,
                     last_amount: U256::from(10u64),
                     last_bytes: U256::from(1_000u64),
                 })
         );
         // Equal totals are allowed (idempotent re-record).
-        s.advance_lane(lane, U256::from(1_000u64), U256::from(10u64), 0)?;
+        s.advance_lane(lane, U256::from(1_000u64), U256::from(10u64))?;
         // Strictly higher advances.
-        s.advance_lane(lane, U256::from(2_000u64), U256::from(20u64), 0)?;
+        s.advance_lane(lane, U256::from(2_000u64), U256::from(20u64))?;
         anyhow::ensure!(
             s.lane_progress(lane)
                 .ok_or_else(|| anyhow::anyhow!("missing lane"))?
@@ -700,7 +681,7 @@ mod tests {
         let lane = only_lane(&base);
         // `sample` already left this lane at (bytes 4_096, amount 1_234);
         // advance past that before probing the regression cases below.
-        base.advance_lane(lane, U256::from(5_000u64), U256::from(5_000u64), 0)?;
+        base.advance_lane(lane, U256::from(5_000u64), U256::from(5_000u64))?;
 
         // (reported (bytes, amount), expected regressed field).
         let cases = [
@@ -710,7 +691,7 @@ mod tests {
         for ((bytes, amount), expected_field) in cases {
             let mut s = base.clone();
             let err = s
-                .advance_lane(lane, bytes, amount, 0)
+                .advance_lane(lane, bytes, amount)
                 .err()
                 .ok_or_else(|| anyhow::anyhow!("expected regression error for {expected_field}"))?;
             anyhow::ensure!(
@@ -771,7 +752,6 @@ mod tests {
             lane,
             U256::from(3_000u64),
             U256::from(30u64),
-            0,
         )?;
         anyhow::ensure!(outcome == AdvanceOutcome::Advanced, "got {outcome:?}");
         let stored = store
@@ -792,7 +772,7 @@ mod tests {
         let lane = only_lane(&s);
         // `sample` already left this lane at (bytes 4_096, amount 1_234);
         // advance past that before probing the regression cases below.
-        s.advance_lane(lane, U256::from(9_000u64), U256::from(9_000u64), 0)?;
+        s.advance_lane(lane, U256::from(9_000u64), U256::from(9_000u64))?;
         store.record(&s)?;
 
         // Each cumulative field's regression must surface through the
@@ -803,7 +783,7 @@ mod tests {
             ((U256::from(9_000u64), U256::from(8_999u64)), "amount"),
         ];
         for ((bytes, amount), expected_field) in cases {
-            let outcome = store.advance_progress(s.owner, s.pool_id, lane, bytes, amount, 0)?;
+            let outcome = store.advance_progress(s.owner, s.pool_id, lane, bytes, amount)?;
             anyhow::ensure!(
                 matches!(outcome, AdvanceOutcome::Regressed(BuyerProgressError::Regressed { field, .. }) if field == expected_field),
                 "expected {expected_field} regression, got {outcome:?}"
@@ -840,7 +820,6 @@ mod tests {
                 lane,
                 U256::from(99u64),
                 U256::from(99u64),
-                0
             )? == AdvanceOutcome::PoolMismatch
         );
         anyhow::ensure!(
@@ -854,14 +833,8 @@ mod tests {
 
         // Unknown owner → UnknownPool, no write.
         anyhow::ensure!(
-            store.advance_progress(
-                unknown,
-                s.pool_id,
-                lane,
-                U256::from(1u64),
-                U256::from(1u64),
-                0
-            )? == AdvanceOutcome::UnknownPool
+            store.advance_progress(unknown, s.pool_id, lane, U256::from(1u64), U256::from(1u64),)?
+                == AdvanceOutcome::UnknownPool
         );
         anyhow::ensure!(
             store.add_deposit(unknown, s.pool_id, U256::from(1u64))? == DepositOutcome::UnknownPool

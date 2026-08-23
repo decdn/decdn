@@ -134,10 +134,9 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
         lane: LaneKey,
         bytes: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
-            .advance_progress(owner, pool_id, lane, bytes, amount, next_epoch)
+            .advance_progress(owner, pool_id, lane, bytes, amount)
     }
 
     fn add_deposit(
@@ -179,7 +178,7 @@ mod tests {
             Address::repeat_byte(0xaa),
             U256::from(1_000_000u64),
         );
-        s.advance_lane(lane, U256::from(bytes), U256::from(amount), 0)?;
+        s.advance_lane(lane, U256::from(bytes), U256::from(amount))?;
         Ok((s, lane))
     }
 
@@ -282,7 +281,6 @@ mod tests {
                 lane,
                 U256::from(2_000u64),
                 U256::from(20u64),
-                0,
             )? == AdvanceOutcome::Advanced,
             "advance_progress"
         );

@@ -302,11 +302,9 @@ fn pin_ctx(
         signer: signer.address(),
         provider: provider_addr,
     };
-    let (prior_bytes, prior_amount, prior_epoch) = state
+    let (prior_bytes, prior_amount) = state
         .lane_progress(lane)
-        .map_or((U256::ZERO, U256::ZERO, 0), |p| {
-            (p.last_bytes, p.last_amount, p.next_epoch)
-        });
+        .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
     // Re-issue the self-owned capability from the owner key: it is node-agnostic
     // (valid at every provider this pool pays) and cheap to regenerate, so both
     // the fresh-open and the reused-pool paths present one without a stored copy.
@@ -324,7 +322,6 @@ fn pin_ctx(
     Ok(
         PoolContext::for_pool(state, Arc::clone(signer), voucher_domain.clone())
             .with_provider(provider_addr, prior_bytes, prior_amount)
-            .with_chain_epoch(prior_epoch)
             .with_capability(capability),
     )
 }
@@ -669,7 +666,6 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         pool_id: PoolId,
         bytes_delivered: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<()> {
         let lane = LaneKey {
             pool_id,
@@ -678,14 +674,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         };
         match self
             .store
-            .advance_progress(
-                self.owner,
-                pool_id,
-                lane,
-                bytes_delivered,
-                amount,
-                next_epoch,
-            )
+            .advance_progress(self.owner, pool_id, lane, bytes_delivered, amount)
             .context("advance buyer pool lane progress")?
         {
             AdvanceOutcome::Advanced => Ok(()),
@@ -828,7 +817,6 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
         pool_id: PoolId,
         bytes_delivered: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<()>;
 
     /// Raise the node's pool toward `target_deposit`, returning its NEW total
@@ -860,16 +848,8 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
         pool_id: PoolId,
         bytes_delivered: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<()> {
-        BuyerPoolService::record_progress(
-            self,
-            provider_addr,
-            pool_id,
-            bytes_delivered,
-            amount,
-            next_epoch,
-        )
+        BuyerPoolService::record_progress(self, provider_addr, pool_id, bytes_delivered, amount)
     }
 
     async fn top_up_pool(&self, target_deposit: U256) -> Result<U256> {
@@ -1081,7 +1061,7 @@ mod tests {
             signer: signer_addr,
             provider,
         };
-        state.advance_lane(lane, bytes, amount, 0).unwrap();
+        state.advance_lane(lane, bytes, amount).unwrap();
         state
     }
 
@@ -1127,7 +1107,7 @@ mod tests {
             provider: Address::repeat_byte(4),
         };
         state
-            .advance_lane(lane2, U256::from(5u64), U256::from(60u64), 0)
+            .advance_lane(lane2, U256::from(5u64), U256::from(60u64))
             .unwrap();
         assert_eq!(committed_amount(&state), U256::from(100u64));
     }

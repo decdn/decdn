@@ -152,7 +152,7 @@ async fn run() -> anyhow::Result<()> {
     // advancing the persisted lane watermark.
     let prior_amount = deposit - U256::from(1u64);
     let outcome = store
-        .advance_progress(buyer_addr, pool_id, lane, U256::from(1u64), prior_amount, 0)
+        .advance_progress(buyer_addr, pool_id, lane, U256::from(1u64), prior_amount)
         .context("advance watermark")?;
     anyhow::ensure!(
         matches!(

@@ -272,7 +272,6 @@ mod tests {
             _pool_id: PoolId,
             _bytes_delivered: U256,
             _amount: U256,
-            _next_epoch: u64,
         ) -> Result<()> {
             unreachable!("not exercised by NodeFunder tests")
         }
@@ -290,7 +289,6 @@ mod tests {
     fn test_ctx(deposit: U256) -> Arc<Mutex<PoolContext>> {
         let signer = PrivateKeySigner::random();
         Arc::new(Mutex::new(PoolContext {
-            prior_epoch: 0,
             pool_id: B256::ZERO,
             provider: Address::repeat_byte(9),
             deposit,

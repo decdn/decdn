@@ -721,7 +721,6 @@ mod tests {
     fn healthy_ctx() -> PoolContext {
         let signer = PrivateKeySigner::random();
         PoolContext {
-            prior_epoch: 0,
             pool_id: B256::ZERO,
             // Pinned to a non-zero test provider: `send_voucher` fast-fails on
             // `Address::ZERO` (an unpinned lane), so every driver test that

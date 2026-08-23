@@ -776,7 +776,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher_domain: voucher_dom.clone(),
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
-        prior_epoch: 0,
         client_binding: Some(binding),
         capability: Some(capability),
     };

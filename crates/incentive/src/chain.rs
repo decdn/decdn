@@ -162,26 +162,67 @@ pub fn master_secret<S: SignerSync>(signer: &S) -> Result<B256, alloy::signers::
     Ok(keccak256(sig.as_bytes()))
 }
 
-/// Derive the seed for one `(pool_id, signer, provider)` lane at one chain
-/// epoch: `keccak256(SEED_TAG ‖ master ‖ pool_id ‖ signer ‖ provider ‖ epoch)`.
+/// Derive the seed for one `(pool_id, signer, provider)` lane at one chain:
+/// `keccak256(SEED_TAG ‖ master ‖ pool_id ‖ signer ‖ provider ‖ anchor ‖ price)`.
 ///
 /// Domain-separated on the whole lane triple, so two lanes under one master are
-/// independent and neither is derivable from the other without the master. The
-/// `epoch` counter rolls the chain: a payer that exhausts index
-/// [`MAX_CHAIN_LENGTH`] increments it and commits a fresh root, so a retired
-/// chain's released preimages extend nothing.
+/// independent and neither is derivable from the other without the master.
 ///
-/// Only `epoch` needs persisting — the seed itself is reproduced on demand, so
-/// no chain secret is ever written to disk.
+/// # Why the anchor is the epoch
+///
+/// A chain is identified by the signed voucher that opens it, through that
+/// voucher's cumulative `anchor` amount. The lane's cumulative is monotone for
+/// its whole life, and rolling a chain is DEFINED as folding its frontier into a
+/// new signed amount — so the anchor already counts epochs, and counts them in a
+/// number the protocol maintains for free and both sides can always read.
+///
+/// That makes the double-pay this derivation exists to prevent unrepresentable
+/// rather than merely guarded against. Released preimages are bearer proofs and
+/// redemption prices them as `amount + index × chunk_price`, so recommitting a
+/// root beside an amount that already folded its frontier would pay for those
+/// chunks twice. But the fold is exactly what moves the amount — `A → A + k·p`
+/// for `k ≥ 1` — so every post-fold chain derives a different seed, always. The
+/// `(anchor, root)` pairing is rigid; there is no state to keep correct.
+///
+/// Re-deriving at an UNCHANGED anchor is not a collision but chain resumption:
+/// the anchor is unchanged precisely because nothing was folded, so the same
+/// root is the one the node is still metering, and the payer continues from
+/// `verified_index + 1`. A chain reopened at its own anchor with nothing
+/// released is a no-op — no preimage below the root exists to replay.
+///
+/// # Why the price is in the derivation
+///
+/// A reveal is priced by the voucher that redeems it, not by the voucher that
+/// committed the chain. If a chain opened at `A` with price `p₁` releases `k`,
+/// and a later voucher carries the SAME anchor with `p₂ > p₁` — a reprice that
+/// folded nothing — the same root under the higher price would redeem those `k`
+/// old preimages for `k·(p₂ − p₁)` extra. Binding the price closes that
+/// structurally: a reprice is simply a different chain.
+///
+/// # What this rests on, and the one thing it gives up
+///
+/// Lane-cumulative monotonicity and `pool_id` never being reused — both already
+/// load-bearing for cumulative-voucher replay safety. `anchor` MUST be the
+/// amount in the chain's own opening voucher, not a live in-memory figure; the
+/// voucher is what both sides can point at.
+///
+/// The cost: a RETIRED chain whose opening anchor is forgotten can never be
+/// re-derived. A small counter space could be scanned; `U256` amounts cannot. No
+/// flow needs a retired chain's seed — its frontier is folded into a signed
+/// amount by the act of retiring it — so this is recorded rather than solved.
+///
+/// Nothing is persisted either way: the seed is reproduced on demand from the
+/// signing key and the anchor, so no chain secret is ever written to disk.
 #[must_use]
-pub fn derive_seed(master: B256, lane: &LaneKey, epoch: u64) -> B256 {
-    let mut preimage = Vec::with_capacity(SEED_TAG.len() + 32 + 32 + 20 + 20 + 8);
+pub fn derive_seed(master: B256, lane: &LaneKey, anchor: U256, chunk_price: U256) -> B256 {
+    let mut preimage = Vec::with_capacity(SEED_TAG.len() + 32 + 32 + 20 + 20 + 32 + 32);
     preimage.extend_from_slice(SEED_TAG);
     preimage.extend_from_slice(master.as_slice()); // bytes32 → 32
     preimage.extend_from_slice(lane.pool_id.as_slice()); // bytes32 → 32
     preimage.extend_from_slice(lane.signer.as_slice()); // address → 20
     preimage.extend_from_slice(lane.provider.as_slice()); // address → 20
-    preimage.extend_from_slice(&epoch.to_be_bytes()); // uint64 → 8 BE
+    preimage.extend_from_slice(&anchor.to_be_bytes::<32>()); // uint256 → 32 BE
+    preimage.extend_from_slice(&chunk_price.to_be_bytes::<32>()); // uint256 → 32 BE
     keccak256(preimage)
 }
 
@@ -308,15 +349,22 @@ mod tests {
         }
     }
 
-    /// ADR 003 §One chain per lane: every component of the lane triple, and the
-    /// epoch, must move the seed. If any did not, two lanes would share a chain
-    /// and the payer would pay twice for one tick.
+    /// ADR 003 §One chain per lane: every component of the lane triple, the
+    /// anchor, and the price must move the seed. If any did not, two chains would
+    /// share a root and a released preimage would pay for a tick twice.
     #[test]
-    fn every_lane_component_and_the_epoch_moves_the_seed() {
+    fn every_lane_component_the_anchor_and_the_price_move_the_seed() {
+        const A: U256 = U256::from_limbs([1_000, 0, 0, 0]);
+        const P: U256 = U256::from_limbs([10, 0, 0, 0]);
         let master = B256::repeat_byte(0x99);
-        let base = derive_seed(master, &lane(POOL, SIGNER, PROVIDER), 0);
+        let base = derive_seed(master, &lane(POOL, SIGNER, PROVIDER), A, P);
         let others = [
-            derive_seed(master, &lane(B256::repeat_byte(0x12), SIGNER, PROVIDER), 0),
+            derive_seed(
+                master,
+                &lane(B256::repeat_byte(0x12), SIGNER, PROVIDER),
+                A,
+                P,
+            ),
             derive_seed(
                 master,
                 &lane(
@@ -324,7 +372,8 @@ mod tests {
                     address!("00000000000000000000000000000000000000AB"),
                     PROVIDER,
                 ),
-                0,
+                A,
+                P,
             ),
             derive_seed(
                 master,
@@ -333,14 +382,36 @@ mod tests {
                     SIGNER,
                     address!("00000000000000000000000000000000000000BC"),
                 ),
-                0,
+                A,
+                P,
             ),
-            derive_seed(master, &lane(POOL, SIGNER, PROVIDER), 1),
-            derive_seed(B256::repeat_byte(0x98), &lane(POOL, SIGNER, PROVIDER), 0),
+            // The anchor: a fold moves it, so a post-fold chain is a new chain.
+            derive_seed(master, &lane(POOL, SIGNER, PROVIDER), A + P, P),
+            // The price: a reprice at an unchanged anchor is a new chain too, or
+            // the old preimages would redeem at the new rate.
+            derive_seed(master, &lane(POOL, SIGNER, PROVIDER), A, P + P),
+            derive_seed(B256::repeat_byte(0x98), &lane(POOL, SIGNER, PROVIDER), A, P),
         ];
         for (i, other) in others.into_iter().enumerate() {
             assert_ne!(base, other, "variant {i} collided with the base seed");
         }
+    }
+
+    /// The resumption property, which is what the anchor buys over a counter:
+    /// re-deriving at an UNCHANGED anchor reproduces the SAME chain. The anchor is
+    /// unchanged exactly when nothing was folded, so that chain is the one the
+    /// node is still metering and the payer picks up where it left off — no
+    /// counter to have persisted, and nothing to have got wrong.
+    #[test]
+    fn an_unchanged_anchor_re_derives_the_same_chain() {
+        const A: U256 = U256::from_limbs([1_000, 0, 0, 0]);
+        const P: U256 = U256::from_limbs([10, 0, 0, 0]);
+        let master = B256::repeat_byte(0x99);
+        let lane = lane(POOL, SIGNER, PROVIDER);
+        assert_eq!(
+            root_from_seed(derive_seed(master, &lane, A, P)),
+            root_from_seed(derive_seed(master, &lane, A, P))
+        );
     }
 
     /// Two lanes under one master produce disjoint roots — the property that
@@ -348,7 +419,14 @@ mod tests {
     #[test]
     fn sibling_lanes_commit_disjoint_roots() {
         let master = B256::repeat_byte(0x99);
-        let a = root_from_seed(derive_seed(master, &lane(POOL, SIGNER, PROVIDER), 0));
+        let anchor = U256::from(1_000u64);
+        let price = U256::from(10u64);
+        let a = root_from_seed(derive_seed(
+            master,
+            &lane(POOL, SIGNER, PROVIDER),
+            anchor,
+            price,
+        ));
         let b = root_from_seed(derive_seed(
             master,
             &lane(
@@ -356,7 +434,8 @@ mod tests {
                 SIGNER,
                 address!("00000000000000000000000000000000000000BC"),
             ),
-            0,
+            anchor,
+            price,
         ));
         assert_ne!(a, b);
     }
@@ -373,8 +452,13 @@ mod tests {
 
         let lane = lane(POOL, SIGNER, PROVIDER);
         assert_eq!(
-            derive_seed(first, &lane, 3),
-            derive_seed(master_secret(&reloaded).unwrap(), &lane, 3)
+            derive_seed(first, &lane, U256::from(3u64), U256::from(10u64)),
+            derive_seed(
+                master_secret(&reloaded).unwrap(),
+                &lane,
+                U256::from(3u64),
+                U256::from(10u64)
+            )
         );
     }
 

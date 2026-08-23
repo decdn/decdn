@@ -737,7 +737,6 @@ impl Funder for NullFunder {
 #[allow(dead_code, reason = "wired by the own-origin serve-miss orchestration")]
 fn local_bookkeeping_ctx() -> PoolContext {
     PoolContext {
-        prior_epoch: 0,
         pool_id: B256::ZERO,
         // No provider is paid: rate 0 means no voucher is ever signed, so the
         // ZERO-provider signing guard is never reached on this local leg.

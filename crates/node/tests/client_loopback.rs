@@ -265,7 +265,6 @@ fn channel_context(
     let binding = sign_client_binding(&client_signer, own_node_id, &binding_domain())
         .expect("sign client binding over the loopback client node id");
     PoolContext {
-        prior_epoch: 0,
         pool_id: pool_id(),
         provider: operator_addr(),
         deposit,
@@ -284,7 +283,6 @@ fn channel_context(
 /// what unlocks the paid path.
 fn unbound_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> PoolContext {
     PoolContext {
-        prior_epoch: 0,
         pool_id: pool_id(),
         provider: operator_addr(),
         deposit,

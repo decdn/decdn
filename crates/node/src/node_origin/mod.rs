@@ -1851,7 +1851,6 @@ fn lane_ledger(
             provider: provider_addr,
         },
         ctx.chain_master()?,
-        ctx.prior_epoch,
         Cumulative {
             bytes: ctx.prior_bytes_delivered,
             amount: ctx.prior_amount,
@@ -2310,13 +2309,9 @@ fn persist_buyer_progress(
     progress: &VoucherProgress,
 ) {
     if let Some((bytes_delivered, amount)) = progress.advanced()
-        && let Err(err) = deps.buyer.record_progress(
-            provider_addr,
-            pool_id,
-            bytes_delivered,
-            amount,
-            progress.next_epoch(),
-        )
+        && let Err(err) =
+            deps.buyer
+                .record_progress(provider_addr, pool_id, bytes_delivered, amount)
     {
         deps.metrics.node_pull_progress_persist_failure();
         warn!(%provider_addr, %err, "node-origin: failed to persist buyer voucher progress");

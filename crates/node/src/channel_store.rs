@@ -1111,10 +1111,9 @@ impl BuyerPoolStore for BuyerPoolStoreHandle {
         lane: LaneKey,
         bytes: U256,
         amount: U256,
-        next_epoch: u64,
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
-            .advance_progress(owner, pool_id, lane, bytes, amount, next_epoch)
+            .advance_progress(owner, pool_id, lane, bytes, amount)
     }
 
     fn add_deposit(
