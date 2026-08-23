@@ -40,9 +40,9 @@ use decdn_client_pull::driver::{DriveConfig, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
     BudgetPacer, ClientRangedStore, Cumulative, MultiSourceConfig, PeerSource, PoolContext,
-    PoolLedger, ProgressCallback, PullDeadlines, RetryDisposition, SourceLane, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, multi_source_fetch, open_progressive_pull,
-    retry_disposition, sign_client_binding,
+    PoolExhausted, PoolLedger, ProgressCallback, PullDeadlines, RetryDisposition, SourceLane,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, multi_source_fetch,
+    open_progressive_pull, retry_disposition, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -311,7 +311,7 @@ pub(crate) async fn probe_and_order(
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
     warming: ProxyWarmingParams,
-) -> anyhow::Result<Vec<NodeCandidate>> {
+) -> anyhow::Result<ResolvedTargets> {
     let timestamp_us = micros_now();
     // Probe concurrently in one task. `probe_once`'s future is `Send`, so
     // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
@@ -349,6 +349,7 @@ pub(crate) async fn probe_and_order(
             holders.push(discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
+                total_bytes: resp.total_bytes,
                 // No per-provider funding distinction in the pool model — see
                 // the doc comment above.
                 has_live_channel: false,
@@ -374,7 +375,10 @@ pub(crate) async fn probe_and_order(
              falling back to the holder if it declines (ADR 037)",
         );
     }
-    Ok(ordered.order)
+    Ok(ResolvedTargets {
+        candidates: ordered.order,
+        size_hint: ordered.size_hint,
+    })
 }
 
 /// The ordered provider-failover list plus, when a proxy leads it, that proxy's
@@ -387,6 +391,13 @@ struct FailoverOrder {
     /// `Some((proxy_node_id, proxy_rtt_ms, best_holder_rtt_ms))` when a warming
     /// proxy is prepended; `None` when the list is just the holders.
     warming_lead: Option<(PublicKey, f64, f64)>,
+    /// The largest blob size any holder reported in its probe, when any did
+    /// (`ProbeResponse::total_bytes`). The LARGEST rather than the first: the
+    /// field is unsigned, and this only ever DECLINES fan-out, so taking the
+    /// maximum keeps one node's understated hint from suppressing multi-source
+    /// for the whole set. An overstated one costs nothing — the real header
+    /// governs once the fan-out engages.
+    size_hint: Option<u64>,
 }
 
 /// Assemble the failover order (#1174, ADR 037 § Client selection policy) from
@@ -437,9 +448,11 @@ fn failover_order(
     let order = proxies
         .chain(holders.iter().map(|h| h.candidate.clone()))
         .collect();
+    let size_hint = holders.iter().filter_map(|h| h.total_bytes).max();
     FailoverOrder {
         order,
         warming_lead,
+        size_hint,
     }
 }
 
@@ -460,7 +473,7 @@ async fn discover_provider(
     // same `args`, so they travel as `args` rather than as two more positional
     // parameters (clippy caps this function at 7).
     args: &cli::ClientFetchArgs,
-) -> anyhow::Result<Vec<NodeCandidate>> {
+) -> anyhow::Result<ResolvedTargets> {
     let bootstrap = discovery::bootstrap_nodes(
         &chain.rpc_url,
         capacity_bond,
@@ -483,6 +496,20 @@ async fn discover_provider(
     probe_and_order(endpoint, &selected, relay_hint, hash, warming).await
 }
 
+/// The ordered failover list plus what discovery already learned about the
+/// blob's size.
+pub(crate) struct ResolvedTargets {
+    /// The candidates to try in turn (#1174).
+    pub(crate) candidates: Vec<NodeCandidate>,
+    /// The blob size a holder reported in its probe, when any did. Lets the
+    /// multi-source engagement gate apply its size floor BEFORE opening a pool
+    /// and a throwaway header stream just to learn the size — work the
+    /// single-source path then repeats when the gate declines. `None` on the
+    /// pinned `--node-id` path and whenever no holder reported a size, where the
+    /// gate falls back to the header open.
+    pub(crate) size_hint: Option<u64>,
+}
+
 /// Resolve the ordered failover list of nodes to fetch from (#1174): the
 /// explicit `--node-id` (requiring `--provider-address`) as a single-element
 /// list, or auto-discovery (#936) when `--node-id` is omitted (deriving each
@@ -494,7 +521,7 @@ pub(crate) async fn resolve_target_node(
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     hash: [u8; 32],
-) -> anyhow::Result<Vec<NodeCandidate>> {
+) -> anyhow::Result<ResolvedTargets> {
     if let Some(raw) = &args.node_id {
         // No reachability pre-check: the endpoint is discovery-enabled, so a
         // node-id resolves via `[network.discovery]` / `presets::N0` (plus its
@@ -509,11 +536,16 @@ pub(crate) async fn resolve_target_node(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--provider-address is required with --node-id"))?;
         let provider = super::chain_ctx::parse_address(provider_raw, "--provider-address")?;
-        return Ok(vec![NodeCandidate {
-            node_id,
-            eth_address: provider,
-            region_hint: None,
-        }]);
+        return Ok(ResolvedTargets {
+            candidates: vec![NodeCandidate {
+                node_id,
+                eth_address: provider,
+                region_hint: None,
+            }],
+            // A pinned node is one candidate, so multi-source never engages and
+            // no size hint is needed.
+            size_hint: None,
+        });
     }
 
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
@@ -533,10 +565,10 @@ pub(crate) async fn resolve_target_node(
     // instead of the degraded-but-working fetch the cache exists to provide.
     let order =
         discover_provider(endpoint, chain, capacity_bond, relays.first(), hash, args).await?;
-    if let Some(primary) = order.first() {
+    if let Some(primary) = order.candidates.first() {
         eprintln!(
             "discovered {} candidate node(s); primary {} (provider {}, region {:?})",
-            order.len(),
+            order.candidates.len(),
             primary.node_id,
             primary.eth_address,
             primary.region_hint
@@ -703,7 +735,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
     // Resolve the ordered failover list: explicit `--node-id`, or auto-discover.
-    let candidates = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
+    let targets = resolve_target_node(common, &chain, &endpoint, &relays, hash).await?;
+    let candidates = targets.candidates;
 
     // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
     // failed discovery never prompts for a keystore password. Password from env,
@@ -785,6 +818,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             &relays,
             hash,
             &args.output,
+            targets.size_hint,
             Some(&on_progress),
         )
         .await;
@@ -794,13 +828,35 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                 println!("fetched {bytes} bytes -> {}", args.output.display());
                 return Ok(());
             }
-            // Gate not met: run the single-source failover loop below.
+            // Gate not met: run the single-source failover loop below. The gate
+            // itself reports which condition it was.
             Ok(None) => {}
-            // The parallel fetch engaged but failed; on the delegated path
-            // reconnect a terminal exhaustion to the owner remedy, same as the
-            // single-source path does.
-            Err(err) if grant.is_some() => return Err(annotate_delegated_exhaustion(err)),
-            Err(err) => return Err(err),
+            // The fan-out engaged and failed. Only a TERMINAL failure ends the
+            // fetch: a pool exhaustion (no lane and no provider can fund it) or
+            // what the shared classifier rules terminal. Anything else is
+            // precisely the class the failover loop below was built to survive —
+            // returning it here would fail a recoverable fetch that the
+            // pre-fan-out path completed by trying the next candidate. The loop
+            // resumes the same `.partial`, so nothing already paid for is
+            // re-bought.
+            Err(err)
+                if retry_disposition(&err) == RetryDisposition::Terminal
+                    || err.downcast_ref::<PoolExhausted>().is_some() =>
+            {
+                // On the delegated path reconnect a terminal exhaustion to the
+                // owner remedy, same as the single-source path does.
+                return Err(if grant.is_some() {
+                    annotate_delegated_exhaustion(err)
+                } else {
+                    err
+                });
+            }
+            Err(err) => {
+                eprintln!(
+                    "multi-source fetch failed ({err:#}); falling back to single-source \
+                     failover over the same candidates"
+                );
+            }
         }
     }
 
@@ -1285,16 +1341,45 @@ pub(crate) async fn try_multi_source_fetch<P>(
     relays: &[RelayUrl],
     hash: [u8; 32],
     output: &Path,
+    size_hint: Option<u64>,
     progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
 {
-    // Spread the ranked candidate set across distinct operators (ADR 039 §5.2).
-    // A gate that cannot be met without a probe (kill switch off, or fewer than
-    // two admissible holders) short-circuits BEFORE any chain/network work.
+    // Spread the ranked candidate set across distinct operators (ADR 039
+    // § Source diversity and reputation). Every gate that can be decided without
+    // a probe short-circuits BEFORE any chain/network work — and says which
+    // condition it was, since a user who passed `--multi-source --max-sources 8`
+    // and then watches the blob arrive over one connection has no other way to
+    // tell the size floor from the operator-spread filter from the kill switch.
+    if !common.multi_source_enabled() {
+        return Ok(None);
+    }
     let admissible = discovery::admit_sources(candidates.to_vec(), common.max_sources);
-    if !common.multi_source_enabled() || admissible.len() < 2 {
+    if admissible.len() < 2 {
+        eprintln!(
+            "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
+             and fan-out needs two (one lane per operator: two nodes of one operator would \
+             share a voucher lane)",
+            admissible.len(),
+            candidates.len()
+        );
+        return Ok(None);
+    }
+    // The size floor, applied against discovery's probe-reported hint when there
+    // is one, so a below-floor blob declines here instead of after a pool open
+    // and a throwaway header stream the single-source path then repeats. The
+    // hint is unsigned, so it only ever DECLINES: an overstated one falls
+    // through to the authoritative header check below.
+    if let Some(hint) = size_hint
+        && !should_multi_source(true, hint, common.multi_source_min_bytes, admissible.len())
+    {
+        eprintln!(
+            "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
+             floor (--multi-source-min-bytes)",
+            common.multi_source_min_bytes
+        );
         return Ok(None);
     }
     let Some((first_candidate, rest_candidates)) = admissible.split_first() else {
@@ -1338,14 +1423,20 @@ where
     let total_bytes = header.total_bytes;
     drop(first_pull);
 
-    // The size gate: below the floor a single fast holder already saturates the
-    // downlink, so fan-out is pure overhead — fall through to single-source.
+    // The authoritative size gate, on the header the holder actually served:
+    // below the floor a single fast holder already saturates the downlink, so
+    // fan-out is pure overhead — fall through to single-source.
     if !should_multi_source(
         common.multi_source_enabled(),
         total_bytes,
         common.multi_source_min_bytes,
         admissible.len(),
     ) {
+        eprintln!(
+            "multi-source: not engaging — the blob is {total_bytes} bytes, below the {} byte \
+             fan-out floor (--multi-source-min-bytes)",
+            common.multi_source_min_bytes
+        );
         return Ok(None);
     }
 
@@ -1408,39 +1499,107 @@ where
     )
     .await;
 
-    // Promote the assembled blob when the whole blob is present (mirrors
-    // `drive`'s own completion promotion, which `multi_source_fetch` leaves to the
-    // caller).
-    if fetch_result.is_ok() && ranged_store.is_complete().await.unwrap_or(false) {
-        ranged_store
-            .finalize()
-            .await
-            .map_err(|e| anyhow::anyhow!("finalize assembled blob {}: {e}", output.display()))?;
-    }
-
-    // Persist each lane's own voucher watermark: on success the committed
-    // watermark is safe; on an ambiguous failure settle HIGH per lane so a reuse
-    // never re-signs a spent lane state.
-    for l in &lanes {
-        let vprogress = select_watermark(
-            &fetch_result,
-            l.ledger.committed(),
-            l.ledger.settlement(),
-            l.prior_amount,
+    // Persist every lane's voucher watermark BEFORE anything can return early:
+    // the bytes each lane delivered are paid for whatever the fetch as a whole
+    // did.
+    for (lane, vprogress) in multi_lane_watermarks(deps.self_address, &lane_watermarks(&lanes)) {
+        persist_watermark(
+            deps.store,
+            deps.self_address,
+            lane.pool_id,
+            lane,
+            &vprogress,
         );
-        let lane = LaneKey {
-            pool_id: l.pool_id,
-            signer: deps.self_address,
-            provider: l.provider,
-        };
-        persist_watermark(deps.store, deps.self_address, l.pool_id, lane, &vprogress);
     }
 
     fetch_result.map_err(|err| match lanes.first().map(|l| l.ctx.lock()) {
         Some(Ok(guard)) => annotate_unbound_cache_miss(err, &guard),
         _ => err,
     })?;
+
+    // Promote the assembled blob (mirrors `drive`'s own completion promotion,
+    // which `multi_source_fetch` leaves to the caller). `is_complete` can fail —
+    // a poisoned present lock, an alignment error — and absorbing that failure
+    // into "not complete" would skip `finalize`'s verify sweep and the
+    // `.partial` -> output promote while STILL reporting the byte count as
+    // fetched: the caller prints success, exits 0, and there is no output file.
+    // The blob was paid for in full, so a scripted pipeline proceeding on that
+    // exit code is the worst outcome available here.
+    anyhow::ensure!(
+        ranged_store
+            .is_complete()
+            .await
+            .map_err(|e| anyhow::anyhow!("check assembled blob {}: {e}", output.display()))?,
+        "multi-source fetch of {} reported success but the assembled blob is incomplete",
+        output.display()
+    );
+    ranged_store
+        .finalize()
+        .await
+        .map_err(|e| anyhow::anyhow!("finalize assembled blob {}: {e}", output.display()))?;
     Ok(Some(total_bytes))
+}
+
+/// One lane's persisted-watermark inputs, lifted out of [`MultiLane`] so the
+/// per-lane settlement rule is a pure function the tests can drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LaneWatermark {
+    pool_id: PoolId,
+    provider: Address,
+    /// The lane's persisted prior amount — the baseline the advance is computed
+    /// against.
+    prior_amount: U256,
+    /// The lane's ARMED cumulative: what the lane owes if every voucher it put
+    /// on the wire was received.
+    settlement: Cumulative,
+}
+
+/// Snapshot each lane's watermark inputs.
+fn lane_watermarks(lanes: &[MultiLane<'_>]) -> Vec<LaneWatermark> {
+    lanes
+        .iter()
+        .map(|l| LaneWatermark {
+            pool_id: l.pool_id,
+            provider: l.provider,
+            prior_amount: l.prior_amount,
+            settlement: l.ledger.settlement(),
+        })
+        .collect()
+}
+
+/// Pair each lane's own `LaneKey` with the watermark to persist for it.
+///
+/// Every multi-source lane settles at its ARMED cumulative — [`select_watermark`]'s
+/// ambiguous-failure branch — rather than branching on the fetch's outcome the
+/// way the single-source path does. The fetch result is ONE outcome shared by
+/// every lane, but "did this lane's last voucher land?" is a PER-LANE question,
+/// and on the multi-source path a successful fetch routinely leaves a lane
+/// armed-above-committed: a tail steal drops the victim's `fill_gap` future
+/// wherever it is parked, including inside the voucher exchange that `issue`
+/// deliberately arms before sending. Settling that lane at `committed` on the
+/// fetch's `Ok` persists a cumulative BELOW what the node can redeem, and the
+/// next fetch on that lane signs a cumulative the upstream already holds —
+/// rejected as a regression.
+///
+/// Settling high costs nothing on the clean path: with nothing armed,
+/// `settlement()` equals `committed()`.
+fn multi_lane_watermarks(
+    signer: Address,
+    lanes: &[LaneWatermark],
+) -> Vec<(LaneKey, VoucherProgress)> {
+    lanes
+        .iter()
+        .map(|l| {
+            (
+                LaneKey {
+                    pool_id: l.pool_id,
+                    signer,
+                    provider: l.provider,
+                },
+                VoucherProgress::from_cumulative(l.settlement, l.prior_amount),
+            )
+        })
+        .collect()
 }
 
 /// The CLI's [`Funder`]: a mid-fetch reactive top-up runs the same
@@ -2003,6 +2162,12 @@ mod tests {
     }
 
     fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
+        holder_sized(seed, rtt_ms, None)
+    }
+
+    /// A holder whose probe reported (or withheld) a blob size — the hint the
+    /// multi-source engagement gate applies its floor against.
+    fn holder_sized(seed: u8, rtt_ms: f64, total_bytes: Option<u64>) -> discovery::Probed {
         discovery::Probed {
             candidate: NodeCandidate {
                 node_id: node_key(seed),
@@ -2010,6 +2175,7 @@ mod tests {
                 region_hint: None,
             },
             rtt_ms,
+            total_bytes,
             has_live_channel: false,
         }
     }
@@ -2313,5 +2479,106 @@ mod tests {
             progress.advanced(),
             Some((settlement.bytes, settlement.amount))
         );
+    }
+
+    // ---- per-lane watermarks on the multi-source path ----
+
+    fn lane_wm(pool: u8, provider: u8, prior: u64, bytes: u64, amount: u64) -> LaneWatermark {
+        LaneWatermark {
+            pool_id: PoolId::repeat_byte(pool),
+            provider: Address::repeat_byte(provider),
+            prior_amount: U256::from(prior),
+            settlement: Cumulative {
+                bytes: U256::from(bytes),
+                amount: U256::from(amount),
+            },
+        }
+    }
+
+    /// Each lane's watermark is persisted under ITS OWN `LaneKey` and carries ITS
+    /// OWN cumulative. Crossing the two — lane A's amount under lane B's key —
+    /// strands both channels, and nothing else in the fetch path would notice.
+    #[test]
+    fn multi_lane_watermarks_pair_each_lane_with_its_own_key() {
+        let signer = Address::repeat_byte(0x5E);
+        let lanes = [lane_wm(1, 0xA1, 0, 100, 200), lane_wm(1, 0xB2, 0, 300, 400)];
+        let out = super::multi_lane_watermarks(signer, &lanes);
+        assert_eq!(out.len(), 2);
+
+        assert_eq!(out[0].0.provider, Address::repeat_byte(0xA1));
+        assert_eq!(out[0].0.signer, signer);
+        assert_eq!(out[0].0.pool_id, PoolId::repeat_byte(1));
+        assert_eq!(
+            out[0].1.advanced(),
+            Some((U256::from(100u64), U256::from(200u64))),
+            "lane A carries lane A's cumulative"
+        );
+
+        assert_eq!(out[1].0.provider, Address::repeat_byte(0xB2));
+        assert_eq!(
+            out[1].1.advanced(),
+            Some((U256::from(300u64), U256::from(400u64))),
+            "lane B carries lane B's cumulative"
+        );
+    }
+
+    /// A multi-source lane settles at its ARMED cumulative, never at `committed`.
+    /// A tail steal drops the victim's `fill_gap` future wherever it is parked —
+    /// including inside the voucher exchange `issue` deliberately arms before
+    /// sending — and that is a routine event on a SUCCESSFUL fetch. Settling that
+    /// lane low persists a cumulative below what the node can redeem, and the next
+    /// fetch on the lane signs a value the upstream already holds: rejected as a
+    /// regression.
+    #[test]
+    fn multi_lane_watermarks_settle_high_even_when_the_fetch_succeeded() {
+        let signer = Address::repeat_byte(0x5E);
+        // The armed cumulative sits ABOVE what was acked — the steal-cancelled
+        // shape. `select_watermark(&Ok(()), ..)` would persist the lower one.
+        let lanes = [lane_wm(1, 0xA1, 0, 300, 400)];
+        let out = super::multi_lane_watermarks(signer, &lanes);
+        assert_eq!(
+            out[0].1.advanced(),
+            Some((U256::from(300u64), U256::from(400u64))),
+            "the armed (settlement) cumulative is what gets persisted"
+        );
+    }
+
+    /// A lane that advanced nothing persists nothing: `advanced()` is `None`, and
+    /// `persist_watermark` returns early rather than writing a no-op row.
+    #[test]
+    fn multi_lane_watermarks_report_no_advance_for_an_untouched_lane() {
+        let signer = Address::repeat_byte(0x5E);
+        let lanes = [lane_wm(1, 0xA1, 200, 0, 200)];
+        let out = super::multi_lane_watermarks(signer, &lanes);
+        assert_eq!(
+            out[0].1.advanced(),
+            None,
+            "a lane at its prior amount has not advanced"
+        );
+    }
+
+    // ---- the probe size hint that spares the engagement gate a throwaway open ----
+
+    /// The gate's size hint is the LARGEST size any holder reported. The field is
+    /// unsigned and only ever DECLINES fan-out, so taking the maximum keeps one
+    /// node's understated hint from suppressing multi-source for the whole set.
+    #[test]
+    fn failover_order_takes_the_largest_reported_size_hint() {
+        let holders = vec![
+            holder_sized(1, 10.0, Some(1024)),
+            holder_sized(2, 20.0, Some(64 * 1024 * 1024)),
+            holder_sized(3, 30.0, None),
+        ];
+        let out = super::failover_order(holders, &[], warming_params(false));
+        assert_eq!(out.size_hint, Some(64 * 1024 * 1024));
+    }
+
+    /// No holder reported a size: the gate has no hint and falls back to the
+    /// authoritative header open.
+    #[test]
+    fn failover_order_has_no_size_hint_when_no_holder_reports_one() {
+        let holders = vec![holder_sized(1, 10.0, None), holder_sized(2, 20.0, None)];
+        let out = super::failover_order(holders, &[], warming_params(false));
+        assert_eq!(out.size_hint, None);
     }
 }

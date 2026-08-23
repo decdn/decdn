@@ -40,7 +40,7 @@
 //!   re-queues the still-missing part of its trimmed `[start, mid)` to
 //!   `pending`, and picks again — so the stolen tail is fetched (and paid for)
 //!   by exactly ONE source, not two. Without this the victim's already-running
-//!   `fill_gap` would keep paying to `end` (the Task-4 double-pay).
+//!   `fill_gap` would keep paying to `end` — both sources paying for one tail.
 //! - **Stall / fault.** A source with no verified progress within
 //!   `unit_deadline` (the watchdog trips), or whose `fill_gap` returns a
 //!   RETRYABLE `Err` ([`crate::retry_disposition`] ==
@@ -72,17 +72,17 @@
 //! fault, the fetch returns a generic "all sources failed" error rather than
 //! hanging.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use decdn_bao_range::{AlignedRange, align_range};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::driver::{
-    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted,
+    DriveConfig, DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PoolExhausted, SharedPool,
     contiguous_byte_ranges, drive_with_interval_flush, fill_gap,
 };
 use crate::retry::{RetryDisposition, retry_disposition};
@@ -225,7 +225,37 @@ enum UnitOutcome {
     /// The source stalled or hit a RETRYABLE fault — re-queue the remainder for a
     /// DIFFERENT source and stop taking work. A TERMINAL fault does not reach
     /// here: the worker returns its typed error directly, aborting the fetch.
-    Faulted,
+    ///
+    /// Carries the cause so the fetch can name it: `Some(e)` for a retryable
+    /// `fill_gap` error, `None` for a watchdog stall, which has no error by
+    /// construction. Dropping it would leave a failed fetch describable only as
+    /// "all sources failed", with the node-specific refusal, transport reset, or
+    /// bao mismatch that actually ended it unrecoverable — the CLI installs no
+    /// tracing subscriber, so an unreturned error is a destroyed one.
+    Faulted(Option<anyhow::Error>),
+}
+
+/// Why one lane stopped taking work, kept for the diagnosis a failed fetch
+/// reports. `provider` is the lane's payee address — the only stable identity
+/// the scheduler holds for a source.
+struct LaneFault {
+    provider: Option<Address>,
+    /// `None` for a watchdog stall (no error exists), `Some` for a retryable fault.
+    err: Option<anyhow::Error>,
+}
+
+impl LaneFault {
+    /// One line naming the lane and what ended it, for the aggregate error.
+    fn describe(&self) -> String {
+        let who = self.provider.map_or_else(
+            || "unknown provider".to_string(),
+            |p| format!("provider {p}"),
+        );
+        match &self.err {
+            Some(e) => format!("{who}: {e:#}"),
+            None => format!("{who}: no verified progress within the unit deadline"),
+        }
+    }
 }
 
 /// Client-side knobs for the multi-source scheduler (spec §8). The blob-size
@@ -237,8 +267,8 @@ pub struct MultiSourceConfig {
     /// scheduler engages `min(max_sources, sources.len())` segments.
     pub max_sources: usize,
     /// No-verified-progress deadline before a source's remaining range is
-    /// reassigned. Consumed by the reassignment path (a later task); the core
-    /// scheduler does not read it.
+    /// reassigned. Read by the stall watchdog, which each worker races its `fill_gap`
+    /// against. `Duration::ZERO` disables the watchdog.
     pub unit_deadline: Duration,
 }
 
@@ -257,28 +287,46 @@ struct Work {
 }
 
 impl Work {
+    /// Every worker is free and nothing is queued: the fan-out has no work left,
+    /// so a worker that cannot pick may exit rather than park.
+    fn all_idle(&self) -> bool {
+        self.pending.is_empty() && self.in_flight.iter().all(Option::is_none)
+    }
+
+    /// Worker `i`'s in-flight slot. An out-of-range `i` is a wiring bug, not a
+    /// condition to absorb: silently no-op'ing it would let the worker fetch —
+    /// and pay for — a range `in_flight` never records, which a peer then reads
+    /// as unowned and steals, so both pay for it.
+    fn slot_mut(&mut self, i: usize) -> anyhow::Result<&mut Option<(u64, u64)>> {
+        match self.in_flight.get_mut(i) {
+            Some(slot) => Ok(slot),
+            None => anyhow::bail!("worker index {i} out of range for in-flight slots"),
+        }
+    }
+
     /// Under the caller's lock, choose worker `i`'s next range. Pop a pending
     /// segment first; when none remain, steal the aligned second half of the
     /// largest range still in flight ([`steal_split`]), trimming the victim so
     /// no other freed worker can re-steal the same tail. Records the choice in
-    /// `in_flight[i]`. `Ok(None)` means nothing worth a fresh stream remains —
-    /// the worker exits.
+    /// `in_flight[i]`. `Ok(None)` means there is nothing to start right now —
+    /// the worker parks until a peer changes the work state, and exits only once
+    /// [`Work::all_idle`] holds.
     ///
     /// # Errors
     ///
-    /// Propagates the alignment error [`steal_split`] raises on an
-    /// out-of-bounds range (never on the ranges this scheduler feeds it).
+    /// An out-of-range worker index; or the alignment error [`steal_split`]
+    /// raises on an out-of-bounds range (never on the ranges this scheduler
+    /// feeds it).
     fn pick(&mut self, i: usize, total_bytes: u64) -> anyhow::Result<Option<AlignedRange>> {
         // This worker is starting a fresh unit: clear any cancel signal left from
         // a prior unit, under the lock, so a stale `notify_one` permit cannot
         // spuriously cancel the new unit (see `cancelled`).
-        if let Some(handle) = self.cancel.get(i) {
-            handle.flag.store(false, Ordering::Release);
+        match self.cancel.get(i) {
+            Some(handle) => handle.flag.store(false, Ordering::Release),
+            None => anyhow::bail!("worker index {i} out of range for cancel handles"),
         }
         if let Some(seg) = self.pending.pop_front() {
-            if let Some(slot) = self.in_flight.get_mut(i) {
-                *slot = Some((seg.fetch_start(), seg.fetch_len()));
-            }
+            *self.slot_mut(i)? = Some((seg.fetch_start(), seg.fetch_len()));
             return Ok(Some(seg));
         }
 
@@ -286,58 +334,68 @@ impl Work {
         // Steal the aligned second half of the largest such range. `in_flight[i]`
         // is `None` here (cleared before this pick), so this worker is excluded
         // from the remaining set and never steals from itself.
-        let remaining: Vec<(u64, u64)> = self.in_flight.iter().flatten().copied().collect();
-        let Some(half) = steal_split(&remaining, total_bytes)? else {
-            if let Some(slot) = self.in_flight.get_mut(i) {
-                *slot = None;
-            }
-            return Ok(None);
-        };
-
-        // Trim the victim — the largest in-flight range, the SAME argmax
-        // `steal_split` picked (both iterate `in_flight` in order and take the
-        // last maximum, so they agree) — to end at the split point. A later
-        // freed worker then sees the shortened tail and cannot re-steal the half
-        // this worker just took: at most one source owns any range, by
-        // construction, in the work-state.
-        let victim = self
+        let (owners, remaining): (Vec<usize>, Vec<(u64, u64)>) = self
             .in_flight
             .iter()
             .enumerate()
-            .filter_map(|(idx, slot)| slot.map(|(_, len)| (idx, len)))
-            .max_by_key(|&(_, len)| len)
-            .map(|(idx, _)| idx);
-        if let Some(idx) = victim
-            && idx != i
-            && let Some(Some((start, len))) = self.in_flight.get_mut(idx)
-            && half.fetch_start() > *start
-        {
-            *len = half.fetch_start() - *start;
-            // Signal the victim to STOP fetching past the split. Its
-            // already-running `fill_gap` would otherwise fetch — and pay for —
-            // the tail this worker just took. Set the flag then wake it, both
-            // under the caller's `Work` lock, serialized against the victim's
-            // own `pick` reset above. `notify_one` stores a permit if the victim
-            // is not parked yet, so the signal is never lost.
-            if let Some(handle) = self.cancel.get(idx) {
-                handle.flag.store(true, Ordering::Release);
-                handle.notify.notify_one();
+            .filter_map(|(idx, slot)| slot.map(|r| (idx, r)))
+            .unzip();
+        // `steal_split` returns WHICH remaining range it split, so the trim below
+        // lands on that exact victim — no second argmax to agree with.
+        let Some((v, half)) = steal_split(&remaining, total_bytes)? else {
+            *self.slot_mut(i)? = None;
+            return Ok(None);
+        };
+
+        // Trim the victim to end at the split point, so a later freed worker sees
+        // the shortened tail and cannot re-steal the half this worker just took:
+        // at most one source owns any range, by construction, in the work-state.
+        //
+        // Every branch that cannot complete that trim DECLINES the steal instead
+        // of proceeding. Handing out `half` with the victim untrimmed would leave
+        // two workers owning overlapping ranges, and both would pay for the
+        // overlap — the exact double-pay the trim exists to prevent.
+        let trimmed = owners.get(v).copied().and_then(|victim| {
+            if victim == i {
+                return None;
             }
+            let (start, len) = self.in_flight.get_mut(victim)?.as_mut()?;
+            if half.fetch_start() <= *start {
+                return None;
+            }
+            *len = half.fetch_start() - *start;
+            Some(victim)
+        });
+        let Some(victim) = trimmed else {
+            *self.slot_mut(i)? = None;
+            return Ok(None);
+        };
+
+        // Signal the victim to STOP fetching past the split. Its already-running
+        // `fill_gap` would otherwise fetch — and pay for — the tail this worker
+        // just took. Set the flag then wake it, both under the caller's `Work`
+        // lock, serialized against the victim's own `pick` reset above.
+        // `notify_one` stores a permit if the victim is not parked yet, so the
+        // signal is never lost.
+        if let Some(handle) = self.cancel.get(victim) {
+            handle.flag.store(true, Ordering::Release);
+            handle.notify.notify_one();
         }
 
-        if let Some(slot) = self.in_flight.get_mut(i) {
-            *slot = Some((half.fetch_start(), half.fetch_len()));
-        }
+        *self.slot_mut(i)? = Some((half.fetch_start(), half.fetch_len()));
         Ok(Some(half))
     }
 
     /// Release worker `i`'s lane once its `fill_gap` returns, so a peer's steal
     /// computation stops counting the finished range and this source can be
     /// re-picked for more work.
-    fn clear(&mut self, i: usize) {
-        if let Some(slot) = self.in_flight.get_mut(i) {
-            *slot = None;
-        }
+    ///
+    /// # Errors
+    ///
+    /// An out-of-range worker index (see [`Work::slot_mut`]).
+    fn clear(&mut self, i: usize) -> anyhow::Result<()> {
+        *self.slot_mut(i)? = None;
+        Ok(())
     }
 }
 
@@ -372,11 +430,22 @@ where
 }
 
 /// One worker future per source: loop picking a range and driving `fill_gap`
-/// over it, under a cancel/stall [`tokio::select!`], until `Work::pick`
-/// returns `None` or the source is dropped. Exactly one outstanding range at a
-/// time (the loop drives one `fill_gap` to a terminal outcome before the next
-/// pick) — the one-unit-per-source lane invariant, structurally.
+/// over it, under a cancel/stall [`tokio::select!`], until the fan-out has no
+/// work left or the source is dropped. Exactly one outstanding range at a time
+/// (the loop drives one `fill_gap` to a terminal outcome before the next pick) —
+/// the one-unit-per-source lane invariant, structurally.
+///
+/// A worker that cannot pick PARKS on `progress` rather than retiring. Nothing
+/// to pick is the routine end-of-fetch shape — every in-flight range is below
+/// [`crate::segment::MIN_SPLIT_SIZE`], so no split is worth a fresh stream — and
+/// a worker that exited there is gone when a peer faults moments later and
+/// re-queues its remainder, stranding recoverable work at healthy, already-paid
+/// lanes. It exits only once [`Work::all_idle`] holds, or once IT faults.
 #[allow(clippy::too_many_arguments)]
+// One pick -> drive -> classify loop. The fault classification and the three
+// unit outcomes each justify a money-relevant decision against the loop state
+// they act on; splitting them out would separate the two.
+#[allow(clippy::too_many_lines)]
 async fn run_worker<St, S, P, F>(
     i: usize,
     store: &St,
@@ -389,9 +458,11 @@ async fn run_worker<St, S, P, F>(
     total_bytes: u64,
     drive: &DriveConfig,
     work: &AsyncMutex<Work>,
+    progress_wake: &Notify,
+    faults: &Mutex<Vec<LaneFault>>,
     on_progress: Option<&ProgressCallback>,
     unit_deadline: Duration,
-    pool_spent: &(dyn Fn() -> U256 + Send + Sync),
+    pool: &SharedPool<'_>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -408,10 +479,21 @@ where
             None => anyhow::bail!("worker index {i} out of range for cancel handles"),
         }
     };
-    // Each worker owns its own counters — the reactive-top-up budget is
-    // per-worker here, not shared across the set.
+    // This lane's payee, read once for fault attribution.
+    let provider = ctx.lock().ok().map(|c| c.provider);
+    // Per-worker resume/quote state. The reactive-top-up budget is NOT in here —
+    // it is a property of the one shared pool and lives in `pool`.
     let mut counters = DriveCounters::new();
+    // Wake every parked peer: this worker changed the work state.
+    let wake = || progress_wake.notify_waiters();
     loop {
+        // Register for the peer-progress wakeup BEFORE reading the work state, so
+        // a peer that changes it between this read and the park below cannot slip
+        // between the two and leave this worker asleep on work it could take.
+        let parked = progress_wake.notified();
+        tokio::pin!(parked);
+        parked.as_mut().enable();
+
         // Tiny critical section: pick a range, then DROP the guard before the
         // `fill_gap` await (the guard does not cross the await point).
         let picked = {
@@ -419,7 +501,14 @@ where
             w.pick(i, total_bytes)?
         };
         let Some(range) = picked else {
-            break;
+            // Nothing to start right now. Exit only when no peer holds anything
+            // and nothing is queued; otherwise park — a peer's range is still
+            // draining toward a requeue or a splittable size.
+            if work.lock().await.all_idle() {
+                break;
+            }
+            parked.await;
+            continue;
         };
         let (r_start, r_len) = (range.fetch_start(), range.fetch_len());
 
@@ -438,7 +527,8 @@ where
         let gaps =
             contiguous_byte_ranges(&store.missing_ranges(r_start, r_len).await?, total_bytes);
         if gaps.is_empty() {
-            work.lock().await.clear(i);
+            work.lock().await.clear(i)?;
+            wake();
             continue;
         }
 
@@ -466,10 +556,11 @@ where
                     on_progress,
                     None,
                     None,
-                    // Aggregate solvency: gate this lane on the SHARED pool's
-                    // remaining balance (deposit minus every lane's committed),
-                    // not this one lane's spend alone.
-                    Some(pool_spent),
+                    // Everything this lane must not treat as its own: the
+                    // aggregate spend the deposit gate subtracts, the fetch-wide
+                    // top-up budget, and the credit path that shows a landed
+                    // top-up to EVERY lane.
+                    Some(pool),
                 );
                 tokio::select! {
                     biased;
@@ -493,18 +584,24 @@ where
                         // source's range is NOT reassigned. A RETRYABLE fault (a
                         // stall, a transport reset, a node-specific refusal, or a
                         // single-source-style budget refusal) faults this one
-                        // source: its remainder is re-queued for a DIFFERENT lane.
+                        // source: its remainder is re-queued for a DIFFERENT lane,
+                        // and the error is KEPT so a fetch that runs out of lanes
+                        // can say what each one did.
                         Err(e) => {
                             let terminal = retry_disposition(&e) == RetryDisposition::Terminal
                                 || e.downcast_ref::<PoolExhausted>().is_some();
                             if terminal {
                                 return Err(e);
                             }
-                            UnitOutcome::Faulted
+                            UnitOutcome::Faulted(Some(e))
                         }
                     },
                     () = cancelled(&handle) => UnitOutcome::Cancelled,
-                    () = watchdog(store, g_start, g_len, unit_deadline) => UnitOutcome::Faulted,
+                    // A watchdog trip carries no error by construction — the
+                    // source simply stopped making verified progress.
+                    () = watchdog(store, g_start, g_len, unit_deadline) => {
+                        UnitOutcome::Faulted(None)
+                    }
                 }
             };
             match outcome {
@@ -519,7 +616,8 @@ where
         match terminal {
             // Every gap filled: free the lane and pick again.
             None => {
-                work.lock().await.clear(i);
+                work.lock().await.clear(i)?;
+                wake();
             }
             // Stolen: re-queue the trimmed remainder and stay live. The
             // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
@@ -530,15 +628,24 @@ where
             // same-leg re-bill contract.
             Some(UnitOutcome::Cancelled) => {
                 requeue_missing(store, work, i).await?;
+                wake();
             }
-            // Stalled/faulted: re-queue for a different source, then stop.
-            Some(UnitOutcome::Faulted) => {
+            // Stalled/faulted: record why, re-queue for a different source, then
+            // stop taking work.
+            Some(UnitOutcome::Faulted(err)) => {
+                if let Ok(mut f) = faults.lock() {
+                    f.push(LaneFault { provider, err });
+                }
                 requeue_missing(store, work, i).await?;
+                wake();
                 break;
             }
             Some(UnitOutcome::Completed) => {}
         }
     }
+    // This worker is leaving the set: a peer parked on "someone else still holds
+    // work" must re-evaluate against a set this worker is no longer part of.
+    wake();
     Ok(())
 }
 
@@ -547,32 +654,45 @@ where
 /// gap-set into bao-aligned segments, drives one worker per lane, and lets a
 /// freed lane steal the tail of the largest range still in flight.
 ///
-/// # Per-source payment (ADR 039 § Payment model)
+/// # Per-source payment (ADR 039 § Payment)
 ///
 /// Each [`SourceLane`] pays with its OWN `(ctx, ledger)`: a voucher is scoped to
 /// one on-chain provider and one `(signer, provider)` watermark, so lane `i`'s
 /// worker signs against `lanes[i].ctx.provider` and advances `lanes[i].ledger`
-/// alone. One shared pool DEPOSIT backs the whole set: every worker gates its
-/// draw on `pool_deposit - Σ lanes[j].ledger.committed()` (the aggregate reader
-/// built below), so concurrent lanes cannot each independently spend the whole
-/// deposit. The gate is evaluated at each `fill_gap` leg boundary; the hard
-/// backstop against a node redeeming past the deposit stays on-chain (the pool
-/// pays first-come up to its deposit), exactly as on the single-source path.
+/// alone. Two lanes on the SAME provider would be two concurrent voucher streams
+/// on one `(signer, provider)` watermark — the hazard the one-unit-per-source
+/// rule exists to prevent — so the set is checked for duplicate providers here,
+/// at the boundary, rather than assumed from the caller's admission policy.
 ///
-/// Returns once every gap is filled (or a worker faults). Finalization is the
-/// caller's job — like [`crate::drive`], this only flushes the present record
-/// (spec §5.5 single-writer flush point) once all workers finish.
+/// One shared pool DEPOSIT backs the whole set, and every lane draws through one
+/// shared view of it: the deposit gate subtracts `Σ lanes[j].ledger.committed()`
+/// rather than this lane's own spend, the reactive-top-up budget is counted once
+/// for the fetch rather than once per lane, and a landed top-up is credited to
+/// every lane's context. The gate is evaluated at each `fill_gap` leg boundary;
+/// the hard backstop against a node redeeming past the deposit stays on-chain
+/// (the pool pays first-come up to its deposit), exactly as on the single-source
+/// path.
+///
+/// Returns once every gap is filled, or once a worker hits a TERMINAL fault (a
+/// retryable one only drops that lane). Finalization is the caller's job —
+/// unlike [`crate::drive`], which promotes a complete blob itself, this only
+/// flushes the present record (spec §5.5 single-writer flush point) once all
+/// workers finish.
 ///
 /// # Errors
 ///
-/// An empty `lanes`; a TERMINAL `fill_gap` fault propagated verbatim from a worker
-/// — either a shared-classifier terminal ([`crate::retry_disposition`]: a
-/// payment-layer rejection, an origin blacklist, or an over-cap blob) or a
-/// shared-pool exhaustion ([`crate::PoolExhausted`], terminal only for this
-/// scheduler); a segmentation alignment error; an I/O failure flushing the present
-/// record; or, if every source drops on RETRYABLE faults with the request still
-/// incomplete, a generic "all sources failed" error.
+/// An empty `lanes` or two lanes on one provider; a TERMINAL `fill_gap` fault
+/// propagated verbatim from a worker — either a shared-classifier terminal
+/// ([`crate::retry_disposition`]: a payment-layer rejection, an origin blacklist,
+/// or an over-cap blob) or a shared-pool exhaustion ([`crate::PoolExhausted`],
+/// terminal only for this scheduler); a segmentation alignment error; an I/O
+/// failure flushing the present record; or, if every source drops on RETRYABLE
+/// faults with the request still incomplete, an error naming what each lane did,
+/// wrapping the last real one so a caller can still downcast it.
 #[allow(clippy::too_many_arguments)]
+// Linear set-up (precondition check, segmentation, the shared-pool view) then
+// one drive and one failure report. Flat, not complex.
+#[allow(clippy::too_many_lines)]
 pub async fn multi_source_fetch<St, S, P, F>(
     store: &St,
     lanes: &[SourceLane<'_, S>],
@@ -593,6 +713,25 @@ where
 {
     if lanes.is_empty() {
         anyhow::bail!("multi_source_fetch requires at least one source lane");
+    }
+    // The premise the whole payment model rests on, checked rather than trusted:
+    // one lane per on-chain provider. Two lanes sharing a provider share a
+    // `(signer, provider)` watermark, and their concurrent voucher streams
+    // regress each other — the failure the caller's operator-spread admission is
+    // supposed to make impossible.
+    let mut seen_providers = HashSet::with_capacity(lanes.len());
+    for lane in lanes {
+        let provider = lane
+            .ctx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+            .provider;
+        if !seen_providers.insert(provider) {
+            anyhow::bail!(
+                "multi_source_fetch requires one lane per provider: {provider} appears twice, \
+                 which would run two concurrent voucher streams on one (signer, provider) lane"
+            );
+        }
     }
     let total_bytes = store.total_bytes();
 
@@ -617,21 +756,39 @@ where
             .map(|_| Arc::new(CancelHandle::new()))
             .collect(),
     });
+    // Wakes workers parked because nothing was pickable, whenever a peer frees,
+    // re-queues, or leaves the set.
+    let progress_wake = Notify::new();
+    // Per-lane reasons a lane stopped, so a fetch that runs out of lanes reports
+    // what each one did instead of a contentless count of unfetched bytes.
+    let faults: Mutex<Vec<LaneFault>> = Mutex::new(Vec::new());
 
-    // Shared aggregate-solvency reader: the sum, across EVERY lane, of the
-    // committed voucher amount — the pool's total spend so far. Each worker
-    // subtracts this from the shared deposit to size its own remaining balance,
-    // so no lane treats the whole deposit as its own. Cloning the `Arc<PoolLedger>`
-    // handles keeps the closure `'static`-free of the borrow on `lanes` and lets
-    // every worker share one reader.
+    // The three facts that belong to the POOL and not to any lane (see
+    // [`SharedPool`]). Cloning the `Arc` handles keeps the closures free of the
+    // borrow on `lanes` and lets every worker share one view.
     let lane_ledgers: Vec<Arc<PoolLedger>> = lanes.iter().map(|l| Arc::clone(&l.ledger)).collect();
-    let pool_spent = move || {
+    let spent = move || {
         lane_ledgers
             .iter()
             .map(|l| l.committed().amount)
             .fold(U256::ZERO, U256::saturating_add)
     };
-    let pool_spent: &(dyn Fn() -> U256 + Send + Sync) = &pool_spent;
+    let lane_ctxs: Vec<Arc<Mutex<PoolContext>>> =
+        lanes.iter().map(|l| Arc::clone(&l.ctx)).collect();
+    let credit = move |new_deposit: U256| -> anyhow::Result<()> {
+        for ctx in &lane_ctxs {
+            ctx.lock()
+                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                .deposit = new_deposit;
+        }
+        Ok(())
+    };
+    let topups_used = AtomicU32::new(0);
+    let pool = SharedPool {
+        spent: &spent,
+        topups_used: &topups_used,
+        credit: &credit,
+    };
 
     let workers = lanes.iter().enumerate().map(|(i, lane)| {
         run_worker(
@@ -646,9 +803,11 @@ where
             total_bytes,
             drive,
             &work,
+            &progress_wake,
+            &faults,
             on_progress,
             ms.unit_deadline,
-            pool_spent,
+            &pool,
         )
     });
     // Drive every worker to completion while a single periodic tick flushes the
@@ -659,27 +818,64 @@ where
     // whole in-flight fan-out on resume; the interval bounds that loss to one
     // `PRESENT_RECORD_FLUSH_INTERVAL`.
     let workers = futures_util::future::try_join_all(workers);
-    drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
+    let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
         workers.await?;
         Ok(())
     })
-    .await?;
+    .await;
 
     // Single-writer flush point (spec §5.5): every worker has finished, so the
     // in-memory present set is final — persist the `.ranges` record once more,
-    // off the per-checkpoint hot path.
-    store.flush_present_record()?;
+    // off the per-checkpoint hot path. This runs on the FAILURE path too: the
+    // bytes the fan-out did deliver are paid for, and dropping the record here
+    // makes the next invocation re-fetch and re-pay for them.
+    let flushed = store.flush_present_record();
+    outcome?;
+    flushed?;
 
     // No worker hangs: they either fill their ranges or drop. If every source
     // dropped with the request still incomplete, surface it as an error rather
-    // than returning a false success (or hanging).
+    // than returning a false success (or hanging) — naming each lane and keeping
+    // the last real error as the cause, so a caller's `downcast_ref` still
+    // reaches it (an `UpstreamRefused(NotFound)` here is what the CLI turns into
+    // the two-cause cache-miss diagnosis).
     let unfetched = contiguous_byte_ranges(&store.missing_ranges(offset, len).await?, total_bytes);
     if !unfetched.is_empty() {
         let bytes: u64 = unfetched
             .iter()
             .map(|(_, l)| *l)
             .fold(0, u64::saturating_add);
-        anyhow::bail!("all sources failed; {bytes} bytes unfetched");
+        let mut recorded = match faults.lock() {
+            Ok(mut f) => std::mem::take(&mut *f),
+            Err(_) => Vec::new(),
+        };
+        let detail = recorded
+            .iter()
+            .map(LaneFault::describe)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let summary = if detail.is_empty() {
+            format!("all sources failed; {bytes} bytes unfetched")
+        } else {
+            format!("all sources failed; {bytes} bytes unfetched: {detail}")
+        };
+        // Carry the last real error as the cause. A watchdog stall has none, and
+        // "every source stalled" is a different and more actionable statement
+        // than "the nodes refused" — so a stall-only set stays a bare summary.
+        let cause = recorded
+            .iter()
+            .rposition(|f| f.err.is_some())
+            .and_then(|i| {
+                if i < recorded.len() {
+                    recorded.swap_remove(i).err
+                } else {
+                    None
+                }
+            });
+        return match cause {
+            Some(e) => Err(e.context(summary)),
+            None => Err(anyhow::anyhow!(summary)),
+        };
     }
     Ok(())
 }
@@ -873,20 +1069,22 @@ mod tests {
         Ok(())
     }
 
-    /// Stall/fault reassignment: `src_a` faults after ~8 MiB of its segment;
+    /// Fault reassignment: `src_a` faults after ~8 MiB of its segment;
     /// `src_b` holds the whole blob and covers the reassigned remainder. The
     /// blob still assembles byte-identical, and the faulted source's verified
     /// prefix is NOT refetched (the remainder alone is reassigned).
     #[tokio::test]
-    async fn stalled_source_tail_is_reassigned_and_fetch_completes() -> anyhow::Result<()> {
+    async fn faulted_source_tail_is_reassigned_and_fetch_completes() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
         let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
         let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
-        // src_a faults after 8 MiB of wire on any range longer than that; its
-        // 32 MiB initial segment therefore delivers only a ~8 MiB prefix then
-        // faults. src_b is healthy.
+        // src_a returns a retryable `Err` after 8 MiB of wire on any range longer
+        // than that; its 32 MiB initial segment therefore delivers only a ~8 MiB
+        // prefix then faults. This is the `fill_gap`-error arm, NOT the stall
+        // watchdog — a wedged source that never errors is `stall_after`, covered
+        // separately. src_b is healthy.
         let src_a = ScriptedSource::new(data.clone())?
-            .with_fault_after(8 * 1024 * 1024, || anyhow::anyhow!("scripted stall"))
+            .with_fault_after(8 * 1024 * 1024, || anyhow::anyhow!("scripted fault"))
             .paying(Arc::clone(&ledger_a));
         let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
         let root = src_a.root();
@@ -958,7 +1156,7 @@ mod tests {
     /// before its first byte, so the fast source finishes its own segment and
     /// steals the slow source's tail). With steal-cancellation the stolen tail is
     /// fetched by exactly ONE source, so total delivered ≈ the blob size — not
-    /// ~1.5–2× it (which is what Task 4's bookkeeping-only steal produced).
+    /// ~1.5–2× it (what a bookkeeping-only steal — trim without cancel — produces).
     #[tokio::test]
     async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<()> {
         let data = blob(64 * 1024 * 1024);
@@ -1017,8 +1215,8 @@ mod tests {
             src_fast.delivered_bytes()
         );
         // THE no-double-pay assertion: total bytes fetched across BOTH sources is
-        // within a small bounded slop of the blob size. Task 4's behaviour would
-        // fetch the stolen ~16 MiB tail twice (~80 MiB total); cancellation keeps
+        // within a small bounded slop of the blob size. Without cancellation both
+        // sources fetch the stolen ~16 MiB tail (~80 MiB total); cancellation keeps
         // it near 64 MiB.
         let total_delivered = src_fast.delivered_bytes() + src_slow.delivered_bytes();
         assert!(
@@ -1098,7 +1296,7 @@ mod tests {
 
         let total_delivered = src_slow_finish.delivered_bytes() + src_stealer.delivered_bytes();
         // The backstop makes this exactly the blob size (every present-range steal
-        // is skipped); the pre-fix code re-fetches the stolen tail, +8 MiB here.
+        // is skipped); without it the stolen tail is re-fetched, +8 MiB here.
         // A 4 MiB slop sits cleanly between the two.
         assert!(
             total_delivered <= total + 4 * 1024 * 1024,
@@ -1172,9 +1370,9 @@ mod tests {
     /// [`UpstreamVoucherRejected`] — a payment-layer rejection the shared pool
     /// hits against every provider, so no other lane can fix it. `src_peer`
     /// (lane 1) is slow to start, so it is still on its OWN second segment when the
-    /// terminal fault cancels the worker set. The pre-fix scheduler folded every
-    /// `fill_gap` `Err` into `Faulted`, reassigning the range and ending as the
-    /// generic "all sources failed"; the fix propagates the typed error verbatim
+    /// terminal fault cancels the worker set. Folding every `fill_gap` `Err` into
+    /// `Faulted` would reassign the range and end as the generic "all sources
+    /// failed"; the scheduler instead propagates the typed error verbatim
     /// (downcast-assertable) and leaves the failed segment unfetched.
     #[tokio::test]
     async fn terminal_fault_propagates_and_is_not_reassigned() -> anyhow::Result<()> {
@@ -1373,8 +1571,8 @@ mod tests {
     /// Part A — per-provider payment lanes. Two sources with DISTINCT providers
     /// each pay their OWN ledger: the fetch assembles byte-identical, and each
     /// lane's cumulative advances INDEPENDENTLY, tracking exactly the wire that
-    /// source delivered (never the peer's). The pre-fix scheduler shared one
-    /// `ctx`/`ledger` for every source, so a second provider's bytes were paid on
+    /// source delivered (never the peer's). One `ctx`/`ledger` shared across
+    /// sources would pay a second provider's bytes on
     /// the first provider's lane; here each lane's `committed().bytes` matches its
     /// OWN source's delivered wire, proving the lanes are separate.
     #[tokio::test]
@@ -1430,8 +1628,8 @@ mod tests {
         );
 
         // Each lane's ledger advanced INDEPENDENTLY, and each carries only its OWN
-        // ~half of the blob — NOT the pool total. A single shared ledger (the
-        // pre-fix bug, forced by the old one-ledger API) would have BOTH sources'
+        // ~half of the blob — NOT the pool total. A single ledger shared across
+        // sources would have BOTH sources'
         // `finish` advance the SAME cumulative to ~the whole blob's wire; two
         // separate lanes each stay strictly below the whole blob, and together
         // cover it.
@@ -1696,6 +1894,449 @@ mod tests {
             combined <= one_leg_ceiling,
             "combined committed must stay within deposit + one in-flight leg: \
              combined={combined:?} ceiling={one_leg_ceiling:?}"
+        );
+        Ok(())
+    }
+
+    // ---- stall watchdog (`watchdog`, selected at the worker's `tokio::select!`) ----
+
+    /// A store double whose `missing_ranges` replays a scripted sequence of
+    /// still-missing byte counts, so every branch of [`watchdog`] runs against an
+    /// exact progress history under a paused clock — no wall-clock racing, and no
+    /// dependence on a source's real delivery timing.
+    ///
+    /// Only `total_bytes`/`missing_ranges` are reachable from `watchdog`; the rest
+    /// of the [`IngestStore`] surface returns an error rather than panicking, so a
+    /// future caller that starts using one gets a failure it can see.
+    struct ScriptedMissing {
+        total: u64,
+        /// Still-missing byte counts, one consumed per call. The LAST entry
+        /// repeats forever, which is what lets a "never trips" assertion run to a
+        /// timeout instead of running out of script.
+        script: Mutex<std::collections::VecDeque<u64>>,
+    }
+
+    impl ScriptedMissing {
+        fn new(total: u64, script: &[u64]) -> Self {
+            Self {
+                total,
+                script: Mutex::new(script.iter().copied().collect()),
+            }
+        }
+
+        fn next_missing(&self) -> u64 {
+            let mut q = self.script.lock().expect("script lock");
+            if q.len() > 1 {
+                q.pop_front().unwrap_or(0)
+            } else {
+                q.front().copied().unwrap_or(0)
+            }
+        }
+    }
+
+    fn unsupported<T>() -> decdn_bao_range::RangedStoreError {
+        let _ = std::marker::PhantomData::<T>;
+        decdn_bao_range::RangedStoreError::Backend(Box::from("unsupported on ScriptedMissing"))
+    }
+
+    impl decdn_bao_range::RangedStore for ScriptedMissing {
+        fn total_bytes(&self) -> u64 {
+            self.total
+        }
+
+        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            Box::pin(async { Err(unsupported::<()>()) })
+        }
+
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            _byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            let missing = self.next_missing();
+            Box::pin(async move {
+                if missing == 0 {
+                    return Ok(bao_tree::ChunkRanges::empty());
+                }
+                // 1 KiB per bao chunk; the byte counts the script names are
+                // multiples of that.
+                let start = bao_tree::ChunkNum(byte_offset / 1024);
+                let end = bao_tree::ChunkNum((byte_offset + missing) / 1024);
+                Ok(bao_tree::ChunkRanges::from(start..end))
+            })
+        }
+
+        fn admit(
+            &self,
+            _range: decdn_bao_range::AlignedRange,
+            _bao_bytes: bytes::Bytes,
+        ) -> decdn_bao_range::RangedFuture<'_, ()> {
+            Box::pin(async { Err(unsupported::<()>()) })
+        }
+
+        fn read(
+            &self,
+            _byte_offset: u64,
+            _byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bytes::Bytes> {
+            Box::pin(async { Err(unsupported::<()>()) })
+        }
+
+        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+            Box::pin(async { Err(unsupported::<()>()) })
+        }
+
+        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+            Box::pin(async { Err(unsupported::<()>()) })
+        }
+    }
+
+    impl crate::source::IngestStore for ScriptedMissing {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            _range: &'a decdn_bao_range::AlignedRange,
+            _reader: R,
+            _on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: crate::BaoRangeReader + 'a,
+        {
+            Box::pin(async { Err(anyhow::anyhow!("unsupported on ScriptedMissing")) })
+        }
+
+        fn flush_present_record(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// How long `watchdog` takes to trip against a scripted progress history, or
+    /// `None` if it does not trip within an hour of virtual time.
+    async fn watchdog_trips(script: &[u64], deadline: Duration) -> bool {
+        let store = ScriptedMissing::new(64 * 1024 * 1024, script);
+        tokio::time::timeout(
+            Duration::from_hours(1),
+            super::watchdog(&store, 0, 64 * 1024 * 1024, deadline),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// A full window with bytes still missing and the count NOT shrinking is the
+    /// definition of a stall — the watchdog trips and the worker's range is
+    /// reassigned. Flip the comparison to `now > prev` and a wedged source is
+    /// never reassigned: the fetch hangs to the outer cap.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_trips_when_missing_stops_shrinking() {
+        assert!(
+            watchdog_trips(&[8192, 8192], Duration::from_secs(10)).await,
+            "no progress across a full window must trip the watchdog"
+        );
+    }
+
+    /// A fully delivered range (`missing == 0`) is left to `fill_gap`'s own
+    /// completion, NEVER tripped: the source is inside `finish`, draining the
+    /// vouchers for bytes it already delivered. Tripping here would reassign an
+    /// ALREADY-PAID range — a direct double-pay.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_never_trips_a_fully_delivered_range() {
+        assert!(
+            !watchdog_trips(&[8192, 0], Duration::from_secs(10)).await,
+            "a delivered range must never be tripped while it finishes paying"
+        );
+    }
+
+    /// A source that keeps delivering, however slowly, resets the window at each
+    /// sample and is never reassigned. Without the reset, a healthy-but-slow
+    /// source is falsely reassigned mid-checkpoint — and the new lane re-pays the
+    /// credit-window tail.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_window_resets_while_missing_shrinks() {
+        assert!(
+            !watchdog_trips(
+                &[8192, 7168, 6144, 5120, 4096, 3072, 2048, 1024, 0],
+                Duration::from_secs(10)
+            )
+            .await,
+            "shrinking missing bytes must reset the window, never trip"
+        );
+    }
+
+    /// A zero deadline disables the watchdog outright — reachable today via
+    /// `--unit-deadline-ms 0`.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_zero_deadline_never_trips() {
+        assert!(
+            !watchdog_trips(&[8192, 8192], Duration::ZERO).await,
+            "a zero unit deadline must disable the watchdog"
+        );
+    }
+
+    /// End-to-end: a source that opens, delivers a prefix, then WEDGES without
+    /// erroring is ended by the watchdog ALONE, and its unfetched remainder is
+    /// picked up by a healthy peer. `with_fault_after` cannot produce this shape —
+    /// it takes the `fill_gap`-error arm instead.
+    ///
+    /// The segments are deliberately below `MIN_SPLIT_SIZE` (a 16 MiB blob over
+    /// two lanes) so the healthy peer CANNOT steal the wedged lane's tail: with
+    /// stealing unavailable, the watchdog is the only thing that can end the
+    /// wedge, and without it the fetch sits for the wedge's full 120 s.
+    #[tokio::test]
+    async fn wedged_source_is_ended_by_the_watchdog_and_its_tail_reassigned() -> anyhow::Result<()>
+    {
+        let data = blob(16 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        // A delivers ~4 MiB (one INGEST_CHECKPOINT_BYTES, so `missing_ranges`
+        // visibly shrinks first) and then sleeps far past the unit deadline.
+        let src_a = ScriptedSource::new(data.clone())?
+            .stall_after(4 * 1024 * 1024, Duration::from_mins(2))
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        // The outer bound is what turns "the watchdog never fired" into a
+        // failure rather than a two-minute wait.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            multi_source_fetch(
+                &store,
+                &lanes,
+                &pacer,
+                &funder,
+                root,
+                0,
+                total,
+                &DriveConfig {
+                    working_deposit: U256::ZERO,
+                    max_settle_waits: 0,
+                    settle_backoff: Duration::from_millis(1),
+                },
+                &MultiSourceConfig {
+                    max_sources: 2,
+                    // Well above a checkpoint's worth of delivery time, well
+                    // below the 120 s wedge.
+                    unit_deadline: Duration::from_millis(600),
+                },
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("the wedged lane was never ended: the watchdog did not fire")
+        })??;
+
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "assembled byte-identical after the wedged source was reassigned"
+        );
+        assert!(
+            src_a.delivered_bytes() < 8 * 1024 * 1024,
+            "the wedged source must not have delivered its whole segment: {}",
+            src_a.delivered_bytes()
+        );
+        Ok(())
+    }
+
+    // ---- lane-set preconditions and failure reporting ----
+
+    /// Two lanes on ONE provider are refused at the boundary. They would be two
+    /// concurrent voucher streams on one `(signer, provider)` watermark — the
+    /// hazard the one-unit-per-source rule exists to prevent — and the scheduler
+    /// checks its own premise rather than trusting the caller's admission policy.
+    #[tokio::test]
+    async fn lanes_sharing_one_provider_are_refused() -> anyhow::Result<()> {
+        let data = blob(1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src_a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        // Same provider byte on both lanes.
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xA1),
+        ];
+        let err = multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await
+        .expect_err("two lanes on one provider must be refused");
+        assert!(
+            format!("{err:#}").contains("one lane per provider"),
+            "the refusal must name the duplicate-provider precondition: {err:#}"
+        );
+        // Nothing was fetched or billed.
+        assert_eq!(src_a.delivered_bytes(), 0, "no lane may run");
+        assert_eq!(src_b.delivered_bytes(), 0, "no lane may run");
+        Ok(())
+    }
+
+    /// A fetch that runs out of lanes reports WHAT each lane did and keeps the
+    /// last real error as its cause, so the CLI's `downcast_ref` diagnosis (the
+    /// two-cause unbound-cache-miss explanation) still reaches it. Dropping the
+    /// errors leaves the user of a failed multi-GB fetch with a byte count and
+    /// nothing else: `decdn` installs no tracing subscriber, so an unreturned
+    /// error is a destroyed one.
+    #[tokio::test]
+    async fn all_sources_failing_names_each_lane_and_keeps_the_cause() -> anyhow::Result<()> {
+        let data = blob(8 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        // Both sources refuse with a RETRYABLE typed error, so every lane drops
+        // and the request stays incomplete.
+        let src_a = ScriptedSource::new(data.clone())?
+            .with_fault_after(0, || {
+                anyhow::Error::new(crate::UpstreamRefused::mid_stream(
+                    decdn_protocol::client::StreamError::Overloaded,
+                ))
+            })
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?
+            .with_fault_after(0, || {
+                anyhow::Error::new(crate::UpstreamRefused::mid_stream(
+                    decdn_protocol::client::StreamError::Overloaded,
+                ))
+            })
+            .paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        let err = multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 4,
+                unit_deadline: Duration::from_secs(10),
+            },
+            None,
+        )
+        .await
+        .expect_err("every lane refused, so the fetch must fail");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("bytes unfetched"),
+            "the summary still states what is missing: {rendered}"
+        );
+        // Attribution: both lanes' payee addresses are named.
+        assert!(
+            rendered.contains(&format!("{}", Address::repeat_byte(0xA1)))
+                && rendered.contains(&format!("{}", Address::repeat_byte(0xB2))),
+            "each lane must be named by its provider: {rendered}"
+        );
+        // The typed cause survives, which is what makes the CLI's cache-miss
+        // annotation reachable on this path at all.
+        assert!(
+            err.downcast_ref::<crate::UpstreamRefused>().is_some(),
+            "the last real error must remain downcastable: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// A freed worker with nothing to steal PARKS rather than retiring, so it is
+    /// still there to take over when a peer faults moments later.
+    ///
+    /// Shape: an 16 MiB blob splits into two 8 MiB segments, both below the 16 MiB
+    /// `MIN_SPLIT_SIZE`, so the fast worker's `pick` finds nothing splittable —
+    /// the routine end-of-fetch condition. The slow worker then faults and
+    /// re-queues its remainder. A retiring worker is gone by then and the fetch
+    /// bails "all sources failed" with a healthy, already-paid lane sitting idle.
+    #[tokio::test]
+    async fn a_parked_worker_takes_over_a_later_faulted_peers_remainder() -> anyhow::Result<()> {
+        let data = blob(16 * 1024 * 1024);
+        let ledger_a = Arc::new(PoolLedger::new(Cumulative::default()));
+        let ledger_b = Arc::new(PoolLedger::new(Cumulative::default()));
+        // A: holds back long enough for B to finish its own segment and find
+        // nothing worth stealing, then delivers a prefix and faults.
+        let src_a = ScriptedSource::new(data.clone())?
+            .slow_to_start(Duration::from_millis(400))
+            .with_fault_after(2 * 1024 * 1024, || anyhow::anyhow!("scripted fault"))
+            .paying(Arc::clone(&ledger_a));
+        let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
+        let root = src_a.root();
+        let total = src_a.total_bytes();
+        let (store, dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+
+        let lanes = vec![
+            lane(&src_a, Arc::clone(&ledger_a), 0xA1),
+            lane(&src_b, Arc::clone(&ledger_b), 0xB2),
+        ];
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            &MultiSourceConfig {
+                max_sources: 2,
+                unit_deadline: Duration::from_secs(30),
+            },
+            None,
+        )
+        .await?;
+
+        store.finalize().await?;
+        assert_eq!(
+            std::fs::read(dir.path().join("b"))?,
+            data,
+            "the parked worker covered the faulted peer's remainder"
         );
         Ok(())
     }

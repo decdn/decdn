@@ -1114,6 +1114,30 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **`decdn fetch` fans a large blob out across several holders at once (ADR 039,
+  #1164).** A blob above `--multi-source-min-bytes` (64 MiB) with at least two
+  operator-distinct holders is fetched in parallel over the existing paid
+  `cdn/client/v1` protocol: bao-aligned segments, one per source, with a freed
+  source stealing the second half of the largest range still in flight. No new
+  wire surface — a bounded `byte_len` request already exists and the node
+  already bills the exact aligned span. New flags: `--multi-source` /
+  `--no-multi-source`, `--max-sources` (4), `--multi-source-min-bytes` (64 MiB),
+  `--unit-deadline-ms` (10 s). The node's cache-miss pull leg is untouched, and
+  `bundle pull` stays single-source.
+  - **One payment lane per operator, enforced.** A voucher lane is keyed on
+    `(signer, provider)` and `provider` IS the operator address, so admission
+    takes at most one node per operator and the admitted set shrinks rather than
+    repeat one. The scheduler re-checks the same precondition on the lane set it
+    is handed.
+  - **One deposit, one set of pool facts.** Every lane's deposit gate subtracts
+    the spend committed across ALL lanes, the reactive-top-up budget is counted
+    once per fetch rather than once per lane, and a landed top-up credits every
+    lane's context.
+  - **A failed fan-out falls back to single-source failover** unless the failure
+    is terminal (a pool exhaustion, or what the shared classifier rules
+    terminal). The fetch reports what every source did and keeps the last real
+    error as the cause.
+
 - **The workspace is published to crates.io.** Eleven crates ship —
   `decdn-protocol`, `-config-types`, `-bao-range`, `-common`, `-cache`,
   `-gossip`, `-reputation`, `-incentive`, `-client-pull`, `-node` and

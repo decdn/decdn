@@ -545,6 +545,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             fetch::ProxyWarmingParams::from_args(self.common),
         )
         .await?;
+        // `bundle pull` is single-source (its `open_lock` serializes legs), so
+        // only the candidate order is used here.
+        let order = order.candidates;
 
         let mut last_err: Option<anyhow::Error> = None;
         for (attempt, cand) in order.iter().enumerate() {

@@ -388,6 +388,13 @@ mod doubles {
         /// steal of an already-present range is deterministic — the exact
         /// completed-but-uncleared window the present-bytes backstop must close.
         finish_stall: Option<Duration>,
+        /// Wedge every reader after it has delivered `n` wire bytes: it sleeps
+        /// for the given duration instead of yielding the next chunk. Models a
+        /// source that opens, delivers a prefix, then stops making progress
+        /// WITHOUT erroring — the only shape that reaches the scheduler's stall
+        /// watchdog. A source that returns `Err` takes the fault path instead,
+        /// so `with_fault_after` cannot stand in for this.
+        stall_after: Option<(u64, Duration)>,
         /// Optional ledger to advance on a clean `finish`, modelling payment: a
         /// real pull pays vouchers for the WIRE bytes it drains, and the driver's
         /// completion is PAID-frontier based (`content_paid_frontier`), so a double
@@ -427,6 +434,7 @@ mod doubles {
                 delivered: Arc::new(AtomicU64::new(0)),
                 first_read_stall: None,
                 finish_stall: None,
+                stall_after: None,
                 ledger: None,
             })
         }
@@ -438,6 +446,18 @@ mod doubles {
         #[must_use]
         pub const fn slow_finish(mut self, stall: Duration) -> Self {
             self.finish_stall = Some(stall);
+            self
+        }
+
+        /// Wedge every reader once it has delivered `after_bytes`: the next read
+        /// sleeps for `stall` rather than returning bytes, so the source stops
+        /// making verified progress without ever erroring (see
+        /// [`stall_after`](Self::stall_after)). Pair a `stall` well above the
+        /// scheduler's `unit_deadline` with a checkpoint-crossing `after_bytes`
+        /// to trip the stall watchdog deterministically.
+        #[must_use]
+        pub const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
+            self.stall_after = Some((after_bytes, stall));
             self
         }
 
@@ -573,6 +593,8 @@ mod doubles {
                         wire_len,
                         delivered: Arc::clone(&self.delivered),
                         first_read_stall: self.first_read_stall,
+                        stall_after: self.stall_after,
+                        read_so_far: 0,
                     },
                 ))
             })
@@ -628,6 +650,12 @@ mod doubles {
         /// A one-time stall consumed on the first `read_bytes` (see
         /// [`ScriptedSource::slow_to_start`]); `None` after it fires once.
         first_read_stall: Option<Duration>,
+        /// Wedge this reader once it has delivered the byte threshold (see
+        /// [`ScriptedSource::stall_after`]); `None` after it fires once.
+        stall_after: Option<(u64, Duration)>,
+        /// Wire bytes this reader has yielded so far, against `stall_after`'s
+        /// threshold.
+        read_so_far: u64,
     }
 
     impl iroh_io::AsyncStreamReader for ScriptedReader {
@@ -637,6 +665,15 @@ mod doubles {
             // this reader's tail — the deterministic steal trigger. Cancellation
             // drops this future while it sleeps, delivering nothing on this leg.
             if let Some(stall) = self.first_read_stall.take() {
+                tokio::time::sleep(stall).await;
+            }
+            // A source that delivered a prefix and then wedged: it holds the
+            // connection open, returns no error, and simply stops. Only the
+            // progress-relative watchdog can end this.
+            if let Some((after, stall)) = self.stall_after
+                && self.read_so_far >= after
+            {
+                self.stall_after = None;
                 tokio::time::sleep(stall).await;
             }
             // Model a real network read's yield point. A synchronous in-memory
@@ -651,6 +688,7 @@ mod doubles {
             let chunk = self.wire.split_to(take);
             self.delivered
                 .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            self.read_so_far = self.read_so_far.saturating_add(chunk.len() as u64);
             Ok(chunk)
         }
 

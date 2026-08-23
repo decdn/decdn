@@ -68,6 +68,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -115,6 +116,34 @@ impl std::fmt::Display for PoolExhausted {
 }
 
 impl std::error::Error for PoolExhausted {}
+
+/// The state ONE pool deposit's concurrent lanes share, injected by the
+/// multi-source scheduler. Absent (`None`) on the single-source path, where the
+/// one lane IS the pool and its own [`DriveCounters`] and [`PoolContext`] already
+/// hold every fact below.
+///
+/// Three facts are properties of the POOL, not of a lane, so a per-lane copy of
+/// any of them lets N lanes each spend what only one pool holds:
+///
+/// - **Spend.** The deposit gate must subtract what EVERY lane committed, not
+///   what this one did.
+/// - **Top-up budget.** [`Funder::max_topups`] bounds the reactive top-ups ONE
+///   fetch may escrow. Counting them per-lane multiplies the bound by the lane
+///   count.
+/// - **Deposit.** A landed top-up raises the deposit every lane draws on. Written
+///   only through this lane's `ctx`, it is invisible to the others, whose gate
+///   still subtracts the aggregate spend from a stale deposit and walks to a
+///   false exhaustion.
+pub(crate) struct SharedPool<'a> {
+    /// Sum, across every lane, of the committed voucher amount — the pool's
+    /// total spend so far.
+    pub(crate) spent: &'a (dyn Fn() -> U256 + Send + Sync),
+    /// Reactive top-ups this FETCH has spent, across every lane.
+    pub(crate) topups_used: &'a AtomicU32,
+    /// Credit a landed top-up's new deposit to EVERY lane's `PoolContext`, so no
+    /// lane gates on a stale deposit.
+    pub(crate) credit: &'a (dyn Fn(U256) -> anyhow::Result<()> + Send + Sync),
+}
 
 /// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
@@ -358,7 +387,7 @@ where
     // (and re-pay for) the whole in-flight range on resume; the interval bounds
     // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
     // single-source path's sole periodic flush owner — `fill_gap` never flushes.
-    drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
+    let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
         let mut counters = DriveCounters::new();
         for (gap_start, gap_len) in gaps {
             fill_gap(
@@ -377,21 +406,27 @@ where
                 on_progress,
                 pacing_wait,
                 served_paid,
-                // Single-source: the deposit gate uses this one lane's own
-                // committed amount (no aggregate view). The multi-source
-                // scheduler passes a shared summing reader here instead.
+                // Single-source: this one lane IS the pool, so its own
+                // `counters` and `ctx` already hold the spend, the top-up
+                // budget, and the deposit. The multi-source scheduler injects
+                // the shared view of all three here instead.
                 None,
             )
             .await?;
         }
         Ok(())
     })
-    .await?;
+    .await;
 
-    // Final flush now that every gap this drive filled has landed: persists the
-    // terminal `.ranges` snapshot (the interval owner above already bounded any
-    // mid-fetch crash-loss to one interval).
-    store.flush_present_record()?;
+    // Final flush of whatever landed — on the FAILURE path too. The bytes a
+    // failed drive did deliver are paid for, and the interval owner's last tick
+    // can be up to one interval stale, so skipping this on `Err` discards
+    // already-bought resume progress the next invocation would have to re-pay
+    // for. The drive's own error is the more informative one, so it wins when
+    // both fail; a flush failure alone still surfaces.
+    let flushed = store.flush_present_record();
+    outcome?;
+    flushed?;
 
     // Promote only when the WHOLE blob is present — `finalize` verifies and
     // renames the whole `.partial`, which it cannot do while bytes outside `R`
@@ -429,7 +464,7 @@ pub(crate) async fn fill_gap<St, S, P, F>(
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
     served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
-    pool_spent: Option<&(dyn Fn() -> U256 + Send + Sync)>,
+    pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -446,7 +481,7 @@ where
     // 039 § Payment model: one deposit backs the whole set). It replaces ONLY the
     // amount subtracted for the deposit gate — the per-leg paid-frontier math below
     // still reads THIS lane's own `committed.bytes`.
-    let spent = move |own_amount: U256| pool_spent.map_or(own_amount, |f| f());
+    let spent = move |own_amount: U256| pool.map_or(own_amount, |p| (p.spent)());
 
     // Per-open state; reset the moment an open succeeds. `awaiting_settle` is set
     // only right after a top-up, and consulted ONLY in the error-classification
@@ -533,7 +568,13 @@ where
             remaining_deposit,
             next_voucher_cost: counters.next_voucher_cost,
             working_deposit: config.working_deposit,
-            topups_used: counters.topups_used,
+            // The reactive-top-up budget is a property of the POOL, not of a
+            // lane: `Funder::max_topups` bounds what ONE fetch may escrow, and
+            // every lane escrows into the ONE deposit. Multi-source reads the
+            // count shared across lanes; single-source reads its own.
+            topups_used: pool.map_or(counters.topups_used, |p| {
+                p.topups_used.load(Ordering::Acquire)
+            }),
             max_topups: funder.max_topups(),
             exhaustion_confirmed,
             // `pulled_frontier` is this leg's own admitted/present frontier —
@@ -582,9 +623,18 @@ where
                     DepositOutcome::Added(new_deposit) => {
                         // Credit the new deposit through the shared handle so the
                         // source's next open (which clones the context) sees it.
-                        ctx.lock()
-                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-                            .deposit = new_deposit;
+                        // The deposit backs the whole lane set, so multi-source
+                        // credits EVERY lane: a lane left on the pre-top-up value
+                        // subtracts the aggregate spend from a stale deposit and
+                        // walks to a false exhaustion the pool can already fund.
+                        match pool {
+                            Some(p) => (p.credit)(new_deposit)?,
+                            None => {
+                                ctx.lock()
+                                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                                    .deposit = new_deposit;
+                            }
+                        }
                     }
                     DepositOutcome::UnknownPool => {
                         anyhow::bail!(
@@ -602,7 +652,14 @@ where
                         );
                     }
                 }
-                counters.topups_used = counters.topups_used.saturating_add(1);
+                // Spend one unit of the top-up budget — the shared one when lanes
+                // draw on one pool, so N lanes cannot each escrow `max_topups`.
+                match pool {
+                    Some(p) => {
+                        p.topups_used.fetch_add(1, Ordering::AcqRel);
+                    }
+                    None => counters.topups_used = counters.topups_used.saturating_add(1),
+                }
                 // The node's watcher may not observe this top-up before the next
                 // open; wait it out rather than misread the refusal.
                 awaiting_settle = true;

@@ -153,8 +153,15 @@ pub(crate) fn initial_segments(
 }
 
 /// Pick the largest remaining range and, if it is at least [`MIN_SPLIT_SIZE`],
-/// return its aligned second half for a freed source to steal. Returns `None`
-/// when nothing remaining is worth a fresh stream.
+/// return its index in `remaining` together with its aligned second half for a
+/// freed source to steal. Returns `None` when nothing remaining is worth a fresh
+/// stream.
+///
+/// The INDEX is returned, not just the half, so the caller trims the range this
+/// function actually split. Re-deriving the argmax at the call site couples two
+/// modules to one tie-breaking rule with no compiler support: a caller that
+/// picked a different maximum would trim and cancel one source while a second
+/// keeps streaming — and paying for — the tail this half just handed away.
 ///
 /// The chosen range is first [canonicalized](canonicalize_ranges) to its
 /// enclosing group boundaries, so the returned half never rounds up past the
@@ -164,12 +171,18 @@ pub(crate) fn initial_segments(
 ///
 /// # Errors
 ///
-/// Propagates [`decdn_bao_range::RangeVerifyError`] from `align_range`.
+/// Propagates [`decdn_bao_range::RangeVerifyError`] for a range out of bounds
+/// against `total_bytes` — raised by [`canonicalize_ranges`], which runs before
+/// `align_range` ever sees the range.
 pub(crate) fn steal_split(
     remaining: &[(u64, u64)],
     total_bytes: u64,
-) -> anyhow::Result<Option<AlignedRange>> {
-    let Some(&(start, len)) = remaining.iter().max_by_key(|&&(_, len)| len) else {
+) -> anyhow::Result<Option<(usize, AlignedRange)>> {
+    let Some((victim, &(start, len))) = remaining
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &(_, len))| len)
+    else {
         return Ok(None);
     };
     if len < MIN_SPLIT_SIZE {
@@ -189,7 +202,7 @@ pub(crate) fn steal_split(
     if second_half.fetch_start() <= canon_start || second_half.fetch_start() >= canon_end {
         return Ok(None);
     }
-    Ok(Some(second_half))
+    Ok(Some((victim, second_half)))
 }
 
 #[cfg(test)]
@@ -235,6 +248,10 @@ mod tests {
             total,
         )?
         .expect("above floor");
+        let (victim, stolen) = stolen;
+        // The 40 MiB range at index 1 is the one split — the caller trims THAT
+        // one, never a re-derived argmax of its own.
+        assert_eq!(victim, 1);
         assert!(stolen.fetch_start() > 10 * 1024 * 1024);
         assert_eq!(stolen.fetch_end(), 50 * 1024 * 1024);
         assert_eq!(stolen.fetch_start() % (16 * 1024), 0);
@@ -299,7 +316,7 @@ mod tests {
         // true end of the range (not the blob) is what must bound the steal.
         let range = (0, 20 * 1024 * 1024 + 3 * 1024);
         let total = 64 * 1024 * 1024;
-        let stolen = super::steal_split(&[range], total)?.expect("above floor");
+        let (_, stolen) = super::steal_split(&[range], total)?.expect("above floor");
         let enclosing_group_end = (range.0 + range.1).div_ceil(16 * 1024) * (16 * 1024);
         assert!(stolen.fetch_end() <= enclosing_group_end.min(total));
         Ok(())
