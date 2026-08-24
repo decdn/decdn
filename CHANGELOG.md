@@ -549,10 +549,11 @@ since project inception and will roll into the first tagged release.
   store overwrote, leaving tests written against the memory store unrepresentative
   of what ships. Both impls now raise the stored total and never lower it, with
   `forget_loss` the only downward transition. The redb store resolves the row
-  through one `redb::Table::entry` lookup and drops the transaction instead of
-  committing when the total does not advance, so a late, smaller write costs no
-  fsync — this table shares one file with the lane table, where an unconditional
-  commit contended with the periodic voucher flush.
+  aborts the transaction instead of committing when the total does not advance,
+  so a late, smaller write costs no fsync — this table shares one file with the
+  lane table, where an unconditional commit contended with the periodic voucher
+  flush. Skipping the commit is sound only because every writer of that file uses
+  `Durability::Immediate`, so the stored total is already durable.
 
 - **A cooperative close now reconciles when the client's watermark lags the
   node's (#1495).** `decdn channel coop-close`
@@ -847,15 +848,17 @@ since project inception and will roll into the first tagged release.
 
 - **The node flushes lane writes to redb in table-key order, and the workspace
   floor moves to `redb = "4.2"`.** `flush` drains a `HashSet` of dirty lanes, so
-  the batch reached redb in an order randomized per process. Sorting it by the
-  `pool_id ‖ signer ‖ provider` table key first lets the insert loop append
-  rightward through the B-tree instead of splitting a page per key: the
-  `lane_state_v1` table holds about half as many pages and the full-table scan at
-  the next open runs sequentially. The `4.2` floor is load-bearing rather than
-  cosmetic — 4.2 is the first release that walks a large ascending batch inside
-  one transaction without panicking on a leaf page that fills through in-place
-  appends, and `redb = "4"` would let a lockfile regeneration resolve back below
-  it. Tombstones sort alongside the writes, so a flush is fully deterministic.
+  the batch reached redb in an arbitrary order. Sorting it by the
+  `pool_id ‖ signer ‖ provider` table key first hits redb's append fast path,
+  which fills a leaf page before opening the next instead of leaving each one
+  part-full at a random split point: measured over 512 lanes, `lane_state_v1`
+  occupies about 30% fewer leaf pages (47 against 65-68). The gain lands on keys
+  appended past the end of the table — new lanes, and the cold-load case — since
+  an overwrite of a hydrated lane replaces in place whatever order it arrives in.
+  The `4.2` floor is load-bearing: that append fast path arrives in 4.2, and below
+  it the same sort is a pessimization (1.31x MORE leaf pages on 4.1), so a
+  lockfile regeneration resolving under the floor would silently invert the
+  change. Tombstones sort alongside the writes, so a flush is deterministic.
 
 - **config: `cache.max_blob_size_mb` now defaults to `cache.cache_size_mb`
   instead of a fixed 1 GiB.** The old memory-era default refused a blob a node's

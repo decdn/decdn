@@ -453,13 +453,15 @@ impl PendingSettleStore for MemoryPendingSettleStore {
 /// restart does not grant a pool a fresh free-floor budget: the un-vouchered floor
 /// is un-redeemable, so it appears in no on-chain quantity and must be stored here.
 ///
-/// Implementations MUST commit durably (fsync, on disk-backed impls) before
-/// returning `Ok`, mirroring the [`PoolStateStore`] contract. Implementations MUST
-/// also raise a pool's total monotonically: the callers are floor-reservation drops
-/// that each read their own cumulative total on their own blocking thread and can
-/// land out of order, so no caller can impose an ordering. A total at or below the
-/// stored one leaves the row unchanged. [`PoolFloorLossStore::forget_loss`] is the
-/// only downward transition, and it clears the row outright at pool close.
+/// Implementations MUST raise a pool's total monotonically: a total at or below
+/// the stored one leaves the row unchanged, and [`PoolFloorLossStore::forget_loss`]
+/// is the only downward transition. The store owns this rather than the caller
+/// because a caller that persists its total from an independent task cannot order
+/// its writes against another's.
+///
+/// Any write that raises the total MUST commit durably (fsync, on disk-backed
+/// impls) before returning `Ok`, mirroring the [`PoolStateStore`] contract. A call
+/// that raises nothing may skip the commit: the durable value already satisfies it.
 pub trait PoolFloorLossStore: Send + Sync {
     /// Raise the pool's cumulative dead-charge total to `micro_usdc`. A total at or
     /// below the stored one is a no-op, so a late, smaller write cannot regress the

@@ -49,7 +49,7 @@ use decdn_incentive::{
     AdvanceOutcome, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome, LaneChain, LaneKey,
     LaneState, PoolId,
 };
-use redb::{Database, Durability, Entry, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 /// File name of the redb database within `data_dir`.
@@ -769,22 +769,27 @@ struct FlushSnapshot {
 impl FlushSnapshot {
     /// Order both batches by their [`lane_key_bytes`] table key, which is redb's
     /// own key order — redb compares a `&[u8; N]` key lexicographically over the
-    /// encoding. The insert loop then walks the B-tree left to right, packing
-    /// leaf pages instead of splitting one per key: the table holds about half
-    /// as many pages, and [`PersistentPoolStateStore::hydrate_lanes`] scans it
-    /// sequentially at the next open.
+    /// encoding. Ascending keys hit redb's append fast path, which fills a leaf
+    /// page before opening the next instead of leaving each page part-full at a
+    /// random split point. Measured over 512 lanes at this key and value size,
+    /// the table occupies about 30% fewer leaf pages (47 against 65-68).
+    ///
+    /// The gain lands on keys appended past the end of the table — new lanes, and
+    /// the cold-load case — because an overwrite of a hydrated lane replaces in
+    /// place whatever order it arrives in. Steady-state flushes are dominated by
+    /// overwrites, so treat this as a bound on how far the table sprawls over its
+    /// lifetime rather than a saving on every flush.
     ///
     /// Sorting the encoded key rather than an `Ord` on [`LaneKey`] keeps the
     /// sort key and the redb key the same value, so a change to the key layout
     /// cannot make the two disagree. `dirty` and `tombstones` are disjoint (see
     /// [`LaneBuffer`]), so the insert run and the remove run never meet on one
     /// key, and sorting both leaves the whole flush deterministic — the buffer
-    /// holds them in `HashSet`s, whose iteration order is randomized per
-    /// process.
+    /// holds them in `HashSet`s, whose iteration order carries no meaning.
     fn sort_by_table_key(&mut self) {
         self.writes
-            .sort_unstable_by_key(|(lane, _)| lane_key_bytes(lane));
-        self.tombstones.sort_unstable_by_key(lane_key_bytes);
+            .sort_by_cached_key(|(lane, _)| lane_key_bytes(lane));
+        self.tombstones.sort_by_cached_key(lane_key_bytes);
     }
 }
 
@@ -1246,48 +1251,41 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
         write_txn
             .set_durability(Durability::Immediate)
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        // Monotonic write: a pool's `dead_charge` only ever grows. Concurrent
-        // reservation drops on the same pool commit from independent blocking
-        // threads and can land out of order, so a late, smaller total leaves the
-        // row alone rather than re-granting already-consumed free-floor budget.
-        // One `entry` lookup resolves the row for both the compare and the write.
+        // Monotonic write: a pool's `dead_charge` only ever grows. The caller reads
+        // its cumulative total under a lock but persists it from an independent
+        // blocking task, so two writes for one pool can land out of order. A total
+        // at or below what is stored therefore leaves the row alone rather than
+        // re-granting already-consumed free-floor budget. `begin_write` holds redb's
+        // exclusive writer slot, so the compare and the write are atomic together.
         let advanced = {
             let mut table = write_txn
                 .open_table(POOL_FLOOR_LOSS_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            match table
-                .entry(&key)
-                .map_err(|err| StoreError::Backend(format!("entry: {err}")))?
-            {
-                Entry::Occupied(mut occupied) => {
-                    let existing = occupied
-                        .get()
-                        .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-                        .value();
-                    if micro_usdc > existing {
-                        occupied
-                            .insert(micro_usdc)
-                            .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Entry::Vacant(vacant) => {
-                    vacant
-                        .insert(micro_usdc)
-                        .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-                    true
-                }
+            let existing = table
+                .get(&key)
+                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+                .map_or(0u128, |v| v.value());
+            if micro_usdc > existing {
+                table
+                    .insert(&key, micro_usdc)
+                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+                true
+            } else {
+                false
             }
         };
-        // A total at or below what is stored changes nothing, so drop the
-        // transaction instead of committing it. Dropping aborts, which skips an
-        // fsync that would write back the value already on disk — this table
-        // shares one redb file with the lane table, so a no-op commit contends
-        // with the periodic voucher flush.
+        // Nothing changed, so abort rather than fsync a transaction that holds no
+        // change. This is sound only because every writer of this file commits with
+        // `Durability::Immediate`: `existing` is therefore already durable and at or
+        // above what this call asks for, so the postcondition holds without a write.
+        // A `Durability::None` writer anywhere in this file breaks that. Aborting
+        // does not free redb's writer slot any earlier than a commit would — the
+        // slot was taken at `begin_write` — it saves the fsync, which is what
+        // contends with the periodic voucher flush on this shared file.
         if !advanced {
-            return Ok(());
+            return write_txn
+                .abort()
+                .map_err(|err| StoreError::Backend(format!("abort (no-op write): {err}")));
         }
         write_txn
             .commit()
@@ -1977,9 +1975,9 @@ mod tests {
         assert_floor_loss_is_monotonic(&PersistentPoolStateStore::open(dir.path())?)
     }
 
-    /// The monotonic floor is what reaches disk: the smaller total's transaction is
-    /// dropped rather than committed, and that abort must not roll back the larger
-    /// total's earlier commit.
+    /// The monotonic floor is what reaches disk. The smaller total lands LAST, so a
+    /// store that wrote unconditionally would leave it behind for the reopen to
+    /// find; this pins the durable outcome, not the mechanism that produces it.
     #[test]
     fn redb_pool_floor_loss_non_regression_survives_reopen() -> anyhow::Result<()> {
         let dir = data_dir()?;
@@ -1994,6 +1992,47 @@ mod tests {
         }
         let store = PersistentPoolStateStore::open(dir.path())?;
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_000u128)]);
+        Ok(())
+    }
+
+    /// Out-of-order totals for one pool settle on the maximum. This is the shape
+    /// the monotonic contract exists for: the caller reads its cumulative total
+    /// under a lock, then persists it from an independent blocking task, so the
+    /// writes arrive interleaved. Reading and writing inside one `begin_write` is
+    /// what makes the compare-and-raise atomic — splitting the compare into its own
+    /// read transaction would reintroduce a lost update, and this test is what
+    /// would catch that.
+    #[test]
+    fn concurrent_out_of_order_totals_settle_on_the_max() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        let pool = sample(11).pool_id;
+        // Jumbled per thread so no thread walks its own values in order, and the
+        // global maximum is not written by the last thread to finish.
+        let threads: Vec<_> = (0u128..8)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || -> Result<(), StoreError> {
+                    for i in 0u128..64 {
+                        store.record_loss(pool, (i * 37 + t * 11) % 500)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in threads {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+        }
+        let want = (0u128..8)
+            .flat_map(|t| (0u128..64).map(move |i| (i * 37 + t * 11) % 500))
+            .max()
+            .ok_or_else(|| anyhow::anyhow!("empty value set"))?;
+        anyhow::ensure!(
+            store.load_losses()? == vec![(pool, want)],
+            "interleaved writers settle on the maximum, not the last write"
+        );
         Ok(())
     }
 
@@ -2149,11 +2188,19 @@ mod tests {
         Ok(())
     }
 
-    /// A large batch recorded in descending key order flushes in one transaction
-    /// and hydrates whole at the next open. This is the multi-leaf-page ascending
-    /// append path the sort feeds redb.
+    /// A batch large enough to span many leaf pages flushes in one transaction and
+    /// hydrates whole at the next open, and it lands in redb packed rather than
+    /// sprawling.
+    ///
+    /// `record` marks lanes in a `HashSet`, so a test cannot choose the order the
+    /// snapshot is built in — only [`FlushSnapshot::sort_by_table_key`] decides what
+    /// redb sees. The `leaf_pages` bound is therefore the one assertion that ties
+    /// `flush` to that sort: unsorted `HashSet` order measures 65-68 pages here and
+    /// sorted measures 47, so dropping the call from `flush` trips the bound.
     #[test]
-    fn flush_of_a_large_descending_batch_round_trips() -> anyhow::Result<()> {
+    fn flush_of_a_large_batch_lands_packed_and_round_trips() -> anyhow::Result<()> {
+        use redb::ReadableTableMetadata as _;
+
         let dir = data_dir()?;
         let mut lanes: Vec<LaneState> = Vec::with_capacity(512);
         for pool in 0u8..=255 {
@@ -2161,7 +2208,6 @@ mod tests {
                 lanes.push(mk_lane(pool, signer, 1_000 + u64::from(pool)));
             }
         }
-        lanes.reverse();
         {
             let store = PersistentPoolStateStore::open(dir.path())?;
             for lane in &lanes {
@@ -2180,6 +2226,15 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("lane missing after reopen"))?;
             anyhow::ensure!(got == *lane, "each lane round-trips to its own record");
         }
+
+        let read_txn = store.db.begin_read()?;
+        let leaf_pages = read_txn.open_table(LANE_TABLE)?.stats()?.leaf_pages();
+        anyhow::ensure!(
+            leaf_pages <= 55,
+            "a sorted flush packs {} lanes into <=55 leaf pages; got {leaf_pages} \
+             (unsorted measures 65-68, so this is `flush` skipping the sort)",
+            lanes.len()
+        );
         Ok(())
     }
 
