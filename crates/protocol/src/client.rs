@@ -575,8 +575,8 @@ impl StreamResponse {
 /// than on frames. A sender therefore picks whatever size suits it; nothing is
 /// negotiated and no message carries the choice.
 ///
-/// The lower bound is load-bearing, not cosmetic (#1088). A shorter final frame
-/// A shorter final frame is permitted, never an *empty* one: an empty frame carries no
+/// The lower bound is load-bearing, not cosmetic (#1088). A shorter final frame is
+/// permitted, never an *empty* one: an empty frame carries no
 /// payload, so it advances neither the receiver's cumulative byte count nor its
 /// voucher accounting. An unbounded run of them therefore drives the receive
 /// loops without making application-level progress, and the `cumulative >

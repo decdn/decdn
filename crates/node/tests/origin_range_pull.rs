@@ -45,7 +45,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 mod support;
 use support::{
     HandlerDomains, build_handler_full_configured, fresh_key, local_endpoint, permissive_limiter,
-    read_client_msg, shutdown, spawn_server, write_client_msg,
+    read_client_msg, read_stream_response, shutdown, spawn_server, write_client_msg,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -201,14 +201,8 @@ async fn ranged_paid_pull(
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
     write_frame_to(&mut send, &payload).await?;
 
-    let resp = match read_client_msg(&mut recv).await? {
-        ClientMessage::StreamResponse(r) => r,
-        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
-    };
-    anyhow::ensure!(
-        resp.body.ok,
-        "delivery refused (code rides in the trailing ext)"
-    );
+    let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     // The advertised size is the *whole* blob; the range delivers `byte_len`, or
     // the whole tail when `byte_len == 0`. Reject an impossible advertised total
     // rather than masking a server bug: a signed `total_bytes` before the offset
