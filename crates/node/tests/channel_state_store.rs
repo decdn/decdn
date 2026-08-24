@@ -691,8 +691,9 @@ async fn record_loss_races_the_lane_flush_on_the_shared_file() -> anyhow::Result
 
 /// Floor-loss survival across a restart, distinguishable from overwrite
 /// semantics (#1783): the SMALLER total lands LAST before the restart, so a
-/// store that overwrote — the pre-#1780 behavior the existing restart coverage
-/// cannot tell apart — would hydrate the regressed value. A second pool plays
+/// store that overwrote rather than raised monotonically would hydrate the
+/// regressed value — a single-fold restart test cannot tell the two apart. A
+/// second pool plays
 /// the #1781 race (its `record_loss` lands after its `forget_loss`) and must
 /// stay gone across the same restart, with the bring-up sweep reclaiming its
 /// tombstone.

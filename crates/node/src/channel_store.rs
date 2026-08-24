@@ -1389,9 +1389,8 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
         // serialized after this commit sees the tombstone, so the delete cannot be
         // undone by an in-flight persist (#1781). The tombstone goes in even when
         // the pool never recorded a row — the racing `record_loss` may be the
-        // pool's FIRST — which is also why the pre-tombstone "no-op on a
-        // never-written store" early-return is gone: forget must always leave the
-        // marker.
+        // pool's FIRST — so forget takes no "never-written store" early-return:
+        // it must always leave the marker.
         {
             let mut table = write_txn
                 .open_table(POOL_FLOOR_LOSS_TABLE)
@@ -1413,8 +1412,12 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
     }
 
     fn sweep_forgotten(&self) -> Result<usize, StoreError> {
-        // Existence probe via a read transaction so a store that never forgot a
-        // pool sweeps nothing and creates nothing.
+        // Existence probe via a read transaction: a missing table means no
+        // writer has ever committed on it, so there is nothing to sweep and
+        // nothing to create. The table existing does NOT imply a tombstone —
+        // any committed `record_loss` creates it empty as a side effect of its
+        // in-transaction check — that case falls through to the no-op abort
+        // below.
         {
             let read_txn = self
                 .db
@@ -1452,9 +1455,11 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
                 }
                 keys
             };
-            // Belt-and-braces: `record_loss`'s in-transaction tombstone check means
-            // a tombstoned pool can hold no loss row, but the removal is O(1) per
-            // tombstone and heals any row a pre-tombstone build leaked.
+            // Belt-and-braces: `record_loss`'s in-transaction tombstone check
+            // means a tombstoned pool can hold no loss row, so each removal is
+            // expected to remove nothing. It is O(1) per tombstone and keeps the
+            // sweep's postcondition — neither row nor tombstone for a forgotten
+            // pool — independent of that invariant.
             let mut table = write_txn
                 .open_table(POOL_FLOOR_LOSS_TABLE)
                 .map_err(|e| floor_loss_backend_err("open_table", None, e))?;
