@@ -58,7 +58,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
-use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
 use crate::dht::chain_projection::{with_read, with_write};
@@ -259,10 +259,11 @@ impl<R: RegistryChainReads> RegistrySink<R> {
                 // Dropping the change leaves the cached set out of sync with chain
                 // state until a follow-up event for the same operator arrives, or
                 // until `on_tick_complete`'s re-enumeration succeeds. An RPC
-                // failure here usually travels with the poll failure that
-                // eventually errors the route, and `on_recovered` forces the
-                // re-enumeration on the tick the route comes back — so the repair
-                // tracks the outage rather than the cadence. Unlike a
+                // failure here is an `eth_call` while the poll is `eth_getLogs`,
+                // so it can happen with the route perfectly healthy — in which
+                // case the repair is the cadence, not the recovery edge. When it
+                // does travel with a poll failure, `on_recovered` forces the
+                // re-enumeration on the tick the route comes back. Unlike a
                 // stream-level error this does not trip the watcher backoff, so
                 // without this counter it would move no metric at all.
                 self.metrics.staker_set_watcher_resolve_failure();
@@ -372,8 +373,13 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
     /// and the cadence is at its least helpful — the reconcile is skipped while
     /// the route is errored, so the repair has not been running. Clearing the
     /// clock makes [`Self::on_tick_complete`], on this same tick, re-read.
+    ///
+    /// Floored by [`clear_cadence_on_recovery`]: an endpoint that flaps rather
+    /// than staying down produces a recovery edge every few seconds, and
+    /// clearing the clock unconditionally would aim a full paginated enumeration
+    /// at it on each one.
     fn on_recovered(&mut self) {
-        self.last_resync = None;
+        clear_cadence_on_recovery(&mut self.last_resync, self.resync_interval);
     }
 
     /// Cadence-gated re-enumeration: rebuild both projections from chain state
@@ -1263,6 +1269,14 @@ mod tests {
                 .any(|l| l == "decdn_capacity_bond_registry_resync_failures_total 1"),
             "a failed resync must surface on its counter:\n{text}"
         );
+        // And the liveness gauge must stay unstamped. Stamping it here would
+        // disable the staleness alert, which is the only thing that catches the
+        // resync being skipped rather than failing.
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_capacity_bond_registry_last_resync_timestamp_seconds 0"),
+            "a failed resync must not stamp the liveness gauge:\n{text}"
+        );
     }
 
     /// A successful resync stamps the liveness gauge. That gauge is the only
@@ -1306,8 +1320,10 @@ mod tests {
         let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
         let (mut sink, active, _bindings, _op, _regions, _m) = sink(reads, true);
 
-        // The clock is freshly stamped, so the cadence alone would defer a full
-        // interval — the state a route has after erroring for a while.
+        // Last resync a few minutes ago: past the recovery floor, far short of
+        // the cadence. This is the state a route is in after an outage — the
+        // cadence alone would defer for the rest of the interval.
+        sink.last_resync = Instant::now().checked_sub(Duration::from_mins(5));
         sink.on_tick_complete().await.unwrap();
         assert!(
             active.read().unwrap().is_empty(),
@@ -1324,6 +1340,36 @@ mod tests {
         assert!(
             is_active(&active, nid(9)),
             "the reconcile on the recovery tick must re-enumerate"
+        );
+    }
+
+    /// The forced resync is floored, so a flapping endpoint cannot buy one full
+    /// enumeration per flap.
+    ///
+    /// A recovery edge fires every time a route comes back from an errored tick.
+    /// An endpoint that flaps rather than staying down produces one on roughly
+    /// the backoff interval — seconds — and each unfloored one would aim a
+    /// paginated `getRegisteredNodes` at an endpoint that is already failing.
+    #[tokio::test]
+    async fn a_flapping_route_cannot_force_a_resync_per_recovery() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
+        let (mut sink, active, _bindings, _op, _regions, _m) = sink(reads, true);
+
+        // A resync that just landed — the state after the previous flap's
+        // forced re-enumeration.
+        let just_now = Instant::now();
+        sink.last_resync = Some(just_now);
+
+        sink.on_recovered();
+        assert_eq!(
+            sink.last_resync,
+            Some(just_now),
+            "a resync younger than the floor must survive the recovery edge"
+        );
+        sink.on_tick_complete().await.unwrap();
+        assert!(
+            active.read().unwrap().is_empty(),
+            "and the reconcile must still be gated, so no enumeration is issued"
         );
     }
 

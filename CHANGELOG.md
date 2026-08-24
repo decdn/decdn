@@ -602,12 +602,46 @@ since project inception and will roll into the first tagged release.
   warm entries. A faulted candidate keeps whatever the previous index held for
   it; one first seen inside the fault window has nothing to carry forward and is
   absent until a later rescan. Faults surface on
-  `decdn_cache_origin_probe_failures_total` and reach both DHT seed paths
-  through `HolderSnapshot::origin_probe_faults`, which is the origin-held half's
-  counterpart to `store_error` — neither half can now truncate the announce set
-  while the snapshot reads healthy. An HTTP origin still reports a 5xx as a plain
-  negative (the `Origin::size` contract), so this covers S3/R2 and the
-  filesystem.
+  `decdn_cache_origin_probe_failures_total` and reach every DHT seed path through
+  `HolderSnapshot`, the origin half's counterpart to `store_error`. An HTTP
+  origin still reports a server-side 5xx as a plain negative (the `Origin::size`
+  contract), so that one case stays invisible; its transport faults, S3/R2 and
+  the filesystem all count.
+  - The index and its unresolved counts are one `ArcSwap` payload, published and
+    read together, so a seed cannot pair a fault-truncated set with a later
+    rescan's zero count and call it healthy. `origin_held_snapshot` is the only
+    way to read it — `origin_held_hashes` is gone, because a caller that could
+    take the set without the counts is how that pairing gets lost.
+  - Rescans are serialized. Carrying an entry forward makes a rescan a
+    read-modify-write spanning the whole walk, and both triggers spawn detached,
+    so two overlapping passes let the slower one publish a payload derived from a
+    pre-empted index — dropping whatever the fresher pass found. A walk also gets
+    slower exactly when the origin is faulting, which is when a second pass is
+    most likely to start on top of it.
+  - Only a retry-eligible fault carries an entry forward. A permanent one — a
+    revoked ACL, a symlink escape — reads the same on every rescan, so carrying
+    it would advertise content the serve path refuses until an operator
+    intervened.
+  - Candidates dedupe on their own `seen` set. Keying off the index being built
+    re-probed every hash that resolved absent, or faulted with nothing to carry
+    forward, once per listing it appeared in — and counted a fault per probe.
+  - Rescan probes are bounded by their own ceiling rather than
+    `cache.origin_probe_timeout_ms`, which is sized to stop a slow origin
+    stalling the probe *serve* path. Borrowing it would turn a merely slow origin
+    into an all-fault rescan, and on a cold boot — where nothing can be carried
+    forward — into a permanently empty announce set.
+  - `decdn_cache_origin_enumerate_failures_total` covers the rescan's other leg.
+    An origin whose listing fails contributes no candidates at all, so its hashes
+    leave the announce set with no per-hash fault and nothing to carry forward:
+    the same silent shrink, one step earlier.
+  - The origin-only ownership probe each stored hash is put to counts its faults
+    on `decdn_dht_republish_seed_origin_probe_failures_total`, the origin-side
+    twin of the store-walk counter beside it. A `Fault` there is skipped rather
+    than announced, which on a remote origin dropped a node's own store-only
+    content on a transport blip while the snapshot read healthy.
+  - All three seed paths report a short set. The periodic rescan seed runs far
+    more often than the boot seed or the lag sweep, so leaving it silent made the
+    most common truncation the least visible one.
 
 - **dht: a poisoned scheduler lock no longer wedges the republisher for the
   process lifetime.** Every `Mutex` site in `RepublishScheduler` swallowed
@@ -621,7 +655,11 @@ since project inception and will roll into the first tagged release.
   `with_read`/`with_write` that recovers via `PoisonError::into_inner` and warns.
   Recovery is safe here: the invariant is "`scheduled` mirrors the heap", and
   both sides already tolerate the other's entry being absent, so a torn state
-  costs one spurious or one skipped republish rather than corruption.
+  costs one spurious or one skipped republish rather than corruption. All three
+  helpers clear the poison as they recover, so the warning is one line per panic
+  rather than one per acquisition — these locks sit on a 1 Hz timer and on the
+  inbound `Store` path, where an ungated log is the flood `dispatch`'s own poison
+  gate exists to prevent.
 
 - **dht: a lag sweep is cancelled at shutdown instead of racing the cache
   flush.** The sweep is detached and holds a `CacheEngine` clone, and
@@ -634,10 +672,13 @@ since project inception and will roll into the first tagged release.
   before it flushes the store, and the sweep worker selects against that same
   token. The ordering is the point: a signal the republisher had to forward would
   reach the sweep only once that task was next polled, which is not ordered
-  against the flush at all. A sweep abandoned on shutdown also releases its
-  `CacheEngine` clone before the flush rather than after. A queued pass is
-  discarded along with it, which is correct here and is now stated rather than
-  claimed away — see #1814 for the panic path, where it is not.
+  against the flush at all. The worker's `select!` is `biased` on that token, so
+  a sweep polled any time after the flush takes the cancel arm instead of
+  observing the store it was walking disappear. Nothing joins the worker, so it
+  may outlive the flush by a poll — it just cannot report anything once
+  cancelled. A queued pass is discarded along with it, which is correct here and
+  is now stated rather than claimed away — see #1814 for the panic path, where it
+  is not.
 
 - **node: the capacity-bond registry resync now reports whether it is working.**
   `RegistrySink::on_tick_complete` is the only systematic repair for a drifted
@@ -658,9 +699,20 @@ since project inception and will roll into the first tagged release.
   `on_recovered`, a sync no-op-by-default seam the poller fires on the tick a
   route comes back from an errored one — before that tick's reconcile, so a sink
   that clears its cadence clock there re-reads immediately rather than a full
-  interval later. `RegistrySink` clears `last_resync`; the repair now tracks the
-  outage that caused the drift. All five watchers on the shared poller have the
-  seam.
+  interval later. All five sinks on the shared poller use it: the registry,
+  slash, blacklist, fee-shares and rate-bounds sinks each gate their reconcile on
+  a clock they stamp *before* the read, so all five deferred a further interval
+  after exactly the outage that made them stale.
+  - The forced re-read is floored at a fifteenth of each sink's own cadence. A
+    recovery edge fires whenever a route comes back from an errored tick, so an
+    endpoint that flaps rather than staying down would otherwise buy a full
+    authoritative re-read per flap, aimed at an endpoint already failing.
+  - `ErasedSink`'s method defaults are gone. It has exactly one implementation —
+    the blanket forward — so a default there is unreachable, and its only effect
+    was to turn a forgotten forward into a silent no-op that swallowed every real
+    sink's implementation.
+  - The recovery edge is armed by `fail_whole_tick` too, so a shared head-read
+    failure — the shape a whole-RPC outage takes — arms it for every route.
 
 - **dht: coalesced lag sweeps are countable.**
   `decdn_dht_republish_lag_sweeps_total` counts lag *events* rather than store

@@ -47,7 +47,7 @@ use tracing::{debug, info, warn};
 use decdn_common::redact::sanitize_err_chain;
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
-use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
 use crate::metrics::{Metrics, metric_hook};
 
@@ -403,6 +403,18 @@ impl<R: SlashChainReads> LogSink for SlashSink<R> {
             "detected-slash set resynced from chain"
         );
         Ok(())
+    }
+
+    /// Force the backstop re-read on the tick the watcher recovers, rather than
+    /// waiting out the cadence.
+    ///
+    /// [`Self::on_tick_complete`] stamps its clock before the read, so an outage
+    /// that spans a due tick defers the re-read a further `resync_interval` —
+    /// and the reconcile does not run at all while the route is errored. A slash
+    /// recorded during the outage would otherwise sit unseen for up to that long,
+    /// which eats into the appeal window.
+    fn on_recovered(&mut self) {
+        clear_cadence_on_recovery(&mut self.last_resync, self.resync_interval);
     }
 }
 

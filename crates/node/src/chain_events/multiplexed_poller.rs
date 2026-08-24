@@ -86,10 +86,8 @@ use super::{backfill_windows, timed};
 #[async_trait]
 pub(crate) trait ErasedSink: Send {
     async fn apply(&mut self, log: Log) -> Result<()>;
-    async fn on_tick_complete(&mut self) -> Result<()> {
-        Ok(())
-    }
-    fn on_recovered(&mut self) {}
+    async fn on_tick_complete(&mut self) -> Result<()>;
+    fn on_recovered(&mut self);
 }
 
 #[async_trait]
@@ -202,13 +200,16 @@ struct RouteState {
     errored: bool,
     /// First-cycle edge tracking for `on_established`.
     established: bool,
-    /// Set when this route errored on an earlier tick and has not yet been told
-    /// it recovered; consumed by `notify_recovered_routes` on the first tick it
-    /// comes back clean.
+    /// Set when this route — or the tick as a whole, via `fail_whole_tick` —
+    /// errored on an earlier tick and has not yet been told it recovered;
+    /// consumed by `notify_recovered_routes` on the first tick it comes back
+    /// clean.
     ///
     /// Not derived from `!established`: that is also true on the first-ever
     /// tick, and a sink whose reconcile just ran at bootstrap would then be
-    /// asked to re-read immediately.
+    /// asked to re-read immediately. The condition this records is "errored at
+    /// least once", which a shared-read failure on the very first tick does
+    /// satisfy — that route then gets one redundant re-read, which is safe.
     recovering: bool,
 }
 
@@ -547,10 +548,21 @@ fn notify_recovered_routes(poller: &mut MultiplexedPoller, shutdown: &Cancellati
         if r.errored || !r.recovering {
             continue;
         }
+        let Some(sink) = r.sink.as_erased_mut() else {
+            // Unreachable in production; see the matching branch in
+            // `demux_window_logs`. The edge is deliberately NOT consumed here —
+            // clearing it would lose the recovery notification for the whole
+            // outage rather than for one tick.
+            debug_assert!(
+                false,
+                "route {} has an unresolved SinkSource::Factory at recovery time; \
+                 spawn() must resolve every factory before run()",
+                r.label
+            );
+            continue;
+        };
         r.recovering = false;
-        if let Some(sink) = r.sink.as_erased_mut() {
-            sink.on_recovered();
-        }
+        sink.on_recovered();
     }
 }
 
@@ -1231,6 +1243,60 @@ mod tests {
             1,
             "route B does not re-apply — its floor already covers this range"
         );
+    }
+
+    /// A shared-read failure arms the recovery edge for every route.
+    ///
+    /// `fail_whole_tick` returns before `notify_recovered_routes` and
+    /// `fire_route_hooks` ever run, so it is the *only* place the edge is armed
+    /// for a whole-RPC outage — the most common real one, and the one a
+    /// cadence-gated sink most needs the forced re-read after. Nothing else
+    /// covers this leg: a per-route apply failure takes an entirely different
+    /// path through `fire_route_hooks`.
+    #[tokio::test]
+    async fn a_whole_tick_failure_arms_the_recovery_edge_for_every_route() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let (route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
+        let (route_b, sink_b) = head_route("b", ADDR_B, TOPIC_B);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .route(route_a)
+                .route(route_b)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // Tick 1: the shared head read fails, so no route errored individually.
+        asserter.push_failure_msg("head is down");
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_err(), "a head-read failure must fail the tick");
+
+        // Tick 2: the RPC is back.
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&Vec::<Log>::new());
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "recovery tick should complete: {result:?}");
+
+        for (label, sink) in [("a", &sink_a), ("b", &sink_b)] {
+            let guard = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                guard.recovered_at.len(),
+                1,
+                "route {label} must be told it recovered from a whole-tick failure, \
+                 or a cadence-gated sink waits out its full interval after the \
+                 outage that made it stale"
+            );
+            assert_eq!(
+                guard.recovered_at.first().copied(),
+                Some(0),
+                "route {label}'s recovery must land before that tick's reconcile"
+            );
+        }
     }
 
     /// A route that recovers must be told, on the recovery tick and before that

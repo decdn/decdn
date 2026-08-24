@@ -419,6 +419,21 @@ pub struct DecdnMetrics {
     /// Operator-visible name:
     /// `decdn_dht_republish_seed_store_walk_failures_total`.
     pub dht_republish_seed_store_walk_failures: Counter,
+
+    /// Stored hashes a bulk republish seed could not put to its origin — the
+    /// ownership test an origin-only node applies to every blob in its store,
+    /// answered by neither "yours" nor "not yours".
+    ///
+    /// The origin-side twin of
+    /// `decdn_dht_republish_seed_store_walk_failures_total`, and it degrades the
+    /// same way: a hash that cannot be confirmed is left out of the announce set
+    /// rather than advertised, because announcing on a transport blip risks
+    /// offering content the serve gate then refuses. So an unreachable remote
+    /// origin quietly shrinks the announce set of a node that holds the content.
+    /// Distinct from `decdn_cache_origin_probe_failures_total`, which counts the
+    /// rescan's probes rather than the seed's. Operator-visible name:
+    /// `decdn_dht_republish_seed_origin_probe_failures_total`.
+    pub dht_republish_seed_origin_probe_failures: Counter,
     /// Accepted vouchers whose nonce skipped one or more values past the
     /// previously-accepted nonce (`voucher.nonce > last_nonce + 1`), counted
     /// once per gapped voucher (#747). The voucher is still accepted —
@@ -1188,8 +1203,9 @@ pub struct DecdnMetrics {
     /// that catches a resync being *skipped* — the reconcile does not run at all
     /// while the route is errored, which emits nothing, not even the failure
     /// counter. Reads `0` until the first successful resync, which is one
-    /// `REGISTRY_RESYNC_INTERVAL` after boot at the earliest, so an alert needs
-    /// both a `> 0` guard and a threshold above that interval.
+    /// `REGISTRY_RESYNC_INTERVAL` after boot on the cadence alone, sooner if the
+    /// watcher errors and recovers before then. So an alert needs both a `> 0`
+    /// guard and a threshold above that interval.
     pub capacity_bond_registry_last_resync_timestamp_seconds: Gauge,
     /// `decdn_blacklist_watcher_last_tick_timestamp_seconds` (#1316, #1320): Unix
     /// time of the blacklist watcher's last successful poll tick. This is the
@@ -2137,6 +2153,10 @@ recorders! {
     /// Record a bulk republish seed (boot cold start or lag sweep) that could
     /// not walk the store and covered only the origin-held half.
     dht_republish_seed_store_walk_failure => dht_republish_seed_store_walk_failures.inc();
+    /// Record `count` stored hashes a bulk republish seed could not put to its
+    /// origin, leaving them out of the announce set.
+    dht_republish_seed_origin_probe_failures(count: u64) =>
+        dht_republish_seed_origin_probe_failures.inc_by(count);
 
     /// Stamp the slash watcher's `*_last_tick_timestamp_seconds` liveness gauge
     /// with the current wall-clock time (#1316). The `on_tick_success` hook,

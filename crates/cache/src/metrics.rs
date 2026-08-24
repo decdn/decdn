@@ -175,18 +175,18 @@ pub struct CacheMetrics {
 
     /// Origin size probes that faulted during an origin rescan — a transport
     /// error from one or more configured origins with none of them confirming
-    /// the object, or the probe walk overrunning
-    /// `cache.origin_probe_timeout_ms` — rather than answering "held" or "not
-    /// held".
+    /// the object, or the probe walk overrunning its ceiling — rather than
+    /// answering "held" or "not held".
     ///
     /// Operator-actionable: a rescan resolves each candidate against the origin
     /// to decide what this node advertises, so a throttled `HeadObject` window
     /// during a rescan would otherwise shrink the announce set silently. A
-    /// faulted candidate keeps its previous index entry where there is one, so
-    /// a nonzero rate means the index is running on stale sizes; a candidate
-    /// first seen during the fault window has no previous entry and is absent
-    /// from the announce set until a later rescan resolves it. Correlate with
-    /// the origin backend's own error rate.
+    /// retry-eligible fault keeps whatever entry an earlier pass indexed, so a
+    /// sustained nonzero rate means the node may still be advertising content
+    /// the origin has since stopped holding — every request for it is then a
+    /// refusal. A candidate first seen inside the fault window has no earlier
+    /// entry and is simply absent until a later rescan resolves it. Correlate
+    /// with the origin backend's own error rate.
     ///
     /// Field name omits `_total`: the `OpenMetrics` encoder appends it
     /// automatically, so the emitted name is

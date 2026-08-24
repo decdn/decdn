@@ -197,7 +197,7 @@ impl RepublishScheduler {
     /// Batch-schedule every hash in `iter` with an independent
     /// cold-start jitter draw (uniform(0, 40 min) per hash, NOT a
     /// shared timestamp). Callers pass a `holder_snapshot` result,
-    /// or `origin_held_hashes` for the origin-only rescan — never
+    /// or `origin_held_snapshot` for the origin-only rescan — never
     /// `access_times_snapshot`, which maps `Hash -> Instant` and is
     /// empty on cold start; see the `iter_hashes` rustdoc.
     ///
@@ -371,10 +371,11 @@ pub(crate) struct HolderSnapshot {
 /// store-only content on a blip and reports a healthy snapshot.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
-/// yielding nothing, because a partial announce strictly beats none. Both
-/// halves report their own degradation — `store_error` for the store walk,
-/// `origin_probe_faults` for the last origin rescan — so neither can truncate
-/// the announce set while the snapshot reads healthy.
+/// yielding nothing, because a partial announce strictly beats none. Every way
+/// the set can come up short reports itself: `store_error` when the walk failed
+/// outright, `origin_probe_faults` for questions the origin would not answer —
+/// the last rescan's and this walk's own ownership tests both — and
+/// `origin_enumerate_failures` for an origin that could not be listed at all.
 pub(crate) async fn holder_snapshot(
     cache: &decdn_cache::CacheEngine,
     relay_foreign_namespaces: bool,
@@ -416,15 +417,15 @@ pub(crate) async fn holder_snapshot(
 
 /// What one lag sweep did, for the completion log.
 ///
-/// `degraded` rides along so the completion line names the outcome: a
-/// store-walk failure warns from inside [`lag_sweep`], several frames away, and
-/// an unqualified "complete" would read as a clean run to anyone grepping for
-/// it.
+/// `degraded` rides along so the completion line names the outcome: the warnings
+/// come from inside [`lag_sweep`], several frames away, and an unqualified
+/// "complete" would read as a clean run to anyone grepping for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SweepOutcome {
     /// Hashes this sweep newly scheduled.
     reseeded: usize,
-    /// Whether the store walk failed, leaving only the origin-held half.
+    /// Whether this sweep could not resolve everything the node holds — a failed
+    /// store walk, a faulted origin probe, or an origin that could not be listed.
     degraded: bool,
 }
 
@@ -454,6 +455,9 @@ async fn lag_sweep(
              origin-held half only. Blobs held only in the store stay \
              un-republished until the next sweep or restart"
         );
+    }
+    if snapshot.origin_probe_faults > 0 {
+        metrics.dht_republish_seed_origin_probe_failures(snapshot.origin_probe_faults);
     }
     if snapshot.origin_probe_faults > 0 || snapshot.origin_enumerate_failures > 0 {
         tracing::warn!(
@@ -525,11 +529,14 @@ struct SweepSlot<'a> {
 /// Detached, like the batch publish: the store walk costs one `status()` per
 /// blob, and running it on the `select!` loop would stall shutdown and the
 /// eager per-insert publishes. Cancelled on shutdown — the next lag, or the
-/// next boot, re-seeds. Cancelling rather than letting the walk run out
-/// matters twice: the worker drops its `CacheEngine` clone before the runtime
-/// flushes the store, and a walk that ends because the store went away under
-/// it never reaches `lag_sweep`'s degradation arm, which would otherwise fire
-/// an alertable counter on an ordinary restart.
+/// next boot, re-seeds.
+///
+/// The cancellation is what keeps a clean restart quiet. The runtime cancels
+/// before it flushes the store, and the `select!` below is `biased` with
+/// cancellation first, so a worker polled any time after the flush takes the
+/// cancel arm rather than observing the store it was walking disappear and
+/// reporting that as a degradation. Nothing joins the worker, so it may outlive
+/// the flush by a poll — it just cannot report anything once cancelled.
 ///
 /// Coalescing re-runs rather than drops. Each pass re-derives the advertised
 /// set once, at its start, so a lag observed mid-walk concerns commits that
@@ -595,9 +602,10 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     let shutdown = slot.shutdown.clone();
     let relay_foreign_namespaces = slot.relay_foreign_namespaces;
     tokio::spawn(async move {
-        // RAII for the panic path: a panic inside the walk (iroh-blobs is
-        // outside the workspace anti-panic lints) would otherwise strand the
-        // slot and disable every later sweep for the process lifetime, while
+        // RAII for the two paths that leave without a successful release CAS:
+        // shutdown, and a panic inside the walk (iroh-blobs is outside the
+        // workspace anti-panic lints). Either would otherwise strand the slot and
+        // disable every later sweep for the process lifetime, while
         // `lag_sweeps_total` kept climbing — a wedge that reads as health.
         let mut guard = SweepSlotGuard {
             state: &state,
@@ -1103,12 +1111,31 @@ mod tests {
     struct StubOrigin {
         data: bytes::Bytes,
         hash: decdn_cache::Hash,
+        axes: StubAxes,
+    }
+
+    /// The four axes real backends differ on, as one value so a constructor
+    /// cannot set three of them and forget the fourth.
+    ///
+    /// Four independent booleans is what the fixture is: each axis is a distinct
+    /// thing a real backend does or does not do, and every combination models a
+    /// backend that exists. `Default` is "holds nothing, lists nothing, fails
+    /// nothing", so each constructor names only what it varies.
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct StubAxes {
+        /// `enumerate` lists the blob, which is what puts it in the origin-held
+        /// index.
         enumerable: bool,
+        /// `size` confirms the blob — the ownership test.
         answers_size: bool,
-        /// `size` returns a transport error instead of an answer — the fourth
-        /// axis, because a backend that is merely unreachable must not read as
-        /// one that does not hold the object.
+        /// `size` returns a transport error instead of an answer, because a
+        /// backend that is merely unreachable must not read as one that does not
+        /// hold the object.
         faults_size: bool,
+        /// `enumerate` fails, so the rescan gets no candidates from this origin
+        /// at all — the coarser half of the same outage.
+        faults_enumerate: bool,
     }
 
     impl decdn_cache::Origin for StubOrigin {
@@ -1141,14 +1168,14 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
         > {
-            if self.faults_size {
+            if self.axes.faults_size {
                 return Box::pin(async {
                     Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
                         "synthetic HEAD outage"
                     )))
                 });
             }
-            let n = (self.answers_size && hash == self.hash)
+            let n = (self.axes.answers_size && hash == self.hash)
                 .then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
             Box::pin(async move { Ok(n) })
         }
@@ -1162,7 +1189,14 @@ mod tests {
                     + '_,
             >,
         > {
-            let out = if self.enumerable {
+            if self.axes.faults_enumerate {
+                return Box::pin(async {
+                    Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
+                        "synthetic listing outage"
+                    )))
+                });
+            }
+            let out = if self.axes.enumerable {
                 vec![self.hash]
             } else {
                 Vec::new()
@@ -1177,9 +1211,11 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable,
-            answers_size: enumerable,
-            faults_size: false,
+            axes: StubAxes {
+                enumerable,
+                answers_size: enumerable,
+                ..StubAxes::default()
+            },
         })
     }
 
@@ -1190,9 +1226,25 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable: false,
-            answers_size: true,
-            faults_size: false,
+            axes: StubAxes {
+                answers_size: true,
+                ..StubAxes::default()
+            },
+        })
+    }
+
+    /// An origin that cannot be listed and cannot answer `size` — a backend that
+    /// has gone away entirely, so the rescan reports both of its legs.
+    fn enumerating_faulting_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+        Arc::new(StubOrigin {
+            data: bytes::Bytes::from_static(payload),
+            hash: decdn_cache::Hash::new(payload),
+            axes: StubAxes {
+                enumerable: true,
+                answers_size: true,
+                faults_size: true,
+                faults_enumerate: true,
+            },
         })
     }
 
@@ -1202,9 +1254,11 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable: false,
-            answers_size: true,
-            faults_size: true,
+            axes: StubAxes {
+                answers_size: true,
+                faults_size: true,
+                ..StubAxes::default()
+            },
         })
     }
 
@@ -1214,9 +1268,7 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable: false,
-            answers_size: false,
-            faults_size: false,
+            axes: StubAxes::default(),
         })
     }
 
@@ -1323,7 +1375,7 @@ mod tests {
         // enumerate, and neither is pinned. Without the ownership probe the
         // snapshot would be empty.
         assert!(
-            cache.origin_held_hashes().is_empty(),
+            cache.origin_held_snapshot().hashes.is_empty(),
             "fixture precondition: nothing is enumerable or pinned"
         );
 
@@ -1381,6 +1433,43 @@ mod tests {
         assert!(
             outcome.degraded,
             "a sweep that could not resolve everything it holds is degraded"
+        );
+        Ok(())
+    }
+
+    /// The rescan's own unresolved counts must reach the seed, not just the
+    /// walk's.
+    ///
+    /// `holder_snapshot` seeds both counters from the cache's report and then
+    /// adds its own ownership-probe faults on top. Without this, replacing
+    /// either initializer with a literal `0` passes every other test while
+    /// silently disabling the rescan half of the degradation signal end to end —
+    /// including the cold-start warn and `SweepOutcome::degraded`.
+    #[tokio::test]
+    async fn holder_snapshot_carries_the_rescans_own_failures() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        // Enumerable, so the rescan asks about it — and faulting, so it cannot
+        // answer. The listing itself fails too, which is the other leg.
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![enumerating_faulting_stub_origin(b"rescan-wiring")],
+            16,
+        )
+        .await?;
+        cache.rescan_origins().await;
+
+        let snap = holder_snapshot(&cache, true).await;
+        assert_eq!(
+            snap.origin_enumerate_failures, 1,
+            "the rescan's failed listing must reach the seed"
+        );
+
+        let scheduler = RepublishScheduler::new();
+        let metrics = crate::metrics::Metrics::new();
+        let outcome = lag_sweep(&cache, true, &scheduler, &metrics).await;
+        assert!(
+            outcome.degraded,
+            "a seed built on a rescan that could not list its origin is degraded"
         );
         Ok(())
     }
@@ -1543,7 +1632,9 @@ mod tests {
 
     /// A lag that lands while a sweep owns the slot folds into that sweep and
     /// bumps the coalesced sibling, so `lag_sweeps_total` stays readable: the
-    /// difference between the two is the number of walks actually started.
+    /// difference between the two is the number of lags that claimed an idle
+    /// slot. Not the number of walks — a folded lag earns the running worker a
+    /// further pass, which the difference never counts.
     ///
     /// Drives the slot protocol directly with the state pre-claimed. A
     /// concurrency-observing variant would have to win a race against a real
@@ -1553,9 +1644,13 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let tmp = tempfile::tempdir()?;
+        let held = decdn_cache::Hash::new(b"coalesce");
         let cache =
             decdn_cache::CacheEngine::open(tmp.path(), vec![foreign_stub_origin(b"coalesce")], 16)
                 .await?;
+        // Commit a blob, so "no walk happened" is distinguishable from "a walk
+        // happened and found nothing".
+        cache.get(held).await?;
         let scheduler = Arc::new(RepublishScheduler::new());
         let metrics = Arc::new(crate::metrics::Metrics::new());
         // Pre-claimed: stand in for a worker mid-walk without racing one.

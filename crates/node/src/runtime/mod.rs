@@ -1786,6 +1786,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             "cold-start store seed failed; blobs not re-fetched this session go un-republished until a later lag sweep re-walks the store, or until restart (ADR 022 §Bootstrap AC 15 degraded)"
         );
     }
+    if snapshot.origin_probe_faults > 0 {
+        infra
+            .node_metrics
+            .dht_republish_seed_origin_probe_failures(snapshot.origin_probe_faults);
+    }
     if snapshot.origin_probe_faults > 0 || snapshot.origin_enumerate_failures > 0 {
         tracing::warn!(
             faults = snapshot.origin_probe_faults,
@@ -1835,9 +1840,21 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 let scheduler = Arc::clone(&scheduler);
                 tokio::spawn(async move {
                     cache.rescan_origins().await;
+                    let report = cache.origin_held_snapshot();
+                    // The steady-state announce trigger reports a short set the
+                    // same way the boot seed and the lag sweep do. It runs far
+                    // more often than either, so leaving it silent would make the
+                    // most common truncation the least visible one.
+                    if report.probe_faults > 0 || report.enumerate_failures > 0 {
+                        tracing::warn!(
+                            faults = report.probe_faults,
+                            enumerate_failures = report.enumerate_failures,
+                            "origin rescan could not resolve every candidate; the announce set omits anything it could not confirm and no earlier pass had indexed"
+                        );
+                    }
                     scheduler.seed_cold_start(
-                        cache
-                            .origin_held_hashes()
+                        report
+                            .hashes
                             .into_iter()
                             .map(|h| decdn_protocol::ContentHash::from_bytes(*h.as_bytes())),
                     );
@@ -2422,10 +2439,13 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = eviction_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = probe_rate_limit_gc_stop_tx.send(());
-    // Cancels the republisher AND any lag sweep it left detached, ordered
-    // strictly before the `cache.shutdown()` flush below — a sweep still walking
-    // the store then abandons the walk rather than seeing the store disappear
-    // and reporting its own teardown as a store-walk failure.
+    // Cancels the republisher AND any lag sweep it left detached. The cancel is
+    // ordered strictly before the `cache.shutdown()` flush below, which is what
+    // the sweep needs: its `select!` is `biased` on this token, so a worker
+    // polled any time after the flush takes the cancel arm instead of observing
+    // the store it was walking disappear and reporting that as a store-walk
+    // failure. The sweeps are detached and not joined, so one may outlive the
+    // flush by a poll — it just cannot report anything once cancelled.
     republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
     // The five chain watchers are now one multiplexed poller with one shutdown

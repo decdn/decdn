@@ -112,7 +112,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
-use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
 use crate::content_deny::ContentDenylist;
@@ -628,6 +628,17 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             self.last_rescan = clean.then(Instant::now);
         }
         Ok(())
+    }
+
+    /// Force the batched re-scope on the tick the watcher recovers.
+    ///
+    /// The same clock `apply` clears after a failed per-event re-scope, cleared
+    /// for the same reason: a stale deny set means serving content a takedown
+    /// covers, which is slashable. An outage is when the set is most likely to
+    /// have drifted and when the cadence helps least, since the reconcile does
+    /// not run at all while the route is errored.
+    fn on_recovered(&mut self) {
+        clear_cadence_on_recovery(&mut self.last_rescan, self.rescan_interval);
     }
 }
 

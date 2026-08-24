@@ -496,10 +496,12 @@ entirely, which emits nothing at all, not even the counter.
 
 A route recovering from an errored tick forces a re-enumeration on the tick it
 comes back, so a stale gauge on a healthy route means the reads themselves are
-failing. That trigger covers poll-level outages only: a `nodeIdOf` resolution
-failure is returned as `Ok` and never errors the route, so a membership change
-dropped that way waits for the cadence even while everything else looks
-healthy — watch `decdn_staker_set_watcher_resolve_failures_total` for it.
+failing. Two limits on that trigger. It covers poll-level outages only: a
+`nodeIdOf` resolution failure is returned as `Ok` and never errors the route, so
+a membership change dropped that way waits for the cadence even while everything
+else looks healthy — watch `decdn_staker_set_watcher_resolve_failures_total` for
+it. And it is floored, so an endpoint that flaps every few seconds does not earn
+a full enumeration per flap.
 
 **Remediate:** check the RPC provider's `eth_call` path — the enumeration is
 paginated `eth_call`s, not `eth_getLogs`, so it can fail while the event tail
@@ -521,13 +523,21 @@ what is missing was never announced.
 failed` at `WARN`.
 
 **What it means:** a rescan resolves each candidate against the origin — one
-`HEAD`/`HeadObject`/stat per hash — to decide what this node advertises. A
-throttle window or transport outage during that pass leaves candidates
-unresolved. A candidate the previous index already knew keeps its entry, so the
-announce set holds but the size it advertises is the older one; a candidate first
-seen inside the fault window has nothing to carry forward and is absent from the
-announce set until a later rescan resolves it. Note an HTTP origin reports a 5xx
-as a plain "not held", so this counter covers S3/R2 and filesystem origins.
+`HEAD`/`HeadObject`/stat per deduped candidate — to decide what this node
+advertises. A throttle window or transport outage during that pass leaves
+candidates unresolved.
+
+A retry-eligible fault on a candidate an earlier pass indexed keeps that entry,
+on the bet that the origin comes back. The bet has a cost: while it holds, the
+node advertises content the origin may have stopped holding, and every request
+for it is a refusal. A *permanent* fault — a revoked ACL, a symlink escape — is
+not carried, because it would read the same on every rescan and hold the entry
+until an operator intervened. A candidate first seen inside the fault window has
+nothing to carry and is simply absent until a later rescan resolves it.
+
+One case this counter cannot see: an HTTP origin reports a server-side 5xx as a
+plain "not held", indistinguishable from a 404. Its *transport* faults, and
+S3/R2 and filesystem origins throughout, do count.
 
 The enumerate counter is the more severe of the two. A listing that fails
 produces no candidates at all, so every hash discoverable only through that
@@ -536,9 +546,11 @@ forward — only operator pins naming those hashes survive the pass.
 
 **Remediate:** check the origin backend's own error and throttle rates. The next
 successful rescan repairs the index on its own — at boot, on the
-`cache.fs_rescan_interval_sec` timer, or on `decdn node reload`. A sustained
-nonzero rate means the rescan cadence is racing a backend that cannot serve it;
-raise the interval or the origin's request budget rather than restarting.
+`cache.fs_rescan_interval_sec` timer, or on `decdn node reload`. Rescans are
+serialized, so a slow one delays the next rather than stacking with it. A
+sustained nonzero rate means the rescan cadence is racing a backend that cannot
+serve it; raise `cache.fs_rescan_interval_sec` or the origin's request budget
+rather than restarting.
 
 ## Delivery hash mismatch — metered on the pull leg only
 
