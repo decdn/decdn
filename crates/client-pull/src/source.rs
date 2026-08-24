@@ -36,7 +36,9 @@ use decdn_incentive::DepositOutcome;
 use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::{PullReader, StashedFault};
-use crate::{PoolContext, PoolLedger, PullDeadlines, UpstreamPullHeader, VoucherProgress};
+use crate::{
+    DialObserver, PoolContext, PoolLedger, PullDeadlines, UpstreamPullHeader, VoucherProgress,
+};
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
 /// the same boxed-future async-trait shape [`decdn_bao_range::RangedStore`] and
@@ -225,6 +227,15 @@ pub struct PeerSource<'a> {
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
+    /// Notified with a weak handle to every connection this source dials, set by a
+    /// caller that must observe those connections reach drained before it drops the
+    /// runtime their QUIC drivers live on (`decdn-node`'s per-serve pull legs).
+    ///
+    /// It sits HERE rather than in the caller because a dial that fails its
+    /// handshake never yields a reader — and those are exactly the opens whose
+    /// connection is left live on the pull runtime, so a caller-side wrapper around
+    /// the returned reader cannot see them.
+    on_connect: Option<&'a DialObserver<'a>>,
 }
 
 impl std::fmt::Debug for PeerSource<'_> {
@@ -272,7 +283,18 @@ impl<'a> PeerSource<'a> {
             max_blob_size_bytes,
             max_rate_per_mb,
             deadlines,
+            on_connect: None,
         }
+    }
+
+    /// Observe every connection this source dials.
+    ///
+    /// For a caller that drops the runtime the pull ran on: see [`DialObserver`].
+    /// A source without one behaves identically and costs nothing.
+    #[must_use]
+    pub const fn with_dial_observer(mut self, on_connect: &'a DialObserver<'a>) -> Self {
+        self.on_connect = Some(on_connect);
+        self
     }
 }
 
@@ -310,6 +332,7 @@ impl BlobSource for PeerSource<'_> {
                 self.max_rate_per_mb,
                 self.deadlines,
                 range.fetch_len(),
+                self.on_connect,
             )
             .await?;
             Ok((header, PullReader::new(pull)))

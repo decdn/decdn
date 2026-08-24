@@ -138,44 +138,136 @@ pub async fn local_endpoint(
     Ok((ep, addr))
 }
 
-/// How long teardown waits for every endpoint to drain before it gives up.
+/// How long teardown has, in total, to reap every task and drain every endpoint.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Abort `tasks`, then close `endpoints` under one shared deadline.
+/// Own a test's whole iroh teardown: abort `tasks`, reap them, then close
+/// `endpoints` — all under one shared deadline.
 ///
-/// The abort comes first because [`Endpoint::close`] waits for in-flight
-/// connections to drain, and a handler task parked mid-stream holds one open.
-/// Closing an endpoint whose accept loop still runs is what wedges teardown.
+/// # Order
 ///
-/// The deadline is shared across the whole call rather than applied per
-/// endpoint, so a wedge costs [`SHUTDOWN_TIMEOUT`] once instead of once per
-/// endpoint. The `drained/total` count in the warning names the position that
-/// stalled, and nextest attributes the line to the test that printed it.
+/// Abort, reap, close. [`tokio::task::JoinHandle::abort`] only SCHEDULES
+/// cancellation; the task's future is dropped when the runtime next polls it. A
+/// close that starts before that drop still finds a handler parked mid-stream
+/// holding a connection open, and [`Endpoint::close`] waits for in-flight
+/// connections to drain. Reaping between the two turns that race into a
+/// happens-before. An accept loop that DETACHES a task per connection — the shape
+/// in `dht_loopback` and `origin_range_pull` — passes no handle for those and
+/// needs none: closing the endpoint tears their connections down, which is what
+/// ends them. [`spawn_server`] instead awaits each connection inline, so its loop
+/// handle covers the handler too.
 ///
-/// A timeout warns and returns instead of failing: teardown runs after every
-/// assertion, so the test's real verdict is already decided by the time this
-/// is reached. `.config/nextest.toml` is the hard backstop for a wedge that
-/// outlives even this.
+/// # One deadline, and what a breach means
+///
+/// The deadline covers the whole call rather than one stage or one endpoint, so
+/// a wedge costs [`SHUTDOWN_TIMEOUT`] once, and every join and close sits inside
+/// it. A caller that tears an endpoint down by hand instead is outside this
+/// guarantee and can still park until the `.config/nextest.toml` backstop; route
+/// teardown through this function, or [`reap`] for a one-shot task.
+///
+/// A breach warns rather than fails, and names the stage it stalled in:
+/// `tasks reaped` short of `N` is a task outliving its own abort;
+/// `endpoints closed` short of `M` is a stranded upstream QUIC driver in the code
+/// under test (#1675). The second is a KNOWN open defect that no test here can
+/// fix, so failing on it would redden CI for something already tracked; the named
+/// line plus `decdn_node_pull_abandon_drain_timeout_total` are how it stays visible. A
+/// panicking server task is different — that is this test's own verdict, and it
+/// is returned.
+///
+/// A caller that joins its own task must do so BEFORE this, and only for a
+/// one-shot task that ends on its own — an accept loop ends only once its
+/// endpoint closes, so joining one first deadlocks.
+///
+/// # Panics are an assertion channel
+///
+/// A server task carries its handler's panics, and that is the only way one can
+/// surface: the accept loops swallow handler errors. [`JoinError::is_cancelled`]
+/// marks this function's own abort and is not a failure — it can mean nothing
+/// else, because this function OWNS the handle and no other party can cancel it.
+/// Anything else is returned, so a handler that has already panicked fails the
+/// test that spawned it. What the abort gives up is a panic the handler would
+/// have raised during a post-close wind-down: use [`reap`] instead for a task
+/// whose tail carries assertions.
+///
+/// [`JoinError::is_cancelled`]: tokio::task::JoinError::is_cancelled
+///
+/// # Errors
+///
+/// A server task that panicked.
 pub async fn shutdown<const N: usize, const M: usize>(
-    tasks: [tokio::task::AbortHandle; N],
+    tasks: [tokio::task::JoinHandle<()>; N],
     endpoints: [&Endpoint; M],
-) {
+) -> anyhow::Result<()> {
     for task in &tasks {
         task.abort();
     }
-    let mut drained = 0usize;
-    let closed = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+    let mut reaped = 0usize;
+    let mut closed = 0usize;
+    let mut fault: Option<anyhow::Error> = None;
+    let within = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        for task in tasks {
+            match task.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    // Keep the FIRST fault: it is the one that happened, and a
+                    // later task's panic is often a consequence of it.
+                    if fault.is_none() {
+                        fault = Some(anyhow::Error::new(e).context(format!(
+                            "shutdown: server task {reaped} did not exit cleanly"
+                        )));
+                    }
+                }
+            }
+            reaped += 1;
+        }
         for ep in endpoints {
             ep.close().await;
-            drained += 1;
+            closed += 1;
         }
     })
     .await;
-    if closed.is_err() {
+    if within.is_err() {
         eprintln!(
-            "shutdown: endpoint close timed out after {SHUTDOWN_TIMEOUT:?} \
-             ({drained}/{M} drained)"
+            "shutdown: teardown exceeded {SHUTDOWN_TIMEOUT:?} \
+             ({reaped}/{N} tasks reaped, {closed}/{M} endpoints closed)"
         );
+    }
+    fault.map_or(Ok(()), Err)
+}
+
+/// Join a ONE-SHOT server task under the same deadline [`shutdown`] uses, and
+/// return what it returned.
+///
+/// The counterpart to [`shutdown`] for a task that ends on its own — an accept
+/// that handles a single connection and returns — which several callers must join
+/// BEFORE closing the server endpoint, and whose `Err` several of them assert on.
+/// [`shutdown`] cannot serve those: it aborts first, which would discard exactly
+/// that verdict.
+///
+/// The deadline is what makes it safe. A handler parked mid-stream would otherwise
+/// park the test with it until the `.config/nextest.toml` backstop, which is the
+/// same unbounded-join hazard [`shutdown`] exists to remove.
+///
+/// # Errors
+///
+/// The task panicked, was cancelled, or outlived [`SHUTDOWN_TIMEOUT`].
+pub async fn reap<T>(label: &str, task: tokio::task::JoinHandle<T>) -> anyhow::Result<T> {
+    let handle = task.abort_handle();
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            Err(anyhow::Error::new(e).context(format!("{label}: task did not exit cleanly")))
+        }
+        Err(_) => {
+            // Abort rather than detach. Dropping the `JoinHandle` leaves the task
+            // running, still holding whatever connection parked it, so the caller's
+            // next `shutdown` would pay the deadline over again for the same wedge.
+            handle.abort();
+            Err(anyhow::anyhow!(
+                "{label}: task outlived {SHUTDOWN_TIMEOUT:?} — it is parked, not finishing"
+            ))
+        }
     }
 }
 

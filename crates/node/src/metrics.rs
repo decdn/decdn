@@ -739,6 +739,21 @@ pub struct DecdnMetrics {
     /// — the desync tracked in #1122 — and the deposit sizing and pool count should be
     /// reviewed alongside it.
     pub node_pull_pool_wedged: Counter,
+    /// `decdn_node_pull_abandon_drain_timeout_total` (#1779): an abandoned pull leg's upstream
+    /// connection did not reach its drained state before the leg's drain ceiling, so
+    /// the per-serve runtime was dropped with that connection's QUIC driver still on
+    /// it.
+    ///
+    /// The connection is now STRANDED: with no driver it can never reach drained, and
+    /// `Endpoint::close()` waits on exactly that. **Any sustained rate means this
+    /// node's shutdown will hang**, and each tick is one upstream this node closed
+    /// discourteously — the peer holds the connection open until its own idle timeout.
+    ///
+    /// Zero is the expected value at every load: the drain waits on the transition
+    /// itself, not on a fixed span, so it ceilings out only when a connection is
+    /// genuinely stuck. A non-zero rate points at the per-serve pull-leg runtimes
+    /// (#1675), not at the peer.
+    pub node_pull_abandon_drain_timeout: Counter,
     /// `decdn_node_pull_refused_total` (#1144): a selected upstream refused
     /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
     /// wire code, including the `InternalError` that DOES tar the provider's
@@ -809,7 +824,7 @@ pub struct DecdnMetrics {
     ///
     /// 1. the node's own chain lane (a slow L2, a stuck nonce) is slower than
     ///    `CHANNEL_OPEN_CALLER_BUDGET` — the interesting one; and
-    /// 2. a boot or idle **reconcile** holds the provider's open slot (`OpenSlotReserved`).
+    /// 2. a boot or idle **reconcile** holds the provider's open slot.
     ///
     /// The verdict is the same for both — try the next candidate, score nothing — which
     /// is why they share a counter. But the *diagnosis* is not: reconcile runs at every
@@ -1840,6 +1855,11 @@ recorders! {
     /// KEPT for the reclaim sweep and the provider suppressed instead (#1145 review).
     /// Money at rest — see the counter's docs.
     node_pull_pool_wedged => node_pull_pool_wedged.inc();
+
+    /// An abandoned pull leg's upstream connection did not drain inside its ceiling
+    /// (#1779), so its QUIC driver is stranded on a runtime about to be dropped.
+    /// Endpoint close will block — see the counter's docs.
+    node_pull_abandon_drain_timeout => node_pull_abandon_drain_timeout.inc();
 
     /// A selected upstream refused delivery up front (#1144). Counts every wire
     /// code; only `InternalError` also scores the provider's reputation.

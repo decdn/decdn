@@ -33,7 +33,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
@@ -53,6 +53,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use super::abandon_drain::{ConnDrain, as_observer, drain_abandoned};
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
@@ -72,14 +73,6 @@ use crate::selection::{CHANNEL_OPEN_CALLER_BUDGET, Candidate, MAX_PROVIDER_ATTEM
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A chunk-range's byte span
 /// is its boundaries scaled by this (twin of the driver's private constant).
 const CHUNK_BYTES: u64 = 1024;
-
-/// How long an ABANDONED pull leg yields its runtime so the upstream connection can
-/// flush its `CONNECTION_CLOSE` and drain before the current-thread runtime that owns
-/// it is dropped (see the drain in [`run_pull_leg`]). iroh bounds a
-/// close handshake to roughly three seconds on bad connectivity and returns much
-/// faster in the usual case (instant on loopback), so this comfortably covers the
-/// drain without holding the pull thread for longer than a real close would take.
-pub(super) const ABANDON_DRAIN: Duration = Duration::from_secs(3);
 
 /// A discovered, channel-open upstream ready to be pulled from by [`drive`], plus
 /// the `total_bytes` the caller needs to sign its `StreamResponse`. Everything a
@@ -403,6 +396,9 @@ impl NodeOrigin {
             rate_ceiling,
             deadlines,
             0,
+            // The pre-flight handshake runs on the OUTER runtime, which keeps
+            // living, so its driver is never stranded and needs no observer.
+            None,
         )
         .await
         {
@@ -540,6 +536,10 @@ pub(crate) async fn run_pull_leg(
         Err(_) => total_bytes,
     };
 
+    // Record every connection this leg dials, so an abandoned leg can wait for
+    // each to drain before this pull-thread runtime is dropped.
+    let abandoned = ConnDrain::default();
+    let observer = abandoned.observer();
     let peer_source = PeerSource::new(
         &deps.endpoint,
         endpoint_target,
@@ -551,7 +551,8 @@ pub(crate) async fn run_pull_leg(
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
-    );
+    )
+    .with_dial_observer(as_observer(&observer));
     // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037): the pull
     // never runs further ahead of the downstream served-paid frontier than the
     // ramped window allows, in lockstep with the serve leg's own ramp.
@@ -617,24 +618,22 @@ pub(crate) async fn run_pull_leg(
     };
     let elapsed = started.elapsed();
 
-    // Abandon drain. On cancel the `drive` future above is dropped
-    // mid-transfer, which queues an upstream `Connection::close` (via
-    // `UpstreamPull::drop`) but does NOT drive it to completion. That connection's
-    // QUIC driver lives on THIS pull-thread current-thread runtime, which the caller
-    // (`window.rs`) drops the instant we return. Without a drain the close frame is
-    // never flushed: the connection is stranded with no driver, so it can never reach
-    // "closed or timed out", and the node's own `Endpoint::close()` — which iroh
-    // otherwise bounds to a few seconds — would wait forever (a hang that surfaces
-    // whenever the endpoint is closed while an abandoned pull is in flight). Yield the
-    // runtime briefly so the abandoned connection flushes its CONNECTION_CLOSE and
-    // drains on the runtime that owns it. A drive that returns `Err` strands its
-    // upstream connection the SAME way a cancel does — it returns without a graceful
-    // cooperative close (unlike the clean `Ok` path, which closes inside `drive`) —
-    // so the drain must cover it too, or `Endpoint::close()` hangs whenever a pull
-    // failed mid-serve (e.g. a corrupt upstream). Only the clean `Ok` path skips the
-    // drain and stays on the hot path with no added latency.
+    // Abandon drain. On cancel the `drive` future above is dropped mid-transfer,
+    // which queues an upstream `Connection::close` (via `UpstreamPull::drop`) but
+    // does NOT drive it to completion. That connection's QUIC driver lives on THIS
+    // pull-thread current-thread runtime, which the caller (`window.rs`) drops the
+    // instant we return. Without a drain the connection is stranded with no driver,
+    // so it never reaches drained and the node's own `Endpoint::close()` waits
+    // forever. Wait for the transition itself rather than a fixed span — see
+    // [`super::abandon_drain`] for why no constant can be the right length. A drive
+    // that returns `Err` strands its upstream connection the SAME way a cancel does,
+    // so the wait covers it too. The clean `Ok` path skips the wait and stays on the
+    // hot path: `UpstreamPull::finish` closes the connection there, which is a state
+    // transition and not a drain, so that path carries the same residual as #1675 —
+    // accepted rather than proven clean, because waiting would add `3 * PTO` to every
+    // successful serve-miss teardown, which the last serve observer joins.
     if cancelled || result.is_err() {
-        tokio::time::sleep(ABANDON_DRAIN).await;
+        drain_abandoned(&abandoned, provider_addr, &deps.metrics).await;
     }
 
     // Reputation scoring, skipped on cancel — an abandoned pull is neither a
@@ -889,16 +888,10 @@ pub(crate) async fn run_local_pull_leg(
         }
     };
 
-    // Abandon drain, for the same reason as the paid leg: a cancelled or
-    // errored `drive` returns without a graceful cooperative close, and the
-    // orchestration drops this pull-thread runtime the instant we return. There is no
-    // UPSTREAM iroh connection here (the origin fetch is an HTTP/S3/fs call inside the
-    // cache engine, which does not strand a QUIC driver on this runtime), so the drain
-    // is strictly a belt-and-braces yield; keep it identical to the paid twin so the
-    // two teardown shapes do not drift. Only the clean `Ok` path skips it.
-    if cancelled || result.is_err() {
-        tokio::time::sleep(ABANDON_DRAIN).await;
-    }
+    // No abandon drain here, unlike the paid twin. This leg fetches from the node's
+    // OWN origin — an HTTP/S3/fs call inside the cache engine — so a cancelled or
+    // errored `drive` strands no QUIC driver on this pull-thread runtime, and there
+    // is nothing for the orchestration's immediate drop of that runtime to break.
 
     // Classify a terminal error. There is no upstream, so a fault is ALWAYS local
     // (our own origin is corrupt/misconfigured, or a transport fault reaching it):

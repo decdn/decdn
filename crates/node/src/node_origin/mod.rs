@@ -40,11 +40,13 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
+mod abandon_drain;
 mod admit_store;
 mod backend_source;
 mod funder;
 mod pull_leg;
 
+use abandon_drain::{ConnDrain, as_observer, drain_abandoned};
 pub(crate) use admit_store::NodeAdmitStore;
 #[allow(
     unused_imports,
@@ -53,7 +55,6 @@ pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
 use funder::{SETTLE_POLL_STEP, settle_wait_budget};
-use pull_leg::ABANDON_DRAIN;
 #[allow(
     unused_imports,
     reason = "wired by the own-origin serve-miss orchestration"
@@ -779,6 +780,8 @@ impl NodeOrigin {
             // Whole-tail fetch; a bounded gap request is the gap-driven driver's
             // (#1608) `source::PeerSource`, not this candidate-fallback open.
             0,
+            // Outer runtime: nothing to strand, so no dial observer.
+            None,
         )
         .await
         {
@@ -1987,6 +1990,8 @@ async fn pull_from_candidate(
         rate_ceiling,
         deadlines,
         0,
+        // Outer runtime: nothing to strand, so no dial observer.
+        None,
     )
     .await
     {
@@ -2029,9 +2034,9 @@ async fn pull_from_candidate(
     // - ABANDON DRAIN. A cancelled or errored `drive` returns without a graceful
     //   cooperative close, stranding the upstream iroh connection whose QUIC driver
     //   lives on this pull-thread runtime; dropping the runtime with no drain hangs the
-    //   node's `Endpoint::close()`. Yield [`ABANDON_DRAIN`] on those paths so the
-    //   connection flushes its CONNECTION_CLOSE first. The clean `Ok` path closes
-    //   inside `drive` and skips the drain.
+    //   node's `Endpoint::close()`. Wait on those paths for the connection to actually
+    //   reach drained (see the `abandon_drain` module), under its own ceiling. The
+    //   clean `Ok` path skips the wait and carries the same residual as #1675.
     let hash = Hash::from(hash_bytes);
     let endpoint = deps.endpoint.clone();
     let slash_domain = deps.slash_domain.clone();
@@ -2078,6 +2083,8 @@ async fn pull_from_candidate(
                 prior_amount,
                 ledger: Arc::clone(&ledger_for_drive),
             };
+            let abandoned = ConnDrain::default();
+            let observer = abandoned.observer();
             let source = PeerSource::new(
                 &endpoint,
                 EndpointAddr::new(pk),
@@ -2089,13 +2096,14 @@ async fn pull_from_candidate(
                 max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
-            );
+            )
+            .with_dial_observer(as_observer(&observer));
             let pacer = BudgetPacer::new();
             let funder = NodeFunder::new(
                 buyer,
                 Arc::clone(&ctx),
                 Arc::clone(&ledger_for_drive),
-                metrics,
+                Arc::clone(&metrics),
                 reactive_funded_for_thread,
             );
             // Whole blob: offset 0, len `total_bytes`. `drive` derives missing ranges
@@ -2129,12 +2137,12 @@ async fn pull_from_candidate(
                     Ok(())
                 }
             };
-            // Drain a stranded upstream connection on the cancel/`Err` paths only, so
-            // `Endpoint::close()` cannot hang on the runtime this thread is about to
-            // drop. The `_settle` guard drops AFTER this, persisting the final
+            // Wait out a stranded upstream connection on the cancel/`Err` paths only,
+            // so `Endpoint::close()` cannot hang on the runtime this thread is about
+            // to drop. The `_settle` guard drops AFTER this, persisting the final
             // watermark.
             if cancelled || result.is_err() {
-                tokio::time::sleep(ABANDON_DRAIN).await;
+                drain_abandoned(&abandoned, provider_addr, &metrics).await;
             }
             (result, pool_id, cancelled)
         }))
