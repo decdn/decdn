@@ -4462,8 +4462,10 @@ fn spawn_a_paid_then_silent_server(
 /// dropped future. It does: the [`SettleOnDrop`] guard rides the PULL THREAD (not the
 /// `fetch` future), so it persists the final acked watermark AFTER the cancelled
 /// `drive` fully stops. Lose that — settle nothing, or settle a stale value from the
-/// racing outer future — and the next pull re-signs a spent nonce, the upstream rejects
-/// it `AmountRegression`, and the lane wedges for the rest of its life.
+/// racing outer future — and the next pull re-signs from a stale cumulative amount, the
+/// upstream rejects it `AmountRegression`, and once the bounded watermark-resume attempts
+/// are spent the lane wedges and the provider drops out of ranking for the suppression
+/// window.
 ///
 /// The cancellation here is a `timeout` that drops the fetch — standing in for the real
 /// droppers — against a stall budget long enough that `PullStalled` cannot be what ends
@@ -4567,8 +4569,8 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "a cancelled pull must persist the watermark the upstream already acked, \
-             from the pull thread — otherwise the next reuse re-signs a stale nonce and \
-             the lane wedges until it expires. Got {:?}",
+             from the pull thread — otherwise the next reuse re-signs from a stale \
+             cumulative amount and the lane wedges, suppressing the provider. Got {:?}",
             progress_log(&recorded)?
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6941,13 +6943,14 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
 }
 
 /// The #852 regression: a second cache-miss pull to the same provider **reuses**
-/// the buyer channel and resumes from the persisted voucher watermark, so it
-/// signs `nonce = 3, 4 …` (not a stale `nonce = 1`) and the upstream accepts it.
+/// the buyer channel and resumes from the persisted voucher watermark, so it signs
+/// cumulative amounts that continue past the first pull's rather than restarting at
+/// zero, and the upstream accepts them.
 ///
 /// Without that persistence the second pull re-signs from zero and the upstream
-/// rejects it (`AmountRegression`), so the second fetch is a `NotFound`. Here both
-/// fetches deliver the blob and the persisted log advances monotonically (nonce 2 →
-/// 4, bytes 1.5 MiB → 3 MiB).
+/// rejects it (`AmountRegression`); once the bounded watermark-resume attempts are
+/// spent the second fetch is a `NotFound`. Here both fetches deliver the blob and the
+/// persisted log advances monotonically — cumulative bytes and amount both double.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
@@ -7054,8 +7057,8 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     )
     .await;
 
-    // First pull (hash1): opens the channel against A, pays nonce 1..2, persists
-    // the watermark.
+    // First pull (hash1): opens the channel against A, pays for its wire bytes, and
+    // persists the watermark.
     let first_fetch = Origin::fetch(&origin, hash1, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("first fetch failed: {e}"))?;
@@ -7071,7 +7074,7 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
 
     // Second pull (hash2, a DISTINCT blob not yet cached): REUSES the same
     // channel, resumes from the persisted watermark, and the upstream accepts
-    // the continued nonces — this is the bug's fix. Fetching a distinct hash
+    // the continued cumulative amounts — this is the bug's fix. Fetching a distinct hash
     // (rather than re-fetching hash1) is what forces this leg to actually pull:
     // `drive()` re-derives `missing_ranges` from the cache store, so re-fetching
     // an already-cached blob would pull and pay nothing (#1675) and leave the
@@ -7089,8 +7092,8 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         "second pull bytes mismatch"
     );
 
-    // The persisted watermark advanced monotonically across the two pulls rather
-    // than resetting: nonce 2 → 4, with cumulative bytes and amount doubling.
+    // The persisted watermark advances monotonically across the two pulls rather
+    // than resetting: cumulative bytes and amount both double.
     // Under ADR 038 the pull meters WIRE bytes (bao: content + interleaved proof),
     // so each fetch contributes its bao-encoded size and per-fetch amount, and the
     // reused channel carries them forward (#852).
@@ -9585,24 +9588,24 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
 /// the same provider first, which is what an ordinary node on a tens-of-nodes network does
 /// all day: the cache engine coalesces in-flight pulls BY HASH, so distinct hashes run
 /// concurrent `NodeOrigin::fetch` calls, and both take the channel-REUSE fast path and read
-/// the same `prior_nonce`.
+/// the same `prior_amount`.
 ///
-/// With a ledger each, both pulls sign `prior_nonce + 1`. Node A — the real `ClientHandler`,
-/// enforcing real cumulative monotonicity — accepts the first and rejects the second
-/// `AmountRegression`, so one of these two fetches comes back empty. An empty fetch is bad
-/// on its own; what makes it a money bug is that `AmountRegression` is a TERMINAL verdict —
-/// it wedges the channel (the row is kept for the reclaim sweep, but the provider is
-/// suppressed and the loser's ledger desyncs) — so a collision the shared ledger prevents
-/// would otherwise strand the deposit. Hence the assertions beyond "both blobs arrived":
-/// nothing is retired, and the channel's nonce advances through EVERY voucher of both pulls
-/// on one monotonic sequence.
+/// With a ledger each, both pulls sign from that same `prior_amount`, so their cumulative
+/// amounts collide. Node A — the real `ClientHandler`, enforcing real cumulative
+/// monotonicity — accepts the first and rejects the second `AmountRegression`, so one of
+/// these two fetches comes back empty. An empty fetch is bad on its own; what makes it a
+/// money bug is that `AmountRegression` is TERMINAL once the bounded watermark-resume
+/// attempts are spent — it wedges the channel (the row is kept for the reclaim sweep, but
+/// the provider is suppressed and the loser's ledger desyncs) — so a collision the shared
+/// ledger prevents would otherwise strand the deposit. Hence the assertions beyond "both
+/// blobs arrived": nothing is retired, and the recorded cumulative carries EVERY voucher of
+/// both pulls on one monotonic sequence.
 ///
-/// Since #1484 the client sends vouchers optimistically and each pull persists the shared
-/// ledger's SETTLE-HIGH watermark, so both `record_progress` calls now report the fully
-/// advanced cumulative rather than two disjoint sub-watermarks: the evidence of sharing is
-/// that the recorded nonce reaches the full four-voucher total (one interval + one closing per
-/// 1.5 MiB pull), which two separate ledgers — each capped at nonce 2 and colliding on nonce
-/// 1 — could never reach.
+/// The client sends vouchers optimistically and each pull persists the shared ledger's
+/// SETTLE-HIGH watermark (#1484), so both `record_progress` calls report the fully advanced
+/// cumulative rather than two disjoint sub-watermarks: the evidence of sharing is that the
+/// recorded cumulative wire bytes reach both pulls' combined total, which two separate
+/// ledgers — each capped at one pull's wire bytes — could never reach.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Result<()> {
@@ -9769,7 +9772,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         anyhow::anyhow!(
             "concurrent ledger pulls hung past {join_budget:?} — likely \
              CHANNEL_OPEN_CALLER_BUDGET={CHANNEL_OPEN_CALLER_BUDGET:?} expiry under llvm-cov \
-             contention, not StaleNonce; pending={} timeout={} stalled={} recorded={:?} \
+             contention, not AmountRegression; pending={} timeout={} stalled={} recorded={:?} \
              retired={:?}",
             counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),

@@ -1239,8 +1239,8 @@ pub async fn stream_fetch(
 /// Like `stream_fetch`, but reports the channel's acked voucher watermark via
 /// the `progress` out-param so the caller can persist what it paid (#852).
 ///
-/// `progress` is an out-param: on return it holds the cumulative `(nonce,
-/// bytes_delivered, amount)` of the last *acked* voucher. Internally the pull
+/// `progress` is an out-param: on return it holds the cumulative
+/// `(bytes_delivered, amount)` of the last *acked* voucher. Internally the pull
 /// runs against a one-shot [`PoolLedger`] seeded from `ctx.prior_*`; the
 /// ledger's snapshot is copied back into `progress` on every return path — `Ok`,
 /// `Err`, or timeout — so the caller can record progress even for a mid-stream
@@ -1604,7 +1604,7 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// (the error path never reaches `decode_verified_range`), so there is
 /// nothing to legitimately splice a jump with. Retrying at the caller's
 /// original offset is always safe and is the only thing this bundle field
-/// is actually needed for: fixing the ledger's amount/nonce/bytes BASELINE
+/// is actually needed for: fixing the ledger's amount/bytes BASELINE
 /// so the resumed stream's vouchers verify against what the node now
 /// expects, not re-deriving where in the blob to resume.
 ///
@@ -1623,10 +1623,10 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't eligible).
 ///
 /// The daemon's node-to-node cache-miss buyer leg does not use this wrapper: it
-/// drives its own resume loop over [`open_progressive_pull`] in
-/// `decdn-node`'s `node_origin/resume.rs`, which reseeds on the same contract and
+/// reaches the same reseed loop through [`open_progressive_pull`], and
 /// additionally answers a genuine `SpendingCapExhausted` with an on-chain top-up —
-/// the thing a from-zero buffered retry could never do without re-paying for the
+/// `decdn-node`'s `node_origin/funder.rs` supplies the `Funder` that does it, the
+/// thing a from-zero buffered retry could never do without re-paying for the
 /// delivered prefix. Either way `pull_verdict` / `voucher_verdict` in `decdn-node`
 /// see only the terminal outcome, so the `OurDeadLane` classification there
 /// stays correct as the fallback.

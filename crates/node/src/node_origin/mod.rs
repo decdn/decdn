@@ -421,7 +421,8 @@ pub struct NodeOriginDeps {
     pub config: NodeOriginConfig,
     /// The live voucher ledger of each provider's current channel, shared by every
     /// concurrent pull on it (#1145 review). Not a cache — see [`BuyerLedgers`] for
-    /// why a per-pull ledger collides at `prior_nonce + 1` and what that now costs.
+    /// why a per-pull ledger collides on the same cumulative amount and what that
+    /// costs.
     pub ledgers: Arc<BuyerLedgers>,
     /// Providers suppressed from ranking because one rejected our voucher on a reason this
     /// lane cannot recover from — mapped to the first Unix second at which the provider is
@@ -2706,11 +2707,11 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     }
     // Above the peer-blaming arms, alongside the other local faults: the upstream
     // answered honestly ("the blob is only N bytes"), and the offset it refused is one
-    // WE computed — a resume frontier that overran the blob (#1530). Before the miss
-    // path could resume at all this was unreachable, so it had no arm and fell through
-    // to `Unreachable`, which would mark an honest peer down with a local EWMA hit
-    // (ADR 008 scoring is local-only) on the strength of our own arithmetic. `ResumeOffsetPastEnd`'s own doc says it: "this is a statement
-    // about the offset, not about the peer".
+    // WE computed — a resume frontier that overran the blob (#1530). Without an arm of
+    // its own it falls through to `Unreachable`, which marks an honest peer down with a
+    // local EWMA hit (ADR 008 scoring is local-only) on the strength of our own
+    // arithmetic. `ResumeOffsetPastEnd`'s own doc says it: "this is a statement about
+    // the offset, not about the peer".
     if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
         return PullVerdict::OurLocalFault;
     }
