@@ -83,11 +83,13 @@ pub enum NodeCommand {
     /// fields (issue #373). Equivalent to `kill -HUP <pid>` but goes
     /// through the loopback admin surface, so operator tooling that
     /// already speaks JSON-RPC doesn't need to also know which PID to
-    /// signal. Currently `observability.log_level`, `cache.pinned_hashes`,
-    /// `security.*`, and the `[content]` denylist are reloadable; other
-    /// fields are logged as ignored. Both paths share the same internal mutex, so a
-    /// concurrent SIGHUP and `decdn node reload` queue rather than
-    /// race. Requires the node to have been started with `decdn-node run
+    /// signal. `observability.log_level`, `cache.pinned_hashes`,
+    /// `security.*`, the `[content]` denylist, and `[load_shed]` are
+    /// reloadable; other fields are logged as ignored. The authoritative
+    /// list is the module doc of the node's `runtime/reload.rs` — when a
+    /// section is added there, update this help text too. Both paths
+    /// share the same internal mutex, so a concurrent SIGHUP and `decdn
+    /// node reload` queue rather than race. Requires the node to have been started with `decdn-node run
     /// --config <path>` — without a path on disk there's nothing to
     /// re-read.
     Reload(ReloadArgs),
@@ -338,8 +340,7 @@ pub struct EvictArgs {
 }
 
 /// `decdn node reload` — re-read the running node's config file via
-/// `admin_v1_reload` (issue #373) and print the post-reload `rate_per_mb`
-/// and `log_level`.
+/// `admin_v1_reload` (issue #373) and print the post-reload `log_level`.
 #[derive(Args, Debug)]
 pub struct ReloadArgs {
     /// Base URL of the node's admin HTTP surface. See `health --admin-url`
@@ -355,7 +356,7 @@ pub struct ReloadArgs {
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Emit the admin response as JSON instead of two human-readable lines.
+    /// Emit the admin response as JSON instead of the `log_level=` line.
     #[arg(long)]
     pub json: bool,
 
@@ -547,10 +548,10 @@ pub enum RotateKeyTarget {
 /// reads chain state to pick its next phase rather than trusting a flag.
 ///
 /// Neither path restarts the daemon. The node key is not hot-reloadable
-/// (`admin_v1_reload` and SIGHUP cover `observability.log_level`,
-/// `cache.pinned_hashes`, and `security.*` — not the
-/// iroh endpoint), so the runbook's drain → stop → rotate → restart sequence
-/// stays the operator's to drive, with `decdn node drain` for the first step.
+/// (`admin_v1_reload` and SIGHUP cover mutable config fields — see the
+/// node's `runtime/reload.rs` for the set — not the iroh endpoint), so the
+/// runbook's drain → stop → rotate → restart sequence stays the operator's
+/// to drive, with `decdn node drain` for the first step.
 #[derive(Args, Debug)]
 pub struct RotateKeyArgs {
     /// Which key to rotate: `iroh` or `eth`. Required, because rotating the
