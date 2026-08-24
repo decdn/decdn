@@ -19,3 +19,26 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'package(decdn-e2e)'
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+# The two anvil-backed `decdn-node` targets boot anvil, shell out to `forge`, and
+# drive real node code against a live chain, so they are legitimately slower than
+# the rest of that package and are excluded from its tighter cap below. They build
+# only under `--features anvil-e2e`, and the job that runs them uses this default
+# profile rather than `decdn-e2e`'s override — so they need their own row here.
+# Sized above `anvil_settlement_e2e`'s own 780s `OVERALL_TIMEOUT`, which is what
+# actually bounds them. A new `anvil_*` target belongs in this filter as well as in
+# that job's `--test` list.
+[[profile.default.overrides]]
+filter = 'binary(anvil_settlement_e2e) + binary(anvil_bringup_shutdown_e2e)'
+slow-timeout = { period = "120s", terminate-after = 8 }
+
+# The in-process `decdn-node` suite tears its iroh fixtures down through
+# `tests/support::shutdown`, which bounds its own work and fails with the stage it
+# stalled in. This cap therefore no longer has to absorb a teardown wedge — it
+# catches only a hang that predates teardown, so it can sit much closer to the
+# suite's real cost. The slowest legitimate test measures ~13s uninstrumented; 180s
+# leaves room for coverage instrumentation and a loaded runner while naming a wedge
+# 120s sooner than the global backstop, with the first `SLOW` line at 60s.
+[[profile.default.overrides]]
+filter = 'package(decdn-node) - binary(anvil_settlement_e2e) - binary(anvil_bringup_shutdown_e2e)'
+slow-timeout = { period = "60s", terminate-after = 3 }

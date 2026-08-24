@@ -69,6 +69,26 @@ impl PullReader {
         }
     }
 
+    /// A non-owning handle to this pull's upstream QUIC connection.
+    ///
+    /// For a caller that runs [`crate::drive`] on a runtime it is about to drop
+    /// — `decdn-node`'s per-serve pull-leg runtimes — and must first observe
+    /// that the connection reached its DRAINED state. A locally closed
+    /// connection does not reach it synchronously: QUIC holds the connection for
+    /// `3 * PTO` after the close before its driver forwards the endpoint's
+    /// draining event, and [`iroh::Endpoint::close`] waits on exactly that
+    /// event. `Connection::closed()` cannot serve as the signal, because it
+    /// resolves the instant the local close sets the connection error — before
+    /// the `CONNECTION_CLOSE` is on the wire. The connection driver holds the
+    /// last strong reference and releases it on the poll that forwards the
+    /// event, so a weak handle that fails to upgrade IS the transition.
+    ///
+    /// Weak by construction: holding one cannot delay the close it observes.
+    #[must_use]
+    pub fn connection_handle(&self) -> iroh::endpoint::WeakConnectionHandle {
+        self.pull.conn.weak_handle()
+    }
+
     /// Recover the inner [`UpstreamPull`] once the decode loop is done with this
     /// reader, so [`crate::source::BlobSource::finish`] can drain it to the
     /// stream end and recover the acked voucher watermark.

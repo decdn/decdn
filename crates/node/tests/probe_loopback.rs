@@ -472,13 +472,11 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
     conn.close(0u32.into(), b"bye");
-    shutdown([], [&client_ep]).await;
+    shutdown([], [&client_ep]).await?;
 
     // Allow the server task to finish handling before closing its endpoint.
-    accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    shutdown([], [&server_ep]).await;
+    support::reap("accept", accept_task).await??;
+    shutdown([], [&server_ep]).await?;
     Ok(())
 }
 
@@ -562,11 +560,11 @@ async fn assert_reset_with_code(
 
 async fn tear_down(h: Harness) -> anyhow::Result<()> {
     h.client_conn.close(0u32.into(), b"bye");
-    shutdown([], [&h.client_ep]).await;
+    shutdown([], [&h.client_ep]).await?;
     // Handler is expected to return Err on these error-path tests; we only
     // need to confirm the task joined, not that it succeeded.
     let _ = h.accept_task.await;
-    shutdown([], [&h.server_ep]).await;
+    shutdown([], [&h.server_ep]).await?;
     Ok(())
 }
 
@@ -782,7 +780,7 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     // Manual teardown — `h.accept_task` was consumed above, so the shared
     // `tear_down` helper can't run as-is.
     h.client_conn.close(0u32.into(), b"bye");
-    shutdown([], [&h.client_ep, &h.server_ep]).await;
+    shutdown([], [&h.client_ep, &h.server_ep]).await?;
     Ok(())
 }
 
@@ -823,7 +821,7 @@ where
                 if error_code == expected_code =>
             {
                 if reason.as_ref() == expected_reason {
-                    shutdown([], [&ep]).await;
+                    shutdown([], [&ep]).await?;
                     return Ok(());
                 }
                 anyhow::bail!(
@@ -837,7 +835,7 @@ where
             // Retry with a fresh connection.
             other => last_transient = Some(other),
         }
-        shutdown([], [&ep]).await;
+        shutdown([], [&ep]).await?;
     }
     anyhow::bail!(
         "never observed an APP_ERR_RATE_LIMITED close carrying {:?} in {MAX_ATTEMPTS} attempts; \
@@ -930,7 +928,7 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
             match client_ep.connect(target, ALPN_PROBE).await {
                 Ok(conn) => Ok((client_ep, conn)),
                 Err(e) => {
-                    shutdown([], [&client_ep]).await;
+                    shutdown([], [&client_ep]).await?;
                     Err(anyhow::anyhow!("connect: {e}"))
                 }
             }
@@ -949,10 +947,7 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         "live connection must hit the pre-drained 127.0.0.1 bucket"
     );
 
-    shutdown([], [&server_ep]).await;
-    accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))?;
+    shutdown([accept_task], [&server_ep]).await?;
     Ok(())
 }
 
@@ -1047,7 +1042,7 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
             match client_ep.connect(target, ALPN_PROBE).await {
                 Ok(conn) => Ok((client_ep, conn)),
                 Err(e) => {
-                    shutdown([], [&client_ep]).await;
+                    shutdown([], [&client_ep]).await?;
                     Err(anyhow::anyhow!("connect: {e}"))
                 }
             }
@@ -1066,10 +1061,7 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
         "probe per-peer rejection must appear in /metrics scrape:\n{scrape}"
     );
 
-    shutdown([], [&server_ep]).await;
-    accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))?;
+    shutdown([accept_task], [&server_ep]).await?;
     Ok(())
 }
 
@@ -1134,11 +1126,9 @@ async fn run_one_probe_as(
         ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
     };
     conn.close(0u32.into(), b"bye");
-    shutdown([], [&client_ep]).await;
-    accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    shutdown([], [&server_ep]).await;
+    shutdown([], [&client_ep]).await?;
+    support::reap("accept", accept_task).await??;
+    shutdown([], [&server_ep]).await?;
     Ok(resp)
 }
 
@@ -1650,10 +1640,8 @@ async fn idle_timeout_closes_quiet_connection() -> anyhow::Result<()> {
         other => anyhow::bail!("expected ConnectionError::TimedOut, got {other:?}"),
     }
 
-    shutdown([], [&client_ep]).await;
-    accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    shutdown([], [&server_ep]).await;
+    shutdown([], [&client_ep]).await?;
+    support::reap("accept", accept_task).await??;
+    shutdown([], [&server_ep]).await?;
     Ok(())
 }

@@ -373,8 +373,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -663,8 +662,7 @@ async fn a_released_preimage_pays_for_a_chunk_and_resumes_delivery() -> anyhow::
     );
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -697,8 +695,7 @@ async fn a_preimage_before_its_epoch_voucher_is_unanchored() -> anyhow::Result<(
     expect_reject(&mut recv, VoucherRejectReason::UnanchoredPreimage).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -730,8 +727,7 @@ async fn a_preimage_at_index_zero_is_refused() -> anyhow::Result<()> {
     expect_reject(&mut recv, VoucherRejectReason::ChainIndexZero).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -770,8 +766,7 @@ async fn a_foreign_preimage_is_refused() -> anyhow::Result<()> {
     expect_reject(&mut recv, VoucherRejectReason::BadPreimage).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -804,8 +799,7 @@ async fn a_chain_opened_below_the_quoted_rate_is_refused() -> anyhow::Result<()>
     expect_reject(&mut recv, VoucherRejectReason::ChunkPriceMismatch).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -844,8 +838,7 @@ async fn a_sealed_voucher_carrying_a_price_is_refused() -> anyhow::Result<()> {
     expect_reject(&mut recv, VoucherRejectReason::ChunkPriceMismatch).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -925,8 +918,7 @@ async fn two_streams_on_one_lane_converge_on_the_deepest_index() -> anyhow::Resu
     );
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -959,8 +951,7 @@ async fn unpaid_stream_is_served_only_the_floor_then_pauses() -> anyhow::Result<
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -1009,8 +1000,7 @@ async fn paying_grows_the_window_to_paid_over_divisor() -> anyhow::Result<()> {
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -1043,8 +1033,7 @@ async fn divisor_zero_serves_the_full_credit_max_immediately() -> anyhow::Result
     assert_parked_awaiting_voucher(&mut recv).await?;
 
     conn.close(0u32.into(), b"done");
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -1104,8 +1093,7 @@ async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
         "idle-close must bump decdn_client_idle_close_total; got:\n{encoded}"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -1199,8 +1187,7 @@ async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow
         "post-stream idle-close must bump decdn_client_idle_close_total; got:\n{encoded}"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -1675,8 +1662,7 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
     );
 
     drop(conn);
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -1753,8 +1739,7 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
         "the re-armed reap must bump decdn_client_idle_close_total"
     );
 
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -1832,8 +1817,7 @@ async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> 
         "repeated re-arms must end in exactly one metered idle-close"
     );
 
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -1920,8 +1904,7 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
         "the post-concurrency idle reap must be metered exactly once"
     );
 
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -2046,8 +2029,7 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
         after_a.amount,
     );
 
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -2133,8 +2115,7 @@ async fn second_same_lane_stream_refused_when_budget_covers_one() -> anyhow::Res
         .pay_and_finish(&signer, VoucherTotals::default())
         .await?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2210,8 +2191,7 @@ async fn finished_stream_releases_its_lane_slot() -> anyhow::Result<()> {
         stall_delivery_at_closing_voucher(&conn, *hash_b.as_bytes(), wire_b, Some(&ext)).await?;
     let _ = second.pay_and_finish(&signer, totals).await?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2272,8 +2252,7 @@ async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
         totals.wire_bytes
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2339,8 +2318,7 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     // exercises the gate, not delivery — so the server side may still be
     // writing when the endpoints close; that is expected, not an error.
     drop(conn);
-    shutdown([], [&client_ep, &server_ep]).await;
-    let _ = server_task.await;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2431,8 +2409,7 @@ async fn skip_ahead_voucher_on_a_concurrent_lane_is_accepted() -> anyhow::Result
         only.last_bytes_delivered(),
     );
 
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -2510,8 +2487,7 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
         only.last_bytes_delivered(),
     );
 
-    shutdown([], [&client_ep, &fx.server_ep]).await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -2591,8 +2567,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
         only.last_bytes_delivered()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2744,8 +2719,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
          pre-serve deposit gate"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2842,8 +2816,7 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
         "an accepted voucher must advance the lane's last-voucher clock"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -2931,8 +2904,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
 
     assert_receipts_cover_the_delivery(&receipts.snapshot(), hash, client_node_id, &payload)?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3102,8 +3074,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
         recorded.len()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    let _ = server_task.await;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3189,8 +3160,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
         only.last_bytes_delivered()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3301,8 +3271,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
         s2.last_bytes_delivered()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3398,8 +3367,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
         only.last_bytes_delivered()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3482,8 +3450,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
         only.last_bytes_delivered()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3553,8 +3520,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
         "error should mention the zero rate: {err}"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3623,8 +3589,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
         "unknown-lane refusal must bump its reason counter"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3722,8 +3687,7 @@ async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()>
         state.last_amount()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3779,8 +3743,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
         "a funded sub-interval request must not trip the deposit gate"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3841,8 +3804,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
         other => anyhow::bail!("expected a pre-serve StreamResponse acceptance, got {other:?}"),
     }
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3910,8 +3872,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         "the credit-window refusal must bump the deposit counter"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -3980,8 +3941,7 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
         "the spent-down refusal must bump the deposit counter"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -4058,8 +4018,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         "the resume must not trip the deposit gate"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -4133,8 +4092,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         "an exactly-funded channel must not trip the deposit gate"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -4242,8 +4200,7 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
         persisted.last_bytes_delivered()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -4318,8 +4275,7 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
         "error should surface the expired grant as CapabilityExpired: {err}"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -4847,9 +4803,7 @@ async fn pool_recheck_gated_by_interval_lets_drained_stream_continue() -> anyhow
     );
 
     fx.conn.close(0u32.into(), b"done");
-    fx.client_ep.close().await;
-    fx.server_ep.close().await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -4898,9 +4852,7 @@ async fn pool_recheck_fires_after_interval_on_drained_pool() -> anyhow::Result<(
     );
 
     fx.conn.close(0u32.into(), b"done");
-    fx.client_ep.close().await;
-    fx.server_ep.close().await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -4927,9 +4879,7 @@ async fn solvent_pool_stream_completes_across_recheck_interval() -> anyhow::Resu
     );
 
     fx.conn.close(0u32.into(), b"done");
-    fx.client_ep.close().await;
-    fx.server_ep.close().await;
-    fx.server_task.await?;
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
     Ok(())
 }
 
@@ -5484,8 +5434,7 @@ async fn client_blob_too_large_is_refused() -> anyhow::Result<()> {
         "oversized-blob refusal must bump its reason counter (#876)"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5537,8 +5486,7 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
         progress.advanced()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5614,8 +5562,7 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
         progress.advanced()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5656,8 +5603,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         "exact-ceiling blob must deliver intact"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5699,8 +5645,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
         "a quote exactly at the buyer ceiling must deliver intact"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5783,8 +5728,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         "final progress ({prev}) must reach the expected wire length ({expected})"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5911,8 +5855,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
         "the takedown refusal must bump its own reason counter, not the eviction one"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5983,8 +5926,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
         "...nor land on the eviction counter, which is now non-takedown evictions only"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6066,8 +6008,7 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
          delivery ({err})"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6119,8 +6060,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
         "the compliance gauge must count a miss-path refusal too"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6163,8 +6103,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
         "evicted-since-probe refusal must bump its reason counter (#876)"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6209,8 +6148,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
         "a binding recovering a different address must reset the stream, got {res:?}"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6279,8 +6217,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
         "a bound-but-laneless request must bump the unknown-lane counter"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6367,8 +6304,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
     }
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6422,8 +6358,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
         "the funder binding must bump the unknown-lane counter"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6485,8 +6420,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
         "the compliance gauge must count the delegated-channel refusal"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6547,8 +6481,7 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
         "the delegate is the lane signer across a completed delivery"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6633,8 +6566,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
          delivery ({err})"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6766,8 +6698,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
         total_bytes
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -6844,8 +6775,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
         "cache-miss refusal must bump its reason counter"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7012,7 +6942,7 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
         "an unbound request must NOT trigger a paid pull"
     );
-    shutdown([], [&c1]).await;
+    shutdown([], [&c1]).await?;
 
     // 2) Bound to the WRONG owner: valid signature, but not the channel's client
     //    → not authorized → pull NOT attempted.
@@ -7032,7 +6962,7 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
         "a binding for a non-owner address must NOT trigger a paid pull"
     );
-    shutdown([], [&c2]).await;
+    shutdown([], [&c2]).await?;
 
     // 3) Bound to the channel OWNER: authorized → the pull IS attempted (the
     //    counting origin is reached exactly once).
@@ -7052,10 +6982,9 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         "the channel owner's bound request MUST trigger the pull exactly once, got {}",
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
-    shutdown([], [&c3]).await;
+    shutdown([], [&c3]).await?;
 
-    shutdown([], [&server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&server_ep]).await?;
     Ok(())
 }
 
@@ -7119,7 +7048,7 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
         hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
         "the funder of a delegated channel must NOT trigger a paid pull"
     );
-    shutdown([], [&c1]).await;
+    shutdown([], [&c1]).await?;
 
     // 2) Bound as the pinned DELEGATE signer: authorized → the pull is attempted.
     let delegate_sk = fresh_key();
@@ -7132,10 +7061,9 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
         "the pinned voucher signer MUST trigger the pull exactly once, got {}",
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
-    shutdown([], [&c2]).await;
+    shutdown([], [&c2]).await?;
 
-    shutdown([], [&server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&server_ep]).await?;
     Ok(())
 }
 
@@ -7295,8 +7223,7 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
         "the refusal must come from the floor, not from the fill missing"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7366,8 +7293,7 @@ async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
         "an exactly-funded channel must not trip the deposit floor"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7430,8 +7356,7 @@ async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         "the refusal must be attributed to the deposit floor, not to the fill missing"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7509,8 +7434,7 @@ async fn a_refused_request_clamps_the_rate_exactly_once() -> anyhow::Result<()> 
         metrics.encode()?
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7572,8 +7496,7 @@ async fn a_request_rejected_before_pricing_does_not_clamp_the_rate() -> anyhow::
         metrics.encode()?
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7612,8 +7535,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
         "a blacklisted funder must NOT trigger a paid pull, clean delegate or not"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7661,8 +7583,7 @@ async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> any
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -7785,11 +7706,10 @@ async fn pull_through_fills_under_deadline(
     // completes or the outer deadline fires), so the store state is settled by
     // the time this returns.
     let _ = raw_request(&client_ep, target, &req, Some(&ext_owner)).await?;
-    shutdown([], [&client_ep]).await;
+    shutdown([], [&client_ep]).await?;
 
     let filled = cache_probe.has(want).await?;
-    shutdown([], [&server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&server_ep]).await?;
     Ok(filled)
 }
 
@@ -8068,8 +7988,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
         "a backend fault must not be counted as a foreign decline"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8161,8 +8080,7 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
         "foreign decline must not touch the origin, got {}",
         cache_metrics.origin_fetches.get()
     );
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8202,8 +8120,7 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8249,8 +8166,7 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
         baseline_fetches
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8300,8 +8216,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8391,8 +8306,7 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8441,8 +8355,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8520,8 +8433,7 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
         "the refusal must be signed — an unsigned one is unattributable"
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8633,8 +8545,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8681,8 +8592,7 @@ async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8729,8 +8639,7 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
         cache_metrics.origin_fetches.get()
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -8810,8 +8719,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     // healthy-but-empty node as broken and steer clients away from it.
     assert_reject_reason(&metrics, 0, 1)?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -9047,8 +8955,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
     // dashboard reports an origin outage as an empty cache.
     assert_reject_reason(&metrics, 1, 0)?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -9108,8 +9015,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
     );
     assert_reject_reason(&metrics, 1, 0)?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -9167,8 +9073,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
     );
     assert_reject_reason(&metrics, 1, 0)?;
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -9464,8 +9369,7 @@ async fn cache_miss_refused_under_concurrency_pressure() -> anyhow::Result<()> {
     // Release the held slot only after the refusal is observed, so the shed
     // decision above is provably driven by the pre-occupied slot.
     drop(held);
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -9547,7 +9451,6 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
         refusal.error
     );
 
-    shutdown([], [&client_ep, &server_ep]).await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
