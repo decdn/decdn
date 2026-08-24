@@ -629,10 +629,15 @@ since project inception and will roll into the first tagged release.
   in flight when the runtime flushed and closed the store saw the store go away,
   took the store-walk failure branch, and fired
   `decdn_dht_republish_seed_store_walk_failures_total` plus a degradation warning
-  on an ordinary clean restart — an alertable counter on a non-event. The worker
-  now selects against a cancellation token that `run_republish` drops on its way
-  out, so shutdown abandons the walk without classifying it, and the worker
-  releases its `CacheEngine` clone before the flush rather than after.
+  on an ordinary clean restart — an alertable counter on a non-event.
+  `run_republish` now takes a `CancellationToken` the runtime owns and cancels
+  before it flushes the store, and the sweep worker selects against that same
+  token. The ordering is the point: a signal the republisher had to forward would
+  reach the sweep only once that task was next polled, which is not ordered
+  against the flush at all. A sweep abandoned on shutdown also releases its
+  `CacheEngine` clone before the flush rather than after. A queued pass is
+  discarded along with it, which is correct here and is now stated rather than
+  claimed away — see #1814 for the panic path, where it is not.
 
 - **node: the capacity-bond registry resync now reports whether it is working.**
   `RegistrySink::on_tick_complete` is the only systematic repair for a drifted
@@ -662,9 +667,12 @@ since project inception and will roll into the first tagged release.
   walks, which is what makes a wedged sweep slot diagnosable, but left no way to
   tell a climbing counter caused by commits outrunning the scheduler from one
   caused by a long walk absorbing a burst. The sibling
-  `decdn_dht_republish_lag_sweeps_coalesced_total` counts the folded lags:
-  subtracting it gives the walks actually started, and a coalesced rate tracking
-  the lag rate one-for-one is the signature of a slot that is never released.
+  `decdn_dht_republish_lag_sweeps_coalesced_total` splits it into the lags that
+  claimed an idle slot and the lags that did not. Neither it nor the difference
+  counts walks — the slot holds one queued position, so any number of lags
+  arriving behind a running worker collapse into a single further pass. The ratio
+  is what reads: coalesced climbing at the lag rate with the difference flat is a
+  slot that is never released.
 
 - **dht: a lagged cache-commit channel now re-seeds the republish scheduler.**
   The republisher schedules a blob's first DHT `Store` off the cache's

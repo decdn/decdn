@@ -1502,7 +1502,7 @@ struct Background {
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
-    republish_stop_tx: oneshot::Sender<()>,
+    republish_stop: CancellationToken,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
@@ -1748,7 +1748,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // with seed-time lands in the channel backlog rather than the
     // gap between the snapshot and the spawn.
     let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
-    let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
+    // A token rather than a `oneshot`: the republisher's detached lag sweep
+    // selects against the same signal, and shutdown must cancel it *before*
+    // `cache.shutdown()` flushes the store. A signal the republisher forwards
+    // only once it is next polled cannot give that ordering.
+    let republish_stop = CancellationToken::new();
     let cache_inserts_rx = infra.cache.subscribe_inserts();
     // Walk the on-disk store (NOT `access_times_snapshot`, which maps `Hash →
     // Instant` and is empty on every cold start) so every committed,
@@ -1782,10 +1786,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             "cold-start store seed failed; blobs not re-fetched this session go un-republished until a later lag sweep re-walks the store, or until restart (ADR 022 §Bootstrap AC 15 degraded)"
         );
     }
-    if snapshot.origin_probe_faults > 0 {
+    if snapshot.origin_probe_faults > 0 || snapshot.origin_enumerate_failures > 0 {
         tracing::warn!(
             faults = snapshot.origin_probe_faults,
-            "cold-start origin seed is incomplete; the boot rescan could not resolve every candidate, so the origin-held half runs on carried-forward sizes and omits anything first seen inside the fault window (ADR 022 §Bootstrap AC 15 degraded)"
+            enumerate_failures = snapshot.origin_enumerate_failures,
+            "cold-start origin seed is incomplete; the boot rescan could not resolve every candidate, so the origin half runs on carried-forward sizes, omits anything first seen inside a fault window, and omits every hash discoverable only through an origin that could not be listed (ADR 022 §Bootstrap AC 15 degraded)"
         );
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
@@ -1807,7 +1812,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         cfg.cache.relay_foreign_namespaces,
         Arc::clone(&infra.node_metrics),
         cache_inserts_rx,
-        republish_stop_rx,
+        republish_stop.clone(),
     ));
 
     // Periodic origin rescan (#1130): re-walk the fs origin + re-check pins so a
@@ -2209,7 +2214,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
-        republish_stop_tx,
+        republish_stop,
         bucket_refresh_stop_tx,
         buyer_bootstrap_stop_tx,
         rpc_watchdog,
@@ -2287,7 +2292,7 @@ pub async fn run(
         eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
-        republish_stop_tx: bg.republish_stop_tx,
+        republish_stop: bg.republish_stop,
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
@@ -2321,7 +2326,7 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
-    republish_stop_tx: oneshot::Sender<()>,
+    republish_stop: CancellationToken,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
@@ -2364,7 +2369,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
-        republish_stop_tx,
+        republish_stop,
         bucket_refresh_stop_tx,
         mut admin_stop_tx,
         rpc_watchdog,
@@ -2417,7 +2422,11 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = eviction_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = probe_rate_limit_gc_stop_tx.send(());
-    let _ = republish_stop_tx.send(());
+    // Cancels the republisher AND any lag sweep it left detached, ordered
+    // strictly before the `cache.shutdown()` flush below — a sweep still walking
+    // the store then abandons the walk rather than seeing the store disappear
+    // and reporting its own teardown as a store-walk failure.
+    republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
     // The five chain watchers are now one multiplexed poller with one shutdown
     // token, so the previous staggered per-watcher stops collapse to a SINGLE

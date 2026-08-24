@@ -88,10 +88,15 @@
 //! during the outage the cadence repair does not run at all, and a resync whose
 //! own read fails stamps the clock anyway and defers a further interval.
 //!
-//! So the window a dropped change survives is bounded by the recovery of the
-//! poll that dropped it, not by where the cadence happens to land afterwards.
-//! The metrics above size that window; the two registry metrics report whether
-//! the repair itself is working.
+//! Neither trigger is a ceiling, for two reasons worth knowing before reading
+//! the metrics as one. The recovery edge fires on a route-level outage — a tick
+//! that errored — and a dropped `nodeIdOf` does not error the route, since
+//! `on_operator_change` returns `Ok` by design; a change lost that way with the
+//! poll otherwise healthy still waits for the cadence. And the re-enumeration
+//! the edge forces can itself fail, which stamps the clock and defers the next
+//! attempt a further interval. So the window closes on the first *successful*
+//! re-enumeration after recovery, not on recovery itself. The metrics above size
+//! that window; the two registry metrics report whether the repair is landing.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};

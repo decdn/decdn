@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -39,19 +39,47 @@ use crate::retry::{
 };
 use crate::{from_store_hash, to_store_hash};
 
-/// What one [`CacheEngine::rescan_origins`] pass resolved.
+/// The origin-held index and what the rescan that built it could not resolve.
 ///
-/// `faults` and `carried` ride alongside the index because a rescan that
-/// silently shrinks the announce set is indistinguishable from one whose origin
-/// genuinely stopped holding the content.
+/// One `ArcSwap` payload rather than an index plus separate counters: a reader
+/// that saw a fault-truncated index alongside a later rescan's zero fault count
+/// would report a short announce set as healthy, which is the failure the counts
+/// exist to expose. Published together, read together.
+#[derive(Debug, Default)]
+struct OriginHeldIndex {
+    /// Hash -> total byte size, for everything a configured origin can serve.
+    held: HashMap<Hash, u64>,
+    /// Candidates whose size probe faulted rather than answering. Each either
+    /// kept a size carried from the previous index or is missing from `held`.
+    probe_faults: u64,
+    /// Origins whose `enumerate` failed. Their listings contributed nothing to
+    /// this pass, so every hash discoverable only through one of them is absent
+    /// from `held` — with no per-hash fault to count, since none was probed.
+    enumerate_failures: u64,
+}
+
+/// What one [`CacheEngine::rescan_origins`] probe pass resolved.
 #[derive(Debug, Default)]
 struct RescanResolution {
-    /// The rebuilt origin-held index: hash -> total byte size.
+    /// The rebuilt index: hash -> total byte size.
     held: HashMap<Hash, u64>,
     /// Candidates whose probe faulted rather than answering.
     faults: u64,
     /// Faulted candidates that kept a size from the previous index.
     carried: usize,
+}
+
+/// The origin-held announce set plus what the rescan behind it could not
+/// resolve, read as one consistent view — see
+/// [`CacheEngine::origin_held_snapshot`].
+#[derive(Debug, Default)]
+pub struct OriginHeldReport {
+    /// Hashes a configured origin can serve, minus anything currently refused.
+    pub hashes: HashSet<Hash>,
+    /// Size probes that faulted on the rescan that built this set.
+    pub probe_faults: u64,
+    /// Origins whose listing failed on that rescan, contributing nothing.
+    pub enumerate_failures: u64,
 }
 
 /// A live origin-existence answer (#1766), distinguishing a genuine negative
@@ -157,12 +185,7 @@ struct Inner {
     /// mirroring `pinned`. Probe and DHT-announce read it so cold origin
     /// content is discoverable on the first request rather than only after a
     /// warm pulls it into the store. Never includes refused/denied hashes.
-    origin_held: ArcSwap<HashMap<Hash, u64>>,
-    /// Origin size probes that faulted during the most recent
-    /// [`CacheEngine::rescan_origins`], rather than answering "held" or "not
-    /// held". Read by the DHT seed paths, which fold it into the snapshot they
-    /// report, so a truncated announce set is never reported as a healthy one.
-    last_rescan_probe_faults: AtomicU64,
+    origin_held: ArcSwap<OriginHeldIndex>,
     /// Live-origin probe memo (#1130 pt3). The `origin_held` index only covers
     /// fs enumeration ∪ pins — http/s3 do not list, so a non-pinned bucket
     /// object is absent from it. [`CacheEngine::origin_probe_size`] falls back to
@@ -1090,8 +1113,7 @@ impl CacheEngine {
                         .map(|h| to_store_hash(*h))
                         .collect::<HashSet<Hash>>(),
                 )),
-                origin_held: ArcSwap::from(Arc::new(HashMap::new())),
-                last_rescan_probe_faults: AtomicU64::new(0),
+                origin_held: ArcSwap::from(Arc::new(OriginHeldIndex::default())),
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
@@ -1255,7 +1277,14 @@ impl CacheEngine {
     /// keeps its entries indefinitely; that is the intended trade, and the
     /// serve path answers from the live origin either way. Faults are counted
     /// on `decdn_cache_origin_probe_failures_total` and reported to the DHT seed
-    /// paths through [`Self::last_rescan_origin_probe_faults`].
+    /// paths through [`Self::origin_held_snapshot`].
+    ///
+    /// An origin whose `enumerate` fails is the coarser version of the same
+    /// thing: it contributes no candidates, so its hashes leave the index with
+    /// no per-hash fault and nothing to carry forward. Only operator pins naming
+    /// them survive. That leg counts on
+    /// `decdn_cache_origin_enumerate_failures_total` and rides the same
+    /// snapshot.
     ///
     /// One caveat the index cannot see: [`Origin::size`] maps every non-success
     /// HTTP status, 5xx included, to `Ok(None)`. So an HTTP origin's transient
@@ -1268,7 +1297,7 @@ impl CacheEngine {
     /// off the hot path at the configured rescan cadence (startup / interval /
     /// reload), never per request.
     pub async fn rescan_origins(&self) {
-        let candidates = self.rescan_candidates().await;
+        let (candidates, enumerate_failures) = self.rescan_candidates().await;
         let RescanResolution {
             held,
             faults,
@@ -1276,14 +1305,20 @@ impl CacheEngine {
         } = self.resolve_candidates(candidates).await;
 
         let count = held.len();
-        self.inner.origin_held.store(Arc::new(held));
-        self.inner
-            .last_rescan_probe_faults
-            .store(faults, Ordering::Relaxed);
-        if faults > 0 {
-            if let Some(m) = &self.inner.metrics {
+        self.inner.origin_held.store(Arc::new(OriginHeldIndex {
+            held,
+            probe_faults: faults,
+            enumerate_failures,
+        }));
+        if let Some(m) = &self.inner.metrics {
+            if faults > 0 {
                 m.origin_probe_failures.inc_by(faults);
             }
+            if enumerate_failures > 0 {
+                m.origin_enumerate_failures.inc_by(enumerate_failures);
+            }
+        }
+        if faults > 0 {
             tracing::warn!(
                 faults,
                 carried,
@@ -1301,22 +1336,32 @@ impl CacheEngine {
     /// listing plus the operator pin set.
     ///
     /// The pin set is snapshotted here rather than read inside the probe loop,
-    /// so the `ArcSwap` guard is never held across a `size()` await. An origin
-    /// whose enumeration fails contributes nothing this pass; its pins still do.
-    async fn rescan_candidates(&self) -> Vec<Hash> {
+    /// so the `ArcSwap` guard is never held across a `size()` await.
+    ///
+    /// Also returns how many origins failed to enumerate. Such an origin
+    /// contributes nothing this pass — its hashes are never probed, so they
+    /// carry no per-hash fault and simply leave the index. Only the operator
+    /// pins naming them survive.
+    async fn rescan_candidates(&self) -> (Vec<Hash>, u64) {
         let mut candidates: Vec<Hash> = Vec::new();
+        let mut enumerate_failures = 0u64;
         for origin in &self.inner.origins {
             match origin.enumerate().await {
                 Ok(hashes) => candidates.extend(hashes),
-                Err(err) => tracing::warn!(
-                    origin = ?origin.kind(),
-                    error = %err,
-                    "rescan_origins: enumerate failed; skipping this origin"
-                ),
+                Err(err) => {
+                    enumerate_failures = enumerate_failures.saturating_add(1);
+                    tracing::warn!(
+                        origin = ?origin.kind(),
+                        error = %err,
+                        "rescan_origins: enumerate failed; every hash discoverable \
+                         only through this origin leaves the announce set until a \
+                         later rescan lists it"
+                    );
+                }
             }
         }
         candidates.extend(self.inner.pinned.load().iter().copied());
-        candidates
+        (candidates, enumerate_failures)
     }
 
     /// Resolve each candidate against the origin chain for
@@ -1331,8 +1376,14 @@ impl CacheEngine {
         let timeout = self.probe_memo_lock().timeout();
         let previous = self.inner.origin_held.load();
         let mut out = RescanResolution::default();
+        // Dedupe on a `seen` set, not on `held`: a candidate that resolves
+        // `Absent`, or faults with nothing to carry forward, never lands in
+        // `held`, and every origin's listing is concatenated with the pin set —
+        // so keying off `held` re-probes those hashes once per duplicate and
+        // counts one fault per probe.
+        let mut seen: HashSet<Hash> = HashSet::new();
         for hash in candidates {
-            if self.refuses(hash) || out.held.contains_key(&hash) {
+            if self.refuses(hash) || !seen.insert(hash) {
                 continue;
             }
             match self.probe_origin_chain(hash, timeout).await {
@@ -1342,7 +1393,7 @@ impl CacheEngine {
                 OriginPresence::Absent => {}
                 OriginPresence::Fault => {
                     out.faults = out.faults.saturating_add(1);
-                    if let Some(size) = previous.get(&hash).copied() {
+                    if let Some(size) = previous.held.get(&hash).copied() {
                         out.held.insert(hash, size);
                         out.carried = out.carried.saturating_add(1);
                     }
@@ -1350,19 +1401,6 @@ impl CacheEngine {
             }
         }
         out
-    }
-
-    /// Origin size probes that faulted during the most recent
-    /// [`Self::rescan_origins`], rather than answering "held" or "not held".
-    ///
-    /// The origin-held half of a DHT seed has no other error channel: a probe
-    /// fault either carries a stale size forward or leaves the candidate out of
-    /// [`Self::origin_held_hashes`] entirely, and the seed cannot tell either
-    /// apart from an origin that genuinely stopped holding the object. Seed
-    /// paths read this so a truncated announce set is reported as degraded
-    /// rather than healthy.
-    pub fn last_rescan_origin_probe_faults(&self) -> u64 {
-        self.inner.last_rescan_probe_faults.load(Ordering::Relaxed)
     }
 
     /// Snapshot of the hashes in the origin-held index (#1130), for seeding the
@@ -1376,10 +1414,35 @@ impl CacheEngine {
         self.inner
             .origin_held
             .load()
+            .held
             .keys()
             .copied()
             .filter(|h| !self.refuses(*h))
             .collect()
+    }
+
+    /// [`Self::origin_held_hashes`] together with what the rescan that built it
+    /// could not resolve, read from one load of the index.
+    ///
+    /// The origin-held half of a DHT seed has no other error channel: a probe
+    /// fault either carries a stale size forward or leaves the candidate out of
+    /// the set, a failed enumeration drops a whole origin's listing, and the seed
+    /// cannot tell either from an origin that genuinely stopped holding the
+    /// content. Reading the pair from one load is what stops a seed from
+    /// combining a truncated set with a later, healthy rescan's counts and
+    /// calling it healthy.
+    pub fn origin_held_snapshot(&self) -> OriginHeldReport {
+        let index = self.inner.origin_held.load();
+        OriginHeldReport {
+            hashes: index
+                .held
+                .keys()
+                .copied()
+                .filter(|h| !self.refuses(*h))
+                .collect(),
+            probe_faults: index.probe_faults,
+            enumerate_failures: index.enumerate_failures,
+        }
     }
 
     /// Total byte size of `hash` if this node can serve it from a configured
@@ -1396,7 +1459,7 @@ impl CacheEngine {
         if self.refuses(hash) {
             return None;
         }
-        self.inner.origin_held.load().get(&hash).copied()
+        self.inner.origin_held.load().held.get(&hash).copied()
     }
 
     /// Total byte size of `hash` if a configured origin can serve it, resolved
@@ -5352,6 +5415,34 @@ mod tests {
     struct ThrottlableOrigin {
         held: Vec<(Hash, u64)>,
         faulting: Arc<AtomicBool>,
+        enumerate_fails: Arc<AtomicBool>,
+        size_calls: Arc<AtomicUsize>,
+    }
+
+    impl ThrottlableOrigin {
+        fn new(held: Vec<(Hash, u64)>) -> (Self, ThrottleControls) {
+            let controls = ThrottleControls {
+                faulting: Arc::new(AtomicBool::new(false)),
+                enumerate_fails: Arc::new(AtomicBool::new(false)),
+                size_calls: Arc::new(AtomicUsize::new(0)),
+            };
+            (
+                Self {
+                    held,
+                    faulting: Arc::clone(&controls.faulting),
+                    enumerate_fails: Arc::clone(&controls.enumerate_fails),
+                    size_calls: Arc::clone(&controls.size_calls),
+                },
+                controls,
+            )
+        }
+    }
+
+    /// The switches and the probe counter a test drives [`ThrottlableOrigin`] by.
+    struct ThrottleControls {
+        faulting: Arc<AtomicBool>,
+        enumerate_fails: Arc<AtomicBool>,
+        size_calls: Arc<AtomicUsize>,
     }
 
     impl Origin for ThrottlableOrigin {
@@ -5374,6 +5465,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
         {
             Box::pin(async move {
+                self.size_calls.fetch_add(1, Ordering::SeqCst);
                 if self.faulting.load(Ordering::SeqCst) {
                     return Err(crate::OriginPullError::Transient(anyhow::anyhow!(
                         "synthetic HeadObject throttle (503 SlowDown)"
@@ -5391,7 +5483,14 @@ mod tests {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, crate::OriginPullError>> + Send + '_>>
         {
-            Box::pin(async { Ok(self.held.iter().map(|(h, _)| *h).collect()) })
+            Box::pin(async {
+                if self.enumerate_fails.load(Ordering::SeqCst) {
+                    return Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                        "synthetic ListObjectsV2 outage"
+                    )));
+                }
+                Ok(self.held.iter().map(|(h, _)| *h).collect())
+            })
         }
     }
 
@@ -5405,11 +5504,8 @@ mod tests {
     async fn rescan_origins_carries_a_faulted_probe_forward() -> anyhow::Result<()> {
         let indexed = Hash::new(b"throttle-indexed");
         let fresh = Hash::new(b"throttle-fresh");
-        let faulting = Arc::new(AtomicBool::new(false));
-        let origin = Arc::new(ThrottlableOrigin {
-            held: vec![(indexed, 5000), (fresh, 9000)],
-            faulting: Arc::clone(&faulting),
-        }) as Arc<dyn Origin>;
+        let (origin, controls) = ThrottlableOrigin::new(vec![(indexed, 5000), (fresh, 9000)]);
+        let origin = Arc::new(origin) as Arc<dyn Origin>;
 
         let tmp = tempfile::tempdir()?;
         let cm = Arc::new(CacheMetrics::default());
@@ -5417,7 +5513,9 @@ mod tests {
             tmp.path(),
             vec![origin],
             10,
-            crate::PinnedHashes::empty(),
+            // `fresh` is also pinned, so it reaches the probe loop twice — once
+            // from the listing and once from the pin set. It must be probed once.
+            crate::PinnedHashes::new([from_store_hash(fresh)].into_iter().collect()),
             crate::RetryPolicy::default(),
             CircuitBreakerPolicy::default(),
             Some(Arc::clone(&cm)),
@@ -5436,14 +5534,22 @@ mod tests {
             "the healthy rescan must index the enumerated hash",
         );
         anyhow::ensure!(
-            engine.last_rescan_origin_probe_faults() == 0,
+            engine.origin_held_snapshot().probe_faults == 0,
             "a healthy rescan reports no faults",
         );
 
         // The throttle opens, and `fresh` becomes a candidate for the first time.
         engine.set_denied(&crate::DeniedHashes::new(HashSet::new()));
-        faulting.store(true, Ordering::SeqCst);
+        controls.faulting.store(true, Ordering::SeqCst);
+        controls.size_calls.store(0, Ordering::SeqCst);
         engine.rescan_origins().await;
+
+        anyhow::ensure!(
+            controls.size_calls.load(Ordering::SeqCst) == 2,
+            "each candidate is probed once however many times it is listed, or a \
+             duplicate inflates the fault count: {} probes for 2 candidates",
+            controls.size_calls.load(Ordering::SeqCst),
+        );
 
         anyhow::ensure!(
             engine.origin_held_size(indexed) == Some(5000),
@@ -5454,9 +5560,9 @@ mod tests {
             "a candidate first seen inside the fault window has nothing to carry forward",
         );
         anyhow::ensure!(
-            engine.last_rescan_origin_probe_faults() == 2,
+            engine.origin_held_snapshot().probe_faults == 2,
             "both faulted probes must be reported to the DHT seed paths, got {}",
-            engine.last_rescan_origin_probe_faults(),
+            engine.origin_held_snapshot().probe_faults,
         );
 
         // The rescan is the metric's only source, so the counter and the
@@ -5468,15 +5574,74 @@ mod tests {
         );
 
         // The throttle closes: the next rescan resolves both.
-        faulting.store(false, Ordering::SeqCst);
+        controls.faulting.store(false, Ordering::SeqCst);
         engine.rescan_origins().await;
         anyhow::ensure!(
             engine.origin_held_size(fresh) == Some(9000),
             "a recovered origin must index what the fault window missed",
         );
         anyhow::ensure!(
-            engine.last_rescan_origin_probe_faults() == 0,
+            engine.origin_held_snapshot().probe_faults == 0,
             "a recovered rescan clears the fault report",
+        );
+        Ok(())
+    }
+
+    /// An origin that cannot be listed drops every hash discoverable only
+    /// through it, and must say so.
+    ///
+    /// This is the more severe half of the same silent shrink: no candidate is
+    /// produced, so there is no per-hash fault and nothing to carry forward. A
+    /// seed reading only the probe-fault count would call the truncated set
+    /// healthy.
+    #[tokio::test]
+    async fn rescan_origins_reports_an_origin_it_could_not_list() -> anyhow::Result<()> {
+        let listed = Hash::new(b"listing-outage");
+        let (origin, controls) = ThrottlableOrigin::new(vec![(listed, 1234)]);
+        let origin = Arc::new(origin) as Arc<dyn Origin>;
+
+        let tmp = tempfile::tempdir()?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![origin],
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
+
+        engine.rescan_origins().await;
+        anyhow::ensure!(
+            engine.origin_held_size(listed) == Some(1234),
+            "the healthy rescan must index the listed hash",
+        );
+
+        controls.enumerate_fails.store(true, Ordering::SeqCst);
+        engine.rescan_origins().await;
+
+        let report = engine.origin_held_snapshot();
+        anyhow::ensure!(
+            report.enumerate_failures == 1,
+            "the failed listing must be reported, got {}",
+            report.enumerate_failures,
+        );
+        anyhow::ensure!(
+            report.probe_faults == 0,
+            "no candidate was produced, so there is no probe to fault",
+        );
+        anyhow::ensure!(
+            !report.hashes.contains(&listed),
+            "an unlisted, unpinned hash genuinely leaves the announce set — the \
+             point is that the report says so",
+        );
+        anyhow::ensure!(
+            cm.origin_enumerate_failures.get() == 1,
+            "the failed listing must surface on its counter, got {}",
+            cm.origin_enumerate_failures.get(),
         );
         Ok(())
     }

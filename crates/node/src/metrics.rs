@@ -392,11 +392,15 @@ pub struct DecdnMetrics {
     pub dht_republish_lag_sweeps: Counter,
 
     /// Lag events folded into a sweep that was already running or already
-    /// queued, rather than starting a walk of their own. The sibling that makes
-    /// `decdn_dht_republish_lag_sweeps_total` readable: subtracting this from it
-    /// gives the number of walks actually started, and a coalesced rate that
-    /// tracks the lag rate one-for-one is the signature of a sweep slot that is
-    /// never released. Operator-visible name:
+    /// queued, rather than starting a walk of their own. The sibling that splits
+    /// `decdn_dht_republish_lag_sweeps_total` into the lags that claimed an idle
+    /// slot and the lags that did not.
+    ///
+    /// **Not** a walk count, and the difference is not one either: the slot has
+    /// a single queued position, so any number of lags arriving behind a running
+    /// worker all count here and collapse into one further pass. The ratio is
+    /// what reads: coalesced climbing at the lag rate, with the difference flat,
+    /// means the slot is never released. Operator-visible name:
     /// `decdn_dht_republish_lag_sweeps_coalesced_total`.
     pub dht_republish_lag_sweeps_coalesced: Counter,
     /// Hashes a lag sweep newly scheduled for republish. Seeding is
@@ -2940,6 +2944,9 @@ mod tests {
             // without it, so an operator has to be able to alert on `> 0`
             // before it has ever fired.
             "decdn_cache_origin_probe_failures_total",
+            // The other leg of the same rescan. The struct field is
+            // `origin_enumerate_failures`.
+            "decdn_cache_origin_enumerate_failures_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

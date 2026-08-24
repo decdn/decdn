@@ -492,9 +492,14 @@ systematic repair for a drifted set. It deliberately reports success upward — 
 error would mark the watcher route errored and stall event pickup — so the
 counter is the only thing that moves when its read fails. The staleness rule
 covers the other case: while the route is errored the repair is skipped
-entirely, which emits nothing at all, not even the counter. The recovery of the
-route forces a re-enumeration on the tick it comes back, so a stale gauge with a
-healthy route means the reads themselves are failing.
+entirely, which emits nothing at all, not even the counter.
+
+A route recovering from an errored tick forces a re-enumeration on the tick it
+comes back, so a stale gauge on a healthy route means the reads themselves are
+failing. That trigger covers poll-level outages only: a `nodeIdOf` resolution
+failure is returned as `Ok` and never errors the route, so a membership change
+dropped that way waits for the cadence even while everything else looks
+healthy — watch `decdn_staker_set_watcher_resolve_failures_total` for it.
 
 **Remediate:** check the RPC provider's `eth_call` path — the enumeration is
 paginated `eth_call`s, not `eth_getLogs`, so it can fail while the event tail
@@ -510,9 +515,10 @@ provider is healthy and the gauge stays stale.
 find some of its blobs through the DHT but not others, with no serve errors —
 what is missing was never announced.
 
-**Detect:** `decdn_cache_origin_probe_failures_total` nonzero, with
-`rescan_origins: origin size probes faulted` at `WARN` naming how many faulted
-and how many kept a carried-forward entry.
+**Detect:** `decdn_cache_origin_probe_failures_total` or
+`decdn_cache_origin_enumerate_failures_total` nonzero, with
+`rescan_origins: origin size probes faulted` or `rescan_origins: enumerate
+failed` at `WARN`.
 
 **What it means:** a rescan resolves each candidate against the origin — one
 `HEAD`/`HeadObject`/stat per hash — to decide what this node advertises. A
@@ -522,6 +528,11 @@ announce set holds but the size it advertises is the older one; a candidate firs
 seen inside the fault window has nothing to carry forward and is absent from the
 announce set until a later rescan resolves it. Note an HTTP origin reports a 5xx
 as a plain "not held", so this counter covers S3/R2 and filesystem origins.
+
+The enumerate counter is the more severe of the two. A listing that fails
+produces no candidates at all, so every hash discoverable only through that
+origin leaves the announce set with no per-hash fault and nothing to carry
+forward — only operator pins naming those hashes survive the pass.
 
 **Remediate:** check the origin backend's own error and throttle rates. The next
 successful rescan repairs the index on its own — at boot, on the

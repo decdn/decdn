@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::RngExt;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::dht::chain_projection::with_lock;
@@ -339,11 +339,15 @@ pub(crate) struct HolderSnapshot {
     /// `hashes`; the caller decides how loudly to report the degradation, since
     /// bring-up and the sweep phrase it differently.
     pub(crate) store_error: Option<decdn_cache::CacheError>,
-    /// Origin size probes that faulted on the rescan the origin-held half comes
-    /// from. The mirror of `store_error` for the other half: nonzero means the
-    /// origin-held set is running on carried-forward sizes, and any candidate
-    /// first seen inside the fault window is missing from it entirely.
+    /// Origin probes that could not answer, across both places this snapshot
+    /// asks one: the rescan the origin-held half comes from, and the ownership
+    /// test each stored hash is put to under the origin-only policy. The mirror
+    /// of `store_error` for the origin half — nonzero means the set is short of
+    /// what this node actually holds, whatever the two halves otherwise report.
     pub(crate) origin_probe_faults: u64,
+    /// Origins whose listing failed on that rescan. More severe than a probe
+    /// fault: no candidate was produced, so nothing could be carried forward.
+    pub(crate) origin_enumerate_failures: u64,
 }
 
 /// Collect the [`HolderSnapshot`] for `cache`.
@@ -361,7 +365,10 @@ pub(crate) struct HolderSnapshot {
 /// this node owns, committed but with its insert event dropped, is in neither
 /// half without it. `Fault` is skipped rather than admitted: a transport blip
 /// must not turn into an advertisement for content the serve path might then
-/// refuse, and faults are not memoised, so the next sweep retries.
+/// refuse, and faults are not memoised, so the next sweep retries. Skipping is
+/// still a hash this node holds and does not announce, so each one counts
+/// toward `origin_probe_faults` — otherwise an origin-only node drops its own
+/// store-only content on a blip and reports a healthy snapshot.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
 /// yielding nothing, because a partial announce strictly beats none. Both
@@ -372,7 +379,9 @@ pub(crate) async fn holder_snapshot(
     cache: &decdn_cache::CacheEngine,
     relay_foreign_namespaces: bool,
 ) -> HolderSnapshot {
-    let mut hashes: HashSet<decdn_cache::Hash> = cache.origin_held_hashes().into_iter().collect();
+    let report = cache.origin_held_snapshot();
+    let mut hashes = report.hashes;
+    let mut origin_probe_faults = report.probe_faults;
     let mut store_error = None;
     match cache.iter_hashes().await {
         Ok(stored) => {
@@ -380,8 +389,18 @@ pub(crate) async fn holder_snapshot(
                 if hashes.contains(&hash) {
                     continue;
                 }
-                if relay_foreign_namespaces || is_own_origin_content(cache, hash).await {
+                if relay_foreign_namespaces {
                     hashes.insert(hash);
+                    continue;
+                }
+                match cache.origin_probe_presence(hash).await {
+                    decdn_cache::OriginPresence::Present(_) => {
+                        hashes.insert(hash);
+                    }
+                    decdn_cache::OriginPresence::Absent => {}
+                    decdn_cache::OriginPresence::Fault => {
+                        origin_probe_faults = origin_probe_faults.saturating_add(1);
+                    }
                 }
             }
         }
@@ -390,21 +409,9 @@ pub(crate) async fn holder_snapshot(
     HolderSnapshot {
         hashes,
         store_error,
-        origin_probe_faults: cache.last_rescan_origin_probe_faults(),
+        origin_probe_faults,
+        origin_enumerate_failures: report.enumerate_failures,
     }
-}
-
-/// Whether a configured origin backend confirms it holds `hash` — the
-/// origin-only node's ownership test, matching the serve gate in
-/// `handlers::client::dispatch`.
-///
-/// Memoised inside the cache under the positive TTL, so a sweep re-walking the
-/// same store does not re-issue a `HEAD` per hash.
-async fn is_own_origin_content(cache: &decdn_cache::CacheEngine, hash: decdn_cache::Hash) -> bool {
-    matches!(
-        cache.origin_probe_presence(hash).await,
-        decdn_cache::OriginPresence::Present(_)
-    )
 }
 
 /// What one lag sweep did, for the completion log.
@@ -436,7 +443,9 @@ async fn lag_sweep(
     metrics: &crate::metrics::Metrics,
 ) -> SweepOutcome {
     let snapshot = holder_snapshot(cache, relay_foreign_namespaces).await;
-    let degraded = snapshot.store_error.is_some() || snapshot.origin_probe_faults > 0;
+    let degraded = snapshot.store_error.is_some()
+        || snapshot.origin_probe_faults > 0
+        || snapshot.origin_enumerate_failures > 0;
     if let Some(err) = &snapshot.store_error {
         metrics.dht_republish_seed_store_walk_failure();
         tracing::warn!(
@@ -446,12 +455,14 @@ async fn lag_sweep(
              un-republished until the next sweep or restart"
         );
     }
-    if snapshot.origin_probe_faults > 0 {
+    if snapshot.origin_probe_faults > 0 || snapshot.origin_enumerate_failures > 0 {
         tracing::warn!(
             faults = snapshot.origin_probe_faults,
-            "dht republish: the last origin rescan could not resolve every \
-             candidate; the origin-held half of this sweep runs on carried-forward \
-             sizes and omits anything first seen inside the fault window"
+            enumerate_failures = snapshot.origin_enumerate_failures,
+            "dht republish: the origin half of this sweep is short of what this \
+             node holds; probes that faulted run on carried-forward sizes and omit \
+             anything first seen inside the fault window, and an origin that could \
+             not be listed contributes nothing at all"
         );
     }
     let reseeded = scheduler.seed_cold_start(
@@ -523,10 +534,18 @@ struct SweepSlot<'a> {
 /// Coalescing re-runs rather than drops. Each pass re-derives the advertised
 /// set once, at its start, so a lag observed mid-walk concerns commits that
 /// snapshot cannot contain; skipping it would strand exactly the blobs the
-/// sweep exists to recover. A request is therefore never lost: it either
-/// starts a worker or moves the slot to `SWEEP_QUEUED`, and the running
-/// worker's release is a compare-exchange that fails if a request landed
-/// first.
+/// sweep exists to recover. A request therefore survives every ordinary
+/// outcome: it either starts a worker or moves the slot to `SWEEP_QUEUED`, and
+/// the running worker's release is a compare-exchange that fails if a request
+/// landed first.
+///
+/// Two paths discard a queued request instead of running it. Shutdown does so
+/// deliberately — the next boot re-seeds. A panic inside the walk does so
+/// because `SweepSlotGuard` can only release the slot, not resume it, and the
+/// unwinding worker has nothing left to run the pass with; those commits then
+/// wait for a later lag or a restart. The guard still prefers that to the
+/// alternative it exists for, a stranded slot that disables every later sweep
+/// for the process lifetime.
 fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     use std::sync::atomic::Ordering;
     loop {
@@ -626,9 +645,15 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
 
 /// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
 /// the cache, drives the scheduler heap, and fans out `Store` requests
-/// to the K+3 closest peers per due hash. Exits on `stop_rx`, or on a
+/// to the K+3 closest peers per due hash. Exits on `stop`, or on a
 /// closed cache subscribe channel — which this task's own `CacheEngine`
 /// clone makes unreachable in practice.
+///
+/// `stop` is owned by the runtime, which cancels it before flushing the cache
+/// store. That ordering is what a detached lag sweep needs: the sweep selects
+/// against this same token, so its walk is abandoned ahead of the flush rather
+/// than on whatever tick this task next happens to be polled — a signal this
+/// task had to forward would give no such guarantee.
 ///
 /// Returns on shutdown so the runtime's `JoinSet` can drain it.
 //
@@ -645,17 +670,13 @@ pub async fn run_republish(
     relay_foreign_namespaces: bool,
     metrics: Arc<crate::metrics::Metrics>,
     mut cache_inserts: broadcast::Receiver<iroh_blobs::Hash>,
-    mut stop_rx: oneshot::Receiver<()>,
+    stop: CancellationToken,
 ) {
     let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     // One sweep at a time, with a queued re-run rather than a dropped request.
     // A lag is a symptom of sustained commit pressure, so `Lagged` commonly
     // repeats; see `spawn_lag_sweep` for the slot protocol.
     let sweep_state = Arc::new(std::sync::atomic::AtomicU8::new(SWEEP_IDLE));
-    // Cancelled before this task returns, so a detached sweep abandons its walk
-    // instead of racing the runtime's cache flush.
-    let sweep_shutdown = CancellationToken::new();
-    let _sweep_shutdown_guard = sweep_shutdown.clone().drop_guard();
     // Use a relatively short polling interval — the driver wakes on
     // cache-insert events, on the scheduler ticking, OR on the
     // shutdown signal. A 1-second poll keeps the worst-case latency
@@ -667,7 +688,7 @@ pub async fn run_republish(
     loop {
         tokio::select! {
             biased;
-            _ = &mut stop_rx => {
+            () = stop.cancelled() => {
                 tracing::debug!("dht republish: shutdown signal received");
                 return;
             }
@@ -705,7 +726,7 @@ pub async fn run_republish(
                             cache: &cache,
                             scheduler: &scheduler,
                             metrics: &metrics,
-                            shutdown: &sweep_shutdown,
+                            shutdown: &stop,
                             relay_foreign_namespaces,
                         });
                     }
@@ -1084,6 +1105,10 @@ mod tests {
         hash: decdn_cache::Hash,
         enumerable: bool,
         answers_size: bool,
+        /// `size` returns a transport error instead of an answer — the fourth
+        /// axis, because a backend that is merely unreachable must not read as
+        /// one that does not hold the object.
+        faults_size: bool,
     }
 
     impl decdn_cache::Origin for StubOrigin {
@@ -1116,6 +1141,13 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
         > {
+            if self.faults_size {
+                return Box::pin(async {
+                    Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
+                        "synthetic HEAD outage"
+                    )))
+                });
+            }
             let n = (self.answers_size && hash == self.hash)
                 .then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
             Box::pin(async move { Ok(n) })
@@ -1147,6 +1179,7 @@ mod tests {
             hash: decdn_cache::Hash::new(payload),
             enumerable,
             answers_size: enumerable,
+            faults_size: false,
         })
     }
 
@@ -1159,6 +1192,19 @@ mod tests {
             hash: decdn_cache::Hash::new(payload),
             enumerable: false,
             answers_size: true,
+            faults_size: false,
+        })
+    }
+
+    /// A remote-shaped origin that has gone unreachable: `size` returns a
+    /// transport error, so the ownership test can neither confirm nor deny.
+    fn faulting_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+        Arc::new(StubOrigin {
+            data: bytes::Bytes::from_static(payload),
+            hash: decdn_cache::Hash::new(payload),
+            enumerable: false,
+            answers_size: true,
+            faults_size: true,
         })
     }
 
@@ -1170,6 +1216,7 @@ mod tests {
             hash: decdn_cache::Hash::new(payload),
             enumerable: false,
             answers_size: false,
+            faults_size: false,
         })
     }
 
@@ -1289,6 +1336,51 @@ mod tests {
         assert!(
             !snap.hashes.contains(&theirs),
             "relayed content is not this node's to announce"
+        );
+        Ok(())
+    }
+
+    /// An ownership probe that faults must be reported, not silently skipped.
+    ///
+    /// Under the origin-only policy every stored hash is put to the origin to
+    /// decide whether it is this node's to announce. A transport blip answers
+    /// neither way, and admitting it would advertise content the serve gate
+    /// might then refuse — so the hash is left out. Left out and unreported, an
+    /// unreachable remote origin silently shrinks the announce set of a node
+    /// that holds the content, which is the same failure the rescan half fixes.
+    #[tokio::test]
+    async fn holder_snapshot_reports_a_faulted_ownership_probe() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let unreachable = decdn_cache::Hash::new(b"policy-probe-fault");
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![faulting_stub_origin(b"policy-probe-fault")],
+            16,
+        )
+        .await?;
+        cache.get(unreachable).await?;
+
+        let snap = holder_snapshot(&cache, false).await;
+
+        assert!(
+            !snap.hashes.contains(&unreachable),
+            "a fault is not a confirmation; announcing on one risks advertising \
+             content the serve gate refuses"
+        );
+        assert_eq!(
+            snap.origin_probe_faults, 1,
+            "the skipped hash must be reported, or the snapshot reads healthy \
+             while the node holds content it does not announce"
+        );
+
+        // The sweep's completion line must name it as degraded, same as a
+        // store-walk failure.
+        let scheduler = RepublishScheduler::new();
+        let metrics = crate::metrics::Metrics::new();
+        let outcome = lag_sweep(&cache, false, &scheduler, &metrics).await;
+        assert!(
+            outcome.degraded,
+            "a sweep that could not resolve everything it holds is degraded"
         );
         Ok(())
     }
