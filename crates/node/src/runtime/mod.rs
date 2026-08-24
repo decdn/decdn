@@ -1295,9 +1295,12 @@ async fn build_chain_and_handlers(
     // Hint the settlement service on each accepted voucher so a lane's accrued
     // claim is planned into a chunk promptly rather than waiting the self-tick.
     client_deps.redeem_hint = Some(redeem_tx.clone());
-    // ADR 041 serve-credit inputs: the SAME warming allowance the buy loop debits
-    // and the eviction path forgets, plus the live operator fee-share cell.
-    client_deps.warming = Arc::clone(&warming);
+    // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
+    // allowance the buy loop debits and the eviction path forgets, plus the live
+    // operator fee-share cell. The background aggregator behind the sink is what
+    // keeps a serve's final step off the ledger lock those two passes hold.
+    client_deps.warming_credit =
+        crate::warming_allowance::spawn_warming_creditor(Arc::clone(&warming));
     client_deps.operator_shares = operator_shares.clone();
     // Origin-only policy (#1759): backend-authoritative own/foreign decision.
     client_deps.relay_foreign_namespaces = cfg.cache.relay_foreign_namespaces;

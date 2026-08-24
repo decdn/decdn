@@ -14019,7 +14019,9 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         0,
         16,
         |deps| {
-            deps.warming = Arc::clone(&warming);
+            deps.warming_credit = Arc::new(
+                decdn_node::warming_allowance::DirectWarmingCreditSink::new(Arc::clone(&warming)),
+            );
             deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(OP_BPS);
         },
     )?;
@@ -14272,7 +14274,10 @@ async fn attack_b_attempt(
             0,
             16,
             |deps| {
-                deps.warming = Arc::clone(warming);
+                deps.warming_credit =
+                    Arc::new(decdn_node::warming_allowance::DirectWarmingCreditSink::new(
+                        Arc::clone(warming),
+                    ));
                 deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(op_bps);
             },
         )?;

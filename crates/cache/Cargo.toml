@@ -50,6 +50,10 @@ async-compression = { workspace = true }
 # pinned set is non-Copy so AtomicU64 can't carry it; ArcSwap is the
 # standard fix and is MIT/Apache-2.0.
 arc-swap = "1"
+# Shards the per-hash LRU access-time map so a stream-completion `record_access`
+# touches one shard while the eviction sweep walks the others. Same crate the
+# node crate already uses for its sharded per-peer maps.
+dashmap = { workspace = true }
 # Jitter for the origin retry/backoff loop (#285). Uses `rand::random::<f64>()`
 # only; no per-call state, so no RNG instance is held.
 rand = { workspace = true }

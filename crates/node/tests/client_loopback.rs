@@ -8259,7 +8259,9 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
         16,
         |deps| {
             deps.pull_through = Some(Duration::from_secs(20));
-            deps.warming = Arc::clone(&warming);
+            deps.warming_credit = Arc::new(
+                decdn_node::warming_allowance::DirectWarmingCreditSink::new(Arc::clone(&warming)),
+            );
             deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(0);
         },
     )?;

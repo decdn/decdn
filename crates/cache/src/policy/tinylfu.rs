@@ -1,45 +1,45 @@
 //! W-TinyLFU estimator + policies (filled in Stage B, Tasks 5-7).
 use super::EvictionPolicy;
 use super::FrequencyEstimator;
-use super::sketch::CountMinSketch;
+use super::sketch::ShardedCountMinSketch;
 use super::{AdmissionContext, AdmissionDecision, AdmissionPolicy, Segment};
 use super::{EvictionContext, EvictionPlan};
 use crate::Hash;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::PoisonError;
 
+/// Shared W-TinyLFU frequency evidence: one sighting per served request from
+/// the serve path, one estimate read per fill-path admission decision and per
+/// probation candidate at sweep time.
+///
+/// The counters live in a [`ShardedCountMinSketch`], so a sighting or an
+/// estimate locks the one shard its hash routes to. Serve completions and
+/// admission reads for different hashes therefore proceed in parallel, and the
+/// periodic aging pass touches a single shard rather than the whole array.
 #[derive(Debug)]
 pub struct TinyLfuEstimator {
-    inner: Mutex<CountMinSketch>,
+    inner: ShardedCountMinSketch,
 }
 
 impl TinyLfuEstimator {
+    /// Size the sketch to roughly `sketch_bytes` of counters: one `u8` per
+    /// counter over `ROWS` rows, so `cols = bytes / 4`, floored at 64 columns.
     #[must_use]
     pub fn new(sketch_bytes: usize) -> Self {
         // one u8 per counter, ROWS(=4) rows: cols = bytes / 4.
         let cols = (sketch_bytes / 4).max(64);
         Self {
-            inner: Mutex::new(CountMinSketch::new(cols)),
+            inner: ShardedCountMinSketch::new(cols),
         }
     }
 }
 
 impl FrequencyEstimator for TinyLfuEstimator {
     fn observe(&self, hash: Hash) {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .increment(&hash);
+        self.inner.increment(&hash);
     }
     fn estimate(&self, hash: Hash) -> u32 {
-        u32::from(
-            self.inner
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .estimate(&hash),
-        )
+        u32::from(self.inner.estimate(&hash))
     }
 }
 
@@ -48,6 +48,9 @@ impl FrequencyEstimator for TinyLfuEstimator {
 /// `Main`. Reads `estimate` only — never calls `observe` (see the ordering
 /// invariant in the module docs: a request must never count as evidence for
 /// its own promotion).
+///
+/// The estimate read takes one sketch shard, so a fill decision and a
+/// concurrent serve completion collide only when their hashes share a shard.
 #[derive(Debug)]
 pub struct ProbationAdmission {
     pub freq: Arc<dyn FrequencyEstimator>,
