@@ -320,6 +320,10 @@ pub(super) struct PoolFloorState {
 pub(super) struct FloorReservation {
     map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
     store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+    /// Failure accounting for the best-effort drop-time persist
+    /// (`floor_loss_persist_failures`, #1782). Held by the guard because the
+    /// persist outlives the serve path that opened it.
+    metrics: Arc<Metrics>,
     pool_id: B256,
     reserved: U256,
     /// Last-noted unpaid `µUSDC` (`u64`, saturating). Read once at drop to size the
@@ -349,6 +353,7 @@ impl FloorReservation {
     fn reserve(
         map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
         store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+        metrics: Arc<Metrics>,
         pool_id: B256,
         reserved: U256,
     ) -> Self {
@@ -359,7 +364,7 @@ impl FloorReservation {
             let entry = guard.entry(pool_id).or_default();
             entry.live_reservation = entry.live_reservation.saturating_add(reserved);
         }
-        Self::new_charged(map, store, pool_id, reserved)
+        Self::new_charged(map, store, metrics, pool_id, reserved)
     }
 
     /// Build a guard for a floor that is ALREADY charged to `live_reservation`
@@ -372,12 +377,14 @@ impl FloorReservation {
     fn new_charged(
         map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
         store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
+        metrics: Arc<Metrics>,
         pool_id: B256,
         reserved: U256,
     ) -> Self {
         Self {
             map,
             store,
+            metrics,
             pool_id,
             reserved,
             unpaid: AtomicU64::new(0),
@@ -480,29 +487,41 @@ impl Drop for FloorReservation {
         // Persist the new total best-effort. The in-memory `dead_charge` above is
         // authoritative for the running process; the durable copy only guards a
         // restart, so a lost persist is the documented small crash-window residual —
-        // logged, never panicked or propagated. `record_loss` is MONOTONIC (it raises
-        // the stored total, never lowers it), so two drops on the same pool completing
-        // out of order cannot regress the row. `record_loss` may fsync, so offload it
-        // to a blocking task when a runtime is available; a drop outside any runtime
-        // (e.g. a sync test) records inline.
+        // logged and counted, never panicked or propagated. `record_loss` is MONOTONIC
+        // (it raises the stored total, never lowers it), so two drops on the same pool
+        // completing out of order cannot regress the row. `record_loss` may fsync, so
+        // offload it to a blocking task when a runtime is available; a drop outside
+        // any runtime (e.g. a sync test) records inline.
         let Some(store) = self.store.clone() else {
             return;
         };
         let pool_id = self.pool_id;
         let micro = snapshot.saturating_to::<u128>();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn_blocking(move || {
-                    if let Err(e) = store.record_loss(pool_id, micro) {
-                        tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
-                    }
-                });
-            }
-            Err(_) => {
-                if let Err(e) = store.record_loss(pool_id, micro) {
-                    tracing::warn!(%pool_id, error = %e, "floor dead-charge persist failed");
+        let metrics = Arc::clone(&self.metrics);
+        // One closure for both dispatch paths so the failure accounting cannot
+        // drift between them (#1782): bump `floor_loss_persist_failures`, log the
+        // µUSDC total that failed to reach disk, and surface a corrupt payment
+        // database at `error!` — after a mid-commit failure redb refuses further
+        // writes until the file is closed and reopened, so every later persist
+        // fails too and the fix is an operator restart, unlike a transient fault.
+        let persist = move || {
+            if let Err(e) = store.record_loss(pool_id, micro) {
+                metrics.floor_loss_persist_failure();
+                if matches!(e, decdn_incentive::StoreError::Corrupt { .. }) {
+                    tracing::error!(
+                        %pool_id, micro, error = %e,
+                        "floor dead-charge persist failed: payment store corrupt"
+                    );
+                } else {
+                    tracing::warn!(%pool_id, micro, error = %e, "floor dead-charge persist failed");
                 }
             }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(persist);
+            }
+            Err(_) => persist(),
         }
     }
 }
@@ -1108,6 +1127,15 @@ impl ClientHandler {
         // carries forward so a restart does not grant a fresh free-floor budget.
         let mut pool_floor: HashMap<B256, PoolFloorState> = HashMap::new();
         if let Some(store) = deps.floor_loss_store.as_ref() {
+            // Reclaim forget tombstones first: handler construction is the one
+            // point where no reservation exists and no drop-time persist can be in
+            // flight, so the sweep cannot reopen the resurrection window the
+            // tombstones close (#1781). This bounds tombstone growth to one
+            // process lifetime.
+            let swept = store.sweep_forgotten()?;
+            if swept > 0 {
+                tracing::debug!(swept, "reclaimed floor-loss tombstones of closed pools");
+            }
             // Fail CLOSED, like the lane-state hydration above: genuine first boot
             // returns `Ok(vec![])` from `load_losses` (the table simply does not
             // exist yet), so any error reaching here is a real store fault. Starting
@@ -1530,6 +1558,7 @@ impl ClientHandler {
         FloorReservation::reserve(
             Arc::clone(&self.pool_floor),
             self.floor_loss_store.clone(),
+            Arc::clone(&self.metrics),
             pool_id,
             reserved,
         )
@@ -1604,6 +1633,7 @@ impl ClientHandler {
         Some(FloorReservation::new_charged(
             Arc::clone(&self.pool_floor),
             self.floor_loss_store.clone(),
+            Arc::clone(&self.metrics),
             pool_id,
             reserved,
         ))
@@ -1613,6 +1643,13 @@ impl ClientHandler {
     /// `PoolFloorState` and its durable `dead_charge` row. Called once when a pool
     /// is reclaimed on-chain; a reclaimed `pool_id` never recurs (monotonic open
     /// nonce), so its accumulated `dead_charge` is permanently moot.
+    ///
+    /// A [`FloorReservation`] drop that snapshotted its total before the in-memory
+    /// remove here can still have its `record_loss` in flight when the durable
+    /// delete commits. The store closes that window, not this method:
+    /// `forget_loss` tombstones the pool id, so the late write is a no-op instead
+    /// of resurrecting a row for a closed pool that nothing would ever delete
+    /// again (#1781).
     pub(crate) async fn forget_pool_floor(&self, pool_id: B256) {
         {
             let mut guard = self
@@ -2618,7 +2655,13 @@ mod tests {
         let floor = decdn_incentive::floor_micro(1000);
         let quarter = floor / U256::from(4u64);
         {
-            let res = FloorReservation::reserve(map.clone(), Some(store.clone()), pool, floor);
+            let res = FloorReservation::reserve(
+                map.clone(),
+                Some(store.clone()),
+                Arc::new(Metrics::new()),
+                pool,
+                floor,
+            );
             // Live reservation is held while the guard lives.
             let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
             anyhow::ensure!(
@@ -2662,7 +2705,8 @@ mod tests {
         let pool = B256::repeat_byte(0x5B);
         let floor = decdn_incentive::floor_micro(1000);
         {
-            let res = FloorReservation::reserve(map.clone(), None, pool, floor);
+            let res =
+                FloorReservation::reserve(map.clone(), None, Arc::new(Metrics::new()), pool, floor);
             // Aborted before delivering/paying anything: unpaid stays 0, and the guard
             // is never marked settled.
             res.note_unpaid(U256::ZERO);
@@ -2753,7 +2797,8 @@ mod tests {
         let pool = B256::repeat_byte(0x5B);
         let floor = decdn_incentive::floor_micro(1000);
         {
-            let res = FloorReservation::reserve(map.clone(), None, pool, floor);
+            let res =
+                FloorReservation::reserve(map.clone(), None, Arc::new(Metrics::new()), pool, floor);
             res.release_live_repaid(); // paid ≥ floor
             let live = lock_floor(&map)?.get(&pool).map(|s| s.live_reservation);
             anyhow::ensure!(
@@ -2765,6 +2810,245 @@ mod tests {
         anyhow::ensure!(
             st.dead_charge == U256::ZERO,
             "a repaid reservation folds no dead charge"
+        );
+        Ok(())
+    }
+
+    /// Read one pool's persisted dead charge out of a floor-loss store, for the
+    /// drop-guard tests below.
+    fn persisted_loss(
+        store: &dyn decdn_incentive::PoolFloorLossStore,
+        pool: B256,
+    ) -> anyhow::Result<Option<u128>> {
+        Ok(store
+            .load_losses()
+            .map_err(|e| anyhow::anyhow!("load_losses: {e}"))?
+            .into_iter()
+            .find(|(id, _)| *id == pool)
+            .map(|(_, micro)| micro))
+    }
+
+    /// Two withheld streams on ONE pool, each reconciled through the real `Drop`
+    /// guard against a real store (no runtime, so each drop persists through the
+    /// synchronous fallback): the second drop persists a cumulative total larger
+    /// than the first, and a later fully-repaid guard writes nothing. This is the
+    /// drop guard driving the store's monotonic contract — every other
+    /// monotonicity test drives the store directly, without its caller (#1783).
+    #[test]
+    fn floor_reservation_sequential_drops_accumulate_dead_charge() -> anyhow::Result<()> {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let store = Arc::new(decdn_incentive::MemoryPoolFloorLossStore::new());
+        let metrics = Arc::new(Metrics::new());
+        let pool = B256::repeat_byte(0x5C);
+        let floor = decdn_incentive::floor_micro(1000);
+        let quarter = floor / U256::from(4u64);
+        {
+            let res = FloorReservation::reserve(
+                map.clone(),
+                Some(store.clone()),
+                Arc::clone(&metrics),
+                pool,
+                floor,
+            );
+            res.note_unpaid(quarter);
+            res.mark_settled();
+        } // settled: folds the quarter unpaid tail
+        anyhow::ensure!(persisted_loss(&*store, pool)? == Some(quarter.to::<u128>()));
+        {
+            let _res = FloorReservation::reserve(
+                map.clone(),
+                Some(store.clone()),
+                Arc::clone(&metrics),
+                pool,
+                floor,
+            );
+        } // abnormal (never settled): folds the FULL reserved floor on top
+        let want = quarter.saturating_add(floor);
+        let st = lock_floor(&map)?.get(&pool).copied().unwrap_or_default();
+        anyhow::ensure!(
+            st.dead_charge == want,
+            "the second drop folds onto the first's total, not over it"
+        );
+        anyhow::ensure!(
+            persisted_loss(&*store, pool)? == Some(want.to::<u128>()),
+            "the second drop persists the RAISED cumulative total"
+        );
+        {
+            let res = FloorReservation::reserve(
+                map.clone(),
+                Some(store.clone()),
+                Arc::clone(&metrics),
+                pool,
+                floor,
+            );
+            res.release_live_repaid();
+        } // repaid: no fold, no write
+        anyhow::ensure!(
+            persisted_loss(&*store, pool)? == Some(want.to::<u128>()),
+            "a repaid guard disturbs neither the accumulator nor the durable total"
+        );
+        Ok(())
+    }
+
+    /// [`decdn_incentive::PoolFloorLossStore`] wrapper that HOLDS every
+    /// `record_loss` at its entry until released, so a test can deterministically
+    /// land a drop-dispatched persist AFTER the pool's forget committed — the
+    /// #1781 interleaving. Everything else delegates straight through.
+    struct GatedLossStore {
+        inner: decdn_incentive::MemoryPoolFloorLossStore,
+        released: std::sync::Mutex<bool>,
+        turnstile: std::sync::Condvar,
+        records_done: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedLossStore {
+        fn new() -> Self {
+            Self {
+                inner: decdn_incentive::MemoryPoolFloorLossStore::new(),
+                released: std::sync::Mutex::new(false),
+                turnstile: std::sync::Condvar::new(),
+                records_done: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn release(&self) {
+            let mut open = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *open = true;
+            self.turnstile.notify_all();
+        }
+    }
+
+    impl decdn_incentive::PoolFloorLossStore for GatedLossStore {
+        fn record_loss(
+            &self,
+            pool_id: B256,
+            micro_usdc: u128,
+        ) -> Result<(), decdn_incentive::StoreError> {
+            let mut open = self
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*open {
+                open = self
+                    .turnstile
+                    .wait(open)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            drop(open);
+            let result = self.inner.record_loss(pool_id, micro_usdc);
+            self.records_done.fetch_add(1, Ordering::SeqCst);
+            result
+        }
+
+        fn load_losses(&self) -> Result<Vec<(B256, u128)>, decdn_incentive::StoreError> {
+            self.inner.load_losses()
+        }
+
+        fn forget_loss(&self, pool_id: B256) -> Result<(), decdn_incentive::StoreError> {
+            self.inner.forget_loss(pool_id)
+        }
+
+        fn sweep_forgotten(&self) -> Result<usize, decdn_incentive::StoreError> {
+            self.inner.sweep_forgotten()
+        }
+    }
+
+    /// The #1781 resurrection race through the REAL drop guard: the guard
+    /// snapshots its cumulative total under the floor lock while the pool's entry
+    /// still exists, dispatches `record_loss` to a blocking task, and the pool's
+    /// forget (in-memory remove + durable `forget_loss`) commits BEFORE that task
+    /// runs. The gate makes the lost race deterministic. The forget's tombstone
+    /// turns the late write into a no-op — without it, the write re-inserted a
+    /// row for the closed pool, and (`record_loss` being monotonic, the pool id
+    /// never recurring) nothing ever deleted it again: one leaked row per closed
+    /// pool, rehydrated on every later boot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_drop_persist_after_forget_does_not_resurrect_row() -> anyhow::Result<()> {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let store = Arc::new(GatedLossStore::new());
+        let pool = B256::repeat_byte(0x5D);
+        let floor = decdn_incentive::floor_micro(1000);
+        let res = FloorReservation::reserve(
+            map.clone(),
+            Some(store.clone()),
+            Arc::new(Metrics::new()),
+            pool,
+            floor,
+        );
+        // Abnormal drop inside the runtime: the guard snapshots `floor` (the map
+        // entry still exists) and dispatches its persist, which parks on the gate.
+        drop(res);
+        // The pool closes: in-memory entry removed, durable row deleted +
+        // tombstoned — the same order `forget_pool_floor` runs them in.
+        {
+            let mut guard = map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&pool);
+        }
+        decdn_incentive::PoolFloorLossStore::forget_loss(&*store, pool)
+            .map_err(|e| anyhow::anyhow!("forget_loss: {e}"))?;
+        // Only now does the drop's `record_loss` land.
+        store.release();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store.records_done.load(Ordering::SeqCst) == 0 {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the gated record_loss never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        anyhow::ensure!(
+            persisted_loss(&*store, pool)?.is_none(),
+            "a record_loss landing after forget_loss must not resurrect the row"
+        );
+        Ok(())
+    }
+
+    /// A failed drop-time persist bumps `floor_loss_persist_failures` (#1782) —
+    /// the only alertable signal that dead charges have stopped reaching disk
+    /// (e.g. redb latching writes after a failed commit on the shared file) and
+    /// that a restart would re-grant pools their consumed free-floor budget.
+    #[test]
+    fn floor_persist_failure_bumps_the_counter() -> anyhow::Result<()> {
+        struct FailingLossStore;
+        impl decdn_incentive::PoolFloorLossStore for FailingLossStore {
+            fn record_loss(&self, _: B256, _: u128) -> Result<(), decdn_incentive::StoreError> {
+                Err(decdn_incentive::StoreError::Backend("injected".into()))
+            }
+            fn load_losses(&self) -> Result<Vec<(B256, u128)>, decdn_incentive::StoreError> {
+                Ok(Vec::new())
+            }
+            fn forget_loss(&self, _: B256) -> Result<(), decdn_incentive::StoreError> {
+                Ok(())
+            }
+            fn sweep_forgotten(&self) -> Result<usize, decdn_incentive::StoreError> {
+                Ok(0)
+            }
+        }
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::new());
+        let pool = B256::repeat_byte(0x5E);
+        let floor = decdn_incentive::floor_micro(1000);
+        {
+            let _res = FloorReservation::reserve(
+                map.clone(),
+                Some(Arc::new(FailingLossStore)),
+                Arc::clone(&metrics),
+                pool,
+                floor,
+            );
+        } // abnormal drop → synchronous persist fallback → injected failure
+        let encoded = metrics.encode()?;
+        anyhow::ensure!(
+            encoded.contains("decdn_floor_loss_persist_failures_total 1"),
+            "a failed dead-charge persist must bump the failure counter"
         );
         Ok(())
     }

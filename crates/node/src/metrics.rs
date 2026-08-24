@@ -469,6 +469,18 @@ pub struct DecdnMetrics {
     /// fsynced — the frontier-only replay surface is widening. Operator-visible
     /// name: `decdn_lane_flush_failures_total`.
     pub lane_flush_failures: Counter,
+    /// Floor dead-charge persists (`record_loss` on a `FloorReservation` drop)
+    /// that failed. The persist is best-effort — the in-memory accumulator stays
+    /// authoritative for the running process — so each failure widens the
+    /// restart-time re-grant window instead of breaking delivery: a restart
+    /// hydrates a stale total and hands the affected pools back free-floor
+    /// budget they already consumed. A sustained rate usually means the shared
+    /// `lanes.redb` file refuses writes (a prior failed commit latches redb
+    /// until the file is closed and reopened — restart the node) or is corrupt;
+    /// pairs with the per-drop `warn!`/`error!` ("floor dead-charge persist
+    /// failed"). Operator-visible name:
+    /// `decdn_floor_loss_persist_failures_total`.
+    pub floor_loss_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
     /// bring-up backfill and the live stream (#1032). A non-zero value means the
@@ -1660,6 +1672,13 @@ recorders! {
     /// shutdown failed. Pairs with the `warn!`s in the background flush task
     /// and the shutdown flush in `runtime/mod.rs`.
     lane_flush_failure => lane_flush_failures.inc();
+
+    /// A floor dead-charge persist (`record_loss` on a `FloorReservation` drop)
+    /// failed; the durable total is now behind the in-memory accumulator until a
+    /// later drop on the pool re-persists it. Pairs with the drop-site
+    /// `warn!`/`error!` in `handlers/client/mod.rs` ("floor dead-charge persist
+    /// failed").
+    floor_loss_persist_failure => floor_loss_persist_failures.inc();
 
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).

@@ -352,3 +352,27 @@ groups:
             `decdn_settlement_watcher_last_tick_timestamp_seconds`.
             Long `for:` because a burst of dry clients is normal.
             See adr/003-payments.md and docs/runbook.md.
+
+      # #1782. The floor dead-charge persist (`record_loss` on a reservation
+      # drop) is best-effort: delivery keeps working while it fails, so without
+      # this rule the only trace is one `warn!` per drop. Sustained failures
+      # usually mean the shared lanes.redb file refuses writes — redb latches
+      # after a failed commit until the file is closed and reopened — or is
+      # corrupt (the node logs the corrupt case at error!). Every failure widens
+      # the restart-time window in which pools are re-granted free-floor budget
+      # they already consumed (adr/003-payments.md §Pool solvency).
+      - alert: DecdnFloorLossPersistFailures
+        expr: sum by (instance) (rate(decdn_floor_loss_persist_failures_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Floor dead-charge persists failing on {{ $labels.instance }}"
+          description: |
+            Dead-charge totals are not reaching disk. The in-memory accumulator
+            still bounds this process, but a restart would hydrate stale totals
+            and re-grant affected pools free-floor budget they already spent.
+            If decdn_lane_flush_failures_total climbs in step, the shared redb
+            file is refusing writes (latched after a failed commit) — restart
+            the node to reopen it. An `error!`-level "payment store corrupt"
+            log line instead means the file itself is damaged.
