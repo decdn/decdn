@@ -422,8 +422,14 @@ impl FloorReservation {
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = guard.entry(self.pool_id).or_default();
-        entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
+        // `get_mut`, not `entry().or_default()`, same as the drop guard: if the
+        // pool was reclaimed (`forget_pool_floor` removed its entry) the live
+        // reservation went with the entry, and re-inserting a default state here
+        // resurrects an entry for a closed pool that nothing removes again — the
+        // in-memory face of #1781.
+        if let Some(entry) = guard.get_mut(&self.pool_id) {
+            entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
+        }
     }
 
     /// Release the live reservation once cumulative payment (`paid_micro`) reaches
@@ -522,6 +528,40 @@ impl Drop for FloorReservation {
                 handle.spawn_blocking(persist);
             }
             Err(_) => persist(),
+        }
+    }
+}
+
+/// Failure accounting for a reclaimed pool's `forget_loss`
+/// ([`ClientHandler::forget_pool_floor`]). A failed forget leaves the row in
+/// place with NO tombstone, so a drop-dispatched `record_loss` still in flight
+/// can re-insert the closed pool's row and nothing ever deletes it again — the
+/// #1781 leak through the error path. Counted under
+/// `floor_loss_persist_failures` so `DecdnFloorLossPersistFailures` covers this
+/// mode too; a corrupt payment store surfaces at `error!`, mirroring the
+/// drop-time persist — redb refuses further writes until the file is reopened,
+/// so the remedy is an operator restart.
+fn note_forget_outcome(
+    metrics: &Metrics,
+    pool_id: B256,
+    result: Result<Result<(), decdn_incentive::StoreError>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            metrics.floor_loss_persist_failure();
+            if matches!(e, decdn_incentive::StoreError::Corrupt { .. }) {
+                tracing::error!(
+                    %pool_id, error = %e,
+                    "pool dead-charge forget failed: payment store corrupt"
+                );
+            } else {
+                tracing::warn!(%pool_id, error = %e, "pool dead-charge forget failed");
+            }
+        }
+        Err(e) => {
+            metrics.floor_loss_persist_failure();
+            tracing::warn!(%pool_id, error = %e, "pool dead-charge forget join failed");
         }
     }
 }
@@ -1662,15 +1702,7 @@ impl ClientHandler {
             return;
         };
         let result = tokio::task::spawn_blocking(move || store.forget_loss(pool_id)).await;
-        match result {
-            Ok(Err(e)) => {
-                tracing::warn!(%pool_id, error = %e, "pool dead-charge forget failed");
-            }
-            Err(e) => {
-                tracing::warn!(%pool_id, error = %e, "pool dead-charge forget join failed");
-            }
-            Ok(Ok(())) => {}
-        }
+        note_forget_outcome(&self.metrics, pool_id, result);
     }
 
     /// Has a takedown landed on this stream since it opened (ADR 011 §On
@@ -2814,6 +2846,36 @@ mod tests {
         Ok(())
     }
 
+    /// A repayment that lands after the pool was reclaimed releases nothing:
+    /// `forget_pool_floor` removed the entry (its live reservation went with
+    /// it), so `release_live_repaid` must not re-insert a default state for the
+    /// closed pool — the in-memory face of the #1781 resurrection race. The
+    /// pool id never recurs, so a re-inserted entry sits in the map for the
+    /// process lifetime, collecting `dead_charge` from any later drop.
+    #[test]
+    fn repaid_release_after_forget_does_not_resurrect_entry() -> anyhow::Result<()> {
+        let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pool = B256::repeat_byte(0x5F);
+        let floor = decdn_incentive::floor_micro(1000);
+        let res =
+            FloorReservation::reserve(map.clone(), None, Arc::new(Metrics::new()), pool, floor);
+        // The pool closes mid-stream: the same in-memory remove
+        // `forget_pool_floor` performs.
+        lock_floor(&map)?.remove(&pool);
+        res.release_live_repaid();
+        anyhow::ensure!(
+            lock_floor(&map)?.get(&pool).is_none(),
+            "a repaid release on a reclaimed pool must not re-insert its entry"
+        );
+        drop(res);
+        anyhow::ensure!(
+            lock_floor(&map)?.get(&pool).is_none(),
+            "the subsequent drop leaves the reclaimed pool absent too"
+        );
+        Ok(())
+    }
+
     /// Read one pool's persisted dead charge out of a floor-loss store, for the
     /// drop-guard tests below.
     fn persisted_loss(
@@ -2962,9 +3024,9 @@ mod tests {
     /// still exists, dispatches `record_loss` to a blocking task, and the pool's
     /// forget (in-memory remove + durable `forget_loss`) commits BEFORE that task
     /// runs. The gate makes the lost race deterministic. The forget's tombstone
-    /// turns the late write into a no-op — without it, the write re-inserted a
+    /// turns the late write into a no-op — without it, the write re-inserts a
     /// row for the closed pool, and (`record_loss` being monotonic, the pool id
-    /// never recurring) nothing ever deleted it again: one leaked row per closed
+    /// never recurring) nothing ever deletes it again: one leaked row per closed
     /// pool, rehydrated on every later boot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn late_drop_persist_after_forget_does_not_resurrect_row() -> anyhow::Result<()> {
@@ -3049,6 +3111,27 @@ mod tests {
         anyhow::ensure!(
             encoded.contains("decdn_floor_loss_persist_failures_total 1"),
             "a failed dead-charge persist must bump the failure counter"
+        );
+        Ok(())
+    }
+
+    /// A failed `forget_loss` bumps `floor_loss_persist_failures` too: the
+    /// closed pool's row survives with no tombstone, open to permanent
+    /// re-insertion by a late persist (#1781's error-path residual), and
+    /// without the counter `DecdnFloorLossPersistFailures` never sees this
+    /// mode.
+    #[test]
+    fn floor_forget_failure_bumps_the_counter() -> anyhow::Result<()> {
+        let metrics = Metrics::new();
+        note_forget_outcome(
+            &metrics,
+            B256::repeat_byte(0x60),
+            Ok(Err(decdn_incentive::StoreError::Backend("injected".into()))),
+        );
+        let encoded = metrics.encode()?;
+        anyhow::ensure!(
+            encoded.contains("decdn_floor_loss_persist_failures_total 1"),
+            "a failed dead-charge forget must bump the failure counter"
         );
         Ok(())
     }

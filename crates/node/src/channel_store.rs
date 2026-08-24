@@ -1412,26 +1412,13 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
     }
 
     fn sweep_forgotten(&self) -> Result<usize, StoreError> {
-        // Existence probe via a read transaction: a missing table means no
-        // writer has ever committed on it, so there is nothing to sweep and
-        // nothing to create. The table existing does NOT imply a tombstone —
-        // any committed `record_loss` creates it empty as a side effect of its
-        // in-transaction check — that case falls through to the no-op abort
-        // below.
-        {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| floor_loss_backend_err("begin_read", None, e))?;
-            match read_txn.open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE) {
-                Ok(_) => {}
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-                Err(err) => {
-                    return Err(floor_loss_backend_err("open_table (tombstones)", None, err));
-                }
-            }
-        }
-
+        // No separate existence probe: `open_table` creates a missing table
+        // inside this transaction, and the no-op abort below rolls that
+        // creation back — the same abort-rolls-back property `record_loss`'s
+        // in-transaction tombstone check relies on. A fresh store therefore
+        // ends the sweep exactly as it began. The table existing does NOT
+        // imply a tombstone — any committed `record_loss` creates it empty as
+        // a side effect of its check — that case also takes the no-op abort.
         let mut write_txn = self
             .db
             .begin_write()
@@ -2179,8 +2166,8 @@ mod tests {
     /// another lands the `record_loss` a reservation drop dispatched before the
     /// pool closed. Whichever order redb's exclusive writer slot serializes them
     /// in, the terminal state is "no row": record-then-forget deletes it,
-    /// forget-then-record hits the tombstone. Before the tombstone, the second
-    /// ordering re-inserted a row nothing would ever delete again.
+    /// forget-then-record hits the tombstone. Without the tombstone, the second
+    /// ordering re-inserts a row nothing ever deletes again.
     #[test]
     fn record_loss_racing_forget_loss_never_leaves_a_row() -> anyhow::Result<()> {
         let dir = data_dir()?;
