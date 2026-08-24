@@ -1775,29 +1775,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let snapshot =
         crate::dht::publish::holder_snapshot(&infra.cache, cfg.cache.relay_foreign_namespaces)
             .await;
-    if let Some(err) = &snapshot.store_error {
-        // Same counter as the lag sweep's degradation: both are this one
-        // derivation failing its store half, and the boot case is the worse of
-        // the two — it lasts the whole process lifetime rather than until the
-        // next lag.
-        infra.node_metrics.dht_republish_seed_store_walk_failure();
-        tracing::warn!(
-            error = %err,
-            "cold-start store seed failed; blobs not re-fetched this session go un-republished until a later lag sweep re-walks the store, or until restart (ADR 022 §Bootstrap AC 15 degraded)"
-        );
-    }
-    if snapshot.origin_probe_faults > 0 {
-        infra
-            .node_metrics
-            .dht_republish_seed_origin_probe_failures(snapshot.origin_probe_faults);
-    }
-    if snapshot.origin_probe_faults > 0 || snapshot.origin_enumerate_failures > 0 {
-        tracing::warn!(
-            faults = snapshot.origin_probe_faults,
-            enumerate_failures = snapshot.origin_enumerate_failures,
-            "cold-start origin seed is incomplete; the boot rescan could not resolve every candidate, so the origin half runs on carried-forward sizes, omits anything first seen inside a fault window, and omits every hash discoverable only through an origin that could not be listed (ADR 022 §Bootstrap AC 15 degraded)"
-        );
-    }
+    // Same counters and lines as the lag sweep's degradation: both are this one
+    // derivation coming up short, and the boot case is the worse of the two —
+    // it lasts the whole process lifetime rather than until the next lag
+    // (ADR 022 §Bootstrap AC 15 degraded).
+    snapshot.report_degradation(&infra.node_metrics, "cold start");
     let cold_start_count = republish_scheduler.seed_cold_start(
         snapshot
             .hashes

@@ -574,6 +574,13 @@ where
     let operator_to_node = Arc::new(RwLock::new(initial_operator_to_node));
     let regions = Arc::new(RwLock::new(initial_regions));
 
+    // Bootstrap IS a successful re-enumeration — the same `getRegisteredNodes`
+    // read, against the same contract. Stamping the liveness gauge here is what
+    // makes the staleness alert usable: its `> 0` guard would otherwise suppress
+    // it forever on the node where every later resync fails or is skipped, which
+    // is the exact node it exists to find.
+    metrics.capacity_bond_registry_resync();
+
     let sink = RegistrySink {
         reads: ContractReads {
             registry: registry.clone(),

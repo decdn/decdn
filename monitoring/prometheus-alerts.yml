@@ -229,12 +229,16 @@ groups:
       # active-staker set. It reports success upward on a failed read (an error
       # would stall event pickup), so the counter is the only thing that moves
       # when it fails — and nothing at all moves when it is *skipped*, which is
-      # what the staleness rule below catches. The `> 0` guard is required: the
-      # gauge reads 0 until the first successful resync, one 15m interval after
-      # boot at the earliest. See adr/appendix-observability.md.
+      # what the staleness rule below catches.
+      #
+      # The window must be longer than the attempt spacing. Attempts are 15m
+      # apart, so a 15m window sees a zero-rate gap whenever a poll or RPC delay
+      # pushes two increments further apart than that — which resets `for` and
+      # means a permanently failing resync never fires. `increase` over 1h always
+      # spans several attempts. See adr/appendix-observability.md.
       - alert: DecdnCapacityBondRegistryResyncFailing
-        expr: rate(decdn_capacity_bond_registry_resync_failures_total[15m]) > 0
-        for: 30m
+        expr: increase(decdn_capacity_bond_registry_resync_failures_total[1h]) > 0
+        for: 15m
         labels:
           severity: warning
         annotations:
@@ -246,6 +250,9 @@ groups:
             decdn_staker_set_watcher_resolve_failures_total.
 
       - alert: DecdnCapacityBondRegistryResyncStale
+        # The `> 0` guard covers only the window before bootstrap completes:
+        # bootstrap is itself a successful enumeration and stamps the gauge, so a
+        # node whose every later resync fails or is skipped still trips this.
         expr: (decdn_capacity_bond_registry_last_resync_timestamp_seconds > 0) and (time() - decdn_capacity_bond_registry_last_resync_timestamp_seconds > 1800)
         for: 15m
         labels:

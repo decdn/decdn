@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,30 @@ use crate::retry::{
     TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
 };
 use crate::{from_store_hash, to_store_hash};
+
+/// Rescan slot: no pass running, and none requested.
+const RESCAN_IDLE: u8 = 0;
+/// A pass owns the slot; nothing queued behind it.
+const RESCAN_RUNNING: u8 = 1;
+/// A pass owns the slot and a further pass is queued behind it.
+const RESCAN_QUEUED: u8 = 2;
+
+/// Releases the rescan slot if a pass leaves without a clean release CAS —
+/// today, only by panicking. Without it the slot stays claimed and every later
+/// rescan returns immediately, so the announce set freezes at whatever the
+/// panicking pass had last published.
+struct RescanSlotGuard<'a> {
+    slot: &'a AtomicU8,
+    armed: bool,
+}
+
+impl Drop for RescanSlotGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.slot.store(RESCAN_IDLE, Ordering::Release);
+        }
+    }
+}
 
 /// Per-candidate ceiling for an origin rescan's existence probes.
 ///
@@ -197,14 +221,22 @@ struct Inner {
     /// content is discoverable on the first request rather than only after a
     /// warm pulls it into the store. Never includes refused/denied hashes.
     origin_held: ArcSwap<OriginHeldIndex>,
-    /// Serializes [`CacheEngine::rescan_origins`]. A rescan reads the current
-    /// index (to carry a faulted candidate forward), probes every candidate, and
-    /// only then publishes — a read-modify-write spanning the whole walk. Both
-    /// production triggers spawn detached, and a walk gets slower exactly when
-    /// the origin is faulting, so without this two passes overlap and the slower
-    /// one publishes a payload derived from a pre-empted index, dropping
-    /// whatever the fresher pass found.
-    rescan_lock: tokio::sync::Mutex<()>,
+    /// Single-flight slot for [`CacheEngine::rescan_origins`], with one queued
+    /// rerun. See `RESCAN_IDLE` / `RESCAN_RUNNING` / `RESCAN_QUEUED`.
+    ///
+    /// A rescan reads the current index (to carry a faulted candidate forward),
+    /// probes every candidate, and only then publishes — a read-modify-write
+    /// spanning the whole walk. Both production triggers fire detached, and a
+    /// walk gets slower exactly when the origin is faulting, so overlapping
+    /// passes would let the slower one publish a payload derived from a
+    /// pre-empted index and drop whatever the fresher pass found.
+    ///
+    /// Excluding is not enough on its own: queueing every trigger behind a lock
+    /// would pile up one waiter per tick for as long as a walk outruns the
+    /// cadence, then run that backlog of obsolete passes back to back. The slot
+    /// collapses any number of triggers into a single rerun, which is all a
+    /// rerun can be worth — the next pass re-derives everything from scratch.
+    rescan_slot: AtomicU8,
     /// Live-origin probe memo (#1130 pt3). The `origin_held` index only covers
     /// fs enumeration ∪ pins — http/s3 do not list, so a non-pinned bucket
     /// object is absent from it. [`CacheEngine::origin_probe_size`] falls back to
@@ -1133,7 +1165,7 @@ impl CacheEngine {
                         .collect::<HashSet<Hash>>(),
                 )),
                 origin_held: ArcSwap::from(Arc::new(OriginHeldIndex::default())),
-                rescan_lock: tokio::sync::Mutex::new(()),
+                rescan_slot: AtomicU8::new(RESCAN_IDLE),
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
@@ -1321,11 +1353,92 @@ impl CacheEngine {
     /// every pin, including the ones that resolve absent and never enter the
     /// index. A local `metadata()` stat per fs entry, one HTTP `HEAD` / S3
     /// `HeadObject` per remote one. Runs off the hot path at the configured
-    /// rescan cadence (startup / interval / reload), never per request, and one
-    /// rescan at a time.
+    /// rescan cadence (startup / interval / reload), never per request.
+    ///
+    /// One pass at a time, with any number of triggers arriving during a pass
+    /// collapsing into a single rerun. A trigger that finds a pass in flight
+    /// returns immediately rather than awaiting it, so a walk that outruns the
+    /// cadence cannot accumulate a backlog of waiters — and one rerun covers
+    /// every trigger it coalesced, because the next pass re-derives everything
+    /// from scratch.
     pub async fn rescan_origins(&self) {
-        // Held for the whole read-probe-publish sequence; see `Inner.rescan_lock`.
-        let _serialized = self.inner.rescan_lock.lock().await;
+        if !self.claim_rescan_slot() {
+            // A pass owns the slot and will take another one for this request.
+            return;
+        }
+        // RAII: a panic inside the walk would otherwise strand the slot and
+        // disable every later rescan for the process lifetime.
+        let mut guard = RescanSlotGuard {
+            slot: &self.inner.rescan_slot,
+            armed: true,
+        };
+        loop {
+            self.rescan_once().await;
+            if self
+                .inner
+                .rescan_slot
+                .compare_exchange(
+                    RESCAN_RUNNING,
+                    RESCAN_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                // Released cleanly with nothing queued. The guard must not store
+                // again: a trigger may already have claimed the slot.
+                guard.armed = false;
+                return;
+            }
+            // The CAS can only fail because a trigger arrived, so consume it and
+            // take another pass.
+            self.inner
+                .rescan_slot
+                .store(RESCAN_RUNNING, Ordering::Release);
+        }
+    }
+
+    /// Take the rescan slot, or register a rerun behind whoever holds it.
+    ///
+    /// Returns whether the caller owns the slot and must do the work. A request
+    /// is never lost: it either claims the slot or moves it to `RESCAN_QUEUED`,
+    /// and the running pass's release is a compare-exchange that fails if one
+    /// landed first.
+    fn claim_rescan_slot(&self) -> bool {
+        loop {
+            match self.inner.rescan_slot.compare_exchange_weak(
+                RESCAN_IDLE,
+                RESCAN_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(RESCAN_RUNNING) => {
+                    if self
+                        .inner
+                        .rescan_slot
+                        .compare_exchange_weak(
+                            RESCAN_RUNNING,
+                            RESCAN_QUEUED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return false;
+                    }
+                }
+                // Already queued — that pass has not taken its snapshot yet, so
+                // it covers this request too.
+                Err(RESCAN_QUEUED) => return false,
+                // Spurious failure or a state change under us; re-read and retry.
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// One rescan pass: gather candidates, resolve them, publish the index.
+    async fn rescan_once(&self) {
         let (candidates, enumerate_failures) = self.rescan_candidates().await;
         let RescanResolution {
             held,
@@ -4820,7 +4933,7 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use crate::origin::{Origin, OriginFetch, OriginKind};
 
@@ -5489,6 +5602,9 @@ mod tests {
         /// The origin still *lists* `held` but no longer serves it, so `size`
         /// answers an authoritative `Ok(None)`.
         holds: Arc<AtomicBool>,
+        /// Milliseconds each `size` takes, so a test can keep a pass in flight
+        /// while other triggers arrive.
+        slow_ms: Arc<AtomicU64>,
         size_calls: Arc<AtomicUsize>,
     }
 
@@ -5499,6 +5615,7 @@ mod tests {
                 permanent: Arc::new(AtomicBool::new(false)),
                 enumerate_fails: Arc::new(AtomicBool::new(false)),
                 holds: Arc::new(AtomicBool::new(true)),
+                slow_ms: Arc::new(AtomicU64::new(0)),
                 size_calls: Arc::new(AtomicUsize::new(0)),
             };
             (
@@ -5508,6 +5625,7 @@ mod tests {
                     permanent: Arc::clone(&controls.permanent),
                     enumerate_fails: Arc::clone(&controls.enumerate_fails),
                     holds: Arc::clone(&controls.holds),
+                    slow_ms: Arc::clone(&controls.slow_ms),
                     size_calls: Arc::clone(&controls.size_calls),
                 },
                 controls,
@@ -5521,6 +5639,7 @@ mod tests {
         permanent: Arc<AtomicBool>,
         enumerate_fails: Arc<AtomicBool>,
         holds: Arc<AtomicBool>,
+        slow_ms: Arc<AtomicU64>,
         size_calls: Arc<AtomicUsize>,
     }
 
@@ -5545,6 +5664,10 @@ mod tests {
         {
             Box::pin(async move {
                 self.size_calls.fetch_add(1, Ordering::SeqCst);
+                let slow = self.slow_ms.load(Ordering::SeqCst);
+                if slow > 0 {
+                    tokio::time::sleep(Duration::from_millis(slow)).await;
+                }
                 if self.faulting.load(Ordering::SeqCst) {
                     return Err(if self.permanent.load(Ordering::SeqCst) {
                         crate::OriginPullError::Permanent(anyhow::anyhow!(
@@ -5721,6 +5844,60 @@ mod tests {
         anyhow::ensure!(
             engine.origin_held_snapshot().probe_faults == 0,
             "a clean `not held` answer is not a fault",
+        );
+        Ok(())
+    }
+
+    /// Triggers arriving during a pass collapse into one rerun rather than
+    /// queueing.
+    ///
+    /// A rescan gets slower exactly when the origin is faulting, which is when
+    /// the periodic trigger is most likely to fire on top of one. Queueing every
+    /// trigger would stack a waiter per tick and then run that backlog of
+    /// obsolete passes back to back, against an origin already struggling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_rescans_collapse_into_one_rerun() -> anyhow::Result<()> {
+        let listed = Hash::new(b"rescan-single-flight");
+        let (origin, controls) = ThrottlableOrigin::new(vec![(listed, 11)]);
+        let origin = Arc::new(origin) as Arc<dyn Origin>;
+
+        let tmp = tempfile::tempdir()?;
+        let engine = Arc::new(CacheEngine::open(tmp.path(), vec![origin], 10).await?);
+
+        // Slow enough that the later triggers land while the first pass is
+        // still probing.
+        controls.slow_ms.store(50, Ordering::SeqCst);
+
+        // Four triggers at once: one claims the slot, the rest collapse into a
+        // single queued rerun — two passes over the one candidate, not four.
+        controls.size_calls.store(0, Ordering::SeqCst);
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            joins.push(tokio::spawn(async move { engine.rescan_origins().await }));
+        }
+        for j in joins {
+            j.await?;
+        }
+
+        let probes = controls.size_calls.load(Ordering::SeqCst);
+        anyhow::ensure!(
+            (1..=2).contains(&probes),
+            "four triggers must collapse into at most one rerun, so at most two \
+             passes probe the single candidate; saw {probes}",
+        );
+        anyhow::ensure!(
+            engine.origin_held_size(listed) == Some(11),
+            "and the index is still published",
+        );
+
+        // The slot is released, so a later trigger still runs.
+        controls.slow_ms.store(0, Ordering::SeqCst);
+        controls.size_calls.store(0, Ordering::SeqCst);
+        engine.rescan_origins().await;
+        anyhow::ensure!(
+            controls.size_calls.load(Ordering::SeqCst) == 1,
+            "a rescan after the burst must still run, or the slot is stranded",
         );
         Ok(())
     }

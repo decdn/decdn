@@ -339,15 +339,80 @@ pub(crate) struct HolderSnapshot {
     /// `hashes`; the caller decides how loudly to report the degradation, since
     /// bring-up and the sweep phrase it differently.
     pub(crate) store_error: Option<decdn_cache::CacheError>,
-    /// Origin probes that could not answer, across both places this snapshot
-    /// asks one: the rescan the origin-held half comes from, and the ownership
-    /// test each stored hash is put to under the origin-only policy. The mirror
-    /// of `store_error` for the origin half — nonzero means the set is short of
-    /// what this node actually holds, whatever the two halves otherwise report.
-    pub(crate) origin_probe_faults: u64,
+    /// Size probes that faulted on the rescan the origin-held half comes from.
+    ///
+    /// Carried from the index rather than measured here, so it describes a pass
+    /// that may be as old as the rescan cadence — kept separate from
+    /// `ownership_probe_faults` for that reason, and because it is already
+    /// metered on the cache's own counter.
+    pub(crate) rescan_probe_faults: u64,
     /// Origins whose listing failed on that rescan. More severe than a probe
     /// fault: no candidate was produced, so nothing could be carried forward.
-    pub(crate) origin_enumerate_failures: u64,
+    pub(crate) rescan_enumerate_failures: u64,
+    /// Stored hashes this walk could not put to the origin — the ownership test
+    /// applied under the origin-only policy, answered neither way.
+    ///
+    /// Measured by this snapshot, so it describes right now. Zero when the node
+    /// relays foreign namespaces, which asks the origin nothing.
+    pub(crate) ownership_probe_faults: u64,
+}
+
+impl HolderSnapshot {
+    /// Whether this snapshot is short of what the node actually holds.
+    pub(crate) const fn is_degraded(&self) -> bool {
+        self.store_error.is_some()
+            || self.rescan_probe_faults > 0
+            || self.rescan_enumerate_failures > 0
+            || self.ownership_probe_faults > 0
+    }
+
+    /// Meter and log every way this snapshot came up short, returning
+    /// [`Self::is_degraded`].
+    ///
+    /// One place, because both full seeds — bring-up cold start and the lag
+    /// sweep — degrade identically and differ only in what they call themselves.
+    /// `context` names the caller in each line.
+    pub(crate) fn report_degradation(
+        &self,
+        metrics: &crate::metrics::Metrics,
+        context: &str,
+    ) -> bool {
+        if let Some(err) = &self.store_error {
+            metrics.dht_republish_seed_store_walk_failure();
+            tracing::warn!(
+                context,
+                error = %err,
+                "dht republish: seed could not walk the store and covered the \
+                 origin-held half only. Blobs held only in the store stay \
+                 un-republished until a later seed walks it successfully"
+            );
+        }
+        // Only this walk's own faults. The rescan's are already on
+        // `decdn_cache_origin_probe_failures_total`, and re-counting them here
+        // would move the seed's counter on a node that asks the origin nothing.
+        if self.ownership_probe_faults > 0 {
+            metrics.dht_republish_seed_origin_probe_failures(self.ownership_probe_faults);
+            tracing::warn!(
+                context,
+                faults = self.ownership_probe_faults,
+                "dht republish: seed could not put every stored hash to its \
+                 origin; each one it could not confirm is left out of the \
+                 announce set rather than advertised"
+            );
+        }
+        if self.rescan_probe_faults > 0 || self.rescan_enumerate_failures > 0 {
+            tracing::warn!(
+                context,
+                faults = self.rescan_probe_faults,
+                enumerate_failures = self.rescan_enumerate_failures,
+                "dht republish: the origin-held half of this seed comes from a \
+                 rescan that could not resolve everything; entries it carried \
+                 forward may name content the origin has dropped, and an origin \
+                 it could not list contributed nothing at all"
+            );
+        }
+        self.is_degraded()
+    }
 }
 
 /// Collect the [`HolderSnapshot`] for `cache`.
@@ -382,7 +447,7 @@ pub(crate) async fn holder_snapshot(
 ) -> HolderSnapshot {
     let report = cache.origin_held_snapshot();
     let mut hashes = report.hashes;
-    let mut origin_probe_faults = report.probe_faults;
+    let mut ownership_probe_faults = 0u64;
     let mut store_error = None;
     match cache.iter_hashes().await {
         Ok(stored) => {
@@ -400,7 +465,7 @@ pub(crate) async fn holder_snapshot(
                     }
                     decdn_cache::OriginPresence::Absent => {}
                     decdn_cache::OriginPresence::Fault => {
-                        origin_probe_faults = origin_probe_faults.saturating_add(1);
+                        ownership_probe_faults = ownership_probe_faults.saturating_add(1);
                     }
                 }
             }
@@ -410,8 +475,9 @@ pub(crate) async fn holder_snapshot(
     HolderSnapshot {
         hashes,
         store_error,
-        origin_probe_faults,
-        origin_enumerate_failures: report.enumerate_failures,
+        rescan_probe_faults: report.probe_faults,
+        rescan_enumerate_failures: report.enumerate_failures,
+        ownership_probe_faults,
     }
 }
 
@@ -444,31 +510,7 @@ async fn lag_sweep(
     metrics: &crate::metrics::Metrics,
 ) -> SweepOutcome {
     let snapshot = holder_snapshot(cache, relay_foreign_namespaces).await;
-    let degraded = snapshot.store_error.is_some()
-        || snapshot.origin_probe_faults > 0
-        || snapshot.origin_enumerate_failures > 0;
-    if let Some(err) = &snapshot.store_error {
-        metrics.dht_republish_seed_store_walk_failure();
-        tracing::warn!(
-            error = %err,
-            "dht republish: lag sweep could not walk the store; re-seeding the \
-             origin-held half only. Blobs held only in the store stay \
-             un-republished until the next sweep or restart"
-        );
-    }
-    if snapshot.origin_probe_faults > 0 {
-        metrics.dht_republish_seed_origin_probe_failures(snapshot.origin_probe_faults);
-    }
-    if snapshot.origin_probe_faults > 0 || snapshot.origin_enumerate_failures > 0 {
-        tracing::warn!(
-            faults = snapshot.origin_probe_faults,
-            enumerate_failures = snapshot.origin_enumerate_failures,
-            "dht republish: the origin half of this sweep is short of what this \
-             node holds; probes that faulted run on carried-forward sizes and omit \
-             anything first seen inside the fault window, and an origin that could \
-             not be listed contributes nothing at all"
-        );
-    }
+    let degraded = snapshot.report_degradation(metrics, "lag sweep");
     let reseeded = scheduler.seed_cold_start(
         snapshot
             .hashes
@@ -1420,7 +1462,7 @@ mod tests {
              content the serve gate refuses"
         );
         assert_eq!(
-            snap.origin_probe_faults, 1,
+            snap.ownership_probe_faults, 1,
             "the skipped hash must be reported, or the snapshot reads healthy \
              while the node holds content it does not announce"
         );
@@ -1460,7 +1502,7 @@ mod tests {
 
         let snap = holder_snapshot(&cache, true).await;
         assert_eq!(
-            snap.origin_enumerate_failures, 1,
+            snap.rescan_enumerate_failures, 1,
             "the rescan's failed listing must reach the seed"
         );
 

@@ -612,12 +612,14 @@ since project inception and will roll into the first tagged release.
     rescan's zero count and call it healthy. `origin_held_snapshot` is the only
     way to read it — `origin_held_hashes` is gone, because a caller that could
     take the set without the counts is how that pairing gets lost.
-  - Rescans are serialized. Carrying an entry forward makes a rescan a
-    read-modify-write spanning the whole walk, and both triggers spawn detached,
-    so two overlapping passes let the slower one publish a payload derived from a
-    pre-empted index — dropping whatever the fresher pass found. A walk also gets
-    slower exactly when the origin is faulting, which is when a second pass is
-    most likely to start on top of it.
+  - One rescan at a time, with any number of triggers arriving during a pass
+    collapsing into a single rerun. Carrying an entry forward makes a rescan a
+    read-modify-write spanning the whole walk, and both triggers fire detached,
+    so overlapping passes let the slower one publish a payload derived from a
+    pre-empted index — dropping whatever the fresher pass found. Excluding alone
+    is not enough: queueing every trigger behind a lock piles up one waiter per
+    tick for as long as a walk outruns the cadence, then runs that backlog of
+    obsolete passes back to back against an origin already struggling.
   - Only a retry-eligible fault carries an entry forward. A permanent one — a
     revoked ACL, a symlink escape — reads the same on every rescan, so carrying
     it would advertise content the serve path refuses until an operator
@@ -638,7 +640,10 @@ since project inception and will roll into the first tagged release.
     on `decdn_dht_republish_seed_origin_probe_failures_total`, the origin-side
     twin of the store-walk counter beside it. A `Fault` there is skipped rather
     than announced, which on a remote origin dropped a node's own store-only
-    content on a transport blip while the snapshot read healthy.
+    content on a transport blip while the snapshot read healthy. `HolderSnapshot`
+    keeps those faults separate from the ones it inherits from the rescan: the
+    seed's counter must not move on a node that asks the origin nothing, and the
+    rescan's are already metered on the cache's own counter.
   - All three seed paths report a short set. The periodic rescan seed runs far
     more often than the boot seed or the lag sweep, so leaving it silent made the
     most common truncation the least visible one.
@@ -707,6 +712,13 @@ since project inception and will roll into the first tagged release.
     recovery edge fires whenever a route comes back from an errored tick, so an
     endpoint that flaps rather than staying down would otherwise buy a full
     authoritative re-read per flap, aimed at an endpoint already failing.
+  - The bootstrap enumeration stamps
+    `decdn_capacity_bond_registry_last_resync_timestamp_seconds`. It is the same
+    read against the same contract, and without it the staleness alert's `> 0`
+    guard suppressed the alert forever on exactly the node it exists to find —
+    one where no later resync ever succeeds. Its companion failure alert measures
+    `increase(...[1h])`: attempts are one resync interval apart, so a window of
+    that same length sees a zero-rate gap on any delay and never sustains.
   - `ErasedSink`'s method defaults are gone. It has exactly one implementation —
     the blanket forward — so a default there is unreachable, and its only effect
     was to turn a forgotten forward into a silent no-op that swallowed every real

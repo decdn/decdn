@@ -1202,10 +1202,11 @@ pub struct DecdnMetrics {
     /// authoritative re-read that repairs a drifted set. It is the only signal
     /// that catches a resync being *skipped* — the reconcile does not run at all
     /// while the route is errored, which emits nothing, not even the failure
-    /// counter. Reads `0` until the first successful resync, which is one
-    /// `REGISTRY_RESYNC_INTERVAL` after boot on the cadence alone, sooner if the
-    /// watcher errors and recovers before then. So an alert needs both a `> 0`
-    /// guard and a threshold above that interval.
+    /// counter. Stamped by the bootstrap enumeration too, which is the same read
+    /// against the same contract; without that a node whose every later resync
+    /// fails would hold the gauge at `0` and never trip a `> 0`-guarded alert.
+    /// The guard is still needed for the window before bootstrap completes, and
+    /// the threshold must exceed `REGISTRY_RESYNC_INTERVAL`.
     pub capacity_bond_registry_last_resync_timestamp_seconds: Gauge,
     /// `decdn_blacklist_watcher_last_tick_timestamp_seconds` (#1316, #1320): Unix
     /// time of the blacklist watcher's last successful poll tick. This is the
