@@ -10,8 +10,9 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
 use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, ProbeResponseBody, decode_message,
-    encode_message, is_unknown_variant, message::ProbeResponse, read_frame, write_frame,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, FrameError, ProbeMessage, ProbeResponseBody,
+    ProbeResponseExt, decode_message, encode_probe_response, is_unknown_variant,
+    message::ProbeResponse, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -562,13 +563,13 @@ impl ProbeHandler {
             }
         };
 
-        let resp = ProbeResponse {
-            body,
-            total_bytes,
-            slash_sig,
-        };
+        let resp = ProbeResponse { body, slash_sig };
+        // `total_bytes` is unsigned, so it rides in the trailing extension rather
+        // than the signed base (ADR 013 §Tier 1). Two-phase encode: a receiver that
+        // predates a future extension field stops at the end of the base.
+        let ext = ProbeResponseExt { total_bytes };
 
-        let payload = encode_message(&ProbeMessage::Response(resp))
+        let payload = encode_probe_response(&resp, Some(&ext))
             .map_err(|e| anyhow::anyhow!("probe encode failed: {e}"))?;
         write_frame(&mut send, &payload)
             .await

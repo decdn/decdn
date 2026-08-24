@@ -591,11 +591,10 @@ mod tests {
                 rate_per_mb: 7,
                 timestamp_us: 0xfeed_face,
             },
-            total_bytes: Some(1_700_000),
             slash_sig: vec![0x3u8; crate::SLASH_SIG_LEN],
         });
 
-        for msg in [req, resp] {
+        for msg in [req, resp.clone()] {
             let payload = encode_message(&msg)?;
             let mut buf = Vec::new();
             write_frame(&mut buf, &payload).await?;
@@ -605,6 +604,28 @@ mod tests {
             assert_eq!(decoded, msg);
             assert!(tail.is_empty(), "no extension bytes expected");
         }
+
+        // The same round trip carrying a Tier-1 extension: the framing layer is
+        // agnostic to it, so the base still decodes and the remainder is the ext
+        // — which is the property the two-phase pattern rests on end to end.
+        let ext = crate::message::ProbeResponseExt {
+            total_bytes: Some(1_700_000),
+        };
+        let ProbeMessage::Response(body) = &resp else {
+            unreachable!("resp is a Response")
+        };
+        let payload = crate::message::encode_probe_response(body, Some(&ext))?;
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &payload).await?;
+        let mut cursor = std::io::Cursor::new(buf);
+        let frame = read_frame(&mut cursor).await?;
+        let (decoded, tail) = decode_message::<ProbeMessage>(&frame)?;
+        assert_eq!(decoded, resp);
+        assert!(!tail.is_empty(), "extension bytes expected");
+        assert_eq!(
+            crate::message::parse_probe_response_ext(tail).map_err(FrameError::from)?,
+            ext
+        );
         Ok(())
     }
 }

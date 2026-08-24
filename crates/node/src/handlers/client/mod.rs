@@ -44,7 +44,7 @@ use decdn_incentive::{
 };
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody, VoucherRejectReason, WatermarkBundle,
+    StreamResponseBody, StreamResponseExt, VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_chunk_frame,

@@ -577,6 +577,31 @@ pub async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMess
     Ok(msg)
 }
 
+/// Read one length-framed `StreamResponse` together with its trailing
+/// [`StreamResponseExt`] (ADR 013 §Tier 1, two-phase).
+///
+/// The open-stage twin of [`read_client_msg`], which drops the remainder because
+/// every mid-stream variant is a single postcard value. Use this wherever a test
+/// needs the unsigned `error` code, which now rides in the extension.
+pub async fn read_stream_response(
+    recv: &mut RecvStream,
+) -> anyhow::Result<(
+    decdn_protocol::StreamResponse,
+    decdn_protocol::StreamResponseExt,
+)> {
+    let frame = read_frame(recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("read frame: {e}"))?;
+    let (msg, tail) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    let ClientMessage::StreamResponse(resp) = msg else {
+        anyhow::bail!("expected a StreamResponse, got {msg:?}");
+    };
+    let ext = decdn_protocol::parse_stream_response_ext(tail)
+        .map_err(|e| anyhow::anyhow!("decode response ext: {e}"))?;
+    Ok((resp, ext))
+}
+
 /// Write one length-framed [`ClientMessage`] to `send` (the write-side twin of
 /// [`read_client_msg`]).
 pub async fn write_client_msg(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {

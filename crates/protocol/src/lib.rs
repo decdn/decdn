@@ -13,13 +13,15 @@ pub mod region;
 pub use client::{
     BINDING_SIG_LEN, CHUNK_BYTES, ChunkData, ChunkPreimage, ClientBinding, ClientMessage,
     MAX_CHAIN_LENGTH, MB_BYTES, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody, VOUCHER_SIG_LEN, Voucher, VoucherRejectReason, encode_chunk_frame,
-    encode_stream_request, parse_stream_request_ext,
+    StreamResponseBody, StreamResponseExt, VOUCHER_SIG_LEN, Voucher, VoucherRejectReason,
+    encode_chunk_frame, encode_stream_request, encode_stream_response, parse_stream_request_ext,
+    parse_stream_response_ext,
 };
 pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,
-    FindNodeResponse, FindValueRequest, FindValueResponse, MAX_BATCH_STORE_HASHES,
-    MAX_CLOSER_NODES, MAX_PROVIDERS_PER_HASH, StoreAck, StoreRequest,
+    FindNodeResponse, FindValueRequest, FindValueResponse, FindValueResponseExt,
+    MAX_BATCH_STORE_HASHES, MAX_CLOSER_NODES, MAX_PROVIDERS_PER_HASH, StoreAck, StoreRequest,
+    StoreRequestExt, encode_dht_message, parse_find_value_response_ext, parse_store_request_ext,
 };
 pub use framing::{
     FrameError, MAX_MESSAGE_SIZE, TopLevelEnum, decode_message, encode_message, is_unknown_variant,
@@ -28,7 +30,8 @@ pub use framing::{
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{
     MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest, ProbeResponse,
-    ProbeResponseBody, SLASH_SIG_LEN,
+    ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN, encode_probe_response,
+    parse_probe_response_ext,
 };
 pub use region::{InvalidRegion, Region, is_valid_region};
 

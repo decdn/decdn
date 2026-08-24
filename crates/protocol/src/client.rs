@@ -109,7 +109,7 @@ pub enum ClientMessage {
     StreamEnd,
     /// discriminant 6 — node → payer, mid-stream failure (carries
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
-    /// [`StreamResponse::error`].
+    /// [`StreamResponseExt::error`].
     StreamError(StreamError),
 }
 
@@ -389,26 +389,108 @@ pub fn parse_stream_request_ext(remainder: &[u8]) -> Result<StreamRequestExt, po
 
 /// Node → payer response to a [`StreamRequest`] (ADR 005 §`cdn/client/v1`).
 ///
-/// The signed [`StreamResponseBody`] is covered by `slash_sig`; `error` is
-/// unsigned. `slash_sig` is mandatory and non-empty (exactly
-/// [`SLASH_SIG_LEN`] bytes); requesters MUST reject missing/zero-length or
-/// zero-`rate_per_mb` responses (enforced via [`StreamResponse::validate`]).
+/// **This struct holds only the frozen base** (ADR 013 §Tier 1): the signed
+/// [`StreamResponseBody`] and the `slash_sig` covering it. Unsigned fields live
+/// in [`StreamResponseExt`], which travels as separate trailing bytes — see
+/// [`encode_stream_response`] / [`parse_stream_response_ext`].
+///
+/// `slash_sig` is mandatory and non-empty (exactly [`SLASH_SIG_LEN`] bytes);
+/// requesters MUST reject missing/zero-length or zero-`rate_per_mb` responses
+/// (enforced via [`StreamResponse::validate`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
     pub body: StreamResponseBody,
-    /// Delivery-side failure code when `body.ok == false` (`NotFound`,
-    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`).
-    /// Unsigned and informational. `VoucherRejected` never rides here — it is
-    /// delivered mid-stream via [`ClientMessage::StreamError`]. The
-    /// `ok`/`error` consistency rules and the mid-stream-only exclusion are
-    /// enforced by [`StreamResponse::validate`], not just documented.
-    pub error: Option<StreamError>,
     /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
     /// produced by the `decdn_incentive` stream slash signer, analogous to its
     /// `ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`] bytes — *not* a
     /// signature over postcard bytes.
     pub slash_sig: Vec<u8>,
+}
+
+/// Optional [`StreamResponse`] extension fields, carried as trailing bytes after
+/// the `StreamResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_stream_response`] / [`parse_stream_response_ext`]).
+///
+/// Nothing here is covered by `slash_sig`. New fields are appended to the END
+/// and MUST be `Option<T>` or have a meaningful `Default`; insertions and
+/// reordering are Tier-3.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StreamResponseExt {
+    /// Delivery-side failure code when `body.ok == false` (`NotFound`,
+    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`).
+    /// Unsigned and informational. `VoucherRejected` never rides here — it is
+    /// delivered mid-stream via [`ClientMessage::StreamError`].
+    ///
+    /// Its agreement with the signed `body.ok` is a cross-half invariant, so it
+    /// is checked by [`StreamResponseExt::validate`], which takes `ok` — the
+    /// base-only [`StreamResponse::validate`] cannot see this field.
+    pub error: Option<StreamError>,
+}
+
+impl StreamResponseExt {
+    /// Check the unsigned half against the signed `ok` flag (ADR 005
+    /// §`cdn/client/v1`): `ok == true` ⇒ no `error`; `ok == false` ⇒ exactly one
+    /// delivery-side `error`, never the mid-stream-only
+    /// [`StreamError::VoucherRejected`].
+    ///
+    /// Separate from parsing so forward-compatible trailing bytes do not couple
+    /// to value checks, and separate from [`StreamResponse::validate`] because
+    /// the rule spans the frozen base and the extension — a receiver holds both
+    /// and must call each.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::StreamErrorWithOk`],
+    /// [`MessageValidationError::MissingStreamError`], or
+    /// [`MessageValidationError::VoucherRejectedInResponse`].
+    pub const fn validate(&self, ok: bool) -> Result<(), MessageValidationError> {
+        match (ok, &self.error) {
+            (true, Some(_)) => Err(MessageValidationError::StreamErrorWithOk),
+            (false, None) => Err(MessageValidationError::MissingStreamError),
+            (false, Some(StreamError::VoucherRejected { .. })) => {
+                Err(MessageValidationError::VoucherRejectedInResponse)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Encode a [`StreamResponse`] with its optional trailing [`StreamResponseExt`]
+/// (ADR 013 §Tier 1, two-phase). See [`encode_stream_request`] for why the two
+/// values are encoded separately.
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_stream_response(
+    resp: &StreamResponse,
+    ext: Option<&StreamResponseExt>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(&ClientMessage::StreamResponse(resp.clone()))?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    }
+    Ok(buf)
+}
+
+/// Parse the trailing [`StreamResponseExt`] bytes returned as the remainder by
+/// [`crate::decode_message`] after a `ClientMessage::StreamResponse`.
+///
+/// An empty remainder ⇒ [`StreamResponseExt::default`] (no error code, which is
+/// only valid alongside `ok == true`). Trailing bytes beyond the known fields
+/// are tolerated for forward compatibility (ADR 013 §Tier 1).
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `StreamResponseExt` prefix.
+pub fn parse_stream_response_ext(remainder: &[u8]) -> Result<StreamResponseExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(StreamResponseExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<StreamResponseExt>(remainder)?.0)
+    }
 }
 
 /// Signed fields of a [`StreamResponse`] (ADR 014 §1). Layout is frozen per
@@ -449,10 +531,11 @@ impl StreamResponse {
     /// - `rate_per_mb` within `(0, MAX_RATE_PER_MB]` (the decode path already
     ///   enforces the upper bound via `deserialize_rate_per_mb`; this adds the
     ///   zero-rate rule),
-    /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes,
-    /// - `ok`/`error` consistency: `ok == true` ⇒ no `error`; `ok == false` ⇒
-    ///   exactly one delivery-side `error` (never the mid-stream-only
-    ///   [`StreamError::VoucherRejected`]).
+    /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes.
+    ///
+    /// The `ok`/`error` consistency rule is NOT here: `error` lives in
+    /// [`StreamResponseExt`], which this method cannot see. A receiver must also
+    /// call [`StreamResponseExt::validate`] with `body.ok`.
     ///
     /// Exposed so requesters re-check on receive and construction sites assert
     /// validity before signing.
@@ -471,16 +554,6 @@ impl StreamResponse {
             return Err(MessageValidationError::InvalidSlashSigLen {
                 len: self.slash_sig.len(),
             });
-        }
-        // ADR 005 §`cdn/client/v1`: the signed `ok` flag and the unsigned
-        // `error` code must agree, and `VoucherRejected` is mid-stream-only.
-        match (self.body.ok, &self.error) {
-            (true, Some(_)) => return Err(MessageValidationError::StreamErrorWithOk),
-            (false, None) => return Err(MessageValidationError::MissingStreamError),
-            (false, Some(StreamError::VoucherRejected { .. })) => {
-                return Err(MessageValidationError::VoucherRejectedInResponse);
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -829,7 +902,7 @@ impl WatermarkBundle {
 /// A stream failure code (ADR 005 §Stream errors). Variant order is frozen.
 ///
 /// Every variant except `VoucherRejected` is delivery-side and rides in
-/// [`StreamResponse::error`] alongside `ok: false`; `VoucherRejected` is the
+/// [`StreamResponseExt::error`] alongside `ok: false`; `VoucherRejected` is the
 /// only variant delivered mid-stream, inside a [`ClientMessage::StreamError`].
 /// All codes are unsigned and informational — never on-chain evidence.
 ///
@@ -903,7 +976,7 @@ pub enum StreamError {
 }
 
 impl StreamError {
-    /// `true` for the delivery-side codes that ride in [`StreamResponse::error`]
+    /// `true` for the delivery-side codes that ride in [`StreamResponseExt::error`]
     /// alongside `ok: false` — everything except `VoucherRejected`. Expresses
     /// the enum's domain split in code rather than only in prose, and backs the
     /// [`StreamResponse::validate`] mid-stream-only exclusion.
@@ -1053,7 +1126,6 @@ mod tests {
     fn sample_response() -> StreamResponse {
         StreamResponse {
             body: sample_body(),
-            error: None,
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         }
     }
@@ -1246,12 +1318,15 @@ mod tests {
                 ok: false,
                 ..sample_body()
             },
-            error: Some(StreamError::BlobTooLarge),
             ..sample_response()
         };
-        let bytes = postcard::to_allocvec(&resp)?;
-        let decoded: StreamResponse = postcard::from_bytes(&bytes)?;
-        assert_eq!(resp, decoded);
+        let ext = StreamResponseExt {
+            error: Some(StreamError::BlobTooLarge),
+        };
+        let buf = encode_stream_response(&resp, Some(&ext))?;
+        let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(decoded, ClientMessage::StreamResponse(resp));
+        assert_eq!(parse_stream_response_ext(remainder)?, ext);
         Ok(())
     }
 
@@ -1498,7 +1573,6 @@ mod tests {
                 timestamp_us: 7,
                 redirect: None,
             },
-            error: None,
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         };
         let bytes = postcard::to_allocvec(&resp)?;
@@ -1510,10 +1584,24 @@ mod tests {
         expected.extend_from_slice(&[6u8; 32]); // body.pool_id
         expected.push(7u8); // body.timestamp_us varint
         expected.push(0u8); // body.redirect = None
-        expected.push(0u8); // error = None
         expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
         expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
         assert_eq!(bytes, expected);
+
+        // Base ‖ ext, with the ext contributing only its own bytes: a reader that
+        // stops after the base sees identical bytes whether or not an extension
+        // followed.
+        let framed = encode_stream_response(
+            &resp,
+            Some(&StreamResponseExt {
+                error: Some(StreamError::NotFound),
+            }),
+        )?;
+        let mut expected_framed = vec![1u8]; // ClientMessage::StreamResponse discriminant
+        expected_framed.extend_from_slice(&expected);
+        expected_framed.push(1u8); // error = Some
+        expected_framed.push(0u8); // StreamError::NotFound discriminant
+        assert_eq!(framed, expected_framed);
         Ok(())
     }
 
@@ -1849,65 +1937,98 @@ mod tests {
     // --- StreamResponse ok/error consistency ---------------------------------
 
     #[test]
-    fn stream_response_validate_rejects_error_with_ok() {
-        // sample_response has body.ok = true; an error must not accompany it.
-        let resp = StreamResponse {
+    fn stream_response_ext_validate_rejects_error_with_ok() {
+        let ext = StreamResponseExt {
             error: Some(StreamError::NotFound),
-            ..sample_response()
         };
         assert_eq!(
-            resp.validate(),
+            ext.validate(true),
             Err(MessageValidationError::StreamErrorWithOk)
         );
     }
 
     #[test]
-    fn stream_response_validate_rejects_failure_without_error() {
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                ok: false,
-                ..sample_body()
-            },
-            error: None,
-            ..sample_response()
-        };
+    fn stream_response_ext_validate_rejects_failure_without_error() {
         assert_eq!(
-            resp.validate(),
+            StreamResponseExt::default().validate(false),
             Err(MessageValidationError::MissingStreamError)
         );
     }
 
     #[test]
-    fn stream_response_validate_accepts_failure_with_delivery_error() {
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                ok: false,
-                ..sample_body()
-            },
+    fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
+        let ext = StreamResponseExt {
             error: Some(StreamError::Overloaded),
-            ..sample_response()
         };
-        assert_eq!(resp.validate(), Ok(()));
+        assert_eq!(ext.validate(false), Ok(()));
     }
 
     #[test]
-    fn stream_response_validate_rejects_voucher_rejected_in_error() {
+    fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
         // VoucherRejected is mid-stream-only; it must never ride in the response.
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                ok: false,
-                ..sample_body()
-            },
+        let ext = StreamResponseExt {
             error: Some(StreamError::VoucherRejected {
                 reason: VoucherRejectReason::SpendingCapExhausted,
                 bundle: None,
             }),
-            ..sample_response()
         };
         assert_eq!(
-            resp.validate(),
+            ext.validate(false),
             Err(MessageValidationError::VoucherRejectedInResponse)
         );
+    }
+
+    /// The base validator cannot see `error`, so an `ok == true` response with a
+    /// stray error code passes it. That is not a hole — it is why a receiver must
+    /// call BOTH halves — but it is worth pinning so nobody "simplifies" the
+    /// receive path down to one call.
+    #[test]
+    fn stream_response_base_validate_cannot_see_the_ext() -> Result<(), MessageValidationError> {
+        sample_response().validate()?;
+        let stray = StreamResponseExt {
+            error: Some(StreamError::NotFound),
+        };
+        assert_eq!(
+            stray.validate(sample_response().body.ok),
+            Err(MessageValidationError::StreamErrorWithOk)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_response_two_phase_with_ext() -> Result<(), postcard::Error> {
+        let resp = sample_response();
+        let ext = StreamResponseExt::default();
+        let buf = encode_stream_response(&resp, Some(&ext))?;
+        let (msg, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(msg, ClientMessage::StreamResponse(resp));
+        assert_eq!(parse_stream_response_ext(remainder)?, ext);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_response_two_phase_no_ext() -> Result<(), postcard::Error> {
+        let resp = sample_response();
+        let buf = encode_stream_response(&resp, None)?;
+        let (msg, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(msg, ClientMessage::StreamResponse(resp));
+        assert!(remainder.is_empty());
+        assert_eq!(
+            parse_stream_response_ext(remainder)?,
+            StreamResponseExt::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
+        let ext = StreamResponseExt {
+            error: Some(StreamError::Overloaded),
+        };
+        let mut bytes = postcard::to_allocvec(&ext)?;
+        bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
+        assert_eq!(parse_stream_response_ext(&bytes)?, ext);
+        Ok(())
     }
 
     // --- ClientMessage dispatcher + StreamError domain split -----------------

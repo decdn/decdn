@@ -28,6 +28,27 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`ProbeResponse` and `StreamResponse` unsigned fields moved into trailing
+  extension structs; `cdn/dht/v1` gains the same seam.** `ProbeResponse` is now
+  exactly `{body, slash_sig}` with `total_bytes` in a new `ProbeResponseExt`;
+  `StreamResponse` is `{body, slash_sig}` with `error` in `StreamResponseExt`.
+  Both are encoded and decoded two-phase, via `encode_probe_response` /
+  `parse_probe_response_ext` and the `StreamResponse` twins. `dht.rs` gains
+  `FindValueResponseExt` and `StoreRequestExt` (both empty today) plus
+  `encode_dht_message`, so all three ALPNs carry the seam ADR 013 §Tier 1 requires.
+  - Why now: postcard fills no defaults for absent trailing fields, so an
+    `Option<T>` appended to an existing struct fails to decode against an older
+    sender. A separately-encoded extension is the only way to add an unsigned
+    field without an ALPN bump — and the wire freezes at first deployment. The
+    ADRs described these fields as trailing; the code had them embedded between
+    `body` and `slash_sig`.
+  - `StreamResponse::validate` no longer checks `ok`/`error` agreement, because it
+    can no longer see `error`. That rule moved to `StreamResponseExt::validate`,
+    which takes `ok`; a receiver must call both.
+  - No contract change: `SlashJudge` is coupled to the signed field set, not the
+    wire encoding — the challenger re-encodes the four signed fields as a fresh
+    ABI blob, so an unsigned extension is invisible on-chain.
+
 - **`cdn/client/v1`: `ChunkData` frame size is now the sender's choice.** The
   protocol bounded a payload at 1,024 bytes; it now bounds it only as non-empty,
   with the framing layer's 16 MiB `MAX_MESSAGE_SIZE` as the effective ceiling.
@@ -1452,6 +1473,20 @@ since project inception and will roll into the first tagged release.
   Contributor tooling only — no runtime, wire, config, or ABI impact.
 
 ### Security
+
+- **Probe `slash_sig` is now cryptographically verified before a response can
+  influence selection.** The requester previously checked only the signature's
+  length; `ProbeSlashData::verify_signer` had no production caller, so a node
+  could return 65 bytes of anything and be selected on the `has_blob` and
+  `rate_per_mb` it claimed. `decdn_client_pull::probe::verify_probe_response`
+  now runs the value invariants, the echoed-field correlation, and recovery to
+  the candidate's registered operator address (ADR 014 §1), and `fetch`/`bundle
+  pull` call it before ordering candidates. A failure drops the response and
+  skips the candidate as requester-local policy — never scored against the peer,
+  since a signature that does not recover attributes nothing to anyone.
+  - The quoted rate is what `slash_sig` makes non-repudiable: quoting `R1` on
+    probe and charging `R2 > R1` within 30 s is slashable on those two signed
+    messages alone. An unverified response is not evidence of anything.
 
 - `ruint` → 1.20.0 (RUSTSEC-2026-0220: `Uint::overflowing_shl`/`overflowing_shr`
   returned false-negative overflow flags, so `checked_*` returned `Some` instead

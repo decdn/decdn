@@ -1362,7 +1362,7 @@ async fn probe_candidate(
         // implies upstream state corruption — skip rather than panic.
         return None;
     };
-    let (resp, rtt_ms) = match probe_once(
+    let (resp, _resp_ext, rtt_ms) = match probe_once(
         &deps.endpoint,
         EndpointAddr::new(pk),
         hash_bytes,

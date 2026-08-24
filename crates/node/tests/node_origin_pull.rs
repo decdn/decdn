@@ -48,9 +48,12 @@ use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, Pull
 use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
-    StreamResponse, StreamResponseBody, VoucherRejectReason,
+    StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
+    encode_stream_response,
 };
-use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
+use decdn_protocol::message::{
+    ProbeResponse, ProbeResponseBody, ProbeResponseExt, encode_probe_response,
+};
 use decdn_protocol::{
     ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, ContentHash, MB_BYTES, ProbeMessage, decode_message,
     encode_message, encode_stream_request, read_frame, write_frame,
@@ -369,13 +372,14 @@ async fn answer_probe(
     .map_err(|e| anyhow::anyhow!("sign probe slash: {e}"))?
     .as_bytes()
     .to_vec();
-    let resp = ProbeResponse {
-        body,
-        total_bytes: Some(total_bytes),
-        slash_sig,
-    };
-    let payload = encode_message(&ProbeMessage::Response(resp))
-        .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
+    let resp = ProbeResponse { body, slash_sig };
+    let payload = encode_probe_response(
+        &resp,
+        Some(&ProbeResponseExt {
+            total_bytes: Some(total_bytes),
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("encode probe response: {e}"))?;
     write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write probe response: {e}"))?;
@@ -1570,14 +1574,10 @@ async fn serve_wrong_bytes(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse {
-        body,
-        error: None,
-        slash_sig,
-    };
+    let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -1707,21 +1707,15 @@ async fn serve_gated_correct_bytes(
             .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
             .as_bytes()
             .to_vec();
-        let resp = StreamResponse {
-            body,
-            error: None,
-            slash_sig,
-        };
+        let resp = StreamResponse { body, slash_sig };
+        let resp_ext = StreamResponseExt { error: None };
         if req.byte_offset == 0 && req.byte_len == 0 {
             // Free header handshake: answer without gating, then loop back to accept
             // the real pull's bi-stream. The buyer aborts after the header, so there
             // is no voucher exchange to await.
-            write_frame(
-                &mut send,
-                &encode_message(&ClientMessage::StreamResponse(resp))?,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("write handshake response: {e}"))?;
+            write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+                .await
+                .map_err(|e| anyhow::anyhow!("write handshake response: {e}"))?;
             let _ = send.finish();
             continue;
         }
@@ -1729,12 +1723,9 @@ async fn serve_gated_correct_bytes(
         // hold here until the test has opened the coalescing second request.
         received.notify_one();
         release.notified().await;
-        write_frame(
-            &mut send,
-            &encode_message(&ClientMessage::StreamResponse(resp))?,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+        write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+            .await
+            .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
         for chunk in served.chunks(WIRE_FRAME) {
             write_frame(
                 &mut send,
@@ -1913,14 +1904,10 @@ async fn serve_then_reject_voucher(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse {
-        body,
-        error: None,
-        slash_sig,
-    };
+    let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -2005,14 +1992,10 @@ async fn serve_then_error_on_voucher(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse {
-        body,
-        error: None,
-        slash_sig,
-    };
+    let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -4099,7 +4082,7 @@ fn signed_response(
     rate: u64,
     total_bytes: u64,
     error: Option<StreamError>,
-) -> Result<StreamResponse> {
+) -> Result<(StreamResponse, StreamResponseExt)> {
     let body = StreamResponseBody {
         hash: req.hash,
         ok: error.is_none(),
@@ -4114,11 +4097,10 @@ fn signed_response(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    Ok(StreamResponse {
-        body,
-        error,
-        slash_sig,
-    })
+    Ok((
+        StreamResponse { body, slash_sig },
+        StreamResponseExt { error },
+    ))
 }
 
 /// The honest whole-blob bao verified-stream wire for `payload` (ADR 038), with
@@ -4207,13 +4189,10 @@ async fn serve_empty_chunks(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
-    let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
-    write_frame(
-        &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
     let empty = encode_empty_chunk_frame()?;
     loop {
         tokio::time::sleep(EMPTY_CHUNK_GAP).await;
@@ -4283,13 +4262,10 @@ async fn serve_then_go_silent(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
-    let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
-    write_frame(
-        &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
     // A real bao prefix, not filler. The buyer decodes INCREMENTALLY and verifies
     // every chunk group against the root as it lands (ADR 038), so filler bytes
     // would be classified as CORRUPTION the moment the first parent hash failed —
@@ -4389,13 +4365,10 @@ async fn serve_a_paid_interval_then_go_silent(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
-    let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
-    write_frame(
-        &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
     // Exactly one payment chunk's worth of bytes, so the buyer's unproved counter
     // lands precisely on the chunk boundary and it must present a proof before it
@@ -4652,13 +4625,10 @@ async fn serve_then_error_mid_stream(
     let req = read_stream_request(&mut recv).await?;
     // An HONEST open: ok == true, signed. The peer has proven it is reachable and
     // answering — everything after this is about how it stops.
-    let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
-    write_frame(
-        &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
     // Two real frames, well under the voucher accounting interval, so no voucher round trip
     // intrudes and the loop is unambiguously mid-delivery when the error lands. Real bao
     // bytes, not filler: the buyer verifies each chunk group as it decodes, so filler
@@ -4811,13 +4781,10 @@ async fn serve_refusal(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
-    let resp = signed_response(&req, eth, slash, rate, total_bytes, Some(error))?;
-    write_frame(
-        &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("write refusal: {e}"))?;
+    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, Some(error))?;
+    write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write refusal: {e}"))?;
     let _ = send.finish();
     conn.closed().await;
     Ok(())
@@ -7281,6 +7248,25 @@ async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMess
     Ok(msg)
 }
 
+/// Read the open-stage `StreamResponse` with its trailing extension, so a
+/// refusal's wire code is available to the caller — it rides in the ext now, and
+/// several tests assert on the code by matching the error text.
+async fn read_client_response(
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<(StreamResponse, StreamResponseExt)> {
+    let frame = read_frame(recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("leaf read frame: {e}"))?;
+    let (msg, tail) =
+        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("leaf decode: {e}"))?;
+    let ClientMessage::StreamResponse(resp) = msg else {
+        anyhow::bail!("expected StreamResponse, got {msg:?}");
+    };
+    let ext = decdn_protocol::parse_stream_response_ext(tail)
+        .map_err(|e| anyhow::anyhow!("leaf decode ext: {e}"))?;
+    Ok((resp, ext))
+}
+
 async fn write_client(send: &mut iroh::endpoint::SendStream, msg: &ClientMessage) -> Result<()> {
     let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("leaf encode: {e}"))?;
     write_frame(send, &payload)
@@ -7364,11 +7350,8 @@ async fn leaf_paced_pull(
         .await
         .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
 
-    let resp = match read_client(&mut recv).await? {
-        ClientMessage::StreamResponse(r) => r,
-        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
-    };
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    let (resp, resp_ext) = read_client_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     let total = resp.body.total_bytes;
     // B forwards + meters WIRE bytes (bao: content + interleaved proof), so the
     // closing-voucher / completeness boundary is the bao-encoded size, not the
@@ -8512,19 +8495,21 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     let frame2 = read_frame(&mut recv2)
         .await
         .map_err(|e| anyhow::anyhow!("read resp: {e}"))?;
-    let (msg2, _) = decode_message::<ClientMessage>(&frame2)
+    let (msg2, rest2) = decode_message::<ClientMessage>(&frame2)
         .map_err(|e| anyhow::anyhow!("decode resp: {e}"))?;
     let ClientMessage::StreamResponse(resp2) = msg2 else {
         anyhow::bail!("leaf2: expected StreamResponse, got {msg2:?}");
     };
+    let resp2_ext = decdn_protocol::parse_stream_response_ext(rest2)
+        .map_err(|e| anyhow::anyhow!("decode resp ext: {e}"))?;
     anyhow::ensure!(
         !resp2.body.ok,
         "concurrent same-lane MISS must be refused while budget covers only one floor"
     );
     anyhow::ensure!(
-        matches!(resp2.error, Some(StreamError::NotFound)),
+        matches!(resp2_ext.error, Some(StreamError::NotFound)),
         "expected the collapsed NotFound wire code for LaneAtCapacity, got {:?}",
-        resp2.error
+        resp2_ext.error
     );
     conn2.close(0u32.into(), b"refused");
 
@@ -8629,8 +8614,7 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
     // NOT served by the fused path.
     anyhow::ensure!(
         !resp.body.ok,
-        "resumed offset>0 miss must be refused, not served; error={:?}",
-        resp.error
+        "resumed offset>0 miss must be refused, not served (code rides in the trailing ext)"
     );
     conn.close(0u32.into(), b"done");
 
@@ -8997,14 +8981,10 @@ async fn serve_wire_paced(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse {
-        body,
-        error: None,
-        slash_sig,
-    };
+    let resp = StreamResponse { body, slash_sig };
     write_frame(
         &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
+        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -9337,11 +9317,8 @@ async fn leaf_underpays_first_voucher(
     .await
     .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
 
-    let resp = match read_client(&mut recv).await? {
-        ClientMessage::StreamResponse(r) => r,
-        other => anyhow::bail!("expected StreamResponse, got {other:?}"),
-    };
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    let (resp, resp_ext) = read_client_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     let interval_bytes = CHUNK_BYTES;
 
     // Read chunks until the first interval boundary, then underpay it.
@@ -12522,13 +12499,10 @@ async fn serve_with_deposit_ceiling(
         .map(|p| p.as_slice())
         .ok_or_else(|| anyhow::anyhow!("deposit-capped upstream: unknown hash requested"))?;
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
-    write_frame(
-        &mut send,
-        &encode_message(&ClientMessage::StreamResponse(resp))?,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
     // Serve the completing POST-TOP-UP leg slowly, AFTER the response is on the wire
     // so the delay lands in the chunk stream (`pull_to_sink`), not the open. The

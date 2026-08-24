@@ -290,9 +290,18 @@ impl ProxyWarmingParams {
 /// Probe `candidates` for `hash` over `endpoint` and return the ordered
 /// provider-failover list (#1174, ADR 037 § Fallback): the sequence `fetch`
 /// tries in turn, each entry a fallback for the one before it, until one
-/// delivers the blob. `slash_sig`/correlation are NOT validated here — selection
-/// only needs `has_blob` + RTT; the chosen node's delivery is fully verified
-/// downstream. Errors if none of the probed candidates hold it.
+/// delivers the blob. Errors if none of the probed candidates hold it.
+///
+/// Every response is verified before it can influence the order: value
+/// invariants, echoed-field correlation, and `slash_sig` recovery to the
+/// candidate's on-chain operator address (ADR 014 §1). Selection reads
+/// `has_blob` and `rate_per_mb` off the response, and both are only meaningful
+/// once the signature attributes them to the peer — an unverified quote is a
+/// claim no one is accountable for, so a node could win selection on a rate it
+/// never committed to. A response that fails is dropped and its candidate
+/// skipped, exactly as for a timeout; it is requester-local policy and never
+/// scored against the peer, since a signature that does not recover attributes
+/// nothing to anyone.
 ///
 /// Every candidate is probed on equal footing: opening cost is
 /// provider-independent, because the caller has ONE pool that fans out to
@@ -311,6 +320,7 @@ pub(crate) async fn probe_and_order(
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
     warming: ProxyWarmingParams,
+    slash_domain: &alloy::sol_types::Eip712Domain,
 ) -> anyhow::Result<ResolvedTargets> {
     let timestamp_us = micros_now();
     // Probe concurrently in one task. `probe_once`'s future is `Send`, so
@@ -344,12 +354,33 @@ pub(crate) async fn probe_and_order(
     // RTT. Only collected when warming is enabled.
     let mut warming_pool: Vec<discovery::WarmingCandidate> = Vec::new();
     for (cand, res) in results {
-        let Some((resp, rtt_ms)) = res else { continue };
+        let Some((resp, resp_ext, rtt_ms)) = res else {
+            continue;
+        };
+        // Verify BEFORE the response can influence the order (ADR 014 §1). A
+        // failure is requester-local policy — drop it and move on, no reputation
+        // effect, because an unrecovered signature attributes nothing to anyone.
+        if let Err(e) = decdn_client_pull::probe::verify_probe_response(
+            &resp,
+            cand.eth_address,
+            slash_domain,
+            hash,
+            timestamp_us,
+        ) {
+            // `decdn` installs no tracing subscriber, so this goes to stderr —
+            // a candidate silently vanishing from selection is exactly what the
+            // user needs told.
+            eprintln!(
+                "warning: dropping an unverifiable probe response from {}: {e}",
+                cand.node_id
+            );
+            continue;
+        }
         if resp.body.has_blob {
             holders.push(discovery::Probed {
                 candidate: cand.clone(),
                 rtt_ms,
-                total_bytes: resp.total_bytes,
+                total_bytes: resp_ext.total_bytes,
                 // No per-provider funding distinction in the pool model — see
                 // the doc comment above.
                 has_live_channel: false,
@@ -493,7 +524,8 @@ async fn discover_provider(
     }
     let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
     let warming = ProxyWarmingParams::from_args(args);
-    probe_and_order(endpoint, &selected, relay_hint, hash, warming).await
+    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    probe_and_order(endpoint, &selected, relay_hint, hash, warming, &slash_dom).await
 }
 
 /// The ordered failover list plus what discovery already learned about the

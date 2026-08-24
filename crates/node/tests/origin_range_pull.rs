@@ -205,7 +205,10 @@ async fn ranged_paid_pull(
         ClientMessage::StreamResponse(r) => r,
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     };
-    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+    anyhow::ensure!(
+        resp.body.ok,
+        "delivery refused (code rides in the trailing ext)"
+    );
     // The advertised size is the *whole* blob; the range delivers `byte_len`, or
     // the whole tail when `byte_len == 0`. Reject an impossible advertised total
     // rather than masking a server bug: a signed `total_bytes` before the offset

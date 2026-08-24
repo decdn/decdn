@@ -271,7 +271,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 #### Implementation note — separating signed and unsigned fields
 
-A signed message serializes its signed fields into a dedicated inner struct (e.g., `ProbeResponseBody`) and computes the signature over that struct's postcard bytes. Unsigned fields (added via minor evolution) live in the outer struct, outside the signed region:
+A signed message holds its signed fields in a dedicated inner struct (e.g., `ProbeResponseBody`). The signature is an EIP-712 typed-data signature over that field set — **not** over the struct's postcard bytes. The distinction matters: the split isolates a *field set*, not a byte range, so where an unsigned field sits on the wire has no bearing on signature validity. Unsigned fields nonetheless live outside the frozen base, in a separately encoded extension, because that is what makes a later addition decodable by an older peer:
 
 ```rust
 /// Signed portion — field set is frozen per protocol version.
@@ -283,16 +283,23 @@ struct ProbeResponseBody {
     timestamp_us: u64,
 }
 
-/// Full wire message — extensions follow body + signature via two-phase deserialization.
+/// Frozen base — the signed body and the signature over it, nothing else.
 #[derive(Serialize, Deserialize)]
 struct ProbeResponse {
     body: ProbeResponseBody,
     slash_sig: Bytes,
-    // Unsigned fields (e.g. total_bytes) trail via two-phase deserialization.
+}
+
+/// Unsigned fields — a separate postcard value appended after the base.
+#[derive(Serialize, Deserialize, Default)]
+struct ProbeResponseExt {
+    total_bytes: Option<u64>,
 }
 ```
 
-Future unsigned extension fields trail `body + signature` and are decoded via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `StreamResponse`.
+Unsigned extension fields trail `body + signature` as their own postcard value and are decoded two-phase (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `StreamResponse` and to `cdn/dht/v1`, so all three ALPNs carry the seam.
+
+A cross-half invariant — one that relates a signed field to an unsigned one, such as `StreamResponse`'s `ok` agreeing with its `error` — belongs on the extension's validator, which takes the signed value as an argument. Neither half can check it alone, so a receiver MUST run both validators.
 
 #### Cross-ADR struct alignment
 

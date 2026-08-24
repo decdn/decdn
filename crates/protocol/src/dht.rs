@@ -250,6 +250,92 @@ pub struct StoreRequest {
     pub holder: NodeId,
 }
 
+/// Optional [`FindValueResponse`] extension fields, carried as trailing bytes
+/// after the message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_dht_message`] / [`parse_find_value_response_ext`]).
+///
+/// Empty today. It exists so the first field a responder needs to add — a
+/// coverage hint, a record age, a freshness bound — is a pure append rather
+/// than a `cdn/dht/v2` bump. Postcard fills no defaults for absent trailing
+/// fields, so the seam has to exist before the field does, and the wire
+/// freezes at first deployment.
+///
+/// Anything added here is UNSIGNED and responder-controlled. DHT records carry
+/// no per-record signature (see the module docs), so an extension field is a
+/// hint the requester may act on only where a lying responder gains nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FindValueResponseExt {}
+
+/// Optional [`StoreRequest`] extension fields, carried as trailing bytes after
+/// the message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_dht_message`] / [`parse_store_request_ext`]).
+///
+/// Empty today, for the same reason as [`FindValueResponseExt`]: the publisher
+/// side is where a record would gain a TTL hint or a partial-holding range, and
+/// that append must stay Tier-1 after launch.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StoreRequestExt {}
+
+/// Encode a [`DhtMessage`] with optional trailing extension bytes (ADR 013
+/// §Tier 1, two-phase).
+///
+/// `ext` is the already-serialized extension for whichever variant `msg` is —
+/// [`FindValueResponseExt`] for `FindValue` responses, [`StoreRequestExt`] for
+/// `Store`. It is passed pre-encoded rather than as an enum so this helper does
+/// not have to grow a variant every time one message gains an extension.
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_dht_message(
+    msg: &DhtMessage,
+    ext: Option<&[u8]>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(msg)?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(ext);
+    }
+    Ok(buf)
+}
+
+/// Parse the trailing [`FindValueResponseExt`] bytes returned as the remainder
+/// by [`crate::decode_message`] after a `DhtMessage::FindValueResponse`.
+///
+/// An empty remainder ⇒ [`FindValueResponseExt::default`]. Trailing bytes beyond
+/// the known fields are tolerated for forward compatibility (ADR 013 §Tier 1).
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `FindValueResponseExt` prefix.
+pub fn parse_find_value_response_ext(
+    remainder: &[u8],
+) -> Result<FindValueResponseExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(FindValueResponseExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<FindValueResponseExt>(remainder)?.0)
+    }
+}
+
+/// Parse the trailing [`StoreRequestExt`] bytes returned as the remainder by
+/// [`crate::decode_message`] after a `DhtMessage::Store`.
+///
+/// An empty remainder ⇒ [`StoreRequestExt::default`]. Trailing bytes beyond the
+/// known fields are tolerated for forward compatibility (ADR 013 §Tier 1).
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `StoreRequestExt` prefix.
+pub fn parse_store_request_ext(remainder: &[u8]) -> Result<StoreRequestExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(StoreRequestExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<StoreRequestExt>(remainder)?.0)
+    }
+}
+
 /// Acknowledgement for a [`StoreRequest`] (ADR 022 §Message Types).
 ///
 /// `accepted == false` means the record was rejected — most commonly the

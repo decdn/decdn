@@ -543,6 +543,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.relays.first(),
             hash,
             fetch::ProxyWarmingParams::from_args(self.common),
+            self.slash_dom,
         )
         .await?;
         // `bundle pull` is single-source (its `open_lock` serializes legs), so

@@ -110,7 +110,7 @@ use decdn_incentive::{
 };
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    VoucherRejectReason, WatermarkBundle, WireCapability,
+    StreamResponseExt, VoucherRejectReason, WatermarkBundle, WireCapability,
 };
 use decdn_protocol::{
     ALPN_CLIENT, CHUNK_BYTES, ChunkPreimage, decode_message, encode_message, read_frame,
@@ -723,8 +723,8 @@ enum Kind {
     /// Open-stage refusal: the upstream signed a [`StreamResponse`] with
     /// `body.ok == false`, already verified against `expected_signer` by
     /// [`verify_response`] before the value is built, so `error` is derived
-    /// *from* `response.error` and `response` always recovers to
-    /// `expected_signer`.
+    /// *from* the response's trailing [`StreamResponseExt`] and `response`
+    /// always recovers to `expected_signer`.
     Open {
         error: StreamError,
         // Boxed (issue #1481 review): `StreamError::VoucherRejected` grew an
@@ -740,14 +740,14 @@ enum Kind {
 
 impl UpstreamRefused {
     /// Build the open-stage refusal for a `body.ok == false` response, deriving
-    /// the wire `error` *from* `response.error` so the two can never disagree
-    /// (#1377 invariant 2). Shared by the buffered [`fetch_inner`] and
+    /// the wire `error` *from* the response's trailing [`StreamResponseExt`] so
+    /// the two can never disagree (#1377 invariant 2). Shared by the buffered [`fetch_inner`] and
     /// progressive [`open_progressive_pull`] open stages so they cannot drift in
     /// how they classify a refusal.
     ///
     /// Returns `anyhow::Error` rather than `Self` because the `None`-error arm is
     /// a protocol violation, not a refusal: callers MUST have run
-    /// [`verify_response`] first, whose `StreamResponse::validate` rejects
+    /// [`verify_response`] first, whose `StreamResponseExt::validate` rejects
     /// `ok == false` with no error code (`MissingStreamError`). Reaching the
     /// `None` arm means that invariant was bypassed, so it is surfaced as the
     /// violation it is rather than defaulted to an invented code — which would
@@ -765,7 +765,7 @@ impl UpstreamRefused {
     /// is kept on its own merits — it is an attributable, non-repudiable record
     /// of *why* a paid pull was declined, which the caller can log, surface, or
     /// present in a dispute without re-signing anything.
-    fn open(response: StreamResponse) -> anyhow::Error {
+    fn open(response: StreamResponse, ext: &StreamResponseExt) -> anyhow::Error {
         // `ok == true` is not a refusal at all — building an `Open` from it would
         // mint an evidence-carrying refusal with `ok == true`, violating invariant
         // 3. `validate` already rejects `(ok: true, error: Some)` as
@@ -779,7 +779,7 @@ impl UpstreamRefused {
                  (StreamResponse::validate invariant bypassed)"
             );
         }
-        match response.error.clone() {
+        match ext.error.clone() {
             Some(error) => anyhow::Error::new(Self {
                 kind: Kind::Open {
                     error,
@@ -788,7 +788,7 @@ impl UpstreamRefused {
             }),
             None => anyhow::anyhow!(
                 "delivery refused but the validated response carried no error code \
-                 (StreamResponse::validate invariant bypassed)"
+                 (StreamResponseExt::validate invariant bypassed)"
             ),
         }
     }
@@ -1493,6 +1493,7 @@ async fn open_stream(
     SendStream,
     RecvStream,
     StreamResponse,
+    StreamResponseExt,
 )> {
     tokio::time::timeout(open, async move {
         let conn = endpoint
@@ -1539,19 +1540,17 @@ async fn open_stream(
             .await
             .map_err(|e| anyhow::anyhow!("write stream request: {e}"))?;
 
-        let resp = match read_client_message(&mut recv).await? {
-            ClientMessage::StreamResponse(r) => r,
-            other => anyhow::bail!("expected StreamResponse, got {}", variant_name(&other)),
-        };
+        let (resp, resp_ext) = read_stream_response(&mut recv).await?;
         verify_response(
             &resp,
+            &resp_ext,
             slash_domain,
             expected_signer,
             hash,
             ctx.pool_id,
             timestamp_us,
         )?;
-        Ok((conn, send, recv, resp))
+        Ok((conn, send, recv, resp, resp_ext))
     })
     .await
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
@@ -1919,7 +1918,7 @@ async fn fetch_inner_once(
     ledger: &PoolLedger,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
-    let (conn, mut send, mut recv, resp) = open_stream(
+    let (conn, mut send, mut recv, resp, resp_ext) = open_stream(
         endpoint,
         target,
         ctx,
@@ -1945,7 +1944,7 @@ async fn fetch_inner_once(
     .await?;
 
     if !resp.body.ok {
-        return Err(UpstreamRefused::open(resp));
+        return Err(UpstreamRefused::open(resp, &resp_ext));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -2445,7 +2444,7 @@ pub async fn open_progressive_pull(
     on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let stall = deadlines.stall;
-    let (conn, send, recv, resp) = open_stream(
+    let (conn, send, recv, resp, resp_ext) = open_stream(
         endpoint,
         target,
         ctx,
@@ -2468,7 +2467,7 @@ pub async fn open_progressive_pull(
     )
     .await?;
     if !resp.body.ok {
-        return Err(UpstreamRefused::open(resp));
+        return Err(UpstreamRefused::open(resp, &resp_ext));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -3059,14 +3058,19 @@ fn voucher_rejection(
 /// Validate + verify a `StreamResponse` on receive (ADR 005, ADR 014 §1, #252).
 fn verify_response(
     resp: &StreamResponse,
+    ext: &StreamResponseExt,
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     pool_id: B256,
     timestamp_us: u64,
 ) -> anyhow::Result<()> {
-    // #252 + slash_sig length/upper-bound checks.
+    // #252 + slash_sig length/upper-bound checks on the frozen base...
     resp.validate()
+        .map_err(|e| anyhow::anyhow!("invalid stream response: {e}"))?;
+    // ...and the ok/error agreement, which spans the signed base and the unsigned
+    // extension, so neither validator can see it alone (ADR 013 §Tier 1).
+    ext.validate(resp.body.ok)
         .map_err(|e| anyhow::anyhow!("invalid stream response: {e}"))?;
     // Echoed-field correlation (ADR 005).
     if resp.body.hash != hash {
@@ -3094,6 +3098,28 @@ async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Re
     write_frame(send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write failed: {e}"))
+}
+
+/// Read the open-stage `StreamResponse` together with its trailing
+/// [`StreamResponseExt`] (ADR 013 §Tier 1, two-phase).
+///
+/// Separate from [`read_client_message`] because only this message carries an
+/// extension: every mid-stream variant is a single postcard value, and widening
+/// the shared reader would push an always-`default()` ext onto all of them.
+async fn read_stream_response(
+    recv: &mut RecvStream,
+) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+    let frame = read_frame(recv)
+        .await
+        .map_err(|e| anyhow::anyhow!("frame read failed: {e}"))?;
+    let (msg, tail) = decode_message::<ClientMessage>(&frame)
+        .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+    let ClientMessage::StreamResponse(response) = msg else {
+        anyhow::bail!("expected StreamResponse, got {}", variant_name(&msg));
+    };
+    let ext = decdn_protocol::parse_stream_response_ext(tail)
+        .map_err(|e| anyhow::anyhow!("decode stream response ext: {e}"))?;
+    Ok((response, ext))
 }
 
 async fn read_client_message(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
@@ -4086,13 +4112,16 @@ mod tests {
         let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
         let response = StreamResponse {
             body: body.clone(),
-            error: Some(StreamError::EvictedSinceProbe),
             slash_sig: sig.as_bytes().to_vec(),
         };
-        // Precondition the real open stage enforces before ever calling `open`.
+        let response_ext = decdn_protocol::StreamResponseExt {
+            error: Some(StreamError::EvictedSinceProbe),
+        };
+        // Preconditions the real open stage enforces before ever calling `open`.
         response.validate()?;
+        response_ext.validate(response.body.ok)?;
 
-        let err = UpstreamRefused::open(response);
+        let err = UpstreamRefused::open(response, &response_ext);
         let refused = err
             .downcast_ref::<UpstreamRefused>()
             .ok_or_else(|| anyhow::anyhow!("open() must stay a typed UpstreamRefused: {err:#}"))?;
@@ -4111,10 +4140,10 @@ mod tests {
         // #1377: `error()` is now DERIVED from the evidence by `open()`, so the two
         // legs cannot desync by construction. This pins that they agree.
         anyhow::ensure!(
-            preserved.error.as_ref() == Some(refused.error()),
-            "the derived wire code {:?} must match the code inside the preserved evidence {:?}",
+            response_ext.error.as_ref() == Some(refused.error()),
+            "the derived wire code {:?} must match the code the extension carried {:?}",
             refused.error(),
-            preserved.error,
+            response_ext.error,
         );
         // The whole point: the surviving signature still recovers to the operator,
         // so it can be replayed to `SlashJudge` with no re-signing by the observer.
@@ -4147,10 +4176,9 @@ mod tests {
                 timestamp_us: 1_700_000_000_000_000,
                 redirect: None,
             },
-            error: None,
             slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
         };
-        let err = UpstreamRefused::open(response);
+        let err = UpstreamRefused::open(response, &decdn_protocol::StreamResponseExt::default());
         assert!(
             err.downcast_ref::<UpstreamRefused>().is_none(),
             "a response with no error code must not become a typed refusal"
