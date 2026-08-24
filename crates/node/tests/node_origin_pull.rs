@@ -5521,11 +5521,12 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     Ok(())
 }
 
-/// #1145 review — a WEDGED provider must be skipped for ALL hashes until its channel expires,
-/// not just the one that wedged it. The `(peer, hash)` negative-cache entry the wedge writes
-/// covers only the same blob for 30s; the provider-wide `wedged_providers` entry (held to the
-/// channel's expiry) is what a miss for a DIFFERENT blob needs. Without it, `try_reuse_live`
-/// (expiry-gated) hands the dead channel back and re-wedges it on the next miss.
+/// #1145 review — a WEDGED provider must be skipped for ALL hashes until its suppression
+/// window elapses, not just the one that wedged it. The `(peer, hash)` negative-cache entry the
+/// wedge writes covers only the same blob for 30s; the provider-wide `wedged_providers` entry
+/// (held for `WEDGED_PROVIDER_SUPPRESSION_SECS`) is what a miss for a DIFFERENT blob needs.
+/// Without it the only peer-keyed SUPPRESSION is that 30s (peer, hash) entry, which does not
+/// cover a different blob, so the next miss re-selects the provider and re-wedges it.
 ///
 /// Fail-on-revert: drop the `provider_is_wedged` filter in `probe_and_rank` and the second
 /// pull re-selects A, re-wedging it — `node_pull_pool_wedged_total` becomes 2, not 1.
@@ -5544,8 +5545,8 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // A rejects every closing voucher with `StaleNonce` → wedges the channel on any pull it
-    // is selected for. The server loops, so it handles both pulls.
+    // A rejects every closing voucher with `AmountRegression` → wedges on any pull it is
+    // selected for. The server loops, so it handles both pulls.
     let task_a = spawn_a_voucher_rejecting_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
@@ -5645,10 +5646,10 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 /// `classify_refusal`, was ruled `OurFault` —
 /// score nothing, suppress nothing, *do* nothing — and skipped the entire channel remedy.
 ///
-/// The consequence is the one the drained-channel test exists to prevent, reached by another
-/// road: the channel stays in the store, `try_reuse_live` (which gates on expiry alone) hands
-/// it straight back on the next miss, and this node re-presents a voucher it cannot honour on
-/// every pull until it expires — logging a `debug!` invisible at the default `RUST_LOG=info`.
+/// The consequence is the one the drained-lane test exists to prevent, reached by another
+/// road: without the wedge the next miss re-selects the same provider, and this node
+/// re-presents a voucher it cannot honour on every pull — logging a `debug!` invisible at the
+/// default `RUST_LOG=info`.
 ///
 /// Driven through the REAL receive loop, for the reason the sibling test above spells out: an
 /// assertion against `classify_pull_failure`'s ladder alone would pass with the bug restored,
@@ -11658,11 +11659,11 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
 /// channel.
 ///
 /// Provider A is cached for hash2 (fetch #1, where healthy H outranks it and delivers),
-/// then wedges its channel on a pull for hash1 (fetch #2: A rejects the closing voucher
-/// with `StaleNonce` → `OurDeadChannel` → provider-wide suppression until channel expiry).
+/// then wedges on a pull for hash1 (fetch #2: A rejects the closing voucher with
+/// `AmountRegression` → `OurDeadLane` → provider-wide suppression for a fixed window).
 /// (A, hash2) is never negative-cached, so when H goes offline and fetch #3 hits the hash2
-/// entry, ONLY the wedged filter stands between A and being handed back a channel that
-/// cannot pay. The wire-level assertion is A's stream counter: still exactly one open ever.
+/// entry, ONLY the wedged filter stands between A and a lane this node cannot pay on. The
+/// wire-level assertion is A's stream counter: still exactly one open ever.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<()> {
@@ -11824,7 +11825,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
 
     // Fetch #2 (hash1): H is tried first and honestly refuses (its cache holds
     // only payload2); A then serves payload1 but rejects the closing voucher —
-    // `OurDeadChannel`, wedging A provider-wide until its channel expires.
+    // `OurDeadLane`, wedging A provider-wide for the suppression window.
     let second = tokio::time::timeout(
         Duration::from_secs(30),
         Origin::fetch(&origin, hash1, u64::MAX),
@@ -11850,8 +11851,8 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     let probes_a_after_wedge = probes_a.load(Ordering::SeqCst);
 
     // --- Take H offline: the hash2 entry now reads [H (dead), A (wedged)], and
-    //     only the wedged filter keeps fetch #3 from handing A's dead channel
-    //     back. ---------------------------------------------------------------------
+    //     only the wedged filter keeps fetch #3 from re-selecting A on a lane this
+    //     node cannot pay on. ---------------------------------------------------------
     shutdown([task_h], [&ep_h]).await?;
 
     // Fetch #3 (hash2, inside the entry's TTL): a probe-cache HIT — H survives the
@@ -11872,7 +11873,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     );
     // THE property under test, at the wire: A's only pull ever is the hash1
     // wedge (handshake + drive = the 2 streams above). A climb past 2 here is
-    // the hit path handing back the dead channel.
+    // the hit path re-selecting the wedged provider.
     anyhow::ensure!(
         streams_a.load(Ordering::SeqCst) == 2,
         "the cache hit re-streamed the WEDGED A — `cached_candidates` must filter a wedged \

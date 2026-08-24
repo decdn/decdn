@@ -733,26 +733,26 @@ pub struct DecdnMetrics {
     /// stream and then says nothing lands here.
     pub node_pull_timeout: Counter,
     /// `decdn_node_pull_voucher_rejected_total` (#857): an upstream rejected a
-    /// voucher this node presented mid-pull (a stale nonce per #852, deposit
-    /// exhaustion, or a channel mismatch). This is the node's own payment-side
-    /// fault, NOT the provider's, so it does NOT tar the provider's reputation. A
-    /// sustained rate means this node's buyer channels are drifting out of sync
-    /// with what upstreams accept.
+    /// voucher this node presented mid-pull (an amount or bytes regression, a
+    /// spent capability cap, or a voucher addressed to the wrong pool or
+    /// provider). This is the node's own payment-side fault, NOT the provider's,
+    /// so it does NOT tar the provider's reputation. A sustained rate means this
+    /// node's buyer lanes are drifting out of sync with what upstreams accept.
     pub node_pull_voucher_rejected: Counter,
     /// `decdn_node_pull_pool_wedged_total` (#1145 review): an upstream rejected our
     /// voucher on terms this lane cannot recover from, while the pool's deposit is STILL
-    /// ESCROWED — a nonce/amount/bytes desync, a balance too small for this voucher, or an
-    /// expiry.
+    /// ESCROWED — an amount or bytes regression, a spent capability cap, an expired
+    /// capability, or a voucher addressed to the wrong pool or provider.
     ///
     /// The pool row is KEPT (it is the only thing that can still reclaim the deposit) and
-    /// the provider is suppressed, so this node cannot use that provider again until the
-    /// pool expires and the reclaim sweep refunds it.
+    /// the PROVIDER is suppressed for a fixed one-hour window. The deposit is not
+    /// stranded: it is shared across every lane, so it stays available to every other
+    /// provider throughout, and the pool has no expiry of its own to wait on.
     ///
-    /// **Any sustained rate is money at rest.** Each tick is a pool whose deposit is
-    /// locked up until expiry and a provider this node has taken out of rotation. A spike
-    /// means buyer watermarks are drifting out of sync with what upstreams have committed
-    /// — the desync tracked in #1122 — and the deposit sizing and pool count should be
-    /// reviewed alongside it.
+    /// **A sustained rate is a provider this node keeps failing to pay.** A spike means
+    /// buyer watermarks are drifting out of sync with what upstreams have committed — the
+    /// desync tracked in #1122 — and the deposit sizing and pool count should be reviewed
+    /// alongside it. One tick costs an hour of that provider's capacity, not the deposit.
     pub node_pull_pool_wedged: Counter,
     /// `decdn_node_pull_abandon_drain_timeout_total` (#1779): an abandoned pull leg's upstream
     /// connection did not reach its drained state before the leg's drain ceiling, so

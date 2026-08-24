@@ -423,12 +423,14 @@ pub struct NodeOriginDeps {
     /// concurrent pull on it (#1145 review). Not a cache — see [`BuyerLedgers`] for
     /// why a per-pull ledger collides at `prior_nonce + 1` and what that now costs.
     pub ledgers: Arc<BuyerLedgers>,
-    /// Providers whose buyer channel is WEDGED — it rejected our voucher on a terminal
-    /// reason, so it cannot serve a paid byte until it expires — mapped to the channel's
-    /// expiry (Unix seconds), the horizon past which the provider becomes rankable again
-    /// (#1145 review). Keyed by the peer's [`DhtNodeId`], so `probe_and_rank` can skip a
-    /// wedged provider for ALL hashes, not just the one that wedged it. In-memory: on
-    /// restart the first miss re-wedges and re-suppresses within one pull.
+    /// Providers suppressed from ranking because one rejected our voucher on a reason this
+    /// lane cannot recover from — mapped to the first Unix second at which the provider is
+    /// rankable again (#1145 review). The horizon is a fixed
+    /// `WEDGED_PROVIDER_SUPPRESSION_SECS` window, not a channel deadline: the buyer pool is
+    /// shared across every provider, so it carries no per-provider expiry to key one on.
+    /// Keyed by the peer's [`DhtNodeId`], so `probe_and_rank` can skip a wedged provider for
+    /// ALL hashes, not just the one that wedged it. In-memory: on restart the first miss
+    /// re-wedges and re-suppresses within one pull.
     pub wedged_providers: Arc<Mutex<HashMap<DhtNodeId, u64>>>,
     /// The cache engine this origin admits into. Set at `provision`, after the
     /// engine exists. The node-to-node pull streams straight into it via
@@ -446,34 +448,67 @@ impl std::fmt::Debug for NodeOriginDeps {
 }
 
 impl NodeOriginDeps {
-    /// Record that `pk`'s buyer channel is wedged until `expires_at` (Unix seconds), so
-    /// `probe_and_rank` skips the provider for ALL hashes until then (#1145 review). An
-    /// `expires_at` of `0` is the `NEVER_EXPIRES` sentinel — a channel that never expires on
-    /// its own is wedged indefinitely, stored as `u64::MAX`.
-    fn record_wedged(&self, pk: &PublicKey, expires_at: u64) {
-        let horizon = if expires_at == 0 {
-            u64::MAX
-        } else {
-            expires_at
-        };
+    /// Suppress `pk` from ranking for [`WEDGED_PROVIDER_SUPPRESSION_SECS`], so
+    /// `probe_and_rank` and `cached_candidates` skip the provider for ALL hashes until that
+    /// window elapses (#1145 review). The window is owned here rather than passed in because
+    /// it is the same for every lane-terminal reason: the pool the lane draws on has no
+    /// per-provider deadline to key one on, so there is nothing for a caller to vary it by.
+    ///
+    /// A re-wedge RESTARTS the window rather than extending the original — the horizon a
+    /// provider earns is measured from its most recent rejection, not its first.
+    fn record_wedged(&self, pk: &PublicKey) {
         let node = DhtNodeId::from_bytes(*pk.as_bytes());
-        self.wedged_providers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(node, horizon);
+        record_wedged_at(
+            &mut self
+                .wedged_providers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            node,
+            crate::payment_settlement::unix_now(),
+        );
     }
 
-    /// True if `peer`'s channel is wedged and still within its expiry horizon. Prunes horizons
-    /// that have passed on read: once the channel expires the reclaim sweep frees the deposit
-    /// and a fresh channel can open, so the provider is worth ranking again.
+    /// True if `peer` is wedged and still inside its suppression horizon. Prunes horizons that
+    /// have passed on read: the window is a cooling-off period, not a verdict, so once it
+    /// elapses the provider is worth ranking again and paying for a sweep task to say so would
+    /// buy nothing a read cannot.
     fn provider_is_wedged(&self, peer: &DhtNodeId, now_secs: u64) -> bool {
         let mut wedged = self
             .wedged_providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        wedged.retain(|_, expires_at| *expires_at > now_secs);
-        wedged.contains_key(peer)
+        prune_and_check_wedged(&mut wedged, peer, now_secs)
     }
+}
+
+/// Suppress `node` for [`WEDGED_PROVIDER_SUPPRESSION_SECS`] measured from `now_secs`.
+///
+/// `insert` overwrites, so re-wedging a provider already in the map restarts its window from
+/// `now_secs` instead of leaving it on the older horizon. That is the intended reading of a
+/// second rejection: the provider earned a fresh window, not the remainder of its first.
+///
+/// Free-standing for the same reason as [`prune_and_check_wedged`] — it is the write half of
+/// the same policy, and pairing them is what lets one test pin the horizon end to end.
+fn record_wedged_at(wedged: &mut HashMap<DhtNodeId, u64>, node: DhtNodeId, now_secs: u64) {
+    wedged.insert(
+        node,
+        now_secs.saturating_add(WEDGED_PROVIDER_SUPPRESSION_SECS),
+    );
+}
+
+/// Drop every suppression horizon `now_secs` has passed, then report whether `peer` still has
+/// one. The horizon is exclusive: a provider is rankable again ON the second its window ends.
+///
+/// Free-standing over the map rather than a method, so the window semantics are testable
+/// without a live [`NodeOriginDeps`] — which needs an iroh endpoint, and would be a fixture far
+/// larger than the assertion.
+fn prune_and_check_wedged(
+    wedged: &mut HashMap<DhtNodeId, u64>,
+    peer: &DhtNodeId,
+    now_secs: u64,
+) -> bool {
+    wedged.retain(|_, expires_at| *expires_at > now_secs);
+    wedged.contains_key(peer)
 }
 
 /// Node-to-node pull-through [`Origin`]. Cheap to clone via the shared inner
@@ -1297,10 +1332,13 @@ async fn probe_and_rank(
         // Filtered BEFORE `take`, so a suppressed peer does not consume a probe-fanout
         // slot that a viable provider could have used.
         .filter(|peer| !deps.negative_cache.contains_active(peer, &target))
-        // Also drop providers whose buyer channel is WEDGED, for ALL hashes until it expires
-        // (#1145 review): a wedged channel cannot serve any blob, and the reuse fast path gates
-        // on expiry alone, so without this the dead channel is handed back on every miss for a
-        // different hash and re-wedged — burning a candidate slot each time.
+        // Also drop WEDGED providers, for ALL hashes until the suppression window elapses
+        // (#1145 review): a provider whose voucher we just failed to pay on lane-terminal terms
+        // is one we cannot pay for any blob right now. Nothing else SUPPRESSES it — the
+        // negative-cache entry the wedge writes alongside this one is keyed on (peer, hash), so
+        // it lapses for any other blob, and the arm deliberately scores no reputation. Without
+        // this the peer is re-selected on the next miss for a different hash and re-wedged —
+        // burning a candidate slot each time.
         .filter(|peer| !deps.provider_is_wedged(peer, now_secs))
         .take(deps.config.probe_fanout)
         .map(|peer| probe_candidate(deps, peer, hash_bytes));
@@ -1482,7 +1520,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         // `probe_and_rank` applies are applied here — this is the other
         // chokepoint every candidate passes through. A pull-time refusal recorded
         // a negative for this exact (peer, hash) seconds ago
-        // (`classify_pull_failure`), and a wedged channel cannot serve ANY hash.
+        // (`classify_pull_failure`), and a wedged provider is out of ranking for ANY hash.
         if deps
             .negative_cache
             .contains_active(&provider.node_id, &target)
@@ -2555,14 +2593,11 @@ fn wedged_channel(
         DhtHash::from_bytes(hash_bytes),
         REFUSAL_SUPPRESSION_TTL,
     );
-    // Provider-wide: a provider that rejected a voucher on terms a lane cannot recover from
-    // is unlikely to serve any hash right now, so take it out of ranking for a bounded window.
-    // The pool has no per-provider deadline to key the horizon on (the deposit fans out across
-    // every provider), so use a fixed suppression window rather than a channel expiry.
-    deps.record_wedged(
-        &pk,
-        crate::payment_settlement::unix_now().saturating_add(WEDGED_PROVIDER_SUPPRESSION_SECS),
-    );
+    // Provider-wide: a provider whose voucher this lane cannot pay is one we cannot pay for any
+    // hash right now, so take it out of ranking for a bounded window. The horizon itself belongs
+    // to `record_wedged` — the pool has no per-provider deadline to key one on (the deposit fans
+    // out across every provider), so there is nothing for this call site to choose.
+    deps.record_wedged(&pk);
     warn!(
         %provider_addr, pool_id = ?channel, ?reason,
         "node-origin: upstream rejected our voucher on terms this lane cannot recover from; \
@@ -2572,8 +2607,9 @@ fn wedged_channel(
 }
 
 /// How long a provider that rejected a voucher on a lane-terminal reason is kept out of
-/// ranking (Unix seconds). Bounded because the pool has no per-provider deadline to key the
-/// horizon on — the shared deposit outlives any single lane.
+/// ranking (seconds — a duration, not an epoch stamp; the map VALUE is the epoch second).
+/// Bounded because the pool has no per-provider deadline to key the horizon on — the shared
+/// deposit outlives any single lane.
 const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 
 /// What a voucher rejection tells us, and therefore what to do about it.
@@ -2993,6 +3029,95 @@ fn now_micros() -> u64 {
 mod tests {
     use super::*;
     use decdn_protocol::VoucherRejectReason;
+
+    /// The wedge is a FIXED [`WEDGED_PROVIDER_SUPPRESSION_SECS`] window measured from the
+    /// rejection, not a channel deadline — the buyer pool is shared across every provider and
+    /// carries no per-provider expiry to key one on. Round-trips the write and the read halves
+    /// so the horizon's DERIVATION is pinned, not just its comparison: nothing else in the
+    /// workspace distinguishes 3600s from any other future instant, because both integration
+    /// tests observe the wedge milliseconds after it is recorded.
+    ///
+    /// Fail-on-revert — each mutation run, with the assertion it actually trips:
+    /// - derive the horizon from anything but `WEDGED_PROVIDER_SUPPRESSION_SECS` in
+    ///   `record_wedged_at` → "the horizon is wedge time + the window";
+    /// - flip `retain`'s `>` to `>=`, or drop the `retain` entirely → both trip "the elapsed
+    ///   sibling must go in the same read", which reaches them before the boundary assertion
+    ///   does because a stale entry survives that prune either way;
+    /// - swap `insert` for `entry().or_insert()` → "a re-wedge must restart the window".
+    ///
+    /// The two map-state assertions pin what the booleans cannot: that the READ is what bounds
+    /// the map. There is deliberately no sweep task, so a prune that stopped happening would
+    /// leak an entry per wedged provider forever.
+    #[test]
+    fn a_wedge_lifts_when_its_fixed_suppression_window_elapses() {
+        let peer = DhtNodeId::from_bytes([7u8; 32]);
+        let other = DhtNodeId::from_bytes([9u8; 32]);
+        let wedged_at = 1_000_000u64;
+        let horizon = wedged_at + WEDGED_PROVIDER_SUPPRESSION_SECS;
+
+        // Inside the window: suppressed, and the entry survives the read.
+        let mut map = HashMap::new();
+        record_wedged_at(&mut map, peer, wedged_at);
+        assert_eq!(
+            map.get(&peer),
+            Some(&horizon),
+            "the horizon is wedge time + the window"
+        );
+        assert!(
+            prune_and_check_wedged(&mut map, &peer, horizon - 1),
+            "a provider must stay suppressed for the whole window"
+        );
+        assert_eq!(map.len(), 1, "an unexpired horizon must survive the prune");
+
+        // A live wedge is per-peer, and one read prunes every elapsed entry, not just the one
+        // asked about. `other` elapsed a second ago; `peer` has not.
+        record_wedged_at(&mut map, other, wedged_at - 1);
+        assert!(
+            prune_and_check_wedged(&mut map, &peer, horizon - 1),
+            "a live horizon must survive a prune that drops a sibling"
+        );
+        assert_eq!(map.len(), 1, "the elapsed sibling must go in the same read");
+        assert!(
+            !prune_and_check_wedged(&mut map, &other, horizon - 1),
+            "an elapsed peer must not inherit a live peer's suppression"
+        );
+
+        // ON the horizon second: rankable again, and the read pruned the entry.
+        let mut map = HashMap::new();
+        record_wedged_at(&mut map, peer, wedged_at);
+        assert!(
+            !prune_and_check_wedged(&mut map, &peer, horizon),
+            "the boundary is exclusive: rankable ON the second the window ends"
+        );
+        assert!(map.is_empty(), "an elapsed horizon must be pruned on read");
+
+        // A re-wedge restarts the window from the newer rejection rather than inheriting the
+        // older horizon — reachable whenever a lifted provider is ranked and wedges again.
+        let mut map = HashMap::new();
+        record_wedged_at(&mut map, peer, wedged_at);
+        record_wedged_at(&mut map, peer, wedged_at + 1_000);
+        assert!(
+            prune_and_check_wedged(&mut map, &peer, horizon),
+            "a re-wedge must restart the window, not inherit the older horizon"
+        );
+    }
+
+    /// The provider-wide window must outlive the per-`(peer, hash)` negative-cache entry the
+    /// same wedge writes. At or below it, `wedged_providers` buys nothing the negative cache
+    /// does not already give for the blob that wedged it, and the filter plus both integration
+    /// tests guarding it become dead weight while still passing green.
+    ///
+    /// Bounding a policy constant is in-convention in this module — see
+    /// `only_a_durable_refusal_earns_the_full_suppression_ttl`.
+    #[test]
+    fn the_provider_wide_window_outlives_the_per_hash_one() {
+        assert!(
+            WEDGED_PROVIDER_SUPPRESSION_SECS > REFUSAL_SUPPRESSION_TTL.as_secs(),
+            "the provider-wide window ({WEDGED_PROVIDER_SUPPRESSION_SECS}s) must outlive the \
+             per-(peer, hash) one ({}s), or the wedge filter buys nothing",
+            REFUSAL_SUPPRESSION_TTL.as_secs()
+        );
+    }
 
     #[test]
     fn region_penalty_only_for_same_region_slow_peer() {
