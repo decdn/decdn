@@ -399,8 +399,10 @@ pub struct DecdnMetrics {
     /// covered only the origin-held half — both the boot-time cold start
     /// and the lag sweep, which share one derivation. The seed degrades
     /// rather than failing, so nothing else surfaces this: blobs held only
-    /// in the store stay un-republished until a later sweep or a restart,
-    /// and on the boot path that is the whole process lifetime.
+    /// in the store stay un-republished until a later sweep re-walks the
+    /// store successfully, or until a restart. A boot-path failure is not
+    /// permanent — the next lag sweep recovers it — but nothing schedules
+    /// one, so a node with no further lag stays degraded for its lifetime.
     /// Operator-visible name:
     /// `decdn_dht_republish_seed_store_walk_failures_total`.
     pub dht_republish_seed_store_walk_failures: Counter,

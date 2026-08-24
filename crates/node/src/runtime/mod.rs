@@ -1753,7 +1753,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // Walk the on-disk store (NOT `access_times_snapshot`, which maps `Hash →
     // Instant` and is empty on every cold start) so every committed,
     // non-evicted blob gets a `uniform(0, 40 min)` republish entry per ADR
-    // 022 §Bootstrap AC 16. On a transient list-error we degrade: the
+    // 022 §Bootstrap AC 15. On a transient list-error we degrade: the
     // steady-state `subscribe_inserts` path catches only blobs newly fetched
     // post-boot — blobs already on disk that get cache-HIT requests are NOT
     // re-scheduled until the next successful restart.
@@ -1779,7 +1779,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         infra.node_metrics.dht_republish_seed_store_walk_failure();
         tracing::warn!(
             error = %err,
-            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 15 degraded)"
+            "cold-start store seed failed; blobs not re-fetched this session go un-republished until a later lag sweep re-walks the store, or until restart (ADR 022 §Bootstrap AC 15 degraded)"
         );
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
