@@ -10,6 +10,15 @@
 //!     new quota, swapping it in under an `RwLock`. Token-bucket state
 //!     is *not* preserved across the rebuild. `0` in any `security.*`
 //!     field disables that layer.
+//!   - the `[content]` denylist (`content.denied_hashes`,
+//!     `content.denied_origins`) — hot reload here is load-bearing, not a
+//!     convenience: ADR 011 sizes this mechanism to the one-hour removal
+//!     clock, so a takedown must never wait on a daemon restart.
+//!   - all of `[load_shed]` — the live `LoadShedController` swaps its
+//!     policy in place.
+//!
+//! This list is the authority; `NodeCommand::Reload`'s help text in
+//! `decdn-common` repeats it for operators, so extend both together.
 //!
 //! Any non-reloadable field the file carries gets a "requires restart"
 //! message (logged on presence, not on change) — the runtime would
