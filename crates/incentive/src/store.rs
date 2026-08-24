@@ -454,10 +454,16 @@ impl PendingSettleStore for MemoryPendingSettleStore {
 /// is un-redeemable, so it appears in no on-chain quantity and must be stored here.
 ///
 /// Implementations MUST commit durably (fsync, on disk-backed impls) before
-/// returning `Ok`, mirroring the [`PoolStateStore`] contract. The stored value is
-/// monotonic per pool by caller discipline; the store does not enforce it.
+/// returning `Ok`, mirroring the [`PoolStateStore`] contract. Implementations MUST
+/// also raise a pool's total monotonically: the callers are floor-reservation drops
+/// that each read their own cumulative total on their own blocking thread and can
+/// land out of order, so no caller can impose an ordering. A total at or below the
+/// stored one leaves the row unchanged. [`PoolFloorLossStore::forget_loss`] is the
+/// only downward transition, and it clears the row outright at pool close.
 pub trait PoolFloorLossStore: Send + Sync {
-    /// Persist the pool's cumulative dead-charge total, overwriting any prior value.
+    /// Raise the pool's cumulative dead-charge total to `micro_usdc`. A total at or
+    /// below the stored one is a no-op, so a late, smaller write cannot regress the
+    /// row and re-grant already-consumed free-floor budget.
     ///
     /// # Errors
     /// Returns [`StoreError`] if the durable write fails.
@@ -498,7 +504,10 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.insert(pool_id, micro_usdc);
+        // Monotonic raise, matching the redb store: out-of-order drops on one pool
+        // must not regress the total and re-grant consumed floor budget.
+        let stored = guard.entry(pool_id).or_insert(0u128);
+        *stored = (*stored).max(micro_usdc);
         Ok(())
     }
 
@@ -695,7 +704,7 @@ mod tests {
         let b = b256!("0000000000000000000000000000000000000000000000000000000000000022");
         store.record_loss(a, 400)?;
         store.record_loss(b, 4_000_000)?;
-        // Overwrite (monotonic advance is the caller's job; the store just stores).
+        // A higher total raises the stored value.
         store.record_loss(a, 800)?;
         let mut all = store.load_losses()?;
         all.sort_by_key(|(k, _)| *k);
@@ -705,6 +714,27 @@ mod tests {
         anyhow::ensure!(store.load_losses()?.len() == 1);
         // Forgetting an unknown pool is a no-op.
         store.forget_loss(a)?;
+        Ok(())
+    }
+
+    /// A late, smaller total — two floor-reservation drops on one pool landing out
+    /// of order — leaves the larger stored total in place, and `forget_loss` is the
+    /// only way back down.
+    #[test]
+    fn floor_loss_store_never_regresses() -> anyhow::Result<()> {
+        let store = MemoryPoolFloorLossStore::new();
+        let pool = b256!("0000000000000000000000000000000000000000000000000000000000000077");
+        store.record_loss(pool, 5_000)?;
+        store.record_loss(pool, 10)?;
+        anyhow::ensure!(store.load_losses()? == vec![(pool, 5_000u128)]);
+        store.record_loss(pool, 5_001)?;
+        anyhow::ensure!(store.load_losses()? == vec![(pool, 5_001u128)]);
+        store.forget_loss(pool)?;
+        store.record_loss(pool, 10)?;
+        anyhow::ensure!(
+            store.load_losses()? == vec![(pool, 10u128)],
+            "forget clears the row, so the next total starts fresh"
+        );
         Ok(())
     }
 }

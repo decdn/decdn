@@ -10,7 +10,7 @@
 //!   not a link: that module exists only under the `redb` feature, so
 //!   linking it would break a `buyer-store-core`-only doc build.)
 //! - `decdn-node`'s `pool_store::PersistentPoolStateStore` owns a combined
-//!   `pools.redb` holding the seller, buyer, pending-settle, and
+//!   `lanes.redb` holding the seller, buyer, pending-settle, and
 //!   watcher-checkpoint tables — one file, because `redb` forbids two
 //!   `Database` handles on the same file.
 //!
@@ -37,7 +37,7 @@ use crate::store::StoreError;
 ///
 /// **The whole thing is a frozen on-disk identifier**, and it is
 /// deliberately private and non-configurable. Changing the name orphans
-/// every existing record in both the node's `pools.redb` and the client's
+/// every existing record in both the node's `lanes.redb` and the client's
 /// `buyer-pools.redb`; changing the key/value types breaks them harder
 /// still, because `redb` persists key/value *type names* in the table
 /// metadata and refuses to open a table whose types don't match — at
@@ -864,7 +864,7 @@ mod tests {
         anyhow::ensure!(
             hex == GOLDEN_RECORD_HEX,
             "the buyer record's on-disk encoding changed — this orphans every existing record in \
-             both `pools.redb` and `buyer-pools.redb`.\n  got:  {hex}\n  want: {GOLDEN_RECORD_HEX}",
+             both `lanes.redb` and `buyer-pools.redb`.\n  got:  {hex}\n  want: {GOLDEN_RECORD_HEX}",
         );
         Ok(())
     }

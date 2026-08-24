@@ -541,6 +541,19 @@ since project inception and will roll into the first tagged release.
 
 #### Payments
 
+- **`PoolFloorLossStore` enforces its monotonic contract, and a no-op write no
+  longer fsyncs.** The trait doc stated that a pool's dead charge was monotonic
+  "by caller discipline", but the callers are floor-reservation drops that each
+  read their own cumulative total on their own blocking thread, so no caller can
+  impose an ordering — and the redb store already clamped while the in-memory
+  store overwrote, leaving tests written against the memory store unrepresentative
+  of what ships. Both impls now raise the stored total and never lower it, with
+  `forget_loss` the only downward transition. The redb store resolves the row
+  through one `redb::Table::entry` lookup and drops the transaction instead of
+  committing when the total does not advance, so a late, smaller write costs no
+  fsync — this table shares one file with the lane table, where an unconditional
+  commit contended with the periodic voucher flush.
+
 - **A cooperative close now reconciles when the client's watermark lags the
   node's (#1495).** `decdn channel coop-close`
   refuses any provider tuple above what the client persisted — correctly, since
@@ -831,6 +844,18 @@ since project inception and will roll into the first tagged release.
   longer exists. Retained here only so the issue number resolves.
 
 ### Changed
+
+- **The node flushes lane writes to redb in table-key order, and the workspace
+  floor moves to `redb = "4.2"`.** `flush` drains a `HashSet` of dirty lanes, so
+  the batch reached redb in an order randomized per process. Sorting it by the
+  `pool_id ‖ signer ‖ provider` table key first lets the insert loop append
+  rightward through the B-tree instead of splitting a page per key: the
+  `lane_state_v1` table holds about half as many pages and the full-table scan at
+  the next open runs sequentially. The `4.2` floor is load-bearing rather than
+  cosmetic — 4.2 is the first release that walks a large ascending batch inside
+  one transaction without panicking on a leaf page that fills through in-place
+  appends, and `redb = "4"` would let a lockfile regeneration resolve back below
+  it. Tombstones sort alongside the writes, so a flush is fully deterministic.
 
 - **config: `cache.max_blob_size_mb` now defaults to `cache.cache_size_mb`
   instead of a fixed 1 GiB.** The old memory-era default refused a blob a node's

@@ -263,7 +263,10 @@ jsonrpsee = { version = "0.26", features = ["server", "http-client", "macros"] }
 # Embedded persistent KV (used by `node` to fence voucher replay across
 # restarts — issue #527 / ADR 003 §Off-chain voucher state persistence).
 # Pure-Rust, ACID, single-file, fsync on commit via `Durability::Immediate`.
-redb = "4"
+# 4.2 floor: `channel_store::flush` commits a whole batch in ascending key order
+# inside one transaction, and 4.2 is the first release that walks that path
+# without panicking on a leaf page that fills through in-place appends.
+redb = "4.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
