@@ -112,7 +112,7 @@ sequenceDiagram
     alt ok = true
         P->>D: Voucher {sig, amt, chain_root, chunk_price} (opens the chain)
         loop Every chunk_bytes (1 MiB)
-            D->>P: ChunkData {bytes} (1024-byte chunks)
+            D->>P: ChunkData {bytes} (sender-sized frames)
             P->>D: ChunkPreimage {preimage, index}
         end
         P->>D: Voucher {sig, amt, chain_root: 0, chunk_price} (closing amount-voucher)
@@ -407,7 +407,7 @@ AwaitingResponse ──StreamResponse{ok: true}──► Streaming
 **Transition rules:**
 
 - **Proof-before-response:** Receiving a `Voucher` or a `ChunkPreimage` on a stream that has not yet received its own `StreamResponse` is a protocol error; that stream MUST be closed. Proofs on other streams sharing the same lane are unaffected — the rule is per-stream, not per-lane.
-- **Partial final chunk:** The last `ChunkData` before `StreamEnd` MAY be smaller than 1,024 bytes. Receivers MUST accept partial chunks at stream end.
+- **Frame size:** A `ChunkData` payload carries at least 1 byte. The sender chooses the length, up to the `MAX_MESSAGE_SIZE` framing cap ([ADR 013](013-schema-evolution.md#adr-013-schema-evolution)). Frames are not uniform and receivers MUST accept any non-empty length, including a shorter frame at stream end. Nothing on the wire carries the choice. A sender MUST NOT let one frame cross a `CHUNK_BYTES` boundary: both sides meter the same frame sequence, and a straddling frame moves the payer past the boundary, which settles as a signed residual voucher in place of the hash-chain preimage.
 - **Non-empty chunk:** A `ChunkData` MUST carry at least one byte. "Partial" permits a *smaller* final chunk, never an *empty* one: senders MUST NOT emit a zero-length `ChunkData` (a blob with no bytes goes straight to `StreamEnd`), and receivers MUST reject one as a protocol error rather than ignoring it. The floor is what makes every frame a unit of progress — an empty frame advances neither the receiver's cumulative byte count nor its voucher accounting, so an unbounded run of them would drive a receive loop without delivering anything, never tripping the overrun guard. Requesters bound the streaming stage by *inactivity*, and that bound is sound only because "a frame arrived" and "bytes made progress" are the same statement; without the floor a peer could hold the deadline open indefinitely with padding, and a stalled-peer signal that can be spoofed cannot be allowed to affect reputation.
 - **Payment pacing:** The node pauses delivery when outstanding (unproved) bytes exceed its [credit window](003-payments.md#credit-window), floored at one `CHUNK_BYTES` (1 MiB). Delivery resumes when the client sends a proof covering the outstanding balance — a `ChunkPreimage` for whole chunks, or a `Voucher` that advances the anchor.
 
@@ -444,7 +444,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 
 - Probe RTT includes iroh's NAT traversal overhead on first connection, inflating the latency estimate. Reusing existing connections for probes gives a cleaner signal.
 - A node under load can respond to probes quickly but deliver slowly — probe RTT is necessary but not sufficient. Reputation (a separate system) provides the longer-term signal.
-- The `cdn/client/v1` payment quantum (1 MiB) is coarser than iroh-blobs' internal chunk granularity (1024 bytes); payment and transfer layers operate at different tick rates, requiring a buffering layer between them
+- Wire frame size is a node-local choice, so two nodes serving the same blob can frame it differently. This is sound because the bao codec verifies chunk groups independently of frame boundaries ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)) and the payment meter counts bytes, not frames. The cost is that a serve path must buffer to its target size before it can emit a frame
 - `ChunkPreimage` is a new `ClientMessage` variant, so adding it renumbers the variant tail. Pre-deployment this is a straight in-place change with no compatibility shim ([ADR 013](013-schema-evolution.md#adr-013-schema-evolution)); after the first deployment the same change would be Tier-3 and require `cdn/client/v2`
 - Concurrent streams sharing a `pool_id` require the payer to maintain a single aggregate byte counter, one hash chain, and one signing task per lane; per-stream independence is lost for payment tracking
 - The delivering node enforces the credit-window threshold across all streams collectively — a slow proof on one stream pauses all streams on that lane

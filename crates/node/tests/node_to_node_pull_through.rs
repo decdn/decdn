@@ -646,10 +646,10 @@ async fn lying_upstream(
     };
     write_client_msg(&mut send, &ClientMessage::StreamResponse(resp)).await?;
 
-    // The wrong bytes, streamed in `CHUNK_SIZE` chunks like the real handler (the
-    // requester rejects any chunk over the ceiling). `served` stays under one
+    // The wrong bytes, streamed in 1 KiB frames — a sender's own choice, since the
+    // requester accepts any non-empty frame. `served` stays under one payment
     // chunk, so exactly one closing voucher flows.
-    for chunk in served.chunks(decdn_protocol::CHUNK_SIZE) {
+    for chunk in served.chunks(1024) {
         write_client_msg(
             &mut send,
             &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),

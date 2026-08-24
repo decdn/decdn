@@ -868,6 +868,17 @@ pub struct PaymentConfig {
     /// (2). `0` opens the full ceiling immediately, reproducing the flat-window
     /// behavior. It is node-local config, not a governance-owned parameter.
     pub credit_ramp_divisor: Option<u64>,
+    /// Target wire-frame size for the serve path, in bytes (ADR 005
+    /// §`cdn/client/v1`). Absent => [`crate::config::DEFAULT_FRAME_TARGET_BYTES`]
+    /// (1 MiB). Must be > 0.
+    ///
+    /// Node-local policy that is never negotiated: no message carries it, the payer
+    /// accepts any non-empty frame, and both bao verification and the payment meter
+    /// are defined over byte counts rather than frame boundaries. Raising it lowers
+    /// per-frame CPU per byte served; the effective ceiling is the framing layer's
+    /// 16 MiB `MAX_MESSAGE_SIZE`. The serve loop clamps each frame to the credit
+    /// window's remaining room, so a large value does not widen credit exposure.
+    pub frame_target_bytes: Option<decdn_config_types::Bytes>,
     /// Background flush period for the lane store, in ms. See
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.
     pub voucher_commit_interval_ms: Option<u64>,

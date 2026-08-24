@@ -1291,6 +1291,7 @@ async fn build_chain_and_handlers(
     client_deps.pull_through_origin = pull_through_origin;
     // Downstream credit-window ramp (ADR 003 §Credit window, #1477, #1669).
     client_deps.credit_max = cfg.payment.credit_max;
+    client_deps.frame_target_bytes = cfg.payment.frame_target_bytes;
     client_deps.credit_ramp_divisor = cfg.payment.credit_ramp_divisor;
     // Hint the settlement service on each accepted voucher so a lane's accrued
     // claim is planned into a chunk promptly rather than waiting the self-tick.
@@ -3859,6 +3860,7 @@ mod tests {
                 rate_per_mb: 10,
                 delivery_floor: 0,
                 credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
+                frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
                 credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
                 voucher_commit_interval_ms:
                     decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,

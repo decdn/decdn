@@ -40,9 +40,9 @@ use decdn_client_pull::sink::content_paid_frontier;
 use super::MAX_PROOFS_PER_CHUNK;
 use super::voucher::StreamAnchor;
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, ChunkData, ClientHandler, ClientMessage,
-    FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream,
-    U256, VecDeque, VoucherRejectReason, VoucherStop,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
+    Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256, VecDeque,
+    VoucherRejectReason, VoucherStop, encode_chunk_frame,
 };
 
 impl ClientHandler {
@@ -98,7 +98,6 @@ impl ClientHandler {
         offset: u64,
         len: u64,
         total_bytes: u64,
-        window: u64,
         floor_reservation: Option<&FloorReservation>,
     ) -> anyhow::Result<()> {
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
@@ -111,9 +110,6 @@ impl ClientHandler {
         let offset = offset.min(end);
 
         let chunk_bytes = CHUNK_BYTES;
-        // Backpressure bound, floored at one chunk so the loop can always make
-        // progress (deliver a full chunk, then recoup the proof that pays it).
-        let window = window.max(chunk_bytes);
 
         // The in-flight takedown re-check (ADR 011) keys on the pool FUNDER (the
         // pool owner, `getPool.owner`), resolved from the cached pool-view. `None`
@@ -155,7 +151,10 @@ impl ClientHandler {
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.
-        let mut next_chunk = producer.next_frame().await?;
+        let opening_window = self.credit_window(chunk_bytes, 0);
+        let mut next_chunk = producer
+            .next_frame(self.frame_target(0, chunk_bytes, opening_window))
+            .await?;
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
         // 003 §Pool solvency). Start the clock at loop entry — admission already
@@ -172,6 +171,12 @@ impl ClientHandler {
             let delivered_at_iter_start = delivered;
             let mut credited_this_iter = 0u64;
 
+            // The ramped window for the payment confirmed so far (ADR 003 §Credit
+            // window), recomputed each iteration exactly as the cache-hit twin in
+            // `deliver` does. Floored at one chunk so the loop can always make
+            // progress: deliver a full chunk, then recoup the proof that pays it.
+            let window = self.credit_window(chunk_bytes, paid);
+
             // --- deliver phase: stream frames while the window has room. Checked
             // BEFORE each send, so `delivered − paid` overshoots by at most the one
             // frame that crosses the threshold. ---
@@ -183,15 +188,12 @@ impl ClientHandler {
                     break;
                 };
                 let clen = chunk.len() as u64;
-                let frame = ChunkData::new(chunk.to_vec())
+                let payload = encode_chunk_frame(&chunk)
                     .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
                 // A downstream drop surfaces here as `Err` (#856 client-disconnect
                 // shape); meter the client-abandon, then propagate so the caller drops
                 // the pull leg.
-                if let Err(e) = self
-                    .write_message(send, &ClientMessage::ChunkData(frame))
-                    .await
-                {
+                if let Err(e) = self.write_payload(send, &payload).await {
                     self.metrics.node_pull_through_client_abandoned();
                     return Err(e);
                 }
@@ -202,7 +204,14 @@ impl ClientHandler {
                     pending.push_back(unvouchered);
                     unvouchered = 0;
                 }
-                next_chunk = producer.next_frame().await?;
+                // Prefetched one pass ahead of the window check; size it against what
+                // remains after this send (see the twin in `deliver`). The room cap is
+                // what keeps this from parking on upstream bytes that this loop must
+                // exit to recoup before they can be pulled.
+                let room = window.saturating_sub(delivered.saturating_sub(paid));
+                next_chunk = producer
+                    .next_frame(self.frame_target(unvouchered, chunk_bytes, room))
+                    .await?;
             }
             let done_delivering = next_chunk.is_none();
 

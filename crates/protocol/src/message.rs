@@ -142,12 +142,6 @@ pub enum MessageValidationError {
         "ChunkData carries a zero-length payload (ADR 005: a chunk must carry at least 1 byte)"
     )]
     EmptyChunk,
-    /// A [`crate::client::ChunkData`] payload exceeds [`crate::CHUNK_SIZE`].
-    /// The ceiling bounds receiver allocation per frame (ADR 005
-    /// §`cdn/client/v1`). Enforced by [`crate::client::ChunkData::new`] and the
-    /// `try_from` decode gate, as above.
-    #[error("ChunkData payload of {len} bytes exceeds CHUNK_SIZE ({max})", max = crate::CHUNK_SIZE)]
-    ChunkTooLarge { len: usize },
     /// A wire [`crate::client::WireCapability`]'s `owner_signature` is empty.
     /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
     /// ERC-1271 contract-signer form may be longer, so only the non-empty

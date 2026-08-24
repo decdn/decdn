@@ -41,13 +41,6 @@ use serde::{Deserialize, Serialize};
 use crate::identity::NodeId;
 use crate::message::{MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 
-/// Exact byte length of a `ChunkData` payload, except the final chunk which MAY
-/// be smaller (ADR 005 §`cdn/client/v1`, §Partial final chunk). Matches
-/// iroh-blobs' internal 1024-byte chunk granularity; the payment quantum
-/// ([`CHUNK_BYTES`]) is coarser, so a buffering layer sits between the payment
-/// and transfer tick rates (ADR 005 §Tradeoffs).
-pub const CHUNK_SIZE: usize = 1024;
-
 /// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
 /// of `rate_per_mb` and, by the identity below, of [`CHUNK_BYTES`].
 pub const MB_BYTES: u64 = 1_048_576;
@@ -493,9 +486,17 @@ impl StreamResponse {
     }
 }
 
-/// Node → payer chunk of blob bytes. Payload is at least 1 and at most
-/// [`CHUNK_SIZE`] bytes; the final chunk before [`ClientMessage::StreamEnd`] MAY
-/// be smaller and receivers MUST accept it (ADR 005 §Partial final chunk).
+/// Node → payer chunk of blob bytes. The payload carries at least one byte; its
+/// length is the sender's choice, bounded above only by the framing layer's
+/// [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE) (ADR 005
+/// §`cdn/client/v1`). Frames need not be uniform, and the frame before
+/// [`ClientMessage::StreamEnd`] is commonly shorter than the ones before it.
+///
+/// Frame size is independent of both verification and payment. The bao codec is
+/// the sole verifier and resolves chunk-group boundaries itself (ADR 038), and
+/// the payment meter ticks on cumulative bytes crossing [`CHUNK_BYTES`] rather
+/// than on frames. A sender therefore picks whatever size suits it; nothing is
+/// negotiated and no message carries the choice.
 ///
 /// The lower bound is load-bearing, not cosmetic (#1088). "Partial final chunk"
 /// permits a *smaller* frame, never an *empty* one: an empty frame carries no
@@ -521,22 +522,21 @@ impl StreamResponse {
 /// receive loop remembering to call it and every emitter avoiding an empty frame — and
 /// the serve side avoids one only *incidentally*, differently on each path:
 ///
-/// - The **buffered** path chunks its payload with `slice::chunks`, which yields no
-///   items for an empty slice. So even the empty blob (whose bao encoding is zero
-///   bytes — see `decdn_bao_range::align_range`) goes straight to
-///   [`ClientMessage::StreamEnd`] rather than sending an empty frame first (#1054).
-/// - The **window-paced** path (#856) forwards upstream frames verbatim and does no
-///   re-chunking, so it inherits the guarantee rather than establishing it.
+/// each serve path coalesces its byte stream into frames and emits whatever has
+/// accumulated, so an empty frame is avoided only because an exhausted stream yields
+/// nothing to emit. The empty blob (whose bao encoding is zero bytes — see
+/// `decdn_bao_range::align_range`) reaches [`ClientMessage::StreamEnd`] the same way,
+/// with no frame sent first (#1054).
 ///
-/// Both facts are true, both are about unrelated code, and either could change without
-/// anyone noticing which invariant they had just removed — while the reputation system
+/// That is a fact about unrelated code, and it could change without anyone noticing
+/// which invariant they had just removed — while the reputation system
 /// depends on it, since a false `PullStalled` scores an honest peer as unreachable. That
 /// is too much weight for a convention, so the type carries the floor instead: the field
 /// is private and both doors reject an empty payload, so it cannot be skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ChunkDataWire")]
 pub struct ChunkData {
-    /// Sequential blob bytes (1..=[`CHUNK_SIZE`]). Private: see the type's docs — this
+    /// Sequential blob bytes, at least one. Private: see the type's docs — this
     /// is the invariant the inactivity deadline and, through it, `PullStalled` rest on.
     bytes: Vec<u8>,
 }
@@ -558,24 +558,23 @@ impl TryFrom<ChunkDataWire> for ChunkData {
 }
 
 impl ChunkData {
-    /// The only constructor. Enforces the payload bounds: non-empty and within
-    /// [`CHUNK_SIZE`].
+    /// The only constructor. Enforces the payload floor: non-empty.
+    ///
+    /// There is no ceiling here. An oversized frame is refused by the framing
+    /// layer against [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE),
+    /// which is the bound that runs before the receiver allocates.
     ///
     /// # Errors
     ///
-    /// [`MessageValidationError::EmptyChunk`] for a zero-length payload;
-    /// [`MessageValidationError::ChunkTooLarge`] above the ceiling.
+    /// [`MessageValidationError::EmptyChunk`] for a zero-length payload.
     pub fn new(bytes: Vec<u8>) -> Result<Self, MessageValidationError> {
         if bytes.is_empty() {
             return Err(MessageValidationError::EmptyChunk);
         }
-        if bytes.len() > CHUNK_SIZE {
-            return Err(MessageValidationError::ChunkTooLarge { len: bytes.len() });
-        }
         Ok(Self { bytes })
     }
 
-    /// The payload. Non-empty and within [`CHUNK_SIZE`] by construction.
+    /// The payload. Non-empty by construction.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -602,19 +601,62 @@ impl ChunkData {
     ///
     /// # Errors
     ///
-    /// [`MessageValidationError::EmptyChunk`] / [`MessageValidationError::ChunkTooLarge`],
-    /// neither of which a constructed frame can produce.
+    /// [`MessageValidationError::EmptyChunk`], which a constructed frame cannot produce.
     pub(crate) const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.bytes.is_empty() {
             return Err(MessageValidationError::EmptyChunk);
         }
-        if self.bytes.len() > CHUNK_SIZE {
-            return Err(MessageValidationError::ChunkTooLarge {
-                len: self.bytes.len(),
-            });
-        }
         Ok(())
     }
+}
+
+/// The `ClientMessage::ChunkData` discriminant, as postcard writes it: the
+/// declaration index, varint-encoded, which is one byte for indices 0..=127.
+/// Pinned by `client_message_discriminants_are_frozen`.
+const CHUNK_DATA_DISCRIMINANT: u8 = 2;
+
+/// Encode one [`ClientMessage::ChunkData`] frame body directly from its payload.
+///
+/// Byte-identical to `encode_message(&ClientMessage::ChunkData(ChunkData::new(payload)?))`
+/// — pinned by `encode_chunk_frame_matches_the_generic_encoder` — but it copies the
+/// payload once instead of twice. The generic path owns the bytes to build the frame
+/// (`Vec<u8>`) and postcard copies them again into its output buffer; the delivery loop
+/// holds its payload as a borrowed slice off the framer's buffer and has no use for the
+/// intermediate value.
+///
+/// This is the serve hot path: one call per wire frame, so the saved copy scales with
+/// everything the node egresses.
+///
+/// The non-empty floor is checked here rather than inherited from [`ChunkData::new`],
+/// since no [`ChunkData`] is built. That keeps the ADR 005 §Non-empty chunk invariant
+/// true of every frame this crate can emit, by either door.
+///
+/// # Errors
+///
+/// [`MessageValidationError::EmptyChunk`] for a zero-length payload.
+pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationError> {
+    if payload.is_empty() {
+        return Err(MessageValidationError::EmptyChunk);
+    }
+    // Discriminant, then the `Vec<u8>` field's postcard length prefix, then the
+    // bytes. Postcard writes a sequence length as a LEB128 varint: seven bits per
+    // byte, low group first, high bit set on every byte but the last.
+    let mut out = Vec::with_capacity(1 + 5 + payload.len());
+    out.push(CHUNK_DATA_DISCRIMINANT);
+    let mut len = payload.len();
+    loop {
+        let mut byte = u8::try_from(len & 0x7F).unwrap_or(0);
+        len >>= 7;
+        if len != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if len == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(payload);
+    Ok(out)
 }
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
@@ -1215,7 +1257,7 @@ mod tests {
 
     #[test]
     fn chunk_data_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        let chunk = ChunkData::new(vec![0x42u8; CHUNK_SIZE])?;
+        let chunk = ChunkData::new(vec![0x42u8; 4096])?;
         let bytes = postcard::to_allocvec(&chunk)?;
         let decoded: ChunkData = postcard::from_bytes(&bytes)?;
         assert_eq!(chunk, decoded);
@@ -1666,22 +1708,75 @@ mod tests {
     }
 
     #[test]
-    fn chunk_data_new_is_the_only_way_in_and_it_enforces_both_bounds() {
-        // The floor is what makes every frame a unit of progress (#1088); the ceiling
-        // bounds per-frame allocation. A 1-byte and a full-size chunk are both legal —
-        // "partial final chunk" means smaller, not empty.
+    fn chunk_data_new_is_the_only_way_in_and_it_enforces_the_floor() {
+        // The floor is what makes every frame a unit of progress (#1088). There is no
+        // ceiling: frame size is the sender's choice, bounded above by the framing
+        // layer's MAX_MESSAGE_SIZE, which runs before the receiver allocates.
         assert_eq!(
             ChunkData::new(Vec::new()),
             Err(MessageValidationError::EmptyChunk)
         );
-        assert_eq!(
-            ChunkData::new(vec![0u8; CHUNK_SIZE + 1]),
-            Err(MessageValidationError::ChunkTooLarge {
-                len: CHUNK_SIZE + 1
-            })
-        );
         assert!(ChunkData::new(vec![0u8]).is_ok());
-        assert!(ChunkData::new(vec![0u8; CHUNK_SIZE]).is_ok());
+        assert!(ChunkData::new(vec![0u8; 1024]).is_ok());
+        assert!(ChunkData::new(vec![0u8; 1024 * 1024]).is_ok());
+    }
+
+    #[test]
+    fn encode_chunk_frame_matches_the_generic_encoder() -> Result<(), Box<dyn std::error::Error>> {
+        // The delivery loop encodes frames with `encode_chunk_frame` to skip one copy,
+        // so it bypasses `ChunkData` and postcard entirely. That is only sound while the
+        // two produce the same bytes. Sizes straddle every varint width boundary of the
+        // length prefix: 1 byte below 128, 2 below 16384, 3 above it.
+        for len in [
+            1usize,
+            2,
+            127,
+            128,
+            129,
+            16_383,
+            16_384,
+            16_385,
+            1024,
+            1024 * 1024,
+        ] {
+            let payload = vec![0xABu8; len];
+            let via_helper = crate::client::encode_chunk_frame(&payload)?;
+            let via_postcard = crate::framing::encode_message(&ClientMessage::ChunkData(
+                ChunkData::new(payload.clone())?,
+            ))?;
+            assert_eq!(
+                via_helper, via_postcard,
+                "encode_chunk_frame diverged from the generic encoder at len {len}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn encode_chunk_frame_golden_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        // An exact-byte pin, independent of both encoders: discriminant 2, then the
+        // payload's postcard length varint, then the payload. If postcard ever changed
+        // its sequence-length encoding, the agreement test above would still pass while
+        // the wire silently moved; this catches that.
+        assert_eq!(
+            crate::client::encode_chunk_frame(&[0xDE, 0xAD, 0xBE, 0xEF])?,
+            vec![0x02, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        // 300 bytes: length 300 = 0b100_101100 → varint [0xAC, 0x02].
+        let big = crate::client::encode_chunk_frame(&[0x11u8; 300])?;
+        assert_eq!(big.get(..3), Some(&[0x02, 0xAC, 0x02][..]));
+        assert_eq!(big.len(), 3 + 300);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_chunk_frame_rejects_an_empty_payload() {
+        // The floor moved off `ChunkData::new` for this path, so it needs its own pin:
+        // ADR 005 §Non-empty chunk must hold for every frame the crate can emit.
+        assert_eq!(
+            crate::client::encode_chunk_frame(&[]),
+            Err(MessageValidationError::EmptyChunk)
+        );
     }
 
     #[test]
@@ -1692,7 +1787,7 @@ mod tests {
         // assertion worth making: if this ever returns `Err`, some construction path has
         // gone around the constructor.
         assert_eq!(ChunkData::new(vec![0u8])?.validate(), Ok(()));
-        assert_eq!(ChunkData::new(vec![0u8; CHUNK_SIZE])?.validate(), Ok(()));
+        assert_eq!(ChunkData::new(vec![0u8; 1024 * 1024])?.validate(), Ok(()));
         Ok(())
     }
 

@@ -400,6 +400,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             },
         },
         payment: ResolvedPayment {
+            frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             rate_per_mb: 10,
             delivery_floor: 0,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,

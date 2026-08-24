@@ -113,11 +113,11 @@ impl decdn_protocol::client::WireCapability
 pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_BYTES: u64
-pub const decdn_protocol::client::CHUNK_SIZE: usize
 pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
+pub fn decdn_protocol::client::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::client::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
 pub mod decdn_protocol::dht
@@ -218,8 +218,6 @@ pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
 pub const decdn_protocol::identity::ID_LEN: usize
 pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
-pub decdn_protocol::message::MessageValidationError::ChunkTooLarge
-pub decdn_protocol::message::MessageValidationError::ChunkTooLarge::len: usize
 pub decdn_protocol::message::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::message::MessageValidationError::EmptyChunk
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
@@ -307,8 +305,6 @@ pub decdn_protocol::FrameError::Io(std::io::error::Error)
 pub decdn_protocol::FrameError::TooLarge(u32)
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::MessageValidationError
-pub decdn_protocol::MessageValidationError::ChunkTooLarge
-pub decdn_protocol::MessageValidationError::ChunkTooLarge::len: usize
 pub decdn_protocol::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::MessageValidationError::EmptyChunk
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
@@ -506,7 +502,6 @@ pub const decdn_protocol::ALPN_PROBE: &[u8]
 pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_BYTES: u64
-pub const decdn_protocol::CHUNK_SIZE: usize
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::MAX_CHAIN_LENGTH: u8
@@ -526,6 +521,7 @@ pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
+pub fn decdn_protocol::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool

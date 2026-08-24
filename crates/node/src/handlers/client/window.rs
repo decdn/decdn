@@ -376,7 +376,6 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                credit_floor,
                 floor_reservation.as_ref(),
             )
             .await;
@@ -678,7 +677,6 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                credit_floor,
                 floor_reservation.as_ref(),
             )
             .await;

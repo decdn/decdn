@@ -32,7 +32,6 @@ use bao_tree::io::fsm::encode_ranges_validated;
 use bytes::{Bytes, BytesMut};
 use decdn_bao_range::{RangedStore, align_range};
 use decdn_cache::{FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
-use decdn_protocol::CHUNK_SIZE;
 use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{Notify, mpsc};
@@ -227,7 +226,7 @@ impl AsyncStreamWriter for ChannelWriter {
     }
 }
 
-/// Drives the coherent whole-range encode and re-cuts its output into `CHUNK_SIZE`
+/// Drives the coherent whole-range encode and coalesces its output into wire
 /// frames. [`Self::next_frame`] yields the next
 /// wire frame, `None` once the whole range is delivered, `Err` on an encode fault
 /// (a gap the pull could not fill, or a proof/verify error) — on which the serve
@@ -283,12 +282,15 @@ impl CoherentFrameProducer {
         }
     }
 
-    /// The next `CHUNK_SIZE` wire frame (or the shorter final remainder), `None`
-    /// once the whole range is delivered.
-    pub(super) async fn next_frame(&mut self) -> anyhow::Result<Option<Bytes>> {
+    /// The next wire frame of up to `target` bytes (or the shorter final remainder),
+    /// `None` once the whole range is delivered.
+    ///
+    /// `target` is per-call for the same reason as its twin on the cache-hit path: the
+    /// serve loop clamps it to the credit window's remaining room.
+    pub(super) async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
         loop {
-            if self.frame_buf.len() >= CHUNK_SIZE {
-                let take = self.frame_buf.len().min(CHUNK_SIZE);
+            if self.frame_buf.len() >= target {
+                let take = self.frame_buf.len().min(target);
                 return Ok(Some(self.frame_buf.split_to(take).freeze()));
             }
             if let Some(bytes) = self.pump().await? {
@@ -435,7 +437,7 @@ mod tests {
     /// Drain a producer's frames to one byte vector.
     async fn drain(mut producer: CoherentFrameProducer) -> anyhow::Result<Vec<u8>> {
         let mut out = Vec::new();
-        while let Some(frame) = producer.next_frame().await? {
+        while let Some(frame) = producer.next_frame(1024).await? {
             out.extend_from_slice(&frame);
         }
         Ok(out)

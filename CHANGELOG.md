@@ -28,6 +28,26 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`cdn/client/v1`: `ChunkData` frame size is now the sender's choice.** The
+  protocol bounded a payload at 1,024 bytes; it now bounds it only as non-empty,
+  with the framing layer's 16 MiB `MAX_MESSAGE_SIZE` as the effective ceiling.
+  `decdn_protocol::CHUNK_SIZE` and `MessageValidationError::ChunkTooLarge` are
+  removed. A serving node coalesces to `payment.frame_target_bytes` (new, default
+  1 MiB) instead of chopping at 1 KiB, so a served MiB costs about one frame
+  rather than 1,024 — the per-frame validate/copy/encode/write cost per byte
+  served drops by the same factor. The 1,024-byte value was vestigial: it tracked
+  iroh-blobs' internal granularity, which ADR 038 superseded with 16 KiB bao chunk
+  groups verified independently of frame boundaries.
+  - Wire-breaking in the new-sender-to-old-receiver direction: an old receiver
+    rejects an oversized frame. Both sides change here, per the pre-launch policy.
+  - A frame never crosses a `CHUNK_BYTES` payment boundary. The old 1 KiB size got
+    that property for free (1,024 divides 1 MiB); at any other size it has to be
+    arranged, or the payer settles residuals with a signed voucher per frame
+    instead of releasing one hash-chain preimage per interval.
+  - New config key `payment.frame_target_bytes` (restart-required, like the rest
+    of `[payment]`). Node-local and never negotiated: nothing on the wire carries
+    it, and the serve loop clamps each frame to the credit window's remaining room.
+
 - **Container image renamed to `decdn-node`, and now published to Docker Hub as
   well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
   the same image is published as `decdn/decdn-node` on Docker Hub. The image
@@ -538,6 +558,14 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **node: the cache-miss serve leg now re-ramps its credit window.** `serve_leg`
+  resolved the window once before its delivery loop and never recomputed it, so a
+  stream served through a miss stayed pinned at the one-chunk ramp floor however
+  much the client paid — strict stop-and-wait, one chunk per round trip, while the
+  cache-hit path ramped toward `payment.credit_max` for the same client. It now
+  recomputes per iteration exactly as the hit path does. Throughput only; the
+  window bound itself was never exceeded.
 
 #### Payments
 

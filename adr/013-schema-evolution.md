@@ -26,7 +26,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. The cap is global, not per-ALPN: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
+The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. The cap is global, not per-ALPN: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB. `ChunkData` is the one message sized to the cap rather than far below it, so a lower local `MAX_MESSAGE_SIZE` bounds frame size directly.
 
 The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
@@ -61,7 +61,7 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 #### `ChunkData` exemption
 
-`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the payment quantum. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` and `ChunkPreimage` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
+`ChunkData` payloads are sender-sized blob chunks ([ADR 005](005-protocol.md#adr-005-wire-protocol)), so unlike every other message on the ALPN their length is not implied by the message type. They MUST use varint-length framing — it is what delimits one payload from the next, and the receiver must also distinguish `ChunkData` from `Voucher` and `ChunkPreimage` on the same stream via the protocol enum discriminant. `MAX_MESSAGE_SIZE` is the only ceiling on a payload, and it is enforced before allocation.
 
 ### Protocol Enums
 
@@ -329,7 +329,7 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 ### Negative
 
-- Varint length prefix adds 1–5 bytes per message. For `ChunkData` (1024-byte payload), ~0.2% including the enum discriminant; for `ProbeRequest` (~40 bytes), ~5%. Both negligible
+- Varint length prefix adds 1–5 bytes per message. Negligible against a `ChunkData` payload, which a sender sizes at up to `MAX_MESSAGE_SIZE`; ~5% on a `ProbeRequest` (~40 bytes), which is small in absolute terms
 - `take_from_bytes` is marginally slower than `from_bytes` (tracks consumed position); negligible for this protocol's message sizes (sub-microsecond)
 - Minor evolution can accumulate "dead weight" — added fields no longer useful, with no removal mechanism short of a major version bump. Unlikely to matter at this protocol's message sizes
 - Signed field freezing means even minor improvements to signed structs (e.g., adding a field to `ProbeResponse`'s signed set) require a full ALPN version bump. Conservative by design — the unsigned outer fields pattern mitigates this for fields that need not be signed

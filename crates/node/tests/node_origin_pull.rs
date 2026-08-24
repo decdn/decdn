@@ -52,8 +52,8 @@ use decdn_protocol::client::{
 };
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, CHUNK_SIZE, ContentHash, MB_BYTES, ProbeMessage,
-    decode_message, encode_message, encode_stream_request, read_frame, write_frame,
+    ALPN_CLIENT, ALPN_PROBE, CHUNK_BYTES, ContentHash, MB_BYTES, ProbeMessage, decode_message,
+    encode_message, encode_stream_request, read_frame, write_frame,
 };
 use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
@@ -64,6 +64,14 @@ use support::{
     HandlerDomains, build_handler_full, build_handler_full_configured, cache_with_blob,
     empty_cache, fresh_key, local_endpoint, permissive_limiter, shutdown, spawn_server,
 };
+
+/// Frame size these hostile-server fixtures cut their wire bytes at.
+///
+/// A sender's own choice, not a protocol value: `cdn/client/v1` bounds a
+/// `ChunkData` payload only as non-empty, so a fixture picks whatever size makes
+/// its case legible. 1 KiB keeps these fixtures' frame counts and boundaries as
+/// they were written.
+const WIRE_FRAME: usize = 1024;
 
 const CHAIN_ID: u64 = 421_614;
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
@@ -1573,7 +1581,7 @@ async fn serve_wrong_bytes(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    for chunk in served.chunks(CHUNK_SIZE) {
+    for chunk in served.chunks(WIRE_FRAME) {
         write_frame(
             &mut send,
             &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
@@ -1727,7 +1735,7 @@ async fn serve_gated_correct_bytes(
         )
         .await
         .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-        for chunk in served.chunks(CHUNK_SIZE) {
+        for chunk in served.chunks(WIRE_FRAME) {
             write_frame(
                 &mut send,
                 &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
@@ -1916,7 +1924,7 @@ async fn serve_then_reject_voucher(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    for chunk in served.chunks(CHUNK_SIZE) {
+    for chunk in served.chunks(WIRE_FRAME) {
         write_frame(
             &mut send,
             &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
@@ -2008,7 +2016,7 @@ async fn serve_then_error_on_voucher(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-    for chunk in served.chunks(CHUNK_SIZE) {
+    for chunk in served.chunks(WIRE_FRAME) {
         write_frame(
             &mut send,
             &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,
@@ -4144,7 +4152,6 @@ fn honest_bao_wire(payload: &[u8]) -> Result<Vec<u8>> {
 /// This is the hostile shape the non-empty floor exists for, and it is bounded by
 /// nothing else on either receive loop:
 ///
-/// - the `CHUNK_SIZE` ceiling passes trivially (0 ≤ ceiling),
 /// - the `cumulative <= expected_wire_bytes` overrun guard never trips, because
 ///   an empty frame advances `cumulative` by zero,
 /// - the voucher cadence never fires (`bytes_since_voucher` also stays at zero),
@@ -4301,14 +4308,14 @@ async fn serve_then_go_silent(
     Ok(())
 }
 
-/// The first `chunks` `ChunkData` frames of `wire`, each `CHUNK_SIZE` bytes (the
+/// The first `chunks` `ChunkData` frames of `wire`, each [`WIRE_FRAME`] bytes (the
 /// last one short if `wire` runs out).
 ///
 /// Shared by the go-silent fixtures so a "prefix" is always a genuine prefix of the
 /// blob's bao encoding rather than filler that the buyer's incremental decoder would
 /// reject as corruption before the fixture's real behaviour ever ran.
 fn wire_frames(wire: &[u8], chunks: usize) -> Result<Vec<Vec<u8>>> {
-    wire.chunks(CHUNK_SIZE)
+    wire.chunks(WIRE_FRAME)
         .take(chunks)
         .map(|c| {
             let data = ChunkData::new(c.to_vec())?;
@@ -4390,13 +4397,16 @@ async fn serve_a_paid_interval_then_go_silent(
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
-    // Exactly one chunk: CHUNK_SIZE divides CHUNK_BYTES evenly, so this lands
-    // the buyer's unproved counter precisely on the chunk boundary and it must
-    // present a proof before it will take another byte.
+    // Exactly one payment chunk's worth of bytes, so the buyer's unproved counter
+    // lands precisely on the chunk boundary and it must present a proof before it
+    // will take another byte. Rounded UP to a whole frame: `WIRE_FRAME` is this
+    // fixture's own choice and need not divide `CHUNK_BYTES`, and a short count
+    // would leave the counter below the boundary and never demand the proof.
     // Honest bao bytes, for the reason `serve_then_go_silent` records: the buyer
     // verifies each chunk group as it decodes, so filler would end the pull as
     // corruption long before the voucher round trip this fixture is built around.
-    let interval_chunks = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX) / CHUNK_SIZE;
+    let interval_bytes = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX);
+    let interval_chunks = interval_bytes.div_ceil(WIRE_FRAME);
     for frame in wire_frames(&wire, interval_chunks)? {
         write_frame(&mut send, &frame)
             .await
@@ -4876,8 +4886,7 @@ const EMPTY_CHUNK_ASSERT_WINDOW: Duration = Duration::from_secs(10);
 /// must be rejected AT ONCE, on the frame itself.
 ///
 /// `ChunkData::validate` has a unit test; this is the one that proves the receive
-/// loop CALLS it. With the call reverted to the old ceiling-only check
-/// (`if chunk.bytes().len() > CHUNK_SIZE { bail }`), an empty frame passes every
+/// loop CALLS it. Drop the non-empty check and an empty frame passes every
 /// other guard in the loop (see [`serve_empty_chunks`]) and the fetch spins until
 /// the 30 s inactivity deadline — so the timeout below, not the `NotFound`, is
 /// the assertion.
@@ -6027,7 +6036,7 @@ const SLOW_PULL_OPEN_BUDGET: Duration = Duration::from_secs(2);
 async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> Result<()> {
     // 6 KiB ⇒ six 1 KiB `ChunkData` frames (a single 16 KiB bao group, so the wire
     // is the content and one closing voucher settles it).
-    let payload = vec![0x51u8; 6 * CHUNK_SIZE];
+    let payload = vec![0x51u8; 6 * WIRE_FRAME];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let wire = honest_bao_wire(&payload)?;
@@ -9001,7 +9010,7 @@ async fn serve_wire_paced(
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
     let interval_bytes = CHUNK_BYTES;
     let mut unvouchered: u64 = 0;
-    for chunk in wire.chunks(CHUNK_SIZE) {
+    for chunk in wire.chunks(WIRE_FRAME) {
         if !gap.is_zero() {
             tokio::time::sleep(gap).await;
         }
@@ -12541,7 +12550,7 @@ async fn serve_with_deposit_ceiling(
 
     let wire = honest_bao_wire_from(payload, req.byte_offset)?;
     let mut unvouchered: u64 = 0;
-    for chunk in wire.chunks(CHUNK_SIZE) {
+    for chunk in wire.chunks(WIRE_FRAME) {
         write_frame(
             &mut send,
             &encode_message(&ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?))?,

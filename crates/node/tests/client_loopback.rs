@@ -4730,7 +4730,7 @@ async fn setup_recheck_holder_and_driven(
 /// Drive a paid stream to completion from the fixture's parked state and return the
 /// total WIRE bytes received (bao content + proof, so `> ` the blob's content size).
 ///
-/// Delivery frames are `CHUNK_SIZE` (1 KiB), so a per-frame voucher would sign
+/// Delivery frames are far smaller than a payment chunk, so a per-frame voucher would sign
 /// thousands of times; instead this pays one cumulative voucher per accumulated
 /// voucher-interval (the efficient cadence the other loopback tests use). The
 /// window ramp can leave a final sub-interval remainder the server parks on
@@ -5645,7 +5645,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
 /// promised wire length — the contract `decdn fetch`'s progress bar relies on.
 #[tokio::test(flavor = "multi_thread")]
 async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
-    // Multi-chunk payload (256 KiB > CHUNK_SIZE) so the callback fires repeatedly
+    // Multi-frame payload (256 KiB) so the callback fires repeatedly
     // and the monotonic-advance assertion has intermediate points to check.
     let payload = vec![0xABu8; 256 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
