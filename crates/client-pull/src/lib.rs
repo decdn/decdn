@@ -1629,7 +1629,7 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// additionally answers a genuine `SpendingCapExhausted` with an on-chain top-up —
 /// the thing a from-zero buffered retry could never do without re-paying for the
 /// delivered prefix. Either way `pull_verdict` / `voucher_verdict` in `decdn-node`
-/// see only the terminal outcome, so the `OurDeadChannel` classification there
+/// see only the terminal outcome, so the `OurDeadLane` classification there
 /// stays correct as the fallback.
 ///
 /// A bundle-less rejection, a non-gated reason, or a bundle that fails
