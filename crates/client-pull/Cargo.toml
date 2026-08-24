@@ -38,6 +38,10 @@ decdn-bao-range = { workspace = true }
 # build without any iroh-blobs crate in the graph to turn the feature on for us.
 bao-tree = { workspace = true, features = ["tokio_fsm"] }
 iroh-io = { workspace = true }
+# `try_join_all` drives one worker future per source concurrently on the caller's
+# task (the multi-source scheduler, spec §5.3) — no `tokio::spawn`, so the
+# `!Send` `ingest_stream` decode future is fine.
+futures-util = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }

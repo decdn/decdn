@@ -68,6 +68,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,6 +83,67 @@ use crate::{
     Cumulative, MAX_RESUME_ATTEMPTS, Pacer, PoolContext, PoolLedger, ProgressCallback,
     UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
 };
+
+/// The shared pool cannot fund the next voucher: its remaining deposit is below
+/// the next voucher's cost and reactive top-up is disabled or exhausted (the
+/// pacer returned [`PaceDecision::Refuse`]).
+///
+/// Typed rather than a bare string so the failover classifier
+/// ([`crate::retry_disposition`]) can `downcast_ref` and rule it **terminal** for
+/// BOTH fetch paths: the pool is the same deposit against every provider (ADR
+/// 003), so reassigning the range to another lane — or failing over to another
+/// candidate — cannot fund it. The single-source path already ended the fetch on
+/// a refuse; the multi-source scheduler needs the typed shape to abort promptly
+/// instead of dropping every lane one by one and masking it as "all sources
+/// failed".
+#[derive(Debug)]
+pub struct PoolExhausted {
+    /// Start of the gap that could not be funded.
+    pub gap_start: u64,
+    /// Length of the gap that could not be funded.
+    pub gap_len: u64,
+}
+
+impl std::fmt::Display for PoolExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gap [{}, +{}) of blob cannot be funded: the remaining deposit cannot cover the \
+             next voucher and reactive top-up is disabled or exhausted",
+            self.gap_start, self.gap_len
+        )
+    }
+}
+
+impl std::error::Error for PoolExhausted {}
+
+/// The state ONE pool deposit's concurrent lanes share, injected by the
+/// multi-source scheduler. Absent (`None`) on the single-source path, where the
+/// one lane IS the pool and its own [`DriveCounters`] and [`PoolContext`] already
+/// hold every fact below.
+///
+/// Three facts are properties of the POOL, not of a lane, so a per-lane copy of
+/// any of them lets N lanes each spend what only one pool holds:
+///
+/// - **Spend.** The deposit gate must subtract what EVERY lane committed, not
+///   what this one did.
+/// - **Top-up budget.** [`Funder::max_topups`] bounds the reactive top-ups ONE
+///   fetch may escrow. Counting them per-lane multiplies the bound by the lane
+///   count.
+/// - **Deposit.** A landed top-up raises the deposit every lane draws on. Written
+///   only through this lane's `ctx`, it is invisible to the others, whose gate
+///   still subtracts the aggregate spend from a stale deposit and walks to a
+///   false exhaustion.
+pub(crate) struct SharedPool<'a> {
+    /// Sum, across every lane, of the committed voucher amount — the pool's
+    /// total spend so far.
+    pub(crate) spent: &'a (dyn Fn() -> U256 + Send + Sync),
+    /// Reactive top-ups this FETCH has spent, across every lane.
+    pub(crate) topups_used: &'a AtomicU32,
+    /// Credit a landed top-up's new deposit to EVERY lane's `PoolContext`, so no
+    /// lane gates on a stale deposit.
+    pub(crate) credit: &'a (dyn Fn(U256) -> anyhow::Result<()> + Send + Sync),
+}
 
 /// The injected wait signal for [`PaceDecision::Wait`] (ADR 037): the
 /// node hands in an implementor that resolves once its serve leg's paid frontier
@@ -159,11 +221,53 @@ pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
 /// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
 pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
+/// How often a fetch's single flush owner persists the `.ranges` present record
+/// while sources are still delivering. `ClientRangedStore::checkpoint` fsyncs
+/// data and outboard every ~4 MiB but no longer writes the record, so this
+/// interval bounds crash-loss of resume progress to at most one interval (spec
+/// §5.5): a killed fetch resumes from the last flushed frontier instead of
+/// refetching — and re-paying for — the whole in-flight download. 5 seconds
+/// mirrors the voucher-flush cadence.
+pub(crate) const PRESENT_RECORD_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Drive `fut` (a fetch's whole gap/worker set) to completion while a single
+/// periodic tick flushes the store's `.ranges` present record every `interval`,
+/// so a crash mid-fetch costs at most one `interval` of resume progress (spec
+/// §5.5). `fut` is the SOLE work driver and this loop is the SOLE periodic flush
+/// owner — nothing inside `fut` flushes — which preserves the single-writer
+/// property `ClientRangedStore::checkpoint` relies on. Returns once `fut`
+/// resolves; the caller does the final flush.
+///
+/// `tokio::time::interval`'s first tick fires immediately, so it is consumed
+/// before the loop to avoid a redundant flush at start.
+pub(crate) async fn drive_with_interval_flush<St, Fut>(
+    store: &St,
+    interval: Duration,
+    fut: Fut,
+) -> anyhow::Result<()>
+where
+    St: IngestStore,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(fut);
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            // Prefer completion: if the work is done, finish rather than flush —
+            // the caller's final flush persists the terminal snapshot.
+            biased;
+            res = &mut fut => return res,
+            _ = tick.tick() => store.flush_present_record()?,
+        }
+    }
+}
+
 /// Fetch-wide counters that persist ACROSS the request's gaps (a top-up budget is
 /// per-fetch, not per-gap), plus the last upstream quote used to price the next
 /// voucher.
 #[derive(Debug, Clone, Copy)]
-struct DriveCounters {
+pub(crate) struct DriveCounters {
     /// Reactive top-ups spent so far — bounded by [`Funder::max_topups`].
     topups_used: u32,
     /// Desync-reseed retries spent so far — bounded by [`MAX_RESUME_ATTEMPTS`].
@@ -173,6 +277,18 @@ struct DriveCounters {
     /// gate open so the first draw always proceeds (an exhaustion can only follow
     /// an open).
     next_voucher_cost: U256,
+}
+
+impl DriveCounters {
+    /// Fresh per-fetch (single-source) or per-worker (multi-source) counters:
+    /// no top-ups or reseeds spent, and no priced voucher yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            topups_used: 0,
+            resume_attempts: 0,
+            next_voucher_cost: U256::ZERO,
+        }
+    }
 }
 
 /// Price the next voucher from an upstream header, the exact formula
@@ -187,7 +303,7 @@ fn voucher_cost(header: &UpstreamPullHeader) -> U256 {
 /// ranges it covers, in ascending order, clamping the final boundary to
 /// `total_bytes` (the ragged last group). Each entry is `(start, len)` with
 /// `len > 0`.
-fn contiguous_byte_ranges(ranges: &ChunkRanges, total_bytes: u64) -> Vec<(u64, u64)> {
+pub(crate) fn contiguous_byte_ranges(ranges: &ChunkRanges, total_bytes: u64) -> Vec<(u64, u64)> {
     let boundaries = ranges.boundaries();
     let mut out = Vec::new();
     let mut it = boundaries.iter();
@@ -264,32 +380,53 @@ where
     let missing = store.missing_ranges(offset, len).await?;
     let gaps = contiguous_byte_ranges(&missing, total_bytes);
 
-    let mut counters = DriveCounters {
-        topups_used: 0,
-        resume_attempts: 0,
-        next_voucher_cost: U256::ZERO,
-    };
+    // Fill every gap while a single periodic tick flushes the `.ranges` present
+    // record (spec §5.5, single-writer flush point). `ClientRangedStore::checkpoint`
+    // no longer persists the record per checkpoint, so without this interval flush
+    // a crash mid-fetch would leave `.ranges` at pre-session state and re-download
+    // (and re-pay for) the whole in-flight range on resume; the interval bounds
+    // that loss to one `PRESENT_RECORD_FLUSH_INTERVAL`. This loop is the
+    // single-source path's sole periodic flush owner — `fill_gap` never flushes.
+    let outcome = drive_with_interval_flush(store, PRESENT_RECORD_FLUSH_INTERVAL, async move {
+        let mut counters = DriveCounters::new();
+        for (gap_start, gap_len) in gaps {
+            fill_gap(
+                store,
+                source,
+                pacer,
+                funder,
+                ctx,
+                ledger,
+                hash,
+                gap_start,
+                gap_len,
+                total_bytes,
+                config,
+                &mut counters,
+                on_progress,
+                pacing_wait,
+                served_paid,
+                // Single-source: this one lane IS the pool, so its own
+                // `counters` and `ctx` already hold the spend, the top-up
+                // budget, and the deposit. The multi-source scheduler injects
+                // the shared view of all three here instead.
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    })
+    .await;
 
-    for (gap_start, gap_len) in gaps {
-        fill_gap(
-            store,
-            source,
-            pacer,
-            funder,
-            ctx,
-            ledger,
-            hash,
-            gap_start,
-            gap_len,
-            total_bytes,
-            config,
-            &mut counters,
-            on_progress,
-            pacing_wait,
-            served_paid,
-        )
-        .await?;
-    }
+    // Final flush of whatever landed — on the FAILURE path too. The bytes a
+    // failed drive did deliver are paid for, and the interval owner's last tick
+    // can be up to one interval stale, so skipping this on `Err` discards
+    // already-bought resume progress the next invocation would have to re-pay
+    // for. The drive's own error is the more informative one, so it wins when
+    // both fail; a flush failure alone still surfaces.
+    let flushed = store.flush_present_record();
+    outcome?;
+    flushed?;
 
     // Promote only when the WHOLE blob is present — `finalize` verifies and
     // renames the whole `.partial`, which it cannot do while bytes outside `R`
@@ -311,7 +448,7 @@ where
 // terminal); splitting them out would separate those from the loop state they act
 // on.
 #[allow(clippy::too_many_lines)]
-async fn fill_gap<St, S, P, F>(
+pub(crate) async fn fill_gap<St, S, P, F>(
     store: &St,
     source: &S,
     pacer: &P,
@@ -327,6 +464,7 @@ async fn fill_gap<St, S, P, F>(
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
     served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
+    pool: Option<&SharedPool<'_>>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -334,6 +472,17 @@ where
     P: Pacer,
     F: Funder,
 {
+    // Solvency basis for the deposit gate. On the single-source path (`None`) it
+    // is THIS lane's own committed amount — `deposit - own_committed`, unchanged.
+    // On the multi-source path a shared reader sums EVERY lane's committed amount,
+    // so each worker gates on `pool_deposit - aggregate_committed` — the true
+    // SHARED remaining toward the reserved floor, so concurrent lanes drawing on
+    // one pool cannot each independently believe the whole deposit is theirs (ADR
+    // 039 § Payment model: one deposit backs the whole set). It replaces ONLY the
+    // amount subtracted for the deposit gate — the per-leg paid-frontier math below
+    // still reads THIS lane's own `committed.bytes`.
+    let spent = move |own_amount: U256| pool.map_or(own_amount, |p| (p.spent)());
+
     // Per-open state; reset the moment an open succeeds. `awaiting_settle` is set
     // only right after a top-up, and consulted ONLY in the error-classification
     // path below: it gates the bounded settle-wait on an ACTUAL stale-resume
@@ -377,7 +526,7 @@ where
         let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 
         let committed = ledger.committed();
-        let remaining_deposit = locked_deposit(ctx)?.saturating_sub(committed.amount);
+        let remaining_deposit = locked_deposit(ctx)?.saturating_sub(spent(committed.amount));
 
         // Anchor the leg on the first pass at `gap_start` with the current committed
         // baseline (fresh / cross-invocation: `paid_wire == 0`, so the frontier is
@@ -419,7 +568,13 @@ where
             remaining_deposit,
             next_voucher_cost: counters.next_voucher_cost,
             working_deposit: config.working_deposit,
-            topups_used: counters.topups_used,
+            // The reactive-top-up budget is a property of the POOL, not of a
+            // lane: `Funder::max_topups` bounds what ONE fetch may escrow, and
+            // every lane escrows into the ONE deposit. Multi-source reads the
+            // count shared across lanes; single-source reads its own.
+            topups_used: pool.map_or(counters.topups_used, |p| {
+                p.topups_used.load(Ordering::Acquire)
+            }),
             max_topups: funder.max_topups(),
             exhaustion_confirmed,
             // `pulled_frontier` is this leg's own admitted/present frontier —
@@ -461,20 +616,25 @@ where
                 );
             }
             PaceDecision::Refuse => {
-                anyhow::bail!(
-                    "gap [{gap_start}, +{gap_len}) of blob cannot be funded: the remaining \
-                     deposit cannot cover the next voucher and reactive top-up is \
-                     disabled or exhausted"
-                );
+                return Err(anyhow::Error::new(PoolExhausted { gap_start, gap_len }));
             }
             PaceDecision::TopUp(additional) => {
                 match funder.top_up(additional).await? {
                     DepositOutcome::Added(new_deposit) => {
                         // Credit the new deposit through the shared handle so the
                         // source's next open (which clones the context) sees it.
-                        ctx.lock()
-                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
-                            .deposit = new_deposit;
+                        // The deposit backs the whole lane set, so multi-source
+                        // credits EVERY lane: a lane left on the pre-top-up value
+                        // subtracts the aggregate spend from a stale deposit and
+                        // walks to a false exhaustion the pool can already fund.
+                        match pool {
+                            Some(p) => (p.credit)(new_deposit)?,
+                            None => {
+                                ctx.lock()
+                                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                                    .deposit = new_deposit;
+                            }
+                        }
                     }
                     DepositOutcome::UnknownPool => {
                         anyhow::bail!(
@@ -492,7 +652,14 @@ where
                         );
                     }
                 }
-                counters.topups_used = counters.topups_used.saturating_add(1);
+                // Spend one unit of the top-up budget — the shared one when lanes
+                // draw on one pool, so N lanes cannot each escrow `max_topups`.
+                match pool {
+                    Some(p) => {
+                        p.topups_used.fetch_add(1, Ordering::AcqRel);
+                    }
+                    None => counters.topups_used = counters.topups_used.saturating_add(1),
+                }
                 // The node's watcher may not observe this top-up before the next
                 // open; wait it out rather than misread the refusal.
                 awaiting_settle = true;
@@ -583,7 +750,7 @@ where
                         let guard = ctx
                             .lock()
                             .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
-                        let remaining = guard.deposit.saturating_sub(committed.amount);
+                        let remaining = guard.deposit.saturating_sub(spent(committed.amount));
 
                         // 2. Desync heal (driver-owned, NOT a PaceDecision): an
                         //    authenticated bundle that ADVANCES our committed
@@ -1496,6 +1663,129 @@ mod tests {
             got.as_ref(),
             plaintext.as_slice(),
             "byte-exact after a window-paced, served-paid-gated drive"
+        );
+    }
+
+    /// An [`IngestStore`] wrapper that counts `flush_present_record` calls and
+    /// delegates every real operation to an inner [`ClientRangedStore`]. It lets
+    /// a test observe the interval flush firing during a still-running fetch.
+    struct FlushCountingStore {
+        inner: ClientRangedStore,
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RangedStore for FlushCountingStore {
+        fn total_bytes(&self) -> u64 {
+            self.inner.total_bytes()
+        }
+        fn present_ranges(&self) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.present_ranges()
+        }
+        fn missing_ranges(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, bao_tree::ChunkRanges> {
+            self.inner.missing_ranges(byte_offset, byte_len)
+        }
+        fn admit(
+            &self,
+            range: AlignedRange,
+            bao_bytes: Bytes,
+        ) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.inner.admit(range, bao_bytes)
+        }
+        fn read(
+            &self,
+            byte_offset: u64,
+            byte_len: u64,
+        ) -> decdn_bao_range::RangedFuture<'_, Bytes> {
+            self.inner.read(byte_offset, byte_len)
+        }
+        fn is_complete(&self) -> decdn_bao_range::RangedFuture<'_, bool> {
+            self.inner.is_complete()
+        }
+        fn finalize(&self) -> decdn_bao_range::RangedFuture<'_, ()> {
+            self.inner.finalize()
+        }
+    }
+
+    impl crate::source::IngestStore for FlushCountingStore {
+        fn ingest_stream<'a, R>(
+            &'a self,
+            range: &'a AlignedRange,
+            reader: R,
+            on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<R>> + 'a>>
+        where
+            R: crate::source::BaoRangeReader + 'a,
+        {
+            Box::pin(self.inner.ingest_stream(range, reader, on_progress))
+        }
+
+        fn flush_present_record(&self) -> std::io::Result<()> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.flush_present_record()
+        }
+    }
+
+    /// The interval flush persists resume progress MID-fetch, not only at
+    /// completion (spec §5.5): `drive_with_interval_flush` is raced against a
+    /// work future that stays pending for several short intervals, and the
+    /// store's `flush_present_record` must fire MORE THAN ONCE before the work
+    /// resolves — so a crash between the last flush and completion loses at most
+    /// one interval, never the whole in-flight fetch. It also pins the
+    /// single-writer property: only the interval owner flushes (the work future
+    /// never does), and the flushed record equals the durable checkpointed
+    /// prefix reopened from disk.
+    #[tokio::test]
+    async fn interval_flush_persists_progress_before_completion() {
+        let total = 8 * 1024 * 1024;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let dir = tmp_dir();
+        let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+        // Durably checkpoint a real, verified 4 MiB prefix into the store — the
+        // resume progress the interval flush must persist — without yet writing
+        // the `.ranges` record (checkpoint no longer does, spec §5.5).
+        let prefix = align_range(0, 4 * 1024 * 1024, total).expect("align prefix");
+        preadmit(&inner, &plaintext, &outboard, &prefix).await;
+
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = FlushCountingStore {
+            inner,
+            flushes: Arc::clone(&flushes),
+        };
+
+        // A work future that stays pending across several 20 ms intervals, so the
+        // interval owner flushes repeatedly before the work resolves.
+        let work = async {
+            tokio::time::sleep(std::time::Duration::from_millis(130)).await;
+            Ok(())
+        };
+        super::drive_with_interval_flush(&store, std::time::Duration::from_millis(20), work)
+            .await
+            .expect("interval-flush wrapper completes when the work future resolves");
+
+        // MORE THAN ONCE while the work was still pending: the flush is periodic,
+        // not a single completion flush. (~6 ticks over 130 ms at 20 ms; assert a
+        // conservative floor to stay robust under CI scheduling jitter.)
+        let count = flushes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count > 1,
+            "the interval owner must flush more than once during a still-running \
+             fetch, got {count}"
+        );
+
+        // The interval flush is a REAL persist: reopening the store from disk
+        // recovers exactly the checkpointed 4 MiB prefix — a crash right here
+        // would resume from it, not refetch from zero.
+        let reopened = ClientRangedStore::open(dir.path(), "blob", root, total).expect("reopen");
+        let present = reopened.present_ranges().await.expect("present");
+        assert_eq!(
+            present,
+            prefix.chunk_ranges().clone(),
+            "the interval-flushed record must persist the checkpointed prefix"
         );
     }
 }

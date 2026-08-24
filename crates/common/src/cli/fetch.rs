@@ -147,6 +147,57 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MS", default_value_t = 30)]
     pub proxy_warming_margin_ms: u64,
 
+    /// Multi-source parallel fetch (ADR 039): fan a large blob out across
+    /// several admissible holders at once via a shared-store scheduler with
+    /// tail-stealing, rather than the single-source failover loop. Engages
+    /// only when the blob clears `--multi-source-min-bytes` AND at least two
+    /// admissible holders are found (see [`Self::multi_source_min_bytes`],
+    /// [`Self::max_sources`]); a small blob or a single-holder blob always
+    /// takes the single-source path regardless of this flag.
+    ///
+    /// **Defaults on.** Pass `--no-multi-source` to always use the
+    /// single-source path.
+    ///
+    /// Read directly ONLY when `--no-multi-source` cannot also be set (e.g.
+    /// after `overrides_with` has resolved a conflict some other way);
+    /// callers wanting the effective value use [`Self::multi_source_enabled`],
+    /// which also accounts for `--no-multi-source`.
+    #[arg(long, default_value_t = true, overrides_with = "no_multi_source")]
+    pub multi_source: bool,
+
+    /// Off-switch for `--multi-source` (clap negation companion — mirrors the
+    /// `--proxy-warming`/direct-route pairing above, but as a flag pair
+    /// rather than a `bool`-valued flag). Never read directly outside
+    /// [`Self::multi_source_enabled`]: clap has no built-in way to make one
+    /// flag *write* another derive field, so the two fields are resolved by
+    /// that method rather than by clap itself. `pub` only because callers
+    /// outside this crate build `ClientFetchArgs` literals (test fixtures)
+    /// rather than going through clap.
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "multi_source")]
+    pub no_multi_source: bool,
+
+    /// Cap on concurrently-used holders for a multi-source fetch — the initial
+    /// segment count `admit_sources` admits and `multi_source_fetch` fans out
+    /// across (ADR 039). Enough to saturate typical downlinks without paying
+    /// for marginal lanes.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    pub max_sources: usize,
+
+    /// Multi-source engagement floor, in bytes: a blob at or below this size
+    /// always takes the single-source path — fanning it out across several
+    /// lanes only adds redemption overhead (one `redeem` call per lane) for no
+    /// parallelism win on a transfer that small. Defaults to 64 MiB.
+    #[arg(long, value_name = "BYTES", default_value_t = 67_108_864)]
+    pub multi_source_min_bytes: u64,
+
+    /// No-verified-progress deadline before a multi-source worker's remaining
+    /// range is reassigned to another source (ADR 039), in milliseconds. Must
+    /// sit comfortably above `4 MiB / min-expected-throughput` — progress is
+    /// checkpoint-granular at that size, so a smaller deadline can falsely
+    /// reassign a healthy-but-slow source mid-checkpoint. Defaults to 10 s.
+    #[arg(long, value_name = "MS", default_value_t = 10_000)]
+    pub unit_deadline_ms: u64,
+
     /// EIP-712 `chainId` for both domains. Overrides `blockchain.chain_id`;
     /// defaults to Arbitrum Sepolia.
     #[arg(long, value_name = "ID")]
@@ -366,6 +417,15 @@ impl ClientFetchArgs {
              names no node",
         );
         Ok(())
+    }
+
+    /// The effective multi-source kill switch: on by default, off if either
+    /// `--no-multi-source` was passed (regardless of `--multi-source`'s own
+    /// value — the negation always wins) or `--multi-source` was explicitly
+    /// set to `false`.
+    #[must_use]
+    pub const fn multi_source_enabled(&self) -> bool {
+        self.multi_source && !self.no_multi_source
     }
 
     /// The `dcap1:` capability token this fetch adopts, if any: the inline
@@ -673,6 +733,25 @@ mod tests {
             .resolve_capability_token()
             .unwrap();
         assert_eq!(token.as_deref(), Some("dcap1:abc"));
+    }
+
+    /// `--multi-source` defaults on; `--no-multi-source` is the off-switch.
+    /// [`ClientFetchArgs::multi_source_enabled`] is the resolved value every
+    /// caller reads (mirroring `--proxy-warming`'s bool style above, but as a
+    /// flag pair rather than a `bool`-valued flag). `overrides_with` clears
+    /// the OTHER flag's occurrence, so whichever of the pair appears LAST on
+    /// the command line wins.
+    #[test]
+    fn multi_source_defaults_on_and_no_multi_source_disables_it() {
+        assert!(parse(&[]).multi_source_enabled(), "defaults on");
+        assert!(
+            !parse(&["--no-multi-source"]).multi_source_enabled(),
+            "--no-multi-source disables it"
+        );
+        assert!(
+            parse(&["--no-multi-source", "--multi-source"]).multi_source_enabled(),
+            "a later --multi-source overrides an earlier --no-multi-source"
+        );
     }
 
     /// `--capability-file` returns the file's trimmed contents; the two forms are

@@ -18,6 +18,7 @@
 //! client data dir, falling back to that file when the registry cannot be read.
 //! That cache is the only filesystem state this module owns.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -698,6 +699,54 @@ pub fn select_candidates(
     candidates
 }
 
+/// Pick up to `max_sources` candidates from an already-ranked `ordered` list,
+/// admitting at most ONE per `eth_address` (operator), without disturbing rank
+/// order. Used by the multi-source scheduler's engagement gate to pick the
+/// source set for a parallel fetch — `select_candidates`/`rank` pick a single
+/// best node, this picks a *set*.
+///
+/// One greedy pass, walking `ordered` in rank order: admit a candidate the first
+/// time its `eth_address` is seen. A candidate is skipped only when it adds no
+/// new operator, so two equally-diversifying candidates are never reordered —
+/// the pass only skips ahead over already-represented operators.
+///
+/// # Why the set never repeats an operator
+///
+/// A voucher is scoped to one `(signer, provider)` lane, and `provider` IS the
+/// operator's `eth_address`. Two admitted nodes of one operator therefore become
+/// two payment lanes on ONE watermark: their concurrent voucher streams regress
+/// each other, and their persisted watermarks collide under one `LaneKey`, last
+/// write winning at the LOWER value. Filling spare slots with a repeat operator
+/// buys parallelism the payment model cannot express, so the set shrinks
+/// instead: with one operator present this returns ONE candidate, and the
+/// caller's two-holder engagement gate then declines multi-source entirely.
+///
+/// Region is not a separate tiebreaking pass: the pass already walks candidates
+/// in rank order, so among several unseen operators the one ranked first (which
+/// is also, incidentally, the first with a given region) is the one admitted —
+/// there is nothing left for a region check to change without reordering by
+/// something other than rank, which the contract forbids.
+///
+/// The result holds `min(max_sources, distinct operators in ordered)`
+/// candidates, in rank order.
+#[must_use]
+pub fn admit_sources(ordered: Vec<NodeCandidate>, max_sources: usize) -> Vec<NodeCandidate> {
+    if max_sources == 0 {
+        return Vec::new();
+    }
+    let mut seen_operators = HashSet::with_capacity(max_sources);
+    let mut out = Vec::with_capacity(max_sources.min(ordered.len()));
+    for candidate in ordered {
+        if out.len() >= max_sources {
+            break;
+        }
+        if seen_operators.insert(candidate.eth_address) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
 /// A probed candidate that holds the blob, with its measured RTT and whether the
 /// client already has a live payment channel with it.
 #[derive(Debug, Clone)]
@@ -706,6 +755,12 @@ pub struct Probed {
     pub candidate: NodeCandidate,
     /// Round-trip time measured by the probe, in milliseconds.
     pub rtt_ms: f64,
+    /// The blob size the node reported, when it knew it. UNSIGNED and outside
+    /// `slash_sig` (ADR 005 §`cdn/probe/v1`), so it is a hint for sizing
+    /// decisions only — never for anything a lying node could profit from. It
+    /// spares the multi-source engagement gate a throwaway header open just to
+    /// learn whether the blob clears the fan-out floor.
+    pub total_bytes: Option<u64>,
     /// Whether the buyer-channel store already holds a live (non-expired)
     /// channel for `candidate.eth_address`.
     pub has_live_channel: bool,
@@ -883,6 +938,7 @@ mod tests {
         Probed {
             candidate: candidate(seed, "US"),
             rtt_ms,
+            total_bytes: None,
             has_live_channel,
         }
     }
@@ -943,6 +999,110 @@ mod tests {
         let out = select_candidates(cands, Some("US"), 5);
         assert_eq!(out[0].eth_address, Address::repeat_byte(2));
         assert_eq!(out[1].eth_address, Address::repeat_byte(1));
+    }
+
+    /// An iroh node id derived from a small seed, for [`cand`] fixtures — mirrors
+    /// [`candidate`]'s own key derivation but named to match the brief's helper
+    /// naming (`pk`/`addr`/`cand`) for the `admit_sources` tests below.
+    fn pk(seed: u8) -> PublicKey {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    /// A distinct Ethereum address per seed, for [`cand`] fixtures — the
+    /// "operator" identity `admit_sources` spreads across.
+    fn addr(seed: u8) -> Address {
+        Address::repeat_byte(seed)
+    }
+
+    /// Build a [`NodeCandidate`] from an already-derived node id and address,
+    /// plus a region code (parsed the same way [`candidate`] does). Distinct
+    /// from `candidate(seed, region)` above because `admit_sources` tests need
+    /// the node id and operator address to vary independently (several nodes
+    /// under the same operator).
+    fn cand(node_id: PublicKey, eth_address: Address, region: Option<&str>) -> NodeCandidate {
+        NodeCandidate {
+            node_id,
+            eth_address,
+            region_hint: region.and_then(Region::parse),
+        }
+    }
+
+    #[test]
+    fn admit_sources_admits_one_node_per_operator_in_rank_order() {
+        // Ranked: [op1/us, op1/us, op2/eu, op3/us]. max=3 → one node per
+        // operator, in rank order: the FIRST op1 node, then op2, then op3 —
+        // never the second op1 node, which would share op1's voucher lane.
+        let ranked = vec![
+            cand(pk(1), addr(1), Some("US")),
+            cand(pk(2), addr(1), Some("US")),
+            cand(pk(3), addr(2), Some("EU")),
+            cand(pk(4), addr(3), Some("US")),
+        ];
+        let out = admit_sources(ranked, 3);
+        // Identity, not just count: reversing the skip would still yield three
+        // distinct operators, but from the wrong (lower-ranked) nodes.
+        assert_eq!(
+            out.iter().map(|c| c.node_id).collect::<Vec<_>>(),
+            vec![pk(1), pk(3), pk(4)]
+        );
+    }
+
+    /// The set SHRINKS rather than repeating an operator. Two nodes of one
+    /// operator would become two payment lanes on one `(signer, provider)`
+    /// watermark — concurrent voucher streams that regress each other, and two
+    /// watermark writes colliding under one `LaneKey`.
+    #[test]
+    fn admit_sources_never_repeats_an_operator() {
+        let ranked = vec![
+            cand(pk(1), addr(1), Some("US")),
+            cand(pk(2), addr(1), Some("US")),
+            cand(pk(3), addr(1), Some("EU")),
+        ];
+        let out = admit_sources(ranked, 4);
+        assert_eq!(out.len(), 1, "one operator admits one source, not three");
+        assert_eq!(
+            out[0].node_id,
+            pk(1),
+            "the rank-first node of that operator"
+        );
+    }
+
+    /// A spare slot left by the operator-distinctness rule is NOT filled with a
+    /// repeat operator: with two operators behind four nodes and `max = 4`, the
+    /// admitted set is two, not four.
+    #[test]
+    fn admit_sources_leaves_slots_empty_rather_than_repeating() {
+        let ranked = vec![
+            cand(pk(1), addr(1), None),
+            cand(pk(2), addr(2), None),
+            cand(pk(3), addr(1), None),
+            cand(pk(4), addr(2), None),
+        ];
+        let out = admit_sources(ranked, 4);
+        assert_eq!(
+            out.iter().map(|c| c.eth_address).collect::<Vec<_>>(),
+            vec![addr(1), addr(2)]
+        );
+    }
+
+    /// `max_sources` larger than the candidate count returns everything, not a
+    /// padded or truncated set.
+    #[test]
+    fn admit_sources_max_larger_than_candidates_returns_all() {
+        let ranked = vec![
+            cand(pk(1), addr(1), Some("US")),
+            cand(pk(2), addr(2), Some("EU")),
+        ];
+        let out = admit_sources(ranked.clone(), 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out, ranked, "rank order preserved when nothing is dropped");
+    }
+
+    /// `max_sources == 0` is a valid, non-panicking request for nothing.
+    #[test]
+    fn admit_sources_zero_max_returns_empty() {
+        let ranked = vec![cand(pk(1), addr(1), Some("US"))];
+        assert_eq!(admit_sources(ranked, 0), Vec::new());
     }
 
     #[test]

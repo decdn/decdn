@@ -113,6 +113,14 @@ impl IngestStore for NodeAdmitStore {
     /// only sees the resulting truncation as a generic `CacheError`. Surfacing
     /// the parked fault verbatim keeps `pull_verdict` fault classification,
     /// reputation, channel remedies, and reactive top-up (`SpendingCapExhausted`) working.
+    /// No-op: unlike [`decdn_client_pull::ClientRangedStore`]'s `.partial` +
+    /// `.ranges` sidecar, this store's presence is derived live from
+    /// [`CacheEngine`]'s own admitted-range bookkeeping — there is no
+    /// separate present-range record to flush.
+    fn flush_present_record(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn ingest_stream<'a, R>(
         &'a self,
         range: &'a AlignedRange,

@@ -132,6 +132,19 @@ pub trait IngestStore: decdn_bao_range::RangedStore {
     ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
     where
         R: BaoRangeReader + 'a;
+
+    /// Persist the store's current in-memory present-range snapshot to its
+    /// durable record. The single-writer flush point (spec §5.5): several
+    /// `ingest_stream` calls can run concurrently on one store (the
+    /// multi-source scheduler), so the record is no longer written per
+    /// checkpoint — callers flush it explicitly instead. `drive` calls this
+    /// once after its gap loop, before `finalize`, so the single-source path
+    /// keeps its resume durability without per-checkpoint fsyncs.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure persisting the record.
+    fn flush_present_record(&self) -> std::io::Result<()>;
 }
 
 /// The injected pool top-up seam. Wraps the deployment's funding path — the
@@ -316,7 +329,9 @@ impl BlobSource for PeerSource<'_> {
 
 #[cfg(any(test, feature = "test-util"))]
 mod doubles {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use alloy::primitives::U256;
     use bao_tree::io::outboard::PreOrderMemOutboard;
@@ -352,6 +367,34 @@ mod doubles {
         /// driver pulled ONLY the gaps of `missing_ranges` and never a held
         /// range.
         opened: Arc<Mutex<Vec<(u64, u64)>>>,
+        /// Total WIRE bytes this source's readers actually delivered (summed
+        /// across every reader). Unlike [`opened`](Self::opened) — which records
+        /// the requested `fetch_len` at `open` time, before a byte streams —
+        /// this counts bytes that truly left the source, so it is the honest
+        /// proxy for "bytes fetched and paid for". A leg cancelled mid-stream
+        /// stops incrementing this the instant its reader is dropped, which is
+        /// exactly what lets the multi-source no-double-pay assertion see that a
+        /// stolen tail was fetched by ONE source, not two.
+        delivered: Arc<AtomicU64>,
+        /// One-time stall injected on the FIRST read of every reader this source
+        /// yields. Models a slow-to-start peer; a fast peer (no stall) then
+        /// reliably finishes its own segment and steals the slow peer's tail,
+        /// forcing the steal path deterministically without wall-clock racing on
+        /// per-byte timing.
+        first_read_stall: Option<Duration>,
+        /// Delay injected inside `finish`, AFTER the range's bytes are fully
+        /// delivered but BEFORE `fill_gap` returns. Holds the completed range in
+        /// the scheduler's `in_flight` (delivered, not yet cleared) so a peer's
+        /// steal of an already-present range is deterministic — the exact
+        /// completed-but-uncleared window the present-bytes backstop must close.
+        finish_stall: Option<Duration>,
+        /// Wedge every reader after it has delivered `n` wire bytes: it sleeps
+        /// for the given duration instead of yielding the next chunk. Models a
+        /// source that opens, delivers a prefix, then stops making progress
+        /// WITHOUT erroring — the only shape that reaches the scheduler's stall
+        /// watchdog. A source that returns `Err` takes the fault path instead,
+        /// so `with_fault_after` cannot stand in for this.
+        stall_after: Option<(u64, Duration)>,
         /// Optional ledger to advance on a clean `finish`, modelling payment: a
         /// real pull pays vouchers for the WIRE bytes it drains, and the driver's
         /// completion is PAID-frontier based (`content_paid_frontier`), so a double
@@ -388,8 +431,52 @@ mod doubles {
                 outboard: ob.data.into(),
                 fault: None,
                 opened: Arc::new(Mutex::new(Vec::new())),
+                delivered: Arc::new(AtomicU64::new(0)),
+                first_read_stall: None,
+                finish_stall: None,
+                stall_after: None,
                 ledger: None,
             })
+        }
+
+        /// Delay every `finish` by `stall` after its range is fully delivered,
+        /// holding the completed range in the scheduler's `in_flight` so a peer's
+        /// steal of an already-present range fires deterministically (see
+        /// [`finish_stall`](Self::finish_stall)).
+        #[must_use]
+        pub const fn slow_finish(mut self, stall: Duration) -> Self {
+            self.finish_stall = Some(stall);
+            self
+        }
+
+        /// Wedge every reader once it has delivered `after_bytes`: the next read
+        /// sleeps for `stall` rather than returning bytes, so the source stops
+        /// making verified progress without ever erroring (see
+        /// [`stall_after`](Self::stall_after)). Pair a `stall` well above the
+        /// scheduler's `unit_deadline` with a checkpoint-crossing `after_bytes`
+        /// to trip the stall watchdog deterministically.
+        #[must_use]
+        pub const fn stall_after(mut self, after_bytes: u64, stall: Duration) -> Self {
+            self.stall_after = Some((after_bytes, stall));
+            self
+        }
+
+        /// Inject a one-time `stall` on the first read of every reader this
+        /// source yields, so a competing fast source finishes first and steals
+        /// this one's tail — the deterministic trigger the no-double-pay test
+        /// needs.
+        #[must_use]
+        pub const fn slow_to_start(mut self, stall: Duration) -> Self {
+            self.first_read_stall = Some(stall);
+            self
+        }
+
+        /// Total WIRE bytes actually delivered across every reader (see
+        /// [`delivered`](Self::delivered)). The honest "fetched and paid" proxy
+        /// the no-double-pay assertion reads.
+        #[must_use]
+        pub fn delivered_bytes(&self) -> u64 {
+            self.delivered.load(Ordering::SeqCst)
         }
 
         /// Model payment: on every clean `finish`, advance `ledger`'s committed
@@ -504,6 +591,10 @@ mod doubles {
                         wire,
                         fault,
                         wire_len,
+                        delivered: Arc::clone(&self.delivered),
+                        first_read_stall: self.first_read_stall,
+                        stall_after: self.stall_after,
+                        read_so_far: 0,
                     },
                 ))
             })
@@ -511,6 +602,11 @@ mod doubles {
 
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
             Box::pin(async move {
+                // Hold the completed-but-unpaid range open (delivered, `fill_gap`
+                // not yet returned) so a peer can steal it while it is present.
+                if let Some(stall) = self.finish_stall {
+                    tokio::time::sleep(stall).await;
+                }
                 let Some(ledger) = &self.ledger else {
                     // Unpaid double: no channel, nothing to drain, no watermark.
                     return Ok(VoucherProgress::default());
@@ -547,12 +643,53 @@ mod doubles {
         /// The wire byte count this reader was handed (before consumption), used by
         /// [`ScriptedSource::finish`] to advance a paying ledger by this leg's spend.
         wire_len: u64,
+        /// Shared with the parent [`ScriptedSource`]: bumped by the bytes each
+        /// `read_bytes` actually yields, so a mid-stream drop stops counting the
+        /// instant it happens.
+        delivered: Arc<AtomicU64>,
+        /// A one-time stall consumed on the first `read_bytes` (see
+        /// [`ScriptedSource::slow_to_start`]); `None` after it fires once.
+        first_read_stall: Option<Duration>,
+        /// Wedge this reader once it has delivered the byte threshold (see
+        /// [`ScriptedSource::stall_after`]); `None` after it fires once.
+        stall_after: Option<(u64, Duration)>,
+        /// Wire bytes this reader has yielded so far, against `stall_after`'s
+        /// threshold.
+        read_so_far: u64,
     }
 
     impl iroh_io::AsyncStreamReader for ScriptedReader {
         async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+            // A slow-to-start peer: sleep once before the first byte so a fast
+            // peer reliably wins the race, finishes its own segment, and steals
+            // this reader's tail — the deterministic steal trigger. Cancellation
+            // drops this future while it sleeps, delivering nothing on this leg.
+            if let Some(stall) = self.first_read_stall.take() {
+                tokio::time::sleep(stall).await;
+            }
+            // A source that delivered a prefix and then wedged: it holds the
+            // connection open, returns no error, and simply stops. Only the
+            // progress-relative watchdog can end this.
+            if let Some((after, stall)) = self.stall_after
+                && self.read_so_far >= after
+            {
+                self.stall_after = None;
+                tokio::time::sleep(stall).await;
+            }
+            // Model a real network read's yield point. A synchronous in-memory
+            // reader never pends, so under the cooperative single-thread runtime
+            // the first-polled multi-source worker would drain every segment
+            // before a peer worker is ever polled — starving the fan-out. One
+            // yield per read lets concurrent workers interleave, exactly as I/O
+            // waits would. Behavior-neutral for the single-source driver tests
+            // (a yield only reschedules the same task).
+            tokio::task::yield_now().await;
             let take = self.wire.len().min(len);
-            Ok(self.wire.split_to(take))
+            let chunk = self.wire.split_to(take);
+            self.delivered
+                .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            self.read_so_far = self.read_so_far.saturating_add(chunk.len() as u64);
+            Ok(chunk)
         }
 
         async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {

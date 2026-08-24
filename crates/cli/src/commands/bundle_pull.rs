@@ -44,10 +44,10 @@ use serde::{Deserialize, Serialize};
 
 use super::chain_ctx;
 use super::fetch;
-use decdn_client_pull::PullDeadlines;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
+use decdn_client_pull::{PullDeadlines, RetryDisposition, retry_disposition};
 
 type FetchTarget = (PublicKey, Address);
 
@@ -545,6 +545,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             fetch::ProxyWarmingParams::from_args(self.common),
         )
         .await?;
+        // `bundle pull` is single-source (its `open_lock` serializes legs), so
+        // only the candidate order is used here.
+        let order = order.candidates;
 
         let mut last_err: Option<anyhow::Error> = None;
         for (attempt, cand) in order.iter().enumerate() {
@@ -554,7 +557,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 Err(err) => err,
             };
             let more = attempt + 1 < order.len();
-            if fetch::retry_disposition(&err) == fetch::RetryDisposition::Terminal || !more {
+            if retry_disposition(&err) == RetryDisposition::Terminal || !more {
                 return Err(err);
             }
             eprintln!(

@@ -54,7 +54,18 @@ pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
 pub mod ranged_store;
+/// Failover classification (#1174, ADR 037 § Fallback): decide whether a fetch
+/// failure is terminal or worth retrying against another provider/lane. Shared by
+/// the CLI single-source loop and the multi-source scheduler.
+pub mod retry;
 pub mod rtt_map;
+/// Client-only multi-source fetch scheduler (spec §5.3): fan a request across
+/// several paid sources over one shared store, with bao-aligned segmentation
+/// and tail-stealing. Drives [`driver::fill_gap`] per range.
+mod scheduler;
+/// Pure segmentation and tail-steal helpers for the multi-source scheduler
+/// (spec §5.3): no I/O, no async.
+mod segment;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
 // module's own links (`ResponseDecoder`, `resume_offset`, …) would go unresolved
@@ -65,7 +76,8 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
-pub use driver::{PacingWait, drive};
+pub use decdn_bao_range::RangedStore;
+pub use driver::{PacingWait, PoolExhausted, drive};
 pub use ledger::{
     ChainCommit, Cumulative, EpochAction, Metered, PoolLedger, Released, StreamProof,
 };
@@ -73,6 +85,8 @@ pub use pacer::{
     BudgetPacer, PULL_WINDOW_FLOOR, PaceDecision, PaceState, Pacer, RampPacer, WindowPacer,
 };
 pub use ranged_store::ClientRangedStore;
+pub use retry::{RetryDisposition, retry_disposition};
+pub use scheduler::{MultiSourceConfig, SourceLane, multi_source_fetch};
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
 
 #[cfg(any(test, feature = "test-util"))]
