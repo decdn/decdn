@@ -2,7 +2,7 @@
 //!
 //! A client (`decdn fetch`) has no seller state, so it gets a **buyer-only**
 //! store: its own `buyer-pools.redb`, one table. The node instead keeps its
-//! buyer table inside a combined `pools.redb` alongside the seller,
+//! buyer table inside a combined `lanes.redb` alongside the seller,
 //! pending-settle, and watcher-checkpoint tables, because `redb` forbids two
 //! `Database` handles on one file.
 //!

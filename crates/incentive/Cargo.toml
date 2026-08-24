@@ -14,7 +14,7 @@ categories.workspace = true
 [features]
 # Shared buyer-pool redb table (`buyer_pool_table`, #1246): the on-disk
 # record codec plus the table operations, over a caller-supplied
-# `redb::Database`. The node's combined seller+buyer `pools.redb` store
+# `redb::Database`. The node's combined seller+buyer `lanes.redb` store
 # enables *only* this and keeps its own file + per-op transaction wiring (redb
 # forbids two `Database` handles on one file), so both buyer stores share one
 # definition of the on-disk format without the node adopting

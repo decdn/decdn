@@ -480,8 +480,8 @@ impl Drop for FloorReservation {
         // Persist the new total best-effort. The in-memory `dead_charge` above is
         // authoritative for the running process; the durable copy only guards a
         // restart, so a lost persist is the documented small crash-window residual —
-        // logged, never panicked or propagated. `record_loss` is MONOTONIC (it takes
-        // the max with the on-disk value), so two drops on the same pool completing
+        // logged, never panicked or propagated. `record_loss` is MONOTONIC (it raises
+        // the stored total, never lowers it), so two drops on the same pool completing
         // out of order cannot regress the row. `record_loss` may fsync, so offload it
         // to a blocking task when a runtime is available; a drop outside any runtime
         // (e.g. a sync test) records inline.

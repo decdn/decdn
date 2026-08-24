@@ -541,6 +541,21 @@ since project inception and will roll into the first tagged release.
 
 #### Payments
 
+- **`PoolFloorLossStore` enforces its monotonic contract, and a no-op write no
+  longer fsyncs.** The trait doc stated that a pool's dead charge was monotonic
+  "by caller discipline", but a floor-reservation drop reads its cumulative total
+  under the pool-map lock and then persists it from an independent blocking task,
+  so no caller can order its write against another's — and the redb store already
+  clamped while the in-memory
+  store overwrote, leaving tests written against the memory store unrepresentative
+  of what ships. Both impls now raise the stored total and never lower it, with
+  `forget_loss` the only downward transition. The redb store reads the row and
+  aborts the transaction instead of committing when the total does not advance,
+  so a late, smaller write costs no fsync — this table shares one file with the
+  lane table, where an unconditional commit contended with the periodic voucher
+  flush. Skipping the commit is sound only because every writer of that file uses
+  `Durability::Immediate`, so the stored total is already durable.
+
 - **A cooperative close now reconciles when the client's watermark lags the
   node's (#1495).** `decdn channel coop-close`
   refuses any provider tuple above what the client persisted — correctly, since
@@ -831,6 +846,20 @@ since project inception and will roll into the first tagged release.
   longer exists. Retained here only so the issue number resolves.
 
 ### Changed
+
+- **The node flushes lane writes to redb in table-key order, and the workspace
+  floor moves to `redb = "4.2"`.** `flush` drains a `HashSet` of dirty lanes, so
+  the batch reached redb in an arbitrary order. Sorting it by the
+  `pool_id ‖ signer ‖ provider` table key first hits redb's append fast path,
+  which fills a leaf page before opening the next instead of leaving each one
+  part-full at a random split point: measured over 512 lanes, `lane_state_v1`
+  occupies about 30% fewer leaf pages (47 against 65-68). The gain lands on keys
+  appended past the end of the table — new lanes, and the cold-load case — since
+  an overwrite of a hydrated lane replaces in place whatever order it arrives in.
+  The `4.2` floor is load-bearing: that append fast path arrives in 4.2, and below
+  it the same sort is a pessimization (1.31x MORE leaf pages on 4.1), so a
+  lockfile regeneration resolving under the floor would silently invert the
+  change. Tombstones sort alongside the writes, so a flush is deterministic.
 
 - **config: `cache.max_blob_size_mb` now defaults to `cache.cache_size_mb`
   instead of a fixed 1 GiB.** The old memory-era default refused a blob a node's
