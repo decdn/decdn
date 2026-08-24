@@ -35,13 +35,19 @@ since project inception and will roll into the first tagged release.
   Both are encoded and decoded two-phase, via `encode_probe_response` /
   `parse_probe_response_ext` and the `StreamResponse` twins. `dht.rs` gains
   `FindValueResponseExt` and `StoreRequestExt` (both empty today) plus
-  `encode_dht_message`, so all three ALPNs carry the seam ADR 013 §Tier 1 requires.
-  - Why now: postcard fills no defaults for absent trailing fields, so an
-    `Option<T>` appended to an existing struct fails to decode against an older
-    sender. A separately-encoded extension is the only way to add an unsigned
-    field without an ALPN bump — and the wire freezes at first deployment. The
-    ADRs described these fields as trailing; the code had them embedded between
-    `body` and `slash_sig`.
+  `encode_find_value_response` / `encode_store_request`, wired through the DHT
+  handler's write and read paths so all three ALPNs carry the seam ADR 013 §Tier 1
+  requires — and so the DHT half is exercised rather than merely reserved.
+  - Why: postcard fills no defaults for absent trailing fields, so an `Option<T>`
+    appended to an existing struct fails to decode against an older sender. A
+    separately-encoded extension is the only way to add an unsigned field without
+    an ALPN bump. The ADRs already described these fields as trailing; the code
+    had them embedded between `body` and `slash_sig`.
+  - Why now rather than later: only the *relocation* is wire-breaking and so
+    pre-launch-only. The extension mechanism itself could be added at any time —
+    every reader decodes with `take_from_bytes` and already tolerates trailing
+    bytes. What this buys is a frozen base that is exactly signed content plus its
+    signature, with every unsigned field in one place.
   - `StreamResponse::validate` no longer checks `ok`/`error` agreement, because it
     can no longer see `error`. That rule moved to `StreamResponseExt::validate`,
     which takes `ok`; a receiver must call both.
@@ -66,8 +72,11 @@ since project inception and will roll into the first tagged release.
     arranged, or the payer settles residuals with a signed voucher per frame
     instead of releasing one hash-chain preimage per interval.
   - New config key `payment.frame_target_bytes` (restart-required, like the rest
-    of `[payment]`). Node-local and never negotiated: nothing on the wire carries
-    it, and the serve loop clamps each frame to the credit window's remaining room.
+    of `[payment]`), valid in `1..=1048576`. Node-local and never negotiated:
+    nothing on the wire carries it, and the serve loop clamps each frame both to
+    the payment-chunk boundary and to the credit window's remaining room. One
+    payment chunk is the ceiling because a frame never crosses a boundary; a
+    larger value is rejected rather than silently ignored.
 
 - **Container image renamed to `decdn-node`, and now published to Docker Hub as
   well as GHCR.** `ghcr.io/decdn/decdn` becomes `ghcr.io/decdn/decdn-node`, and
@@ -1481,9 +1490,15 @@ since project inception and will roll into the first tagged release.
   `rate_per_mb` it claimed. `decdn_client_pull::probe::verify_probe_response`
   now runs the value invariants, the echoed-field correlation, and recovery to
   the candidate's registered operator address (ADR 014 §1), and `fetch`/`bundle
-  pull` call it before ordering candidates. A failure drops the response and
-  skips the candidate as requester-local policy — never scored against the peer,
-  since a signature that does not recover attributes nothing to anyone.
+  pull` call it before ordering candidates, as does the daemon's own
+  provider-selection probe on a cache miss. A failure drops the response and skips
+  the candidate as requester-local policy — never scored against the peer, since a
+  signature that does not recover attributes nothing to anyone.
+  - `decdn fetch` now distinguishes the two ways every candidate can drop out. A
+    wrong `blockchain.slash_judge_address` or `chain_id` fails verification against
+    every honest node, and reporting that as "none of the probed nodes hold the
+    blob" sends an operator hunting for missing content instead of a local
+    misconfiguration.
   - The quoted rate is what `slash_sig` makes non-repudiable: quoting `R1` on
     probe and charging `R2 > R1` within 30 s is slashable on those two signed
     messages alone. An unverified response is not evidence of anything.

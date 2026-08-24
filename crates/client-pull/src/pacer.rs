@@ -40,7 +40,15 @@ use decdn_protocol::client::CHUNK_BYTES;
 /// the chunk it must complete to pay — a payment that can then never come. Carrying
 /// both roundings on top of the chunk closes that gap at every window size, because
 /// the ramp only ever widens the window above this floor.
-pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 2 * CHUNK_GROUP_BYTES;
+///
+/// A **third** group covers the serving node's prefetch. A serve leg reads one frame
+/// ahead of its own credit-window check, so once that window shuts it still asks its
+/// producer for up to one bao chunk group more wire — bytes the producer can only
+/// get from this pull. Without reserved headroom that request parks on data the pull
+/// may not draw until a payment that the parked serve leg is the one blocked from
+/// collecting. The two rounding groups cannot pay for it: the liveness invariant
+/// below spends them in full.
+pub const PULL_WINDOW_FLOOR: u64 = CHUNK_BYTES + 3 * CHUNK_GROUP_BYTES;
 
 /// A snapshot of one fetch's budget state at a gap boundary, everything a
 /// [`Pacer`] needs and nothing it must fetch. Plain `Copy` data so a decision is
@@ -498,20 +506,32 @@ mod tests {
     /// The liveness invariant `PULL_WINDOW_FLOOR` exists to hold: a pull window
     /// must clear one payment chunk by BOTH group roundings that separate paid
     /// wire from drawable content — `content_paid_frontier`'s floor to a group
-    /// boundary, and `WindowPacer`'s floor of its own room to whole groups.
+    /// boundary, and `WindowPacer`'s floor of its own room to whole groups — AND
+    /// still leave a group for the serving node's one-frame prefetch.
     ///
     /// Modelled at the worst case for each: the served-paid frontier lags the
     /// client's true paid position by a full group, and the room the pacer grants
-    /// loses another. What survives must still be a whole chunk, or the client can
-    /// never complete the chunk whose payment would widen the window.
+    /// loses another. What survives must be a whole chunk plus the group the serve
+    /// leg reads ahead, or one side or the other parks — the client short of the
+    /// chunk whose payment would widen the window, or the serve leg short of the
+    /// frame it prefetches past its own shut window.
+    ///
+    /// The prefetch term is what ties this constant to
+    /// `ClientHandler::frame_target`'s room floor on the serving side. Lowering
+    /// this floor, or raising that floor, breaks liveness on the cache-miss leg —
+    /// and it breaks it as a hang, not a failed assertion, so it is pinned here
+    /// rather than left to an integration test to discover by timeout.
     #[test]
-    fn the_pull_window_floor_clears_one_chunk_after_both_group_roundings() {
+    fn the_pull_window_floor_clears_one_chunk_and_a_prefetch_after_both_roundings() {
         let survives = PULL_WINDOW_FLOOR - 2 * CHUNK_GROUP_BYTES;
+        let needed = CHUNK_BYTES + CHUNK_GROUP_BYTES;
         assert!(
-            survives >= CHUNK_BYTES,
+            survives >= needed,
             "a {PULL_WINDOW_FLOOR}-byte floor leaves only {survives} bytes after both \
-             roundings, short of the {CHUNK_BYTES}-byte chunk the client must complete \
-             to pay — the pull would park forever"
+             roundings, short of the {needed} bytes the client must draw — one \
+             {CHUNK_BYTES}-byte chunk to complete a payment, plus the \
+             {CHUNK_GROUP_BYTES}-byte group the serve leg prefetches past a shut \
+             window. One side or the other would park forever"
         );
     }
 

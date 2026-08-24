@@ -2053,8 +2053,9 @@ fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow
 /// `expected_wire_bytes` have arrived) through the shared `ledger`, until
 /// `StreamEnd`. Returns the assembled buffer and the cumulative byte count for
 /// the caller's completeness check (integrity is verified per bao chunk group by
-/// the decoder, not here). Enforces `ChunkData`'s bounds — the non-empty FLOOR and the
-/// size ceiling (#1088) — plus the `cumulative <= expected_wire_bytes` overrun guard
+/// the decoder, not here). Enforces `ChunkData`'s non-empty FLOOR (#1088) — an
+/// oversized frame is refused earlier still, by the framing layer's
+/// `MAX_MESSAGE_SIZE`, before it allocates — plus the `cumulative <= expected_wire_bytes` overrun guard
 /// (ADR 005 §`cdn/client/v1`). The floor is the load-bearing one: it is what lets the
 /// inactivity deadline below rest on frame arrival, since an empty frame would refresh
 /// the clock while advancing nothing.
@@ -2146,7 +2147,7 @@ async fn receive_and_pay(
             ClientMessage::ChunkData(chunk) => {
                 // The running total must not exceed what the response promised —
                 // otherwise a malicious server could stream unbounded bytes (OOM) and
-                // we would overpay (ADR 005 §`cdn/client/v1`). The 1..=CHUNK_SIZE bounds
+                // we would overpay (ADR 005 §`cdn/client/v1`). The non-empty floor
                 // needed no check here: the frame could not have been decoded otherwise.
                 let chunk_len = chunk.bytes().len() as u64;
                 cumulative = cumulative.saturating_add(chunk_len);
@@ -2580,9 +2581,11 @@ impl UpstreamPull {
     /// More bytes than promised, a mid-stream `StreamError` (typed [`UpstreamRefused`]), an
     /// unexpected message, a [`UpstreamVoucherRejected`] / transport error while paying, or —
     /// on the inactivity clock — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
-    /// the stall budget elapses before the first byte (`cumulative == 0`). An empty or
-    /// over-`CHUNK_SIZE` `ChunkData` is not raised here: it is rejected at decode by
-    /// `ChunkData`'s `serde(try_from)` (#1088), so it surfaces out of `read_client_message`.
+    /// the stall budget elapses before the first byte (`cumulative == 0`). A malformed
+    /// `ChunkData` is not raised here: an empty payload is rejected at decode by
+    /// `ChunkData`'s `serde(try_from)` (#1088) and an oversized frame by the framing
+    /// layer's `MAX_MESSAGE_SIZE` before it allocates, so both surface out of
+    /// `read_client_message`.
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
             return Ok(None);

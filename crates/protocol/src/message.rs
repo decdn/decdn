@@ -118,28 +118,28 @@ pub enum MessageValidationError {
     /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
     /// `error`. A node MUST NOT both promise to serve and report a failure
     /// (ADR 005 §`cdn/client/v1`). Enforced via
-    /// [`crate::client::StreamResponse::validate`].
+    /// [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse has ok=true but also carries an error")]
     StreamErrorWithOk,
     /// A [`crate::client::StreamResponse`] carries `body.ok == false` but no
     /// `error` code. A refusal MUST name its reason (ADR 005
-    /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponse::validate`].
+    /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse has ok=false but no error code")]
     MissingStreamError,
     /// A [`crate::client::StreamResponse`] carries a mid-stream-only
     /// [`crate::client::StreamError::VoucherRejected`] in its `error` field.
     /// That variant rides exclusively in [`crate::client::ClientMessage::StreamError`]
     /// (ADR 005 §`VoucherRejected` semantics). Enforced via
-    /// [`crate::client::StreamResponse::validate`].
+    /// [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse.error carries VoucherRejected (a mid-stream-only code)")]
     VoucherRejectedInResponse,
     /// A [`crate::client::ChunkData`] carries a zero-length payload. ADR 005
-    /// §Partial final chunk permits a *smaller* final frame, never an *empty*
+    /// §Frame size permits a *shorter* final frame, never an *empty*
     /// one: an empty frame advances neither the receiver's cumulative byte count
     /// nor its voucher accounting, so an unbounded run of them drives the receive
     /// loop without application-level progress (#1088). Enforced by
-    /// [`crate::client::ChunkData::new`] and the `try_from` decode gate — the only
-    /// two ways to obtain a frame.
+    /// [`crate::client::ChunkData::new`], the `try_from` decode gate, and
+    /// [`crate::client::encode_chunk_frame`] — every route to a frame body.
     #[error(
         "ChunkData carries a zero-length payload (ADR 005: a chunk must carry at least 1 byte)"
     )]

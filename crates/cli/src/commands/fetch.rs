@@ -353,8 +353,16 @@ pub(crate) async fn probe_and_order(
     // Candidate pool): reachable nodes that don't hold the blob, with a measured
     // RTT. Only collected when warming is enabled.
     let mut warming_pool: Vec<discovery::WarmingCandidate> = Vec::new();
+    // Three ways a candidate drops out, counted separately: the terminal error below
+    // has to name the one that actually happened. A wrong `slash_judge_address` or
+    // `chain_id` makes EVERY honest node fail verification, and reporting that as
+    // "nobody holds the blob" sends the operator hunting for missing content instead
+    // of a local misconfiguration.
+    let mut unreachable = 0usize;
+    let mut unverifiable = 0usize;
     for (cand, res) in results {
         let Some((resp, resp_ext, rtt_ms)) = res else {
+            unreachable += 1;
             continue;
         };
         // Verify BEFORE the response can influence the order (ADR 014 §1). A
@@ -370,6 +378,7 @@ pub(crate) async fn probe_and_order(
             // `decdn` installs no tracing subscriber, so this goes to stderr —
             // a candidate silently vanishing from selection is exactly what the
             // user needs told.
+            unverifiable += 1;
             eprintln!(
                 "warning: dropping an unverifiable probe response from {}: {e}",
                 cand.node_id
@@ -395,7 +404,20 @@ pub(crate) async fn probe_and_order(
     }
 
     if holders.is_empty() {
-        anyhow::bail!("none of the {probe_count} probed node(s) hold the requested blob");
+        if unverifiable > 0 {
+            anyhow::bail!(
+                "{unverifiable} of {probe_count} probed node(s) answered, but their probe \
+                 signatures did not recover to the operator address each is registered \
+                 under. That is usually local configuration rather than missing content: \
+                 check that blockchain.slash_judge_address and blockchain.chain_id match \
+                 the deployment these nodes registered against"
+            );
+        }
+        let answered = probe_count.saturating_sub(unreachable);
+        anyhow::bail!(
+            "none of the {probe_count} probed node(s) hold the requested blob \
+             ({unreachable} did not answer, {answered} answered without it)"
+        );
     }
 
     let ordered = failover_order(holders, &warming_pool, warming);

@@ -30,7 +30,7 @@ The Ethereum key is the same secp256k1 key the node already holds for staking an
 
 ```
 ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, slash_sig}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, slash_sig} ++ Ext {error?}
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`

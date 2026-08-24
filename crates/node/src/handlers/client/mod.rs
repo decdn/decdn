@@ -1561,15 +1561,6 @@ impl ClientHandler {
         }
     }
 
-    /// The effective downstream credit window in bytes for a stream whose voucher
-    /// interval is `interval_bytes` and whose cumulative confirmed payment is
-    /// `paid` (ADR 003 §Credit window). The window ramps from one interval toward
-    /// `credit_max` as `paid` grows, so the serve loop's bounded credit exposure —
-    /// `delivered − paid` — is exactly the window: `paid / credit_ramp_divisor`
-    /// once that clears the one-interval floor, the floor itself below that point
-    /// (including at `paid == 0`), and the full `credit_max` when
-    /// `credit_ramp_divisor` is `0`. Floored at one interval so the loop always
-    /// makes progress.
     /// The frame size to request from a frame producer, given `unvouchered` — the
     /// bytes delivered since the last payment-chunk boundary — and `interval_bytes`,
     /// the payment quantum.
@@ -1599,19 +1590,56 @@ impl ClientHandler {
     /// recoup — which it cannot do while parked. Sizing the request to the room that
     /// actually remains keeps the prefetch satisfiable from what is already buffered.
     ///
-    /// The room cap is floored at one bao chunk group so a closed window yields a
-    /// short frame rather than a single byte; that runt is sent once the recoup
-    /// reopens the window, so a fully-ramped stream settles at about two frames per
-    /// payment chunk rather than one.
+    /// The room cap is floored at one bao chunk group so a shut window yields a
+    /// short frame rather than a single byte; that runt goes out once the recoup
+    /// reopens the window. A stream sitting at the one-chunk credit floor therefore
+    /// spends about two frames per payment chunk — a full frame, then the runt the
+    /// shut window produced — while a ramped stream keeps `room` far above the floor
+    /// and spends one.
+    ///
+    /// **The floor is exactly one group because the pull side reserves exactly one.**
+    /// On a cache miss the bytes this prefetch asks for can only come from the
+    /// upstream pull, and `decdn_client_pull::PULL_WINDOW_FLOOR` carries a third
+    /// chunk group for precisely this request. Raising the floor here without
+    /// raising it there parks the serve leg on bytes the pull may not draw —
+    /// a hang, not a failed assertion. `frame_target_room_floor_matches_the_pull_reservation`
+    /// pins the pair.
     pub(super) fn frame_target(&self, unvouchered: u64, interval_bytes: u64, room: u64) -> usize {
-        let to_boundary = interval_bytes.saturating_sub(unvouchered).max(1);
+        // `unvouchered < interval_bytes` at every call site — both loops reset it to
+        // zero the moment it reaches a full interval. Were that ever to break, a
+        // saturating `0` would ask for one-byte frames forever: a stream that still
+        // "progresses" at six orders of magnitude below line rate, with no error and
+        // no metric. Fall back to a whole interval instead, which is wrong in the
+        // same direction as the rest of the clamp rather than catastrophically.
+        debug_assert!(
+            unvouchered < interval_bytes,
+            "unvouchered {unvouchered} must stay below the {interval_bytes}-byte interval"
+        );
+        let to_boundary = interval_bytes
+            .checked_sub(unvouchered)
+            .filter(|remaining| *remaining > 0)
+            .unwrap_or(interval_bytes);
         let want = self
             .frame_target_bytes
             .min(to_boundary)
             .min(room.max(decdn_bao_range::CHUNK_GROUP_BYTES));
-        usize::try_from(want).unwrap_or(usize::MAX)
+        // Saturating toward `usize::MAX` would tell a producer to buffer without
+        // bound — the O(blob size) behaviour the framers exist to avoid. Every term
+        // above is already `<= CHUNK_BYTES`, so this only ever runs on a 16-bit
+        // target, where one chunk group is the safe answer.
+        usize::try_from(want)
+            .unwrap_or_else(|_| usize::try_from(decdn_bao_range::CHUNK_GROUP_BYTES).unwrap_or(1))
     }
 
+    /// The effective downstream credit window in bytes for a stream whose voucher
+    /// interval is `interval_bytes` and whose cumulative confirmed payment is
+    /// `paid` (ADR 003 §Credit window). The window ramps from one interval toward
+    /// `credit_max` as `paid` grows, so the serve loop's bounded credit exposure —
+    /// `delivered − paid` — is exactly the window: `paid / credit_ramp_divisor`
+    /// once that clears the one-interval floor, the floor itself below that point
+    /// (including at `paid == 0`), and the full `credit_max` when
+    /// `credit_ramp_divisor` is `0`. Floored at one interval so the loop always
+    /// makes progress.
     pub(super) fn credit_window(&self, interval_bytes: u64, paid: u64) -> u64 {
         decdn_incentive::ramped_credit_window(
             self.credit_ramp_divisor,
@@ -2125,9 +2153,9 @@ mod tests {
     /// target. Both sides meter the same frame sequence and exchange one preimage per
     /// interval; a straddling frame lands the payer past the boundary, which settles
     /// as a signed residual voucher instead — a per-frame signature on the hot path
-    /// and a cadence the two sides no longer share. The 1 KiB frames this replaced
-    /// got the property for free (1024 divides 1 MiB); at any other size it has to be
-    /// arranged.
+    /// and a cadence the two sides no longer share. A frame size that divides
+    /// `interval_bytes` gets the property for free; at any other size it has to be
+    /// cut for explicitly, which is what this clamp does.
     #[tokio::test]
     async fn a_frame_never_crosses_a_payment_chunk_boundary() {
         let metrics = Arc::new(Metrics::new());
@@ -2156,9 +2184,10 @@ mod tests {
         assert_eq!(unvouchered, interval, "the walk must land ON the boundary");
     }
 
-    /// At the default 1 MiB target an interval costs ONE frame, not the 1,024 the
-    /// fixed 1 KiB payload cost. This is the whole point of the change and nothing
-    /// else measures it.
+    /// At the default target an open window spends exactly ONE frame per payment
+    /// interval. Nothing else pins that the default target and the payment quantum
+    /// line up, and a regression multiplies per-frame CPU across every byte the node
+    /// egresses.
     #[tokio::test]
     async fn an_open_window_spends_one_frame_per_payment_chunk() {
         let metrics = Arc::new(Metrics::new());
@@ -2168,6 +2197,36 @@ mod tests {
             handler.frame_target(0, interval, u64::MAX) as u64,
             interval,
             "an open window at the default target must cover the interval in one frame"
+        );
+    }
+
+    /// The serve side's prefetch floor and the pull side's reservation are one
+    /// invariant split across two crates, so it needs a test that names both.
+    ///
+    /// `frame_target` floors its room cap at one bao chunk group, which on a cache
+    /// miss is a request the upstream pull must be allowed to satisfy past a shut
+    /// credit window. `PULL_WINDOW_FLOOR` reserves a third group for exactly that.
+    /// Raise one without the other and the cache-miss leg parks — and it parks as a
+    /// hang with no diagnostic, which is why the relationship is asserted here
+    /// rather than left to an integration test's timeout.
+    #[tokio::test]
+    async fn frame_target_room_floor_matches_the_pull_reservation() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+
+        // What the serve side asks for past a shut window.
+        let prefetch = handler.frame_target(0, interval, 0) as u64;
+        assert_eq!(prefetch, group, "the room floor is one bao chunk group");
+
+        // What the pull side can still draw once both group roundings are spent.
+        let drawable = decdn_client_pull::PULL_WINDOW_FLOOR - 2 * group;
+        assert!(
+            drawable >= interval + prefetch,
+            "the pull floor leaves {drawable} bytes after both roundings, but the \
+             client must complete a {interval}-byte chunk to pay AND the serve leg \
+             prefetches {prefetch} bytes past its shut window — the miss leg would park"
         );
     }
 

@@ -450,15 +450,8 @@ async fn open_paid_stream(
     write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
-    match read_client_msg(&mut recv).await? {
-        ClientMessage::StreamResponse(resp) => {
-            anyhow::ensure!(
-                resp.body.ok,
-                "delivery refused (code rides in the trailing ext)"
-            );
-        }
-        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
-    }
+    let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
     Ok((send, recv))
 }
 
@@ -1379,15 +1372,8 @@ async fn stall_delivery_at_closing_voucher(
         .await
         .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
 
-    match read_client_msg(&mut recv).await? {
-        ClientMessage::StreamResponse(resp) => {
-            anyhow::ensure!(
-                resp.body.ok,
-                "delivery refused (code rides in the trailing ext)"
-            );
-        }
-        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
-    }
+    let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error);
 
     let mut wire_bytes: u64 = 0;
     while wire_bytes < expected_wire {
@@ -4737,7 +4723,7 @@ async fn setup_recheck_holder_and_driven(
 /// Drive a paid stream to completion from the fixture's parked state and return the
 /// total WIRE bytes received (bao content + proof, so `> ` the blob's content size).
 ///
-/// Delivery frames are far smaller than a payment chunk, so a per-frame voucher would sign
+/// A payment chunk spans one or a few delivery frames, so a per-frame voucher would sign
 /// thousands of times; instead this pays one cumulative voucher per accumulated
 /// voucher-interval (the efficient cadence the other loopback tests use). The
 /// window ramp can leave a final sub-interval remainder the server parks on

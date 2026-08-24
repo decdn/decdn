@@ -875,9 +875,11 @@ pub struct PaymentConfig {
     /// Node-local policy that is never negotiated: no message carries it, the payer
     /// accepts any non-empty frame, and both bao verification and the payment meter
     /// are defined over byte counts rather than frame boundaries. Raising it lowers
-    /// per-frame CPU per byte served; the effective ceiling is the framing layer's
-    /// 16 MiB `MAX_MESSAGE_SIZE`. The serve loop clamps each frame to the credit
-    /// window's remaining room, so a large value does not widen credit exposure.
+    /// per-frame CPU per byte served, up to one `CHUNK_BYTES` payment interval
+    /// (1 MiB) — a frame never crosses a payment-chunk boundary, so a larger value
+    /// is rejected rather than silently ignored. The serve loop also clamps each
+    /// frame to the credit window's remaining room, so a large value does not widen
+    /// credit exposure.
     pub frame_target_bytes: Option<decdn_config_types::Bytes>,
     /// Background flush period for the lane store, in ms. See
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.

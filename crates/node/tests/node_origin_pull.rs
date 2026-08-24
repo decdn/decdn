@@ -72,8 +72,8 @@ use support::{
 ///
 /// A sender's own choice, not a protocol value: `cdn/client/v1` bounds a
 /// `ChunkData` payload only as non-empty, so a fixture picks whatever size makes
-/// its case legible. 1 KiB keeps these fixtures' frame counts and boundaries as
-/// they were written.
+/// its case legible. 1 KiB keeps each fixture's frame count small enough to reason
+/// about while still crossing several frame boundaries.
 const WIRE_FRAME: usize = 1024;
 
 const CHAIN_ID: u64 = 421_614;
@@ -7249,8 +7249,8 @@ async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMess
 }
 
 /// Read the open-stage `StreamResponse` with its trailing extension, so a
-/// refusal's wire code is available to the caller — it rides in the ext now, and
-/// several tests assert on the code by matching the error text.
+/// refusal's wire code is available to the caller — it rides in the extension, and
+/// several tests assert on it by matching the error text.
 async fn read_client_response(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<(StreamResponse, StreamResponseExt)> {

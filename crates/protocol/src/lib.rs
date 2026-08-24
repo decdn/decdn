@@ -21,7 +21,8 @@ pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,
     FindNodeResponse, FindValueRequest, FindValueResponse, FindValueResponseExt,
     MAX_BATCH_STORE_HASHES, MAX_CLOSER_NODES, MAX_PROVIDERS_PER_HASH, StoreAck, StoreRequest,
-    StoreRequestExt, encode_dht_message, parse_find_value_response_ext, parse_store_request_ext,
+    StoreRequestExt, encode_find_value_response, encode_store_request,
+    parse_find_value_response_ext, parse_store_request_ext,
 };
 pub use framing::{
     FrameError, MAX_MESSAGE_SIZE, TopLevelEnum, decode_message, encode_message, is_unknown_variant,

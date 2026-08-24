@@ -582,7 +582,7 @@ pub async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMess
 ///
 /// The open-stage twin of [`read_client_msg`], which drops the remainder because
 /// every mid-stream variant is a single postcard value. Use this wherever a test
-/// needs the unsigned `error` code, which now rides in the extension.
+/// needs the unsigned `error` code, which rides in the extension.
 pub async fn read_stream_response(
     recv: &mut RecvStream,
 ) -> anyhow::Result<(

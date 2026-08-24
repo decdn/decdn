@@ -372,8 +372,16 @@ impl DhtHandler {
                 return Ok(());
             }
         };
-        let payload = encode_message(&resp)
-            .map_err(|e| anyhow::anyhow!("dht response encode failed: {e}"))?;
+        // `FindValueResponse` carries a Tier-1 extension (ADR 013 §Tier 1), so it
+        // is encoded two-phase; every other variant is a single postcard value.
+        let payload = match &resp {
+            wire::DhtMessage::FindValueResponse(r) => {
+                wire::encode_find_value_response(r, Some(&wire::FindValueResponseExt::default()))
+                    .map_err(|e| anyhow::anyhow!("dht response encode failed: {e}"))?
+            }
+            other => encode_message(other)
+                .map_err(|e| anyhow::anyhow!("dht response encode failed: {e}"))?,
+        };
         write_frame(&mut send, &payload)
             .await
             .map_err(|e| anyhow::anyhow!("dht response write failed: {e}"))?;
@@ -769,7 +777,19 @@ async fn read_dht_request(
                 app_code,
             })
         }
-        Ok((msg, _tail)) => {
+        Ok((msg, tail)) => {
+            // A `Store` carries a Tier-1 extension; parsing it here is what makes the
+            // seam real rather than a reserved name. Every other request leaves an
+            // empty remainder, which reads back as the default.
+            if matches!(msg, wire::DhtMessage::Store(_))
+                && let Err(e) = wire::parse_store_request_ext(tail)
+            {
+                reset(send, recv, APP_ERR_MALFORMED_MESSAGE);
+                return Err(DhtReadError {
+                    err: anyhow::anyhow!("dht store extension decode failed: {e}"),
+                    app_code: APP_ERR_MALFORMED_MESSAGE,
+                });
+            }
             // Narrow the full wire enum down to the handler-supported
             // request set. Response variants on a server-accepted stream
             // close with `APP_ERR_UNSUPPORTED_MESSAGE`: the handler is a

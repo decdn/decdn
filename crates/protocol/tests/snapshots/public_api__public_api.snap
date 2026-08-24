@@ -182,7 +182,8 @@ pub struct decdn_protocol::dht::StoreRequestExt
 pub const decdn_protocol::dht::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::dht::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::dht::MAX_PROVIDERS_PER_HASH: usize
-pub fn decdn_protocol::dht::encode_dht_message(&decdn_protocol::dht::DhtMessage, core::option::Option<&[u8]>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::dht::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::dht::encode_store_request(&decdn_protocol::dht::StoreRequest, core::option::Option<&decdn_protocol::dht::StoreRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::dht::parse_find_value_response_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::FindValueResponseExt, postcard::error::Error>
 pub fn decdn_protocol::dht::parse_store_request_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::StoreRequestExt, postcard::error::Error>
 pub mod decdn_protocol::framing
@@ -541,9 +542,10 @@ impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMes
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
-pub fn decdn_protocol::encode_dht_message(&decdn_protocol::dht::DhtMessage, core::option::Option<&[u8]>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::encode_probe_response(&decdn_protocol::message::ProbeResponse, core::option::Option<&decdn_protocol::message::ProbeResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::encode_store_request(&decdn_protocol::dht::StoreRequest, core::option::Option<&decdn_protocol::dht::StoreRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_stream_response(&decdn_protocol::client::StreamResponse, core::option::Option<&decdn_protocol::client::StreamResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool

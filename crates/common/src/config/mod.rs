@@ -387,8 +387,10 @@ pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
 /// chunk. Node-local policy that travels on no message: the payer accepts any
 /// non-empty frame, and neither the bao codec's chunk groups nor the payment meter
 /// is defined over frame boundaries. Larger frames cost proportionally less
-/// per-frame CPU per byte served; the serve loop clamps each frame to the credit
-/// window's remaining room, so this is a ceiling rather than an exact size.
+/// per-frame CPU per byte served, and one payment interval is both the default and
+/// the maximum — a frame never crosses a payment-chunk boundary. The serve loop also
+/// clamps each frame to the credit window's remaining room, so this is a ceiling
+/// rather than an exact size.
 pub const DEFAULT_FRAME_TARGET_BYTES: u64 = decdn_protocol::CHUNK_BYTES;
 /// Default background flush period in milliseconds when
 /// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
@@ -2678,18 +2680,29 @@ pub fn resolve_payment_into(
     let credit_ramp_divisor = file
         .and_then(|p| p.credit_ramp_divisor)
         .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
-    // Serve-path wire-frame target (ADR 005 §`cdn/client/v1`). Default 1 MiB. No
-    // upper bound is enforced here: the framing layer refuses anything over
-    // `MAX_MESSAGE_SIZE` (16 MiB) at write time, which is the real ceiling. `0` is
-    // rejected below — it would ask the framers for zero-length frames, and an empty
-    // `ChunkData` is a protocol error.
+    // Serve-path wire-frame target (ADR 005 §`cdn/client/v1`). Default and ceiling
+    // are both one `CHUNK_BYTES` payment interval: a frame never crosses a payment
+    // boundary, so the serve loop clamps every request to the interval remainder and
+    // a larger value could not reach the wire. Rejected rather than silently clamped
+    // — an operator who sets 8 MiB expecting bigger frames deserves to be told the
+    // value is unreachable, not to watch for a change that never comes. `0` is
+    // rejected for the opposite reason: it would ask the framers for zero-length
+    // frames, and an empty `ChunkData` is a protocol error.
     let frame_target_bytes = file
         .and_then(|p| p.frame_target_bytes.as_ref())
         .map_or(DEFAULT_FRAME_TARGET_BYTES, |b| b.get());
-    bag.check_with(frame_target_bytes > 0, "payment.frame_target_bytes", || {
-        "payment.frame_target_bytes must be > 0 (an empty wire frame is a protocol error)"
-            .to_string()
-    });
+    bag.check_with(
+        frame_target_bytes > 0 && frame_target_bytes <= decdn_protocol::CHUNK_BYTES,
+        "payment.frame_target_bytes",
+        || {
+            format!(
+                "payment.frame_target_bytes must be in 1..={} (one payment chunk); a \
+                 frame never crosses a payment-chunk boundary, so a larger value \
+                 could never reach the wire",
+                decdn_protocol::CHUNK_BYTES
+            )
+        },
+    );
     // Background flush period (ADR 003 §Off-chain voucher state persistence).
     // `0` would build a zero-period `tokio::time::interval`, which panics; reject
     // it so an operator wanting tight durability sets a small positive value.

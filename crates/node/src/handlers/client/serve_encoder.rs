@@ -13,7 +13,8 @@
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
 //!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture;
 //! - the encoded bytes are pushed through a bounded channel ([`ChannelWriter`]) and
-//!   re-cut into `CHUNK_SIZE` `cdn/client/v1` frames by [`CoherentFrameProducer`].
+//!   coalesced into `cdn/client/v1` frames of a caller-chosen target size by
+//!   [`CoherentFrameProducer`].
 //!
 //! The encode future and the frame consumer run CONCURRENTLY on the one serve task
 //! (the bounded channel backpressures the encoder), so `CoherentFrameProducer`

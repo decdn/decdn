@@ -127,9 +127,12 @@ impl ClientMessage {
     /// skipped (they are not enforced at decode time — see
     /// [`StreamResponse::validate`]).
     ///
-    /// `StreamRequest`'s optional [`StreamRequestExt`] travels as separate
-    /// trailing bytes (two-phase), so it is *not* reachable from here; validate
-    /// it via [`StreamRequestExt::validate`] after [`parse_stream_request_ext`].
+    /// The `ok`/`error` agreement is NOT among them: `error` lives in the trailing
+    /// [`StreamResponseExt`], which this method cannot see. Neither extension is
+    /// reachable from here — validate [`StreamRequestExt`] via its own `validate`
+    /// after [`parse_stream_request_ext`], and [`StreamResponseExt`] via
+    /// [`StreamResponseExt::validate`] with `body.ok` after
+    /// [`parse_stream_response_ext`].
     /// Variants with no value invariants (`StreamEnd`, `StreamError`) return
     /// `Ok(())`.
     ///
@@ -448,7 +451,7 @@ impl StreamResponseExt {
         match (ok, &self.error) {
             (true, Some(_)) => Err(MessageValidationError::StreamErrorWithOk),
             (false, None) => Err(MessageValidationError::MissingStreamError),
-            (false, Some(StreamError::VoucherRejected { .. })) => {
+            (false, Some(code)) if !code.is_delivery_side() => {
                 Err(MessageValidationError::VoucherRejectedInResponse)
             }
             _ => Ok(()),
@@ -560,9 +563,10 @@ impl StreamResponse {
 }
 
 /// Node → payer chunk of blob bytes. The payload carries at least one byte; its
-/// length is the sender's choice, bounded above only by the framing layer's
-/// [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE) (ADR 005
-/// §`cdn/client/v1`). Frames need not be uniform, and the frame before
+/// length is the sender's choice, bounded above by the framing layer's
+/// [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE); ADR 005
+/// §`cdn/client/v1` additionally requires a sender not to cross a `CHUNK_BYTES`
+/// payment boundary, so in practice a frame runs to at most one interval. Frames need not be uniform, and the frame before
 /// [`ClientMessage::StreamEnd`] is commonly shorter than the ones before it.
 ///
 /// Frame size is independent of both verification and payment. The bao codec is
@@ -571,14 +575,15 @@ impl StreamResponse {
 /// than on frames. A sender therefore picks whatever size suits it; nothing is
 /// negotiated and no message carries the choice.
 ///
-/// The lower bound is load-bearing, not cosmetic (#1088). "Partial final chunk"
-/// permits a *smaller* frame, never an *empty* one: an empty frame carries no
+/// The lower bound is load-bearing, not cosmetic (#1088). A shorter final frame
+/// A shorter final frame is permitted, never an *empty* one: an empty frame carries no
 /// payload, so it advances neither the receiver's cumulative byte count nor its
 /// voucher accounting. An unbounded run of them therefore drives the receive
 /// loops without making application-level progress, and the `cumulative >
 /// expected_wire` overrun guard — which only ever trips on bytes — never fires.
-/// An empty frame cannot be obtained at all — [`ChunkData::new`] and the `try_from` decode
-/// gate both reject one, and they are the only two doors. That is the invariant the pull
+/// An empty frame cannot be obtained at all — [`ChunkData::new`], the `try_from` decode
+/// gate, and [`encode_chunk_frame`] each reject one, and between them they are every
+/// route to a frame body. That is the invariant the pull
 /// paths' inactivity deadline rests on: with empty frames banned, "a frame arrived" and
 /// "bytes made progress" are the same statement, so a peer cannot refresh the deadline
 /// with padding.
@@ -605,7 +610,9 @@ impl StreamResponse {
 /// which invariant they had just removed — while the reputation system
 /// depends on it, since a false `PullStalled` scores an honest peer as unreachable. That
 /// is too much weight for a convention, so the type carries the floor instead: the field
-/// is private and both doors reject an empty payload, so it cannot be skipped.
+/// is private, both `ChunkData` doors reject an empty payload, and
+/// [`encode_chunk_frame`] — the door both serve paths use, which builds no
+/// `ChunkData` — restates the same check. Every route is closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ChunkDataWire")]
 pub struct ChunkData {
@@ -979,7 +986,7 @@ impl StreamError {
     /// `true` for the delivery-side codes that ride in [`StreamResponseExt::error`]
     /// alongside `ok: false` — everything except `VoucherRejected`. Expresses
     /// the enum's domain split in code rather than only in prose, and backs the
-    /// [`StreamResponse::validate`] mid-stream-only exclusion.
+    /// [`StreamResponseExt::validate`] mid-stream-only exclusion.
     pub const fn is_delivery_side(&self) -> bool {
         !self.is_mid_stream()
     }

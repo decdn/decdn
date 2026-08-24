@@ -107,7 +107,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, slash_sig}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, slash_sig} ++ Ext {error?}
 
     alt ok = true
         P->>D: Voucher {sig, amt, chain_root, chunk_price} (opens the chain)
