@@ -539,7 +539,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
 
         match read_client_msg(&mut recv).await? {
             ClientMessage::StreamResponse(r) => {
-                anyhow::ensure!(r.body.ok, "expected an ok response, got {:?}", r.error);
+                anyhow::ensure!(r.body.ok, "expected an ok response, got a refusal");
             }
             _ => anyhow::bail!("expected a StreamResponse first"),
         }
@@ -639,17 +639,19 @@ async fn lying_upstream(
         .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse {
-        body,
-        error: None,
-        slash_sig,
-    };
-    write_client_msg(&mut send, &ClientMessage::StreamResponse(resp)).await?;
+    let resp = StreamResponse { body, slash_sig };
+    let payload = decdn_protocol::encode_stream_response(
+        &resp,
+        Some(&decdn_protocol::StreamResponseExt { error: None }),
+    )?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
 
-    // The wrong bytes, streamed in `CHUNK_SIZE` chunks like the real handler (the
-    // requester rejects any chunk over the ceiling). `served` stays under one
+    // The wrong bytes, streamed in 1 KiB frames — a sender's own choice, since the
+    // requester accepts any non-empty frame. `served` stays under one payment
     // chunk, so exactly one closing voucher flows.
-    for chunk in served.chunks(decdn_protocol::CHUNK_SIZE) {
+    for chunk in served.chunks(1024) {
         write_client_msg(
             &mut send,
             &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),

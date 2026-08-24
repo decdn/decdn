@@ -6,8 +6,9 @@
 //!
 //! # Signed-field freezing (ADR 013 §Signed Field Freezing)
 //!
-//! [`ProbeResponse`] is split into a signed [`ProbeResponseBody`] plus the
-//! outer unsigned fields `total_bytes` and `slash_sig`. Unlike an Ed25519
+//! [`ProbeResponse`] is exactly a signed [`ProbeResponseBody`] plus its
+//! `slash_sig`; every unsigned field trails in [`ProbeResponseExt`], encoded
+//! separately and decoded two-phase (ADR 013 §Tier 1). Unlike an Ed25519
 //! signature over postcard bytes, `slash_sig` is **not** computed over a
 //! postcard serialization: it is an EIP-712
 //! secp256k1 signature over the *typed-data hash of the body fields*
@@ -24,9 +25,10 @@
 //! ALPN bump. ADR 013 freezes a signed field set at the protocol version that
 //! introduces it; `cdn/probe/v1` had no prior signed `ProbeResponse`, so the
 //! set `{hash, has_blob, rate_per_mb, timestamp_us}` is the v1 baseline (ADR
-//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` is the ADR 013 Tier-1
-//! unsigned-evolution exemplar (ADR 005 §`cdn/probe/v1`) and is deliberately
-//! NOT covered by `slash_sig`. The `ProbeMessage` variant order is unchanged.
+//! 005 §`cdn/probe/v1`, ADR 014 §1). `total_bytes` rides in
+//! [`ProbeResponseExt`] as the ADR 013 Tier-1 unsigned-evolution exemplar (ADR
+//! 005 §`cdn/probe/v1`) and is deliberately NOT covered by `slash_sig`. The
+//! `ProbeMessage` variant order is unchanged.
 //!
 //! This crate deliberately does not depend on any crypto library. The caller
 //! (`decdn_incentive::ProbeSlashData` and the probe handler/CLI) computes and
@@ -116,38 +118,32 @@ pub enum MessageValidationError {
     /// A [`crate::client::StreamResponse`] carries `body.ok == true` yet also an
     /// `error`. A node MUST NOT both promise to serve and report a failure
     /// (ADR 005 §`cdn/client/v1`). Enforced via
-    /// [`crate::client::StreamResponse::validate`].
+    /// [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse has ok=true but also carries an error")]
     StreamErrorWithOk,
     /// A [`crate::client::StreamResponse`] carries `body.ok == false` but no
     /// `error` code. A refusal MUST name its reason (ADR 005
-    /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponse::validate`].
+    /// §`cdn/client/v1`). Enforced via [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse has ok=false but no error code")]
     MissingStreamError,
     /// A [`crate::client::StreamResponse`] carries a mid-stream-only
     /// [`crate::client::StreamError::VoucherRejected`] in its `error` field.
     /// That variant rides exclusively in [`crate::client::ClientMessage::StreamError`]
     /// (ADR 005 §`VoucherRejected` semantics). Enforced via
-    /// [`crate::client::StreamResponse::validate`].
+    /// [`crate::client::StreamResponseExt::validate`].
     #[error("StreamResponse.error carries VoucherRejected (a mid-stream-only code)")]
     VoucherRejectedInResponse,
     /// A [`crate::client::ChunkData`] carries a zero-length payload. ADR 005
-    /// §Partial final chunk permits a *smaller* final frame, never an *empty*
+    /// §Frame size permits a *shorter* final frame, never an *empty*
     /// one: an empty frame advances neither the receiver's cumulative byte count
     /// nor its voucher accounting, so an unbounded run of them drives the receive
     /// loop without application-level progress (#1088). Enforced by
-    /// [`crate::client::ChunkData::new`] and the `try_from` decode gate — the only
-    /// two ways to obtain a frame.
+    /// [`crate::client::ChunkData::new`], the `try_from` decode gate, and
+    /// [`crate::client::encode_chunk_frame`] — every route to a frame body.
     #[error(
         "ChunkData carries a zero-length payload (ADR 005: a chunk must carry at least 1 byte)"
     )]
     EmptyChunk,
-    /// A [`crate::client::ChunkData`] payload exceeds [`crate::CHUNK_SIZE`].
-    /// The ceiling bounds receiver allocation per frame (ADR 005
-    /// §`cdn/client/v1`). Enforced by [`crate::client::ChunkData::new`] and the
-    /// `try_from` decode gate, as above.
-    #[error("ChunkData payload of {len} bytes exceeds CHUNK_SIZE ({max})", max = crate::CHUNK_SIZE)]
-    ChunkTooLarge { len: usize },
     /// A wire [`crate::client::WireCapability`]'s `owner_signature` is empty.
     /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
     /// ERC-1271 contract-signer form may be longer, so only the non-empty
@@ -202,26 +198,49 @@ pub struct ProbeRequest {
 
 /// Node → client response on `cdn/probe/v1` (ADR 005 §`cdn/probe/v1`).
 ///
-/// The signed [`ProbeResponseBody`] is covered by `slash_sig` (EIP-712
-/// secp256k1, ADR 014 §1). `total_bytes` is an optional unsigned field added
-/// per the ADR 013 Tier-1 minor-evolution pattern and is deliberately NOT
-/// covered by `slash_sig`. `slash_sig` is mandatory and non-empty on the
-/// wire; requesters MUST reject missing/zero-length signatures (enforced via
-/// [`ProbeResponse::validate`] and the requester's [`SLASH_SIG_LEN`] check).
+/// **This struct holds only the frozen base** (ADR 013 §Tier 1): the signed
+/// [`ProbeResponseBody`] and the `slash_sig` covering it. Unsigned fields live
+/// in [`ProbeResponseExt`], which travels as separate trailing bytes — see
+/// [`encode_probe_response`] / [`parse_probe_response_ext`].
+///
+/// The split is what keeps a future unsigned field out of Tier 3. Postcard is
+/// positional and fills no defaults for absent trailing fields, so an
+/// `Option<T>` appended to *this* struct would fail to decode against an older
+/// sender that never wrote it; appended to the separately-decoded extension it
+/// costs no coordination at all.
+///
+/// `slash_sig` is mandatory and non-empty on the wire; requesters MUST reject
+/// missing/zero-length signatures (enforced via [`ProbeResponse::validate`] and
+/// the requester's [`SLASH_SIG_LEN`] check).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
     pub body: ProbeResponseBody,
-    /// Blob size in bytes when known. Optional, unsigned, NOT covered by
-    /// `slash_sig` (ADR 005 §`cdn/probe/v1`, ADR 013 Tier-1). Nodes SHOULD
-    /// include it when the size is known so requesters can estimate cost.
-    pub total_bytes: Option<u64>,
     /// EIP-712 secp256k1 signature over the typed-data hash of `body`'s
     /// fields `{hash, has_blob, rate_per_mb, timestamp_us}` (ADR 014 §1; see
     /// `decdn_incentive::ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`]
     /// bytes — *not* a signature over postcard bytes. The verify path
     /// rejects any other length.
     pub slash_sig: Vec<u8>,
+}
+
+/// Optional [`ProbeResponse`] extension fields, carried as trailing bytes after
+/// the `ProbeResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_probe_response`] / [`parse_probe_response_ext`]).
+///
+/// Nothing here is covered by `slash_sig`, and nothing here may become
+/// load-bearing for payment, slashing, or any decision a lying node profits
+/// from: an unsigned field is a hint, and the sender is the party with the
+/// motive to shade it.
+///
+/// New fields are appended to the END of this struct and MUST be `Option<T>` or
+/// have a meaningful `Default`. Insertions and reordering are Tier-3.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProbeResponseExt {
+    /// Blob size in bytes when known. Nodes SHOULD include it when the size is
+    /// known so requesters can estimate cost before opening a payment pool.
+    /// Unsigned: treat it as a sizing hint, never as a commitment.
+    pub total_bytes: Option<u64>,
 }
 
 /// Signed fields of a [`ProbeResponse`]. Layout is frozen per ADR 013 — future
@@ -251,6 +270,48 @@ pub struct ProbeResponseBody {
     /// The requester-generated microsecond timestamp from the corresponding
     /// [`ProbeRequest`], echoed back unchanged.
     pub timestamp_us: u64,
+}
+
+/// Encode a [`ProbeResponse`] with its optional trailing [`ProbeResponseExt`]
+/// (ADR 013 §Tier 1, two-phase).
+///
+/// The base message and the extension are encoded as two adjacent postcard
+/// values in one frame. Encoding them separately is what makes a future field
+/// appended to [`ProbeResponseExt`] invisible to an older receiver, which stops
+/// consuming at the end of the base and discards the rest.
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_probe_response(
+    resp: &ProbeResponse,
+    ext: Option<&ProbeResponseExt>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(&ProbeMessage::Response(resp.clone()))?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    }
+    Ok(buf)
+}
+
+/// Parse the trailing [`ProbeResponseExt`] bytes returned as the remainder by
+/// [`crate::decode_message`] after a `ProbeMessage::Response`.
+///
+/// An empty remainder ⇒ [`ProbeResponseExt::default`] (no size hint). Trailing
+/// bytes beyond the known fields are tolerated for forward compatibility (ADR
+/// 013 §Tier 1): a future optional field appended to [`ProbeResponseExt`] is
+/// read by new receivers and skipped by old ones.
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `ProbeResponseExt` prefix.
+pub fn parse_probe_response_ext(remainder: &[u8]) -> Result<ProbeResponseExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(ProbeResponseExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<ProbeResponseExt>(remainder)?.0)
+    }
 }
 
 impl ProbeResponse {
@@ -317,8 +378,13 @@ mod tests {
     fn sample_response() -> ProbeResponse {
         ProbeResponse {
             body: sample_body(),
-            total_bytes: Some(4096),
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
+        }
+    }
+
+    fn sample_ext() -> ProbeResponseExt {
+        ProbeResponseExt {
+            total_bytes: Some(4096),
         }
     }
 
@@ -343,16 +409,50 @@ mod tests {
         Ok(())
     }
 
+    /// Two-phase with an extension present: the base decodes, and the remainder
+    /// carries the ext.
     #[test]
-    fn probe_response_total_bytes_none_roundtrip() -> Result<(), postcard::Error> {
-        let resp = ProbeResponse {
-            total_bytes: None,
-            ..sample_response()
-        };
-        let bytes = postcard::to_allocvec(&resp)?;
-        let decoded: ProbeResponse = postcard::from_bytes(&bytes)?;
-        assert_eq!(resp, decoded);
-        assert_eq!(decoded.total_bytes, None);
+    fn probe_response_two_phase_with_ext() -> Result<(), postcard::Error> {
+        let resp = sample_response();
+        let ext = sample_ext();
+        let buf = encode_probe_response(&resp, Some(&ext))?;
+        let (msg, remainder) = postcard::take_from_bytes::<ProbeMessage>(&buf)?;
+        assert_eq!(msg, ProbeMessage::Response(resp));
+        assert!(
+            !remainder.is_empty(),
+            "the ext must travel as trailing bytes"
+        );
+        assert_eq!(parse_probe_response_ext(remainder)?, ext);
+        Ok(())
+    }
+
+    /// A sender that writes no extension leaves an empty remainder, which reads
+    /// back as the default rather than an error. This is the case an OLD sender
+    /// produces against a NEW receiver, and it is the whole reason the ext is a
+    /// separate postcard value.
+    #[test]
+    fn probe_response_two_phase_no_ext() -> Result<(), postcard::Error> {
+        let resp = sample_response();
+        let buf = encode_probe_response(&resp, None)?;
+        let (msg, remainder) = postcard::take_from_bytes::<ProbeMessage>(&buf)?;
+        assert_eq!(msg, ProbeMessage::Response(resp));
+        assert!(remainder.is_empty());
+        assert_eq!(
+            parse_probe_response_ext(remainder)?,
+            ProbeResponseExt::default()
+        );
+        Ok(())
+    }
+
+    /// The Tier-1 property itself: a NEWER sender appends a field this build does
+    /// not know, and the ext still parses. Without this the extension seam buys
+    /// nothing.
+    #[test]
+    fn probe_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
+        let ext = sample_ext();
+        let mut bytes = postcard::to_allocvec(&ext)?;
+        bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
+        assert_eq!(parse_probe_response_ext(&bytes)?, ext);
         Ok(())
     }
 
@@ -572,23 +672,38 @@ mod tests {
                 rate_per_mb: 4,
                 timestamp_us: 5,
             },
-            total_bytes: None,
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         };
         let bytes = postcard::to_allocvec(&resp)?;
         // postcard layout: body{ hash=32 raw, has_blob=1 byte (0x01),
         // rate_per_mb=4 (1-byte varint), timestamp_us=5 (1-byte varint) },
-        // total_bytes=None (1-byte Option tag 0x00), slash_sig Vec
-        // (len varint 65=0x41, then 65 bytes).
-        let mut expected = Vec::with_capacity(32 + 1 + 1 + 1 + 1 + 1 + SLASH_SIG_LEN);
+        // slash_sig Vec (len varint 65=0x41, then 65 bytes). Nothing unsigned
+        // rides here — the extension is a SEPARATE postcard value appended by
+        // `encode_probe_response`, asserted below.
+        let mut expected = Vec::with_capacity(32 + 1 + 1 + 1 + 1 + SLASH_SIG_LEN);
         expected.extend_from_slice(&[3u8; 32]); // body.hash
         expected.push(1u8); // body.has_blob = true
         expected.push(4u8); // body.rate_per_mb varint
         expected.push(5u8); // body.timestamp_us varint
-        expected.push(0u8); // total_bytes = None
         expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
         expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
         assert_eq!(bytes, expected);
+
+        // The full frame is base ‖ ext, with the ext contributing exactly its own
+        // bytes and nothing to the base. A reader that stops after the base sees
+        // a byte-identical message either way, which is the forward-compatibility
+        // guarantee stated as bytes.
+        let framed = encode_probe_response(
+            &resp,
+            Some(&ProbeResponseExt {
+                total_bytes: Some(7),
+            }),
+        )?;
+        let mut expected_framed = vec![1u8]; // ProbeMessage::Response discriminant
+        expected_framed.extend_from_slice(&expected);
+        expected_framed.push(1u8); // total_bytes = Some
+        expected_framed.push(7u8); // total_bytes varint
+        assert_eq!(framed, expected_framed);
         Ok(())
     }
 }

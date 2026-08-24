@@ -24,10 +24,10 @@ use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer}
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, SLASH_SIG_LEN,
-    decode_message, encode_message,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, ProbeResponseExt,
+    SLASH_SIG_LEN, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
-    read_frame, write_frame,
+    parse_probe_response_ext, read_frame, write_frame,
 };
 use iroh::endpoint::{
     ApplicationClose, Connection, ConnectionError, IdleTimeout, QuicTransportConfig, ReadError,
@@ -455,9 +455,9 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
     let frame = read_frame(&mut recv)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
-    let (msg, _rest) = decode_message::<ProbeMessage>(&frame)?;
-    let resp: ProbeResponse = match msg {
-        ProbeMessage::Response(r) => r,
+    let (msg, tail) = decode_message::<ProbeMessage>(&frame)?;
+    let (resp, resp_ext): (ProbeResponse, ProbeResponseExt) = match msg {
+        ProbeMessage::Response(r) => (r, parse_probe_response_ext(tail)?),
         ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
     };
 
@@ -468,7 +468,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         !resp.body.has_blob,
         "empty cache must report has_blob=false"
     );
-    assert_eq!(resp.total_bytes, None, "no size when blob absent");
+    assert_eq!(resp_ext.total_bytes, None, "no size when blob absent");
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
     conn.close(0u32.into(), b"bye");
@@ -706,7 +706,6 @@ async fn probe_response_on_server_stream_returns_unsupported_code() -> anyhow::R
             rate_per_mb: 0,
             timestamp_us: 0,
         },
-        total_bytes: None,
         slash_sig: vec![0u8; SLASH_SIG_LEN],
     }))?;
     write_frame(&mut send, &payload)
@@ -1072,7 +1071,7 @@ async fn run_one_probe(
     server_sk: SecretKey,
     handler: Arc<ProbeHandler>,
     req: ProbeRequest,
-) -> anyhow::Result<ProbeResponse> {
+) -> anyhow::Result<(ProbeResponse, ProbeResponseExt)> {
     run_one_probe_as(fresh_key(), server_sk, handler, req).await
 }
 
@@ -1084,7 +1083,7 @@ async fn run_one_probe_as(
     server_sk: SecretKey,
     handler: Arc<ProbeHandler>,
     req: ProbeRequest,
-) -> anyhow::Result<ProbeResponse> {
+) -> anyhow::Result<(ProbeResponse, ProbeResponseExt)> {
     let server_id = server_sk.public();
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
@@ -1121,9 +1120,9 @@ async fn run_one_probe_as(
     let frame = read_frame(&mut recv)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
-    let (msg, _rest) = decode_message::<ProbeMessage>(&frame)?;
+    let (msg, tail) = decode_message::<ProbeMessage>(&frame)?;
     let resp = match msg {
-        ProbeMessage::Response(r) => r,
+        ProbeMessage::Response(r) => (r, parse_probe_response_ext(tail)?),
         ProbeMessage::Request(_) => anyhow::bail!("unexpected request variant on client"),
     };
     conn.close(0u32.into(), b"bye");
@@ -1150,13 +1149,13 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
         hash: *hash.as_bytes(),
         timestamp_us: 0xabc_def,
     };
-    let resp = run_one_probe(server_sk, handler, req).await?;
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(resp.body.has_blob, "cached blob must report has_blob=true");
     anyhow::ensure!(
-        resp.total_bytes == Some(payload.len() as u64),
+        resp_ext.total_bytes == Some(payload.len() as u64),
         "total_bytes should report the blob size, got {:?}",
-        resp.total_bytes
+        resp_ext.total_bytes
     );
     anyhow::ensure!(resp.body.hash == *hash.as_bytes(), "hash echoed");
     assert_slash_sig_valid(&resp, &signer, &domain)?;
@@ -1190,30 +1189,31 @@ async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
         hash: *foreign_hash.as_bytes(),
         timestamp_us: 1,
     };
-    let foreign_resp = run_one_probe(fresh_key(), Arc::clone(&handler), foreign_req).await?;
+    let (foreign_resp, foreign_resp_ext) =
+        run_one_probe(fresh_key(), Arc::clone(&handler), foreign_req).await?;
     anyhow::ensure!(
         !foreign_resp.body.has_blob,
         "origin-only node must not advertise a store hit outside its own origin"
     );
     anyhow::ensure!(
-        foreign_resp.total_bytes.is_none(),
+        foreign_resp_ext.total_bytes.is_none(),
         "a non-advertised hash must carry no total_bytes hint, got {:?}",
-        foreign_resp.total_bytes
+        foreign_resp_ext.total_bytes
     );
 
     let own_req = ProbeRequest {
         hash: *own_hash.as_bytes(),
         timestamp_us: 2,
     };
-    let own_resp = run_one_probe(fresh_key(), handler, own_req).await?;
+    let (own_resp, own_resp_ext) = run_one_probe(fresh_key(), handler, own_req).await?;
     anyhow::ensure!(
         own_resp.body.has_blob,
         "origin-only node must still advertise its own backend-held content"
     );
     anyhow::ensure!(
-        own_resp.total_bytes == Some(own_payload.len() as u64),
+        own_resp_ext.total_bytes == Some(own_payload.len() as u64),
         "own content's total_bytes should report the backend size, got {:?}",
-        own_resp.total_bytes
+        own_resp_ext.total_bytes
     );
 
     Ok(())
@@ -1243,16 +1243,16 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
         hash: *hash.as_bytes(),
         timestamp_us: 0x1234,
     };
-    let resp = run_one_probe(server_sk, handler, req).await?;
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
         !resp.body.has_blob,
         "holds-disabled must yield has_blob=false even though the blob is cached"
     );
     anyhow::ensure!(
-        resp.total_bytes.is_none(),
+        resp_ext.total_bytes.is_none(),
         "no size advertised when has_blob=false, got {:?}",
-        resp.total_bytes
+        resp_ext.total_bytes
     );
     // The signature must cover has_blob=false (not a stale true).
     assert_slash_sig_valid(&resp, &signer, &domain)?;
@@ -1311,16 +1311,16 @@ async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyho
         hash: *hb.as_bytes(),
         timestamp_us: 0x55,
     };
-    let resp = run_one_probe(server_sk, handler, req).await?;
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
         resp.body.has_blob,
         "budget-exhausted must still advertise has_blob=true — the hold is forgone, not the answer"
     );
     anyhow::ensure!(
-        resp.total_bytes == Some(b.len() as u64),
+        resp_ext.total_bytes == Some(b.len() as u64),
         "the advertised blob must carry its size, got {:?}",
-        resp.total_bytes
+        resp_ext.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
@@ -1394,16 +1394,16 @@ async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> 
         hash: *hash.as_bytes(),
         timestamp_us: 0x9001,
     };
-    let resp = run_one_probe(server_sk, handler, req).await?;
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
         resp.body.has_blob,
         "an end-client under a stake-lane reservation must still get has_blob=true (hold shed, not the answer)"
     );
     anyhow::ensure!(
-        resp.total_bytes == Some(payload.len() as u64),
+        resp_ext.total_bytes == Some(payload.len() as u64),
         "the advertised blob must carry its size, got {:?}",
-        resp.total_bytes
+        resp_ext.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
@@ -1480,16 +1480,16 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
         hash: *hash.as_bytes(),
         timestamp_us: 0x9002,
     };
-    let resp = run_one_probe_as(client_sk, server_sk, handler, req).await?;
+    let (resp, resp_ext) = run_one_probe_as(client_sk, server_sk, handler, req).await?;
 
     anyhow::ensure!(
         resp.body.has_blob,
         "a stake-lane requester must keep its reserved headroom -> has_blob=true"
     );
     anyhow::ensure!(
-        resp.total_bytes == Some(payload.len() as u64),
+        resp_ext.total_bytes == Some(payload.len() as u64),
         "stake-lane requester should be served the blob size, got {:?}",
-        resp.total_bytes
+        resp_ext.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
@@ -1533,7 +1533,7 @@ async fn probe_rate_raised_to_floor_before_signing() -> anyhow::Result<()> {
         hash: [9u8; 32],
         timestamp_us: 99,
     };
-    let resp = run_one_probe(server_sk, handler, req).await?;
+    let (resp, _resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
         resp.body.rate_per_mb == 42,

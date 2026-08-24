@@ -29,8 +29,8 @@ The Ethereum key is the same secp256k1 key the node already holds for staking an
 `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Requesters MUST reject responses with missing or zero-length `slash_sig`. There is no opt-out: every interaction in the paid delivery path is on-chain slashable. The fields covered by `slash_sig` are the same fields that drive the slashing mechanisms in [ADR 005](005-protocol.md#adr-005-wire-protocol):
 
 ```
-ProbeResponse {has_blob, rate_per_mb, timestamp_us, total_bytes?, slash_sig}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, slash_sig}
+ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, slash_sig} ++ Ext {error?}
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`

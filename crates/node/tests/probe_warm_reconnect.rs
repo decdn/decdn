@@ -219,7 +219,7 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     let (client, _client_addr) = local_endpoint(SecretKey::generate()).await?;
 
     // Cold: nothing cached for this peer yet.
-    let (cold, _rtt) = decdn_client_pull::probe::probe_once(
+    let (cold, _ext, _rtt) = decdn_client_pull::probe::probe_once(
         &client,
         target.clone(),
         PROBE_HASH,
@@ -232,7 +232,7 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     // Let the server's session ticket land so the next probes are warm.
     tokio::time::sleep(TICKET_SETTLE).await;
 
-    let (warm, _rtt) = decdn_client_pull::probe::probe_once(
+    let (warm, _ext, _rtt) = decdn_client_pull::probe::probe_once(
         &client,
         target.clone(),
         PROBE_HASH,
@@ -247,7 +247,7 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     );
 
     // The daemon-side copy of the client, on the same warm endpoint.
-    let (warm_node, _rtt) = decdn_node::client_requester::probe::probe_once(
+    let (warm_node, _ext, _rtt) = decdn_node::client_requester::probe::probe_once(
         &client,
         target.clone(),
         PROBE_HASH,
@@ -302,7 +302,7 @@ async fn probe_survives_a_server_restart_under_the_same_identity() -> anyhow::Re
 
     let (client, _client_addr) = local_endpoint(SecretKey::generate()).await?;
 
-    let (first, _rtt) =
+    let (first, _ext, _rtt) =
         decdn_client_pull::probe::probe_once(&client, target, PROBE_HASH, 0x2001, PROBE_TIMEOUT)
             .await?;
     assert_answer(&first, 0x2001, &signer, &domain)?;
@@ -319,7 +319,7 @@ async fn probe_survives_a_server_restart_under_the_same_identity() -> anyhow::Re
     // now undecryptable and must not wedge the probe.
     let (router2, server_ep2, target2, signer2, domain2, _cache_tmp2) =
         spawn_probe_server(&metrics, server_sk).await?;
-    let (after, _rtt) =
+    let (after, _ext, _rtt) =
         decdn_client_pull::probe::probe_once(&client, target2, PROBE_HASH, 0x2002, PROBE_TIMEOUT)
             .await?;
     assert_answer(&after, 0x2002, &signer2, &domain2)?;

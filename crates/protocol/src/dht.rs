@@ -250,6 +250,111 @@ pub struct StoreRequest {
     pub holder: NodeId,
 }
 
+/// Optional [`FindValueResponse`] extension fields, carried as trailing bytes
+/// after the message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_find_value_response`] / [`parse_find_value_response_ext`]).
+///
+/// Empty today. It names the append site for the first field a responder needs —
+/// a coverage hint, a record age, a freshness bound — so that field lands as a
+/// pure append rather than a `cdn/dht/v2` bump. Postcard fills no defaults for
+/// absent trailing fields, which is why the field must go in a separately encoded
+/// extension rather than onto [`FindValueResponse`] itself.
+///
+/// Anything added here is UNSIGNED and responder-controlled. DHT records carry
+/// no per-record signature (see the module docs), so an extension field is a
+/// hint the requester may act on only where a lying responder gains nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FindValueResponseExt {}
+
+/// Optional [`StoreRequest`] extension fields, carried as trailing bytes after
+/// the message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_store_request`] / [`parse_store_request_ext`]).
+///
+/// Empty today, for the same reason as [`FindValueResponseExt`]: the publisher
+/// side is where a record would gain a TTL hint or a partial-holding range, and
+/// that append must stay Tier-1 after launch.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StoreRequestExt {}
+
+/// Encode a [`DhtMessage::FindValueResponse`] with its optional trailing
+/// [`FindValueResponseExt`] (ADR 013 §Tier 1, two-phase).
+///
+/// Typed per variant rather than taking pre-serialized bytes, so an extension
+/// cannot be attached to a message it does not belong to.
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_find_value_response(
+    resp: &FindValueResponse,
+    ext: Option<&FindValueResponseExt>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(&DhtMessage::FindValueResponse(resp.clone()))?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    }
+    Ok(buf)
+}
+
+/// Encode a [`DhtMessage::Store`] with its optional trailing [`StoreRequestExt`]
+/// (ADR 013 §Tier 1, two-phase). Typed per variant, as above.
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_store_request(
+    req: &StoreRequest,
+    ext: Option<&StoreRequestExt>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(&DhtMessage::Store(*req))?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    }
+    Ok(buf)
+}
+
+/// Parse the trailing [`FindValueResponseExt`] bytes returned as the remainder
+/// by [`crate::decode_message`] after a `DhtMessage::FindValueResponse`.
+///
+/// An empty remainder ⇒ [`FindValueResponseExt::default`]. Trailing bytes beyond
+/// the known fields are tolerated for forward compatibility (ADR 013 §Tier 1).
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `FindValueResponseExt` prefix. While [`FindValueResponseExt`] holds no fields it consumes
+/// no bytes and cannot fail; the signature carries the error so that adding the
+/// first field is a pure append here too.
+pub fn parse_find_value_response_ext(
+    remainder: &[u8],
+) -> Result<FindValueResponseExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(FindValueResponseExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<FindValueResponseExt>(remainder)?.0)
+    }
+}
+
+/// Parse the trailing [`StoreRequestExt`] bytes returned as the remainder by
+/// [`crate::decode_message`] after a `DhtMessage::Store`.
+///
+/// An empty remainder ⇒ [`StoreRequestExt::default`]. Trailing bytes beyond the
+/// known fields are tolerated for forward compatibility (ADR 013 §Tier 1).
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `StoreRequestExt` prefix. While [`StoreRequestExt`] holds no fields it consumes
+/// no bytes and cannot fail; the signature carries the error so that adding the
+/// first field is a pure append here too.
+pub fn parse_store_request_ext(remainder: &[u8]) -> Result<StoreRequestExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(StoreRequestExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<StoreRequestExt>(remainder)?.0)
+    }
+}
+
 /// Acknowledgement for a [`StoreRequest`] (ADR 022 §Message Types).
 ///
 /// `accepted == false` means the record was rejected — most commonly the

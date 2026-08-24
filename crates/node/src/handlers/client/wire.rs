@@ -2,8 +2,8 @@
 
 use super::{
     B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, SendStream, ServeRejectReason,
-    StreamError, StreamRequest, StreamResponse, StreamResponseBody, StreamSlashData, U256,
-    VoucherRejectReason, WatermarkBundle, encode_message, write_frame,
+    StreamError, StreamRequest, StreamResponse, StreamResponseBody, StreamResponseExt,
+    StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message, write_frame,
 };
 
 impl ClientHandler {
@@ -61,22 +61,40 @@ impl ClientHandler {
         rate_per_mb
     }
 
-    /// Sign a `StreamResponse` body and assemble the full message.
+    /// Sign a `StreamResponse` body and assemble the frozen base plus its
+    /// unsigned extension (ADR 013 §Tier 1). `error` rides in the extension, so
+    /// the pair must be written together — see [`Self::write_stream_response`].
     pub(super) fn sign_response(
         &self,
         body: StreamResponseBody,
         error: Option<StreamError>,
-    ) -> anyhow::Result<StreamResponse> {
+    ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         let slash_sig = StreamSlashData::from_response_body(&body)
             .sign(self.eth_signer.as_ref(), &self.slash_domain)
             .map_err(|e| anyhow::anyhow!("stream slash_sig signing failed: {e}"))?
             .as_bytes()
             .to_vec();
-        Ok(StreamResponse {
-            body,
-            error,
-            slash_sig,
-        })
+        Ok((
+            StreamResponse { body, slash_sig },
+            StreamResponseExt { error },
+        ))
+    }
+
+    /// Write a `StreamResponse` and its trailing extension as one frame.
+    ///
+    /// The two-phase encode is why this exists rather than a plain
+    /// [`Self::write_message`]: the base and the extension are adjacent postcard
+    /// values, and a receiver that predates a future extension field stops at the
+    /// end of the base and discards the rest (ADR 013 §Tier 1).
+    pub(super) async fn write_stream_response(
+        &self,
+        send: &mut SendStream,
+        resp: &StreamResponse,
+        ext: &StreamResponseExt,
+    ) -> anyhow::Result<()> {
+        let payload = decdn_protocol::encode_stream_response(resp, Some(ext))
+            .map_err(|e| anyhow::anyhow!("encode stream response: {e}"))?;
+        self.write_payload(send, &payload).await
     }
 
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
@@ -147,9 +165,8 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, Some(error))?;
-        self.write_message(send, &ClientMessage::StreamResponse(resp))
-            .await?;
+        let (resp, resp_ext) = self.sign_response(body, Some(error))?;
+        self.write_stream_response(send, &resp, &resp_ext).await?;
         let _ = send.finish();
         Ok(())
     }

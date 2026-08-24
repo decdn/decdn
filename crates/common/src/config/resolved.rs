@@ -515,6 +515,10 @@ pub struct ResolvedPayment {
     pub credit_max: u64,
     /// Ramp divisor for the credit window; `0` opens the full ceiling immediately.
     pub credit_ramp_divisor: u64,
+    /// Target wire-frame size for the serve path, in bytes (ADR 005
+    /// §`cdn/client/v1`). See [`crate::config::DEFAULT_FRAME_TARGET_BYTES`] (1 MiB).
+    /// Clamped down to the credit window's remaining room per frame.
+    pub frame_target_bytes: u64,
     /// Background flush period for the lane store, in ms. See
     /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 s). Must be > 0.
     pub voucher_commit_interval_ms: u64,

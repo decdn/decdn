@@ -1362,11 +1362,12 @@ async fn probe_candidate(
         // implies upstream state corruption — skip rather than panic.
         return None;
     };
-    let (resp, rtt_ms) = match probe_once(
+    let probe_ts = now_micros();
+    let (resp, _resp_ext, rtt_ms) = match probe_once(
         &deps.endpoint,
         EndpointAddr::new(pk),
         hash_bytes,
-        now_micros(),
+        probe_ts,
         PROBE_TIMEOUT,
     )
     .await
@@ -1380,9 +1381,27 @@ async fn probe_candidate(
             return None;
         }
     };
-    // Shape + echoed-hash validation (ADR 005 / ADR 014 §1); a malformed or
-    // off-hash response is dropped, not scored.
-    if resp.validate().is_err() || resp.body.hash != hash_bytes {
+    // Shape, echoed-field correlation, and `slash_sig` recovery to the peer's
+    // registered operator address (ADR 005 §Signer binding, ADR 014 §1). Selection
+    // reads `has_blob` and `rate_per_mb` off this response and then PAYS the winner,
+    // so an unrecovered signature would let a node win on a rate it never committed
+    // to — and leave nothing to slash when it declines to honour it.
+    //
+    // A failure is requester-local policy, never an attributable fault: dropped
+    // without a reputation event, exactly as for a timeout, because a signature that
+    // does not recover attributes nothing to anyone (ADR 008).
+    let Some(provider_addr) = deps.addr_resolver.address_of(&peer) else {
+        debug!("node-origin: probed peer has no resolvable operator address; skipping");
+        return None;
+    };
+    if let Err(err) = crate::client_requester::probe::verify_probe_response(
+        &resp,
+        provider_addr,
+        &deps.slash_domain,
+        hash_bytes,
+        probe_ts,
+    ) {
+        debug!(%err, "node-origin: dropping an unverifiable probe response");
         return None;
     }
     if !resp.body.has_blob {

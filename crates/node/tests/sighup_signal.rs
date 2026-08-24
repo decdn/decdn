@@ -128,6 +128,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             },
         },
         payment: ResolvedPayment {
+            frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             rate_per_mb: rate,
             delivery_floor: 0,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,

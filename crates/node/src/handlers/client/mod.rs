@@ -2,7 +2,8 @@
 //!
 //! Serves the revenue path: a payer opens one bidirectional QUIC stream per
 //! blob, the node answers with a signed [`StreamResponse`], then streams
-//! [`ChunkData`], collecting one hash-chain preimage per delivered
+//! [`ChunkData`](decdn_protocol::client::ChunkData) frames, collecting one
+//! hash-chain preimage per delivered
 //! `CHUNK_BYTES` chunk — with a signed `Voucher` to open a chain, to roll one,
 //! and to settle a sub-chunk residual — and pausing only when the unpaid balance
 //! (`delivered − paid`) reaches the credit window — so delivery pipelines
@@ -42,12 +43,12 @@ use decdn_incentive::{
     verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
-    ChunkData, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody, VoucherRejectReason, WatermarkBundle,
+    ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
+    StreamResponseBody, StreamResponseExt, VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_message,
-    is_unknown_variant, read_frame, write_frame,
+    ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_chunk_frame,
+    encode_message, is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -862,6 +863,14 @@ pub struct ClientHandlerDeps {
     /// sets it from `payment.credit_ramp_divisor`. `0` opens the full ceiling
     /// immediately.
     pub credit_ramp_divisor: u64,
+    /// Target wire-frame size in bytes for the serve path (ADR 005
+    /// §`cdn/client/v1`). Node-local policy, never negotiated: the payer accepts
+    /// any non-empty frame, and neither payment nor bao verification is defined
+    /// over frame boundaries. Defaults to `DEFAULT_FRAME_TARGET_BYTES` (1 MiB);
+    /// the runtime sets it from `payment.frame_target_bytes`. The serve loop
+    /// clamps each request to the credit window's remaining room, so this is a
+    /// ceiling on frame size rather than an exact size.
+    pub frame_target_bytes: u64,
     pub idle_timeout: Option<Duration>,
     /// Wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003
     /// §Pool solvency). `None` (the default and production path) reads as
@@ -950,6 +959,7 @@ impl ClientHandlerDeps {
             pull_through_origin: None,
             credit_max: decdn_common::config::DEFAULT_CREDIT_MAX,
             credit_ramp_divisor: decdn_common::config::DEFAULT_CREDIT_RAMP_DIVISOR,
+            frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             idle_timeout: None,
             pool_recheck_interval: None,
             floor_loss_store: None,
@@ -1065,6 +1075,10 @@ pub struct ClientHandler {
     /// construction via [`ClientHandlerDeps`]. Read through
     /// [`Self::credit_window`].
     credit_ramp_divisor: u64,
+    /// Target wire-frame size in bytes, set at construction via
+    /// [`ClientHandlerDeps`]. Read through [`Self::frame_target`], which clamps it
+    /// to the credit window's remaining room.
+    frame_target_bytes: u64,
     /// Live content deny-set (ADR 011). Consulted at three points, all of which
     /// must gate or the check is bypassable: the hash gate above the
     /// availability check in `serve_stream`, the origin gate right after channel
@@ -1216,6 +1230,7 @@ impl ClientHandler {
             pull_through_origin: deps.pull_through_origin,
             credit_max: deps.credit_max,
             credit_ramp_divisor: deps.credit_ramp_divisor,
+            frame_target_bytes: deps.frame_target_bytes,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
@@ -1544,6 +1559,76 @@ impl ClientHandler {
                  — see docs/runbook.md"
             );
         }
+    }
+
+    /// The frame size to request from a frame producer, given `unvouchered` — the
+    /// bytes delivered since the last payment-chunk boundary — and `interval_bytes`,
+    /// the payment quantum.
+    ///
+    /// **A frame never crosses a payment-chunk boundary.** Both sides meter the same
+    /// byte stream over the same frame sequence, and each waits for the other at
+    /// every `interval_bytes`: the node accumulates `unvouchered` until it reaches a
+    /// full interval and then demands a proof, while the payer releases one
+    /// hash-chain preimage per interval. A frame that straddled a boundary would
+    /// land the payer's counter PAST it, which is settled with a signed voucher for
+    /// the residual instead of a preimage — a per-frame signature on the hot path,
+    /// and a cadence the two sides no longer agree on. Cutting at the boundary keeps
+    /// the preimage path exact, whatever the target.
+    ///
+    /// This also bounds the node's credit exposure. The serve loop checks the window
+    /// BEFORE each send, so `delivered - paid` overshoots by at most one frame; with
+    /// frames capped at one interval the overshoot is at most one payment chunk —
+    /// the same granularity the node bills at, and the bound ADR 003 §Credit window
+    /// states as "the window, plus at most one chunk".
+    ///
+    /// `room` — the window's unused remainder, `window - (delivered - paid)` — caps
+    /// the request as well, and that cap is load-bearing on the **cache-miss** leg
+    /// rather than merely tidy. Both loops prefetch one frame ahead of the window
+    /// check, and on a miss the producer is fed by an upstream pull paced against
+    /// this stream's own served-and-paid frontier. Asking a closed window for a full
+    /// frame parks the prefetch on bytes that cannot arrive until the loop exits to
+    /// recoup — which it cannot do while parked. Sizing the request to the room that
+    /// actually remains keeps the prefetch satisfiable from what is already buffered.
+    ///
+    /// The room cap is floored at one bao chunk group so a shut window yields a
+    /// short frame rather than a single byte; that runt goes out once the recoup
+    /// reopens the window. A stream sitting at the one-chunk credit floor therefore
+    /// spends about two frames per payment chunk — a full frame, then the runt the
+    /// shut window produced — while a ramped stream keeps `room` far above the floor
+    /// and spends one.
+    ///
+    /// **The floor is exactly one group because the pull side reserves exactly one.**
+    /// On a cache miss the bytes this prefetch asks for can only come from the
+    /// upstream pull, and `decdn_client_pull::PULL_WINDOW_FLOOR` carries a third
+    /// chunk group for precisely this request. Raising the floor here without
+    /// raising it there parks the serve leg on bytes the pull may not draw —
+    /// a hang, not a failed assertion. `frame_target_room_floor_matches_the_pull_reservation`
+    /// pins the pair.
+    pub(super) fn frame_target(&self, unvouchered: u64, interval_bytes: u64, room: u64) -> usize {
+        // `unvouchered < interval_bytes` at every call site — both loops reset it to
+        // zero the moment it reaches a full interval. Were that ever to break, a
+        // saturating `0` would ask for one-byte frames forever: a stream that still
+        // "progresses" at six orders of magnitude below line rate, with no error and
+        // no metric. Fall back to a whole interval instead, which is wrong in the
+        // same direction as the rest of the clamp rather than catastrophically.
+        debug_assert!(
+            unvouchered < interval_bytes,
+            "unvouchered {unvouchered} must stay below the {interval_bytes}-byte interval"
+        );
+        let to_boundary = interval_bytes
+            .checked_sub(unvouchered)
+            .filter(|remaining| *remaining > 0)
+            .unwrap_or(interval_bytes);
+        let want = self
+            .frame_target_bytes
+            .min(to_boundary)
+            .min(room.max(decdn_bao_range::CHUNK_GROUP_BYTES));
+        // Saturating toward `usize::MAX` would tell a producer to buffer without
+        // bound — the O(blob size) behaviour the framers exist to avoid. Every term
+        // above is already `<= CHUNK_BYTES`, so this only ever runs on a 16-bit
+        // target, where one chunk group is the safe answer.
+        usize::try_from(want)
+            .unwrap_or_else(|_| usize::try_from(decdn_bao_range::CHUNK_GROUP_BYTES).unwrap_or(1))
     }
 
     /// The effective downstream credit window in bytes for a stream whose voucher
@@ -2063,6 +2148,118 @@ pub(super) async fn handler_over_store(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A frame must never cross a payment-chunk boundary, whatever the configured
+    /// target. Both sides meter the same frame sequence and exchange one preimage per
+    /// interval; a straddling frame lands the payer past the boundary, which settles
+    /// as a signed residual voucher instead — a per-frame signature on the hot path
+    /// and a cadence the two sides no longer share. A frame size that divides
+    /// `interval_bytes` gets the property for free; at any other size it has to be
+    /// cut for explicitly, which is what this clamp does.
+    #[tokio::test]
+    async fn a_frame_never_crosses_a_payment_chunk_boundary() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        let wide_open = u64::MAX;
+
+        // Walk a whole interval in the frame sizes the handler itself hands out and
+        // confirm the walk lands exactly on the boundary rather than stepping over it.
+        let mut unvouchered = 0u64;
+        let mut frames = 0u32;
+        while unvouchered < interval {
+            let target = handler.frame_target(unvouchered, interval, wide_open) as u64;
+            assert!(target > 0, "a zero-length frame is a protocol error");
+            unvouchered += target;
+            assert!(
+                unvouchered <= interval,
+                "frame of {target} crossed the boundary: {unvouchered} > {interval}"
+            );
+            frames += 1;
+            assert!(
+                frames < 64,
+                "target collapsed to runt frames: {frames} per interval"
+            );
+        }
+        assert_eq!(unvouchered, interval, "the walk must land ON the boundary");
+    }
+
+    /// At the default target an open window spends exactly ONE frame per payment
+    /// interval. Nothing else pins that the default target and the payment quantum
+    /// line up, and a regression multiplies per-frame CPU across every byte the node
+    /// egresses.
+    #[tokio::test]
+    async fn an_open_window_spends_one_frame_per_payment_chunk() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        assert_eq!(
+            handler.frame_target(0, interval, u64::MAX) as u64,
+            interval,
+            "an open window at the default target must cover the interval in one frame"
+        );
+    }
+
+    /// The serve side's prefetch floor and the pull side's reservation are one
+    /// invariant split across two crates, so it needs a test that names both.
+    ///
+    /// `frame_target` floors its room cap at one bao chunk group, which on a cache
+    /// miss is a request the upstream pull must be allowed to satisfy past a shut
+    /// credit window. `PULL_WINDOW_FLOOR` reserves a third group for exactly that.
+    /// Raise one without the other and the cache-miss leg parks — and it parks as a
+    /// hang with no diagnostic, which is why the relationship is asserted here
+    /// rather than left to an integration test's timeout.
+    #[tokio::test]
+    async fn frame_target_room_floor_matches_the_pull_reservation() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+
+        // What the serve side asks for past a shut window.
+        let prefetch = handler.frame_target(0, interval, 0) as u64;
+        assert_eq!(prefetch, group, "the room floor is one bao chunk group");
+
+        // What the pull side can still draw once both group roundings are spent.
+        let drawable = decdn_client_pull::PULL_WINDOW_FLOOR - 2 * group;
+        assert!(
+            drawable >= interval + prefetch,
+            "the pull floor leaves {drawable} bytes after both roundings, but the \
+             client must complete a {interval}-byte chunk to pay AND the serve leg \
+             prefetches {prefetch} bytes past its shut window — the miss leg would park"
+        );
+    }
+
+    /// A closed window must not be asked for a full frame. Both loops prefetch one
+    /// frame ahead of the window check, and on the cache-miss leg the producer is fed
+    /// by an upstream pull paced against this stream's own served-and-paid frontier —
+    /// so a large request parks on bytes that only recouping can unblock, and the
+    /// loop must exit to recoup. The room cap is what keeps that prefetch
+    /// satisfiable; the floor keeps it from degenerating to a single byte.
+    #[tokio::test]
+    async fn a_closed_window_yields_a_short_frame_not_a_full_one() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await;
+        let interval = decdn_protocol::CHUNK_BYTES;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+
+        let closed = handler.frame_target(0, interval, 0) as u64;
+        assert_eq!(
+            closed, group,
+            "a closed window must fall back to the group floor"
+        );
+
+        // A partly-open window is honoured as-is once it clears the floor.
+        assert_eq!(
+            handler.frame_target(0, interval, 4 * group) as u64,
+            4 * group
+        );
+        // ...and the boundary still wins when it is the tighter of the two.
+        assert_eq!(
+            handler.frame_target(interval - group, interval, u64::MAX) as u64,
+            group
+        );
+    }
 
     /// Build the smallest `ClientHandler` for the handler-layer tests below,
     /// seeding the floor-`M` minimum-remaining-deposit at zero.

@@ -31,7 +31,7 @@ Proof overhead is `O(log n)` — on the order of a kilobyte of sibling hashes fo
 
 ### Wire format
 
-The `StreamResponse` / `Voucher` / `ChunkPreimage` / `StreamEnd` envelope is unchanged. `ChunkData` payloads carry bao verified-stream bytes (interleaved data and proof nodes) instead of raw content. Payment messages remain interleaved as today: the bao stream is framed into fixed 1 MiB pieces (`CHUNK_BYTES`) and the receiver reassembles them before feeding the decoder. The codec is the sole verifier, so wire framing boundaries are independent of chunk-group boundaries (the codec handles the partial final group and right-edge spine).
+The `StreamResponse` / `Voucher` / `ChunkPreimage` / `StreamEnd` envelope is unchanged. `ChunkData` payloads carry bao verified-stream bytes (interleaved data and proof nodes) instead of raw content. Payment messages remain interleaved as today: the bao stream is framed into sender-sized pieces, no larger than one `CHUNK_BYTES` payment interval, and the receiver reassembles them before feeding the decoder. The codec is the sole verifier, so wire framing boundaries are independent of chunk-group boundaries (the codec handles the partial final group and right-edge spine).
 
 `cdn/client/v1` is pre-finalisation (no testnet deployment), so the payload format changes **in place** — no version bump, no compatibility shim. The flat-hasher payload is replaced; the two formats do not coexist.
 

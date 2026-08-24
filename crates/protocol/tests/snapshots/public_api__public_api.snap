@@ -75,7 +75,6 @@ impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::StreamResponse
 pub decdn_protocol::client::StreamResponse::body: decdn_protocol::client::StreamResponseBody
-pub decdn_protocol::client::StreamResponse::error: core::option::Option<decdn_protocol::client::StreamError>
 pub decdn_protocol::client::StreamResponse::slash_sig: alloc::vec::Vec<u8>
 impl decdn_protocol::client::StreamResponse
 pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
@@ -87,6 +86,10 @@ pub decdn_protocol::client::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::client::StreamResponseBody::redirect: core::option::Option<decdn_protocol::identity::NodeId>
 pub decdn_protocol::client::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::client::StreamResponseBody::total_bytes: u64
+pub struct decdn_protocol::client::StreamResponseExt
+pub decdn_protocol::client::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
+impl decdn_protocol::client::StreamResponseExt
+pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::Voucher
 pub decdn_protocol::client::Voucher::amount: u64
 pub decdn_protocol::client::Voucher::bytes_delivered: u64
@@ -113,13 +116,15 @@ impl decdn_protocol::client::WireCapability
 pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_BYTES: u64
-pub const decdn_protocol::client::CHUNK_SIZE: usize
 pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
+pub fn decdn_protocol::client::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::client::encode_stream_response(&decdn_protocol::client::StreamResponse, core::option::Option<&decdn_protocol::client::StreamResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::client::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
+pub fn decdn_protocol::client::parse_stream_response_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamResponseExt, postcard::error::Error>
 pub mod decdn_protocol::dht
 pub enum decdn_protocol::dht::DhtMessage
 pub decdn_protocol::dht::DhtMessage::BatchStore(decdn_protocol::dht::BatchStoreRequest)
@@ -166,15 +171,21 @@ pub struct decdn_protocol::dht::FindValueResponse
 pub decdn_protocol::dht::FindValueResponse::closer_nodes: decdn_protocol::dht::CloserNodes
 pub decdn_protocol::dht::FindValueResponse::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::dht::FindValueResponse::providers: alloc::vec::Vec<decdn_protocol::identity::NodeId>
+pub struct decdn_protocol::dht::FindValueResponseExt
 pub struct decdn_protocol::dht::StoreAck
 pub decdn_protocol::dht::StoreAck::accepted: bool
 pub decdn_protocol::dht::StoreAck::hash: decdn_protocol::identity::ContentHash
 pub struct decdn_protocol::dht::StoreRequest
 pub decdn_protocol::dht::StoreRequest::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::dht::StoreRequest::holder: decdn_protocol::identity::NodeId
+pub struct decdn_protocol::dht::StoreRequestExt
 pub const decdn_protocol::dht::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::dht::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::dht::MAX_PROVIDERS_PER_HASH: usize
+pub fn decdn_protocol::dht::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::dht::encode_store_request(&decdn_protocol::dht::StoreRequest, core::option::Option<&decdn_protocol::dht::StoreRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::dht::parse_find_value_response_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::FindValueResponseExt, postcard::error::Error>
+pub fn decdn_protocol::dht::parse_store_request_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::StoreRequestExt, postcard::error::Error>
 pub mod decdn_protocol::framing
 pub enum decdn_protocol::framing::FrameError
 pub decdn_protocol::framing::FrameError::Decode(postcard::error::Error)
@@ -218,8 +229,6 @@ pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
 pub const decdn_protocol::identity::ID_LEN: usize
 pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
-pub decdn_protocol::message::MessageValidationError::ChunkTooLarge
-pub decdn_protocol::message::MessageValidationError::ChunkTooLarge::len: usize
 pub decdn_protocol::message::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::message::MessageValidationError::EmptyChunk
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
@@ -245,7 +254,6 @@ pub decdn_protocol::message::ProbeRequest::timestamp_us: u64
 pub struct decdn_protocol::message::ProbeResponse
 pub decdn_protocol::message::ProbeResponse::body: decdn_protocol::message::ProbeResponseBody
 pub decdn_protocol::message::ProbeResponse::slash_sig: alloc::vec::Vec<u8>
-pub decdn_protocol::message::ProbeResponse::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponse
 pub const fn decdn_protocol::message::ProbeResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::message::ProbeResponseBody
@@ -253,8 +261,12 @@ pub decdn_protocol::message::ProbeResponseBody::has_blob: bool
 pub decdn_protocol::message::ProbeResponseBody::hash: [u8; 32]
 pub decdn_protocol::message::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::message::ProbeResponseBody::timestamp_us: u64
+pub struct decdn_protocol::message::ProbeResponseExt
+pub decdn_protocol::message::ProbeResponseExt::total_bytes: core::option::Option<u64>
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
+pub fn decdn_protocol::message::encode_probe_response(&decdn_protocol::message::ProbeResponse, core::option::Option<&decdn_protocol::message::ProbeResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::message::parse_probe_response_ext(&[u8]) -> core::result::Result<decdn_protocol::message::ProbeResponseExt, postcard::error::Error>
 pub mod decdn_protocol::region
 pub struct decdn_protocol::region::InvalidRegion
 impl core::error::Error for decdn_protocol::region::InvalidRegion
@@ -307,8 +319,6 @@ pub decdn_protocol::FrameError::Io(std::io::error::Error)
 pub decdn_protocol::FrameError::TooLarge(u32)
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::MessageValidationError
-pub decdn_protocol::MessageValidationError::ChunkTooLarge
-pub decdn_protocol::MessageValidationError::ChunkTooLarge::len: usize
 pub decdn_protocol::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::MessageValidationError::EmptyChunk
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
@@ -416,6 +426,7 @@ pub struct decdn_protocol::FindValueResponse
 pub decdn_protocol::FindValueResponse::closer_nodes: decdn_protocol::dht::CloserNodes
 pub decdn_protocol::FindValueResponse::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::FindValueResponse::providers: alloc::vec::Vec<decdn_protocol::identity::NodeId>
+pub struct decdn_protocol::FindValueResponseExt
 pub struct decdn_protocol::InvalidRegion
 impl core::error::Error for decdn_protocol::region::InvalidRegion
 impl core::fmt::Display for decdn_protocol::region::InvalidRegion
@@ -435,7 +446,6 @@ pub decdn_protocol::ProbeRequest::timestamp_us: u64
 pub struct decdn_protocol::ProbeResponse
 pub decdn_protocol::ProbeResponse::body: decdn_protocol::message::ProbeResponseBody
 pub decdn_protocol::ProbeResponse::slash_sig: alloc::vec::Vec<u8>
-pub decdn_protocol::ProbeResponse::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponse
 pub const fn decdn_protocol::message::ProbeResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::ProbeResponseBody
@@ -443,6 +453,8 @@ pub decdn_protocol::ProbeResponseBody::has_blob: bool
 pub decdn_protocol::ProbeResponseBody::hash: [u8; 32]
 pub decdn_protocol::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::ProbeResponseBody::timestamp_us: u64
+pub struct decdn_protocol::ProbeResponseExt
+pub decdn_protocol::ProbeResponseExt::total_bytes: core::option::Option<u64>
 pub struct decdn_protocol::Region(_)
 impl decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::as_str(&self) -> &str
@@ -466,6 +478,7 @@ pub decdn_protocol::StoreAck::hash: decdn_protocol::identity::ContentHash
 pub struct decdn_protocol::StoreRequest
 pub decdn_protocol::StoreRequest::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::StoreRequest::holder: decdn_protocol::identity::NodeId
+pub struct decdn_protocol::StoreRequestExt
 pub struct decdn_protocol::StreamRequest
 pub decdn_protocol::StreamRequest::byte_len: u64
 pub decdn_protocol::StreamRequest::byte_offset: u64
@@ -480,7 +493,6 @@ impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::StreamResponse
 pub decdn_protocol::StreamResponse::body: decdn_protocol::client::StreamResponseBody
-pub decdn_protocol::StreamResponse::error: core::option::Option<decdn_protocol::client::StreamError>
 pub decdn_protocol::StreamResponse::slash_sig: alloc::vec::Vec<u8>
 impl decdn_protocol::client::StreamResponse
 pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
@@ -492,6 +504,10 @@ pub decdn_protocol::StreamResponseBody::rate_per_mb: u64
 pub decdn_protocol::StreamResponseBody::redirect: core::option::Option<decdn_protocol::identity::NodeId>
 pub decdn_protocol::StreamResponseBody::timestamp_us: u64
 pub decdn_protocol::StreamResponseBody::total_bytes: u64
+pub struct decdn_protocol::StreamResponseExt
+pub decdn_protocol::StreamResponseExt::error: core::option::Option<decdn_protocol::client::StreamError>
+impl decdn_protocol::client::StreamResponseExt
+pub const fn decdn_protocol::client::StreamResponseExt::validate(&self, bool) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::Voucher
 pub decdn_protocol::Voucher::amount: u64
 pub decdn_protocol::Voucher::bytes_delivered: u64
@@ -506,7 +522,6 @@ pub const decdn_protocol::ALPN_PROBE: &[u8]
 pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_BYTES: u64
-pub const decdn_protocol::CHUNK_SIZE: usize
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::MAX_CHAIN_LENGTH: u8
@@ -526,10 +541,19 @@ pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
+pub fn decdn_protocol::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
+pub fn decdn_protocol::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
+pub fn decdn_protocol::encode_probe_response(&decdn_protocol::message::ProbeResponse, core::option::Option<&decdn_protocol::message::ProbeResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::encode_store_request(&decdn_protocol::dht::StoreRequest, core::option::Option<&decdn_protocol::dht::StoreRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
+pub fn decdn_protocol::encode_stream_response(&decdn_protocol::client::StreamResponse, core::option::Option<&decdn_protocol::client::StreamResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
 pub fn decdn_protocol::is_valid_region(&str) -> bool
+pub fn decdn_protocol::parse_find_value_response_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::FindValueResponseExt, postcard::error::Error>
+pub fn decdn_protocol::parse_probe_response_ext(&[u8]) -> core::result::Result<decdn_protocol::message::ProbeResponseExt, postcard::error::Error>
+pub fn decdn_protocol::parse_store_request_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::StoreRequestExt, postcard::error::Error>
 pub fn decdn_protocol::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
+pub fn decdn_protocol::parse_stream_response_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamResponseExt, postcard::error::Error>
 pub async fn decdn_protocol::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::write_frame<W: tokio::io::async_write::AsyncWrite + core::marker::Unpin>(&mut W, &[u8]) -> core::result::Result<(), decdn_protocol::framing::FrameError>

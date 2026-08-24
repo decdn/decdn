@@ -3,11 +3,11 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, ClientMessage,
-    Connection, FillOutcome, FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex,
-    OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
-    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt, read_first_message,
-    reset_stream, verify_binding,
+    Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
+    FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex, OwnedSemaphorePermit,
+    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
+    StreamReadError, StreamResponseBody, U256, VarInt, read_first_message, reset_stream,
+    verify_binding,
 };
 use futures_util::StreamExt as _;
 use std::sync::atomic::Ordering;
@@ -1073,8 +1073,8 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None)?;
-        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+        let (resp, resp_ext) = self.sign_response(body, None)?;
+        self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
 
         // Stream the blob, collecting vouchers at each interval boundary.

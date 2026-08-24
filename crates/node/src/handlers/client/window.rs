@@ -7,9 +7,9 @@ use alloy::primitives::U256;
 use crate::node_origin::PullLegTarget;
 
 use super::{
-    Arc, B256, CHUNK_BYTES, ClientHandler, ClientMessage, FillOutcome, FloorReservation, Hash,
-    LaneDeliveryState, LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason,
-    StreamRequest, StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
+    Arc, B256, CHUNK_BYTES, ClientHandler, FillOutcome, FloorReservation, Hash, LaneDeliveryState,
+    LaneKey, Mutex, NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest,
+    StreamResponseBody, WINDOW_PULL_FALLBACK_DEADLINE,
 };
 
 impl ClientHandler {
@@ -257,8 +257,8 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None)?;
-        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+        let (resp, resp_ext) = self.sign_response(body, None)?;
+        self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
 
         // Seed the shared per-hash outboard with proof for held ranges no pull admits
@@ -376,7 +376,6 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                credit_floor,
                 floor_reservation.as_ref(),
             )
             .await;
@@ -528,8 +527,8 @@ impl ClientHandler {
             timestamp_us: req.timestamp_us,
             redirect: None,
         };
-        let resp = self.sign_response(body, None)?;
-        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+        let (resp, resp_ext) = self.sign_response(body, None)?;
+        self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
 
         // (5) The two decoupled legs (ADR 037). Identical coordination
@@ -678,7 +677,6 @@ impl ClientHandler {
                 req.byte_offset,
                 req.byte_len,
                 total_bytes,
-                credit_floor,
                 floor_reservation.as_ref(),
             )
             .await;

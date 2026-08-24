@@ -570,8 +570,8 @@ impl ClientFixture {
             ClientMessage::StreamResponse(resp) => {
                 anyhow::ensure!(
                     resp.body.ok,
-                    "delivery capture expected ok:true, got a refusal ({:?})",
-                    resp.error
+                    "delivery capture expected ok:true, got a refusal (error rides in the \
+                     trailing StreamResponseExt)"
                 );
                 Ok(resp)
             }
@@ -667,7 +667,7 @@ impl ClientFixture {
         hash: Hash,
         timestamp_us: u64,
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        let (resp, _rtt) = decdn_client_pull::probe::probe_once(
+        let (resp, _ext, _rtt) = decdn_client_pull::probe::probe_once(
             &self.endpoint,
             Self::target(node).await?,
             *hash.as_bytes(),
@@ -699,7 +699,7 @@ impl ClientFixture {
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
         let target = EndpointAddr::new(node_id)
             .with_ip_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
-        let (resp, _rtt) = decdn_client_pull::probe::probe_once(
+        let (resp, _ext, _rtt) = decdn_client_pull::probe::probe_once(
             &self.endpoint,
             target,
             *hash.as_bytes(),

@@ -41,13 +41,6 @@ use serde::{Deserialize, Serialize};
 use crate::identity::NodeId;
 use crate::message::{MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 
-/// Exact byte length of a `ChunkData` payload, except the final chunk which MAY
-/// be smaller (ADR 005 §`cdn/client/v1`, §Partial final chunk). Matches
-/// iroh-blobs' internal 1024-byte chunk granularity; the payment quantum
-/// ([`CHUNK_BYTES`]) is coarser, so a buffering layer sits between the payment
-/// and transfer tick rates (ADR 005 §Tradeoffs).
-pub const CHUNK_SIZE: usize = 1024;
-
 /// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
 /// of `rate_per_mb` and, by the identity below, of [`CHUNK_BYTES`].
 pub const MB_BYTES: u64 = 1_048_576;
@@ -116,7 +109,7 @@ pub enum ClientMessage {
     StreamEnd,
     /// discriminant 6 — node → payer, mid-stream failure (carries
     /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
-    /// [`StreamResponse::error`].
+    /// [`StreamResponseExt::error`].
     StreamError(StreamError),
 }
 
@@ -134,9 +127,12 @@ impl ClientMessage {
     /// skipped (they are not enforced at decode time — see
     /// [`StreamResponse::validate`]).
     ///
-    /// `StreamRequest`'s optional [`StreamRequestExt`] travels as separate
-    /// trailing bytes (two-phase), so it is *not* reachable from here; validate
-    /// it via [`StreamRequestExt::validate`] after [`parse_stream_request_ext`].
+    /// The `ok`/`error` agreement is NOT among them: `error` lives in the trailing
+    /// [`StreamResponseExt`], which this method cannot see. Neither extension is
+    /// reachable from here — validate [`StreamRequestExt`] via its own `validate`
+    /// after [`parse_stream_request_ext`], and [`StreamResponseExt`] via
+    /// [`StreamResponseExt::validate`] with `body.ok` after
+    /// [`parse_stream_response_ext`].
     /// Variants with no value invariants (`StreamEnd`, `StreamError`) return
     /// `Ok(())`.
     ///
@@ -396,26 +392,108 @@ pub fn parse_stream_request_ext(remainder: &[u8]) -> Result<StreamRequestExt, po
 
 /// Node → payer response to a [`StreamRequest`] (ADR 005 §`cdn/client/v1`).
 ///
-/// The signed [`StreamResponseBody`] is covered by `slash_sig`; `error` is
-/// unsigned. `slash_sig` is mandatory and non-empty (exactly
-/// [`SLASH_SIG_LEN`] bytes); requesters MUST reject missing/zero-length or
-/// zero-`rate_per_mb` responses (enforced via [`StreamResponse::validate`]).
+/// **This struct holds only the frozen base** (ADR 013 §Tier 1): the signed
+/// [`StreamResponseBody`] and the `slash_sig` covering it. Unsigned fields live
+/// in [`StreamResponseExt`], which travels as separate trailing bytes — see
+/// [`encode_stream_response`] / [`parse_stream_response_ext`].
+///
+/// `slash_sig` is mandatory and non-empty (exactly [`SLASH_SIG_LEN`] bytes);
+/// requesters MUST reject missing/zero-length or zero-`rate_per_mb` responses
+/// (enforced via [`StreamResponse::validate`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
     pub body: StreamResponseBody,
-    /// Delivery-side failure code when `body.ok == false` (`NotFound`,
-    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`).
-    /// Unsigned and informational. `VoucherRejected` never rides here — it is
-    /// delivered mid-stream via [`ClientMessage::StreamError`]. The
-    /// `ok`/`error` consistency rules and the mid-stream-only exclusion are
-    /// enforced by [`StreamResponse::validate`], not just documented.
-    pub error: Option<StreamError>,
     /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
     /// produced by the `decdn_incentive` stream slash signer, analogous to its
     /// `ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`] bytes — *not* a
     /// signature over postcard bytes.
     pub slash_sig: Vec<u8>,
+}
+
+/// Optional [`StreamResponse`] extension fields, carried as trailing bytes after
+/// the `StreamResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
+/// [`encode_stream_response`] / [`parse_stream_response_ext`]).
+///
+/// Nothing here is covered by `slash_sig`. New fields are appended to the END
+/// and MUST be `Option<T>` or have a meaningful `Default`; insertions and
+/// reordering are Tier-3.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StreamResponseExt {
+    /// Delivery-side failure code when `body.ok == false` (`NotFound`,
+    /// `Overloaded`, `BlobTooLarge`, `InternalError`, `EvictedSinceProbe`).
+    /// Unsigned and informational. `VoucherRejected` never rides here — it is
+    /// delivered mid-stream via [`ClientMessage::StreamError`].
+    ///
+    /// Its agreement with the signed `body.ok` is a cross-half invariant, so it
+    /// is checked by [`StreamResponseExt::validate`], which takes `ok` — the
+    /// base-only [`StreamResponse::validate`] cannot see this field.
+    pub error: Option<StreamError>,
+}
+
+impl StreamResponseExt {
+    /// Check the unsigned half against the signed `ok` flag (ADR 005
+    /// §`cdn/client/v1`): `ok == true` ⇒ no `error`; `ok == false` ⇒ exactly one
+    /// delivery-side `error`, never the mid-stream-only
+    /// [`StreamError::VoucherRejected`].
+    ///
+    /// Separate from parsing so forward-compatible trailing bytes do not couple
+    /// to value checks, and separate from [`StreamResponse::validate`] because
+    /// the rule spans the frozen base and the extension — a receiver holds both
+    /// and must call each.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageValidationError::StreamErrorWithOk`],
+    /// [`MessageValidationError::MissingStreamError`], or
+    /// [`MessageValidationError::VoucherRejectedInResponse`].
+    pub const fn validate(&self, ok: bool) -> Result<(), MessageValidationError> {
+        match (ok, &self.error) {
+            (true, Some(_)) => Err(MessageValidationError::StreamErrorWithOk),
+            (false, None) => Err(MessageValidationError::MissingStreamError),
+            (false, Some(code)) if !code.is_delivery_side() => {
+                Err(MessageValidationError::VoucherRejectedInResponse)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Encode a [`StreamResponse`] with its optional trailing [`StreamResponseExt`]
+/// (ADR 013 §Tier 1, two-phase). See [`encode_stream_request`] for why the two
+/// values are encoded separately.
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_stream_response(
+    resp: &StreamResponse,
+    ext: Option<&StreamResponseExt>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(&ClientMessage::StreamResponse(resp.clone()))?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    }
+    Ok(buf)
+}
+
+/// Parse the trailing [`StreamResponseExt`] bytes returned as the remainder by
+/// [`crate::decode_message`] after a `ClientMessage::StreamResponse`.
+///
+/// An empty remainder ⇒ [`StreamResponseExt::default`] (no error code, which is
+/// only valid alongside `ok == true`). Trailing bytes beyond the known fields
+/// are tolerated for forward compatibility (ADR 013 §Tier 1).
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `StreamResponseExt` prefix.
+pub fn parse_stream_response_ext(remainder: &[u8]) -> Result<StreamResponseExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(StreamResponseExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<StreamResponseExt>(remainder)?.0)
+    }
 }
 
 /// Signed fields of a [`StreamResponse`] (ADR 014 §1). Layout is frozen per
@@ -456,10 +534,11 @@ impl StreamResponse {
     /// - `rate_per_mb` within `(0, MAX_RATE_PER_MB]` (the decode path already
     ///   enforces the upper bound via `deserialize_rate_per_mb`; this adds the
     ///   zero-rate rule),
-    /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes,
-    /// - `ok`/`error` consistency: `ok == true` ⇒ no `error`; `ok == false` ⇒
-    ///   exactly one delivery-side `error` (never the mid-stream-only
-    ///   [`StreamError::VoucherRejected`]).
+    /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes.
+    ///
+    /// The `ok`/`error` consistency rule is NOT here: `error` lives in
+    /// [`StreamResponseExt`], which this method cannot see. A receiver must also
+    /// call [`StreamResponseExt::validate`] with `body.ok`.
     ///
     /// Exposed so requesters re-check on receive and construction sites assert
     /// validity before signing.
@@ -479,32 +558,32 @@ impl StreamResponse {
                 len: self.slash_sig.len(),
             });
         }
-        // ADR 005 §`cdn/client/v1`: the signed `ok` flag and the unsigned
-        // `error` code must agree, and `VoucherRejected` is mid-stream-only.
-        match (self.body.ok, &self.error) {
-            (true, Some(_)) => return Err(MessageValidationError::StreamErrorWithOk),
-            (false, None) => return Err(MessageValidationError::MissingStreamError),
-            (false, Some(StreamError::VoucherRejected { .. })) => {
-                return Err(MessageValidationError::VoucherRejectedInResponse);
-            }
-            _ => {}
-        }
         Ok(())
     }
 }
 
-/// Node → payer chunk of blob bytes. Payload is at least 1 and at most
-/// [`CHUNK_SIZE`] bytes; the final chunk before [`ClientMessage::StreamEnd`] MAY
-/// be smaller and receivers MUST accept it (ADR 005 §Partial final chunk).
+/// Node → payer chunk of blob bytes. The payload carries at least one byte; its
+/// length is the sender's choice, bounded above by the framing layer's
+/// [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE); ADR 005
+/// §`cdn/client/v1` additionally requires a sender not to cross a `CHUNK_BYTES`
+/// payment boundary, so in practice a frame runs to at most one interval. Frames need not be uniform, and the frame before
+/// [`ClientMessage::StreamEnd`] is commonly shorter than the ones before it.
 ///
-/// The lower bound is load-bearing, not cosmetic (#1088). "Partial final chunk"
-/// permits a *smaller* frame, never an *empty* one: an empty frame carries no
+/// Frame size is independent of both verification and payment. The bao codec is
+/// the sole verifier and resolves chunk-group boundaries itself (ADR 038), and
+/// the payment meter ticks on cumulative bytes crossing [`CHUNK_BYTES`] rather
+/// than on frames. A sender therefore picks whatever size suits it; nothing is
+/// negotiated and no message carries the choice.
+///
+/// The lower bound is load-bearing, not cosmetic (#1088). A shorter final frame is
+/// permitted, never an *empty* one: an empty frame carries no
 /// payload, so it advances neither the receiver's cumulative byte count nor its
 /// voucher accounting. An unbounded run of them therefore drives the receive
 /// loops without making application-level progress, and the `cumulative >
 /// expected_wire` overrun guard — which only ever trips on bytes — never fires.
-/// An empty frame cannot be obtained at all — [`ChunkData::new`] and the `try_from` decode
-/// gate both reject one, and they are the only two doors. That is the invariant the pull
+/// An empty frame cannot be obtained at all — [`ChunkData::new`], the `try_from` decode
+/// gate, and [`encode_chunk_frame`] each reject one, and between them they are every
+/// route to a frame body. That is the invariant the pull
 /// paths' inactivity deadline rests on: with empty frames banned, "a frame arrived" and
 /// "bytes made progress" are the same statement, so a peer cannot refresh the deadline
 /// with padding.
@@ -521,22 +600,23 @@ impl StreamResponse {
 /// receive loop remembering to call it and every emitter avoiding an empty frame — and
 /// the serve side avoids one only *incidentally*, differently on each path:
 ///
-/// - The **buffered** path chunks its payload with `slice::chunks`, which yields no
-///   items for an empty slice. So even the empty blob (whose bao encoding is zero
-///   bytes — see `decdn_bao_range::align_range`) goes straight to
-///   [`ClientMessage::StreamEnd`] rather than sending an empty frame first (#1054).
-/// - The **window-paced** path (#856) forwards upstream frames verbatim and does no
-///   re-chunking, so it inherits the guarantee rather than establishing it.
+/// each serve path coalesces its byte stream into frames and emits whatever has
+/// accumulated, so an empty frame is avoided only because an exhausted stream yields
+/// nothing to emit. The empty blob (whose bao encoding is zero bytes — see
+/// `decdn_bao_range::align_range`) reaches [`ClientMessage::StreamEnd`] the same way,
+/// with no frame sent first (#1054).
 ///
-/// Both facts are true, both are about unrelated code, and either could change without
-/// anyone noticing which invariant they had just removed — while the reputation system
+/// That is a fact about unrelated code, and it could change without anyone noticing
+/// which invariant they had just removed — while the reputation system
 /// depends on it, since a false `PullStalled` scores an honest peer as unreachable. That
 /// is too much weight for a convention, so the type carries the floor instead: the field
-/// is private and both doors reject an empty payload, so it cannot be skipped.
+/// is private, both `ChunkData` doors reject an empty payload, and
+/// [`encode_chunk_frame`] — the door both serve paths use, which builds no
+/// `ChunkData` — restates the same check. Every route is closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ChunkDataWire")]
 pub struct ChunkData {
-    /// Sequential blob bytes (1..=[`CHUNK_SIZE`]). Private: see the type's docs — this
+    /// Sequential blob bytes, at least one. Private: see the type's docs — this
     /// is the invariant the inactivity deadline and, through it, `PullStalled` rest on.
     bytes: Vec<u8>,
 }
@@ -558,24 +638,23 @@ impl TryFrom<ChunkDataWire> for ChunkData {
 }
 
 impl ChunkData {
-    /// The only constructor. Enforces the payload bounds: non-empty and within
-    /// [`CHUNK_SIZE`].
+    /// The only constructor. Enforces the payload floor: non-empty.
+    ///
+    /// There is no ceiling here. An oversized frame is refused by the framing
+    /// layer against [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE),
+    /// which is the bound that runs before the receiver allocates.
     ///
     /// # Errors
     ///
-    /// [`MessageValidationError::EmptyChunk`] for a zero-length payload;
-    /// [`MessageValidationError::ChunkTooLarge`] above the ceiling.
+    /// [`MessageValidationError::EmptyChunk`] for a zero-length payload.
     pub fn new(bytes: Vec<u8>) -> Result<Self, MessageValidationError> {
         if bytes.is_empty() {
             return Err(MessageValidationError::EmptyChunk);
         }
-        if bytes.len() > CHUNK_SIZE {
-            return Err(MessageValidationError::ChunkTooLarge { len: bytes.len() });
-        }
         Ok(Self { bytes })
     }
 
-    /// The payload. Non-empty and within [`CHUNK_SIZE`] by construction.
+    /// The payload. Non-empty by construction.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -602,19 +681,62 @@ impl ChunkData {
     ///
     /// # Errors
     ///
-    /// [`MessageValidationError::EmptyChunk`] / [`MessageValidationError::ChunkTooLarge`],
-    /// neither of which a constructed frame can produce.
+    /// [`MessageValidationError::EmptyChunk`], which a constructed frame cannot produce.
     pub(crate) const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.bytes.is_empty() {
             return Err(MessageValidationError::EmptyChunk);
         }
-        if self.bytes.len() > CHUNK_SIZE {
-            return Err(MessageValidationError::ChunkTooLarge {
-                len: self.bytes.len(),
-            });
-        }
         Ok(())
     }
+}
+
+/// The `ClientMessage::ChunkData` discriminant, as postcard writes it: the
+/// declaration index, varint-encoded, which is one byte for indices 0..=127.
+/// Pinned by `client_message_discriminants_are_frozen`.
+const CHUNK_DATA_DISCRIMINANT: u8 = 2;
+
+/// Encode one [`ClientMessage::ChunkData`] frame body directly from its payload.
+///
+/// Byte-identical to `encode_message(&ClientMessage::ChunkData(ChunkData::new(payload)?))`
+/// — pinned by `encode_chunk_frame_matches_the_generic_encoder` — but it copies the
+/// payload once instead of twice. The generic path owns the bytes to build the frame
+/// (`Vec<u8>`) and postcard copies them again into its output buffer; the delivery loop
+/// holds its payload as a borrowed slice off the framer's buffer and has no use for the
+/// intermediate value.
+///
+/// This is the serve hot path: one call per wire frame, so the saved copy scales with
+/// everything the node egresses.
+///
+/// The non-empty floor is checked here rather than inherited from [`ChunkData::new`],
+/// since no [`ChunkData`] is built. That keeps the ADR 005 §Non-empty chunk invariant
+/// true of every frame this crate can emit, by either door.
+///
+/// # Errors
+///
+/// [`MessageValidationError::EmptyChunk`] for a zero-length payload.
+pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationError> {
+    if payload.is_empty() {
+        return Err(MessageValidationError::EmptyChunk);
+    }
+    // Discriminant, then the `Vec<u8>` field's postcard length prefix, then the
+    // bytes. Postcard writes a sequence length as a LEB128 varint: seven bits per
+    // byte, low group first, high bit set on every byte but the last.
+    let mut out = Vec::with_capacity(1 + 5 + payload.len());
+    out.push(CHUNK_DATA_DISCRIMINANT);
+    let mut len = payload.len();
+    loop {
+        let mut byte = u8::try_from(len & 0x7F).unwrap_or(0);
+        len >>= 7;
+        if len != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if len == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(payload);
+    Ok(out)
 }
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
@@ -787,7 +909,7 @@ impl WatermarkBundle {
 /// A stream failure code (ADR 005 §Stream errors). Variant order is frozen.
 ///
 /// Every variant except `VoucherRejected` is delivery-side and rides in
-/// [`StreamResponse::error`] alongside `ok: false`; `VoucherRejected` is the
+/// [`StreamResponseExt::error`] alongside `ok: false`; `VoucherRejected` is the
 /// only variant delivered mid-stream, inside a [`ClientMessage::StreamError`].
 /// All codes are unsigned and informational — never on-chain evidence.
 ///
@@ -861,10 +983,10 @@ pub enum StreamError {
 }
 
 impl StreamError {
-    /// `true` for the delivery-side codes that ride in [`StreamResponse::error`]
+    /// `true` for the delivery-side codes that ride in [`StreamResponseExt::error`]
     /// alongside `ok: false` — everything except `VoucherRejected`. Expresses
     /// the enum's domain split in code rather than only in prose, and backs the
-    /// [`StreamResponse::validate`] mid-stream-only exclusion.
+    /// [`StreamResponseExt::validate`] mid-stream-only exclusion.
     pub const fn is_delivery_side(&self) -> bool {
         !self.is_mid_stream()
     }
@@ -1011,7 +1133,6 @@ mod tests {
     fn sample_response() -> StreamResponse {
         StreamResponse {
             body: sample_body(),
-            error: None,
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         }
     }
@@ -1204,18 +1325,21 @@ mod tests {
                 ok: false,
                 ..sample_body()
             },
-            error: Some(StreamError::BlobTooLarge),
             ..sample_response()
         };
-        let bytes = postcard::to_allocvec(&resp)?;
-        let decoded: StreamResponse = postcard::from_bytes(&bytes)?;
-        assert_eq!(resp, decoded);
+        let ext = StreamResponseExt {
+            error: Some(StreamError::BlobTooLarge),
+        };
+        let buf = encode_stream_response(&resp, Some(&ext))?;
+        let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(decoded, ClientMessage::StreamResponse(resp));
+        assert_eq!(parse_stream_response_ext(remainder)?, ext);
         Ok(())
     }
 
     #[test]
     fn chunk_data_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        let chunk = ChunkData::new(vec![0x42u8; CHUNK_SIZE])?;
+        let chunk = ChunkData::new(vec![0x42u8; 4096])?;
         let bytes = postcard::to_allocvec(&chunk)?;
         let decoded: ChunkData = postcard::from_bytes(&bytes)?;
         assert_eq!(chunk, decoded);
@@ -1456,7 +1580,6 @@ mod tests {
                 timestamp_us: 7,
                 redirect: None,
             },
-            error: None,
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         };
         let bytes = postcard::to_allocvec(&resp)?;
@@ -1468,10 +1591,24 @@ mod tests {
         expected.extend_from_slice(&[6u8; 32]); // body.pool_id
         expected.push(7u8); // body.timestamp_us varint
         expected.push(0u8); // body.redirect = None
-        expected.push(0u8); // error = None
         expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
         expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
         assert_eq!(bytes, expected);
+
+        // Base ‖ ext, with the ext contributing only its own bytes: a reader that
+        // stops after the base sees identical bytes whether or not an extension
+        // followed.
+        let framed = encode_stream_response(
+            &resp,
+            Some(&StreamResponseExt {
+                error: Some(StreamError::NotFound),
+            }),
+        )?;
+        let mut expected_framed = vec![1u8]; // ClientMessage::StreamResponse discriminant
+        expected_framed.extend_from_slice(&expected);
+        expected_framed.push(1u8); // error = Some
+        expected_framed.push(0u8); // StreamError::NotFound discriminant
+        assert_eq!(framed, expected_framed);
         Ok(())
     }
 
@@ -1666,22 +1803,75 @@ mod tests {
     }
 
     #[test]
-    fn chunk_data_new_is_the_only_way_in_and_it_enforces_both_bounds() {
-        // The floor is what makes every frame a unit of progress (#1088); the ceiling
-        // bounds per-frame allocation. A 1-byte and a full-size chunk are both legal —
-        // "partial final chunk" means smaller, not empty.
+    fn chunk_data_new_is_the_only_way_in_and_it_enforces_the_floor() {
+        // The floor is what makes every frame a unit of progress (#1088). There is no
+        // ceiling: frame size is the sender's choice, bounded above by the framing
+        // layer's MAX_MESSAGE_SIZE, which runs before the receiver allocates.
         assert_eq!(
             ChunkData::new(Vec::new()),
             Err(MessageValidationError::EmptyChunk)
         );
-        assert_eq!(
-            ChunkData::new(vec![0u8; CHUNK_SIZE + 1]),
-            Err(MessageValidationError::ChunkTooLarge {
-                len: CHUNK_SIZE + 1
-            })
-        );
         assert!(ChunkData::new(vec![0u8]).is_ok());
-        assert!(ChunkData::new(vec![0u8; CHUNK_SIZE]).is_ok());
+        assert!(ChunkData::new(vec![0u8; 1024]).is_ok());
+        assert!(ChunkData::new(vec![0u8; 1024 * 1024]).is_ok());
+    }
+
+    #[test]
+    fn encode_chunk_frame_matches_the_generic_encoder() -> Result<(), Box<dyn std::error::Error>> {
+        // The delivery loop encodes frames with `encode_chunk_frame` to skip one copy,
+        // so it bypasses `ChunkData` and postcard entirely. That is only sound while the
+        // two produce the same bytes. Sizes straddle every varint width boundary of the
+        // length prefix: 1 byte below 128, 2 below 16384, 3 above it.
+        for len in [
+            1usize,
+            2,
+            127,
+            128,
+            129,
+            16_383,
+            16_384,
+            16_385,
+            1024,
+            1024 * 1024,
+        ] {
+            let payload = vec![0xABu8; len];
+            let via_helper = crate::client::encode_chunk_frame(&payload)?;
+            let via_postcard = crate::framing::encode_message(&ClientMessage::ChunkData(
+                ChunkData::new(payload.clone())?,
+            ))?;
+            assert_eq!(
+                via_helper, via_postcard,
+                "encode_chunk_frame diverged from the generic encoder at len {len}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn encode_chunk_frame_golden_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        // An exact-byte pin, independent of both encoders: discriminant 2, then the
+        // payload's postcard length varint, then the payload. If postcard ever changed
+        // its sequence-length encoding, the agreement test above would still pass while
+        // the wire silently moved; this catches that.
+        assert_eq!(
+            crate::client::encode_chunk_frame(&[0xDE, 0xAD, 0xBE, 0xEF])?,
+            vec![0x02, 0x04, 0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        // 300 bytes: length 300 = 0b100_101100 → varint [0xAC, 0x02].
+        let big = crate::client::encode_chunk_frame(&[0x11u8; 300])?;
+        assert_eq!(big.get(..3), Some(&[0x02, 0xAC, 0x02][..]));
+        assert_eq!(big.len(), 3 + 300);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_chunk_frame_rejects_an_empty_payload() {
+        // The floor moved off `ChunkData::new` for this path, so it needs its own pin:
+        // ADR 005 §Non-empty chunk must hold for every frame the crate can emit.
+        assert_eq!(
+            crate::client::encode_chunk_frame(&[]),
+            Err(MessageValidationError::EmptyChunk)
+        );
     }
 
     #[test]
@@ -1692,7 +1882,7 @@ mod tests {
         // assertion worth making: if this ever returns `Err`, some construction path has
         // gone around the constructor.
         assert_eq!(ChunkData::new(vec![0u8])?.validate(), Ok(()));
-        assert_eq!(ChunkData::new(vec![0u8; CHUNK_SIZE])?.validate(), Ok(()));
+        assert_eq!(ChunkData::new(vec![0u8; 1024 * 1024])?.validate(), Ok(()));
         Ok(())
     }
 
@@ -1754,65 +1944,98 @@ mod tests {
     // --- StreamResponse ok/error consistency ---------------------------------
 
     #[test]
-    fn stream_response_validate_rejects_error_with_ok() {
-        // sample_response has body.ok = true; an error must not accompany it.
-        let resp = StreamResponse {
+    fn stream_response_ext_validate_rejects_error_with_ok() {
+        let ext = StreamResponseExt {
             error: Some(StreamError::NotFound),
-            ..sample_response()
         };
         assert_eq!(
-            resp.validate(),
+            ext.validate(true),
             Err(MessageValidationError::StreamErrorWithOk)
         );
     }
 
     #[test]
-    fn stream_response_validate_rejects_failure_without_error() {
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                ok: false,
-                ..sample_body()
-            },
-            error: None,
-            ..sample_response()
-        };
+    fn stream_response_ext_validate_rejects_failure_without_error() {
         assert_eq!(
-            resp.validate(),
+            StreamResponseExt::default().validate(false),
             Err(MessageValidationError::MissingStreamError)
         );
     }
 
     #[test]
-    fn stream_response_validate_accepts_failure_with_delivery_error() {
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                ok: false,
-                ..sample_body()
-            },
+    fn stream_response_ext_validate_accepts_failure_with_delivery_error() {
+        let ext = StreamResponseExt {
             error: Some(StreamError::Overloaded),
-            ..sample_response()
         };
-        assert_eq!(resp.validate(), Ok(()));
+        assert_eq!(ext.validate(false), Ok(()));
     }
 
     #[test]
-    fn stream_response_validate_rejects_voucher_rejected_in_error() {
+    fn stream_response_ext_validate_rejects_voucher_rejected_in_error() {
         // VoucherRejected is mid-stream-only; it must never ride in the response.
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                ok: false,
-                ..sample_body()
-            },
+        let ext = StreamResponseExt {
             error: Some(StreamError::VoucherRejected {
                 reason: VoucherRejectReason::SpendingCapExhausted,
                 bundle: None,
             }),
-            ..sample_response()
         };
         assert_eq!(
-            resp.validate(),
+            ext.validate(false),
             Err(MessageValidationError::VoucherRejectedInResponse)
         );
+    }
+
+    /// The base validator cannot see `error`, so an `ok == true` response with a
+    /// stray error code passes it. That is not a hole — it is why a receiver must
+    /// call BOTH halves — but it is worth pinning so nobody "simplifies" the
+    /// receive path down to one call.
+    #[test]
+    fn stream_response_base_validate_cannot_see_the_ext() -> Result<(), MessageValidationError> {
+        sample_response().validate()?;
+        let stray = StreamResponseExt {
+            error: Some(StreamError::NotFound),
+        };
+        assert_eq!(
+            stray.validate(sample_response().body.ok),
+            Err(MessageValidationError::StreamErrorWithOk)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_response_two_phase_with_ext() -> Result<(), postcard::Error> {
+        let resp = sample_response();
+        let ext = StreamResponseExt::default();
+        let buf = encode_stream_response(&resp, Some(&ext))?;
+        let (msg, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(msg, ClientMessage::StreamResponse(resp));
+        assert_eq!(parse_stream_response_ext(remainder)?, ext);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_response_two_phase_no_ext() -> Result<(), postcard::Error> {
+        let resp = sample_response();
+        let buf = encode_stream_response(&resp, None)?;
+        let (msg, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
+        assert_eq!(msg, ClientMessage::StreamResponse(resp));
+        assert!(remainder.is_empty());
+        assert_eq!(
+            parse_stream_response_ext(remainder)?,
+            StreamResponseExt::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_response_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
+        let ext = StreamResponseExt {
+            error: Some(StreamError::Overloaded),
+        };
+        let mut bytes = postcard::to_allocvec(&ext)?;
+        bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);
+        assert_eq!(parse_stream_response_ext(&bytes)?, ext);
+        Ok(())
     }
 
     // --- ClientMessage dispatcher + StreamError domain split -----------------

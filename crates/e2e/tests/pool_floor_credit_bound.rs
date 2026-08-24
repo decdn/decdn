@@ -6,9 +6,15 @@
 //! bound against fakes (`FixedRemainingPoolView`, a stubbed `PoolView`); this
 //! journey proves it end to end against a real anvil chain, a real
 //! `decdn-node` daemon, and the real paid `cdn/client/v1` wire — including one
-//! lane that is a genuine cache MISS, so the shared `serve_leg` (used by both
-//! `serve_via_backend_origin` and `serve_via_window_pull_through`) folds its
-//! `dead_charge` into the same per-pool accumulator as the cache-hit path.
+//! lane whose blob is not in the cache at open, so the fill path folds its
+//! `dead_charge` into the same per-pool accumulator as the already-warm path.
+//!
+//! That lane reaches the client through the buffered `try_local_populate` route,
+//! not `serve_leg`: `seed_origin_blob` writes `{H}` without a `{H}.obao4`, so the
+//! serviceability probe finds no outboard and the range-pull leg is never chosen.
+//! Nothing here exercises `serve_via_backend_origin` or the window pull-through,
+//! and the burst measured below is a lower bound taken at `paid == 0`, where a
+//! ramped credit window and one pinned at its floor are indistinguishable.
 //!
 //! Shape: one owner opens and funds a `PaymentPool` with a deposit sized to
 //! fit exactly two ramp-floors of free credit above `M` (see the sizing
@@ -179,9 +185,9 @@ async fn run() -> anyhow::Result<()> {
     let floor_bytes = usize::try_from(CHUNK_BYTES).unwrap_or(usize::MAX);
 
     // A HIT blob (warmed into the node's cache at launch) and a MISS blob
-    // (written only into the node's opaque origin backend, never touching the
-    // cache — the only way it reaches a client is a genuine reactive
-    // `serve_via_backend_origin` pull, see `NodeFixture::seed_origin_blob`).
+    // (written only into the node's opaque origin backend, so it reaches a client
+    // through a reactive origin fill — the buffered `try_local_populate` route,
+    // since `seed_origin_blob` writes no outboard for the range-pull leg to use).
     // Both exceed one ramp-floor interval so a withheld lane is capped by the
     // credit window itself, not by running out of content (see
     // `deposit_micro_usdc`'s doc comment).
@@ -474,15 +480,19 @@ async fn open_and_withhold(
         .await
         .context("node sent no open frame within budget")?
         .context("read open frame")?;
-    let (msg, _rest) =
+    let (msg, tail) =
         decdn_protocol::decode_message::<ClientMessage>(&first).context("decode open frame")?;
     let ClientMessage::StreamResponse(resp) = msg else {
         anyhow::bail!("expected a StreamResponse open frame, got a different message");
     };
+    // The refusal code rides in the trailing extension (ADR 013 §Tier 1), so the
+    // open frame is read two-phase.
+    let resp_ext =
+        decdn_protocol::parse_stream_response_ext(tail).context("decode open frame extension")?;
     if !resp.body.ok {
         conn.close(0u32.into(), b"refused");
         return Ok(WithholdOutcome::Refused(
-            resp.error.unwrap_or(StreamError::InternalError),
+            resp_ext.error.unwrap_or(StreamError::InternalError),
         ));
     }
 

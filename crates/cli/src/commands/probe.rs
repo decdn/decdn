@@ -74,7 +74,7 @@ pub async fn probe(
     // Transport and RTT measurement live in `probe_once`.
     let result = probe_once(&endpoint, target, hash, timestamp_us, timeout).await;
     endpoint.close().await;
-    let (resp, rtt_ms) = result?;
+    let (resp, resp_ext, rtt_ms) = result?;
 
     // Correlation: the node echoes both the queried hash and the
     // requester timestamp (ADR 005). A mismatch means a stale/confused
@@ -104,7 +104,7 @@ pub async fn probe(
         .map_err(|e| anyhow::anyhow!("rejecting probe response: {e}"))?;
 
     let mut stdout = std::io::stdout().lock();
-    write_probe_response(&mut stdout, &resp, rtt_ms, args.json)
+    write_probe_response(&mut stdout, &resp, &resp_ext, rtt_ms, args.json)
         .map_err(|e| anyhow::anyhow!("failed to write probe response: {e}"))?;
     Ok(())
 }
@@ -117,6 +117,7 @@ pub async fn probe(
 pub(crate) fn write_probe_response(
     w: &mut impl std::io::Write,
     resp: &decdn_protocol::message::ProbeResponse,
+    resp_ext: &decdn_protocol::ProbeResponseExt,
     rtt_ms: f64,
     json: bool,
 ) -> std::io::Result<()> {
@@ -146,7 +147,7 @@ pub(crate) fn write_probe_response(
             "hash": hash_hex,
             "has_blob": resp.body.has_blob,
             "rate_per_mb": resp.body.rate_per_mb,
-            "total_bytes": resp.total_bytes,
+            "total_bytes": resp_ext.total_bytes,
             "timestamp_us": resp.body.timestamp_us,
             "rtt_ms": rtt_ms_quantized,
             "slash_sig": slash_sig_hex,
@@ -156,7 +157,7 @@ pub(crate) fn write_probe_response(
         writeln!(w, "hash:          {hash_hex}")?;
         writeln!(w, "has_blob:      {}", resp.body.has_blob)?;
         writeln!(w, "rate_per_mb:   {} (base units)", resp.body.rate_per_mb)?;
-        match resp.total_bytes {
+        match resp_ext.total_bytes {
             Some(n) => writeln!(w, "total_bytes:   {n}")?,
             None => writeln!(w, "total_bytes:   (unknown)")?,
         }
@@ -178,17 +179,23 @@ mod tests {
     use decdn_protocol::SLASH_SIG_LEN;
     use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 
-    fn fixture(rate_per_mb: u64, has_blob: bool, total_bytes: Option<u64>) -> ProbeResponse {
-        ProbeResponse {
-            body: ProbeResponseBody {
-                hash: [0xAB; 32],
-                has_blob,
-                rate_per_mb,
-                timestamp_us: 1_700_000_000_000_000,
+    fn fixture(
+        rate_per_mb: u64,
+        has_blob: bool,
+        total_bytes: Option<u64>,
+    ) -> (ProbeResponse, decdn_protocol::ProbeResponseExt) {
+        (
+            ProbeResponse {
+                body: ProbeResponseBody {
+                    hash: [0xAB; 32],
+                    has_blob,
+                    rate_per_mb,
+                    timestamp_us: 1_700_000_000_000_000,
+                },
+                slash_sig: vec![0xCD; SLASH_SIG_LEN],
             },
-            total_bytes,
-            slash_sig: vec![0xCD; SLASH_SIG_LEN],
-        }
+            decdn_protocol::ProbeResponseExt { total_bytes },
+        )
     }
 
     /// #252: the requester gate (`ProbeResponse::validate`, invoked on the
@@ -198,7 +205,7 @@ mod tests {
     /// bound is enforced at decode time; zero is the requester-side obligation.
     #[test]
     fn validate_rejects_zero_rate_response() {
-        let resp = fixture(0, true, Some(4096));
+        let (resp, _resp_ext) = fixture(0, true, Some(4096));
         let err = resp.validate().expect_err("zero rate must be rejected");
         assert!(
             matches!(err, decdn_protocol::MessageValidationError::RateIsZero),
@@ -210,9 +217,9 @@ mod tests {
     /// guarantees. Catches a renamed key, a dropped field, or a type drift.
     #[test]
     fn json_output_keys_and_types() {
-        let resp = fixture(10, true, Some(4096));
+        let (resp, resp_ext) = fixture(10, true, Some(4096));
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 12.5, true).unwrap();
+        write_probe_response(&mut buf, &resp, &resp_ext, 12.5, true).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
 
@@ -243,9 +250,9 @@ mod tests {
     /// a size (ADR 005: optional field).
     #[test]
     fn json_total_bytes_null_when_absent() {
-        let resp = fixture(10, false, None);
+        let (resp, resp_ext) = fixture(10, false, None);
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 1.0, true).unwrap();
+        write_probe_response(&mut buf, &resp, &resp_ext, 1.0, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(parsed["total_bytes"].is_null());
         assert_eq!(parsed["has_blob"].as_bool(), Some(false));
@@ -254,9 +261,9 @@ mod tests {
     /// `rtt_ms` is quantized to ms precision. `12.5009` rounds to `12.501`.
     #[test]
     fn json_rtt_ms_quantized_to_ms_precision() {
-        let resp = fixture(10, true, None);
+        let (resp, resp_ext) = fixture(10, true, None);
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 12.500_9, true).unwrap();
+        write_probe_response(&mut buf, &resp, &resp_ext, 12.500_9, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let rtt = parsed["rtt_ms"].as_f64().unwrap();
         assert!(
@@ -269,9 +276,9 @@ mod tests {
     /// without `-s`/slurp.
     #[test]
     fn json_output_is_single_line() {
-        let resp = fixture(10, true, Some(1));
+        let (resp, resp_ext) = fixture(10, true, Some(1));
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 1.0, true).unwrap();
+        write_probe_response(&mut buf, &resp, &resp_ext, 1.0, true).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         assert_eq!(
             text.lines().count(),
@@ -284,9 +291,9 @@ mod tests {
     /// scripts grep for `has_blob:` / `rtt:` etc. without `--json`.
     #[test]
     fn pretty_output_emits_labelled_lines_in_stable_order() {
-        let resp = fixture(7, true, Some(2048));
+        let (resp, resp_ext) = fixture(7, true, Some(2048));
         let mut buf: Vec<u8> = Vec::new();
-        write_probe_response(&mut buf, &resp, 1.234, false).unwrap();
+        write_probe_response(&mut buf, &resp, &resp_ext, 1.234, false).unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 7);

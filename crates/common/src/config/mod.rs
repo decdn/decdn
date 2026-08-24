@@ -382,6 +382,16 @@ pub const DEFAULT_CREDIT_MAX: u64 = 64 * 1024 * 1024;
 /// exceeds half the revenue the stream has already confirmed. Lower ramps faster;
 /// `0` opens the full [`DEFAULT_CREDIT_MAX`] from the first byte.
 pub const DEFAULT_CREDIT_RAMP_DIVISOR: u64 = 2;
+/// Default serve-path wire-frame target (ADR 005 §`cdn/client/v1`): 1 MiB, matching
+/// the payment quantum so a fully-ramped stream sends about one frame per priced
+/// chunk. Node-local policy that travels on no message: the payer accepts any
+/// non-empty frame, and neither the bao codec's chunk groups nor the payment meter
+/// is defined over frame boundaries. Larger frames cost proportionally less
+/// per-frame CPU per byte served, and one payment interval is both the default and
+/// the maximum — a frame never crosses a payment-chunk boundary. The serve loop also
+/// clamps each frame to the credit window's remaining room, so this is a ceiling
+/// rather than an exact size.
+pub const DEFAULT_FRAME_TARGET_BYTES: u64 = decdn_protocol::CHUNK_BYTES;
 /// Default background flush period in milliseconds when
 /// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
 /// state persistence): 5 s.
@@ -2670,6 +2680,29 @@ pub fn resolve_payment_into(
     let credit_ramp_divisor = file
         .and_then(|p| p.credit_ramp_divisor)
         .unwrap_or(DEFAULT_CREDIT_RAMP_DIVISOR);
+    // Serve-path wire-frame target (ADR 005 §`cdn/client/v1`). Default and ceiling
+    // are both one `CHUNK_BYTES` payment interval: a frame never crosses a payment
+    // boundary, so the serve loop clamps every request to the interval remainder and
+    // a larger value could not reach the wire. Rejected rather than silently clamped
+    // — an operator who sets 8 MiB expecting bigger frames deserves to be told the
+    // value is unreachable, not to watch for a change that never comes. `0` is
+    // rejected for the opposite reason: it would ask the framers for zero-length
+    // frames, and an empty `ChunkData` is a protocol error.
+    let frame_target_bytes = file
+        .and_then(|p| p.frame_target_bytes.as_ref())
+        .map_or(DEFAULT_FRAME_TARGET_BYTES, |b| b.get());
+    bag.check_with(
+        frame_target_bytes > 0 && frame_target_bytes <= decdn_protocol::CHUNK_BYTES,
+        "payment.frame_target_bytes",
+        || {
+            format!(
+                "payment.frame_target_bytes must be in 1..={} (one payment chunk); a \
+                 frame never crosses a payment-chunk boundary, so a larger value \
+                 could never reach the wire",
+                decdn_protocol::CHUNK_BYTES
+            )
+        },
+    );
     // Background flush period (ADR 003 §Off-chain voucher state persistence).
     // `0` would build a zero-period `tokio::time::interval`, which panics; reject
     // it so an operator wanting tight durability sets a small positive value.
@@ -2690,6 +2723,7 @@ pub fn resolve_payment_into(
         delivery_floor,
         credit_max,
         credit_ramp_divisor,
+        frame_target_bytes,
         voucher_commit_interval_ms,
     }
 }
@@ -5074,6 +5108,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
+            frame_target_bytes: None,
             voucher_commit_interval_ms: None,
         };
         let err = resolve_payment(&cli, Some(&file))
@@ -5122,6 +5157,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
+            frame_target_bytes: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -5169,6 +5205,7 @@ swap_pool_address = \"0xPool\"
                 delivery_floor: None,
                 credit_max: None,
                 credit_ramp_divisor: None,
+                frame_target_bytes: None,
                 voucher_commit_interval_ms: set,
             };
             let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -5216,6 +5253,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             credit_max: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
             credit_ramp_divisor: Some(5),
+            frame_target_bytes: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -9590,6 +9628,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
+            frame_target_bytes: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -9605,6 +9644,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             credit_max: None,
             credit_ramp_divisor: None,
+            frame_target_bytes: None,
             voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;

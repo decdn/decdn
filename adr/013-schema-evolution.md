@@ -26,7 +26,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. The cap is global, not per-ALPN: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
+The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. The cap is global, not per-ALPN: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB. `ChunkData` is the one message far larger than the rest — a sender sizes it up to one `CHUNK_BYTES` payment interval (1 MiB), still well under the cap.
 
 The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
@@ -61,7 +61,7 @@ These are low-level framing helpers. Application-layer deserialization is separa
 
 #### `ChunkData` exemption
 
-`ChunkData` payloads (1024-byte blob chunks) are already implicitly length-delimited by the QUIC stream's byte count and the payment quantum. They MUST still use varint-length framing for consistency — the receiver must distinguish `ChunkData` from `Voucher` and `ChunkPreimage` on the same stream via the protocol enum discriminant. The 1–2 byte overhead on 1024-byte chunks is ~0.1%.
+`ChunkData` payloads are sender-sized blob chunks ([ADR 005](005-protocol.md#adr-005-wire-protocol)), so unlike every other message on the ALPN their length is not implied by the message type. They MUST use varint-length framing — it is what delimits one payload from the next, and the receiver must also distinguish `ChunkData` from `Voucher` and `ChunkPreimage` on the same stream via the protocol enum discriminant. `MAX_MESSAGE_SIZE` is the only ceiling on a payload, and it is enforced before allocation.
 
 ### Protocol Enums
 
@@ -271,7 +271,7 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 
 #### Implementation note — separating signed and unsigned fields
 
-A signed message serializes its signed fields into a dedicated inner struct (e.g., `ProbeResponseBody`) and computes the signature over that struct's postcard bytes. Unsigned fields (added via minor evolution) live in the outer struct, outside the signed region:
+A signed message holds its signed fields in a dedicated inner struct (e.g., `ProbeResponseBody`). The signature is an EIP-712 typed-data signature over that field set — **not** over the struct's postcard bytes. The distinction matters: the split isolates a *field set*, not a byte range, so where an unsigned field sits on the wire has no bearing on signature validity. Unsigned fields nonetheless live outside the frozen base, in a separately encoded extension, because that is what makes a later addition decodable by an older peer:
 
 ```rust
 /// Signed portion — field set is frozen per protocol version.
@@ -283,16 +283,23 @@ struct ProbeResponseBody {
     timestamp_us: u64,
 }
 
-/// Full wire message — extensions follow body + signature via two-phase deserialization.
+/// Frozen base — the signed body and the signature over it, nothing else.
 #[derive(Serialize, Deserialize)]
 struct ProbeResponse {
     body: ProbeResponseBody,
     slash_sig: Bytes,
-    // Unsigned fields (e.g. total_bytes) trail via two-phase deserialization.
+}
+
+/// Unsigned fields — a separate postcard value appended after the base.
+#[derive(Serialize, Deserialize, Default)]
+struct ProbeResponseExt {
+    total_bytes: Option<u64>,
 }
 ```
 
-Future unsigned extension fields trail `body + signature` and are decoded via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `StreamResponse`.
+Unsigned extension fields trail `body + signature` as their own postcard value and are decoded two-phase (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `StreamResponse` and to `cdn/dht/v1`, so all three ALPNs carry the seam.
+
+A cross-half invariant — one that relates a signed field to an unsigned one, such as `StreamResponse`'s `ok` agreeing with its `error` — belongs on the extension's validator, which takes the signed value as an argument. Neither half can check it alone, so a receiver MUST run both validators.
 
 #### Cross-ADR struct alignment
 
@@ -329,7 +336,7 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 ### Negative
 
-- Varint length prefix adds 1–5 bytes per message. For `ChunkData` (1024-byte payload), ~0.2% including the enum discriminant; for `ProbeRequest` (~40 bytes), ~5%. Both negligible
+- Varint length prefix adds 1–5 bytes per message. Negligible against a `ChunkData` payload, which a sender sizes at up to one `CHUNK_BYTES` payment interval; ~5% on a `ProbeRequest` (~40 bytes), which is small in absolute terms
 - `take_from_bytes` is marginally slower than `from_bytes` (tracks consumed position); negligible for this protocol's message sizes (sub-microsecond)
 - Minor evolution can accumulate "dead weight" — added fields no longer useful, with no removal mechanism short of a major version bump. Unlikely to matter at this protocol's message sizes
 - Signed field freezing means even minor improvements to signed structs (e.g., adding a field to `ProbeResponse`'s signed set) require a full ALPN version bump. Conservative by design — the unsigned outer fields pattern mitigates this for fields that need not be signed

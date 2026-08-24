@@ -1137,7 +1137,7 @@ async fn probe_and_rank(
         }
         let timestamp_us = wall_clock_us();
         match probe_once(&endpoint, target, hash, timestamp_us, timeout).await {
-            Ok((_, rtt_ms)) => rows.push(LookupRow {
+            Ok((_, _, rtt_ms)) => rows.push(LookupRow {
                 node_id: c.node_id,
                 eth_address: c.eth_address,
                 region_hint: c.region_hint,
