@@ -354,6 +354,8 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         Arc::clone(&routing),
         Arc::clone(&scheduler),
         cache,
+        true,
+        Arc::new(decdn_node::metrics::Metrics::new()),
         inserts_rx,
         stop_rx,
     ));
@@ -392,4 +394,138 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     server.endpoint.close().await;
     server.accept_task.abort();
     Ok(())
+}
+
+/// A lagged cache-commit channel must re-seed the scheduler from local state.
+///
+/// The channel is bounded and best-effort — the cache does not retain the
+/// hashes it drops — so a blob committed inside the lag window would otherwise
+/// carry no DHT record until an operator restarted the node. This drives the
+/// real `run_republish` loop against a real `CacheEngine` and asserts the
+/// missed hashes end up scheduled.
+///
+/// No server or routing table: the sweep's contract is what reaches the
+/// *scheduler*. Publishing them to peers is the tick path, covered by
+/// `run_republish_publishes_immediately_on_cache_insert` above.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow::Result<()> {
+    use decdn_node::dht::{RepublishScheduler, publish::run_republish};
+    use tokio::sync::{broadcast, oneshot};
+
+    let payloads: [&'static [u8]; 4] = [b"lag-a", b"lag-b", b"lag-c", b"lag-d"];
+    let cache_dir = tempfile::tempdir()?;
+    let origins: Vec<Arc<dyn decdn_cache::Origin>> =
+        payloads.iter().map(|p| stub_origin(p)).collect();
+    let cache = decdn_cache::CacheEngine::open(cache_dir.path(), origins, 16).await?;
+    let hashes: Vec<iroh_blobs::Hash> = payloads
+        .iter()
+        .map(|p| decdn_cache::Hash::new(*p))
+        .collect();
+    for h in &hashes {
+        cache.get(*h).await?;
+    }
+
+    // Overflow before the task starts polling: a receiver created ahead of
+    // more sends than the channel holds sees `Lagged` on its first `recv`,
+    // which makes the trigger deterministic rather than timing-dependent.
+    let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(2);
+    for h in &hashes {
+        inserts_tx.send(*h).unwrap();
+    }
+
+    let key = fresh_key();
+    let publisher_id = key.public();
+    let (publisher_ep, _addr) = local_endpoint(key, vec![ALPN_DHT.to_vec()]).await?;
+    let scheduler = Arc::new(RepublishScheduler::new());
+    let metrics = Arc::new(Metrics::new());
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(run_republish(
+        publisher_ep.clone(),
+        publisher_id,
+        // Empty routing table: with no peers the publish fan-out is a no-op,
+        // which is what keeps this test about the sweep.
+        Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *publisher_id.as_bytes(),
+        )))),
+        Arc::clone(&scheduler),
+        cache,
+        true,
+        Arc::clone(&metrics),
+        inserts_rx,
+        stop_rx,
+    ));
+
+    // The sweep is detached and walks the store, so poll rather than assume
+    // it has landed by any fixed point.
+    let mut seeded_count = 0usize;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        seeded_count = scheduler.len();
+        if seeded_count >= payloads.len() {
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    let _ = task.await;
+
+    assert_eq!(
+        seeded_count,
+        payloads.len(),
+        "the lag sweep must schedule every held blob, not just the ones the \
+         receiver still saw after the overflow"
+    );
+    let text = metrics.encode().unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l == "decdn_dht_republish_lag_sweeps_total 1"),
+        "the lag must surface on its counter:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l == "decdn_dht_republish_sweep_failures_total 0"),
+        "a healthy store walk must not count as a degraded sweep:\n{text}"
+    );
+
+    publisher_ep.close().await;
+    Ok(())
+}
+
+/// Single-blob stub origin: `fetch` commits the payload into the store on
+/// `get`, which is all this file needs to build a non-empty cache.
+fn stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+    #[derive(Debug)]
+    struct StubOrigin {
+        data: bytes::Bytes,
+        hash: decdn_cache::Hash,
+    }
+
+    impl decdn_cache::Origin for StubOrigin {
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            hash: decdn_cache::Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let result = if hash == self.hash {
+                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(decdn_cache::OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    Arc::new(StubOrigin {
+        data: bytes::Bytes::from_static(payload),
+        hash: decdn_cache::Hash::new(payload),
+    })
 }

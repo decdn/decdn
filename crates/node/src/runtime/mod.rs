@@ -1762,30 +1762,24 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // the first republish, not only after a warm pulls it into the store.
     infra.cache.rescan_origins().await;
 
-    // Union store-complete blobs with origin-held content. The scheduler dedups
-    // internally (idempotent `scheduled` set); collecting into a set first keeps
-    // the logged count honest and coalesces a hash that is both stored and
-    // origin-held into one jitter draw. On a store list-error we still seed the
-    // origin-held set — announce degrades only for the store half.
-    //
-    // Under the origin-only policy (`relay_foreign_namespaces == false`) the
-    // store union is skipped: the store may still hold leftover foreign
-    // content from before the toggle was set, and seeding it would announce
-    // blobs the serve gate now declines. Own content is unaffected — it lives
-    // in `origin_held_hashes()` regardless of the toggle.
-    let mut cold_start_set: std::collections::HashSet<decdn_cache::Hash> =
-        infra.cache.origin_held_hashes().into_iter().collect();
-    if cfg.cache.relay_foreign_namespaces {
-        match infra.cache.iter_hashes().await {
-            Ok(hashes) => cold_start_set.extend(hashes),
-            Err(err) => tracing::warn!(
-                error = %err,
-                "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
-            ),
-        }
+    // Union store-complete blobs with origin-held content — the same snapshot
+    // the republisher's lag sweep re-seeds from, so the two cannot drift apart.
+    // The union coalesces a hash that is both stored and origin-held into one
+    // jitter draw, and on a store list-error the origin-held half still seeds:
+    // announce degrades only for the store half. See `holder_snapshot` for why
+    // the store half is skipped under the origin-only policy.
+    let snapshot =
+        crate::dht::publish::holder_snapshot(&infra.cache, cfg.cache.relay_foreign_namespaces)
+            .await;
+    if let Some(err) = &snapshot.store_error {
+        tracing::warn!(
+            error = %err,
+            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
+        );
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
-        cold_start_set
+        snapshot
+            .hashes
             .into_iter()
             .map(|h| decdn_protocol::ContentHash::from_bytes(*h.as_bytes())),
     );
@@ -1799,6 +1793,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         Arc::clone(&ch.dht_routing),
         Arc::clone(&republish_scheduler),
         infra.cache.clone(),
+        cfg.cache.relay_foreign_namespaces,
+        Arc::clone(&infra.node_metrics),
         cache_inserts_rx,
         republish_stop_rx,
     ));

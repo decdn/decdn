@@ -378,6 +378,29 @@ pub struct DecdnMetrics {
     /// retries the tail. Operator-visible name:
     /// `decdn_dht_batch_store_hashes_deferred_rate_limit_total`.
     pub dht_batch_store_hashes_deferred_rate_limit: Counter,
+    /// Times the republisher lost its cache-commit event window — the
+    /// `subscribe_inserts` broadcast channel overflowed and reported
+    /// `Lagged` — and started a re-seed sweep. The cache does not retain
+    /// the missed hashes, so without the sweep a blob committed inside the
+    /// window stays undiscoverable until the node restarts (ADR 022
+    /// §Bootstrap). A nonzero rate means commits are outrunning the
+    /// scheduler; discovery still converges, but up to one cold-start
+    /// window late. Operator-visible name:
+    /// `decdn_dht_republish_lag_sweeps_total`.
+    pub dht_republish_lag_sweeps: Counter,
+    /// Hashes a lag sweep newly scheduled for republish. Seeding is
+    /// idempotent, so this counts the repair, not the walk: a sweep that
+    /// finds every held hash already scheduled adds zero. Pair with
+    /// `dht_republish_lag_sweeps` — sweeps climbing while this stays flat
+    /// means the lags are costing nothing. Operator-visible name:
+    /// `decdn_dht_republish_sweep_reseeded_total`.
+    pub dht_republish_sweep_reseeded: Counter,
+    /// Lag sweeps that could not walk the local blob store and re-seeded
+    /// only the origin-held half. The sweep degrades rather than failing,
+    /// so nothing else surfaces this: blobs held only in the store stay
+    /// un-republished until a later sweep or a restart. Operator-visible
+    /// name: `decdn_dht_republish_sweep_failures_total`.
+    pub dht_republish_sweep_failures: Counter,
     /// Accepted vouchers whose nonce skipped one or more values past the
     /// previously-accepted nonce (`voucher.nonce > last_nonce + 1`), counted
     /// once per gapped voucher (#747). The voucher is still accepted —
@@ -522,8 +545,9 @@ pub struct DecdnMetrics {
     /// operator-indexed event (`Reinstated` / `UnbondingRequested`) was
     /// dropped because the follow-up `nodeIdOf(operator)` RPC failed. A dropped
     /// resolution leaves the cached active set out of sync with chain state for
-    /// that operator until a later event or the (future) resync path corrects
-    /// it — exactly the silent drift these #783/#788 metrics exist to surface.
+    /// that operator until a later event, or at the latest until the watcher's
+    /// cadence-gated `getRegisteredNodes` re-enumeration corrects it — exactly
+    /// the silent drift these #783/#788 metrics exist to surface.
     /// Unlike a stream-level error, this does NOT trip a backoff/restart, so it
     /// would otherwise move no metric at all. Pairs with the per-failure
     /// `warn!` in [`crate::dht::capacity_bond_registry`]'s
@@ -2052,6 +2076,15 @@ recorders! {
     /// them (ADR 022 §Batch token accounting, #648).
     dht_batch_store_hashes_deferred_rate_limit(count: u64)
         => dht_batch_store_hashes_deferred_rate_limit.inc_by(count);
+
+    /// Record a republish lag sweep starting (the cache-commit broadcast
+    /// channel reported `Lagged`).
+    dht_republish_lag_sweep => dht_republish_lag_sweeps.inc();
+    /// Record `count` hashes a lag sweep newly scheduled for republish.
+    dht_republish_sweep_reseeded(count: u64) => dht_republish_sweep_reseeded.inc_by(count);
+    /// Record a lag sweep that could not walk the store and re-seeded only
+    /// the origin-held half.
+    dht_republish_sweep_failure => dht_republish_sweep_failures.inc();
 
     /// Stamp the slash watcher's `*_last_tick_timestamp_seconds` liveness gauge
     /// with the current wall-clock time (#1316). The `on_tick_success` hook,

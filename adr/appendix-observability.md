@@ -184,6 +184,9 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 | `decdn_dht_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer buckets. |
 | `decdn_dht_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP buckets. |
 | `decdn_dht_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer buckets. |
+| `decdn_dht_republish_lag_sweeps_total` | Counter | R | live | — | Times the republisher lost its cache-commit event window (`Lagged` on the insert broadcast) and started a re-seed sweep ([ADR 022 § Bootstrap](022-content-discovery.md#bootstrap)). |
+| `decdn_dht_republish_sweep_reseeded_total` | Counter | R | live | — | Hashes a lag sweep newly scheduled for republish. Seeding is idempotent, so this counts the repair, not the walk. |
+| `decdn_dht_republish_sweep_failures_total` | Counter | R | live | — | Lag sweeps that could not walk the local blob store and re-seeded only the origin-held half. |
 
 Both rate-limit trios come from the same `RejectLayer` enum and the same shared limiter (`crates/node/src/rate_limit.rs`); the probe copies are in [§ Probe Metrics](#probe-metrics-cdnprobev1). They are **sibling counters, not a `layer` label**, per [§ Reason splits](#reason-splits-sibling-counters-not-labels) — recover the rolled-up rate with `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))` (a `__name__` regex, not shell-style brace expansion — PromQL has no such syntax; the braces elsewhere in this appendix are naming shorthand for a family, never a query). [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) and [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) specify these sibling trios; no single labelled `*_rejections_total` counter exists.
 

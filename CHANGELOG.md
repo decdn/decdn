@@ -589,6 +589,26 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **dht: a lagged cache-commit channel now re-seeds the republish scheduler.**
+  The republisher schedules a blob's first DHT `Store` off the cache's
+  `subscribe_inserts` broadcast. That channel is bounded and retains nothing it
+  drops, so a `Lagged` receiver cannot backfill — and the handler only logged,
+  leaving every hash committed inside the lag window with no DHT record until an
+  operator restarted the node. It now re-derives the held set (origin-held index
+  plus, when relaying foreign namespaces, the committed store) and seeds whatever
+  is missing, drawing `uniform(0, 40 min)` per record so the repair costs one
+  cold-start window rather than a burst (ADR 022 §Bootstrap, AC 20). The sweep
+  runs detached and coalesces, so repeated lags do not stack store walks.
+  - Seeding is now idempotent: `RepublishScheduler::seed_cold_start` skips a hash
+    that is already scheduled instead of pushing a second heap entry. A duplicate
+    entry drained twice and bought one spurious republish per re-seed, which also
+    affected the periodic origin rescan. Its return value now counts hashes
+    *newly* scheduled; `schedule_cold_start` is removed, since seeding through it
+    bypassed the new guarantee and nothing called it.
+  - New counters `decdn_dht_republish_lag_sweeps_total`,
+    `decdn_dht_republish_sweep_reseeded_total`, and
+    `decdn_dht_republish_sweep_failures_total` make the window alertable.
+
 - **node: the cache-miss serve leg now re-ramps its credit window.** `serve_leg`
   resolved the window once before its delivery loop and never recomputed it, so a
   stream served through a miss stayed pinned at the one-chunk ramp floor however

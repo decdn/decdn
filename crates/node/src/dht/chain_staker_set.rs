@@ -40,9 +40,7 @@
 //! exponentially-growing backoff (1s → 60s cap), and re-polls. The cursor is
 //! retained across the backoff, so the next `eth_getLogs` tick re-scans
 //! `[cursor, head]` and re-applies any membership event that landed during the
-//! outage — no stream-level drift window. (There is still no `getRegisteredNodes`
-//! resync to reconcile against a checkpoint older than the live cursor, but that
-//! is only reachable via the per-event `nodeIdOf` drop below, not a backoff gap.)
+//! outage — no stream-level drift window.
 //!
 //! A narrower drift source: an operator-indexed event whose follow-up
 //! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
@@ -72,8 +70,14 @@
 //! there is no separate node-address watcher family to correlate against
 //! (#1231).
 //!
-//! A `getRegisteredNodes` resync-on-extended-outage path is a follow-up;
-//! these metrics surface the window that path would close.
+//! Every drift source above is repaired by the watcher's cadence-gated
+//! re-enumeration: `capacity_bond_registry` re-derives the whole projection from
+//! `getRegisteredNodes` every `REGISTRY_RESYNC_INTERVAL`, build-then-swap, so a
+//! dropped `nodeIdOf` change survives at most one interval rather than until the
+//! next event for that operator. The trigger is the cadence, not the recovery
+//! edge — a `LogSink` observes only `apply` and `on_tick_complete`, and neither
+//! carries the poller's error/recovery state — so the metrics above still size a
+//! drift window the resync bounds but does not eliminate.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};

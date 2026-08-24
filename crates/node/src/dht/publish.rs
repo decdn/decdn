@@ -31,6 +31,16 @@
 //! window matches the steady-state mean cycle so bootstrap rate equals
 //! steady-state rate by construction.
 //!
+//! Lag sweep (ADR 022 §Bootstrap "Re-seed after a lost commit
+//! window"): the commit-event channel is bounded and best-effort, and
+//! the cache retains nothing it drops, so a `Lagged` receiver cannot
+//! backfill. The scheduler instead re-derives the held set
+//! ([`holder_snapshot`]) and seeds whatever is missing. Seeding is
+//! idempotent and uses the same `uniform(0, 40 min)` window as cold
+//! start, so a sweep costs one cold-start window rather than a burst —
+//! the immediate bulk republish is non-conforming here for the same
+//! reason it is at boot.
+//!
 //! Implementation: a single tokio task drives all records via a
 //! `BinaryHeap<(due_at, hash)>`. The heap is small (one entry per
 //! cached blob, capped by the cache's blob count) and the next
@@ -167,29 +177,34 @@ impl RepublishScheduler {
         self.schedule_with_offset(hash, offset);
     }
 
-    /// Schedule `hash` with the cold-start jitter window (0–40 min).
-    /// Used at boot for every blob already in the cache.
-    pub fn schedule_cold_start(&self, hash: ContentHash) {
-        let offset = jitter_us(Duration::ZERO, COLD_START_MAX);
-        self.schedule_with_offset(hash, offset);
-    }
-
     /// Batch-schedule every hash in `iter` with an independent
     /// cold-start jitter draw (uniform(0, 40 min) per hash, NOT a
     /// shared timestamp). Callers should pass
     /// [`decdn_cache::CacheEngine::iter_hashes`] results (NOT
     /// `access_times_snapshot`) — see the `iter_hashes` rustdoc for
-    /// the rationale. Returns the number of hashes scheduled —
-    /// useful for the startup log line so operators can see how big
-    /// the cold-start queue is.
+    /// the rationale.
+    ///
+    /// Seeding is idempotent: a hash already scheduled keeps its
+    /// existing due time and gets no second heap entry. That matters
+    /// wherever the seed runs against a non-empty scheduler — the
+    /// lag sweep in [`run_republish`] and the periodic origin
+    /// rescan — because a duplicate entry drains a second time on a
+    /// later tick and buys a spurious republish per re-seed.
+    ///
+    /// Returns the number of hashes *newly* scheduled — useful for
+    /// the startup log line so operators can see how big the
+    /// cold-start queue is, and for the sweep so a no-op sweep is
+    /// distinguishable from a repair.
     pub fn seed_cold_start<I>(&self, iter: I) -> usize
     where
         I: IntoIterator<Item = ContentHash>,
     {
         let mut count = 0usize;
         for hash in iter {
-            self.schedule_cold_start(hash);
-            count = count.saturating_add(1);
+            let offset = jitter_us(Duration::ZERO, COLD_START_MAX);
+            if self.schedule_if_absent(hash, offset) {
+                count = count.saturating_add(1);
+            }
         }
         count
     }
@@ -205,6 +220,31 @@ impl RepublishScheduler {
         if let Ok(mut heap) = self.heap.lock() {
             schedule_at(&mut heap, hash, due_us);
         }
+    }
+
+    /// Schedule `hash` at `now + offset_us` only if it is not already
+    /// scheduled. Returns whether it was added.
+    ///
+    /// The `scheduled` set is the dedupe key, and it is also what
+    /// [`Self::drain_due`] pops from — so "already scheduled" means
+    /// "has a live entry that will drain", never "was ever scheduled".
+    /// A hash the tick path just drained is absent again and re-seeds
+    /// normally.
+    fn schedule_if_absent(&self, hash: ContentHash, offset_us: u64) -> bool {
+        let due_us = now_us().saturating_add(offset_us);
+        // Both guards are held across the test-and-push so a concurrent
+        // `drain_due` cannot pop the hash out of `scheduled` between the
+        // membership test and the heap push, which would strand the new
+        // entry as a tombstone. Acquired heap-then-scheduled to match
+        // `drain_due`'s order — the reverse would deadlock against it.
+        let (Ok(mut heap), Ok(mut s)) = (self.heap.lock(), self.scheduled.lock()) else {
+            return false;
+        };
+        if !s.insert(hash) {
+            return false;
+        }
+        schedule_at(&mut heap, hash, due_us);
+        true
     }
 
     /// Drain all entries whose `due_us <= now_us`. Returns the popped
@@ -254,6 +294,87 @@ impl Default for RepublishScheduler {
     }
 }
 
+/// Every hash this node holds and may advertise, as one snapshot.
+///
+/// The union of the origin-held index and — when the node relays foreign
+/// namespaces — the committed blobs in the local store. This is the input to
+/// every bulk seed of the republish scheduler: bring-up cold start and the lag
+/// sweep in [`run_republish`] both need the same set, and computing it in one
+/// place is what keeps them from drifting apart.
+#[derive(Debug)]
+pub struct HolderSnapshot {
+    /// The union. Deduplicated, so a hash that is both stored and origin-held
+    /// draws one jitter offset rather than two.
+    pub hashes: HashSet<decdn_cache::Hash>,
+    /// `Some` when the store walk failed. The origin-held half is still in
+    /// `hashes`; the caller decides how loudly to report the degradation, since
+    /// bring-up and the sweep phrase it differently.
+    pub store_error: Option<decdn_cache::CacheError>,
+}
+
+/// Collect the [`HolderSnapshot`] for `cache`.
+///
+/// Under the origin-only policy (`relay_foreign_namespaces == false`) the store
+/// half is skipped: the store may hold leftover foreign content from before the
+/// toggle was set, and announcing it would advertise blobs the serve gate now
+/// declines. Own content is unaffected — it lives in the origin-held index
+/// regardless of the toggle.
+///
+/// Never fails: a store-walk error degrades to the origin-held half rather than
+/// yielding nothing, because a partial announce strictly beats none.
+pub async fn holder_snapshot(
+    cache: &decdn_cache::CacheEngine,
+    relay_foreign_namespaces: bool,
+) -> HolderSnapshot {
+    let mut hashes: HashSet<decdn_cache::Hash> = cache.origin_held_hashes().into_iter().collect();
+    let mut store_error = None;
+    if relay_foreign_namespaces {
+        match cache.iter_hashes().await {
+            Ok(stored) => hashes.extend(stored),
+            Err(err) => store_error = Some(err),
+        }
+    }
+    HolderSnapshot {
+        hashes,
+        store_error,
+    }
+}
+
+/// Re-seed the republish scheduler from local state after the cache-commit
+/// event window was lost.
+///
+/// Returns the number of hashes newly scheduled. Seeding draws
+/// `uniform(0, 40 min)` per record, so a sweep of C blobs spreads over the
+/// steady-state mean cycle instead of firing as one burst — ADR 022 §Bootstrap
+/// makes the single-tick bulk republish non-conforming for exactly this reason,
+/// which is why the sweep goes through the scheduler and never calls
+/// [`publish_batch`] directly.
+async fn lag_sweep(
+    cache: &decdn_cache::CacheEngine,
+    relay_foreign_namespaces: bool,
+    scheduler: &RepublishScheduler,
+    metrics: &crate::metrics::Metrics,
+) -> usize {
+    let snapshot = holder_snapshot(cache, relay_foreign_namespaces).await;
+    if let Some(err) = &snapshot.store_error {
+        metrics.dht_republish_sweep_failure();
+        tracing::warn!(
+            error = %err,
+            "dht republish: lag sweep could not walk the store; re-seeding the \
+             origin-held half only. Blobs held only in the store stay \
+             un-republished until the next sweep or restart"
+        );
+    }
+    let reseeded = scheduler.seed_cold_start(
+        snapshot
+            .hashes
+            .into_iter()
+            .map(|h| ContentHash::from_bytes(*h.as_bytes())),
+    );
+    metrics.dht_republish_sweep_reseeded(u64::try_from(reseeded).unwrap_or(u64::MAX));
+    reseeded
+}
+
 /// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
 /// the cache, drives the scheduler heap, and fans out `Store` requests
 /// to the K+3 closest peers per due hash. Exits on `stop_rx` or when
@@ -271,10 +392,16 @@ pub async fn run_republish(
     routing: Arc<Mutex<RoutingTable>>,
     scheduler: Arc<RepublishScheduler>,
     cache: decdn_cache::CacheEngine,
+    relay_foreign_namespaces: bool,
+    metrics: Arc<crate::metrics::Metrics>,
     mut cache_inserts: broadcast::Receiver<iroh_blobs::Hash>,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
     let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
+    // One sweep at a time. A lag is a symptom of sustained commit pressure, so
+    // `Lagged` commonly repeats; without this each one would start another full
+    // store walk on top of the last.
+    let sweep_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Use a relatively short polling interval — the driver wakes on
     // cache-insert events, on the scheduler ticking, OR on the
     // shutdown signal. A 1-second poll keeps the worst-case latency
@@ -307,19 +434,56 @@ pub async fn run_republish(
                         scheduler.schedule_steady(hash_bytes);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // ADR 022 §STORE Flow & doc on
-                        // `subscribe_inserts`: lagged consumers force a
-                        // full republish sweep. We don't have a cache
-                        // `iter_hashes` API yet (filed for follow-up);
-                        // log so the operator sees the gap and can
-                        // restart the node if the cache changed
-                        // unpredictably during the lag.
+                        // ADR 022 §STORE Flow & the `subscribe_inserts`
+                        // contract: the cache does not retain the missed
+                        // hashes, so a lagged consumer MUST re-derive the
+                        // held set rather than try to backfill. Without the
+                        // sweep a blob committed inside the lag window stays
+                        // undiscoverable until an operator restarts.
                         tracing::warn!(
                             missed = n,
                             "dht republish: cache-insert channel lagged; \
-                             missed hashes will republish on the next \
-                             cold-start (or operator restart)"
+                             re-seeding the scheduler from local state"
                         );
+                        metrics.dht_republish_lag_sweep();
+                        // Detached, like the batch publish below: the store
+                        // walk costs one `status()` per blob, and running it
+                        // on the select loop would stall shutdown and the
+                        // eager per-insert publishes. Abandoned on shutdown
+                        // — the next lag, or the next boot, re-seeds.
+                        if sweep_running
+                            .compare_exchange(
+                                false,
+                                true,
+                                std::sync::atomic::Ordering::AcqRel,
+                                std::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            let cache = cache.clone();
+                            let scheduler = Arc::clone(&scheduler);
+                            let metrics = Arc::clone(&metrics);
+                            let running = Arc::clone(&sweep_running);
+                            tokio::spawn(async move {
+                                let reseeded = lag_sweep(
+                                    &cache,
+                                    relay_foreign_namespaces,
+                                    &scheduler,
+                                    &metrics,
+                                )
+                                .await;
+                                running.store(false, std::sync::atomic::Ordering::Release);
+                                tracing::info!(
+                                    reseeded,
+                                    "dht republish: lag sweep complete"
+                                );
+                            });
+                        } else {
+                            tracing::debug!(
+                                "dht republish: lag sweep already running; \
+                                 the in-flight one covers this lag too"
+                            );
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Cache dropped — nothing more to schedule.
@@ -670,6 +834,223 @@ mod tests {
             s.is_empty(),
             "drain_due at deadline should empty the scheduler"
         );
+    }
+
+    /// Single-blob stub origin. `enumerate` + `size` are what put a hash in
+    /// the origin-held index; `fetch` is what puts it in the store. Which of
+    /// the two a test wants is set per-instance, so one type covers the
+    /// store half, the origin-held half, and the overlap between them.
+    #[derive(Debug)]
+    struct StubOrigin {
+        data: bytes::Bytes,
+        hash: decdn_cache::Hash,
+        enumerable: bool,
+    }
+
+    impl decdn_cache::Origin for StubOrigin {
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Filesystem
+        }
+
+        fn fetch(
+            &self,
+            hash: decdn_cache::Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let result = if hash == self.hash {
+                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(decdn_cache::OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+
+        fn size(
+            &self,
+            hash: decdn_cache::Hash,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+        > {
+            let n = (self.enumerable && hash == self.hash)
+                .then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
+            Box::pin(async move { Ok(n) })
+        }
+
+        fn enumerate(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<Vec<decdn_cache::Hash>, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let out = if self.enumerable {
+                vec![self.hash]
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    fn stub_origin(payload: &'static [u8], enumerable: bool) -> Arc<dyn decdn_cache::Origin> {
+        Arc::new(StubOrigin {
+            data: bytes::Bytes::from_static(payload),
+            hash: decdn_cache::Hash::new(payload),
+            enumerable,
+        })
+    }
+
+    /// With relay on, the snapshot is the union of both halves — and a hash
+    /// present in both appears once, so it draws one jitter offset rather
+    /// than two.
+    #[tokio::test]
+    async fn holder_snapshot_unions_store_and_origin_held() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        // `stored` is fetchable but not enumerable (store half only);
+        // `origin` is enumerable and also fetched below, so it lands in both.
+        let stored = decdn_cache::Hash::new(b"holder-stored");
+        let origin_held = decdn_cache::Hash::new(b"holder-origin");
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![
+                stub_origin(b"holder-stored", false),
+                stub_origin(b"holder-origin", true),
+            ],
+            16,
+        )
+        .await?;
+        cache.get(stored).await?;
+        cache.get(origin_held).await?;
+        cache.rescan_origins().await;
+
+        let snap = holder_snapshot(&cache, true).await;
+
+        assert!(snap.store_error.is_none(), "the store walk must succeed");
+        assert!(snap.hashes.contains(&stored), "store half missing");
+        assert!(
+            snap.hashes.contains(&origin_held),
+            "origin-held half missing"
+        );
+        assert_eq!(snap.hashes.len(), 2, "the overlap must dedupe: {snap:?}");
+        Ok(())
+    }
+
+    /// Origin-only nodes must not announce the store half: it can hold
+    /// foreign content left over from before the toggle was set, which the
+    /// serve gate now declines. Own content is in the origin-held index and
+    /// is unaffected.
+    #[tokio::test]
+    async fn holder_snapshot_skips_store_when_relay_foreign_namespaces_is_false()
+    -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let foreign = decdn_cache::Hash::new(b"holder-foreign");
+        let own = decdn_cache::Hash::new(b"holder-own");
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![
+                stub_origin(b"holder-foreign", false),
+                stub_origin(b"holder-own", true),
+            ],
+            16,
+        )
+        .await?;
+        cache.get(foreign).await?;
+        cache.get(own).await?;
+        cache.rescan_origins().await;
+
+        let snap = holder_snapshot(&cache, false).await;
+
+        assert!(
+            !snap.hashes.contains(&foreign),
+            "an origin-only node must not announce store-only content"
+        );
+        assert!(
+            snap.hashes.contains(&own),
+            "own (origin-held) content is announced regardless of the toggle"
+        );
+        assert!(
+            snap.store_error.is_none(),
+            "a skipped store walk is not a failed one"
+        );
+        Ok(())
+    }
+
+    /// An empty node yields an empty snapshot rather than an error — the
+    /// sweep's no-op case.
+    #[tokio::test]
+    async fn holder_snapshot_on_an_empty_cache_is_empty() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let cache = decdn_cache::CacheEngine::open(tmp.path(), vec![], 16).await?;
+
+        let snap = holder_snapshot(&cache, true).await;
+
+        assert!(snap.hashes.is_empty(), "{snap:?}");
+        assert!(snap.store_error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn seed_cold_start_skips_already_scheduled_hashes() {
+        // The lag sweep and the periodic origin rescan both seed a
+        // scheduler that is already populated. A second entry for an
+        // already-scheduled hash would drain twice — once at the earlier
+        // due time and again on a later tick, once the tick path has
+        // re-added the hash — buying a spurious republish per re-seed.
+        let s = RepublishScheduler::new();
+        let hashes: Vec<ContentHash> = (1u8..=5).map(h).collect();
+        assert_eq!(s.seed_cold_start(hashes.iter().copied()), 5);
+
+        assert_eq!(
+            s.seed_cold_start(hashes.iter().copied()),
+            0,
+            "re-seeding an unchanged held set must schedule nothing new"
+        );
+        assert_eq!(s.len(), 5, "and must not grow the scheduled set");
+
+        // Drain far past the window: every hash appears exactly once, so
+        // no duplicate entry survived. `drain_due` dedupes within one
+        // call, so also assert the scheduler is empty afterwards — a
+        // duplicate would still be sitting in the heap.
+        let deadline_us = now_us()
+            .saturating_add(u64::try_from(COLD_START_MAX.as_micros()).unwrap())
+            .saturating_add(1_000);
+        let drained = s.drain_due(deadline_us);
+        assert_eq!(drained.len(), 5, "each hash drains once: {drained:?}");
+        assert!(s.is_empty());
+
+        // A hash the tick path just drained is absent again, so the next
+        // seed re-adds it — "already scheduled" must mean "has a live
+        // entry", not "was ever scheduled".
+        assert_eq!(
+            s.seed_cold_start(hashes.iter().copied()),
+            5,
+            "a drained hash must be re-seedable"
+        );
+    }
+
+    #[test]
+    fn seed_cold_start_returns_only_newly_scheduled() {
+        // Partial overlap is the sweep's real shape: some hashes were
+        // committed inside the lag window and are missing, the rest are
+        // already scheduled. The count is what the operator log reports,
+        // so it must name the repair, not the walk.
+        let s = RepublishScheduler::new();
+        assert_eq!(s.seed_cold_start((1u8..=3).map(h)), 3);
+
+        assert_eq!(
+            s.seed_cold_start((1u8..=5).map(h)),
+            2,
+            "only the two hashes not already scheduled count"
+        );
+        assert_eq!(s.len(), 5);
     }
 
     #[test]
