@@ -225,6 +225,39 @@ groups:
             longer being refreshed and will drift from chain state. Correlate with
             decdn_staker_set_watcher_down_seconds and check the RPC provider.
 
+      # The registry re-enumeration is the only systematic repair for a drifted
+      # active-staker set. It reports success upward on a failed read (an error
+      # would stall event pickup), so the counter is the only thing that moves
+      # when it fails — and nothing at all moves when it is *skipped*, which is
+      # what the staleness rule below catches. The `> 0` guard is required: the
+      # gauge reads 0 until the first successful resync, one 15m interval after
+      # boot at the earliest. See adr/appendix-observability.md.
+      - alert: DecdnCapacityBondRegistryResyncFailing
+        expr: rate(decdn_capacity_bond_registry_resync_failures_total[15m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Capacity-bond registry re-enumeration failing on {{ $labels.instance }}"
+          description: |
+            The repair for a drifted active-staker set is itself failing, so a
+            membership change dropped by a failed nodeIdOf stays dropped. Check
+            the RPC provider's eth_call path; correlate with
+            decdn_staker_set_watcher_resolve_failures_total.
+
+      - alert: DecdnCapacityBondRegistryResyncStale
+        expr: (decdn_capacity_bond_registry_last_resync_timestamp_seconds > 0) and (time() - decdn_capacity_bond_registry_last_resync_timestamp_seconds > 1800)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Capacity-bond registry not re-enumerating on {{ $labels.instance }}"
+          description: |
+            No successful getRegisteredNodes re-enumeration in two intervals. The
+            repair is skipped entirely while the watcher route is errored, which
+            emits nothing — not even the failure counter. Correlate with
+            decdn_staker_set_watcher_down_seconds and check the RPC provider.
+
       # The origin directory is a lazy on-demand cache, not a watcher, so it has
       # no last-tick gauge to stale out; alert on its getOrigins failure counter
       # instead. Each failure means a DHT provider-lookup miss fell back to

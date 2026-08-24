@@ -1782,6 +1782,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             "cold-start store seed failed; blobs not re-fetched this session go un-republished until a later lag sweep re-walks the store, or until restart (ADR 022 §Bootstrap AC 15 degraded)"
         );
     }
+    if snapshot.origin_probe_faults > 0 {
+        tracing::warn!(
+            faults = snapshot.origin_probe_faults,
+            "cold-start origin seed is incomplete; the boot rescan could not resolve every candidate, so the origin-held half runs on carried-forward sizes and omits anything first seen inside the fault window (ADR 022 §Bootstrap AC 15 degraded)"
+        );
+    }
     let cold_start_count = republish_scheduler.seed_cold_start(
         snapshot
             .hashes

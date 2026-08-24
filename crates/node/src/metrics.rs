@@ -390,6 +390,15 @@ pub struct DecdnMetrics {
     /// window late. Operator-visible name:
     /// `decdn_dht_republish_lag_sweeps_total`.
     pub dht_republish_lag_sweeps: Counter,
+
+    /// Lag events folded into a sweep that was already running or already
+    /// queued, rather than starting a walk of their own. The sibling that makes
+    /// `decdn_dht_republish_lag_sweeps_total` readable: subtracting this from it
+    /// gives the number of walks actually started, and a coalesced rate that
+    /// tracks the lag rate one-for-one is the signature of a sweep slot that is
+    /// never released. Operator-visible name:
+    /// `decdn_dht_republish_lag_sweeps_coalesced_total`.
+    pub dht_republish_lag_sweeps_coalesced: Counter,
     /// Hashes a lag sweep newly scheduled for republish. Seeding is
     /// idempotent, so this counts the repair, not the walk: a sweep that
     /// finds every held hash already scheduled adds zero. Operator-visible
@@ -561,6 +570,23 @@ pub struct DecdnMetrics {
     /// `RegistrySink::on_operator_change`. Field has no `_total` suffix because
     /// the `OpenMetrics` encoder appends it.
     pub staker_set_watcher_resolve_failures: Counter,
+
+    /// `decdn_capacity_bond_registry_resync_failures_total`: times the
+    /// capacity-bond registry's periodic re-enumeration of `getRegisteredNodes`
+    /// could not read chain state and kept the projections it already had.
+    ///
+    /// That re-enumeration is the only systematic repair for an active-staker
+    /// set that has drifted from chain state, and it deliberately reports
+    /// success upward — returning an error would mark the watcher route errored
+    /// and stall event pickup, trading a stale set for no updates at all. So a
+    /// persistently failing resync moves nothing else. Two behaviours compound
+    /// it, both correlated with the RPC fault that caused the drift: the resync
+    /// is skipped entirely while the route is errored, and a failed read stamps
+    /// the cadence clock anyway, deferring the next attempt a further interval.
+    /// Pairs with the liveness gauge below, which is what catches the skipped
+    /// case. Field has no `_total` suffix because the `OpenMetrics` encoder
+    /// appends it.
+    pub capacity_bond_registry_resync_failures: Counter,
     /// `decdn_staker_set_watcher_down_seconds` (#783, semantics corrected
     /// #788): true downtime — seconds the staker-set watcher has been in the
     /// error/backoff state, i.e. failing its `eth_getLogs` poll tick. Reads `0`
@@ -1149,6 +1175,18 @@ pub struct DecdnMetrics {
     /// of the staker-set watcher's last successful poll tick. Staleness
     /// semantics as `slash_watcher_last_tick_timestamp_seconds`.
     pub staker_set_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_capacity_bond_registry_last_resync_timestamp_seconds`: Unix time
+    /// of the capacity-bond registry's last successful re-enumeration of
+    /// `getRegisteredNodes`.
+    ///
+    /// Distinct from the tick gauge above: a tick is the event tail, this is the
+    /// authoritative re-read that repairs a drifted set. It is the only signal
+    /// that catches a resync being *skipped* — the reconcile does not run at all
+    /// while the route is errored, which emits nothing, not even the failure
+    /// counter. Reads `0` until the first successful resync, which is one
+    /// `REGISTRY_RESYNC_INTERVAL` after boot at the earliest, so an alert needs
+    /// both a `> 0` guard and a threshold above that interval.
+    pub capacity_bond_registry_last_resync_timestamp_seconds: Gauge,
     /// `decdn_blacklist_watcher_last_tick_timestamp_seconds` (#1316, #1320): Unix
     /// time of the blacklist watcher's last successful poll tick. This is the
     /// signal that distinguishes a live blacklist loop from a dead one — a dead
@@ -2087,6 +2125,9 @@ recorders! {
     /// Record a republish lag sweep starting (the cache-commit broadcast
     /// channel reported `Lagged`).
     dht_republish_lag_sweep => dht_republish_lag_sweeps.inc();
+    /// Record a lag folded into an already-running or already-queued sweep
+    /// rather than starting a walk of its own.
+    dht_republish_lag_sweep_coalesced => dht_republish_lag_sweeps_coalesced.inc();
     /// Record `count` hashes a lag sweep newly scheduled for republish.
     dht_republish_sweep_reseeded(count: u64) => dht_republish_sweep_reseeded.inc_by(count);
     /// Record a bulk republish seed (boot cold start or lag sweep) that could
@@ -2099,6 +2140,16 @@ recorders! {
     slash_watcher_tick => slash_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
     staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// A capacity-bond registry re-enumeration failed and the previous
+    /// projections were kept. Bumps
+    /// `capacity_bond_registry_resync_failures_total`. Pairs with the `warn!` in
+    /// [`crate::dht::capacity_bond_registry`]'s `RegistrySink::on_tick_complete`.
+    capacity_bond_registry_resync_failure => capacity_bond_registry_resync_failures.inc();
+    /// Stamp the capacity-bond registry's re-enumeration liveness gauge on a
+    /// successful resync. Reads `0` until the first one lands, so any alert on
+    /// it needs a `> 0` guard.
+    capacity_bond_registry_resync =>
+        capacity_bond_registry_last_resync_timestamp_seconds.set(unix_now_secs());
     /// Stamp the blacklist watcher's liveness gauge (#1316, #1320).
     blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the payment-settlement watcher's liveness gauge (#1316).
@@ -2884,6 +2935,11 @@ mod tests {
             // the series must exist from a fresh registry — an operator has to
             // be able to alert on `> 0` before it has ever fired.
             "decdn_cache_inflight_mutex_poisoned_total",
+            // Origin-rescan probe faults. The struct field is
+            // `origin_probe_failures`. The announce set shrinks silently
+            // without it, so an operator has to be able to alert on `> 0`
+            // before it has ever fired.
+            "decdn_cache_origin_probe_failures_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

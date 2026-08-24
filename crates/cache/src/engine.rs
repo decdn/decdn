@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,21 @@ use crate::retry::{
     TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
 };
 use crate::{from_store_hash, to_store_hash};
+
+/// What one [`CacheEngine::rescan_origins`] pass resolved.
+///
+/// `faults` and `carried` ride alongside the index because a rescan that
+/// silently shrinks the announce set is indistinguishable from one whose origin
+/// genuinely stopped holding the content.
+#[derive(Debug, Default)]
+struct RescanResolution {
+    /// The rebuilt origin-held index: hash -> total byte size.
+    held: HashMap<Hash, u64>,
+    /// Candidates whose probe faulted rather than answering.
+    faults: u64,
+    /// Faulted candidates that kept a size from the previous index.
+    carried: usize,
+}
 
 /// A live origin-existence answer (#1766), distinguishing a genuine negative
 /// from a backend fault. It is the target of the two-way collapse in
@@ -143,6 +158,11 @@ struct Inner {
     /// content is discoverable on the first request rather than only after a
     /// warm pulls it into the store. Never includes refused/denied hashes.
     origin_held: ArcSwap<HashMap<Hash, u64>>,
+    /// Origin size probes that faulted during the most recent
+    /// [`CacheEngine::rescan_origins`], rather than answering "held" or "not
+    /// held". Read by the DHT seed paths, which fold it into the snapshot they
+    /// report, so a truncated announce set is never reported as a healthy one.
+    last_rescan_probe_faults: AtomicU64,
     /// Live-origin probe memo (#1130 pt3). The `origin_held` index only covers
     /// fs enumeration ∪ pins — http/s3 do not list, so a non-pinned bucket
     /// object is absent from it. [`CacheEngine::origin_probe_size`] falls back to
@@ -1071,6 +1091,7 @@ impl CacheEngine {
                         .collect::<HashSet<Hash>>(),
                 )),
                 origin_held: ArcSwap::from(Arc::new(HashMap::new())),
+                last_rescan_probe_faults: AtomicU64::new(0),
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
@@ -1225,14 +1246,64 @@ impl CacheEngine {
     /// swapped atomically (like `pinned`): a concurrent reader sees the old or
     /// the new map, never a partial one.
     ///
-    /// **Cost:** one [`Self::origin_size`] probe per held hash — a local
-    /// `metadata()` stat per fs entry, one HTTP `HEAD` / S3 `HeadObject` per
-    /// pinned remote hash. Runs off the hot path at the configured rescan
-    /// cadence (startup / interval / reload), never per request.
+    /// A candidate whose probe *faults* — a transport error, or the walk
+    /// overrunning the probe timeout — keeps whatever size the previous index
+    /// held for it instead of being dropped alongside the genuinely-absent. A
+    /// fault is not an authoritative absence, and dropping on one shrinks the
+    /// announce set for a whole rescan interval on a throttle window the origin
+    /// recovers from in seconds. An origin that faults indefinitely therefore
+    /// keeps its entries indefinitely; that is the intended trade, and the
+    /// serve path answers from the live origin either way. Faults are counted
+    /// on `decdn_cache_origin_probe_failures_total` and reported to the DHT seed
+    /// paths through [`Self::last_rescan_origin_probe_faults`].
+    ///
+    /// One caveat the index cannot see: [`Origin::size`] maps every non-success
+    /// HTTP status, 5xx included, to `Ok(None)`. So an HTTP origin's transient
+    /// server error is indistinguishable from a 404 here, and that candidate is
+    /// still dropped. S3/R2 and the filesystem classify a transient failure as
+    /// an error and are covered.
+    ///
+    /// **Cost:** one origin probe per held hash — a local `metadata()` stat per
+    /// fs entry, one HTTP `HEAD` / S3 `HeadObject` per pinned remote hash. Runs
+    /// off the hot path at the configured rescan cadence (startup / interval /
+    /// reload), never per request.
     pub async fn rescan_origins(&self) {
-        // Gather candidate hashes: every enumerable origin's listing plus the
-        // operator pin set (snapshotted before any await, so we never hold the
-        // `ArcSwap` guard across a `size()` probe).
+        let candidates = self.rescan_candidates().await;
+        let RescanResolution {
+            held,
+            faults,
+            carried,
+        } = self.resolve_candidates(candidates).await;
+
+        let count = held.len();
+        self.inner.origin_held.store(Arc::new(held));
+        self.inner
+            .last_rescan_probe_faults
+            .store(faults, Ordering::Relaxed);
+        if faults > 0 {
+            if let Some(m) = &self.inner.metrics {
+                m.origin_probe_failures.inc_by(faults);
+            }
+            tracing::warn!(
+                faults,
+                carried,
+                count,
+                "rescan_origins: origin size probes faulted; carried the previous \
+                 index entry forward where there was one. Candidates with no \
+                 previous entry are absent from the announce set until a rescan \
+                 resolves them"
+            );
+        }
+        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+    }
+
+    /// Every hash [`Self::rescan_origins`] considers: each enumerable origin's
+    /// listing plus the operator pin set.
+    ///
+    /// The pin set is snapshotted here rather than read inside the probe loop,
+    /// so the `ArcSwap` guard is never held across a `size()` await. An origin
+    /// whose enumeration fails contributes nothing this pass; its pins still do.
+    async fn rescan_candidates(&self) -> Vec<Hash> {
         let mut candidates: Vec<Hash> = Vec::new();
         for origin in &self.inner.origins {
             match origin.enumerate().await {
@@ -1245,23 +1316,53 @@ impl CacheEngine {
             }
         }
         candidates.extend(self.inner.pinned.load().iter().copied());
+        candidates
+    }
 
-        // Resolve size for each present, non-refused candidate, deduping so we
-        // probe each hash once. `origin_size` is a local stat (fs) or one HEAD
-        // (pinned remote); `None`/error means "origin doesn't have it" → skip.
-        let mut held: HashMap<Hash, u64> = HashMap::new();
+    /// Resolve each candidate against the origin chain for
+    /// [`Self::rescan_origins`], deduping so a hash is probed once.
+    ///
+    /// One local stat (fs) or one `HEAD` (pinned remote) per hash, through
+    /// [`Self::probe_origin_chain`] rather than [`Self::origin_size`], which
+    /// folds a transport error into "origin doesn't have it". The probe memo is
+    /// deliberately bypassed: a large enumeration would evict the live serve
+    /// path's warm entries from a bounded LRU.
+    async fn resolve_candidates(&self, candidates: Vec<Hash>) -> RescanResolution {
+        let timeout = self.probe_memo_lock().timeout();
+        let previous = self.inner.origin_held.load();
+        let mut out = RescanResolution::default();
         for hash in candidates {
-            if self.refuses(hash) || held.contains_key(&hash) {
+            if self.refuses(hash) || out.held.contains_key(&hash) {
                 continue;
             }
-            if let Ok(Some(size)) = self.origin_size(hash).await {
-                held.insert(hash, size);
+            match self.probe_origin_chain(hash, timeout).await {
+                OriginPresence::Present(size) => {
+                    out.held.insert(hash, size);
+                }
+                OriginPresence::Absent => {}
+                OriginPresence::Fault => {
+                    out.faults = out.faults.saturating_add(1);
+                    if let Some(size) = previous.get(&hash).copied() {
+                        out.held.insert(hash, size);
+                        out.carried = out.carried.saturating_add(1);
+                    }
+                }
             }
         }
+        out
+    }
 
-        let count = held.len();
-        self.inner.origin_held.store(Arc::new(held));
-        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+    /// Origin size probes that faulted during the most recent
+    /// [`Self::rescan_origins`], rather than answering "held" or "not held".
+    ///
+    /// The origin-held half of a DHT seed has no other error channel: a probe
+    /// fault either carries a stale size forward or leaves the candidate out of
+    /// [`Self::origin_held_hashes`] entirely, and the seed cannot tell either
+    /// apart from an origin that genuinely stopped holding the object. Seed
+    /// paths read this so a truncated announce set is reported as degraded
+    /// rather than healthy.
+    pub fn last_rescan_origin_probe_faults(&self) -> u64 {
+        self.inner.last_rescan_probe_faults.load(Ordering::Relaxed)
     }
 
     /// Snapshot of the hashes in the origin-held index (#1130), for seeding the
@@ -1320,56 +1421,30 @@ impl CacheEngine {
         }
     }
 
-    /// Live existence probe against the configured origins, distinguishing a
-    /// genuine negative from a backend fault (#1766). This is the primitive
-    /// behind [`Self::origin_probe_size`]; callers that must NOT treat a fault
-    /// as an authoritative absence (the origin-only serve gate) use this
-    /// directly instead of the size-only wrapper.
+    /// Walk the origin chain for `hash`, distinguishing a genuine negative from
+    /// a backend fault, with no memo read or write.
     ///
-    /// A memo hit returns with no I/O. On a miss the origin chain is walked
-    /// directly (NOT via [`Self::origin_size`] — that helper's per-origin
-    /// error handling is deliberately swallow-and-advance, so other callers
-    /// can fall through a dead origin to a live one; a fault-aware caller
-    /// needs the raw per-origin outcomes instead), under a
-    /// `cache.origin_probe_timeout_ms` ceiling for the whole walk:
+    /// Deliberately not routed through [`Self::origin_size`]: that helper's
+    /// per-origin error handling is swallow-and-advance, so other callers can
+    /// fall through a dead origin to a live one, and its terminal `Ok(None)`
+    /// folds a fault into a negative. A fault-aware caller needs the raw
+    /// per-origin outcomes instead.
     ///
-    /// - ANY origin answering `Ok(Some(size))` is `Present(size)`, memoised
-    ///   under the positive TTL — the first such answer wins, same order as
-    ///   [`Self::origin_size`];
+    /// - ANY origin answering `Ok(Some(size))` is `Present(size)` — the first
+    ///   such answer wins, same order as [`Self::origin_size`];
     /// - failing that, ANY origin answering `Err(_)` (a transport error), or
-    ///   the whole walk overrunning the timeout, is `Fault` and is **never
-    ///   memoised** — a fault is transient, so the next probe should retry
-    ///   the backend immediately rather than parrot a cached non-answer, and
-    ///   not caching it does not weaken the flood bound (an attacker's
-    ///   random hashes genuinely 404, they do not fault);
-    /// - only when every configured origin answered `Ok(None)` (a genuine
-    ///   `HEAD` 404, checked on all of them) — or no origin is configured at
-    ///   all, the old [`CacheError::NoOrigin`] case: a node with nothing
-    ///   configured genuinely holds nothing, which is not transient — is the
-    ///   answer `Absent`, memoised under the short negative TTL. This is
-    ///   deliberately the lowest-precedence outcome: if at least one origin
-    ///   is unreachable and none confirmed the object, the honest answer is
-    ///   "unknown" (`Fault`), never an authoritative `NotFound`.
+    ///   the whole walk overrunning `timeout`, is `Fault`;
+    /// - only when every configured origin answered `Ok(None)` — or no origin
+    ///   is configured at all, a node that genuinely holds nothing — is the
+    ///   answer `Absent`. This is deliberately the lowest-precedence outcome:
+    ///   if at least one origin is unreachable and none confirmed the object,
+    ///   the honest answer is "unknown", never an authoritative `NotFound`.
+    ///
+    /// One `timeout` bounds the whole walk so a slow origin cannot stall behind
+    /// a fast one that already answered.
     ///
     /// **Never fetches the body** — existence and size only.
-    pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {
-        if self.refuses(hash) {
-            return OriginPresence::Absent;
-        }
-        let now = Instant::now();
-        let timeout = {
-            let mut memo = self.probe_memo_lock();
-            if let Some(presence) = memo.get(hash, now) {
-                return presence.into();
-            }
-            memo.timeout()
-        };
-        // Live probe off the memo lock (never hold it across the await). Own
-        // chain walk (see the doc comment above for why this does not go
-        // through `origin_size`): `Present` wins outright, a live `Err`
-        // downgrades an all-`None` sweep from `Absent` to `Fault`, and the
-        // whole walk is bounded by one timeout so a slow origin cannot stall
-        // behind a fast one that already answered.
+    async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> OriginPresence {
         let walk = async {
             let mut any_fault = false;
             for origin in &self.inner.origins {
@@ -1393,10 +1468,49 @@ impl CacheEngine {
                 OriginPresence::Absent
             }
         };
-        let presence = match tokio::time::timeout(timeout, walk).await {
+        match tokio::time::timeout(timeout, walk).await {
             Ok(presence) => presence,
             Err(_) => OriginPresence::Fault,
+        }
+    }
+
+    /// Live existence probe against the configured origins, distinguishing a
+    /// genuine negative from a backend fault (#1766). This is the primitive
+    /// behind [`Self::origin_probe_size`]; callers that must NOT treat a fault
+    /// as an authoritative absence (the origin-only serve gate) use this
+    /// directly instead of the size-only wrapper.
+    ///
+    /// A memo hit returns with no I/O. On a miss the origin chain is walked
+    /// under a `cache.origin_probe_timeout_ms` ceiling — deliberately not via
+    /// [`Self::origin_size`], whose per-origin error handling is
+    /// swallow-and-advance so other callers can fall through a dead origin to a
+    /// live one — and this layer decides what to remember:
+    ///
+    /// - `Present(size)` is memoised under the positive TTL;
+    /// - `Fault` is **never memoised** — a fault is transient, so the next
+    ///   probe should retry the backend immediately rather than parrot a cached
+    ///   non-answer, and not caching it does not weaken the flood bound (an
+    ///   attacker's random hashes genuinely 404, they do not fault);
+    /// - `Absent` — every configured origin answered `Ok(None)`, or none is
+    ///   configured at all (a node with nothing configured genuinely holds
+    ///   nothing, which is not transient) — is memoised under the short
+    ///   negative TTL.
+    ///
+    /// **Never fetches the body** — existence and size only.
+    pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {
+        if self.refuses(hash) {
+            return OriginPresence::Absent;
+        }
+        let now = Instant::now();
+        let timeout = {
+            let mut memo = self.probe_memo_lock();
+            if let Some(presence) = memo.get(hash, now) {
+                return presence.into();
+            }
+            memo.timeout()
         };
+        // Live probe off the memo lock (never hold it across the await).
+        let presence = self.probe_origin_chain(hash, timeout).await;
         match presence {
             OriginPresence::Present(size) => {
                 self.probe_memo_lock()
@@ -5227,6 +5341,142 @@ mod tests {
         anyhow::ensure!(
             engine.origin_held_size(h2).is_none(),
             "denied hash must not be advertised",
+        );
+        Ok(())
+    }
+
+    /// Origin that enumerates a fixed set and whose `size()` can be switched
+    /// from answering to faulting, standing in for a `HeadObject` throttle
+    /// window that opens between two rescans.
+    #[derive(Debug)]
+    struct ThrottlableOrigin {
+        held: Vec<(Hash, u64)>,
+        faulting: Arc<AtomicBool>,
+    }
+
+    impl Origin for ThrottlableOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::S3
+        }
+
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(OriginFetch::NotFound) })
+        }
+
+        fn size(
+            &self,
+            hash: Hash,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
+        {
+            Box::pin(async move {
+                if self.faulting.load(Ordering::SeqCst) {
+                    return Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                        "synthetic HeadObject throttle (503 SlowDown)"
+                    )));
+                }
+                Ok(self
+                    .held
+                    .iter()
+                    .find(|(h, _)| *h == hash)
+                    .map(|(_, len)| *len))
+            })
+        }
+
+        fn enumerate(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, crate::OriginPullError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(self.held.iter().map(|(h, _)| *h).collect()) })
+        }
+    }
+
+    /// A faulted size probe must not evict a hash from the origin-held index.
+    ///
+    /// The index is what probe and DHT-announce advertise. A transport fault is
+    /// not an authoritative absence, so dropping on one makes a throttle window
+    /// the origin recovers from in seconds cost a whole rescan interval of
+    /// announce coverage — with every downstream signal reporting success.
+    #[tokio::test]
+    async fn rescan_origins_carries_a_faulted_probe_forward() -> anyhow::Result<()> {
+        let indexed = Hash::new(b"throttle-indexed");
+        let fresh = Hash::new(b"throttle-fresh");
+        let faulting = Arc::new(AtomicBool::new(false));
+        let origin = Arc::new(ThrottlableOrigin {
+            held: vec![(indexed, 5000), (fresh, 9000)],
+            faulting: Arc::clone(&faulting),
+        }) as Arc<dyn Origin>;
+
+        let tmp = tempfile::tempdir()?;
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![origin],
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
+
+        // First rescan resolves `indexed` only: `fresh` is enumerated but the
+        // origin is asked about it after the throttle opens.
+        engine.set_denied(&crate::DeniedHashes::new(
+            [from_store_hash(fresh)].into_iter().collect(),
+        ));
+        engine.rescan_origins().await;
+        anyhow::ensure!(
+            engine.origin_held_size(indexed) == Some(5000),
+            "the healthy rescan must index the enumerated hash",
+        );
+        anyhow::ensure!(
+            engine.last_rescan_origin_probe_faults() == 0,
+            "a healthy rescan reports no faults",
+        );
+
+        // The throttle opens, and `fresh` becomes a candidate for the first time.
+        engine.set_denied(&crate::DeniedHashes::new(HashSet::new()));
+        faulting.store(true, Ordering::SeqCst);
+        engine.rescan_origins().await;
+
+        anyhow::ensure!(
+            engine.origin_held_size(indexed) == Some(5000),
+            "a faulted probe must keep the previous index entry, not drop it",
+        );
+        anyhow::ensure!(
+            engine.origin_held_size(fresh).is_none(),
+            "a candidate first seen inside the fault window has nothing to carry forward",
+        );
+        anyhow::ensure!(
+            engine.last_rescan_origin_probe_faults() == 2,
+            "both faulted probes must be reported to the DHT seed paths, got {}",
+            engine.last_rescan_origin_probe_faults(),
+        );
+
+        // The rescan is the metric's only source, so the counter and the
+        // per-rescan report must agree.
+        anyhow::ensure!(
+            cm.origin_probe_failures.get() == 2,
+            "faulted probes must surface on their counter, got {}",
+            cm.origin_probe_failures.get(),
+        );
+
+        // The throttle closes: the next rescan resolves both.
+        faulting.store(false, Ordering::SeqCst);
+        engine.rescan_origins().await;
+        anyhow::ensure!(
+            engine.origin_held_size(fresh) == Some(9000),
+            "a recovered origin must index what the fault window missed",
+        );
+        anyhow::ensure!(
+            engine.last_rescan_origin_probe_faults() == 0,
+            "a recovered rescan clears the fault report",
         );
         Ok(())
     }

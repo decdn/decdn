@@ -172,6 +172,25 @@ pub struct CacheMetrics {
     /// automatically, so the emitted name is
     /// `decdn_cache_tag_drop_failures_total`.
     pub tag_drop_failures: Counter,
+
+    /// Origin size probes that faulted during an origin rescan — a transport
+    /// error from every configured origin, or the probe walk overrunning
+    /// `cache.origin_probe_timeout_ms` — rather than answering "held" or "not
+    /// held".
+    ///
+    /// Operator-actionable: a rescan resolves each candidate against the origin
+    /// to decide what this node advertises, so a throttled `HeadObject` window
+    /// during a rescan would otherwise shrink the announce set silently. A
+    /// faulted candidate keeps its previous index entry where there is one, so
+    /// a nonzero rate means the index is running on stale sizes; a candidate
+    /// first seen during the fault window has no previous entry and is absent
+    /// from the announce set until a later rescan resolves it. Correlate with
+    /// the origin backend's own error rate.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_origin_probe_failures_total`.
+    pub origin_probe_failures: Counter,
     /// Per-origin circuit-breaker trips from CLOSED/HALF-OPEN to OPEN
     /// (#963). Bumped once each time a breaker opens — on crossing the
     /// `failure_threshold` from CLOSED, or on a failed HALF-OPEN trial.

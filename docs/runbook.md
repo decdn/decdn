@@ -474,6 +474,61 @@ The counter does not reset without a restart, which is deliberate: the evidence
 should outlive the incident. Alert on `> 0` rather than `rate()` for the same
 reason.
 
+## Active-staker set repair not running
+
+**Symptoms:** none directly visible. The node keeps serving, probing and
+settling normally while the cached active-staker set drifts from chain state,
+mis-shedding stake-lane probes and gating DHT `Store` admission on stale
+membership.
+
+**Detect:** `DecdnCapacityBondRegistryResyncFailing` on
+`rate(decdn_capacity_bond_registry_resync_failures_total[15m]) > 0`, or
+`DecdnCapacityBondRegistryResyncStale` on
+`decdn_capacity_bond_registry_last_resync_timestamp_seconds` going stale, with
+`capacity-bond registry resync failed; keeping current projections` at `WARN`.
+
+**What it means:** the re-enumeration of `getRegisteredNodes` is the only
+systematic repair for a drifted set. It deliberately reports success upward — an
+error would mark the watcher route errored and stall event pickup — so the
+counter is the only thing that moves when its read fails. The staleness rule
+covers the other case: while the route is errored the repair is skipped
+entirely, which emits nothing at all, not even the counter. The recovery of the
+route forces a re-enumeration on the tick it comes back, so a stale gauge with a
+healthy route means the reads themselves are failing.
+
+**Remediate:** check the RPC provider's `eth_call` path — the enumeration is
+paginated `eth_call`s, not `eth_getLogs`, so it can fail while the event tail
+still ticks. Correlate with `decdn_staker_set_watcher_down_seconds` and
+`decdn_staker_set_watcher_resolve_failures_total`: down-seconds climbing means
+the poll is failing too, and the repair will run on its own when the route
+recovers. A restart re-enumerates at bootstrap and is the fallback if the
+provider is healthy and the gauge stays stale.
+
+## Origin rescan probes faulting
+
+**Symptoms:** the node advertises less content than it holds. Peers and clients
+find some of its blobs through the DHT but not others, with no serve errors —
+what is missing was never announced.
+
+**Detect:** `decdn_cache_origin_probe_failures_total` nonzero, with
+`rescan_origins: origin size probes faulted` at `WARN` naming how many faulted
+and how many kept a carried-forward entry.
+
+**What it means:** a rescan resolves each candidate against the origin — one
+`HEAD`/`HeadObject`/stat per hash — to decide what this node advertises. A
+throttle window or transport outage during that pass leaves candidates
+unresolved. A candidate the previous index already knew keeps its entry, so the
+announce set holds but the size it advertises is the older one; a candidate first
+seen inside the fault window has nothing to carry forward and is absent from the
+announce set until a later rescan resolves it. Note an HTTP origin reports a 5xx
+as a plain "not held", so this counter covers S3/R2 and filesystem origins.
+
+**Remediate:** check the origin backend's own error and throttle rates. The next
+successful rescan repairs the index on its own — at boot, on the
+`cache.fs_rescan_interval_sec` timer, or on `decdn node reload`. A sustained
+nonzero rate means the rescan cadence is racing a backend that cannot serve it;
+raise the interval or the origin's request budget rather than restarting.
+
 ## Delivery hash mismatch — metered on the pull leg only
 
 **Symptoms:** clients report corrupt or rejected blobs; a peer is serving bytes

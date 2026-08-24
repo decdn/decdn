@@ -589,6 +589,83 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **cache: an origin size probe that faults no longer drops the hash from the
+  announce set.** `rescan_origins` resolved each candidate through
+  `origin_size`, whose per-origin error handling is swallow-and-advance, so a
+  transport fault arrived as `Ok(None)` — indistinguishable from an origin that
+  genuinely does not hold the object. A throttled `HeadObject` window during a
+  rescan therefore evicted those hashes from the origin-held index, and an
+  origin-only node that hit one at boot advertised a fraction of its content for
+  a whole rescan interval with every downstream signal green. The rescan now
+  walks the origin chain through the same fault-aware primitive the serve gate
+  uses, bypassing its memo so a large enumeration cannot evict the live path's
+  warm entries. A faulted candidate keeps whatever the previous index held for
+  it; one first seen inside the fault window has nothing to carry forward and is
+  absent until a later rescan. Faults surface on
+  `decdn_cache_origin_probe_failures_total` and reach both DHT seed paths
+  through `HolderSnapshot::origin_probe_faults`, which is the origin-held half's
+  counterpart to `store_error` — neither half can now truncate the announce set
+  while the snapshot reads healthy. An HTTP origin still reports a 5xx as a plain
+  negative (the `Origin::size` contract), so this covers S3/R2 and the
+  filesystem.
+
+- **dht: a poisoned scheduler lock no longer wedges the republisher for the
+  process lifetime.** Every `Mutex` site in `RepublishScheduler` swallowed
+  poison — `len()` read `0`, `is_empty()` read `true`, `drain_due` returned
+  empty, `unschedule` and the schedule path no-opped. `Mutex` poison is sticky,
+  so one panic under a guard turned the scheduler into a black hole: nothing
+  scheduled, nothing drained, and the node silently stopped advertising every
+  hash it held while continuing to serve, probe and settle. All five sites, plus
+  the two routing-table sites in the same file, now run through
+  `chain_projection::with_lock`, a `Mutex` analogue of the existing
+  `with_read`/`with_write` that recovers via `PoisonError::into_inner` and warns.
+  Recovery is safe here: the invariant is "`scheduled` mirrors the heap", and
+  both sides already tolerate the other's entry being absent, so a torn state
+  costs one spurious or one skipped republish rather than corruption.
+
+- **dht: a lag sweep is cancelled at shutdown instead of racing the cache
+  flush.** The sweep is detached and holds a `CacheEngine` clone, and
+  `run_republish` returned on its stop signal without touching it. A walk still
+  in flight when the runtime flushed and closed the store saw the store go away,
+  took the store-walk failure branch, and fired
+  `decdn_dht_republish_seed_store_walk_failures_total` plus a degradation warning
+  on an ordinary clean restart — an alertable counter on a non-event. The worker
+  now selects against a cancellation token that `run_republish` drops on its way
+  out, so shutdown abandons the walk without classifying it, and the worker
+  releases its `CacheEngine` clone before the flush rather than after.
+
+- **node: the capacity-bond registry resync now reports whether it is working.**
+  `RegistrySink::on_tick_complete` is the only systematic repair for a drifted
+  active-staker set, and it returns `Ok` on a failed read by design — an `Err`
+  would mark the route errored and stall event pickup. That left a persistently
+  failing repair moving no metric at all. It now bumps
+  `decdn_capacity_bond_registry_resync_failures_total` on failure and stamps
+  `decdn_capacity_bond_registry_last_resync_timestamp_seconds` on success. The
+  gauge is what catches the repair being *skipped* rather than failing: the
+  reconcile does not run at all while the route is errored, which emits nothing.
+  It reads `0` until the first success, so its alert carries the `> 0` guard.
+
+- **node: an active-staker set drifted by an RPC outage is repaired when the
+  watcher recovers, not on the next cadence tick.** The re-enumeration was
+  cadence-driven only, and the cadence slips in exactly the scenario that causes
+  the drift: the reconcile is skipped while the route is errored, and a failed
+  read stamps the clock and defers a further interval. `LogSink` gains
+  `on_recovered`, a sync no-op-by-default seam the poller fires on the tick a
+  route comes back from an errored one — before that tick's reconcile, so a sink
+  that clears its cadence clock there re-reads immediately rather than a full
+  interval later. `RegistrySink` clears `last_resync`; the repair now tracks the
+  outage that caused the drift. All five watchers on the shared poller have the
+  seam.
+
+- **dht: coalesced lag sweeps are countable.**
+  `decdn_dht_republish_lag_sweeps_total` counts lag *events* rather than store
+  walks, which is what makes a wedged sweep slot diagnosable, but left no way to
+  tell a climbing counter caused by commits outrunning the scheduler from one
+  caused by a long walk absorbing a burst. The sibling
+  `decdn_dht_republish_lag_sweeps_coalesced_total` counts the folded lags:
+  subtracting it gives the walks actually started, and a coalesced rate tracking
+  the lag rate one-for-one is the signature of a slot that is never released.
+
 - **dht: a lagged cache-commit channel now re-seeds the republish scheduler.**
   The republisher schedules a blob's first DHT `Store` off the cache's
   `subscribe_inserts` broadcast. That channel is bounded and retains nothing it

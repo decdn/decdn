@@ -258,11 +258,11 @@ impl<R: RegistryChainReads> RegistrySink<R> {
             Err(err) => {
                 // Dropping the change leaves the cached set out of sync with chain
                 // state until a follow-up event for the same operator arrives, or
-                // until `on_tick_complete`'s re-enumeration succeeds. That resync
-                // shortens the window rather than bounding it: it is skipped while
-                // the route is errored, and a failed `full_snapshot` stamps the
-                // clock and defers another `REGISTRY_RESYNC_INTERVAL` — both
-                // correlated with the RPC failure that caused this drop. Unlike a
+                // until `on_tick_complete`'s re-enumeration succeeds. An RPC
+                // failure here usually travels with the poll failure that
+                // eventually errors the route, and `on_recovered` forces the
+                // re-enumeration on the tick the route comes back — so the repair
+                // tracks the outage rather than the cadence. Unlike a
                 // stream-level error this does not trip the watcher backoff, so
                 // without this counter it would move no metric at all.
                 self.metrics.staker_set_watcher_resolve_failure();
@@ -363,6 +363,19 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         Ok(())
     }
 
+    /// Force the next reconcile to re-enumerate, rather than waiting out the
+    /// cadence.
+    ///
+    /// The watcher just recovered from an errored tick, which is exactly when
+    /// the projections are most likely to have drifted: an event dropped by a
+    /// failed `nodeIdOf` during the outage leaves the cached set out of sync,
+    /// and the cadence is at its least helpful — the reconcile is skipped while
+    /// the route is errored, so the repair has not been running. Clearing the
+    /// clock makes [`Self::on_tick_complete`], on this same tick, re-read.
+    fn on_recovered(&mut self) {
+        self.last_resync = None;
+    }
+
     /// Cadence-gated re-enumeration: rebuild both projections from chain state
     /// and swap them in.
     ///
@@ -373,7 +386,14 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
     ///
     /// Returns `Ok` on failure. The event tail is the primary path and is still
     /// working; backing the whole watcher off would also stall event pickup,
-    /// trading a stale set for no updates at all.
+    /// trading a stale set for no updates at all. A failure moves
+    /// `decdn_capacity_bond_registry_resync_failures_total` instead, and a
+    /// success stamps
+    /// `decdn_capacity_bond_registry_last_resync_timestamp_seconds`.
+    ///
+    /// Two triggers reach here: the cadence, and
+    /// [`Self::on_recovered`] clearing the clock when the route comes back from
+    /// an errored tick.
     async fn on_tick_complete(&mut self) -> Result<()> {
         let now = Instant::now();
         if self
@@ -389,6 +409,10 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         let (active, bindings, operator_to_node, regions) = match self.reads.full_snapshot().await {
             Ok(snapshot) => snapshot,
             Err(err) => {
+                // `Ok` upward, so the counter is the only thing that moves: an
+                // `Err` marks the route errored, which stalls event pickup and
+                // also skips the next resync entirely.
+                self.metrics.capacity_bond_registry_resync_failure();
                 warn!(%err, "capacity-bond registry resync failed; keeping current projections");
                 return Ok(());
             }
@@ -408,6 +432,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         with_write(&self.regions, "chain region directory", |map| {
             *map = regions;
         });
+        self.metrics.capacity_bond_registry_resync();
         debug!(
             active_count = active_len,
             binding_count = binding_len,
@@ -1218,7 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn resync_failure_keeps_the_previous_projections() {
         let reads = StubReads::new(Ok(None)).with_snapshot(Err("rpc down"));
-        let (mut sink, active, _bindings, _op, _regions, _m) = sink(reads, true);
+        let (mut sink, active, _bindings, _op, _regions, metrics) = sink(reads, true);
         with_write(&active, "t", |set| {
             set.insert(nid(1));
         });
@@ -1229,6 +1254,76 @@ mod tests {
         assert!(
             active.read().unwrap().contains(&nid(1)),
             "a failed resync must not clear the set"
+        );
+        // The reconcile reports success upward on purpose, so nothing else
+        // moves: without this counter a repair that never lands is invisible.
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_capacity_bond_registry_resync_failures_total 1"),
+            "a failed resync must surface on its counter:\n{text}"
+        );
+    }
+
+    /// A successful resync stamps the liveness gauge. That gauge is the only
+    /// signal that catches a resync being *skipped* rather than failing — the
+    /// reconcile does not run at all while the route is errored, which emits
+    /// nothing, not even the failure counter.
+    #[tokio::test]
+    async fn a_successful_resync_stamps_the_liveness_gauge() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
+        let (mut sink, _active, _bindings, _op, _regions, metrics) = sink(reads, true);
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_capacity_bond_registry_last_resync_timestamp_seconds 0"),
+            "the gauge must export at zero before the first resync, so an alert \
+             can guard on `> 0`:\n{text}"
+        );
+
+        sink.last_resync = None;
+        sink.on_tick_complete().await.unwrap();
+
+        let text = metrics.encode().unwrap();
+        let stamped = text.lines().any(|l| {
+            l.strip_prefix("decdn_capacity_bond_registry_last_resync_timestamp_seconds ")
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_some_and(|v| v > 0)
+        });
+        assert!(stamped, "a successful resync must stamp the gauge:\n{text}");
+    }
+
+    /// The watcher recovering from an errored tick must force a re-enumeration,
+    /// not wait out the cadence.
+    ///
+    /// An outage is when the set is most likely to have drifted and when the
+    /// cadence helps least: the reconcile is skipped entirely while the route is
+    /// errored, so the repair has not been running, and the first cadence tick
+    /// to land afterwards has no relationship to when the watcher came back.
+    #[tokio::test]
+    async fn recovery_forces_a_resync_the_cadence_would_defer() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
+        let (mut sink, active, _bindings, _op, _regions, _m) = sink(reads, true);
+
+        // The clock is freshly stamped, so the cadence alone would defer a full
+        // interval — the state a route has after erroring for a while.
+        sink.on_tick_complete().await.unwrap();
+        assert!(
+            active.read().unwrap().is_empty(),
+            "the cadence must still gate a tick that is not due"
+        );
+
+        sink.on_recovered();
+        assert!(
+            sink.last_resync.is_none(),
+            "recovery must clear the cadence clock"
+        );
+        sink.on_tick_complete().await.unwrap();
+
+        assert!(
+            is_active(&active, nid(9)),
+            "the reconcile on the recovery tick must re-enumerate"
         );
     }
 

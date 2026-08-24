@@ -216,6 +216,24 @@ pub(crate) trait LogSink: Send {
     fn on_tick_complete(&mut self) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
+
+    /// Run on the tick a route recovers from an errored one, before that tick's
+    /// [`Self::on_tick_complete`]. The seam for forcing an authoritative re-read
+    /// after an outage rather than waiting out a cadence: a sink whose reconcile
+    /// is cadence-gated clears its own clock here, and its next
+    /// `on_tick_complete` — the one on this same tick — re-reads.
+    ///
+    /// A cadence is not equivalent. The reconcile does not run at all while the
+    /// route is errored, and a reconcile whose own read failed defers itself a
+    /// further interval, so after a long RPC outage the first repair is whatever
+    /// cadence tick happens to land after recovery, with no relationship to when
+    /// the watcher came back.
+    ///
+    /// Sync and infallible on purpose: it exists to clear local state, and a
+    /// failure here has nowhere useful to go — the reconcile that follows on
+    /// this same tick is what does the work, and reports its own outcome.
+    /// Default: no-op.
+    fn on_recovered(&mut self) {}
 }
 
 /// A loop-level observability hook carried on a

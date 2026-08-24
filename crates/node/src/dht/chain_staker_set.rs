@@ -65,26 +65,33 @@
 //! - `decdn_staker_set_active_count` — current cached active-set size,
 //!   to spot a frozen or collapsed cache.
 //!
+//! Two more cover the repair rather than the drift:
+//! - `decdn_capacity_bond_registry_resync_failures_total` — re-enumerations
+//!   that could not read chain state and kept the previous projections.
+//! - `decdn_capacity_bond_registry_last_resync_timestamp_seconds` — when the
+//!   last one succeeded; the signal that catches a repair being *skipped*,
+//!   which emits nothing at all.
+//!
 //! Since #1110 these describe the one shared `capacity-bond` loop, which also
 //! feeds the bindings projection — so they are that loop's health for both, and
 //! there is no separate node-address watcher family to correlate against
 //! (#1231).
 //!
-//! The watcher's cadence-gated re-enumeration is what repairs the drift sources
-//! above: `capacity_bond_registry` re-derives the whole projection from
-//! `getRegisteredNodes` every `REGISTRY_RESYNC_INTERVAL`, build-then-swap, so a
-//! dropped `nodeIdOf` change is normally corrected within one interval rather
-//! than waiting for the next event for that operator.
+//! Re-enumeration is what repairs the drift sources above:
+//! `capacity_bond_registry` re-derives the whole projection from
+//! `getRegisteredNodes`, build-then-swap, so a dropped `nodeIdOf` change is
+//! corrected without waiting for the next event for that operator. Two triggers
+//! drive it. The cadence runs it every `REGISTRY_RESYNC_INTERVAL`. The recovery
+//! edge runs it on the tick the route comes back from an errored one, through
+//! `LogSink::on_recovered`, which is what covers the outage case the cadence
+//! handles worst: `reconcile_routes` skips a route that errored this tick, so
+//! during the outage the cadence repair does not run at all, and a resync whose
+//! own read fails stamps the clock anyway and defers a further interval.
 //!
-//! That is a cadence, not a ceiling, and the two ways it slips are both
-//! correlated with the RPC fault that caused the drift. `reconcile_routes` skips
-//! `on_tick_complete` for a route that errored this tick, so the repair does not
-//! run at all while the poll is failing. A resync whose own read fails stamps the
-//! clock anyway and defers a further interval. The trigger is also the cadence
-//! rather than the recovery edge — a `LogSink` observes only `apply` and
-//! `on_tick_complete`, and neither carries the poller's error state. So the
-//! metrics above still size a drift window that the resync shortens but does not
-//! bound.
+//! So the window a dropped change survives is bounded by the recovery of the
+//! poll that dropped it, not by where the cadence happens to land afterwards.
+//! The metrics above size that window; the two registry metrics report whether
+//! the repair itself is working.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
