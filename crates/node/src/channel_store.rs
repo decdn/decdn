@@ -133,6 +133,24 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 const POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; 32], u128> =
     TableDefinition::new("pool_floor_loss_v1");
 
+/// redb table of tombstones for pools whose floor-loss row was
+/// [`PoolFloorLossStore::forget_loss`]-ed. A reservation drop reads its
+/// cumulative total under the in-memory floor lock but persists it from an
+/// independent blocking task, so a `record_loss` can land AFTER the pool's
+/// `forget_loss` committed; without the tombstone that late write re-inserts a
+/// row for a closed pool, and — `record_loss` being monotonic and the pool id
+/// never recurring — nothing would ever delete it again (#1781). `record_loss`
+/// checks this table inside its own write transaction (redb's exclusive writer
+/// slot makes the check atomic with the insert) and treats a tombstoned pool as
+/// a no-op. Swept at bring-up ([`PoolFloorLossStore::sweep_forgotten`]), when no
+/// persist can be in flight, so tombstones accumulate for at most one process
+/// lifetime. Lives in the same database file as [`LANE_TABLE`].
+///
+/// Key: raw `PoolId` bytes (`[u8; 32]`). Value: none (`()`), presence is the
+/// tombstone.
+const POOL_FLOOR_LOSS_FORGOTTEN_TABLE: TableDefinition<&[u8; 32], ()> =
+    TableDefinition::new("pool_floor_loss_forgotten_v1");
+
 /// Byte width of a capability key on disk: `pool_id ‖ signer` = `32 + 20`. A
 /// capability authorizes one signer under one pool for every provider, so it is
 /// keyed by the `(pool_id, signer)` pair — not the full lane triple.
@@ -1238,58 +1256,99 @@ impl PendingSettleStore for PersistentPoolStateStore {
     }
 }
 
+/// Map a redb error from the floor-loss surface into a [`StoreError`],
+/// surfacing database corruption distinctly (#1782): `redb::Error::Corrupted`
+/// becomes [`StoreError::Corrupt`], so the reservation-drop logging can tell
+/// "the payment database is corrupt" (operator intervention: close and reopen —
+/// redb refuses further writes after a mid-commit failure) from a transient
+/// backend fault. Everything else stays [`StoreError::Backend`].
+fn floor_loss_backend_err(
+    op: &str,
+    pool_id: Option<B256>,
+    err: impl Into<redb::Error>,
+) -> StoreError {
+    match err.into() {
+        redb::Error::Corrupted(detail) => StoreError::Corrupt {
+            pool_id,
+            detail: format!("{op}: {detail}"),
+        },
+        other => StoreError::Backend(format!("{op}: {other}")),
+    }
+}
+
 impl PoolFloorLossStore for PersistentPoolStateStore {
     fn record_loss(&self, pool_id: B256, micro_usdc: u128) -> Result<(), StoreError> {
         let key: [u8; 32] = pool_id.into();
         let mut write_txn = self
             .db
             .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+            .map_err(|e| floor_loss_backend_err("begin_write", Some(pool_id), e))?;
         // Force fsync-on-commit, same durability discipline as the other
         // tables: a lost dead-charge entry after a restart would silently
         // re-grant a pool a fresh free-floor budget.
         write_txn
             .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        // Monotonic write: a pool's `dead_charge` only ever grows. The caller reads
-        // its cumulative total under a lock but persists it from an independent
-        // blocking task, so two writes for one pool can land out of order. A total
-        // at or below what is stored therefore leaves the row alone rather than
-        // re-granting already-consumed free-floor budget. `begin_write` holds redb's
-        // exclusive writer slot, so the compare and the write are atomic together.
+            .map_err(|e| floor_loss_backend_err("set_durability", Some(pool_id), e))?;
+        // A tombstoned pool is closed: this write is a stale in-flight persist that
+        // lost the race with `forget_loss`, and honoring it would resurrect a row
+        // no later forget will ever delete (#1781). The check sits inside the write
+        // transaction — redb's exclusive writer slot orders it against the
+        // tombstone insert — so there is no window between check and write. The
+        // `open_table` creates the tombstone table on a fresh store; the abort
+        // below rolls that back on the no-op paths, and the advancing path commits
+        // a real write anyway.
         let advanced = {
-            let mut table = write_txn
-                .open_table(POOL_FLOOR_LOSS_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            let existing = table
+            let forgotten = write_txn
+                .open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE)
+                .map_err(|e| floor_loss_backend_err("open_table (tombstones)", Some(pool_id), e))?;
+            let tombstoned = forgotten
                 .get(&key)
-                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-                .map_or(0u128, |v| v.value());
-            if micro_usdc > existing {
-                table
-                    .insert(&key, micro_usdc)
-                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-                true
-            } else {
+                .map_err(|e| floor_loss_backend_err("get (tombstone)", Some(pool_id), e))?
+                .is_some();
+            if tombstoned {
                 false
+            } else {
+                // Monotonic write: a pool's `dead_charge` only ever grows. The
+                // caller reads its cumulative total under a lock but persists it
+                // from an independent blocking task, so two writes for one pool can
+                // land out of order. A total at or below what is stored therefore
+                // leaves the row alone rather than re-granting already-consumed
+                // free-floor budget. `begin_write` holds redb's exclusive writer
+                // slot, so the compare and the write are atomic together.
+                let mut table = write_txn
+                    .open_table(POOL_FLOOR_LOSS_TABLE)
+                    .map_err(|e| floor_loss_backend_err("open_table", Some(pool_id), e))?;
+                let existing = table
+                    .get(&key)
+                    .map_err(|e| floor_loss_backend_err("get", Some(pool_id), e))?
+                    .map_or(0u128, |v| v.value());
+                if micro_usdc > existing {
+                    table
+                        .insert(&key, micro_usdc)
+                        .map_err(|e| floor_loss_backend_err("insert", Some(pool_id), e))?;
+                    true
+                } else {
+                    false
+                }
             }
         };
         // Nothing changed, so abort rather than fsync a transaction that holds no
         // change. This is sound only because every writer of this file commits with
         // `Durability::Immediate`: `existing` is therefore already durable and at or
-        // above what this call asks for, so the postcondition holds without a write.
-        // A `Durability::None` writer anywhere in this file breaks that. Aborting
-        // does not free redb's writer slot any earlier than a commit would — the
-        // slot was taken at `begin_write` — it saves the fsync, which is what
-        // contends with the periodic voucher flush on this shared file.
+        // above what this call asks for (or the pool is tombstoned and the write is
+        // stale), so the postcondition holds without a write. A `Durability::None`
+        // writer anywhere in this file breaks that. Aborting does not free redb's
+        // writer slot any earlier than a commit would — the slot was taken at
+        // `begin_write` — it saves the fsync, which is what contends with the
+        // periodic voucher flush on this shared file.
         if !advanced {
             return write_txn
                 .abort()
-                .map_err(|err| StoreError::Backend(format!("abort (no-op write): {err}")));
+                .map_err(|e| floor_loss_backend_err("abort (no-op write)", Some(pool_id), e));
         }
         write_txn
             .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+            .map_err(|e| floor_loss_backend_err("commit (fsync)", Some(pool_id), e))?;
         Ok(())
     }
 
@@ -1297,21 +1356,21 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
         let read_txn = self
             .db
             .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+            .map_err(|e| floor_loss_backend_err("begin_read", None, e))?;
         // A never-written table means no pool has accrued a dead charge yet —
         // first-boot tolerance, matching the other tables in this file.
         let table = match read_txn.open_table(POOL_FLOOR_LOSS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+            Err(err) => return Err(floor_loss_backend_err("open_table", None, err)),
         };
         let mut out = Vec::new();
         let iter = table
             .iter()
-            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+            .map_err(|e| floor_loss_backend_err("table iter", None, e))?;
         for entry in iter {
             let (key_guard, value_guard) =
-                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+                entry.map_err(|e| floor_loss_backend_err("iter entry", None, e))?;
             out.push((B256::from(*key_guard.value()), value_guard.value()));
         }
         Ok(out)
@@ -1319,41 +1378,100 @@ impl PoolFloorLossStore for PersistentPoolStateStore {
 
     fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError> {
         let key: [u8; 32] = pool_id.into();
-
-        // Check first whether the table has ever been created. forget on a
-        // never-written store is a no-op by contract and must not create the
-        // table as a side effect.
-        {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-            match read_txn.open_table(POOL_FLOOR_LOSS_TABLE) {
-                Ok(_) => {}
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-                Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-            }
-        }
-
         let mut write_txn = self
             .db
             .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+            .map_err(|e| floor_loss_backend_err("begin_write", Some(pool_id), e))?;
         write_txn
             .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+            .map_err(|e| floor_loss_backend_err("set_durability", Some(pool_id), e))?;
+        // Row delete and tombstone insert in ONE transaction: a `record_loss`
+        // serialized after this commit sees the tombstone, so the delete cannot be
+        // undone by an in-flight persist (#1781). The tombstone goes in even when
+        // the pool never recorded a row — the racing `record_loss` may be the
+        // pool's FIRST — so forget takes no "never-written store" early-return:
+        // it must always leave the marker.
         {
             let mut table = write_txn
                 .open_table(POOL_FLOOR_LOSS_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+                .map_err(|e| floor_loss_backend_err("open_table", Some(pool_id), e))?;
             table
                 .remove(&key)
-                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+                .map_err(|e| floor_loss_backend_err("remove", Some(pool_id), e))?;
+            let mut forgotten = write_txn
+                .open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE)
+                .map_err(|e| floor_loss_backend_err("open_table (tombstones)", Some(pool_id), e))?;
+            forgotten
+                .insert(&key, ())
+                .map_err(|e| floor_loss_backend_err("insert (tombstone)", Some(pool_id), e))?;
         }
         write_txn
             .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+            .map_err(|e| floor_loss_backend_err("commit (fsync)", Some(pool_id), e))?;
         Ok(())
+    }
+
+    fn sweep_forgotten(&self) -> Result<usize, StoreError> {
+        // No separate existence probe: `open_table` creates a missing table
+        // inside this transaction, and the no-op abort below rolls that
+        // creation back — the same abort-rolls-back property `record_loss`'s
+        // in-transaction tombstone check relies on. A fresh store therefore
+        // ends the sweep exactly as it began. The table existing does NOT
+        // imply a tombstone — any committed `record_loss` creates it empty as
+        // a side effect of its check — that case also takes the no-op abort.
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| floor_loss_backend_err("begin_write", None, e))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|e| floor_loss_backend_err("set_durability", None, e))?;
+        let swept = {
+            let mut forgotten = write_txn
+                .open_table(POOL_FLOOR_LOSS_FORGOTTEN_TABLE)
+                .map_err(|e| floor_loss_backend_err("open_table (tombstones)", None, e))?;
+            let keys: Vec<[u8; 32]> = {
+                let iter = forgotten
+                    .iter()
+                    .map_err(|e| floor_loss_backend_err("table iter (tombstones)", None, e))?;
+                let mut keys = Vec::new();
+                for entry in iter {
+                    let (key_guard, _) = entry
+                        .map_err(|e| floor_loss_backend_err("iter entry (tombstones)", None, e))?;
+                    keys.push(*key_guard.value());
+                }
+                keys
+            };
+            // Belt-and-braces: `record_loss`'s in-transaction tombstone check
+            // means a tombstoned pool can hold no loss row, so each removal is
+            // expected to remove nothing. It is O(1) per tombstone and keeps the
+            // sweep's postcondition — neither row nor tombstone for a forgotten
+            // pool — independent of that invariant.
+            let mut table = write_txn
+                .open_table(POOL_FLOOR_LOSS_TABLE)
+                .map_err(|e| floor_loss_backend_err("open_table", None, e))?;
+            for key in &keys {
+                table
+                    .remove(key)
+                    .map_err(|e| floor_loss_backend_err("remove", None, e))?;
+                forgotten
+                    .remove(key)
+                    .map_err(|e| floor_loss_backend_err("remove (tombstone)", None, e))?;
+            }
+            keys.len()
+        };
+        // An empty sweep holds no change: skip the fsync, same rationale as
+        // `record_loss`'s no-op abort.
+        if swept == 0 {
+            return write_txn
+                .abort()
+                .map_err(|e| floor_loss_backend_err("abort (no-op sweep)", None, e))
+                .map(|()| 0);
+        }
+        write_txn
+            .commit()
+            .map_err(|e| floor_loss_backend_err("commit (fsync)", None, e))?;
+        Ok(swept)
     }
 }
 
@@ -1966,12 +2084,23 @@ mod tests {
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_000u128)]);
         store.record_loss(pool, 5_001)?;
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_001u128)]);
+        // Forget is terminal: the delete tombstones the pool, so an in-flight
+        // persist landing after it — the #1781 interleaving — cannot resurrect the
+        // row. Only the bring-up sweep clears the tombstone, and at bring-up no
+        // persist can be in flight.
         store.forget_loss(pool)?;
         store.record_loss(pool, 10)?;
         anyhow::ensure!(
-            store.load_losses()? == vec![(pool, 10u128)],
-            "forget clears the row, so the next total starts fresh"
+            store.load_losses()?.is_empty(),
+            "a record_loss landing after forget_loss must not resurrect the row"
         );
+        anyhow::ensure!(store.sweep_forgotten()? == 1, "one tombstone swept");
+        store.record_loss(pool, 10)?;
+        anyhow::ensure!(
+            store.load_losses()? == vec![(pool, 10u128)],
+            "after the bring-up sweep the pool id accepts writes again"
+        );
+        store.forget_loss(pool)?;
         Ok(())
     }
 
@@ -1999,6 +2128,72 @@ mod tests {
         }
         let store = PersistentPoolStateStore::open(dir.path())?;
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_000u128)]);
+        Ok(())
+    }
+
+    /// A forget tombstone is durable: a `record_loss` landing after a restart —
+    /// there is none in the real system, but the property it pins is that the
+    /// tombstone rides the same fsync discipline as the rows — still cannot
+    /// resurrect the row, and the bring-up sweep then reclaims the tombstone
+    /// without disturbing other pools' rows (#1781).
+    #[test]
+    fn redb_forget_tombstone_survives_reopen_and_boot_sweep_reclaims_it() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let closed = sample(21).pool_id;
+        let live = sample(22).pool_id;
+        {
+            let store = PersistentPoolStateStore::open(dir.path())?;
+            store.record_loss(closed, 700)?;
+            store.record_loss(live, 900)?;
+            store.forget_loss(closed)?;
+        }
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        store.record_loss(closed, 700)?;
+        anyhow::ensure!(
+            store.load_losses()? == vec![(live, 900u128)],
+            "the tombstone survives the reopen and blocks the late write"
+        );
+        anyhow::ensure!(store.sweep_forgotten()? == 1, "the boot sweep reclaims it");
+        anyhow::ensure!(store.sweep_forgotten()? == 0, "sweep is idempotent");
+        anyhow::ensure!(
+            store.load_losses()? == vec![(live, 900u128)],
+            "the sweep does not disturb live rows"
+        );
+        Ok(())
+    }
+
+    /// The #1781 interleaving, raced for real: one thread forgets the pool while
+    /// another lands the `record_loss` a reservation drop dispatched before the
+    /// pool closed. Whichever order redb's exclusive writer slot serializes them
+    /// in, the terminal state is "no row": record-then-forget deletes it,
+    /// forget-then-record hits the tombstone. Without the tombstone, the second
+    /// ordering re-inserts a row nothing ever deletes again.
+    #[test]
+    fn record_loss_racing_forget_loss_never_leaves_a_row() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        for round in 0u8..8 {
+            let pool = B256::repeat_byte(round.saturating_add(0x30));
+            store.record_loss(pool, 1_000)?;
+            let recorder = {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || store.record_loss(pool, 2_000))
+            };
+            let forgetter = {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || store.forget_loss(pool))
+            };
+            recorder
+                .join()
+                .map_err(|_| anyhow::anyhow!("recorder thread panicked"))??;
+            forgetter
+                .join()
+                .map_err(|_| anyhow::anyhow!("forgetter thread panicked"))??;
+            anyhow::ensure!(
+                store.load_losses()?.is_empty(),
+                "round {round}: a late record_loss resurrected a forgotten pool's row"
+            );
+        }
         Ok(())
     }
 

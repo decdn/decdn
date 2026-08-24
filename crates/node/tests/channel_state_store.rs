@@ -605,3 +605,122 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `record_loss` racing the periodic lane flush on the SHARED `lanes.redb` file
+/// (#1783). #1780 aborts (rather than fsyncs) `record_loss`'s no-op write
+/// precisely because it contends with the voucher flush on this file, yet the two
+/// paths were never driven concurrently. Three tasks interleave on redb's
+/// exclusive writer slot: a lane driving 50 monotonic vouchers through
+/// `apply_voucher` (each a durable lane write), a pool walking its dead-charge
+/// total upward through raising and non-raising (abort-path) `record_loss` calls,
+/// and a pool cycling record/forget. Lane state, the monotonic loss total, and
+/// the forget tombstone must each land intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_loss_races_the_lane_flush_on_the_shared_file() -> anyhow::Result<()> {
+    use decdn_incentive::PoolFloorLossStore;
+
+    let dir = data_dir()?;
+    let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+    let domain = voucher_domain(CHAIN_ID, VERIFYING);
+
+    let lane_signer = PrivateKeySigner::random();
+    let lane_pool = b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let loss_pool = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let churn_pool = b256!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+
+    let lane_task = {
+        let store = Arc::clone(&store);
+        let domain = domain.clone();
+        let signer = lane_signer.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<U256> {
+            let mut state = make_state(lane_pool, &signer);
+            for i in 1u64..=50 {
+                let v = signed_voucher(&signer, &domain, lane_pool, i * 100, i * 1_024)?;
+                state.apply_voucher(&v, &domain, &*store)?;
+            }
+            Ok(state.last_amount())
+        })
+    };
+
+    let loss_task = {
+        let store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+            for i in 1u128..=200 {
+                store.record_loss(loss_pool, i * 10)?;
+                // Non-raising total: the no-op abort path, interleaved with the
+                // lane flush's committing writes on the same file.
+                store.record_loss(loss_pool, 5)?;
+            }
+            Ok(())
+        })
+    };
+
+    let churn_task = {
+        let store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+            for i in 1u128..=50 {
+                store.record_loss(churn_pool, i)?;
+                store.forget_loss(churn_pool)?;
+            }
+            Ok(())
+        })
+    };
+
+    let lane_final = lane_task.await??;
+    loss_task.await??;
+    churn_task.await??;
+
+    anyhow::ensure!(lane_final == U256::from(5_000u64));
+    let lanes = store.load_all()?;
+    anyhow::ensure!(
+        lanes.len() == 1 && lanes.first().map(LaneState::last_amount) == Some(U256::from(5_000u64)),
+        "lane state must survive the concurrent floor-loss writers intact"
+    );
+    let losses = store.load_losses()?;
+    anyhow::ensure!(
+        losses == vec![(loss_pool, 2_000u128)],
+        "the loss total must settle on its monotonic maximum and the churned pool \
+         must stay forgotten, got {losses:?}"
+    );
+    anyhow::ensure!(
+        store.sweep_forgotten()? == 1,
+        "the churned pool's forget leaves exactly one tombstone for the boot sweep"
+    );
+    Ok(())
+}
+
+/// Floor-loss survival across a restart, distinguishable from overwrite
+/// semantics (#1783): the SMALLER total lands LAST before the restart, so a
+/// store that overwrote rather than raised monotonically would hydrate the
+/// regressed value — a single-fold restart test cannot tell the two apart. A
+/// second pool plays
+/// the #1781 race (its `record_loss` lands after its `forget_loss`) and must
+/// stay gone across the same restart, with the bring-up sweep reclaiming its
+/// tombstone.
+#[test]
+fn floor_loss_restart_hydrates_the_monotonic_maximum() -> anyhow::Result<()> {
+    use decdn_incentive::PoolFloorLossStore;
+
+    let dir = data_dir()?;
+    let survivor = b256!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+    let reclaimed = b256!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    {
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        store.record_loss(survivor, 5_000)?;
+        store.record_loss(survivor, 3_000)?; // late, smaller: out-of-order drop
+        store.record_loss(reclaimed, 700)?;
+        store.forget_loss(reclaimed)?;
+        store.record_loss(reclaimed, 700)?; // late persist after the forget
+    }
+    // "Restart": reopen the same file, sweep tombstones as bring-up does, hydrate.
+    let store = PersistentPoolStateStore::open(dir.path())?;
+    anyhow::ensure!(
+        store.sweep_forgotten()? == 1,
+        "the reclaimed pool's tombstone survives the restart for the boot sweep"
+    );
+    anyhow::ensure!(
+        store.load_losses()? == vec![(survivor, 5_000u128)],
+        "hydration must see the monotonic maximum, and nothing for the reclaimed pool"
+    );
+    Ok(())
+}

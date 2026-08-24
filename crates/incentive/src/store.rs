@@ -12,7 +12,7 @@
 //! (`crates/node`) provides a `redb`-backed persistent implementation; tests use
 //! [`MemoryPoolStateStore`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use alloy::primitives::B256;
@@ -459,13 +459,24 @@ impl PendingSettleStore for MemoryPendingSettleStore {
 /// because a caller that persists its total from an independent task cannot order
 /// its writes against another's.
 ///
+/// For the same reason, `forget_loss` is TERMINAL for a pool id: it leaves a
+/// tombstone that makes every later `record_loss` for that pool a no-op. The
+/// caller that forgets a pool cannot order its delete against a `record_loss`
+/// already dispatched from another task, and a reclaimed pool id never recurs
+/// (monotonic open nonce) — so a write landing after the forget is always stale
+/// and must not resurrect the row. [`PoolFloorLossStore::sweep_forgotten`]
+/// reclaims the tombstones; it is safe only at bring-up, before any reservation
+/// exists, when no persist can be in flight.
+///
 /// Any write that raises the total MUST commit durably (fsync, on disk-backed
 /// impls) before returning `Ok`, mirroring the [`PoolStateStore`] contract. A call
 /// that raises nothing may skip the commit: the durable value already satisfies it.
 pub trait PoolFloorLossStore: Send + Sync {
     /// Raise the pool's cumulative dead-charge total to `micro_usdc`. A total at or
     /// below the stored one is a no-op, so a late, smaller write cannot regress the
-    /// row and re-grant already-consumed free-floor budget.
+    /// row and re-grant already-consumed free-floor budget. A pool that was
+    /// [`PoolFloorLossStore::forget_loss`]-ed is also a no-op: the pool is closed,
+    /// so the write is a stale in-flight persist and must not resurrect the row.
     ///
     /// # Errors
     /// Returns [`StoreError`] if the durable write fails.
@@ -478,18 +489,39 @@ pub trait PoolFloorLossStore: Send + Sync {
     /// Returns [`StoreError`] if the backing store is unreadable.
     fn load_losses(&self) -> Result<Vec<(B256, u128)>, StoreError>;
 
-    /// Drop a pool's entry (on pool close/reclaim). Idempotent.
+    /// Drop a pool's entry (on pool close/reclaim) and tombstone the pool id, so
+    /// an in-flight `record_loss` that lands after this call cannot re-insert the
+    /// row. Idempotent.
     ///
     /// # Errors
     /// Returns [`StoreError`] if the durable delete fails.
     fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError>;
+
+    /// Reclaim every tombstone left by [`PoolFloorLossStore::forget_loss`],
+    /// returning how many were swept. Bounds tombstone growth to one process
+    /// lifetime. ONLY safe at bring-up, before any reservation exists: once a
+    /// tombstone is swept, a still-in-flight `record_loss` for its pool would
+    /// insert again — at bring-up no such write can exist.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] if the durable delete fails.
+    fn sweep_forgotten(&self) -> Result<usize, StoreError>;
 }
 
 /// In-memory [`PoolFloorLossStore`] for tests. Not durable — drops with the
 /// process. The runtime uses the redb-backed impl in `crates/node`.
 #[derive(Debug, Default)]
 pub struct MemoryPoolFloorLossStore {
-    inner: Mutex<HashMap<B256, u128>>,
+    inner: Mutex<MemoryFloorLoss>,
+}
+
+/// Totals and tombstones under ONE mutex, so `forget_loss`'s delete-and-tombstone
+/// is atomic against a concurrent `record_loss` — the same atomicity the redb impl
+/// gets from its exclusive write transaction.
+#[derive(Debug, Default)]
+struct MemoryFloorLoss {
+    totals: HashMap<B256, u128>,
+    forgotten: HashSet<B256>,
 }
 
 impl MemoryPoolFloorLossStore {
@@ -506,13 +538,19 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        // A tombstoned pool is closed: this write is a stale in-flight persist that
+        // lost the race with `forget_loss`, and honoring it would resurrect a row
+        // no later forget will ever delete.
+        if guard.forgotten.contains(&pool_id) {
+            return Ok(());
+        }
         // Monotonic raise, matching the redb store step for step: out-of-order drops
         // on one pool must not regress the total and re-grant consumed floor budget.
         // An absent row reads as zero rather than being created, so a total that
         // raises nothing — including a zero against an absent row — writes nothing.
-        let stored = guard.get(&pool_id).copied().unwrap_or(0u128);
+        let stored = guard.totals.get(&pool_id).copied().unwrap_or(0u128);
         if micro_usdc > stored {
-            guard.insert(pool_id, micro_usdc);
+            guard.totals.insert(pool_id, micro_usdc);
         }
         Ok(())
     }
@@ -522,7 +560,7 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        Ok(guard.iter().map(|(&k, &v)| (k, v)).collect())
+        Ok(guard.totals.iter().map(|(&k, &v)| (k, v)).collect())
     }
 
     fn forget_loss(&self, pool_id: B256) -> Result<(), StoreError> {
@@ -530,8 +568,19 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.remove(&pool_id);
+        guard.totals.remove(&pool_id);
+        guard.forgotten.insert(pool_id);
         Ok(())
+    }
+
+    fn sweep_forgotten(&self) -> Result<usize, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let swept = guard.forgotten.len();
+        guard.forgotten.clear();
+        Ok(swept)
     }
 }
 
@@ -735,12 +784,36 @@ mod tests {
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_000u128)]);
         store.record_loss(pool, 5_001)?;
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_001u128)]);
+        Ok(())
+    }
+
+    /// `forget_loss` is terminal for a pool id: a `record_loss` landing after it —
+    /// the in-flight persist a reservation drop dispatched before the pool was
+    /// reclaimed — is a no-op and does not resurrect the row. `sweep_forgotten`
+    /// (bring-up only) reclaims the tombstones.
+    #[test]
+    fn floor_loss_record_after_forget_does_not_resurrect() -> anyhow::Result<()> {
+        let store = MemoryPoolFloorLossStore::new();
+        let pool = b256!("0000000000000000000000000000000000000000000000000000000000000077");
+        store.record_loss(pool, 5_000)?;
         store.forget_loss(pool)?;
-        store.record_loss(pool, 10)?;
+        store.record_loss(pool, 5_000)?;
         anyhow::ensure!(
-            store.load_losses()? == vec![(pool, 10u128)],
-            "forget clears the row, so the next total starts fresh"
+            store.load_losses()?.is_empty(),
+            "a record_loss landing after forget_loss must not resurrect the row"
         );
+        // A pool never recorded but forgotten (the drop's FIRST persist lost the
+        // race) is tombstoned the same way.
+        let unseen = b256!("0000000000000000000000000000000000000000000000000000000000000088");
+        store.forget_loss(unseen)?;
+        store.record_loss(unseen, 40)?;
+        anyhow::ensure!(store.load_losses()?.is_empty());
+        anyhow::ensure!(store.sweep_forgotten()? == 2, "both tombstones are swept");
+        anyhow::ensure!(store.sweep_forgotten()? == 0, "sweep is idempotent");
+        // After the bring-up sweep the pool id accepts writes again; at bring-up no
+        // stale persist can exist, and a reclaimed pool id never recurs.
+        store.record_loss(pool, 10)?;
+        anyhow::ensure!(store.load_losses()? == vec![(pool, 10u128)]);
         Ok(())
     }
 }
