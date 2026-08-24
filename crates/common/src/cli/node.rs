@@ -88,10 +88,10 @@ pub enum NodeCommand {
     /// reloadable; other fields are logged as ignored. The authoritative
     /// list is the module doc of the node's `runtime/reload.rs` — when a
     /// section is added there, update this help text too. Both paths
-    /// share the same internal mutex, so a concurrent SIGHUP and `decdn
-    /// node reload` queue rather than race. Requires the node to have been started with `decdn-node run
-    /// --config <path>` — without a path on disk there's nothing to
-    /// re-read.
+    /// share the same internal mutex, so a concurrent SIGHUP and
+    /// `decdn node reload` queue rather than race. Requires the node to
+    /// have been started with `decdn-node run --config <path>` — without
+    /// a path on disk there's nothing to re-read.
     Reload(ReloadArgs),
     /// Trigger graceful shutdown of the running node via `admin_v1_drain`
     /// (issue #244, ADR 025). Equivalent to `kill -TERM <pid>` but goes
