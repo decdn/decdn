@@ -849,7 +849,7 @@ mod tests {
     }
 
     /// The buyer record is a **frozen on-disk format**, shared by the
-    /// node's `pools.redb` and the client's `buyer-pools.redb`. Postcard
+    /// node's `lanes.redb` and the client's `buyer-pools.redb`. Postcard
     /// encodes struct fields positionally and unnamed, so reordering,
     /// retyping, or inserting a field rewrites the bytes with no compile
     /// error and no other test failure — every store the suites build is a

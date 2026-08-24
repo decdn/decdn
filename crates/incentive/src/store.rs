@@ -506,10 +506,14 @@ impl PoolFloorLossStore for MemoryPoolFloorLossStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        // Monotonic raise, matching the redb store: out-of-order drops on one pool
-        // must not regress the total and re-grant consumed floor budget.
-        let stored = guard.entry(pool_id).or_insert(0u128);
-        *stored = (*stored).max(micro_usdc);
+        // Monotonic raise, matching the redb store step for step: out-of-order drops
+        // on one pool must not regress the total and re-grant consumed floor budget.
+        // An absent row reads as zero rather than being created, so a total that
+        // raises nothing — including a zero against an absent row — writes nothing.
+        let stored = guard.get(&pool_id).copied().unwrap_or(0u128);
+        if micro_usdc > stored {
+            guard.insert(pool_id, micro_usdc);
+        }
         Ok(())
     }
 

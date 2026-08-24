@@ -1951,6 +1951,13 @@ mod tests {
     /// the redb store that ships.
     fn assert_floor_loss_is_monotonic<S: PoolFloorLossStore>(store: &S) -> anyhow::Result<()> {
         let pool = b256!("7700000000000000000000000000000000000000000000000000000000000000");
+        // A zero total against an absent row raises nothing, so it writes no row.
+        // An absent row reads as zero in both impls; neither materializes one here.
+        store.record_loss(pool, 0)?;
+        anyhow::ensure!(
+            store.load_losses()?.is_empty(),
+            "a zero total does not materialize a row"
+        );
         store.record_loss(pool, 5_000)?;
         store.record_loss(pool, 10)?;
         anyhow::ensure!(store.load_losses()? == vec![(pool, 5_000u128)]);

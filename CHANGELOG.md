@@ -543,12 +543,13 @@ since project inception and will roll into the first tagged release.
 
 - **`PoolFloorLossStore` enforces its monotonic contract, and a no-op write no
   longer fsyncs.** The trait doc stated that a pool's dead charge was monotonic
-  "by caller discipline", but the callers are floor-reservation drops that each
-  read their own cumulative total on their own blocking thread, so no caller can
-  impose an ordering — and the redb store already clamped while the in-memory
+  "by caller discipline", but a floor-reservation drop reads its cumulative total
+  under the pool-map lock and then persists it from an independent blocking task,
+  so no caller can order its write against another's — and the redb store already
+  clamped while the in-memory
   store overwrote, leaving tests written against the memory store unrepresentative
   of what ships. Both impls now raise the stored total and never lower it, with
-  `forget_loss` the only downward transition. The redb store resolves the row
+  `forget_loss` the only downward transition. The redb store reads the row and
   aborts the transaction instead of committing when the total does not advance,
   so a late, smaller write costs no fsync — this table shares one file with the
   lane table, where an unconditional commit contended with the periodic voucher
