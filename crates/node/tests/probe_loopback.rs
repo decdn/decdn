@@ -561,9 +561,10 @@ async fn assert_reset_with_code(
 async fn tear_down(h: Harness) -> anyhow::Result<()> {
     h.client_conn.close(0u32.into(), b"bye");
     shutdown([], [&h.client_ep]).await?;
-    // Handler is expected to return Err on these error-path tests; we only
-    // need to confirm the task joined, not that it succeeded.
-    let _ = h.accept_task.await;
+    // Handler is expected to return Err on these error-path tests; we only need
+    // to confirm the task joined, not that it succeeded — bounded, so a handler
+    // that parks fails here rather than parking the test.
+    let _ = support::reap("accept", h.accept_task).await;
     shutdown([], [&h.server_ep]).await?;
     Ok(())
 }

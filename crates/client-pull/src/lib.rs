@@ -944,7 +944,7 @@ impl std::error::Error for PullStalled {}
 /// # It also decides what a CLIENT is told (#1560)
 ///
 /// Reputation is not the only consequence. A second consumer — the node crate's
-/// `record_channel_open_failure` — reads this marker to choose between answering a
+/// `record_pool_open_failure` — reads this marker to choose between answering a
 /// downstream client `StreamError::NotFound` ("we could not obtain this blob") and
 /// `InternalError` ("unexpected failure; do not retry this node"). That path involves no
 /// peer and no reputation at all.
@@ -1441,6 +1441,17 @@ pub async fn stream_fetch_shared(
     .await
 }
 
+/// Notified with a weak handle to each upstream connection at the moment it is
+/// dialled, before any handshake step that could fail with the connection already
+/// live on the caller's runtime.
+///
+/// For a caller that runs a pull on a runtime it is about to drop — `decdn-node`'s
+/// per-serve pull-leg runtimes — and must first observe every connection it dialled
+/// reach its drained state. The handle is weak by construction, so observing can
+/// never delay the close it watches, and a caller with no such hazard (the
+/// publisher CLI, one long-lived runtime) passes `None` and pays nothing.
+pub type DialObserver<'a> = dyn Fn(iroh::endpoint::WeakConnectionHandle) + Send + Sync + 'a;
+
 /// The OPEN stage of a `cdn/client/v1` pull, shared by the buffered
 /// [`fetch_inner`] and the progressive [`open_progressive_pull`] so the two cannot
 /// drift: dial, open the bi-stream, send the [`StreamRequest`], and read + verify
@@ -1476,6 +1487,7 @@ async fn open_stream(
     byte_len: u64,
     timestamp_us: u64,
     open: Duration,
+    on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(
     iroh::endpoint::Connection,
     SendStream,
@@ -1487,6 +1499,12 @@ async fn open_stream(
             .connect(target, ALPN_CLIENT)
             .await
             .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+        // Hand the caller its handle HERE, before the handshake — every step below
+        // can fail with the connection already dialled and its driver already on
+        // this runtime, and a caller that must observe the drain needs those too.
+        if let Some(observe) = on_connect {
+            observe(conn.weak_handle());
+        }
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -1922,6 +1940,7 @@ async fn fetch_inner_once(
         0,
         timestamp_us,
         open,
+        None,
     )
     .await?;
 
@@ -2419,6 +2438,11 @@ pub async fn open_progressive_pull(
     // the exact gap length so the server scopes both the serve and the payment
     // to it, rather than streaming the whole remainder.
     byte_len: u64,
+    // Notified with a weak handle to the connection the instant it is dialled, so a
+    // caller on a runtime it is about to drop can wait for that connection to reach
+    // drained — including on the handshake failures below, which return with the
+    // connection already live. `None` for a caller with no such hazard.
+    on_connect: Option<&DialObserver<'_>>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let stall = deadlines.stall;
     let (conn, send, recv, resp) = open_stream(
@@ -2440,6 +2464,7 @@ pub async fn open_progressive_pull(
         byte_len,
         timestamp_us,
         deadlines.open,
+        on_connect,
     )
     .await?;
     if !resp.body.ok {

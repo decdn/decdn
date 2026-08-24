@@ -2315,8 +2315,9 @@ async fn concurrent_opens_admit_exactly_one() -> anyhow::Result<()> {
     );
 
     // The admitted stream's chunks are left unread here — this test only
-    // exercises the gate, not delivery — so the server side may still be
-    // writing when the endpoints close; that is expected, not an error.
+    // exercises the gate, not delivery — so the server side may still be writing
+    // when the endpoints close. `spawn_server` swallows handler errors, so that
+    // reaches nothing below; only a panic would.
     drop(conn);
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -4624,9 +4625,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     );
 
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5092,9 +5091,7 @@ async fn sequential_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
     );
 
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5171,9 +5168,7 @@ async fn concurrent_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
 
     drop(held);
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5230,9 +5225,7 @@ async fn topped_up_pool_serves_many_lanes() -> anyhow::Result<()> {
 
     drop(held);
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5283,9 +5276,7 @@ async fn withholding_lane_records_one_floor_of_dead_charge() -> anyhow::Result<(
     // (the fold is capped at the reserved floor).
     await_pool_dead_charge(&loss, u128::from(HARNESS_FLOOR_COST)).await?;
 
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -5344,9 +5335,7 @@ async fn rejected_first_voucher_still_records_dead_charge() -> anyhow::Result<()
     await_pool_dead_charge(&loss, u128::from(HARNESS_FLOOR_COST)).await?;
 
     conn.close(0u32.into(), b"done");
-    client_ep.close().await;
-    server_ep.close().await;
-    server_task.await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
@@ -9211,9 +9200,7 @@ async fn dead_charge_persists_across_restart() -> anyhow::Result<()> {
 
         await_persistent_pool_dead_charge(&redb_store, u128::from(HARNESS_FLOOR_COST)).await?;
 
-        client_ep.close().await;
-        server_ep.close().await;
-        server_task.await?;
+        shutdown([server_task], [&client_ep, &server_ep]).await?;
         // `redb_store` (and every other reference to it) drops at the end of
         // this block, releasing redb's process-exclusive lock on `dir.path()`
         // before the reopen below — reopening while still held returns

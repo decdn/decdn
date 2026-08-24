@@ -1133,6 +1133,8 @@ where
         deps.max_rate_per_mb,
         deps.deadlines,
         0,
+        // One long-lived runtime: this connection's driver outlives the fetch.
+        None,
     )
     .await
     .map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
@@ -1413,6 +1415,8 @@ where
             deps.max_rate_per_mb,
             deps.deadlines,
             0,
+            // One long-lived runtime: this connection's driver outlives the fetch.
+            None,
         )
         .await
         .map_err(|err| match first.ctx.lock() {

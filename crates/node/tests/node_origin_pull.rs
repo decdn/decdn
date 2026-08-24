@@ -2559,18 +2559,23 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     // real value — it is a term of the outer deadline.
     let stall_budget = Duration::from_secs(20);
     let per_candidate = Duration::from_secs(2);
-    let (origin, engine, _engine_tmp) = build_origin_with_timeout(
+    // Seeded ranking, not live probes. The score multiplies rate by measured RTT, so
+    // on a loaded runner a wedged node's probe RTT can inflate past A's and flip the
+    // pricier honest node ahead of it — then only ONE wedged open is tried and the
+    // third-attempt assertion below fails for a reason that has nothing to do with
+    // the wedge. Seeding every provider at one `rtt_ms` collapses the RTT term to a
+    // constant, leaving the 2x rate spread to decide the order.
+    let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
         buyer,
         &local_rep,
         &b_metrics,
-        vec![w_dht, w2_dht, a_dht],
+        &[(w_dht, STALL_RATE), (w2_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
         per_candidate,
         stall_budget,
-        0,
     )
     .await;
 
@@ -4601,6 +4606,10 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     // A tick here means this node dropped a per-serve runtime with a live QUIC driver
     // on it, which is what makes an endpoint close hang — the failure mode the whole
     // cancel path exists to avoid.
+    //
+    // This reads as "drained", not "not finished yet", only because the poll above
+    // waited for the SETTLE, and the settle guard drops after the drain returns. Move
+    // those two apart and this assertion goes vacuous with nothing to flag it.
     assert_counter(&b_metrics, "node_pull_abandon_drain_timeout_total", 0)?;
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
@@ -9419,9 +9428,11 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     // leaves the log empty — and an empty log reads as a spend of zero, which passes
     // the bound below while proving nothing.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Exactly one settle per leg, so the first non-empty read is the final
+    // watermark, not a partial one.
     let settled = loop {
         if let Some(&(_, bytes, _)) = progress_log(&recorded)?.last() {
-            break Some(bytes);
+            break bytes;
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
@@ -9434,7 +9445,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         !cache_b.has(hash).await?,
         "an underpaid serve must not promote the partial blob"
     );
-    let upstream_bytes: u64 = settled.map_or(0, |bytes| u64::try_from(bytes).unwrap_or(u64::MAX));
+    let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
     // The ramped credit window (#1669) at `paid = 0` is the pacing floor, which is
     // `credit_floor.max(PULL_WINDOW_FLOOR)`. `PULL_WINDOW_FLOOR` carries two chunk
     // groups on top of one voucher interval so the two group-sized roundings between

@@ -552,7 +552,7 @@ mod adr_013_error_codes {
         conn.close(0u32.into(), b"bye");
         shutdown([], [&client_ep]).await?;
         // The server task is expected to surface the rejection as an Err.
-        let _ = accept_task.await;
+        let _ = support::reap("accept", accept_task).await;
         shutdown([], [&server_ep]).await?;
         Ok(())
     }
@@ -586,7 +586,7 @@ mod adr_013_error_codes {
         // The server task is expected to surface the rejection as an Err, and it
         // ends on its own once the client's connection closes — so it is joined
         // here rather than aborted by `shutdown`.
-        let _ = accept_task.await;
+        let _ = support::reap("accept", accept_task).await;
         shutdown([], [&server_ep]).await?;
         Ok(())
     }
@@ -620,7 +620,7 @@ mod adr_013_error_codes {
         // The server task is expected to surface the rejection as an Err, and it
         // ends on its own once the client's connection closes — so it is joined
         // here rather than aborted by `shutdown`.
-        let _ = accept_task.await;
+        let _ = support::reap("accept", accept_task).await;
         shutdown([], [&server_ep]).await?;
         Ok(())
     }
@@ -666,7 +666,7 @@ mod adr_013_error_codes {
         // The server task is expected to surface the rejection as an Err, and it
         // ends on its own once the client's connection closes — so it is joined
         // here rather than aborted by `shutdown`.
-        let _ = accept_task.await;
+        let _ = support::reap("accept", accept_task).await;
         shutdown([], [&server_ep]).await?;
         Ok(())
     }
@@ -709,7 +709,7 @@ mod adr_013_error_codes {
         // The server task is expected to surface the rejection as an Err, and it
         // ends on its own once the client's connection closes — so it is joined
         // here rather than aborted by `shutdown`.
-        let _ = accept_task.await;
+        let _ = support::reap("accept", accept_task).await;
         shutdown([], [&server_ep]).await?;
         Ok(())
     }
@@ -803,7 +803,7 @@ mod adr_013_error_codes {
         // The server task is expected to surface the rejection as an Err, and it
         // ends on its own once the client's connection closes — so it is joined
         // here rather than aborted by `shutdown`.
-        let _ = accept_task.await;
+        let _ = support::reap("accept", accept_task).await;
         shutdown([], [&server_ep]).await?;
         Ok(())
     }

@@ -53,7 +53,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use super::abandon_drain::{ObservedPeerSource, drain_abandoned};
+use super::abandon_drain::{ConnDrain, as_observer, drain_abandoned};
 use super::admit_store::NodeAdmitStore;
 use super::backend_source::BackendSource;
 use super::funder::NodeFunder;
@@ -396,6 +396,9 @@ impl NodeOrigin {
             rate_ceiling,
             deadlines,
             0,
+            // The pre-flight handshake runs on the OUTER runtime, which keeps
+            // living, so its driver is never stranded and needs no observer.
+            None,
         )
         .await
         {
@@ -533,7 +536,11 @@ pub(crate) async fn run_pull_leg(
         Err(_) => total_bytes,
     };
 
-    let peer_source = ObservedPeerSource::new(PeerSource::new(
+    // Record every connection this leg dials, so an abandoned leg can wait for
+    // each to drain before this pull-thread runtime is dropped.
+    let abandoned = ConnDrain::default();
+    let observer = abandoned.observer();
+    let peer_source = PeerSource::new(
         &deps.endpoint,
         endpoint_target,
         Arc::clone(&ctx),
@@ -544,8 +551,8 @@ pub(crate) async fn run_pull_leg(
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
-    ));
-    let abandoned = peer_source.drain();
+    )
+    .with_dial_observer(as_observer(&observer));
     // The ramped credit-window pacer (ADR 003 §Credit window / ADR 037): the pull
     // never runs further ahead of the downstream served-paid frontier than the
     // ramped window allows, in lockstep with the serve leg's own ramp.
@@ -619,10 +626,12 @@ pub(crate) async fn run_pull_leg(
     // so it never reaches drained and the node's own `Endpoint::close()` waits
     // forever. Wait for the transition itself rather than a fixed span — see
     // [`super::abandon_drain`] for why no constant can be the right length. A drive
-    // that returns `Err` strands its upstream connection the SAME way a cancel does:
-    // it returns without a graceful cooperative close, unlike the clean `Ok` path,
-    // which closes inside `drive`. So the wait covers it too, and only the clean
-    // `Ok` path skips it and stays on the hot path with no added latency.
+    // that returns `Err` strands its upstream connection the SAME way a cancel does,
+    // so the wait covers it too. The clean `Ok` path skips the wait and stays on the
+    // hot path: `UpstreamPull::finish` closes the connection there, which is a state
+    // transition and not a drain, so that path carries the same residual as #1675 —
+    // accepted rather than proven clean, because waiting would add `3 * PTO` to every
+    // successful serve-miss teardown, which the last serve observer joins.
     if cancelled || result.is_err() {
         drain_abandoned(&abandoned, provider_addr, &deps.metrics).await;
     }

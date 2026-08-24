@@ -824,7 +824,7 @@ pub struct DecdnMetrics {
     ///
     /// 1. the node's own chain lane (a slow L2, a stuck nonce) is slower than
     ///    `CHANNEL_OPEN_CALLER_BUDGET` — the interesting one; and
-    /// 2. a boot or idle **reconcile** holds the provider's open slot (`OpenSlotReserved`).
+    /// 2. a boot or idle **reconcile** holds the provider's open slot.
     ///
     /// The verdict is the same for both — try the next candidate, score nothing — which
     /// is why they share a counter. But the *diagnosis* is not: reconcile runs at every

@@ -441,12 +441,12 @@ async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()
         "pull should fail fast on the collapsed channel, not hang to the deadline: {err}"
     );
 
-    // Closing `ep_a` ends the refuser's accept loop: its next accept yields None.
-    shutdown([], [&ep_b, &ep_a]).await?;
     // Join rather than abort, so a panic inside the fake upstream surfaces here
-    // instead of being silently dropped — matching how the happy path joins its
-    // server tasks.
-    refuser.await?;
+    // instead of being silently dropped. Closing `ep_a` is what ends its accept
+    // loop, so the join must come after — and bounded, or a refuser that never
+    // returns parks the test.
+    shutdown([], [&ep_b, &ep_a]).await?;
+    support::reap("refuser", refuser).await?;
     Ok(())
 }
 
