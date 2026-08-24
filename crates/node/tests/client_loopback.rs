@@ -3171,7 +3171,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
 /// Reused channel: two sequential streams on one channel. The second stream
 /// must resume from the first's cumulative voucher state (nonce/bytes/amount),
 /// not restart at zero — otherwise the node rejects the second voucher as
-/// `StaleNonce`/`BytesRegression`. Validates the `PoolContext.prior_*`
+/// `AmountRegression`/`BytesRegression`. Validates the `PoolContext.prior_*`
 /// resume fields.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_reused_channel_resumes() -> anyhow::Result<()> {

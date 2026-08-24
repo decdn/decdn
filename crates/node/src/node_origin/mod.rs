@@ -3422,7 +3422,7 @@ mod tests {
     /// Only a fault in THIS node may stop a failed pull answering `NotFound` (#1560).
     ///
     /// The asymmetry is the whole point, and both halves of it can regress silently. Widen
-    /// it and a node with one wedged channel to one provider tells every client "do not
+    /// it and a node with one wedged lane to one provider tells every client "do not
     /// retry this node" — steering traffic off a node that is fine for every other provider
     /// and every other blob. Narrow it (or let a future verdict fall into a catch-all) and
     /// we are back to the bug: a broken buyer key signs a client a `NotFound` about content

@@ -156,8 +156,8 @@ impl PoolOpener for StubOpener {
         // A retired channel is GONE: the store row was dropped, so there is nothing to
         // resume from and the next open starts clean. Modelling this is what lets a test
         // distinguish "we retired the channel" from "we retired it and then resumed the
-        // dead watermark anyway", which would wedge the fresh channel exactly as the old
-        // one was (#1145 review).
+        // dead watermark anyway", which would wedge the fresh lane exactly as the
+        // retired one is (#1145 review).
         let was_retired = self
             .retired
             .lock()
@@ -1864,11 +1864,11 @@ fn spawn_server_concurrent(
 }
 
 /// A protocol-correct upstream that serves the *right* bytes but rejects the
-/// closing voucher with `StreamError(VoucherRejected { StaleNonce })` instead of
-/// accepting it — the buyer-side payment failure of #857/#852. Drives the
-/// requester to `UpstreamVoucherRejected`. Modelled on [`serve_wrong_bytes`] but
-/// serving the correct payload so the failure is unambiguously the voucher leg,
-/// not corruption.
+/// closing voucher with `StreamError(VoucherRejected { reason })` — the caller's
+/// `VoucherRejectReason` — instead of accepting it: the buyer-side payment failure
+/// of #857/#852. Drives the requester to `UpstreamVoucherRejected`. Modelled on
+/// [`serve_wrong_bytes`] but serving the correct payload so the failure is
+/// unambiguously the voucher leg, not corruption.
 async fn serve_then_reject_voucher(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
@@ -2104,7 +2104,7 @@ fn spawn_a_voucher_rejecting_server(
 /// Like [`spawn_a_voucher_rejecting_server`], but counts both `cdn/probe/v1` requests and
 /// `cdn/client/v1` stream attempts — the instrument for the probe-cache wedged-filter test
 /// (#1223 review), which must show this provider is never streamed to again once its
-/// channel wedges, however the candidate list that would have re-selected it was built.
+/// lane wedges, however the candidate list that would have re-selected it was built.
 #[allow(clippy::too_many_arguments)]
 fn spawn_a_voucher_rejecting_server_with_counters(
     ep: iroh::Endpoint,
@@ -4463,7 +4463,7 @@ fn spawn_a_paid_then_silent_server(
 /// `fetch` future), so it persists the final acked watermark AFTER the cancelled
 /// `drive` fully stops. Lose that — settle nothing, or settle a stale value from the
 /// racing outer future — and the next pull re-signs a spent nonce, the upstream rejects
-/// `StaleNonce`, and the channel wedges for the whole life of the lane.
+/// it `AmountRegression`, and the lane wedges for the rest of its life.
 ///
 /// The cancellation here is a `timeout` that drops the fetch — standing in for the real
 /// droppers — against a stall budget long enough that `PullStalled` cannot be what ends
@@ -4568,7 +4568,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
             tokio::time::Instant::now() < deadline,
             "a cancelled pull must persist the watermark the upstream already acked, \
              from the pull thread — otherwise the next reuse re-signs a stale nonce and \
-             the channel wedges until it expires. Got {:?}",
+             the lane wedges until it expires. Got {:?}",
             progress_log(&recorded)?
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6944,10 +6944,10 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
 /// the buyer channel and resumes from the persisted voucher watermark, so it
 /// signs `nonce = 3, 4 …` (not a stale `nonce = 1`) and the upstream accepts it.
 ///
-/// Before the fix, the first pull's progress was never persisted, so the second
-/// pull re-signed from zero and the upstream rejected it (`StaleNonce`) — the
-/// second fetch would be a `NotFound`. Here both fetches deliver the blob and the
-/// persisted log advances monotonically (nonce 2 → 4, bytes 1.5 MiB → 3 MiB).
+/// Without that persistence the second pull re-signs from zero and the upstream
+/// rejects it (`AmountRegression`), so the second fetch is a `NotFound`. Here both
+/// fetches deliver the blob and the persisted log advances monotonically (nonce 2 →
+/// 4, bytes 1.5 MiB → 3 MiB).
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
@@ -9588,13 +9588,14 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
 /// the same `prior_nonce`.
 ///
 /// With a ledger each, both pulls sign `prior_nonce + 1`. Node A — the real `ClientHandler`,
-/// enforcing real nonce monotonicity — accepts the first and rejects the second
-/// `StaleNonce`, so one of these two fetches comes back empty. That alone was a bad day;
-/// what makes it a money bug is that `StaleNonce` is now a TERMINAL verdict — it wedges the
-/// channel (the row is kept for the reclaim sweep, but the provider is suppressed and the
-/// loser's ledger desyncs) — so a collision the shared ledger prevents would otherwise strand
-/// the deposit. Hence the assertions beyond "both blobs arrived": nothing was retired, and the
-/// channel's nonce advanced through EVERY voucher of both pulls on one monotonic sequence.
+/// enforcing real cumulative monotonicity — accepts the first and rejects the second
+/// `AmountRegression`, so one of these two fetches comes back empty. An empty fetch is bad
+/// on its own; what makes it a money bug is that `AmountRegression` is a TERMINAL verdict —
+/// it wedges the channel (the row is kept for the reclaim sweep, but the provider is
+/// suppressed and the loser's ledger desyncs) — so a collision the shared ledger prevents
+/// would otherwise strand the deposit. Hence the assertions beyond "both blobs arrived":
+/// nothing is retired, and the channel's nonce advances through EVERY voucher of both pulls
+/// on one monotonic sequence.
 ///
 /// Since #1484 the client sends vouchers optimistically and each pull persists the shared
 /// ledger's SETTLE-HIGH watermark, so both `record_progress` calls now report the fully
@@ -9780,10 +9781,11 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(&first, OriginFetch::AlreadyAdmitted),
-        "first concurrent pull returned {first:?} (expected AlreadyAdmitted); StaleNonce would retire \
-         the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
-         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
-         timeout={} stalled={} recorded={:?} retired={:?}",
+        "first concurrent pull returned {first:?} (expected AlreadyAdmitted); AmountRegression \
+         would retire the channel and cap cumulative at one pull's wire bytes, while \
+         CHANNEL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
+         surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?} \
+         retired={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
@@ -9794,10 +9796,11 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(&second, OriginFetch::AlreadyAdmitted),
-        "second concurrent pull returned {second:?} (expected AlreadyAdmitted); StaleNonce would retire \
-         the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
-         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
-         timeout={} stalled={} recorded={:?} retired={:?}",
+        "second concurrent pull returned {second:?} (expected AlreadyAdmitted); AmountRegression \
+         would retire the channel and cap cumulative at one pull's wire bytes, while \
+         CHANNEL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
+         surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?} \
+         retired={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
@@ -9811,8 +9814,8 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         "blob 2 bytes mismatch"
     );
 
-    // The collision's real cost: `StaleNonce` is a terminal verdict, so the losing pull
-    // would have RETIRED the channel the winner was still streaming on.
+    // The collision's real cost: `AmountRegression` is a terminal verdict, so the losing
+    // pull would RETIRE the channel the winner is still streaming on.
     let retired_now = retired.lock().expect("retired lock").clone();
     anyhow::ensure!(
         retired_now.is_empty(),
@@ -11731,7 +11734,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     let hash2 = Hash::new(&payload2);
 
     // --- Node A: honest at probe for everything, serves payload1, then rejects
-    //     the closing voucher with `StaleNonce` — the wedge trigger. -------------
+    //     the closing voucher with `AmountRegression` — the wedge trigger. -------
     let probes_a = Arc::new(AtomicUsize::new(0));
     let streams_a = Arc::new(AtomicUsize::new(0));
     let a_sk = fresh_key();
