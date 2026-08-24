@@ -589,6 +589,50 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **dht: a lagged cache-commit channel now re-seeds the republish scheduler.**
+  The republisher schedules a blob's first DHT `Store` off the cache's
+  `subscribe_inserts` broadcast. That channel is bounded and retains nothing it
+  drops, so a `Lagged` receiver cannot backfill — and the handler only logged,
+  leaving every hash committed inside the lag window with no DHT record until an
+  operator restarted the node. It now re-derives the held set (origin-held index
+  plus, when relaying foreign namespaces, the committed store) and seeds whatever
+  is missing, drawing `uniform(0, 40 min)` per record so the repair costs one
+  cold-start window rather than a burst (ADR 022 §Bootstrap, AC 20). The sweep
+  runs detached, and coalesces by re-running rather than skipping: each pass
+  re-derives the held set once at its start, so a lag observed mid-walk earns a
+  further pass instead of riding a snapshot taken before its own commits. The
+  single-flight slot is released through the shared `PruneGuard`, so a panic in
+  the store walk cannot strand it and silently disable every later sweep.
+  - `RepublishScheduler` now tracks each hash's authoritative due time rather
+    than bare membership, and `drain_due` discards a popped entry whose due time
+    disagrees. A `BinaryHeap` cannot reschedule an interior entry, so every
+    supersede left a tombstone that a later schedule resurrected into a spurious
+    republish — reachable three ways: a re-seed racing the eager per-insert
+    publish, a re-seed racing the tick path's drain-then-reschedule, and
+    `unschedule` followed by a re-seed. `seed_cold_start` leaves an
+    already-scheduled hash alone and returns the count *newly* scheduled;
+    `schedule_cold_start` is removed, since nothing called it.
+  - The due-time gate accepts origin-held content. `cache_still_holds` consulted
+    only the iroh-blobs store, so a filesystem or pinned-origin hash that was
+    never imported got advertised at probe time yet dropped at its first due
+    time, publishing no `Store` at all — silently discarding what the cold-start
+    seed has fed it since #1130.
+  - An origin-only node now recovers its own store-only content. The origin-held
+    index covers enumerable origins plus present pins, and a remote S3/R2/HTTP
+    origin deliberately does not enumerate, so an unpinned object the node owns
+    was in neither half of the snapshot. Stored hashes are now put to
+    `origin_probe_presence` — the same question the origin-only serve gate asks —
+    so the snapshot advertises exactly what the node would serve.
+  - New counters `decdn_dht_republish_lag_sweeps_total`,
+    `decdn_dht_republish_sweep_reseeded_total`, and
+    `decdn_dht_republish_seed_store_walk_failures_total` make the window
+    alertable. The last covers the boot-time cold start too, which shares one
+    derivation with the sweep and previously degraded with no metric at all.
+  - A closed cache-commit channel now stops the republisher instead of being
+    logged and re-polled. `recv` on a closed channel resolves instantly and
+    forever, so the old arm would have spun a core; the task's own `CacheEngine`
+    clone keeps the sender alive, which is what made it unreachable.
+
 - **node: the cache-miss serve leg now re-ramps its credit window.** `serve_leg`
   resolved the window once before its delivery loop and never recomputed it, so a
   stream served through a miss stayed pinned at the one-chunk ramp floor however

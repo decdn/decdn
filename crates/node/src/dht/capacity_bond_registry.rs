@@ -257,9 +257,14 @@ impl<R: RegistryChainReads> RegistrySink<R> {
             Ok(r) => r,
             Err(err) => {
                 // Dropping the change leaves the cached set out of sync with chain
-                // state until a follow-up event for the same operator arrives.
-                // Unlike a stream-level error this does not trip the watcher
-                // backoff, so without this counter it would move no metric at all.
+                // state until a follow-up event for the same operator arrives, or
+                // until `on_tick_complete`'s re-enumeration succeeds. That resync
+                // shortens the window rather than bounding it: it is skipped while
+                // the route is errored, and a failed `full_snapshot` stamps the
+                // clock and defers another `REGISTRY_RESYNC_INTERVAL` — both
+                // correlated with the RPC failure that caused this drop. Unlike a
+                // stream-level error this does not trip the watcher backoff, so
+                // without this counter it would move no metric at all.
                 self.metrics.staker_set_watcher_resolve_failure();
                 warn!(
                     err = %sanitize_err_chain(&err),
@@ -1238,6 +1243,43 @@ mod tests {
         assert!(
             active.read().unwrap().is_empty(),
             "a resync ran despite not being due"
+        );
+    }
+
+    /// The resync is what closes the `nodeIdOf` drop window. An operator-indexed
+    /// event whose follow-up read fails is dropped silently (no `Err`, no
+    /// backoff), so the counter is the only live signal — and the cadence-gated
+    /// re-enumeration is the only systematic repair short of a restart. A later
+    /// event for the same operator would also correct it, but nothing guarantees
+    /// one arrives. This pins both legs together, since either alone reads as
+    /// complete.
+    #[tokio::test]
+    async fn resync_repairs_a_set_drifted_by_a_dropped_node_id_of() {
+        let (mut sink, active, _bindings, _op, _regions, metrics) =
+            sink(StubReads::new(Err("rpc down")), true);
+
+        // Leg 1: the reinstatement is lost, counted, and does not fail the tick.
+        sink.apply(reinstated_log(addr(9))).await.unwrap();
+        assert!(
+            !is_active(&active, nid(9)),
+            "a dropped nodeIdOf must leave the operator out of the cached set"
+        );
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_staker_set_watcher_resolve_failures_total 1"),
+            "the drop must surface on its own counter:\n{text}"
+        );
+
+        // Leg 2: the RPC recovers and the next due resync reconciles against
+        // chain truth, which has 9 active.
+        sink.reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
+        sink.last_resync = None;
+        sink.on_tick_complete().await.unwrap();
+
+        assert!(
+            is_active(&active, nid(9)),
+            "the resync must restore the membership change the event tail dropped"
         );
     }
 

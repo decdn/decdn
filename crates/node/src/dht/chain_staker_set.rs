@@ -40,9 +40,7 @@
 //! exponentially-growing backoff (1s → 60s cap), and re-polls. The cursor is
 //! retained across the backoff, so the next `eth_getLogs` tick re-scans
 //! `[cursor, head]` and re-applies any membership event that landed during the
-//! outage — no stream-level drift window. (There is still no `getRegisteredNodes`
-//! resync to reconcile against a checkpoint older than the live cursor, but that
-//! is only reachable via the per-event `nodeIdOf` drop below, not a backoff gap.)
+//! outage — no stream-level drift window.
 //!
 //! A narrower drift source: an operator-indexed event whose follow-up
 //! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
@@ -72,8 +70,21 @@
 //! there is no separate node-address watcher family to correlate against
 //! (#1231).
 //!
-//! A `getRegisteredNodes` resync-on-extended-outage path is a follow-up;
-//! these metrics surface the window that path would close.
+//! The watcher's cadence-gated re-enumeration is what repairs the drift sources
+//! above: `capacity_bond_registry` re-derives the whole projection from
+//! `getRegisteredNodes` every `REGISTRY_RESYNC_INTERVAL`, build-then-swap, so a
+//! dropped `nodeIdOf` change is normally corrected within one interval rather
+//! than waiting for the next event for that operator.
+//!
+//! That is a cadence, not a ceiling, and the two ways it slips are both
+//! correlated with the RPC fault that caused the drift. `reconcile_routes` skips
+//! `on_tick_complete` for a route that errored this tick, so the repair does not
+//! run at all while the poll is failing. A resync whose own read fails stamps the
+//! clock anyway and defers a further interval. The trigger is also the cadence
+//! rather than the recovery edge — a `LogSink` observes only `apply` and
+//! `on_tick_complete`, and neither carries the poller's error state. So the
+//! metrics above still size a drift window that the resync shortens but does not
+//! bound.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
