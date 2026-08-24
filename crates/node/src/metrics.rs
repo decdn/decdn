@@ -480,9 +480,9 @@ pub struct DecdnMetrics {
     /// residual). A sustained rate usually means the shared
     /// `lanes.redb` file refuses writes (a prior failed commit latches redb
     /// until the file is closed and reopened — restart the node) or is corrupt;
-    /// pairs with the per-drop `warn!`/`error!` ("floor dead-charge persist
-    /// failed"). Operator-visible name:
-    /// `decdn_floor_loss_persist_failures_total`.
+    /// pairs with the per-failure `warn!`/`error!` lines ("floor dead-charge
+    /// persist failed" / "pool dead-charge forget failed"). Operator-visible
+    /// name: `decdn_floor_loss_persist_failures_total`.
     pub floor_loss_persist_failures: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the

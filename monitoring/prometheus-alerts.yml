@@ -356,8 +356,8 @@ groups:
       # #1782. The floor dead-charge writes (`record_loss` on a reservation
       # drop, `forget_loss` on pool reclaim) are best-effort: delivery keeps
       # working while they fail, so without this rule the only trace is one
-      # `warn!` per failure. Sustained failures
-      # usually mean the shared lanes.redb file refuses writes — redb latches
+      # `warn!`/`error!` line per failure. Sustained failures usually mean the
+      # shared lanes.redb file refuses writes — redb latches
       # after a failed commit until the file is closed and reopened — or is
       # corrupt (the node logs the corrupt case at error!). Every failure widens
       # the restart-time window in which pools are re-granted free-floor budget
@@ -368,7 +368,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Floor dead-charge persists failing on {{ $labels.instance }}"
+          summary: "Floor dead-charge writes failing on {{ $labels.instance }}"
           description: |
             Dead-charge totals are not reaching disk ("floor dead-charge
             persist failed" in the logs), or a closed pool's row could not be
