@@ -258,10 +258,13 @@ impl<R: RegistryChainReads> RegistrySink<R> {
             Err(err) => {
                 // Dropping the change leaves the cached set out of sync with chain
                 // state until a follow-up event for the same operator arrives, or
-                // at the latest until `on_tick_complete`'s re-enumeration one
-                // `REGISTRY_RESYNC_INTERVAL` later. Unlike a stream-level error
-                // this does not trip the watcher backoff, so without this counter
-                // it would move no metric at all.
+                // until `on_tick_complete`'s re-enumeration succeeds. That resync
+                // shortens the window rather than bounding it: it is skipped while
+                // the route is errored, and a failed `full_snapshot` stamps the
+                // clock and defers another `REGISTRY_RESYNC_INTERVAL` — both
+                // correlated with the RPC failure that caused this drop. Unlike a
+                // stream-level error this does not trip the watcher backoff, so
+                // without this counter it would move no metric at all.
                 self.metrics.staker_set_watcher_resolve_failure();
                 warn!(
                     err = %sanitize_err_chain(&err),
@@ -1246,8 +1249,10 @@ mod tests {
     /// The resync is what closes the `nodeIdOf` drop window. An operator-indexed
     /// event whose follow-up read fails is dropped silently (no `Err`, no
     /// backoff), so the counter is the only live signal — and the cadence-gated
-    /// re-enumeration is the only repair short of a restart. This pins both legs
-    /// together, since either alone reads as complete.
+    /// re-enumeration is the only systematic repair short of a restart. A later
+    /// event for the same operator would also correct it, but nothing guarantees
+    /// one arrives. This pins both legs together, since either alone reads as
+    /// complete.
     #[tokio::test]
     async fn resync_repairs_a_set_drifted_by_a_dropped_node_id_of() {
         let (mut sink, active, _bindings, _op, _regions, metrics) =

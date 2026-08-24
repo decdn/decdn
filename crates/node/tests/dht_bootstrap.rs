@@ -404,8 +404,8 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
 /// real `run_republish` loop against a real `CacheEngine` and asserts the
 /// missed hashes end up scheduled.
 ///
-/// No server or routing table: the sweep's contract is what reaches the
-/// *scheduler*. Publishing them to peers is the tick path, covered by
+/// No server, and no peers in the routing table: the sweep's contract is what
+/// reaches the *scheduler*. Publishing to peers is the tick path, covered by
 /// `run_republish_publishes_immediately_on_cache_insert` above.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow::Result<()> {
@@ -482,12 +482,172 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
     );
     assert!(
         text.lines()
-            .any(|l| l == "decdn_dht_republish_sweep_failures_total 0"),
-        "a healthy store walk must not count as a degraded sweep:\n{text}"
+            .any(|l| l == "decdn_dht_republish_seed_store_walk_failures_total 0"),
+        "a healthy store walk must not count as a degraded seed:\n{text}"
     );
 
     publisher_ep.close().await;
     Ok(())
+}
+
+/// An origin-only node must not sweep in store-only content.
+///
+/// The sweep re-seeds through the same `relay_foreign_namespaces` gate the serve
+/// path applies, so this pins the flag's threading from `run_republish` down to
+/// the snapshot — an inverted or hardcoded value compiles and passes every other
+/// test while making the node advertise blobs its serve gate then declines.
+///
+/// Both polarities run over identical fixtures so the assertion is a contrast,
+/// not an absolute: the store-only blob is never sent on the insert channel, so
+/// the only path that can schedule it is the sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_republish_lag_sweep_honours_the_origin_only_policy() -> anyhow::Result<()> {
+    let origin_only = sweep_scheduled_count(false).await?;
+    let relaying = sweep_scheduled_count(true).await?;
+
+    assert_eq!(
+        origin_only, 1,
+        "an origin-only node must sweep in its origin-held content and nothing \
+         from the store"
+    );
+    assert_eq!(
+        relaying, 2,
+        "a relaying node must sweep in both halves — otherwise the origin-only \
+         assertion above proves nothing"
+    );
+    Ok(())
+}
+
+/// Drive one lag sweep at the given policy and return how many hashes ended up
+/// scheduled. `own` is enumerable (origin-held) and is the only hash published
+/// on the insert channel; `foreign` is fetch-only, so it lives in the store
+/// alone and the sweep is the only path that can reach it.
+async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result<usize> {
+    use decdn_node::dht::{RepublishScheduler, publish::run_republish};
+    use tokio::sync::{broadcast, oneshot};
+
+    let cache_dir = tempfile::tempdir()?;
+    let own = decdn_cache::Hash::new(b"policy-own");
+    let foreign = decdn_cache::Hash::new(b"policy-foreign");
+    let cache = decdn_cache::CacheEngine::open(
+        cache_dir.path(),
+        vec![
+            enumerable_stub_origin(b"policy-own"),
+            stub_origin(b"policy-foreign"),
+        ],
+        16,
+    )
+    .await?;
+    cache.get(own).await?;
+    cache.get(foreign).await?;
+    cache.rescan_origins().await;
+
+    // Overflow before the receiver polls so `Lagged` is deterministic. Only
+    // `own` rides the channel, so the eager per-insert arm can never be what
+    // schedules `foreign`.
+    let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(2);
+    for _ in 0..4 {
+        inserts_tx.send(own).unwrap();
+    }
+
+    let key = fresh_key();
+    let publisher_id = key.public();
+    let (publisher_ep, _addr) = local_endpoint(key, vec![ALPN_DHT.to_vec()]).await?;
+    let scheduler = Arc::new(RepublishScheduler::new());
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(run_republish(
+        publisher_ep.clone(),
+        publisher_id,
+        Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+            *publisher_id.as_bytes(),
+        )))),
+        Arc::clone(&scheduler),
+        cache,
+        relay_foreign_namespaces,
+        Arc::new(Metrics::new()),
+        inserts_rx,
+        stop_rx,
+    ));
+
+    // Poll up to the expected ceiling, then let the loop settle so a late
+    // arrival would still be observed rather than raced past.
+    let want = if relay_foreign_namespaces { 2 } else { 1 };
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if scheduler.len() >= want {
+            break;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let settled = scheduler.len();
+    let _ = stop_tx.send(());
+    let _ = task.await;
+
+    publisher_ep.close().await;
+    Ok(settled)
+}
+
+/// [`stub_origin`]'s enumerable twin: also answers `enumerate` and `size`, which
+/// is what puts the hash in the cache's origin-held index.
+fn enumerable_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+    #[derive(Debug)]
+    struct EnumerableStub {
+        data: bytes::Bytes,
+        hash: decdn_cache::Hash,
+    }
+
+    impl decdn_cache::Origin for EnumerableStub {
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Filesystem
+        }
+
+        fn fetch(
+            &self,
+            hash: decdn_cache::Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let result = if hash == self.hash {
+                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(decdn_cache::OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+
+        fn size(
+            &self,
+            hash: decdn_cache::Hash,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+        > {
+            let n = (hash == self.hash).then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
+            Box::pin(async move { Ok(n) })
+        }
+
+        fn enumerate(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<Vec<decdn_cache::Hash>, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let out = vec![self.hash];
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    Arc::new(EnumerableStub {
+        data: bytes::Bytes::from_static(payload),
+        hash: decdn_cache::Hash::new(payload),
+    })
 }
 
 /// Single-blob stub origin: `fetch` commits the payload into the store on

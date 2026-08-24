@@ -598,7 +598,11 @@ since project inception and will roll into the first tagged release.
   plus, when relaying foreign namespaces, the committed store) and seeds whatever
   is missing, drawing `uniform(0, 40 min)` per record so the repair costs one
   cold-start window rather than a burst (ADR 022 §Bootstrap, AC 20). The sweep
-  runs detached and coalesces, so repeated lags do not stack store walks.
+  runs detached, and coalesces by re-running rather than skipping: each pass
+  re-derives the held set once at its start, so a lag observed mid-walk earns a
+  further pass instead of riding a snapshot taken before its own commits. The
+  single-flight slot is released through the shared `PruneGuard`, so a panic in
+  the store walk cannot strand it and silently disable every later sweep.
   - Seeding is now idempotent: `RepublishScheduler::seed_cold_start` skips a hash
     that is already scheduled instead of pushing a second heap entry. A duplicate
     entry drained twice and bought one spurious republish per re-seed, which also
@@ -607,7 +611,13 @@ since project inception and will roll into the first tagged release.
     bypassed the new guarantee and nothing called it.
   - New counters `decdn_dht_republish_lag_sweeps_total`,
     `decdn_dht_republish_sweep_reseeded_total`, and
-    `decdn_dht_republish_sweep_failures_total` make the window alertable.
+    `decdn_dht_republish_seed_store_walk_failures_total` make the window
+    alertable. The last covers the boot-time cold start too, which shares one
+    derivation with the sweep and previously degraded with no metric at all.
+  - A closed cache-commit channel now stops the republisher instead of being
+    logged and re-polled. `recv` on a closed channel resolves instantly and
+    forever, so the old arm would have spun a core; the task's own `CacheEngine`
+    clone keeps the sender alive, which is what made it unreachable.
 
 - **node: the cache-miss serve leg now re-ramps its credit window.** `serve_leg`
   resolved the window once before its delivery loop and never recomputed it, so a

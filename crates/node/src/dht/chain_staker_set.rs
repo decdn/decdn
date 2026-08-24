@@ -70,14 +70,21 @@
 //! there is no separate node-address watcher family to correlate against
 //! (#1231).
 //!
-//! Every drift source above is repaired by the watcher's cadence-gated
-//! re-enumeration: `capacity_bond_registry` re-derives the whole projection from
+//! The watcher's cadence-gated re-enumeration is what repairs the drift sources
+//! above: `capacity_bond_registry` re-derives the whole projection from
 //! `getRegisteredNodes` every `REGISTRY_RESYNC_INTERVAL`, build-then-swap, so a
-//! dropped `nodeIdOf` change survives at most one interval rather than until the
-//! next event for that operator. The trigger is the cadence, not the recovery
-//! edge — a `LogSink` observes only `apply` and `on_tick_complete`, and neither
-//! carries the poller's error/recovery state — so the metrics above still size a
-//! drift window the resync bounds but does not eliminate.
+//! dropped `nodeIdOf` change is normally corrected within one interval rather
+//! than waiting for the next event for that operator.
+//!
+//! That is a cadence, not a ceiling, and the two ways it slips are both
+//! correlated with the RPC fault that caused the drift. `reconcile_routes` skips
+//! `on_tick_complete` for a route that errored this tick, so the repair does not
+//! run at all while the poll is failing. A resync whose own read fails stamps the
+//! clock anyway and defers a further interval. The trigger is also the cadence
+//! rather than the recovery edge — a `LogSink` observes only `apply` and
+//! `on_tick_complete`, and neither carries the poller's error state. So the
+//! metrics above still size a drift window that the resync shortens but does not
+//! bound.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};

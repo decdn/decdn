@@ -1772,9 +1772,14 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         crate::dht::publish::holder_snapshot(&infra.cache, cfg.cache.relay_foreign_namespaces)
             .await;
     if let Some(err) = &snapshot.store_error {
+        // Same counter as the lag sweep's degradation: both are this one
+        // derivation failing its store half, and the boot case is the worse of
+        // the two — it lasts the whole process lifetime rather than until the
+        // next lag.
+        infra.node_metrics.dht_republish_seed_store_walk_failure();
         tracing::warn!(
             error = %err,
-            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
+            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 15 degraded)"
         );
     }
     let cold_start_count = republish_scheduler.seed_cold_start(
