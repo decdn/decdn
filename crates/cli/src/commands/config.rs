@@ -404,23 +404,90 @@ pub enum Role {
     Relay,
     /// `--origin <URL>`: a serving node with an active `[cache.origin]`
     /// backend (`relay_foreign_namespaces` derives to `false`, origin-only).
-    Origin(decdn_config_types::OriginUrl),
+    Origin(OriginSpec),
     /// `--client`: a fetch-only consumer — identity + chain coordinates,
     /// none of the cache/origin/serving sections.
     Client,
 }
 
+/// The `[cache.origin]` backend `--origin` asked for, one variant per
+/// `OriginConfig` kind. Each spelling of the flag value maps to exactly one:
+/// `http(s)://` → [`OriginSpec::Http`], `file:///` → [`OriginSpec::Fs`],
+/// `s3` / `s3://<bucket>` → [`OriginSpec::S3`].
+#[derive(Debug)]
+pub enum OriginSpec {
+    /// HTTP(S) pull-through base URL.
+    Http(decdn_config_types::OriginUrl),
+    /// Local filesystem root (from a `file:///` URL).
+    Fs(std::path::PathBuf),
+    /// S3-compatible origin. `bucket` is `None` for the bare `s3` spelling —
+    /// the emitted block then carries a placeholder bucket to edit.
+    S3 { bucket: Option<String> },
+}
+
 /// Map the `config init` role flags to a [`Role`]. `--origin` and `--client`
-/// are mutually exclusive at the clap layer (`conflicts_with`); the URL is
-/// validated and normalized through the same [`decdn_config_types::parse_origin_url`]
-/// the daemon's resolver uses, so a URL this accepts cannot fail resolution.
+/// are mutually exclusive at the clap layer (`conflicts_with`).
 fn resolve_role(args: &cli::ConfigInitArgs) -> anyhow::Result<Role> {
     if args.client {
         return Ok(Role::Client);
     }
     match args.origin.as_deref() {
-        Some(raw) => Ok(Role::Origin(decdn_config_types::parse_origin_url(raw)?)),
+        Some(raw) => Ok(Role::Origin(parse_origin_spec(raw)?)),
         None => Ok(Role::Relay),
+    }
+}
+
+/// Parse the `--origin` flag value into an [`OriginSpec`].
+///
+/// Every accepted value is validated through the same guard the daemon's
+/// config resolver applies to that origin kind — `parse_origin_url` for http,
+/// `validate_s3_bucket_name` for a named bucket — so a value `config init`
+/// accepts cannot fail resolution. The S3 key `prefix` stays a commented key
+/// (its validation and normalization live in the resolver alone), so an
+/// `s3://bucket/prefix` spelling is rejected rather than half-supported.
+fn parse_origin_spec(raw: &str) -> anyhow::Result<OriginSpec> {
+    if raw == "s3" {
+        return Ok(OriginSpec::S3 { bucket: None });
+    }
+    // The raw value is not echoed on a parse failure: an unparseable origin
+    // string can still carry `user:pass@` userinfo, and the redaction helpers
+    // only work on values that parsed.
+    let url = url::Url::parse(raw).context(
+        "invalid --origin value (expected an http(s):// or file:/// URL, `s3`, or s3://<bucket>)",
+    )?;
+    match url.scheme() {
+        "http" | "https" => Ok(OriginSpec::Http(decdn_config_types::parse_origin_url(raw)?)),
+        "file" => {
+            // `to_file_path` rejects a remote host (`file://host/path`) and
+            // percent-decodes the path; the result is absolute by construction.
+            let path = url.to_file_path().map_err(|()| {
+                anyhow::anyhow!(
+                    "--origin file:// URL must name a local absolute path \
+                     (file:///var/lib/decdn/origin)"
+                )
+            })?;
+            Ok(OriginSpec::Fs(path))
+        }
+        "s3" => {
+            let bucket = url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("--origin s3:// URL must name a bucket"))?
+                .to_string();
+            decdn_common::config::validate_s3_bucket_name(&bucket)
+                .with_context(|| format!("invalid --origin s3 bucket `{bucket}`"))?;
+            anyhow::ensure!(
+                url.path().is_empty() || url.path() == "/",
+                "--origin s3://<bucket> takes no key prefix; set the commented `prefix` key \
+                 in the generated [cache.origin] section instead"
+            );
+            Ok(OriginSpec::S3 {
+                bucket: Some(bucket),
+            })
+        }
+        other => anyhow::bail!(
+            "unsupported --origin scheme {other:?}: pass an http(s):// or file:/// URL, `s3`, \
+             or s3://<bucket>"
+        ),
     }
 }
 
@@ -468,10 +535,18 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
             output.display()
         ),
     }
-    if let Role::Origin(url) = &role {
+    if let Role::Origin(spec) = &role {
+        let backend = match spec {
+            OriginSpec::Http(url) => decdn_config_types::redact_for_log(url.as_url()),
+            OriginSpec::Fs(path) => format!("fs {}", path.display()),
+            OriginSpec::S3 { bucket: Some(b) } => format!("s3 bucket {b}"),
+            OriginSpec::S3 { bucket: None } => {
+                "s3 (edit the MUST-EDIT bucket in [cache.origin])".to_string()
+            }
+        };
         println!(
-            "origin backend: {} — cache.relay_foreign_namespaces derives to false (origin-only)",
-            decdn_config_types::redact_for_log(url.as_url())
+            "origin backend: {backend} — cache.relay_foreign_namespaces derives to false \
+             (origin-only)"
         );
     }
     Ok(())
@@ -507,7 +582,7 @@ fn render_config(chain: Option<&known_chains::KnownChain>, role: &Role) -> anyho
         }
     };
     match role {
-        Role::Origin(url) => insert_origin_block(&base, url),
+        Role::Origin(spec) => insert_origin_block(&base, spec),
         Role::Relay | Role::Client => Ok(base),
     }
 }
@@ -652,10 +727,7 @@ fn splice_section(
 /// override line sits *above* the `[cache.origin]` header: uncommented in
 /// place it lands in `[cache]`, where the key belongs — below the header it
 /// would parse as an unknown `[cache.origin]` field and fail resolution.
-fn insert_origin_block(
-    template: &str,
-    url: &decdn_config_types::OriginUrl,
-) -> anyhow::Result<String> {
+fn insert_origin_block(template: &str, spec: &OriginSpec) -> anyhow::Result<String> {
     let at = template
         .find("\n[payment]\n")
         .map(|i| i + 1)
@@ -666,8 +738,52 @@ fn insert_origin_block(
     let tail = template
         .get(at..)
         .context("rendered config tail slice out of bounds")?;
-    // `url` came through `parse_origin_url`, whose normalization
-    // percent-encodes characters that could break out of a TOML basic string.
+    let backend = match spec {
+        // `url` came through `parse_origin_url`, whose normalization
+        // percent-encodes characters that could break out of a TOML basic
+        // string.
+        OriginSpec::Http(url) => format!(
+            "[cache.origin]\n\
+             kind = \"http\"\n\
+             url = \"{url}\"\n"
+        ),
+        OriginSpec::Fs(path) => {
+            let path = path
+                .to_str()
+                .context("--origin file:// path is not valid UTF-8, so it cannot be written to a TOML config")?;
+            format!(
+                "[cache.origin]\n\
+                 kind = \"fs\"\n\
+                 path = {}\n",
+                toml_basic_string(path)?
+            )
+        }
+        OriginSpec::S3 { bucket } => {
+            let (bucket_line, edit_note) = match bucket {
+                Some(b) => (format!("bucket = {}", toml_basic_string(b)?), ""),
+                None => (
+                    "bucket = \"your-origin-bucket\"    # MUST-EDIT: your bucket name".to_string(),
+                    " Edit the MUST-EDIT bucket, then",
+                ),
+            };
+            format!(
+                "# S3-compatible origin (AWS S3 / Cloudflare R2 / Backblaze B2 / MinIO).{edit_note}\n\
+                 # confirm `region`; for non-AWS providers uncomment `endpoint_url` (and\n\
+                 # `path_style = true` for MinIO). Credentials default to the AWS chain\n\
+                 # (env / ~/.aws / IAM role) — uncomment [cache.origin.credentials] to override.\n\
+                 [cache.origin]\n\
+                 kind = \"s3\"\n\
+                 {bucket_line}\n\
+                 region = \"us-east-1\"                      # required even with a custom endpoint_url (SigV4 signing)\n\
+                 # endpoint_url = \"https://<accountid>.r2.cloudflarestorage.com\"  # for R2/B2/MinIO; omit for AWS\n\
+                 # path_style = true                         # required true for MinIO\n\
+                 # prefix = \"blobs/\"                         # optional key prefix; final key is {{prefix}}{{hex[0..2]}}/{{hex}}\n\
+                 # decompress = \"auto\"                       # \"auto\" decompresses gzip/zstd, \"strict\" refuses non-identity encodings\n\
+                 # [cache.origin.credentials]\n\
+                 # source = \"default-chain\"                  # or \"static\" with access_key_id = \"...\" and secret_access_key = \"...\"\n"
+            )
+        }
+    };
     let block = format!(
         "# --- Origin backend (written by `decdn config init --origin`) ---\n\
          # An active origin backend makes this an ORIGIN node: the runtime derives\n\
@@ -675,12 +791,28 @@ fn insert_origin_block(
          # next line to override the derived value — set true to also relay foreign\n\
          # content for pay while running an origin backend.\n\
          # relay_foreign_namespaces = false\n\
-         [cache.origin]\n\
-         kind = \"http\"\n\
-         url = \"{url}\"\n\
+         {backend}\
          \n"
     );
     Ok(format!("{head}{block}{tail}"))
+}
+
+/// Quote a value as a TOML basic string, escaping `\` and `"`.
+///
+/// Needed for values that did not come through `parse_origin_url`'s
+/// percent-encoding — a filesystem path or a bucket name — where a quote or
+/// backslash in the value would otherwise break out of the emitted string.
+/// Control characters (which TOML basic strings also forbid) are rejected
+/// rather than escaped: none has a legitimate place in a path or bucket name.
+fn toml_basic_string(value: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "value contains a control character, which cannot be written to a TOML config"
+    );
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 /// Trimmed TOML template `decdn config init --client` writes.
@@ -1300,9 +1432,8 @@ mod tests {
             .expect("sole chain");
         // `parse_origin_url` appends the trailing slash the runtime needs; the
         // rendered file must carry the normalized form.
-        let url = decdn_config_types::parse_origin_url("https://origin.example/v1")
-            .expect("valid origin URL");
-        let rendered = render_config(Some(chain), &Role::Origin(url)).expect("render");
+        let spec = parse_origin_spec("https://origin.example/v1").expect("valid origin URL");
+        let rendered = render_config(Some(chain), &Role::Origin(spec)).expect("render");
 
         let cfg: config::FileConfig =
             toml::from_str(&rendered).expect("rendered --origin config must parse as FileConfig");
@@ -1330,11 +1461,72 @@ mod tests {
     /// `--origin` composes with the blank template too (`--chain none`).
     #[test]
     fn render_origin_config_without_chain_parses() {
-        let url =
-            decdn_config_types::parse_origin_url("https://origin.example/").expect("valid URL");
-        let rendered = render_config(None, &Role::Origin(url)).expect("render");
+        let spec = parse_origin_spec("https://origin.example/").expect("valid URL");
+        let rendered = render_config(None, &Role::Origin(spec)).expect("render");
         let cfg: config::FileConfig = toml::from_str(&rendered).expect("must parse as FileConfig");
         assert!(cfg.cache.expect("[cache] present").origin.is_some());
+    }
+
+    /// `--origin file:///path` writes an fs origin carrying the decoded local
+    /// path, with a quote-bearing path escaped rather than breaking the TOML.
+    #[test]
+    fn render_fs_origin_config_carries_the_path() {
+        // %20 decodes to a space; the quote exercises `toml_basic_string`.
+        let spec = parse_origin_spec("file:///var/lib/decdn%20blobs/ori%22gin").expect("valid URL");
+        assert!(
+            matches!(&spec, OriginSpec::Fs(p) if p.to_str() == Some("/var/lib/decdn blobs/ori\"gin"))
+        );
+        let rendered = render_config(None, &Role::Origin(spec)).expect("render");
+        let cfg: config::FileConfig = toml::from_str(&rendered).expect("must parse as FileConfig");
+        match cfg.cache.expect("[cache] present").origin {
+            Some(config::types::OriginConfig::Fs { path }) => {
+                assert_eq!(
+                    path,
+                    std::path::PathBuf::from("/var/lib/decdn blobs/ori\"gin")
+                );
+            }
+            other => panic!("expected an fs origin, got {other:?}"),
+        }
+    }
+
+    /// Bare `--origin s3` writes an S3 block with a placeholder bucket that
+    /// still parses and would pass resolution (DNS-safe bucket, non-empty
+    /// region); `s3://<bucket>` fills the bucket in.
+    #[test]
+    fn render_s3_origin_config_places_bucket() {
+        for (flag, bucket) in [
+            ("s3", "your-origin-bucket"),
+            ("s3://decdn-blobs", "decdn-blobs"),
+        ] {
+            let spec = parse_origin_spec(flag).expect("valid s3 spelling");
+            let rendered = render_config(None, &Role::Origin(spec)).expect("render");
+            let cfg: config::FileConfig =
+                toml::from_str(&rendered).expect("must parse as FileConfig");
+            match cfg.cache.expect("[cache] present").origin {
+                Some(config::types::OriginConfig::S3(s3)) => {
+                    assert_eq!(s3.bucket, bucket, "for --origin {flag}");
+                    assert_eq!(s3.region, "us-east-1", "for --origin {flag}");
+                }
+                other => panic!("expected an s3 origin for --origin {flag}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The `--origin` spellings the parser must refuse, each with the reason
+    /// the error names: a remote-host file URL, an s3 URL with a key prefix
+    /// (the commented `prefix` key owns that), a bucket failing the shared
+    /// DNS-safety guard, and an unknown scheme.
+    #[test]
+    fn parse_origin_spec_rejects_bad_spellings() {
+        for (flag, expected) in [
+            ("file://host.example/var/blobs", "local absolute path"),
+            ("s3://decdn-blobs/some/prefix", "no key prefix"),
+            ("s3://Bad_Bucket", "invalid --origin s3 bucket"),
+            ("ftp://origin.example/", "unsupported --origin scheme"),
+        ] {
+            let err = format!("{:#}", parse_origin_spec(flag).expect_err(flag));
+            assert!(err.contains(expected), "--origin {flag}: {err}");
+        }
     }
 
     /// The client template is the trimmed fetch-only shape: it parses against
@@ -1426,7 +1618,7 @@ mod tests {
             resolve_role(&args(Some("https://origin.example/"), false)).expect("origin"),
             Role::Origin(_)
         ));
-        // ftp:// fails the http/https scheme check in `parse_origin_url`.
+        // ftp:// fails the scheme classification in `parse_origin_spec`.
         assert!(resolve_role(&args(Some("ftp://origin.example/"), false)).is_err());
     }
 }

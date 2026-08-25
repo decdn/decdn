@@ -43,12 +43,15 @@ pub struct ConfigInitArgs {
     #[arg(long, value_name = "NAME")]
     pub chain: Option<String>,
 
-    /// Configure an ORIGIN node: write an active `[cache.origin]` pointing at
-    /// this HTTP(S) pull-through base URL. Presence of an origin backend is the
-    /// role signal — `cache.relay_foreign_namespaces` then derives to `false`
-    /// (origin-only). Omit for a relay node (no origin; serves foreign content
-    /// for pay; derives to `true`). Origin kinds `fs`/`s3` have no flag — edit
-    /// the generated `[cache.origin]` section following its comments.
+    /// Configure an ORIGIN node: write an active `[cache.origin]` pull-through
+    /// backend. Accepts an `http(s)://` base URL (http origin), a `file:///`
+    /// path (fs origin), or `s3` / `s3://<bucket>` (S3-compatible origin —
+    /// bare `s3` leaves a placeholder bucket to edit; either form leaves
+    /// region/endpoint/prefix for the generated comments to walk through).
+    /// Presence of an origin backend is the role signal —
+    /// `cache.relay_foreign_namespaces` then derives to `false` (origin-only).
+    /// Omit for a relay node (no origin; serves foreign content for pay;
+    /// derives to `true`).
     #[arg(long, value_name = "URL", conflicts_with = "client")]
     pub origin: Option<String>,
 

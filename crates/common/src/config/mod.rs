@@ -2307,13 +2307,17 @@ fn resolve_s3_origin(
 /// as an IPv4 address. Catches the common operator typo at config
 /// load instead of on the first request.
 ///
+/// Public because `decdn config init --origin s3://<bucket>` (the CLI)
+/// validates the bucket through this same guard before writing it, so a
+/// bucket `config init` accepts cannot fail config resolution.
+///
 /// AWS-permissive choices we deliberately accept (but stricter
 /// frontends like virtual-hosted-style URLs may reject): names
 /// shorter than 3 chars are rejected (per AWS rule), but `xn--`
 /// prefix and `--ol-s3` suffix are not rejected here — they're
 /// reserved by AWS to never be assigned and the operator-typo case
 /// is rare enough not to warrant the extra code.
-fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
+pub fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!name.is_empty(), "bucket name must not be empty");
     let len = name.len();
     anyhow::ensure!(
