@@ -31,6 +31,7 @@ use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::RngExt;
 use tokio::sync::oneshot;
 
+use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{KEYSPACE_BITS, NodeId, RoutingTable, bucket_index};
 
@@ -118,13 +119,9 @@ async fn refresh_all_non_empty_buckets(
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
 ) {
-    let picks: Vec<BucketPick> = {
-        let Ok(table) = routing.lock() else {
-            tracing::error!("dht bucket-refresh: routing-table mutex poisoned");
-            return;
-        };
-        all_non_empty_picks(&table)
-    };
+    let picks: Vec<BucketPick> = with_lock(routing, "dht routing table", |table| {
+        all_non_empty_picks(table)
+    });
     if picks.is_empty() {
         return;
     }
@@ -194,13 +191,13 @@ async fn refresh_one_bucket(
             // response-learned ids (not the authenticated peer), inserted
             // as Kademlia probe candidates by design — distinct from the
             // `AuthenticatedNodeId`-gated recency refresh in the handler.
-            if let Ok(mut table) = routing.lock() {
+            with_lock(routing, "dht routing table", |table| {
                 for nid in resp.closer_nodes.into_inner() {
                     if nid != self_node_id {
                         table.insert(nid);
                     }
                 }
-            }
+            });
         }
         Err(e) => {
             tracing::debug!(

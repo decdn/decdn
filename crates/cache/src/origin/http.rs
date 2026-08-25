@@ -467,8 +467,7 @@ impl Origin for HttpOrigin {
                 .map_err(OriginPullError::Permanent)?;
             let url_log = redact_for_log(&url);
             // A `HEAD` is the cheapest way to learn the canonical length — no
-            // body crosses the wire. Redirects stay disabled (SSRF, #579); a
-            // 3xx is a non-success and degrades to `None`.
+            // body crosses the wire.
             let send_fut = self.client.head(url.clone()).send();
             let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
                 Err(_elapsed) => {
@@ -482,15 +481,33 @@ impl Origin for HttpOrigin {
                 }
                 Ok(Ok(resp)) => resp,
             };
-            // Any non-success — 404 (absent), 401/403 (permission), 5xx
-            // (outage), or a disabled-redirect 3xx (SSRF, #579) — degrades to
-            // unknown size rather than erroring, mirroring `get_bounded`'s
-            // best-effort outboard read on this same range-pull path. A
-            // *persistent* permission/outage fault re-surfaces with full
-            // severity on the whole-blob `fetch` fallback; abandoning the range
-            // optimization for one HEAD is the intended, cheap degrade.
-            if !resp.status().is_success() {
+            let status = resp.status();
+            // Status classification mirrors `fetch` and the S3 adapter's
+            // `classify_head_object_error`: only a 404 asserts absence and
+            // degrades to `Ok(None)`; every other non-success is a fault the
+            // caller must not read as "the origin does not hold the object".
+            // The distinction is load-bearing well beyond the range-pull
+            // degrade: `probe_origin_chain` feeds the origin-only serve gate
+            // and the DHT announce set, and an `Ok(None)` there is an
+            // authoritative absence — memoised under the negative TTL, signed
+            // as `NotFound` to a paying client, and grounds for the
+            // republisher to unschedule the hash. A 503 must never do that.
+            // Redirects stay disabled (SSRF, #579); a 3xx is a deterministic
+            // origin misconfiguration, so it classifies as permanent like the
+            // other non-transient statuses. Callers that only wanted the
+            // best-effort range scope swallow the error and degrade to a
+            // whole-blob `fetch`, which re-surfaces a persistent fault at
+            // full severity.
+            if status == StatusCode::NOT_FOUND {
                 return Ok(None);
+            }
+            if !status.is_success() {
+                let err = anyhow::anyhow!("origin HEAD {url_log} returned {status}");
+                return Err(if is_transient_status(status) {
+                    OriginPullError::Transient(err)
+                } else {
+                    OriginPullError::Permanent(err)
+                });
             }
             // A `Content-Encoding` response advertises the *encoded* length in
             // `Content-Length`, not the canonical blob size the bao tree needs
@@ -870,6 +887,96 @@ mod tests {
                 OutboardFetch::Unsupported
             ),
             "oversize outboard must degrade to Unsupported",
+        );
+        Ok(())
+    }
+
+    /// A `HEAD` 404 is an authoritative absence: `size` answers `Ok(None)`
+    /// so the probe chain reads it as `Absent`.
+    #[tokio::test]
+    async fn size_404_is_none() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-size-missing-marker");
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{}", hash.to_hex())))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        anyhow::ensure!(
+            origin.size(hash).await?.is_none(),
+            "a 404 must degrade to an unknown size, not error",
+        );
+        Ok(())
+    }
+
+    /// A `HEAD` 503 is a transient fault, never an absence (#1815): folding it
+    /// into `Ok(None)` made `probe_origin_chain` answer `Absent` for an origin
+    /// mid-outage — the serve gate then signed an authoritative `NotFound`,
+    /// memoised under the negative TTL, and the DHT republisher unscheduled
+    /// the hash entirely.
+    #[tokio::test]
+    async fn size_5xx_is_a_transient_fault_not_an_absence() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-size-outage-marker");
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{}", hash.to_hex())))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        match origin.size(hash).await {
+            Err(err) => anyhow::ensure!(
+                err.is_transient(),
+                "a 503 is worth waiting out; got a permanent fault: {err}"
+            ),
+            Ok(size) => anyhow::bail!("a 503 must fault, got Ok({size:?})"),
+        }
+        Ok(())
+    }
+
+    /// A `HEAD` 403 is a permanent fault: it will read the same on every
+    /// probe, so fault-aware callers must not hold state open for it — but it
+    /// is still not an absence the serve gate may sign. Mirrors the S3
+    /// adapter's `classify_head_object_error`.
+    #[tokio::test]
+    async fn size_non_404_decline_is_a_permanent_fault() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-size-forbidden-marker");
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{}", hash.to_hex())))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        match origin.size(hash).await {
+            Err(err) => anyhow::ensure!(
+                !err.is_transient(),
+                "a 403 reads the same on every probe; got a transient fault: {err}"
+            ),
+            Ok(size) => anyhow::bail!("a 403 must fault, got Ok({size:?})"),
+        }
+        Ok(())
+    }
+
+    /// A successful `HEAD` reports the object's `Content-Length`.
+    #[tokio::test]
+    async fn size_reads_content_length_on_success() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-size-present-marker");
+        Mock::given(method("HEAD"))
+            .and(path(format!("/{}", hash.to_hex())))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "12345"))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        anyhow::ensure!(
+            origin.size(hash).await? == Some(12345),
+            "a 200 must surface the Content-Length",
         );
         Ok(())
     }

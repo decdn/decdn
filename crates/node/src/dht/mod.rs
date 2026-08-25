@@ -10,7 +10,7 @@ pub mod bootstrap;
 pub mod bucket_refresh;
 pub mod capacity_bond_registry;
 pub mod chain_origin_directory;
-mod chain_projection;
+pub(crate) mod chain_projection;
 pub mod chain_staker_set;
 pub mod client;
 pub mod lazy_origin_cache;

@@ -1342,12 +1342,10 @@ impl CacheEngine {
     /// `decdn_cache_origin_enumerate_failures_total` and rides the same
     /// snapshot.
     ///
-    /// One caveat the index cannot see: [`Origin::size`] maps every non-success
-    /// HTTP *status*, 5xx included, to `Ok(None)`. So an HTTP origin's transient
-    /// server error is indistinguishable from a 404 here, and that candidate is
-    /// dropped as an authoritative absence. An HTTP origin's *transport* faults
-    /// — a connect or headers timeout — do surface as errors, as do S3/R2's and
-    /// the filesystem's transient failures.
+    /// Every adapter reserves [`Origin::size`]'s `Ok(None)` for an
+    /// authoritative absence (a genuine 404): an HTTP or S3 5xx/408/429
+    /// surfaces as a transient fault and carries forward, a permission decline
+    /// as a permanent one — so no outage is dropped here as an absence.
     ///
     /// **Cost:** one origin probe per deduped candidate — every listed entry and
     /// every pin, including the ones that resolve absent and never enter the
@@ -1735,9 +1733,10 @@ impl CacheEngine {
     /// - `Absent` — every configured origin answered `Ok(None)`, or none is
     ///   configured at all (a node with nothing configured genuinely holds
     ///   nothing, which is not transient) — is memoised under the short
-    ///   negative TTL. Note an HTTP origin answers `Ok(None)` for any
-    ///   non-success status, so an HTTP 5xx reaches this arm and is cached as an
-    ///   absence for the negative TTL.
+    ///   negative TTL. Every adapter reserves `Ok(None)` for an authoritative
+    ///   absence (a genuine 404) — an outage or a permission decline is an
+    ///   `Err`, which reaches the `Fault` arm instead — so this arm never
+    ///   caches a 5xx as an absence.
     ///
     /// **Never fetches the body** — existence and size only.
     pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {

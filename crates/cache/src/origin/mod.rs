@@ -424,18 +424,24 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// — via [`crate::CacheEngine::origin_size`] — before
     /// [`crate::CacheEngine::pull_through_range`].
     ///
-    /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata) and
-    /// **best-effort**: `Ok(None)` means the size is unavailable — the object
-    /// is absent, the backend reports a `Content-Encoding` whose advertised
-    /// length is the *encoded* size (not the canonical blob length, same trap
-    /// as [`Self::fetch`]'s `size_hint`), or any other non-success status (404,
-    /// permission denied, 5xx, a disabled redirect). Like the outboard read on
-    /// the range-pull path ([`Self::fetch_range`]'s bounded helper), a
-    /// status-level decline degrades to `None` rather than erroring — the engine
-    /// falls back to a whole-blob [`Self::fetch`], which re-surfaces a genuine,
-    /// *persistent* fault (a real 403/5xx) at its proper severity. Only a
-    /// transport-level fault (timeout, connection failure) surfaces here as
-    /// [`OriginPullError`]. The default returns `Ok(None)`, so a custom
+    /// The probe is cheap (HTTP `HEAD` / S3 `HeadObject` / `fs` metadata), and
+    /// `Ok(None)` is an **authoritative** "this origin does not hold the
+    /// object — or holds it in a shape the caller cannot range against": a
+    /// genuine 404 / not-found, or a backend reporting a `Content-Encoding`
+    /// whose advertised length is the *encoded* size (not the canonical blob
+    /// length, same trap as [`Self::fetch`]'s `size_hint`). Anything that
+    /// answers neither way — a transport failure, a 5xx/408/429 outage, a
+    /// permission decline, a disabled redirect — surfaces as
+    /// [`OriginPullError`] (`Transient` for the retriable statuses and
+    /// transport faults, `Permanent` for the rest) and must NOT degrade to
+    /// `None` inside the adapter. Fault-aware callers depend on the split: the
+    /// origin-only serve gate and the DHT announce set read `Ok(None)` as an
+    /// absence they may memoise, sign as `NotFound` to a paying client, and
+    /// unschedule from republish — an outage folded into `None` does all
+    /// three. Callers that only want the best-effort range scope
+    /// (`CacheEngine::origin_size`) swallow the error themselves and fall back
+    /// to a whole-blob [`Self::fetch`], which re-surfaces a persistent fault
+    /// at its proper severity. The default returns `Ok(None)`, so a custom
     /// [`Origin`] needs no change and simply never range-pulls.
     fn size(
         &self,

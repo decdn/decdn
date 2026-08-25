@@ -403,6 +403,16 @@ pub struct DecdnMetrics {
     /// means the slot is never released. Operator-visible name:
     /// `decdn_dht_republish_lag_sweeps_coalesced_total`.
     pub dht_republish_lag_sweeps_coalesced: Counter,
+
+    /// Lag-sweep walks that died in a panic instead of completing. The walk
+    /// runs in its own task, so a panic releases the slot through the normal
+    /// path and a queued request still runs — but the dead pass seeded only
+    /// what it reached before it died. A rate here with
+    /// `decdn_dht_republish_sweep_reseeded_total` flat means every sweep dies
+    /// before repairing anything, which nothing else surfaces.
+    /// Operator-visible name:
+    /// `decdn_dht_republish_lag_sweep_panics_total`.
+    pub dht_republish_lag_sweep_panics: Counter,
     /// Hashes a lag sweep newly scheduled for republish. Seeding is
     /// idempotent, so this counts the repair, not the walk: a sweep that
     /// finds every held hash already scheduled adds zero. Operator-visible
@@ -2149,6 +2159,8 @@ recorders! {
     /// Record a lag folded into an already-running or already-queued sweep
     /// rather than starting a walk of its own.
     dht_republish_lag_sweep_coalesced => dht_republish_lag_sweeps_coalesced.inc();
+    /// Record a lag-sweep walk that died in a panic instead of completing.
+    dht_republish_lag_sweep_panicked => dht_republish_lag_sweep_panics.inc();
     /// Record `count` hashes a lag sweep newly scheduled for republish.
     dht_republish_sweep_reseeded(count: u64) => dht_republish_sweep_reseeded.inc_by(count);
     /// Record a bulk republish seed (boot cold start or lag sweep) that could

@@ -65,7 +65,13 @@ pub(super) fn with_write<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&m
 /// Poison-tolerant `Mutex` lock, mirroring [`with_write`] for state behind a
 /// plain `Mutex`. Nest two calls to hold a pair of locks; the outer call is
 /// taken first, so the nesting order is the lock order.
-pub(super) fn with_lock<T, R>(lock: &Mutex<T>, label: &str, f: impl FnOnce(&mut T) -> R) -> R {
+///
+/// `pub(crate)` rather than `pub(super)` because the DHT routing table is
+/// locked from the request handler too, and every acquisition of one `Mutex`
+/// must share one recovery idiom: a site that recovers less than the others
+/// turns a single panic into split-brain, where the republisher keeps working
+/// on a table the query path answers empty for.
+pub(crate) fn with_lock<T, R>(lock: &Mutex<T>, label: &str, f: impl FnOnce(&mut T) -> R) -> R {
     match lock.lock() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => {

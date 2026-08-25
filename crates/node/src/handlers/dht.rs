@@ -38,6 +38,7 @@ use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 
+use crate::dht::chain_projection::with_lock;
 use crate::dht::{
     AuthenticatedNodeId, DhtRateLimiter, DhtRejectLayer, NodeId, RecordStore, RoutingTable,
     StakerSet,
@@ -325,9 +326,14 @@ impl DhtHandler {
         if peer.node_id() == NodeId::from_bytes(*self.self_id.as_bytes()) {
             return;
         }
-        if let Ok(mut table) = self.routing.lock() {
+        // Poison-tolerant like every other acquisition of this table
+        // (`with_lock` clears the poison as it recovers, so the warn is one
+        // line per panic, not one per admitted request). A silent skip here
+        // would drop every learned peer for the process lifetime after a
+        // single panic elsewhere.
+        with_lock(&self.routing, "dht routing table", |table| {
             table.insert(peer.node_id());
-        }
+        });
     }
 
     /// Read one framed `DhtMessage`, dispatch on variant, write the
@@ -681,16 +687,17 @@ impl DhtHandler {
     /// is a raw keyspace point so both a `NodeId` (`FindNode`) and a
     /// `ContentHash` (`FindValue`) fit.
     fn closest_to(&self, target: &[u8; 32]) -> wire::CloserNodes {
-        let Ok(table) = self.routing.lock() else {
-            // Poisoned lock — return empty; the caller will treat this as
-            // "responder has nothing closer", which is honest at this
-            // moment regardless of the lock state.
-            return wire::CloserNodes::default();
-        };
-        // `closest` already caps at `K_BUCKET_SIZE == MAX_CLOSER_NODES`, so the
-        // `CloserNodes` invariant always holds; `unwrap_or_default` is a
-        // belt-and-braces fallback that can't actually fire.
-        wire::CloserNodes::try_new(table.closest(target, MAX_CLOSER_NODES)).unwrap_or_default()
+        // Poison-tolerant: an empty answer from a poisoned guard would be an
+        // assertion about the table's contents this code cannot make, served
+        // to every inbound `FindNode`/`FindValue` for the process lifetime
+        // while the republisher (which recovers) keeps working — a node that
+        // looks healthy and answers every lookup with nothing.
+        with_lock(&self.routing, "dht routing table", |table| {
+            // `closest` already caps at `K_BUCKET_SIZE == MAX_CLOSER_NODES`, so the
+            // `CloserNodes` invariant always holds; `unwrap_or_default` is a
+            // belt-and-braces fallback that can't actually fire.
+            wire::CloserNodes::try_new(table.closest(target, MAX_CLOSER_NODES)).unwrap_or_default()
+        })
     }
 }
 
