@@ -428,6 +428,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         grant,
         locks: LaneLocks::default(),
         open_lock: tokio::sync::Mutex::new(()),
+        pool_serial: tokio::sync::Mutex::new(()),
     };
 
     // Obtain the manifest: the pre-read local one, or fetch the bundle blob.
@@ -552,6 +553,16 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// also perform a low-water top-up) and released before streaming, so
     /// delivery itself still runs concurrently once each entry has its context.
     open_lock: tokio::sync::Mutex<()>,
+    /// Serializes the pool's streaming phase across the whole bundle. Every
+    /// entry shares ONE `PaymentPool` deposit, but the scheduler's `spent`
+    /// view (`scheduler.rs:769`) sums only the lanes of the current fetch.
+    /// Without this, two `--jobs` entries on disjoint provider sets have
+    /// independent remaining-deposit views and can jointly over-issue vouchers
+    /// that exceed the single deposit and cannot all redeem. Holding this
+    /// across the whole payment section (`try_multi_source` + fallback) ensures
+    /// only one entry drives at a time; probes remain concurrent and
+    /// multi-source within an entry still fans out via its own `SharedPool`.
+    pool_serial: tokio::sync::Mutex<()>,
 }
 
 impl<P: Provider + Clone> PullCtx<'_, P> {
@@ -697,6 +708,17 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.slash_dom,
         )
         .await?;
+
+        // Pool-level serialization (see `Self::pool_serial`): every bundle entry
+        // shares ONE `PaymentPool` deposit, but the scheduler's `spent` view
+        // (`scheduler.rs:769`) sums only the lanes of the current fetch. Two
+        // `--jobs` entries on disjoint provider sets would otherwise have
+        // independent remaining-deposit views and could jointly over-issue
+        // vouchers that exceed the single deposit and cannot all redeem. Probes
+        // remain concurrent (above), but the payment + streaming section is
+        // serialized here; multi-source within an entry still fans out via its
+        // own `SharedPool`.
+        let _pool_guard = self.pool_serial.lock().await;
 
         // Multi-source fan-out (ADR 039, #1774): the same pre-branch `decdn
         // fetch` runs. One entry engages N provider lanes at once, so it takes
