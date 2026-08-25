@@ -24,13 +24,19 @@
 //! every concurrent stream must finish before the idle countdown begins (#1261,
 //! #1287).
 //!
-//! Still uncovered (need a hostile client that reimplements the receive loop —
-//! [`stall_delivery_at_closing_voucher`] is now that client's honest half and is
-//! the obvious base to extend; tracked as follow-ups): a mid-stream underpaying
-//! voucher → stream fails; a `BadSignature`/`StaleNonce` rejection *after* an
-//! accepted voucher; the per-connection stream-cap reset-without-signing; a
-//! server over-sending or delivering hash-mismatched bytes; and the
-//! request/voucher read timeouts.
+//! Hostile-client and hostile-server paths (#1562) reimplement the receive or
+//! serve loop by hand — [`stall_delivery_at_closing_voucher`] is the honest half
+//! the payment-fault tests extend, and [`serve_lying_stream`] is the hostile
+//! server the client-side detection tests drive the real [`stream_fetch`]
+//! against. Covered here: an underpaying closing voucher fails the stream and
+//! advances no watermark; a `BadSignature` and a watermark-regression
+//! (`BytesRegression`) proof arriving *after* an accepted voucher are both
+//! rejected in band while the accepted watermark survives; the per-connection
+//! stream-cap sheds an over-cap stream with a bare QUIC reset and no signed
+//! `StreamResponse`; the buyer rejects a server that over-sends past the promised
+//! length or delivers hash-mismatched bytes; and the request-read and
+//! voucher-read timeouts each tear down a peer that opens a stream (or parks a
+//! paid delivery) and then goes silent.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,19 +56,23 @@ use decdn_incentive::{
 };
 use decdn_node::channel_store::PersistentPoolStateStore;
 use decdn_node::client_requester::{
-    Cumulative, PoolContext, PoolLedger, PullDeadlines, RateAboveCeiling, UpstreamVoucherRejected,
-    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
-    stream_fetch_tracked_with_progress,
+    Cumulative, HashMismatch, PoolContext, PoolLedger, PullDeadlines, RateAboveCeiling,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch,
+    stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{
-    CHUNK_BYTES, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
-    VoucherRejectReason,
+    CHUNK_BYTES, ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest,
+    StreamRequestExt, StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
+    encode_stream_response,
 };
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
-use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
+use iroh::endpoint::{
+    ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, RecvStream,
+    SendStream, VarInt,
+};
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
@@ -9441,5 +9451,779 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Hostile-client and hostile-server paths (#1562)
+//
+// The payment-fault tests reuse [`StalledDelivery`] / the raw pipelined stream
+// helpers to reimplement the payer half by hand, so a test chooses exactly which
+// malformed proof it sends and when. The client-side detection tests instead run
+// the real [`stream_fetch`] requester against [`serve_lying_stream`], a raw
+// server that signs a valid `StreamResponse` and then misbehaves on the byte
+// stream. Both extend the honest scaffolding above rather than duplicating it.
+// ---------------------------------------------------------------------------
+
+/// Sign a cumulative voucher carrying an explicit `(bytes_delivered, amount)` and
+/// write it to `send`. Unlike [`pay_cumulative`] (which prices `amount` at the
+/// quoted rate) this hands the caller both fields, so a test can inject a voucher
+/// that regresses or diverges from the lane watermark. Signed correctly by the
+/// lane's pinned key, so the node's signature recovery passes and the reject is
+/// decided by the watermark checks.
+async fn send_signed_voucher(
+    send: &mut SendStream,
+    signer: &PrivateKeySigner,
+    bytes_delivered: u64,
+    amount: U256,
+) -> anyhow::Result<()> {
+    let voucher = Voucher {
+        pool_id: pool_id(),
+        signer: signer.address(),
+        provider: operator_addr(),
+        amount,
+        bytes_delivered: U256::from(bytes_delivered),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    }
+    .sign(signer, &payment_domain())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)?),
+    )
+    .await
+}
+
+/// Write a voucher whose signature bytes do not recover to any point (`r == s ==
+/// 0`, the canonical unrecoverable case) so the node rejects it `BadSignature`
+/// (`VoucherError::InvalidSignature`).
+///
+/// It is derived from a real, correctly-priced voucher and only its signature is
+/// zeroed, so the length still clears the wire `validate()` gate — the reject is
+/// the recovery failing, not a malformed frame. A hostile payer is not bound by
+/// our constructors, so the forgery is modelled on the wire.
+async fn send_unrecoverable_voucher(
+    send: &mut SendStream,
+    signer: &PrivateKeySigner,
+    bytes_delivered: u64,
+) -> anyhow::Result<()> {
+    let amount = min_payment(bytes_delivered, RATE_PER_MB);
+    let voucher = Voucher {
+        pool_id: pool_id(),
+        signer: signer.address(),
+        provider: operator_addr(),
+        amount,
+        bytes_delivered: U256::from(bytes_delivered),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    }
+    .sign(signer, &payment_domain())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    let mut wire = signed_to_wire_voucher(&voucher)?;
+    // Keep the length (so `Voucher::validate` passes) but blank the bytes: `r ==
+    // s == 0` parses structurally yet recovers to nothing → `InvalidSignature`.
+    wire.signature = vec![0u8; wire.signature.len()];
+    write_client_msg(send, &ClientMessage::Voucher(wire)).await
+}
+
+/// Read past any in-flight `ChunkData` to the node's mid-stream `VoucherRejected`,
+/// returning its reason and whether a wallet-less-resume [`WatermarkBundle`] rode
+/// along. The bundle-carrying twin of [`expect_reject`], which asserts the bundle
+/// is absent; a watermark-regression reject on a lane with an accepted voucher
+/// carries one (#1481 §5), so this hands the flag back for the caller to assert.
+async fn read_voucher_reject(recv: &mut RecvStream) -> anyhow::Result<(VoucherRejectReason, bool)> {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_client_msg(recv))
+            .await
+            .map_err(|_| anyhow::anyhow!("node never answered with a rejection"))??;
+        match msg {
+            ClientMessage::ChunkData(_) => {}
+            ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }) => {
+                return Ok((reason, bundle.is_some()));
+            }
+            other => anyhow::bail!("expected a VoucherRejected, got {other:?}"),
+        }
+    }
+}
+
+/// Assert `recv` observes a QUIC reset (or connection close) carrying `code`,
+/// with no readable frame first. Mirrors the probe suite's reset assertion: the
+/// stream-cap shed resets with [`decdn_protocol::APP_ERR_RATE_LIMITED`] and signs
+/// no `StreamResponse`, so a returned frame is itself the failure.
+async fn assert_stream_reset(recv: &mut RecvStream, code: u32) -> anyhow::Result<()> {
+    let expected = VarInt::from_u32(code);
+    match recv.read_to_end(4096).await {
+        Err(ReadToEndError::Read(ReadError::Reset(got))) if got == expected => Ok(()),
+        Err(ReadToEndError::Read(ReadError::ConnectionLost(
+            ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. }),
+        ))) if error_code == expected => Ok(()),
+        Ok(bytes) => anyhow::bail!(
+            "expected a reset carrying {code:#x}, but the server sent {} bytes (it signed a \
+             response instead of shedding)",
+            bytes.len()
+        ),
+        other => anyhow::bail!("expected a reset carrying {code:#x}, got {other:?}"),
+    }
+}
+
+/// An underpaying closing voucher (correct cumulative bytes, an amount far below
+/// the quoted-rate minimum) is a buyer withholding, not a protocol reject: the
+/// node bails the serve loop with no in-band `StreamError` (ADR 003 §Voucher
+/// withholding), so the stream ends in a reset with no `StreamEnd`, and — the
+/// money half — the lane watermark never advances, so the underpaid bytes are
+/// never credited.
+#[tokio::test(flavor = "multi_thread")]
+async fn underpaying_closing_voucher_fails_the_stream_and_credits_nothing() -> anyhow::Result<()> {
+    // Under one credit-window floor (1 chunk) so the delivery has exactly one
+    // (closing) voucher, but large enough that the quoted-rate minimum is well
+    // above 1 — so `amount = 1` is an unambiguous underpayment, not a rounding tie.
+    let payload = vec![0x7Eu8; 768 * 1024];
+    let fx = idle_fixture(&payload, Duration::from_secs(30)).await?;
+    let blob = fx.blob(0)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+    let mut stalled = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob.hash.as_bytes(),
+        blob.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+
+    // The full byte count, but one base unit of payment: `min_payment` for the
+    // whole delivery is far above 1, so this underpays the delivered span.
+    let owed = min_payment(blob.wire_bytes, RATE_PER_MB);
+    anyhow::ensure!(
+        owed > U256::from(1u64),
+        "fixture must owe more than one base unit for the underpay to be unambiguous"
+    );
+    let outcome = stalled
+        .send_cumulative_voucher(&fx.client_signer, blob.wire_bytes, U256::from(1u64))
+        .await;
+    anyhow::ensure!(
+        outcome.is_err(),
+        "an underpaying voucher must bail the stream (a reset, no in-band reject frame), got {outcome:?}"
+    );
+
+    // The withholding is not merely refused — nothing is credited. The lane
+    // watermark stays at zero, so the underpaid bytes cannot be settled later.
+    let persisted = fx.store.load_all()?;
+    if let Some(lane) = persisted.first() {
+        anyhow::ensure!(
+            lane.last_bytes_delivered() == U256::ZERO,
+            "an underpaid stream must not advance the lane watermark, got {}",
+            lane.last_bytes_delivered()
+        );
+        anyhow::ensure!(
+            lane.last_amount() == U256::ZERO,
+            "an underpaid stream must credit no amount, got {}",
+            lane.last_amount()
+        );
+    }
+
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// Drive a raw pipelined stream to the point where one interval has been paid and
+/// accepted and the next is on the wire awaiting its voucher — the shared setup
+/// for the two "hostile proof after an accepted voucher" tests. Returns the live
+/// stream halves plus the client endpoint / server task to tear down.
+struct MidStreamAfterAccept {
+    send: SendStream,
+    recv: RecvStream,
+    signer: Arc<PrivateKeySigner>,
+    store: Arc<dyn PoolStateStore>,
+    conn: Connection,
+    client_ep: Endpoint,
+    server_ep: Endpoint,
+    server_task: tokio::task::JoinHandle<()>,
+}
+
+async fn drive_to_second_interval_awaiting_voucher() -> anyhow::Result<MidStreamAfterAccept> {
+    const CREDIT_MAX: u64 = 64 * 1024 * 1024;
+    // 16 MiB: many intervals, so a reject after interval 2 lands with plenty of
+    // blob still undelivered — genuinely mid-stream, not the closing voucher.
+    let payload = vec![0x9Cu8; 16 * 1024 * 1024];
+    let (cache, hash, cache_tmp) = cache_with_blob(&payload).await?;
+    std::mem::forget(cache_tmp); // keep the cache dir for the connection's life
+    let (store, signer, _deposit) = seeded_store()?;
+
+    // Divisor 2 keeps the window pinned at the one-interval floor after the first
+    // interval is paid (`paid / 2 < floor`), so the server parks after each
+    // interval — a deterministic voucher rendezvous.
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), CREDIT_MAX, 2).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+
+    // Interval 1: delivered on the floor window, then paid + accepted. The server
+    // only widens past the floor after crediting this voucher, so reading
+    // interval 2 below is itself the proof that interval 1 was accepted.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
+
+    // Interval 2 arrives; the server then parks awaiting its voucher, which is
+    // where the hostile proof is injected.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+
+    Ok(MidStreamAfterAccept {
+        send,
+        recv,
+        signer,
+        store,
+        conn,
+        client_ep,
+        server_ep,
+        server_task,
+    })
+}
+
+/// A `BadSignature` proof arriving *after* an accepted voucher is rejected in
+/// band and the accepted watermark survives: signature recovery is the first
+/// watermark-independent gate, so the reject is decided before any lane state is
+/// touched, and it carries no wallet-less-resume bundle (the fix is a valid
+/// signature, not a watermark resync).
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_signature_after_an_accepted_voucher_is_rejected() -> anyhow::Result<()> {
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // A voucher for interval 2's cumulative, correctly priced but with an
+    // unrecoverable signature.
+    send_unrecoverable_voucher(&mut fx.send, &fx.signer, 2 * HARNESS_INTERVAL_BYTES).await?;
+    let (reason, has_bundle) = read_voucher_reject(&mut fx.recv).await?;
+    anyhow::ensure!(
+        reason == VoucherRejectReason::BadSignature,
+        "expected BadSignature, got {reason:?}"
+    );
+    anyhow::ensure!(
+        !has_bundle,
+        "a BadSignature reject carries no watermark bundle: the fix is a valid signature, not a resync"
+    );
+
+    // The accepted interval-1 voucher survives the reject: the watermark holds at
+    // one interval, neither regressed nor advanced by the forged proof.
+    let persisted = fx.store.load_all()?;
+    let lane = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane after an accepted voucher"))?;
+    anyhow::ensure!(
+        lane.last_bytes_delivered() == U256::from(HARNESS_INTERVAL_BYTES),
+        "the accepted watermark must survive the reject, got {}",
+        lane.last_bytes_delivered()
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// A watermark-regressing proof after an accepted voucher — same signed amount as
+/// the accepted watermark but MORE bytes claimed, the single-signer divergence of
+/// #1699 rule 4 — is rejected `BytesRegression`. It carries no wallet-less-resume
+/// bundle: a divergent voucher from the pinned signer is that signer
+/// misbehaving, not a stale local watermark a resync could repair, so the node
+/// hands back nothing to re-sign from. The accepted watermark is unmoved.
+#[tokio::test(flavor = "multi_thread")]
+async fn regressing_voucher_after_an_accepted_voucher_is_rejected() -> anyhow::Result<()> {
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    // Same money as the accepted interval-1 voucher, but claiming twice the bytes:
+    // same amount + more bytes is a divergent fault, not a benign supersede.
+    let accepted_amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    send_signed_voucher(
+        &mut fx.send,
+        &fx.signer,
+        2 * HARNESS_INTERVAL_BYTES,
+        accepted_amount,
+    )
+    .await?;
+    let (reason, has_bundle) = read_voucher_reject(&mut fx.recv).await?;
+    anyhow::ensure!(
+        reason == VoucherRejectReason::BytesRegression,
+        "expected BytesRegression, got {reason:?}"
+    );
+    anyhow::ensure!(
+        !has_bundle,
+        "a divergent equal-amount voucher is a single-signer fault, not a resyncable watermark: no bundle"
+    );
+
+    let persisted = fx.store.load_all()?;
+    let lane = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane after an accepted voucher"))?;
+    anyhow::ensure!(
+        lane.last_bytes_delivered() == U256::from(HARNESS_INTERVAL_BYTES),
+        "the accepted watermark must not move on a regression reject, got {}",
+        lane.last_bytes_delivered()
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
+/// The per-connection stream cap sheds an over-cap stream with a bare QUIC reset
+/// carrying [`decdn_protocol::APP_ERR_RATE_LIMITED`] and signs no
+/// `StreamResponse` (ADR 005 §Concurrent stream limits): signing a response per
+/// shed request would let a request flood amplify into one ECDSA signature each,
+/// so the cap adds no work to the reject path. One stream holds the sole permit
+/// (parked at its closing voucher); a second stream on the same connection is
+/// reset without a response.
+#[tokio::test(flavor = "multi_thread")]
+async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result<()> {
+    // 64 KiB: fits one credit-window floor, so the first stream parks at a single
+    // closing voucher while holding the sole stream permit.
+    let payload = vec![0x4Bu8; 64 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let wire_bytes = support::bao_wire_len_whole(payload.len() as u64);
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    // Per-connection cap of exactly one concurrent stream.
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        0,
+        1,
+        |_deps| {},
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // Stream 1 takes the sole permit and parks at its closing voucher, holding it
+    // for as long as the test declines to pay.
+    let _held =
+        stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire_bytes, Some(&ext)).await?;
+
+    // Stream 2 on the SAME connection finds no permit: the handler resets it with
+    // RATE_LIMITED and never signs a response.
+    let (mut send2, mut recv2) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi (second stream): {e}"))?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x0012_61a0,
+    };
+    write_frame(&mut send2, &encode_stream_request(&req, Some(&ext))?)
+        .await
+        .map_err(|e| anyhow::anyhow!("write second request: {e}"))?;
+    assert_stream_reset(&mut recv2, decdn_protocol::APP_ERR_RATE_LIMITED).await?;
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The first `chunks_frame` bytes of `wire`, framed as `ChunkData` messages of at
+/// most [`LYING_FRAME`] bytes each — a raw upstream's byte stream, hand-rolled so
+/// a test can then append more (over-send) or swap in the wrong bytes
+/// (hash-mismatch).
+const LYING_FRAME: usize = 64 * 1024;
+
+/// Bao interleaved WIRE bytes for the whole of `payload` (content plus proof, ADR
+/// 038) — the header-stripped stream a `cdn/client/v1` server emits. Lets a
+/// hostile server serve the encoding of a DIFFERENT blob under the requested hash.
+fn honest_bao_wire(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let hash = Hash::new(payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+        payload,
+        decdn_cache::range_pull::IROH_BLOCK_SIZE,
+    );
+    let aligned = decdn_cache::range_pull::align_range(0, 0, total_bytes)?;
+    let combined = decdn_cache::range_pull::encode_verified_range(
+        *hash.as_bytes(),
+        &aligned,
+        payload,
+        bytes::Bytes::from(ob.data),
+    )?;
+    Ok(combined
+        .get(8..)
+        .ok_or_else(|| anyhow::anyhow!("combined encoding shorter than its header"))?
+        .to_vec())
+}
+
+/// How a [`serve_lying_stream`] upstream misbehaves after signing a valid
+/// `StreamResponse`.
+#[derive(Clone, Copy)]
+enum Lie {
+    /// Stream the honest wire, then one extra full frame past the promised
+    /// length — the OOM / overpay shape the client's overrun guard closes.
+    OverSend,
+    /// Stream the bao encoding of a different blob of the SAME length under the
+    /// requested hash — a paid-but-corrupt delivery the client's verifier rejects.
+    WrongBytes,
+}
+
+/// A raw `cdn/client/v1` upstream that accepts the request, signs a VALID
+/// `StreamResponse` (so the buyer opens the stream and starts paying), then lies
+/// on the byte stream per [`Lie`]. Models the hostile server the buyer's own
+/// receive-side guards defend against — the counterpart to the payment-fault
+/// tests, which model a hostile client.
+async fn serve_lying_stream(
+    conn: Connection,
+    eth: &Arc<PrivateKeySigner>,
+    slash: &Eip712Domain,
+    served_wire: &[u8],
+    advertised_total_bytes: u64,
+    lie: Lie,
+) -> anyhow::Result<()> {
+    let (mut send, mut recv) = conn
+        .accept_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
+    let req = match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamRequest(req) => req,
+        other => anyhow::bail!("lying upstream: expected a StreamRequest, got {other:?}"),
+    };
+
+    let body = StreamResponseBody {
+        hash: req.hash,
+        ok: true,
+        rate_per_mb: RATE_PER_MB,
+        total_bytes: advertised_total_bytes,
+        pool_id: req.pool_id,
+        timestamp_us: req.timestamp_us,
+        redirect: None,
+    };
+    let slash_sig = StreamSlashData::from_response_body(&body)
+        .sign(eth.as_ref(), slash)
+        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        .as_bytes()
+        .to_vec();
+    let resp = StreamResponse { body, slash_sig };
+    write_frame(
+        &mut send,
+        &encode_stream_response(&resp, Some(&StreamResponseExt { error: None }))?,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+
+    for chunk in served_wire.chunks(LYING_FRAME) {
+        write_client_msg(
+            &mut send,
+            &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),
+        )
+        .await?;
+    }
+
+    match lie {
+        Lie::OverSend => {
+            // One extra full frame past the promised length trips the buyer's
+            // `cumulative > expected_wire` overrun guard; it bails before any
+            // `StreamEnd`, so nothing more is owed here.
+            write_client_msg(
+                &mut send,
+                &ClientMessage::ChunkData(ChunkData::new(vec![0u8; LYING_FRAME])?),
+            )
+            .await?;
+        }
+        Lie::WrongBytes => {
+            // The promised byte count is honest, so the buyer reads to the end,
+            // pays the closing voucher, and only then verifies. Consume that
+            // voucher and close cleanly so the failure is unambiguously the
+            // integrity check, not a truncated stream.
+            let _ = read_client_msg(&mut recv).await;
+            write_client_msg(&mut send, &ClientMessage::StreamEnd).await?;
+        }
+    }
+    let _ = send.finish();
+    conn.closed().await;
+    Ok(())
+}
+
+/// Spawn a one-connection [`serve_lying_stream`] server.
+fn spawn_lying_server(
+    ep: Endpoint,
+    eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    served_wire: Vec<u8>,
+    advertised_total_bytes: u64,
+    lie: Lie,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Ok(conn) = support::accept_one(&ep).await {
+            let _ = serve_lying_stream(
+                conn,
+                &eth,
+                &slash,
+                &served_wire,
+                advertised_total_bytes,
+                lie,
+            )
+            .await;
+        }
+    })
+}
+
+/// The buyer rejects a server that streams more bytes than its signed
+/// `StreamResponse` promised: the `cumulative > expected_wire` overrun guard bails
+/// the fetch before the extra bytes can drive an OOM or an overpay (ADR 005
+/// §`cdn/client/v1`).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> anyhow::Result<()> {
+    // Under one interval, so the honest wire is a single closing-voucher span and
+    // the extra frame is unambiguously past the promise.
+    let payload = vec![0x2Du8; 256 * 1024];
+    let hash = Hash::new(&payload);
+    let wire = honest_bao_wire(&payload)?;
+    let total_bytes = payload.len() as u64;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_lying_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        wire,
+        total_bytes,
+        Lie::OverSend,
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an over-sending server must fail the fetch"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("more than"),
+        "the fetch must fail on the overrun guard, got: {msg}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The buyer rejects hash-mismatched bytes: a server that serves the bao encoding
+/// of a DIFFERENT blob under the requested hash passes the framing but fails
+/// verification, so the fetch returns the typed [`HashMismatch`] and surfaces no
+/// bytes (ADR 038 §Receive side).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_rejects_hash_mismatched_bytes() -> anyhow::Result<()> {
+    // Two distinct blobs of the SAME length: the wire lengths match, so the
+    // buyer reads exactly the promised count and the only thing wrong is content.
+    let wanted = vec![0x11u8; 256 * 1024];
+    let served = vec![0x22u8; 256 * 1024];
+    let wanted_hash = Hash::new(&wanted);
+    anyhow::ensure!(Hash::new(&served) != wanted_hash, "fixtures must differ");
+    let served_wire = honest_bao_wire(&served)?;
+    let total_bytes = wanted.len() as u64;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_lying_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        served_wire,
+        total_bytes,
+        Lie::WrongBytes,
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *wanted_hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a hash-mismatched delivery must fail the fetch"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<HashMismatch>().is_some(),
+        "the fetch must fail with the typed HashMismatch, got: {err:#}"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The request-read timeout tears down a stream whose opener goes silent: a peer
+/// that opens a bidi stream and sends no `StreamRequest` is reset once
+/// `REQUEST_READ_TIMEOUT` elapses, with the no-error code (a stalled peer is not
+/// a protocol fault) — the node never blocks a serve slot on a silent opener.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_read_timeout_resets_a_silent_opener() -> anyhow::Result<()> {
+    let payload = vec![0x61u8; 64 * 1024];
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // Open a stream and send only a frame LENGTH prefix, withholding the body: the
+    // stream reaches the server (an unwritten `open_bi` never does), which parks in
+    // `read_first_message`'s framed read and must give up at the request-read
+    // timeout (5s). `send` is held for the whole wait so the client does not FIN
+    // and end the read early — the reset must be the server's timeout, not our EOF.
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(&[64u8])
+        .await
+        .map_err(|e| anyhow::anyhow!("write frame len: {e}"))?;
+
+    // The parked read is reset (or the connection closed) once the timeout fires;
+    // either way no frame is ever readable. A clean empty EOF would mean the peer
+    // FIN'd — impossible here, `send` is still open — so it is not accepted.
+    let ended = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv)).await;
+    match ended {
+        Ok(Err(_)) => {}
+        Ok(Ok(frame)) => {
+            anyhow::bail!(
+                "server answered a partial request with a {}-byte frame",
+                frame.len()
+            )
+        }
+        Err(_elapsed) => {
+            anyhow::bail!("server never reset a silent opener within the request-read timeout")
+        }
+    }
+    drop(send);
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// The voucher-read timeout tears down a parked paid delivery: a payer that reads
+/// the whole blob and then withholds its closing voucher is cut off once
+/// `VOUCHER_READ_TIMEOUT` elapses (the stream resets with no `StreamEnd`), and no
+/// watermark advances — a silent payer cannot pin the serve loop indefinitely.
+#[tokio::test(flavor = "multi_thread")]
+async fn voucher_read_timeout_ends_a_parked_delivery() -> anyhow::Result<()> {
+    // Under one credit-window floor, so the delivery parks at a single closing
+    // voucher — the exact point `commit_one_proof` blocks under the timeout.
+    let payload = vec![0x62u8; 64 * 1024];
+    // Idle window well past the 10s voucher-read timeout the test is waiting on,
+    // so the app-layer idle reaper never fires first.
+    let fx = idle_fixture(&payload, Duration::from_secs(45)).await?;
+    let blob = fx.blob(0)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&fx.client_signer, client_node_id)?;
+    let mut stalled = stall_delivery_at_closing_voucher(
+        &conn,
+        *blob.hash.as_bytes(),
+        blob.wire_bytes,
+        Some(&ext),
+    )
+    .await?;
+
+    // Withhold the voucher. The server is parked in `commit_one_proof`'s bounded
+    // read and must give up at the voucher-read timeout (10s), ending the stream
+    // with no `StreamEnd` — whether by a reset or a clean close, the payment never
+    // completes, so the next read yields an error rather than a `StreamEnd`.
+    let ended =
+        tokio::time::timeout(Duration::from_secs(20), read_client_msg(&mut stalled.recv)).await;
+    match ended {
+        Ok(Err(_)) => {}
+        Ok(Ok(ClientMessage::StreamEnd)) => {
+            anyhow::bail!("the delivery must not complete without a paid closing voucher")
+        }
+        Ok(Ok(other)) => anyhow::bail!("expected the stream to end unpaid, got {other:?}"),
+        Err(_elapsed) => {
+            anyhow::bail!("server never ended the parked delivery within the voucher-read timeout")
+        }
+    }
+
+    // No voucher was ever accepted, so the lane watermark stayed at zero.
+    let persisted = fx.store.load_all()?;
+    if let Some(lane) = persisted.first() {
+        anyhow::ensure!(
+            lane.last_bytes_delivered() == U256::ZERO,
+            "a timed-out delivery must advance no watermark, got {}",
+            lane.last_bytes_delivered()
+        );
+    }
+
+    shutdown([fx.server_task], [&client_ep, &fx.server_ep]).await?;
     Ok(())
 }

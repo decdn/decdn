@@ -22,6 +22,19 @@
 //!   event, so only the watcher's periodic re-scope of its retained deny-set
 //!   catches it.
 //!
+//! - **Removal reversal (`removal_lifts_the_deny_but_eviction_is_sticky`):** the
+//!   `removeHashGlobal` slow path (an appeal / wrongful-entry reversal) lifts the
+//!   node's governance deny, so the refusal *code* reverts from `HashBlacklisted`
+//!   to the sticky-eviction `EvictedSinceProbe` — but the blob stays evicted, and
+//!   the probe still reports `has_blob: false`. Content un-eviction is not a
+//!   watcher action (eviction is durable and one-way, `evicted.log`); appeal
+//!   restitution is financial, through `SlashAppeal` (ADR 028).
+//! - **Probe-hold interplay (`takedown_evicts_a_probe_held_blob`):** a probe
+//!   places an eviction-hold on `H` (the node signs `has_blob: true`), then
+//!   governance blacklists `H`; the watcher evicts it anyway. A probe-hold is
+//!   LRU-exemption only — a governance takedown always wins (ADR 040 §Pinning),
+//!   which is the cross-layer half of the engine's `try_probe_hold` TOCTOU test.
+//!
 //! **Coverage.** The journey exercises all three serving seams end-to-end
 //! against the daemon — delivery refusal (matched to `HashBlacklisted`), the
 //! probe handler (`has_blob: false`), and on-chain slashability. DHT
@@ -30,8 +43,7 @@
 //! an entry's `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
 //! Window, #1169), so the slash drive advances chain time past that window
 //! before stamping evidence — the node's *reaction* budget is now an on-chain
-//! grace, not just a prose target. Appeal-driven un-eviction and the explicit
-//! probe-hold interplay are follow-ups (see `blacklist_watcher` docs).
+//! grace, not just a prose target.
 
 #![cfg(feature = "anvil-e2e")]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
@@ -54,7 +66,7 @@ use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
 use decdn_e2e::bindings::{Erc20, SlashJudge, SlashJudgeBlacklist};
 use decdn_e2e::chain::{ChainFixture, region_key};
-use decdn_e2e::client::ClientFixture;
+use decdn_e2e::client::{ClientFixture, PoolSession};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 use decdn_e2e::time;
@@ -98,6 +110,22 @@ async fn regional_scope_transition() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_scope_transition()))
         .await
         .context("scope-transition e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removal_lifts_the_deny_but_eviction_is_sticky() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_removal_reversal()))
+        .await
+        .context("removal-reversal e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takedown_evicts_a_probe_held_blob() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_probe_hold_interplay()))
+        .await
+        .context("probe-hold interplay e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -196,6 +224,206 @@ async fn assert_refused_as_blacklisted(
         msg.contains("HashBlacklisted"),
         "refusal must be the blacklist reason, got: {msg}"
     );
+    Ok(())
+}
+
+/// Poll a reused pool session until a single-attempt fetch of `hash` is refused
+/// with a code whose `Display` contains `needle` and (if given) not `excludes`,
+/// or `budget` elapses. Returns whether it converged.
+///
+/// Uses [`ClientFixture::fetch_once`], not [`ClientFixture::fetch`]: `fetch`
+/// retries a *retryable* refusal (and `EvictedSinceProbe` is one) for 45s and
+/// opens a fresh on-chain pool each call, so polling it would burn the budget
+/// before a code transition could ever be observed. `fetch_once` is one attempt
+/// on the existing session — an open-time refusal advances no watermark, so the
+/// session stays reusable across attempts.
+async fn poll_refusal_contains(
+    client: &ClientFixture,
+    session: &mut PoolSession,
+    hash: Hash,
+    needle: &str,
+    excludes: Option<&str>,
+    budget: Duration,
+) -> anyhow::Result<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let msg = match client
+            .fetch_once(session, hash, 0, alloy::primitives::U256::ZERO)
+            .await
+        {
+            Ok(_) => anyhow::bail!("fetch of a refused blob unexpectedly succeeded"),
+            Err(e) => format!("{e:#}"),
+        };
+        if msg.contains(needle) && excludes.is_none_or(|x| !msg.contains(x)) {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The `removeHashGlobal` reversal (an appeal / wrongful-entry override) lifts the
+/// governance deny but not the eviction: the refusal stops being `HashBlacklisted`
+/// (it returns to the sticky-eviction code), yet the blob stays evicted and the
+/// probe still reports `has_blob: false`. Content un-eviction is never a watcher
+/// action — `evicted.log` is durable and one-way, and appeal restitution is
+/// financial (`SlashAppeal`, ADR 028), not a re-serve.
+async fn run_removal_reversal() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let chain = ChainFixture::launch().await?;
+    let payload = vec![0x8Bu8; 2 * MIB]; // H — blacklisted, then removed.
+    // W — never blacklisted; keeps the pool session live so every H probe below is
+    // a cheap `fetch_once` reusing one pool rather than opening a fresh one.
+    let warmup = vec![0x8Cu8; MIB];
+    let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&payload, &warmup]).await?;
+    let hash = hashes[0];
+    let warmup_hash = hashes[1];
+    let admin = node.admin_client()?;
+    let hash_key = to_b256(hash);
+
+    // Baseline: the node holds H.
+    assert!(
+        evict_was_present(&admin, hash).await?,
+        "node must hold H before blacklisting"
+    );
+
+    // One session, proven live by the warm-up fetch of the never-blacklisted W,
+    // reused for every H probe below.
+    let client = ClientFixture::new(&chain).await?;
+    let (mut session, _warm) = client.open_session(&chain, &node, warmup_hash).await?;
+
+    // Blacklist H globally and let the watcher evict it.
+    chain.add_hash_global(hash_key).await?;
+    time::increase_time(chain.admin(), 3600).await?;
+    let evicted = poll(Duration::from_secs(60), || async {
+        Ok((!evict_was_present(&admin, hash).await?).then_some(()))
+    })
+    .await?;
+    assert!(
+        evicted.is_some(),
+        "node never evicted the blacklisted blob H"
+    );
+
+    // While the entry stands, delivery is refused with the blacklist code.
+    assert!(
+        poll_refusal_contains(
+            &client,
+            &mut session,
+            hash,
+            "HashBlacklisted",
+            None,
+            Duration::from_secs(30),
+        )
+        .await?,
+        "delivery must be refused as HashBlacklisted while the entry stands"
+    );
+
+    // Governance removes the entry (the appeal / wrongful-entry slow path). The
+    // watcher lifts the governance deny on the `HashRemoved` tail event, moving
+    // the refusal off `HashBlacklisted` while the eviction stays sticky
+    // (`undeny_hash`: the code returns to the plain-evicted one).
+    chain.remove_hash_global(hash_key).await?;
+
+    // Mine across the poll. The log poller only sees the `HashRemoved` event once
+    // the chain head has advanced past its block (the add→evict path got that for
+    // free from its `increase_time`; a lone removal tx does not), and mining each
+    // round also keeps the watcher's periodic re-scope ticking. The assertion is
+    // the robust half — the refusal stops being `HashBlacklisted` while the blob
+    // stays refused — not the exact post-deny code.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut reverted = false;
+    loop {
+        time::mine(chain.admin()).await?;
+        let msg = match client
+            .fetch_once(&mut session, hash, 0, alloy::primitives::U256::ZERO)
+            .await
+        {
+            Ok(_) => anyhow::bail!("fetch of a removed-but-evicted blob unexpectedly succeeded"),
+            Err(e) => format!("{e:#}"),
+        };
+        if !msg.contains("HashBlacklisted") {
+            reverted = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        reverted,
+        "removal must lift the governance deny — the refusal must stop being HashBlacklisted \
+         (it returns to the sticky-eviction code) once the entry is gone"
+    );
+
+    // The eviction itself is sticky and one-way: the blob is still gone and the
+    // probe still declines it, even though the hash is no longer blacklisted.
+    assert!(
+        !evict_was_present(&admin, hash).await?,
+        "removal must NOT un-evict the blob (eviction is durable, one-way)"
+    );
+    let probe = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
+    assert!(
+        !probe.body.has_blob,
+        "an evicted blob stays unadvertised after the blacklist entry is removed"
+    );
+
+    Ok(())
+}
+
+/// A probe-hold does not shield a blob from a governance takedown. A probe makes
+/// the node sign `has_blob: true` and place an eviction hold on H; governance then
+/// blacklists H, and the watcher evicts it anyway — a probe-hold is LRU-exemption
+/// only, and a takedown always wins (ADR 040 §Pinning). This is the cross-layer
+/// half of the engine's `try_probe_hold` TOCTOU unit test.
+async fn run_probe_hold_interplay() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let chain = ChainFixture::launch().await?;
+    let payload = vec![0x9Du8; 2 * MIB];
+    let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
+    let admin = node.admin_client()?;
+    let hash_key = to_b256(hash);
+
+    // The node holds H and advertises it: this probe signs `has_blob: true` and
+    // places a fresh eviction hold on H (eviction-exempt from LRU for the hold
+    // window).
+    let held = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
+    assert!(
+        held.body.has_blob,
+        "node must advertise H (and so place a probe-hold) before the takedown"
+    );
+
+    // Blacklist H while the hold is live. The watcher evicts within a couple of
+    // its 2s poll cycles — inside the hold window — so the eviction is observed
+    // against a hold the takedown had to override, not one that lapsed first.
+    chain.add_hash_global(hash_key).await?;
+    time::increase_time(chain.admin(), 3600).await?;
+    let evicted = poll(Duration::from_secs(60), || async {
+        Ok((!evict_was_present(&admin, hash).await?).then_some(()))
+    })
+    .await?;
+    assert!(
+        evicted.is_some(),
+        "a governance takedown must evict a probe-held blob (the hold does not shield it)"
+    );
+
+    // The probe seam agrees: the evicted blob is no longer advertised, so the
+    // hold can never be refreshed back into existence.
+    let after = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
+    assert!(
+        !after.body.has_blob,
+        "a taken-down blob must not be advertised, even one that was just probe-held"
+    );
+    assert_refused_as_blacklisted(&chain, &node, hash).await?;
+
     Ok(())
 }
 

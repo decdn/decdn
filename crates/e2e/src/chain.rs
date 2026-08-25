@@ -981,6 +981,27 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "addHashGlobal")
     }
 
+    /// Remove `hash` from the GLOBAL blacklist as governance — the
+    /// `removeHashGlobal` slow path that models an appeal / wrongful-entry
+    /// reversal (ADR 011 § Content Takedown). Impersonates the Timelock (which
+    /// holds `GOVERNANCE_ROLE` after handoff) and blocks until mined. Emits
+    /// `HashRemoved(GLOBAL, hash)`, which the node's blacklist watcher projects by
+    /// lifting the governance deny — the eviction itself stays sticky.
+    pub async fn remove_hash_global(&self, hash: B256) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &raw)
+            .removeHashGlobal(hash)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("removeHashGlobal send")?
+            .get_receipt()
+            .await
+            .context("removeHashGlobal receipt")?;
+        crate::ensure_mined(&receipt, "removeHashGlobal")
+    }
+
     /// Blacklist (or un-blacklist) an origin operator as governance —
     /// `ContentBlacklist.setOriginBlacklist` (ADR 011 § Hash Evasion and Origin
     /// Blacklisting). Impersonates the Timelock (which holds `GOVERNANCE_ROLE`
