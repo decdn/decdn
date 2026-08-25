@@ -265,11 +265,11 @@ async fn poll_refusal_contains(
 }
 
 /// The `removeHashGlobal` reversal (an appeal / wrongful-entry override) lifts the
-/// governance deny but not the eviction: the refusal code reverts from
-/// `HashBlacklisted` to the sticky-eviction `EvictedSinceProbe`, the blob stays
-/// evicted, and the probe still reports `has_blob: false`. Content un-eviction is
-/// never a watcher action — `evicted.log` is durable and one-way, and appeal
-/// restitution is financial (`SlashAppeal`, ADR 028), not a re-serve.
+/// governance deny but not the eviction: the refusal stops being `HashBlacklisted`
+/// (it returns to the sticky-eviction code), yet the blob stays evicted and the
+/// probe still reports `has_blob: false`. Content un-eviction is never a watcher
+/// action — `evicted.log` is durable and one-way, and appeal restitution is
+/// financial (`SlashAppeal`, ADR 028), not a re-serve.
 async fn run_removal_reversal() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -324,20 +324,41 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     );
 
     // Governance removes the entry (the appeal / wrongful-entry slow path). The
-    // watcher lifts the governance deny — via the `HashRemoved` tail event and the
-    // periodic re-scope — so the refusal code reverts to the sticky-eviction one.
+    // watcher lifts the governance deny on the `HashRemoved` tail event, moving
+    // the refusal off `HashBlacklisted` while the eviction stays sticky
+    // (`undeny_hash`: the code returns to the plain-evicted one).
     chain.remove_hash_global(hash_key).await?;
+
+    // Mine across the poll. The log poller only sees the `HashRemoved` event once
+    // the chain head has advanced past its block (the add→evict path got that for
+    // free from its `increase_time`; a lone removal tx does not), and mining each
+    // round also keeps the watcher's periodic re-scope ticking. The assertion is
+    // the robust half — the refusal stops being `HashBlacklisted` while the blob
+    // stays refused — not the exact post-deny code.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut reverted = false;
+    loop {
+        time::mine(chain.admin()).await?;
+        let msg = match client
+            .fetch_once(&mut session, hash, 0, alloy::primitives::U256::ZERO)
+            .await
+        {
+            Ok(_) => anyhow::bail!("fetch of a removed-but-evicted blob unexpectedly succeeded"),
+            Err(e) => format!("{e:#}"),
+        };
+        if !msg.contains("HashBlacklisted") {
+            reverted = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     assert!(
-        poll_refusal_contains(
-            &client,
-            &mut session,
-            hash,
-            "EvictedSinceProbe",
-            Some("HashBlacklisted"),
-            Duration::from_secs(60),
-        )
-        .await?,
-        "removal must lift the governance deny so the refusal reverts to EvictedSinceProbe"
+        reverted,
+        "removal must lift the governance deny — the refusal must stop being HashBlacklisted \
+         (it returns to the sticky-eviction code) once the entry is gone"
     );
 
     // The eviction itself is sticky and one-way: the blob is still gone and the
