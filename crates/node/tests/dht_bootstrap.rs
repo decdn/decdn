@@ -306,7 +306,8 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     // start, so a blob wasn't discoverable for up to 50 minutes —
     // this test is the regression guard.
     use decdn_node::dht::{RepublishScheduler, publish::run_republish};
-    use tokio::sync::{broadcast, oneshot};
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
 
     // Server S in `staked` so the publish-driven `Store` from the
     // republish task lands successfully.
@@ -347,7 +348,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     let cache = decdn_cache::CacheEngine::open(cache_dir.path(), vec![], 16).await?;
     let scheduler = Arc::new(RepublishScheduler::new());
     let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(16);
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let stop = CancellationToken::new();
     let task = tokio::spawn(run_republish(
         publisher_ep.clone(),
         publisher_id,
@@ -357,7 +358,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         true,
         Arc::new(decdn_node::metrics::Metrics::new()),
         inserts_rx,
-        stop_rx,
+        stop.clone(),
     ));
 
     // Simulate a cache insert by broadcasting on the channel. The
@@ -380,7 +381,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
             break;
         }
     }
-    let _ = stop_tx.send(());
+    stop.cancel();
     let _ = task.await;
 
     assert!(
@@ -410,7 +411,8 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
 #[tokio::test(flavor = "multi_thread")]
 async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow::Result<()> {
     use decdn_node::dht::{RepublishScheduler, publish::run_republish};
-    use tokio::sync::{broadcast, oneshot};
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
 
     let payloads: [&'static [u8]; 4] = [b"lag-a", b"lag-b", b"lag-c", b"lag-d"];
     let cache_dir = tempfile::tempdir()?;
@@ -438,7 +440,7 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
     let (publisher_ep, _addr) = local_endpoint(key, vec![ALPN_DHT.to_vec()]).await?;
     let scheduler = Arc::new(RepublishScheduler::new());
     let metrics = Arc::new(Metrics::new());
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let stop = CancellationToken::new();
     let task = tokio::spawn(run_republish(
         publisher_ep.clone(),
         publisher_id,
@@ -452,7 +454,7 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
         true,
         Arc::clone(&metrics),
         inserts_rx,
-        stop_rx,
+        stop.clone(),
     ));
 
     // The sweep is detached and walks the store, so poll rather than assume
@@ -465,7 +467,7 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
             break;
         }
     }
-    let _ = stop_tx.send(());
+    stop.cancel();
     let _ = task.await;
 
     assert_eq!(
@@ -524,7 +526,8 @@ async fn run_republish_lag_sweep_honours_the_origin_only_policy() -> anyhow::Res
 /// alone and the sweep is the only path that can reach it.
 async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result<usize> {
     use decdn_node::dht::{RepublishScheduler, publish::run_republish};
-    use tokio::sync::{broadcast, oneshot};
+    use tokio::sync::broadcast;
+    use tokio_util::sync::CancellationToken;
 
     let cache_dir = tempfile::tempdir()?;
     let own = decdn_cache::Hash::new(b"policy-own");
@@ -554,7 +557,7 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
     let publisher_id = key.public();
     let (publisher_ep, _addr) = local_endpoint(key, vec![ALPN_DHT.to_vec()]).await?;
     let scheduler = Arc::new(RepublishScheduler::new());
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let stop = CancellationToken::new();
     let task = tokio::spawn(run_republish(
         publisher_ep.clone(),
         publisher_id,
@@ -566,7 +569,7 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
         relay_foreign_namespaces,
         Arc::new(Metrics::new()),
         inserts_rx,
-        stop_rx,
+        stop.clone(),
     ));
 
     // Poll up to the expected ceiling, then let the loop settle so a late
@@ -580,7 +583,7 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let settled = scheduler.len();
-    let _ = stop_tx.send(());
+    stop.cancel();
     let _ = task.await;
 
     publisher_ep.close().await;

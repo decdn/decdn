@@ -172,6 +172,42 @@ pub struct CacheMetrics {
     /// automatically, so the emitted name is
     /// `decdn_cache_tag_drop_failures_total`.
     pub tag_drop_failures: Counter,
+
+    /// Origin size probes that faulted during an origin rescan — a transport
+    /// error from one or more configured origins with none of them confirming
+    /// the object, or the probe walk overrunning its ceiling — rather than
+    /// answering "held" or "not held".
+    ///
+    /// Operator-actionable: a rescan resolves each candidate against the origin
+    /// to decide what this node advertises, so a throttled `HeadObject` window
+    /// during a rescan would otherwise shrink the announce set silently. A
+    /// retry-eligible fault keeps whatever entry an earlier pass indexed, so a
+    /// sustained nonzero rate means the node may still be advertising content
+    /// the origin has since stopped holding — every request for it is then a
+    /// refusal. A candidate first seen inside the fault window has no earlier
+    /// entry and is simply absent until a later rescan resolves it. Correlate
+    /// with the origin backend's own error rate.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_origin_probe_failures_total`.
+    pub origin_probe_failures: Counter,
+
+    /// Origins whose `enumerate` failed during a rescan, counted once per origin
+    /// per rescan.
+    ///
+    /// The sibling of `origin_probe_failures` for the other leg of the same
+    /// rescan, and the more severe of the two: a failed listing contributes no
+    /// candidates at all, so every hash discoverable only through that origin
+    /// leaves the announce set with no per-hash fault to carry a previous entry
+    /// forward. Only the operator pins naming those hashes survive. Operator-
+    /// actionable in the same way — correlate with the origin backend's error
+    /// rate; a later successful rescan restores the listing.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_origin_enumerate_failures_total`.
+    pub origin_enumerate_failures: Counter,
     /// Per-origin circuit-breaker trips from CLOSED/HALF-OPEN to OPEN
     /// (#963). Bumped once each time a breaker opens — on crossing the
     /// `failure_threshold` from CLOSED, or on a failed HALF-OPEN trial.

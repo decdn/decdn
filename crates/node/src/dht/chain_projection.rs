@@ -10,6 +10,8 @@
 //!
 //! - [`with_read`] / [`with_write`] — the poison-recovery lock idiom, one
 //!   `warn!` site, `label` naming the projection.
+//! - [`with_lock`] — the same idiom for a `Mutex`: the DHT republish scheduler's
+//!   heap and its live-hash map, and the DHT routing table.
 //! - [`mutate_gauged`] — mutate under the write lock, sample the size while
 //!   still holding it, and republish the gauge only when the mutation actually
 //!   changed the set (a re-scanned `eth_getLogs` window replays no-ops).
@@ -21,7 +23,7 @@
 //! into the [`ChainProjection`] — is what applies mutations, holding its own
 //! `Arc<RwLock<T>>` clone made in `bootstrap`.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tracing::warn;
 
@@ -31,11 +33,18 @@ use tracing::warn;
 /// propagate a panic into the read hot path. Log on the recovery arm so the
 /// original panic surfaces somewhere, matching the precedent in
 /// `cache/src/engine.rs`.
+///
+/// The recovery arm clears the poison, so the warning is one line per panic
+/// rather than one per acquisition. Poison is otherwise sticky, and these locks
+/// sit on paths that run per inbound request and on a 1 Hz timer — an ungated
+/// log there is the megabytes-per-second flood `dispatch`'s own poison gate
+/// exists to prevent.
 pub(crate) fn with_read<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&T) -> R) -> R {
     match state.read() {
         Ok(guard) => f(&guard),
         Err(poisoned) => {
             warn!("{label} RwLock poisoned; recovering inner state");
+            state.clear_poison();
             f(&poisoned.into_inner())
         }
     }
@@ -47,6 +56,21 @@ pub(super) fn with_write<T, R>(state: &RwLock<T>, label: &str, f: impl FnOnce(&m
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => {
             warn!("{label} RwLock poisoned; recovering inner state");
+            state.clear_poison();
+            f(&mut poisoned.into_inner())
+        }
+    }
+}
+
+/// Poison-tolerant `Mutex` lock, mirroring [`with_write`] for state behind a
+/// plain `Mutex`. Nest two calls to hold a pair of locks; the outer call is
+/// taken first, so the nesting order is the lock order.
+pub(super) fn with_lock<T, R>(lock: &Mutex<T>, label: &str, f: impl FnOnce(&mut T) -> R) -> R {
+    match lock.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => {
+            warn!("{label} Mutex poisoned; recovering inner state");
+            lock.clear_poison();
             f(&mut poisoned.into_inner())
         }
     }
@@ -150,5 +174,32 @@ mod tests {
         );
         assert!(!mutated_noop);
         assert_eq!(gauged_noop, None);
+    }
+
+    /// [`with_lock`] recovers a poisoned `Mutex` the same way, including through
+    /// a nested pair — the shape the republish scheduler holds its heap and its
+    /// live-hash map in.
+    #[test]
+    fn with_lock_recovers_a_poisoned_mutex() {
+        let outer = Mutex::new(vec![1u8, 2]);
+        let inner = Mutex::new(HashSet::<u8>::from([1, 2]));
+
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _outer = outer.lock().unwrap();
+            let _inner = inner.lock().unwrap();
+            panic!("poison both locks while holding the guards");
+        }));
+        assert!(poisoned.is_err());
+        assert!(outer.is_poisoned());
+        assert!(inner.is_poisoned());
+
+        let total = with_lock(&outer, "test outer", |o| {
+            o.push(3);
+            with_lock(&inner, "test inner", |i| {
+                i.insert(3);
+                o.len() + i.len()
+            })
+        });
+        assert_eq!(total, 6);
     }
 }

@@ -55,8 +55,10 @@ use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::RngExt;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
+use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
 use decdn_protocol::ContentHash;
@@ -170,13 +172,15 @@ impl RepublishScheduler {
     /// Number of hashes currently scheduled.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.scheduled.lock().map_or(0, |s| s.len())
+        with_lock(&self.scheduled, "dht republish scheduled set", |s| s.len())
     }
 
     /// Whether the scheduler is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.scheduled.lock().is_ok_and(|s| s.is_empty())
+        with_lock(&self.scheduled, "dht republish scheduled set", |s| {
+            s.is_empty()
+        })
     }
 
     /// Schedule `hash` with the steady-state jitter window (30–50 min),
@@ -193,7 +197,7 @@ impl RepublishScheduler {
     /// Batch-schedule every hash in `iter` with an independent
     /// cold-start jitter draw (uniform(0, 40 min) per hash, NOT a
     /// shared timestamp). Callers pass a `holder_snapshot` result,
-    /// or `origin_held_hashes` for the origin-only rescan — never
+    /// or `origin_held_snapshot` for the origin-only rescan — never
     /// `access_times_snapshot`, which maps `Hash -> Instant` and is
     /// empty on cold start; see the `iter_hashes` rustdoc.
     ///
@@ -253,24 +257,20 @@ impl RepublishScheduler {
     /// Both guards are held across the read-and-push so a concurrent
     /// `drain_due` cannot act on a half-applied change. Acquired
     /// heap-then-scheduled to match `drain_due`'s order — the reverse would
-    /// risk deadlocking against it.
+    /// risk deadlocking against it, which is why the [`with_lock`] calls nest
+    /// in that order rather than running side by side.
     fn with_slots<F>(&self, offset_us: u64, f: F) -> bool
     where
         F: FnOnce(&mut BinaryHeap<Reverse<Entry>>, &mut HashMap<ContentHash, u64>, u64) -> bool,
     {
         let due_us = now_us().saturating_add(offset_us);
-        let (Ok(mut heap), Ok(mut scheduled)) = (self.heap.lock(), self.scheduled.lock()) else {
-            // A poisoned lock is sticky, so the scheduler is now inert: nothing
-            // is ever scheduled or drained again and the node silently stops
-            // advertising. `false` here is indistinguishable from "already
-            // scheduled" to the caller, which would report a healthy no-op
-            // sweep, so say it out loud.
-            tracing::error!(
-                "dht republish: scheduler lock poisoned; the hash will not be scheduled"
-            );
-            return false;
-        };
-        f(&mut heap, &mut scheduled, due_us)
+        with_lock(&self.heap, "dht republish heap", |heap| {
+            with_lock(
+                &self.scheduled,
+                "dht republish scheduled set",
+                |scheduled| f(heap, scheduled, due_us),
+            )
+        })
     }
 
     /// Drain every hash whose authoritative due time has passed.
@@ -280,29 +280,35 @@ impl RepublishScheduler {
     /// supersede or an unschedule, and is dropped.
     fn drain_due(&self, now_us: u64) -> Vec<ContentHash> {
         let mut out = Vec::new();
-        if let (Ok(mut heap), Ok(mut scheduled)) = (self.heap.lock(), self.scheduled.lock()) {
-            while let Some(Reverse(Entry { due_us, hash })) = heap.peek().copied() {
-                if due_us > now_us {
-                    break;
-                }
-                heap.pop();
-                if scheduled.get(&hash) != Some(&due_us) {
-                    continue;
-                }
-                out.push(hash);
-                // Drop the live entry so the next `schedule_*` for this hash
-                // re-adds it. The caller re-schedules after publishing.
-                scheduled.remove(&hash);
-            }
-        }
+        with_lock(&self.heap, "dht republish heap", |heap| {
+            with_lock(
+                &self.scheduled,
+                "dht republish scheduled set",
+                |scheduled| {
+                    while let Some(Reverse(Entry { due_us, hash })) = heap.peek().copied() {
+                        if due_us > now_us {
+                            break;
+                        }
+                        heap.pop();
+                        if scheduled.get(&hash) != Some(&due_us) {
+                            continue;
+                        }
+                        out.push(hash);
+                        // Drop the live entry so the next `schedule_*` for this hash
+                        // re-adds it. The caller re-schedules after publishing.
+                        scheduled.remove(&hash);
+                    }
+                },
+            );
+        });
         out
     }
 
     /// Unschedule `hash` — used when the cache evicts the blob.
     pub fn unschedule(&self, hash: &ContentHash) {
-        if let Ok(mut s) = self.scheduled.lock() {
+        with_lock(&self.scheduled, "dht republish scheduled set", |s| {
             s.remove(hash);
-        }
+        });
         // The heap entry is left in place; `drain_due` discards it, and a
         // later re-schedule cannot resurrect it because its `due_us` will no
         // longer match the authoritative one.
@@ -333,6 +339,80 @@ pub(crate) struct HolderSnapshot {
     /// `hashes`; the caller decides how loudly to report the degradation, since
     /// bring-up and the sweep phrase it differently.
     pub(crate) store_error: Option<decdn_cache::CacheError>,
+    /// Size probes that faulted on the rescan the origin-held half comes from.
+    ///
+    /// Carried from the index rather than measured here, so it describes a pass
+    /// that may be as old as the rescan cadence — kept separate from
+    /// `ownership_probe_faults` for that reason, and because it is already
+    /// metered on the cache's own counter.
+    pub(crate) rescan_probe_faults: u64,
+    /// Origins whose listing failed on that rescan. More severe than a probe
+    /// fault: no candidate was produced, so nothing could be carried forward.
+    pub(crate) rescan_enumerate_failures: u64,
+    /// Stored hashes this walk could not put to the origin — the ownership test
+    /// applied under the origin-only policy, answered neither way.
+    ///
+    /// Measured by this snapshot, so it describes right now. Zero when the node
+    /// relays foreign namespaces, which asks the origin nothing.
+    pub(crate) ownership_probe_faults: u64,
+}
+
+impl HolderSnapshot {
+    /// Whether this snapshot is short of what the node actually holds.
+    pub(crate) const fn is_degraded(&self) -> bool {
+        self.store_error.is_some()
+            || self.rescan_probe_faults > 0
+            || self.rescan_enumerate_failures > 0
+            || self.ownership_probe_faults > 0
+    }
+
+    /// Meter and log every way this snapshot came up short, returning
+    /// [`Self::is_degraded`].
+    ///
+    /// One place, because both full seeds — bring-up cold start and the lag
+    /// sweep — degrade identically and differ only in what they call themselves.
+    /// `context` names the caller in each line.
+    pub(crate) fn report_degradation(
+        &self,
+        metrics: &crate::metrics::Metrics,
+        context: &str,
+    ) -> bool {
+        if let Some(err) = &self.store_error {
+            metrics.dht_republish_seed_store_walk_failure();
+            tracing::warn!(
+                context,
+                error = %err,
+                "dht republish: seed could not walk the store and covered the \
+                 origin-held half only. Blobs held only in the store stay \
+                 un-republished until a later seed walks it successfully"
+            );
+        }
+        // Only this walk's own faults. The rescan's are already on
+        // `decdn_cache_origin_probe_failures_total`, and re-counting them here
+        // would move the seed's counter on a node that asks the origin nothing.
+        if self.ownership_probe_faults > 0 {
+            metrics.dht_republish_seed_origin_probe_failures(self.ownership_probe_faults);
+            tracing::warn!(
+                context,
+                faults = self.ownership_probe_faults,
+                "dht republish: seed could not put every stored hash to its \
+                 origin; each one it could not confirm is left out of the \
+                 announce set rather than advertised"
+            );
+        }
+        if self.rescan_probe_faults > 0 || self.rescan_enumerate_failures > 0 {
+            tracing::warn!(
+                context,
+                faults = self.rescan_probe_faults,
+                enumerate_failures = self.rescan_enumerate_failures,
+                "dht republish: the origin-held half of this seed comes from a \
+                 rescan that could not resolve everything; entries it carried \
+                 forward may name content the origin has dropped, and an origin \
+                 it could not list contributed nothing at all"
+            );
+        }
+        self.is_degraded()
+    }
 }
 
 /// Collect the [`HolderSnapshot`] for `cache`.
@@ -350,15 +430,24 @@ pub(crate) struct HolderSnapshot {
 /// this node owns, committed but with its insert event dropped, is in neither
 /// half without it. `Fault` is skipped rather than admitted: a transport blip
 /// must not turn into an advertisement for content the serve path might then
-/// refuse, and faults are not memoised, so the next sweep retries.
+/// refuse, and faults are not memoised, so the next sweep retries. Skipping is
+/// still a hash this node holds and does not announce, so each one counts
+/// toward `origin_probe_faults` — otherwise an origin-only node drops its own
+/// store-only content on a blip and reports a healthy snapshot.
 ///
 /// Never fails: a store-walk error degrades to the origin-held half rather than
-/// yielding nothing, because a partial announce strictly beats none.
+/// yielding nothing, because a partial announce strictly beats none. Every way
+/// the set can come up short reports itself: `store_error` when the walk failed
+/// outright, `origin_probe_faults` for questions the origin would not answer —
+/// the last rescan's and this walk's own ownership tests both — and
+/// `origin_enumerate_failures` for an origin that could not be listed at all.
 pub(crate) async fn holder_snapshot(
     cache: &decdn_cache::CacheEngine,
     relay_foreign_namespaces: bool,
 ) -> HolderSnapshot {
-    let mut hashes: HashSet<decdn_cache::Hash> = cache.origin_held_hashes().into_iter().collect();
+    let report = cache.origin_held_snapshot();
+    let mut hashes = report.hashes;
+    let mut ownership_probe_faults = 0u64;
     let mut store_error = None;
     match cache.iter_hashes().await {
         Ok(stored) => {
@@ -366,8 +455,18 @@ pub(crate) async fn holder_snapshot(
                 if hashes.contains(&hash) {
                     continue;
                 }
-                if relay_foreign_namespaces || is_own_origin_content(cache, hash).await {
+                if relay_foreign_namespaces {
                     hashes.insert(hash);
+                    continue;
+                }
+                match cache.origin_probe_presence(hash).await {
+                    decdn_cache::OriginPresence::Present(_) => {
+                        hashes.insert(hash);
+                    }
+                    decdn_cache::OriginPresence::Absent => {}
+                    decdn_cache::OriginPresence::Fault => {
+                        ownership_probe_faults = ownership_probe_faults.saturating_add(1);
+                    }
                 }
             }
         }
@@ -376,33 +475,23 @@ pub(crate) async fn holder_snapshot(
     HolderSnapshot {
         hashes,
         store_error,
+        rescan_probe_faults: report.probe_faults,
+        rescan_enumerate_failures: report.enumerate_failures,
+        ownership_probe_faults,
     }
-}
-
-/// Whether a configured origin backend confirms it holds `hash` — the
-/// origin-only node's ownership test, matching the serve gate in
-/// `handlers::client::dispatch`.
-///
-/// Memoised inside the cache under the positive TTL, so a sweep re-walking the
-/// same store does not re-issue a `HEAD` per hash.
-async fn is_own_origin_content(cache: &decdn_cache::CacheEngine, hash: decdn_cache::Hash) -> bool {
-    matches!(
-        cache.origin_probe_presence(hash).await,
-        decdn_cache::OriginPresence::Present(_)
-    )
 }
 
 /// What one lag sweep did, for the completion log.
 ///
-/// `degraded` rides along so the completion line names the outcome: a
-/// store-walk failure warns from inside [`lag_sweep`], several frames away, and
-/// an unqualified "complete" would read as a clean run to anyone grepping for
-/// it.
+/// `degraded` rides along so the completion line names the outcome: the warnings
+/// come from inside [`lag_sweep`], several frames away, and an unqualified
+/// "complete" would read as a clean run to anyone grepping for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SweepOutcome {
     /// Hashes this sweep newly scheduled.
     reseeded: usize,
-    /// Whether the store walk failed, leaving only the origin-held half.
+    /// Whether this sweep could not resolve everything the node holds — a failed
+    /// store walk, a faulted origin probe, or an origin that could not be listed.
     degraded: bool,
 }
 
@@ -421,16 +510,7 @@ async fn lag_sweep(
     metrics: &crate::metrics::Metrics,
 ) -> SweepOutcome {
     let snapshot = holder_snapshot(cache, relay_foreign_namespaces).await;
-    let degraded = snapshot.store_error.is_some();
-    if let Some(err) = &snapshot.store_error {
-        metrics.dht_republish_seed_store_walk_failure();
-        tracing::warn!(
-            error = %err,
-            "dht republish: lag sweep could not walk the store; re-seeding the \
-             origin-held half only. Blobs held only in the store stay \
-             un-republished until the next sweep or restart"
-        );
-    }
+    let degraded = snapshot.report_degradation(metrics, "lag sweep");
     let reseeded = scheduler.seed_cold_start(
         snapshot
             .hashes
@@ -471,8 +551,8 @@ impl Drop for SweepSlotGuard<'_> {
 
 /// Everything one lag-sweep worker borrows from [`run_republish`].
 ///
-/// A struct rather than five positional parameters because three of the five
-/// are `&Arc<_>` and would otherwise be transposable at the call site.
+/// A struct rather than six positional parameters because four of the six
+/// are `&Arc<_>` / `&_` and would otherwise be transposable at the call site.
 #[derive(Clone, Copy)]
 struct SweepSlot<'a> {
     /// Three-state slot: see `SWEEP_IDLE` / `SWEEP_RUNNING` / `SWEEP_QUEUED`.
@@ -480,6 +560,9 @@ struct SweepSlot<'a> {
     cache: &'a decdn_cache::CacheEngine,
     scheduler: &'a Arc<RepublishScheduler>,
     metrics: &'a Arc<crate::metrics::Metrics>,
+    /// Cancelled by [`run_republish`] on its way out, so a walk in flight at
+    /// shutdown is abandoned rather than classified as a degradation.
+    shutdown: &'a CancellationToken,
     relay_foreign_namespaces: bool,
 }
 
@@ -487,16 +570,31 @@ struct SweepSlot<'a> {
 ///
 /// Detached, like the batch publish: the store walk costs one `status()` per
 /// blob, and running it on the `select!` loop would stall shutdown and the
-/// eager per-insert publishes. Abandoned on shutdown — the next lag, or the
+/// eager per-insert publishes. Cancelled on shutdown — the next lag, or the
 /// next boot, re-seeds.
+///
+/// The cancellation is what keeps a clean restart quiet. The runtime cancels
+/// before it flushes the store, and the `select!` below is `biased` with
+/// cancellation first, so a worker polled any time after the flush takes the
+/// cancel arm rather than observing the store it was walking disappear and
+/// reporting that as a degradation. Nothing joins the worker, so it may outlive
+/// the flush by a poll — it just cannot report anything once cancelled.
 ///
 /// Coalescing re-runs rather than drops. Each pass re-derives the advertised
 /// set once, at its start, so a lag observed mid-walk concerns commits that
 /// snapshot cannot contain; skipping it would strand exactly the blobs the
-/// sweep exists to recover. A request is therefore never lost: it either
-/// starts a worker or moves the slot to `SWEEP_QUEUED`, and the running
-/// worker's release is a compare-exchange that fails if a request landed
-/// first.
+/// sweep exists to recover. A request therefore survives every ordinary
+/// outcome: it either starts a worker or moves the slot to `SWEEP_QUEUED`, and
+/// the running worker's release is a compare-exchange that fails if a request
+/// landed first.
+///
+/// Two paths discard a queued request instead of running it. Shutdown does so
+/// deliberately — the next boot re-seeds. A panic inside the walk does so
+/// because `SweepSlotGuard` can only release the slot, not resume it, and the
+/// unwinding worker has nothing left to run the pass with; those commits then
+/// wait for a later lag or a restart. The guard still prefers that to the
+/// alternative it exists for, a stranded slot that disables every later sweep
+/// for the process lifetime.
 fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     use std::sync::atomic::Ordering;
     loop {
@@ -520,6 +618,7 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
                     )
                     .is_ok()
                 {
+                    slot.metrics.dht_republish_lag_sweep_coalesced();
                     tracing::debug!(
                         "dht republish: lag sweep already running; queued a further pass"
                     );
@@ -529,6 +628,7 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
             // Already queued — one further pass covers this lag too, because
             // that pass has not taken its snapshot yet.
             Err(SWEEP_QUEUED) => {
+                slot.metrics.dht_republish_lag_sweep_coalesced();
                 tracing::debug!("dht republish: lag sweep already queued");
                 return;
             }
@@ -541,18 +641,32 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     let scheduler = Arc::clone(slot.scheduler);
     let metrics = Arc::clone(slot.metrics);
     let state = Arc::clone(slot.state);
+    let shutdown = slot.shutdown.clone();
     let relay_foreign_namespaces = slot.relay_foreign_namespaces;
     tokio::spawn(async move {
-        // RAII for the panic path: a panic inside the walk (iroh-blobs is
-        // outside the workspace anti-panic lints) would otherwise strand the
-        // slot and disable every later sweep for the process lifetime, while
+        // RAII for the two paths that leave without a successful release CAS:
+        // shutdown, and a panic inside the walk (iroh-blobs is outside the
+        // workspace anti-panic lints). Either would otherwise strand the slot and
+        // disable every later sweep for the process lifetime, while
         // `lag_sweeps_total` kept climbing — a wedge that reads as health.
         let mut guard = SweepSlotGuard {
             state: &state,
             armed: true,
         };
         loop {
-            let outcome = lag_sweep(&cache, relay_foreign_namespaces, &scheduler, &metrics).await;
+            let outcome = tokio::select! {
+                biased;
+                // Shutdown wins: the store is about to be flushed and closed,
+                // so a walk that continues here reports its own teardown as a
+                // store-walk failure. The slot guard releases on the way out.
+                () = shutdown.cancelled() => {
+                    tracing::debug!(
+                        "dht republish: shutdown during a lag sweep; abandoning the walk"
+                    );
+                    return;
+                }
+                outcome = lag_sweep(&cache, relay_foreign_namespaces, &scheduler, &metrics) => outcome,
+            };
             tracing::info!(
                 reseeded = outcome.reseeded,
                 degraded = outcome.degraded,
@@ -579,11 +693,17 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     });
 }
 
-/// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from/// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
+/// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
 /// the cache, drives the scheduler heap, and fans out `Store` requests
-/// to the K+3 closest peers per due hash. Exits on `stop_rx`, or on a
+/// to the K+3 closest peers per due hash. Exits on `stop`, or on a
 /// closed cache subscribe channel — which this task's own `CacheEngine`
 /// clone makes unreachable in practice.
+///
+/// `stop` is owned by the runtime, which cancels it before flushing the cache
+/// store. That ordering is what a detached lag sweep needs: the sweep selects
+/// against this same token, so its walk is abandoned ahead of the flush rather
+/// than on whatever tick this task next happens to be polled — a signal this
+/// task had to forward would give no such guarantee.
 ///
 /// Returns on shutdown so the runtime's `JoinSet` can drain it.
 //
@@ -600,7 +720,7 @@ pub async fn run_republish(
     relay_foreign_namespaces: bool,
     metrics: Arc<crate::metrics::Metrics>,
     mut cache_inserts: broadcast::Receiver<iroh_blobs::Hash>,
-    mut stop_rx: oneshot::Receiver<()>,
+    stop: CancellationToken,
 ) {
     let self_node_id = NodeId::from_bytes(*self_id.as_bytes());
     // One sweep at a time, with a queued re-run rather than a dropped request.
@@ -618,7 +738,7 @@ pub async fn run_republish(
     loop {
         tokio::select! {
             biased;
-            _ = &mut stop_rx => {
+            () = stop.cancelled() => {
                 tracing::debug!("dht republish: shutdown signal received");
                 return;
             }
@@ -656,6 +776,7 @@ pub async fn run_republish(
                             cache: &cache,
                             scheduler: &scheduler,
                             metrics: &metrics,
+                            shutdown: &stop,
                             relay_foreign_namespaces,
                         });
                     }
@@ -749,7 +870,7 @@ async fn publish_hash(
     routing: &Arc<Mutex<RoutingTable>>,
     hash: ContentHash,
 ) {
-    let targets: Vec<NodeId> = if let Ok(table) = routing.lock() {
+    let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
         // ADR 022 §STORE Flow line 128 specifies K+3 (= 23) closest
         // nodes — the three positions beyond K are overflow targets
         // so an attacker suppressing receivers has to take down K+3
@@ -758,10 +879,7 @@ async fn publish_hash(
         // `closest_unbounded` returns up to `n` peers regardless of
         // the wire cap.
         table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
-    } else {
-        tracing::error!("dht republish: routing-table mutex poisoned");
-        return;
-    };
+    });
     if targets.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
@@ -840,13 +958,9 @@ async fn publish_batch(
     routing: &Arc<Mutex<RoutingTable>>,
     hashes: &[ContentHash],
 ) {
-    let groups = {
-        let Ok(table) = routing.lock() else {
-            tracing::error!("dht republish: routing-table mutex poisoned");
-            return;
-        };
-        group_by_receiver(&table, hashes)
-    };
+    let groups = with_lock(routing, "dht routing table", |table| {
+        group_by_receiver(table, hashes)
+    });
     if groups.is_empty() {
         // No routing-table entries yet (e.g. boot before bootstrap).
         // Nothing to do this cycle; the scheduler will retry.
@@ -1039,8 +1153,31 @@ mod tests {
     struct StubOrigin {
         data: bytes::Bytes,
         hash: decdn_cache::Hash,
+        axes: StubAxes,
+    }
+
+    /// The four axes real backends differ on, as one value so a constructor
+    /// cannot set three of them and forget the fourth.
+    ///
+    /// Four independent booleans is what the fixture is: each axis is a distinct
+    /// thing a real backend does or does not do, and every combination models a
+    /// backend that exists. `Default` is "holds nothing, lists nothing, fails
+    /// nothing", so each constructor names only what it varies.
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct StubAxes {
+        /// `enumerate` lists the blob, which is what puts it in the origin-held
+        /// index.
         enumerable: bool,
+        /// `size` confirms the blob — the ownership test.
         answers_size: bool,
+        /// `size` returns a transport error instead of an answer, because a
+        /// backend that is merely unreachable must not read as one that does not
+        /// hold the object.
+        faults_size: bool,
+        /// `enumerate` fails, so the rescan gets no candidates from this origin
+        /// at all — the coarser half of the same outage.
+        faults_enumerate: bool,
     }
 
     impl decdn_cache::Origin for StubOrigin {
@@ -1073,7 +1210,14 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
         > {
-            let n = (self.answers_size && hash == self.hash)
+            if self.axes.faults_size {
+                return Box::pin(async {
+                    Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
+                        "synthetic HEAD outage"
+                    )))
+                });
+            }
+            let n = (self.axes.answers_size && hash == self.hash)
                 .then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
             Box::pin(async move { Ok(n) })
         }
@@ -1087,7 +1231,14 @@ mod tests {
                     + '_,
             >,
         > {
-            let out = if self.enumerable {
+            if self.axes.faults_enumerate {
+                return Box::pin(async {
+                    Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
+                        "synthetic listing outage"
+                    )))
+                });
+            }
+            let out = if self.axes.enumerable {
                 vec![self.hash]
             } else {
                 Vec::new()
@@ -1102,8 +1253,11 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable,
-            answers_size: enumerable,
+            axes: StubAxes {
+                enumerable,
+                answers_size: enumerable,
+                ..StubAxes::default()
+            },
         })
     }
 
@@ -1114,8 +1268,39 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable: false,
-            answers_size: true,
+            axes: StubAxes {
+                answers_size: true,
+                ..StubAxes::default()
+            },
+        })
+    }
+
+    /// An origin that cannot be listed and cannot answer `size` — a backend that
+    /// has gone away entirely, so the rescan reports both of its legs.
+    fn enumerating_faulting_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+        Arc::new(StubOrigin {
+            data: bytes::Bytes::from_static(payload),
+            hash: decdn_cache::Hash::new(payload),
+            axes: StubAxes {
+                enumerable: true,
+                answers_size: true,
+                faults_size: true,
+                faults_enumerate: true,
+            },
+        })
+    }
+
+    /// A remote-shaped origin that has gone unreachable: `size` returns a
+    /// transport error, so the ownership test can neither confirm nor deny.
+    fn faulting_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+        Arc::new(StubOrigin {
+            data: bytes::Bytes::from_static(payload),
+            hash: decdn_cache::Hash::new(payload),
+            axes: StubAxes {
+                answers_size: true,
+                faults_size: true,
+                ..StubAxes::default()
+            },
         })
     }
 
@@ -1125,8 +1310,7 @@ mod tests {
         Arc::new(StubOrigin {
             data: bytes::Bytes::from_static(payload),
             hash: decdn_cache::Hash::new(payload),
-            enumerable: false,
-            answers_size: false,
+            axes: StubAxes::default(),
         })
     }
 
@@ -1233,7 +1417,7 @@ mod tests {
         // enumerate, and neither is pinned. Without the ownership probe the
         // snapshot would be empty.
         assert!(
-            cache.origin_held_hashes().is_empty(),
+            cache.origin_held_snapshot().hashes.is_empty(),
             "fixture precondition: nothing is enumerable or pinned"
         );
 
@@ -1246,6 +1430,88 @@ mod tests {
         assert!(
             !snap.hashes.contains(&theirs),
             "relayed content is not this node's to announce"
+        );
+        Ok(())
+    }
+
+    /// An ownership probe that faults must be reported, not silently skipped.
+    ///
+    /// Under the origin-only policy every stored hash is put to the origin to
+    /// decide whether it is this node's to announce. A transport blip answers
+    /// neither way, and admitting it would advertise content the serve gate
+    /// might then refuse — so the hash is left out. Left out and unreported, an
+    /// unreachable remote origin silently shrinks the announce set of a node
+    /// that holds the content, which is the same failure the rescan half fixes.
+    #[tokio::test]
+    async fn holder_snapshot_reports_a_faulted_ownership_probe() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let unreachable = decdn_cache::Hash::new(b"policy-probe-fault");
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![faulting_stub_origin(b"policy-probe-fault")],
+            16,
+        )
+        .await?;
+        cache.get(unreachable).await?;
+
+        let snap = holder_snapshot(&cache, false).await;
+
+        assert!(
+            !snap.hashes.contains(&unreachable),
+            "a fault is not a confirmation; announcing on one risks advertising \
+             content the serve gate refuses"
+        );
+        assert_eq!(
+            snap.ownership_probe_faults, 1,
+            "the skipped hash must be reported, or the snapshot reads healthy \
+             while the node holds content it does not announce"
+        );
+
+        // The sweep's completion line must name it as degraded, same as a
+        // store-walk failure.
+        let scheduler = RepublishScheduler::new();
+        let metrics = crate::metrics::Metrics::new();
+        let outcome = lag_sweep(&cache, false, &scheduler, &metrics).await;
+        assert!(
+            outcome.degraded,
+            "a sweep that could not resolve everything it holds is degraded"
+        );
+        Ok(())
+    }
+
+    /// The rescan's own unresolved counts must reach the seed, not just the
+    /// walk's.
+    ///
+    /// `holder_snapshot` seeds both counters from the cache's report and then
+    /// adds its own ownership-probe faults on top. Without this, replacing
+    /// either initializer with a literal `0` passes every other test while
+    /// silently disabling the rescan half of the degradation signal end to end —
+    /// including the cold-start warn and `SweepOutcome::degraded`.
+    #[tokio::test]
+    async fn holder_snapshot_carries_the_rescans_own_failures() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        // Enumerable, so the rescan asks about it — and faulting, so it cannot
+        // answer. The listing itself fails too, which is the other leg.
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![enumerating_faulting_stub_origin(b"rescan-wiring")],
+            16,
+        )
+        .await?;
+        cache.rescan_origins().await;
+
+        let snap = holder_snapshot(&cache, true).await;
+        assert_eq!(
+            snap.rescan_enumerate_failures, 1,
+            "the rescan's failed listing must reach the seed"
+        );
+
+        let scheduler = RepublishScheduler::new();
+        let metrics = crate::metrics::Metrics::new();
+        let outcome = lag_sweep(&cache, true, &scheduler, &metrics).await;
+        assert!(
+            outcome.degraded,
+            "a seed built on a rescan that could not list its origin is degraded"
         );
         Ok(())
     }
@@ -1406,6 +1672,124 @@ mod tests {
         Ok(())
     }
 
+    /// A lag that lands while a sweep owns the slot folds into that sweep and
+    /// bumps the coalesced sibling, so `lag_sweeps_total` stays readable: the
+    /// difference between the two is the number of lags that claimed an idle
+    /// slot. Not the number of walks — a folded lag earns the running worker a
+    /// further pass, which the difference never counts.
+    ///
+    /// Drives the slot protocol directly with the state pre-claimed. A
+    /// concurrency-observing variant would have to win a race against a real
+    /// worker's store walk to assert the same two arms.
+    #[tokio::test]
+    async fn a_lag_arriving_mid_sweep_coalesces_and_counts() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir()?;
+        let held = decdn_cache::Hash::new(b"coalesce");
+        let cache =
+            decdn_cache::CacheEngine::open(tmp.path(), vec![foreign_stub_origin(b"coalesce")], 16)
+                .await?;
+        // Commit a blob, so "no walk happened" is distinguishable from "a walk
+        // happened and found nothing".
+        cache.get(held).await?;
+        let scheduler = Arc::new(RepublishScheduler::new());
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        // Pre-claimed: stand in for a worker mid-walk without racing one.
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(SWEEP_RUNNING));
+        let shutdown = CancellationToken::new();
+        let slot = SweepSlot {
+            state: &state,
+            cache: &cache,
+            scheduler: &scheduler,
+            metrics: &metrics,
+            shutdown: &shutdown,
+            relay_foreign_namespaces: true,
+        };
+
+        // First lag: claims the queue slot behind the running worker.
+        spawn_lag_sweep(&slot);
+        assert_eq!(state.load(Ordering::Acquire), SWEEP_QUEUED);
+        // Second lag: the queued pass already covers it.
+        spawn_lag_sweep(&slot);
+        assert_eq!(state.load(Ordering::Acquire), SWEEP_QUEUED);
+
+        let text = metrics.encode()?;
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_dht_republish_lag_sweeps_coalesced_total 2"),
+            "both folded lags must count, so a slot that never releases is \
+             visible as a coalesced rate tracking the lag rate:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_dht_republish_sweep_reseeded_total 0"),
+            "coalescing must not walk the store:\n{text}"
+        );
+        Ok(())
+    }
+
+    /// A sweep must abandon its walk once shutdown starts.
+    ///
+    /// The runtime signals the republisher and then flushes and closes the
+    /// cache store. A walk that keeps going sees the store disappear, takes the
+    /// store-walk failure arm, and fires an alertable counter plus a
+    /// degradation warning on an ordinary restart.
+    #[tokio::test]
+    async fn a_sweep_abandons_its_walk_once_shutdown_starts() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir()?;
+        let held = decdn_cache::Hash::new(b"shutdown-sweep");
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![foreign_stub_origin(b"shutdown-sweep")],
+            16,
+        )
+        .await?;
+        cache.get(held).await?;
+
+        let scheduler = Arc::new(RepublishScheduler::new());
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(SWEEP_IDLE));
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        spawn_lag_sweep(&SweepSlot {
+            state: &state,
+            cache: &cache,
+            scheduler: &scheduler,
+            metrics: &metrics,
+            shutdown: &shutdown,
+            relay_foreign_namespaces: true,
+        });
+
+        // The worker is detached; poll for its guard releasing the slot.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if state.load(Ordering::Acquire) == SWEEP_IDLE {
+                break;
+            }
+        }
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            SWEEP_IDLE,
+            "the slot guard must release on the cancellation path"
+        );
+        assert_eq!(
+            scheduler.len(),
+            0,
+            "a cancelled sweep must not have walked the store"
+        );
+        let text = metrics.encode()?;
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_dht_republish_seed_store_walk_failures_total 0"),
+            "a shutdown is not a store-walk degradation:\n{text}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn superseded_entry_does_not_drain_twice() {
         // The sweep-vs-eager and sweep-vs-tick races both end in this shape:
@@ -1493,6 +1877,37 @@ mod tests {
             let j = jitter_us(STEADY_STATE_MIN, STEADY_STATE_MAX);
             assert!((lo..=hi).contains(&j), "offset {j} outside [{lo}, {hi}]");
         }
+    }
+
+    /// A panic under either scheduler guard poisons a sticky `Mutex`. The
+    /// scheduler must keep scheduling and draining afterwards: an inert
+    /// scheduler stops advertising every hash the node holds while every
+    /// liveness signal stays green.
+    #[test]
+    fn a_poisoned_lock_does_not_wedge_the_scheduler() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let s = RepublishScheduler::new();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _heap = s.heap.lock().unwrap();
+            let _scheduled = s.scheduled.lock().unwrap();
+            panic!("poison both scheduler locks while holding the guards");
+        }));
+        assert!(poisoned.is_err());
+        assert!(s.heap.is_poisoned());
+        assert!(s.scheduled.is_poisoned());
+
+        // Schedule in the past so the drain is deterministic.
+        s.schedule_with_offset(h(1), 0);
+        assert_eq!(s.len(), 1);
+        assert!(!s.is_empty());
+        assert_eq!(s.drain_due(now_us().saturating_add(1)), vec![h(1)]);
+        assert_eq!(s.len(), 0);
+
+        // Unschedule still reaches the map through the poisoned guard.
+        s.schedule_with_offset(h(2), 0);
+        s.unschedule(&h(2));
+        assert!(s.drain_due(now_us().saturating_add(1)).is_empty());
     }
 
     #[test]

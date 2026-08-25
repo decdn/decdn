@@ -26,7 +26,7 @@ use anyhow::Result;
 use decdn_incentive::payment_pool::PaymentPool;
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
-use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::rate_bounds::RateBounds;
 
 /// Projection sink for `RateBoundsUpdated`: decodes each event into the shared
@@ -131,6 +131,16 @@ impl<P: Provider + Clone + 'static> LogSink for RateBoundsSink<P> {
             }
         }
         Ok(())
+    }
+
+    /// Force the safety-net re-read on the tick the watcher recovers.
+    ///
+    /// [`Self::on_tick_complete`] stamps its clock before the call, so an outage
+    /// spanning a due poll defers the re-read a further `poll_interval` — hours,
+    /// at the default. The floor the node enforces at settlement meanwhile stays
+    /// whatever it was before the outage.
+    fn on_recovered(&mut self) {
+        clear_cadence_on_recovery(&mut self.last_poll, self.poll_interval);
     }
 }
 

@@ -27,6 +27,7 @@
 //!   re-read).
 
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 use alloy::rpc::types::Log;
 use anyhow::{Context, Result};
@@ -215,6 +216,77 @@ pub(crate) trait LogSink: Send {
     /// Default: no-op.
     fn on_tick_complete(&mut self) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
+    }
+
+    /// Run on the tick a route recovers from an errored one, before that tick's
+    /// [`Self::on_tick_complete`]. The seam for forcing an authoritative re-read
+    /// after an outage rather than waiting out a cadence: a sink whose reconcile
+    /// is cadence-gated clears its own clock here, and its next
+    /// `on_tick_complete` — the one on this same tick — re-reads.
+    ///
+    /// A cadence is not equivalent. The reconcile does not run at all while the
+    /// route is errored, and a reconcile whose own read failed defers itself a
+    /// further interval, so after a long RPC outage the first repair is whatever
+    /// cadence tick happens to land after recovery, with no relationship to when
+    /// the watcher came back.
+    ///
+    /// Sync and infallible on purpose: it exists to clear local state, and a
+    /// failure here has nowhere useful to go — the reconcile that follows on
+    /// this same tick is what does the work, and reports its own outcome.
+    ///
+    /// A sink whose `on_tick_complete` is cadence-gated wants
+    /// [`clear_cadence_on_recovery`] here. Default: no-op, for a sink whose
+    /// reconcile runs every tick and so has no clock to clear.
+    fn on_recovered(&mut self) {}
+}
+
+/// Divisor turning a sink's own reconcile cadence into the minimum age its last
+/// reconcile must have before a watcher recovery forces another.
+///
+/// A recovery edge fires whenever a route comes back from an errored tick, and
+/// an endpoint that flaps rather than staying down produces one on roughly the
+/// backoff interval. Without a floor each flap costs a full authoritative
+/// re-read aimed at an endpoint that is already failing. Fifteen keeps the
+/// forced repair an order of magnitude faster than the cadence — which is the
+/// entire point of the edge — while bounding what a flap can cost.
+const RECOVERY_FLOOR_DIVISOR: u32 = 15;
+
+/// Clear a cadence clock so the reconcile on this same tick re-reads, unless it
+/// already read within `interval / RECOVERY_FLOOR_DIVISOR`.
+///
+/// The idiom for [`LogSink::on_recovered`] in a sink whose `on_tick_complete`
+/// re-reads authoritative state on a cadence. Such a sink is at its most stale
+/// exactly when a route recovers: the reconcile is skipped entirely while the
+/// route is errored, so the cadence repair has not been running, and a reconcile
+/// whose own read then failed stamped the clock anyway and deferred a further
+/// interval.
+pub(crate) fn clear_cadence_on_recovery<C: CadenceClock>(
+    clock: &mut Option<C>,
+    interval: Duration,
+) {
+    let floor = interval / RECOVERY_FLOOR_DIVISOR;
+    if clock.is_none_or(|last| last.elapsed() >= floor) {
+        *clock = None;
+    }
+}
+
+/// The instant types a sink stamps its cadence clock with. Sinks differ —
+/// `blacklist_watcher` runs on `tokio::time` so its tests can pause the clock —
+/// and [`clear_cadence_on_recovery`] only ever asks one question of either.
+pub(crate) trait CadenceClock: Copy {
+    /// Time since this instant was taken.
+    fn elapsed(self) -> Duration;
+}
+
+impl CadenceClock for Instant {
+    fn elapsed(self) -> Duration {
+        Instant::elapsed(&self)
+    }
+}
+
+impl CadenceClock for tokio::time::Instant {
+    fn elapsed(self) -> Duration {
+        tokio::time::Instant::elapsed(&self)
     }
 }
 

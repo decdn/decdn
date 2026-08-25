@@ -86,9 +86,8 @@ use super::{backfill_windows, timed};
 #[async_trait]
 pub(crate) trait ErasedSink: Send {
     async fn apply(&mut self, log: Log) -> Result<()>;
-    async fn on_tick_complete(&mut self) -> Result<()> {
-        Ok(())
-    }
+    async fn on_tick_complete(&mut self) -> Result<()>;
+    fn on_recovered(&mut self);
 }
 
 #[async_trait]
@@ -98,6 +97,9 @@ impl<S: LogSink> ErasedSink for S {
     }
     async fn on_tick_complete(&mut self) -> Result<()> {
         LogSink::on_tick_complete(self).await
+    }
+    fn on_recovered(&mut self) {
+        LogSink::on_recovered(self);
     }
 }
 
@@ -198,6 +200,17 @@ struct RouteState {
     errored: bool,
     /// First-cycle edge tracking for `on_established`.
     established: bool,
+    /// Set when this route — or the tick as a whole, via `fail_whole_tick` —
+    /// errored on an earlier tick and has not yet been told it recovered;
+    /// consumed by `notify_recovered_routes` on the first tick it comes back
+    /// clean.
+    ///
+    /// Not derived from `!established`: that is also true on the first-ever
+    /// tick, and a sink whose reconcile just ran at bootstrap would then be
+    /// asked to re-read immediately. The condition this records is "errored at
+    /// least once", which a shared-read failure on the very first tick does
+    /// satisfy — that route then gets one redundant re-read, which is safe.
+    recovering: bool,
 }
 
 /// Poller configuration, its resolved routes, and the demux index built once
@@ -348,6 +361,7 @@ impl MultiplexedPollerBuilder {
                 tick_floor: 0,
                 errored: false,
                 established: false,
+                recovering: false,
             });
         }
 
@@ -388,6 +402,7 @@ fn fail_whole_tick(
     }
     for r in &mut poller.routes {
         r.established = false;
+        r.recovering = true;
     }
     err
 }
@@ -517,6 +532,40 @@ async fn reconcile_routes(poller: &mut MultiplexedPoller) {
     }
 }
 
+/// Tell every route that just came back from an errored tick, before the
+/// reconcile below acts on it.
+///
+/// Ordering is the point: a sink whose reconcile is cadence-gated clears its
+/// clock here and re-reads on this same tick's `on_tick_complete`. Firing from
+/// [`fire_route_hooks`], which runs after the reconcile, would delay that repair
+/// a full tick. Suppressed once shutdown is cancelled, mirroring the established
+/// edge — there is no point forcing a re-read the process is about to abandon.
+fn notify_recovered_routes(poller: &mut MultiplexedPoller, shutdown: &CancellationToken) {
+    if shutdown.is_cancelled() {
+        return;
+    }
+    for r in &mut poller.routes {
+        if r.errored || !r.recovering {
+            continue;
+        }
+        let Some(sink) = r.sink.as_erased_mut() else {
+            // Unreachable in production; see the matching branch in
+            // `demux_window_logs`. The edge is deliberately NOT consumed here —
+            // clearing it would lose the recovery notification for the whole
+            // outage rather than for one tick.
+            debug_assert!(
+                false,
+                "route {} has an unresolved SinkSource::Factory at recovery time; \
+                 spawn() must resolve every factory before run()",
+                r.label
+            );
+            continue;
+        };
+        r.recovering = false;
+        sink.on_recovered();
+    }
+}
+
 /// Fire per-route hooks for this tick's outcome and report whether any route
 /// errored (the caller fails the tick on `true`, driving the loop's backoff).
 fn fire_route_hooks(poller: &mut MultiplexedPoller, shutdown: &CancellationToken) -> bool {
@@ -527,6 +576,7 @@ fn fire_route_hooks(poller: &mut MultiplexedPoller, shutdown: &CancellationToken
                 fire(r.on_backoff.as_ref());
             }
             r.established = false;
+            r.recovering = true;
         } else {
             // Liveness stamps on every successful tick, including idle ones —
             // a wedged/panicked/exited task is detectable by staleness.
@@ -591,6 +641,7 @@ async fn run_tick<P: Provider + Clone>(
         }
     }
 
+    notify_recovered_routes(poller, shutdown);
     reconcile_routes(poller).await;
     if fire_route_hooks(poller, shutdown) {
         anyhow::bail!("one or more routes errored this tick"); // drives the loop's backoff sleep
@@ -746,6 +797,10 @@ mod tests {
         fail_apply_on: Option<usize>,
         fail_tick_complete: bool,
         tick_completes: usize,
+        /// One entry per `on_recovered`, holding `tick_completes` as it stood at
+        /// that moment — so a test can pin the ordering against the reconcile,
+        /// not just the count.
+        recovered_at: Vec<usize>,
     }
 
     impl LogSink for ScriptedSink {
@@ -764,6 +819,10 @@ mod tests {
                 anyhow::bail!("scripted reconcile failure");
             }
             Ok(())
+        }
+
+        fn on_recovered(&mut self) {
+            self.recovered_at.push(self.tick_completes);
         }
     }
 
@@ -843,6 +902,15 @@ mod tests {
             }
             Ok(())
         }
+
+        fn on_recovered(&mut self) {
+            let mut guard = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seen = guard.tick_completes;
+            guard.recovered_at.push(seen);
+        }
     }
 
     fn seeded_route(
@@ -900,6 +968,17 @@ mod tests {
         assert_eq!(
             guard.tick_completes, 1,
             "on_tick_complete must forward through the blanket impl"
+        );
+        drop(guard);
+
+        erased.on_recovered();
+        let guard = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            guard.recovered_at.len(),
+            1,
+            "on_recovered must forward through the blanket impl"
         );
     }
 
@@ -1163,6 +1242,165 @@ mod tests {
                 .len(),
             1,
             "route B does not re-apply — its floor already covers this range"
+        );
+    }
+
+    /// A shared-read failure arms the recovery edge for every route.
+    ///
+    /// `fail_whole_tick` returns before `notify_recovered_routes` and
+    /// `fire_route_hooks` ever run, so it is the *only* place the edge is armed
+    /// for a whole-RPC outage — the most common real one, and the one a
+    /// cadence-gated sink most needs the forced re-read after. Nothing else
+    /// covers this leg: a per-route apply failure takes an entirely different
+    /// path through `fire_route_hooks`.
+    #[tokio::test]
+    async fn a_whole_tick_failure_arms_the_recovery_edge_for_every_route() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let (route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
+        let (route_b, sink_b) = head_route("b", ADDR_B, TOPIC_B);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .route(route_a)
+                .route(route_b)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // Tick 1: the shared head read fails, so no route errored individually.
+        asserter.push_failure_msg("head is down");
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_err(), "a head-read failure must fail the tick");
+
+        // Tick 2: the RPC is back.
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&Vec::<Log>::new());
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "recovery tick should complete: {result:?}");
+
+        for (label, sink) in [("a", &sink_a), ("b", &sink_b)] {
+            let guard = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                guard.recovered_at.len(),
+                1,
+                "route {label} must be told it recovered from a whole-tick failure, \
+                 or a cadence-gated sink waits out its full interval after the \
+                 outage that made it stale"
+            );
+            assert_eq!(
+                guard.recovered_at.first().copied(),
+                Some(0),
+                "route {label}'s recovery must land before that tick's reconcile"
+            );
+        }
+    }
+
+    /// A route that recovers must be told, on the recovery tick and before that
+    /// tick's reconcile.
+    ///
+    /// A sink whose authoritative re-read is cadence-gated repairs itself here.
+    /// The cadence alone is at its weakest in exactly this scenario: the
+    /// reconcile is skipped while the route is errored, so the repair does not
+    /// run during the outage at all, and a repair whose own read then fails
+    /// defers itself a further interval. A route that never errored must not be
+    /// told it recovered — its bootstrap read just ran.
+    #[tokio::test]
+    async fn a_recovered_route_is_notified_before_its_reconcile() {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let (route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
+        let (route_b, sink_b) = head_route("b", ADDR_B, TOPIC_B);
+        sink_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_apply_on = Some(0);
+        let built =
+            MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
+                .max_backfill_span(10)
+                .route(route_a)
+                .route(route_b)
+                .build();
+        let Ok(mut poller) = assert_built(built) else {
+            return;
+        };
+
+        // Tick 1: A's apply errors, B is clean.
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&vec![
+            log_at(ADDR_A, TOPIC_A, 1),
+            log_at(ADDR_B, TOPIC_B, 1),
+        ]);
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_err(), "a route error must fail the tick");
+        assert!(
+            sink_a
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recovered_at
+                .is_empty(),
+            "an errored route has not recovered yet"
+        );
+
+        // Tick 2: A comes back.
+        sink_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fail_apply_on = None;
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&vec![
+            log_at(ADDR_A, TOPIC_A, 1),
+            log_at(ADDR_B, TOPIC_B, 1),
+        ]);
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "retry tick should complete: {result:?}");
+
+        {
+            let guard_a = sink_a
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                guard_a.recovered_at.len(),
+                1,
+                "the recovery edge fires exactly once"
+            );
+            // A's reconcile is skipped on the errored tick, so it has run once —
+            // this tick's — by the end. The recovery must have been seen before it.
+            assert_eq!(guard_a.tick_completes, 1);
+            assert_eq!(
+                guard_a.recovered_at.first().copied(),
+                Some(0),
+                "on_recovered must run before this tick's reconcile, so the sink can \
+                 force it to re-read now rather than a cadence later"
+            );
+        }
+
+        assert!(
+            sink_b
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recovered_at
+                .is_empty(),
+            "a route that never errored must not be told it recovered"
+        );
+
+        // Tick 3: A stays healthy, so the edge does not re-fire.
+        asserter.push_success(&U64::from(1));
+        asserter.push_success(&Vec::<Log>::new());
+        let result = run_tick(&provider, &mut poller, &no_shutdown()).await;
+        assert!(result.is_ok(), "third tick should complete: {result:?}");
+        assert_eq!(
+            sink_a
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recovered_at
+                .len(),
+            1,
+            "the edge is consumed, not re-fired on every healthy tick"
         );
     }
 

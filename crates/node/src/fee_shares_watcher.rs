@@ -26,7 +26,7 @@ use anyhow::Result;
 use decdn_incentive::payment_pool::FeeRouter;
 
 use crate::chain_events::multiplexed_poller::{Route, SinkSource};
-use crate::chain_events::resumable_watcher::{CursorStart, LogSink};
+use crate::chain_events::resumable_watcher::{CursorStart, LogSink, clear_cadence_on_recovery};
 use crate::fee_shares::{OperatorShares, operator_bps_from_shares};
 
 /// Projection sink for `SharesUpdated`: decodes each event into the shared
@@ -112,6 +112,16 @@ impl<P: Provider + Clone + 'static> LogSink for FeeSharesSink<P> {
             }
         }
         Ok(())
+    }
+
+    /// Force the safety-net re-read on the tick the watcher recovers.
+    ///
+    /// [`Self::on_tick_complete`] stamps its clock before the call, so an outage
+    /// spanning a due poll defers the re-read a further `poll_interval` — hours,
+    /// at the default. The node meanwhile prices its share of every settlement
+    /// off a split the chain may have moved.
+    fn on_recovered(&mut self) {
+        clear_cadence_on_recovery(&mut self.last_poll, self.poll_interval);
     }
 }
 
