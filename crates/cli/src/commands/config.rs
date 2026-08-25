@@ -1352,16 +1352,19 @@ mod tests {
         // Compare as raw TOML tables (headers literally present in the text),
         // not `FileConfig` fields — those are all-`Option` and always "absent"
         // here, which would pass vacuously if a daemon section were added.
+        // Set comparison, because key iteration order is a `toml` feature
+        // choice (sorted today, insertion-ordered under `preserve_order`).
         let value: toml::Value = toml::from_str(CLIENT_CONFIG).expect("client template is TOML");
-        let sections: Vec<String> = value
+        let sections: std::collections::BTreeSet<String> = value
             .as_table()
             .expect("client template is a TOML table")
             .keys()
             .cloned()
             .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["blockchain".to_string(), "identity".to_string()].into();
         assert_eq!(
-            sections,
-            ["blockchain", "identity"],
+            sections, expected,
             "client template must carry exactly [identity] + [blockchain]"
         );
     }
