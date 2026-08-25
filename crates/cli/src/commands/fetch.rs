@@ -874,6 +874,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             &args.output,
             targets.size_hint,
             Some(&on_progress),
+            // One fetch at a time: no cross-fetch pool opens to serialize.
+            None,
         )
         .await;
         bar.finish_and_clear();
@@ -1315,6 +1317,13 @@ fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> Endpoi
 /// seed a ledger from that lane's persisted cumulative, and wrap a [`PeerSource`]
 /// over it. Mirrors the single-source per-candidate construction in `fetch()`'s
 /// failover loop, hoisted so the whole admitted set is built up front.
+///
+/// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
+/// [`build_ctx_for_fetch`] against other fetches sharing the one on-chain pool
+/// (bundle pull's cross-entry concurrency, #1774); the guard is dropped before
+/// any streaming. Callers must already hold every provider lock for the fetch's
+/// admitted set, so the lock order stays provider-locks → `open_lock` and no
+/// hold-and-wait cycle can form.
 #[allow(clippy::too_many_arguments)]
 async fn build_multi_lane<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
@@ -1323,24 +1332,35 @@ async fn build_multi_lane<'a, P>(
     voucher_dom: &Eip712Domain,
     candidate: &NodeCandidate,
     relays: &[RelayUrl],
+    open_lock: Option<&tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<MultiLane<'a>>
 where
     P: alloy::providers::Provider + Clone,
 {
     let provider = candidate.eth_address;
-    let ctx = build_ctx_for_fetch(
-        grant,
-        deps.store,
-        deps.contract,
-        deps.rpc,
-        signer,
-        voucher_dom,
-        provider,
-        deps.self_address,
-        deps.chain,
-        deps.endpoint,
-    )
-    .await?;
+    let ctx = {
+        // Bundle pull funnels every entry — and every lane of a multi-source
+        // entry — through the one shared `PaymentPool` deposit, so the
+        // open-or-reuse serializes across the whole bundle. The delegated path
+        // opens nothing on-chain; taking the guard there is a harmless no-op.
+        let _open_guard = match open_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        build_ctx_for_fetch(
+            grant,
+            deps.store,
+            deps.contract,
+            deps.rpc,
+            signer,
+            voucher_dom,
+            provider,
+            deps.self_address,
+            deps.chain,
+            deps.endpoint,
+        )
+        .await?
+    };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
     // One ledger per lane, seeded from its persisted `(signer, provider)`
@@ -1386,6 +1406,11 @@ where
 /// on the one shared pool deposit, gated on the aggregate remaining so no lane
 /// over-draws it (ADR 039 § Payment model). On completion each lane's voucher
 /// watermark is persisted independently.
+///
+/// `open_lock` serializes every lane's pool open-or-reuse against other fetches
+/// drawing on the same on-chain pool: `bundle pull` runs many entries
+/// concurrently over ONE shared deposit, so it passes its bundle-wide lock;
+/// `decdn fetch` runs one fetch at a time and passes `None`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn try_multi_source_fetch<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -1399,6 +1424,7 @@ pub(crate) async fn try_multi_source_fetch<P>(
     output: &Path,
     size_hint: Option<u64>,
     progress: Option<&ProgressCallback>,
+    open_lock: Option<&tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
@@ -1446,7 +1472,16 @@ where
     // admitted holder — the same handshake `drive_fetch` performs (no voucher is
     // signed, so it pays nothing). This also opens/reuses that holder's pool,
     // which the lane built below reuses, so the probe is not wasted work.
-    let first = build_multi_lane(deps, grant, signer, voucher_dom, first_candidate, relays).await?;
+    let first = build_multi_lane(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        first_candidate,
+        relays,
+        open_lock,
+    )
+    .await?;
     let probe_target = multi_source_target(first_candidate, relays);
     let (header, first_pull) = {
         let ctx = first
@@ -1501,7 +1536,18 @@ where
     // Build the rest of the lanes (the first is already built + probed).
     let mut lanes = vec![first];
     for candidate in rest_candidates {
-        lanes.push(build_multi_lane(deps, grant, signer, voucher_dom, candidate, relays).await?);
+        lanes.push(
+            build_multi_lane(
+                deps,
+                grant,
+                signer,
+                voucher_dom,
+                candidate,
+                relays,
+                open_lock,
+            )
+            .await?,
+        );
     }
 
     // The `.partial` store beside `output`, keyed on `(hash, total_bytes)`; a

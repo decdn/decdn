@@ -161,7 +161,11 @@ as `decdn fetch`):
   use a strictly increasing cumulative amount, so fetches that share one provider's
   lane are serialized by a per-provider lock (which also makes the
   lazy open-or-reuse first-touch race-free); distinct providers proceed
-  in parallel.
+  in parallel. A blob that clears the multi-source gate fans out to its
+  admitted holders ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)):
+  the entry holds the locks for its whole
+  provider set, acquired in one global order (sorted by address), so two
+  entries with overlapping provider sets cannot deadlock.
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the
