@@ -21,7 +21,6 @@
 //! open-or-reuse call — the pool's on-chain state (deposit, allowance) is one
 //! shared resource now, regardless of which provider an entry is bound for.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -477,19 +476,20 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
 /// form. The nesting also matches the single-source path's provider-lock →
 /// `open_lock` order, so the two lock kinds cannot deadlock each other either.
 ///
-/// The map lives in a `RefCell`: `buffer_unordered` polls every entry future in
-/// one task, so no cross-thread sharing exists. The locks themselves are `Arc`
-/// because `OwnedMutexGuard` — which lets a multi-source entry carry its whole
-/// lock-set in one `Vec` — needs it.
+/// The map is a `tokio::sync::Mutex`: `LaneLocks` is `Sync` so `PullCtx` is
+/// `Sync` and safe to share across `tokio::spawn` if needed. The map guard is
+/// held only to `entry` + `clone` the `Arc`, never across a provider-lock
+/// await. The locks themselves are `Arc` because `OwnedMutexGuard` — which lets
+/// a multi-source entry carry its whole lock-set in one `Vec` — needs it.
 #[derive(Default)]
 struct LaneLocks {
-    map: RefCell<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>,
+    map: tokio::sync::Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LaneLocks {
     /// The per-provider lane lock, created on first use.
-    fn lock(&self, provider: Address) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.map.borrow_mut();
+    async fn lock(&self, provider: Address) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.map.lock().await;
         Arc::clone(
             map.entry(provider)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
@@ -504,15 +504,16 @@ impl LaneLocks {
         ordered.dedup();
         let mut guards = Vec::with_capacity(ordered.len());
         for provider in ordered {
-            guards.push(self.lock(provider).lock_owned().await);
+            guards.push(self.lock(provider).await.lock_owned().await);
         }
         guards
     }
 }
 
 /// Shared, by-reference state for the entry fetch loop. Borrowed by every
-/// in-flight entry future; single-task `buffer_unordered` means interior
-/// mutability (`RefCell`) is sufficient — no future is ever `tokio::spawn`ed.
+/// in-flight entry future. `LaneLocks` is `Sync` via `tokio::sync::Mutex`, so
+/// `PullCtx` is `Sync` and safe to share across `tokio::spawn` if needed;
+/// `buffer_unordered` currently polls in one task.
 struct PullCtx<'a, P: Provider + Clone> {
     endpoint: &'a Endpoint,
     store: &'a RedbBuyerPoolStore,
@@ -555,8 +556,8 @@ struct PullCtx<'a, P: Provider + Clone> {
 
 impl<P: Provider + Clone> PullCtx<'_, P> {
     /// The per-provider lane lock, created on first use.
-    fn provider_lock(&self, provider: Address) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks.lock(provider)
+    async fn provider_lock(&self, provider: Address) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks.lock(provider).await
     }
 
     /// Acquire the lane locks for every provider in `providers`, in one global
@@ -614,41 +615,52 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// pre-probe gate (kill switch, holder count, size-hint floor) runs BEFORE
     /// the lock-set: a fetch the gate declines never fans out, so taking the
     /// lanes would only block concurrent entries sharing those providers.
+    ///
+    /// Held across the whole streaming transfer (header probe + `multi_source_fetch`):
+    /// vouchers are cumulative per `(signer, provider)` lane and the ledger arms
+    /// the voucher before the ack, so releasing between intervals would race the
+    /// watermark. This intentionally serializes concurrent entries sharing any
+    /// provider for the full large-blob transfer — with `--jobs 3` and overlapping
+    /// provider sets parallelism degrades to serial. Narrowing to the
+    /// voucher-exchange critical section is future work if the ledger can be made
+    /// per-interval (see ADR 039).
     async fn try_multi_source(
         &self,
         order: &fetch::ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
     ) -> anyhow::Result<Option<()>> {
-        if fetch::multi_source_gate_declines(self.common, &order.candidates, order.size_hint) {
+        // Admission is computed once and reused for the gate, the lane-lock set,
+        // and the fan-out itself — `try_multi_source_fetch` would otherwise
+        // recompute the same `admit_sources` from `order.candidates`.
+        let admitted = discovery::admit_sources(order.candidates.clone(), self.common.max_sources);
+        if fetch::multi_source_gate_declines(
+            self.common,
+            &order.candidates,
+            &admitted,
+            order.size_hint,
+        ) {
             return Ok(None);
         }
-        // The same admission `try_multi_source_fetch` recomputes internally;
-        // computing it here too is what lets the entry lock its lanes BEFORE the
-        // fan-out starts (a lane that began streaming unlocked would race a
-        // concurrent same-lane entry's voucher watermark).
-        let providers: Vec<Address> =
-            discovery::admit_sources(order.candidates.clone(), self.common.max_sources)
-                .iter()
-                .map(|c| c.eth_address)
-                .collect();
+        let providers: Vec<Address> = admitted.iter().map(|c| c.eth_address).collect();
         let _guards = self.provider_lock_set(&providers).await;
 
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
         // No progress callback: per-entry byte bars would interleave illegibly
-        // across a manifest's many concurrent pulls (#1118).
-        fetch::try_multi_source_fetch(
+        // across a manifest's many concurrent pulls (#1118). The admitted set
+        // already computed for the gate and the lock is moved into the fan-out
+        // so `admit_sources` runs only once per entry.
+        fetch::try_multi_source_fetch_from_admitted(
             &deps,
             self.common,
             self.grant.as_ref(),
             self.signer,
             self.voucher_dom,
-            &order.candidates,
+            admitted,
             self.relays,
             hash,
             staging,
-            order.size_hint,
             None,
             Some(&self.open_lock),
         )
@@ -689,34 +701,32 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // Multi-source fan-out (ADR 039, #1774): the same pre-branch `decdn
         // fetch` runs. One entry engages N provider lanes at once, so it takes
         // the lane locks for its whole admitted set — in one global order, so
-        // two entries with overlapping sets cannot deadlock — then fans out. A
-        // declined gate (kill switch off, too few admissible holders, below the
-        // size floor) is decided BEFORE the locks are taken and falls through
-        // to the single-source failover loop below unchanged; a retryable
-        // fan-out failure does the same, resuming the entry's `.partial` so
-        // nothing paid for is re-bought.
-        if self.common.multi_source_enabled() {
-            match self.try_multi_source(&order, hash, staging).await {
-                Ok(Some(())) => return Ok(()),
-                Ok(None) => {}
-                Err(err)
-                    if retry_disposition(&err) == RetryDisposition::Terminal
-                        || err.downcast_ref::<PoolExhausted>().is_some() =>
-                {
-                    // On the delegated path reconnect a terminal exhaustion to
-                    // the owner remedy, same as the single-source path does.
-                    return Err(if self.grant.is_some() {
-                        fetch::annotate_delegated_exhaustion(err)
-                    } else {
-                        err
-                    });
-                }
-                Err(err) => {
-                    eprintln!(
-                        "bundle pull: multi-source fetch of an entry failed ({err:#}); falling \
-                         back to single-source failover over the same candidates"
-                    );
-                }
+        // two entries with overlapping sets cannot deadlock — then fans out. The
+        // engagement gate (kill switch off, too few admissible holders, below the
+        // size floor) is decided inside `try_multi_source` BEFORE the locks are
+        // taken and falls through to the single-source failover loop below
+        // unchanged; a retryable fan-out failure does the same, resuming the
+        // entry's `.partial` so nothing paid for is re-bought.
+        match self.try_multi_source(&order, hash, staging).await {
+            Ok(Some(())) => return Ok(()),
+            Ok(None) => {}
+            Err(err)
+                if retry_disposition(&err) == RetryDisposition::Terminal
+                    || err.downcast_ref::<PoolExhausted>().is_some() =>
+            {
+                // On the delegated path reconnect a terminal exhaustion to
+                // the owner remedy, same as the single-source path does.
+                return Err(if self.grant.is_some() {
+                    fetch::annotate_delegated_exhaustion(err)
+                } else {
+                    err
+                });
+            }
+            Err(err) => {
+                eprintln!(
+                    "bundle pull: multi-source fetch of an entry failed ({err:#}); falling \
+                     back to single-source failover over the same candidates"
+                );
             }
         }
 
@@ -754,7 +764,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ) -> anyhow::Result<()> {
         // Serialize all access to this provider's lane: the voucher-signing
         // critical section must be atomic per lane.
-        let lock = self.provider_lock(provider);
+        let lock = self.provider_lock(provider).await;
         let _guard = lock.lock().await;
 
         // Owned and local to one entry's fetch: `drive_fetch` takes `ctx` by
@@ -1261,19 +1271,19 @@ mod tests {
         let guards = locks.lock_set(&[p2, p1, p2]).await;
         assert_eq!(guards.len(), 2, "duplicate providers lock once");
         // Every named provider's lane is held; an un-named one is free.
-        assert!(locks.lock(p1).try_lock().is_err());
-        assert!(locks.lock(p2).try_lock().is_err());
-        assert!(locks.lock(p3).try_lock().is_ok());
+        assert!(locks.lock(p1).await.try_lock().is_err());
+        assert!(locks.lock(p2).await.try_lock().is_err());
+        assert!(locks.lock(p3).await.try_lock().is_ok());
         drop(guards);
-        assert!(locks.lock(p1).try_lock().is_ok());
-        assert!(locks.lock(p2).try_lock().is_ok());
+        assert!(locks.lock(p1).await.try_lock().is_ok());
+        assert!(locks.lock(p2).await.try_lock().is_ok());
     }
 
     #[tokio::test]
     async fn lane_lock_set_serializes_same_provider_across_entries() {
         let locks = LaneLocks::default();
         let p1 = addr(1);
-        let guard = locks.lock(p1).lock_owned().await;
+        let guard = locks.lock(p1).await.lock_owned().await;
         // A second entry's lock-set touching the same lane cannot complete
         // while the first holds it, and completes once it is released.
         let providers = [p1];
@@ -1326,6 +1336,40 @@ mod tests {
         })
         .await
         .expect("overlapping lock-sets must not deadlock");
+    }
+
+    #[tokio::test]
+    async fn lane_lock_set_opposite_orders_do_not_deadlock() {
+        // Classic hold-and-wait cycle: {P1,P2} vs {P2,P1} deadlocks with naive
+        // unordered acquisition; sorted global order (ADR 039) prevents it.
+        // Both entries sort to [P1,P2], so the second waits on P1 rather than
+        // holding P2 and waiting on P1.
+        let locks = LaneLocks::default();
+        let (p1, p2) = (addr(1), addr(2));
+        let held = tokio::sync::Notify::new();
+        let first_dropped = std::cell::Cell::new(false);
+
+        let first = async {
+            let guards = locks.lock_set(&[p1, p2]).await;
+            held.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(guards);
+            first_dropped.set(true);
+        };
+        let second = async {
+            held.notified().await;
+            let _guards = locks.lock_set(&[p2, p1]).await;
+            assert!(
+                first_dropped.get(),
+                "opposite-order lane was acquired before holder released it"
+            );
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            futures_util::future::join(first, second).await;
+        })
+        .await
+        .expect("opposite-order lock-sets must not deadlock");
     }
 
     #[test]
