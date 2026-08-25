@@ -26,13 +26,24 @@
 //!
 //! Each [`ReceiptLog::append`] writes one line and flushes it to the OS
 //! (`write_all` + `flush`) but does **not** fsync per record. The receipt log
-//! is an *audit* artifact, not the #527 voucher-replay guard — the durable
-//! anti-replay watermark is [`crate::channel_store::PersistentPoolStateStore`],
-//! which fsyncs every accepted voucher *before* a receipt is ever written. A
-//! crash that loses a not-yet-fsynced receipt tail therefore cannot reopen a
-//! replay window; at worst the audit log trails the lane store by a few
-//! entries. Skipping the per-line fsync keeps the cost off the hot delivery
-//! path at the testnet scale this targets (see CLAUDE.md / ADR 003).
+//! is an *audit* artifact, not the voucher-replay guard. That guard is the lane
+//! watermark in [`crate::channel_store::PersistentPoolStateStore`], which
+//! advances **in memory** the moment a voucher or preimage is accepted, reaches
+//! disk on the runtime's periodic lane flush
+//! (`payment.voucher_commit_interval_ms`, 5 s by default), and is additionally
+//! flushed unconditionally before any on-chain redemption.
+//!
+//! Neither side fsyncs on the delivery path, so after a hard crash the two
+//! tails can disagree in either direction. In particular the audit log can be
+//! **ahead** of the lane store: a receipt line reaches disk while the lane
+//! advance it records is still buffered, so a restart can find a receipt whose
+//! watermark the lane store no longer holds. That direction costs revenue, not
+//! safety — the node forfeits at most one flush interval of *frontier* (value
+//! it has not yet redeemed), which ADR 003 §Off-chain voucher state persistence
+//! accepts, while replay protection rests on the *redeemed* watermark that the
+//! mandatory pre-redemption flush floors. The other direction, a lost receipt
+//! tail, is a gap in the audit record and nothing more. Skipping the per-line
+//! fsync keeps the cost off the hot delivery path (see CLAUDE.md / ADR 003).
 //!
 //! The append is also crash-atomic at the line level only in the usual POSIX
 //! sense (a torn final line is possible after a hard crash); JSONL readers MUST
@@ -224,7 +235,7 @@ pub trait ReceiptLog: Send + Sync {
     ///
     /// Returns the underlying [`std::io::Error`] if serialization or the write
     /// fails. The caller treats a receipt-log failure as non-fatal (the payment
-    /// already committed to the fsynced lane store) and logs it.
+    /// already advanced the lane watermark) and logs it.
     fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()>;
 }
 
@@ -534,8 +545,9 @@ impl ReceiptLog for JsonlReceiptLog {
 /// A [`ReceiptLog`] that drops every receipt. Used as the runtime fallback when
 /// [`JsonlReceiptLog::open`] fails at bring-up: the audit log is best-effort, so
 /// the node serves paid delivery without it rather than refusing to start (the
-/// #527 replay guard lives in the separate, fsynced lane store). The
-/// operator gets one `error!` at startup naming the open failure.
+/// replay guard lives in the separate lane store, which the periodic flush and
+/// the pre-redemption flush make durable). The operator gets one `error!` at
+/// startup naming the open failure.
 #[derive(Debug, Default)]
 pub struct NoopReceiptLog;
 
@@ -549,10 +561,10 @@ impl ReceiptLog for NoopReceiptLog {
 /// hot path (#803).
 ///
 /// The voucher-accept path records a receipt through this seam as each voucher
-/// is durably accepted (acceptance is implicit — delivery simply continues), so
-/// the implementation MUST NOT block on disk I/O: a backed-up sink drops the
+/// is accepted (acceptance is implicit — delivery simply continues), so the
+/// implementation MUST NOT block on disk I/O: a backed-up sink drops the
 /// receipt (best-effort, audit-only) rather than stall the payment, which
-/// already committed to the fsynced lane store. The runtime
+/// already advanced the lane watermark. The runtime
 /// uses [`ChannelReceiptSink`] (hands off to the background
 /// [`spawn_receipt_writer`] task); tests use a synchronous fake behind
 /// [`DirectReceiptSink`].
@@ -569,7 +581,7 @@ pub trait ReceiptSink: Send + Sync {
 /// end-state of #802) is worked off, without ever back-pressuring paid
 /// delivery. On overflow the *audit* receipt is dropped (counted via
 /// [`Metrics::receipt_write_dropped`]) rather than the *payment* stalling — the
-/// payment already committed to the fsynced lane store. Rotation (#802)
+/// payment already advanced the lane watermark. Rotation (#802)
 /// bounds the log on disk; this bounds it in memory.
 pub const RECEIPT_LOG_CAPACITY: usize = 1024;
 
@@ -661,8 +673,8 @@ impl ReceiptSink for DirectReceiptSink {
 ///
 /// Decouples the audit write from the paid-delivery hot path (#803): the
 /// voucher-accept path does only a non-blocking [`ReceiptSink::record`] (a
-/// bounded `try_send`) as each voucher is durably accepted, while this task performs the actual
-/// `append` on the blocking pool. A slow or full disk can therefore only fill
+/// bounded `try_send`) as each voucher is accepted, while this task performs
+/// the actual `append` on the blocking pool. A slow or full disk can only fill
 /// the queue (and drop audit records, counted) — it can never delay delivery
 /// or serialize delivery on the receipt-log mutex. The writer is the *only*
 /// caller of [`ReceiptLog::append`], so the log's internal mutex sees no
@@ -718,8 +730,8 @@ async fn receipt_writer_loop(
 /// `write_all`/`flush` (and any disk stall under a full or slow `data_dir`)
 /// runs on the blocking pool, never on a runtime worker. The single writer
 /// awaits each append before the next, preserving receipt order. An append
-/// error is non-fatal — the payment already committed to the fsynced channel
-/// store — so it is logged at `warn` and the loop continues.
+/// error is non-fatal — the payment already advanced the lane watermark — so it
+/// is logged at `warn` and the loop continues.
 async fn append_one(log: &Arc<dyn ReceiptLog>, receipt: DownloadReceipt) {
     let log = Arc::clone(log);
     let join = tokio::task::spawn_blocking(move || {

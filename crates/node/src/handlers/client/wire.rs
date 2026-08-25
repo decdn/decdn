@@ -8,9 +8,9 @@ use super::{
 
 impl ClientHandler {
     /// Enqueue one audit receipt for a served-and-paid chunk (issues
-    /// #248, #803). Called only after `apply_voucher` committed the payment to
-    /// the fsynced channel store, so a dropped receipt is non-fatal — the
-    /// payment stands regardless.
+    /// #248, #803). Called only after the proof advanced the lane watermark in
+    /// memory, so a dropped receipt is non-fatal — the payment stands
+    /// regardless, and the periodic lane flush mirrors the watermark to disk.
     ///
     /// The receipt is handed to [`ReceiptSink::record`](super::ReceiptSink::record), a **non-blocking**
     /// enqueue: the actual `write_all` + `flush` runs off the hot path in the

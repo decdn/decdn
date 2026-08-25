@@ -991,10 +991,10 @@ pub struct ClientHandler {
     pool_min_remaining_deposit: U256,
     /// Non-blocking sink for the served-and-paid audit log (issues #248, #803).
     /// The voucher-accept path enqueues one receipt here as each voucher is
-    /// durably accepted; the actual disk write happens off the hot path in the
+    /// accepted; the actual disk write happens off the hot path in the
     /// background receipt writer, so receipt-log I/O can never back-pressure
     /// paid delivery. A dropped receipt (queue full) is non-fatal — the payment
-    /// already committed to the fsynced lane store.
+    /// already advanced the lane watermark.
     receipt_sink: Arc<dyn ReceiptSink>,
     /// Durable sink for owner-signed capability material (ADR 003 §Capability
     /// delegation), set at construction via [`ClientHandlerDeps`]. On a stream
@@ -1014,8 +1014,9 @@ pub struct ClientHandler {
     /// (ADR 003 §concurrent streams). No call site holds a map entry across an
     /// `.await`, so lane lookup never blocks an unrelated lane's admission.
     lanes: Arc<DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>>>,
-    /// Serializes absolute lane snapshots without holding the lane map while
-    /// individual lane state (which may be fsync-bound) is locked.
+    /// Serializes absolute lane snapshots without holding the lane map while an
+    /// individual lane's mutex (which the voucher path holds across its store
+    /// record) is locked.
     lane_metrics_refresh: Mutex<()>,
     /// Per-pool floor-credit accumulator (ADR 003 §Pool solvency). Guards an O(1)
     /// map only and is never held across `.await` — a plain `std::sync::Mutex`, so
@@ -1418,10 +1419,10 @@ impl ClientHandler {
     }
 
     /// Register a lane so the voucher path accepts vouchers for it — its
-    /// capability handle is registered on-chain and its [`LaneState`] persisted
-    /// durably, then inserted into the live map. Called both from the on-chain
-    /// capability-registration consumer (#327) and from the seller-side
-    /// capability intake on the first voucher of a new lane.
+    /// capability handle is registered on-chain and its [`LaneState`] recorded
+    /// in the lane store, then inserted into the live map. Called both from the
+    /// on-chain capability-registration consumer (#327) and from the
+    /// seller-side capability intake on the first voucher of a new lane.
     ///
     /// **Idempotent:** a re-observed registration for an already-tracked lane is
     /// a no-op — it MUST NOT reset the accepted-voucher watermark and reopen the
@@ -1430,15 +1431,17 @@ impl ClientHandler {
     ///
     /// # Errors
     ///
-    /// Propagates a [`StoreError`] if the durable persist fails; the caller
-    /// logs and retries.
+    /// Propagates a [`StoreError`] if the store record fails; the caller logs
+    /// and retries.
     pub async fn register_lane(&self, state: LaneState) -> Result<(), StoreError> {
         let key = state.key();
         if self.lanes.contains_key(&key) {
             return Ok(());
         }
-        // The store write is a synchronous fsync (store trait §Durability) —
-        // run it off the runtime worker, same as the voucher-accept path.
+        // `record` inserts into the store's buffered working set; the periodic
+        // lane flush is what puts the row on disk. `PoolStateStore` is a
+        // synchronous seam, so a runtime caller invokes it from the blocking
+        // pool — registration is off the delivery path and can afford the hop.
         let store = Arc::clone(&self.channel_state_store);
         let to_persist = state.clone();
         tokio::task::spawn_blocking(move || store.record(&to_persist))
@@ -1838,11 +1841,22 @@ impl ClientHandler {
 
     /// Snapshot the latest tracked [`LaneState`] for `key`, or `None` if this
     /// node does not track the lane. Used by the settlement watcher's
-    /// self-defense reaction (#1586) to read the node's latest persisted voucher
+    /// self-defense reaction to read the node's strongest accepted proof
     /// (amount / bytes / signature) when a counterparty redeems at a stale
-    /// watermark. Reads the in-memory row, which the voucher-accept path
-    /// advances only *after* the durable store write commits (#527), so the
-    /// snapshot never reports a voucher the node has not persisted.
+    /// watermark.
+    ///
+    /// Reads the in-memory row, which the voucher-accept path advances as it
+    /// verifies each proof — before the periodic lane flush mirrors that
+    /// advance to disk. The snapshot therefore reports the strongest proof this
+    /// process has verified and still holds the signature for, which is what
+    /// the self-defense reaction must submit; it is at least as strong as the
+    /// on-disk row and can lead it by up to one flush interval. It is not a
+    /// read of persisted state: a crash before the next flush drops the
+    /// un-mirrored advance, and the restarted node then snapshots the weaker
+    /// hydrated row. Losing frontier that way is safe (ADR 003 §Off-chain
+    /// voucher state persistence), and the redemption path flushes the store
+    /// durable before it submits, so what the node actually redeems is always
+    /// floored on disk.
     pub async fn lane_state_snapshot(&self, key: LaneKey) -> Option<LaneState> {
         let entry = self.lanes.get(&key).map(|e| Arc::clone(e.value()))?;
         let guard = entry.lock().await;
