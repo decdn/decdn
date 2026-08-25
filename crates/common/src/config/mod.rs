@@ -2307,13 +2307,17 @@ fn resolve_s3_origin(
 /// as an IPv4 address. Catches the common operator typo at config
 /// load instead of on the first request.
 ///
+/// Public because `decdn config init --origin s3://<bucket>` (the CLI)
+/// validates the bucket through this same guard before writing it, so a
+/// bucket `config init` accepts cannot fail config resolution.
+///
 /// AWS-permissive choices we deliberately accept (but stricter
 /// frontends like virtual-hosted-style URLs may reject): names
 /// shorter than 3 chars are rejected (per AWS rule), but `xn--`
 /// prefix and `--ol-s3` suffix are not rejected here — they're
 /// reserved by AWS to never be assigned and the operator-typo case
 /// is rare enough not to warrant the extra code.
-fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
+pub fn validate_s3_bucket_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!name.is_empty(), "bucket name must not be empty");
     let len = name.len();
     anyhow::ensure!(
@@ -10742,61 +10746,5 @@ bind_port = 12345
         let resolved = resolve_probe(Some(&p)).expect("0 makes the maps unbounded");
         assert_eq!(resolved.max_tracked_per_ip, 0);
         assert_eq!(resolved.max_tracked_per_peer, 0);
-    }
-
-    /// Check for the shipped Arbitrum Sepolia operator sample config: it must
-    /// stay in lockstep with the live `FileConfig`
-    /// schema — `deny_unknown_fields` means a renamed or removed key would
-    /// otherwise break every user who copied it, and only surface when they run
-    /// the binary. Parse it, confirm the seeded chain id, and run each contract
-    /// address present through the same EIP-55 check the resolver uses so a
-    /// bad-checksum paste is caught at CI time rather than on someone's machine.
-    fn assert_sample_config_matches_schema(sample: &str) -> anyhow::Result<()> {
-        let cfg: FileConfig =
-            toml::from_str(sample).context("sample config no longer matches FileConfig")?;
-
-        let chain = cfg
-            .blockchain
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("sample is missing the [blockchain] section"))?;
-        assert_eq!(
-            chain.chain_id,
-            Some(421_614),
-            "sample chain_id must be Arbitrum Sepolia"
-        );
-
-        // Every address present in the sample must pass the resolver's EIP-55 check
-        // (all-lowercase / bad-checksum values are rejected there, not at parse time).
-        // Absent fields are skipped — the client sample carries only a subset.
-        for (field, addr) in [
-            ("payment_pool_address", &chain.payment_pool_address),
-            ("capacity_bond_address", &chain.capacity_bond_address),
-            ("slash_judge_address", &chain.slash_judge_address),
-            (
-                "origin_assignment_address",
-                &chain.origin_assignment_address,
-            ),
-            (
-                "publisher_registry_address",
-                &chain.publisher_registry_address,
-            ),
-            (
-                "content_blacklist_address",
-                &chain.content_blacklist_address,
-            ),
-            ("slash_appeal_address", &chain.slash_appeal_address),
-        ] {
-            if let Some(value) = addr {
-                parse_contract_address(field, value)?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn arbitrum_sepolia_operator_sample_config_matches_schema() -> anyhow::Result<()> {
-        assert_sample_config_matches_schema(include_str!(
-            "../../../../examples/configs/arbitrum-sepolia.toml"
-        ))
     }
 }

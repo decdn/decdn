@@ -42,6 +42,24 @@ pub struct ConfigInitArgs {
     /// every address left to fill in.
     #[arg(long, value_name = "NAME")]
     pub chain: Option<String>,
+
+    /// Configure an ORIGIN node: write an active `[cache.origin]` pull-through
+    /// backend. Accepts an `http(s)://` base URL (http origin), a `file:///`
+    /// path (fs origin), or `s3` / `s3://<bucket>` (S3-compatible origin —
+    /// bare `s3` leaves a placeholder bucket to edit; either form leaves
+    /// region/endpoint/prefix for the generated comments to walk through).
+    /// Presence of an origin backend is the role signal —
+    /// `cache.relay_foreign_namespaces` then derives to `false` (origin-only).
+    /// Omit for a relay node (no origin; serves foreign content for pay;
+    /// derives to `true`).
+    #[arg(long, value_name = "URL", conflicts_with = "client")]
+    pub origin: Option<String>,
+
+    /// Write a fetch-only CLIENT config: identity + chain coordinates for a
+    /// consumer that fetches and pays (`decdn fetch`), with none of the
+    /// cache/origin/serving sections a `decdn-node` daemon reads.
+    #[arg(long)]
+    pub client: bool,
 }
 
 /// Validate the resolved configuration without binding ports or connecting to

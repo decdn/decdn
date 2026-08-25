@@ -18,6 +18,15 @@ path = "src/main.rs"
 [dependencies]
 decdn-protocol = { workspace = true }
 decdn-common = { workspace = true }
+# `config init --origin <URL>` validates and normalizes the origin base URL
+# through the same `parse_origin_url` the daemon's resolver uses, so the
+# generated `[cache.origin]` and the runtime agree by construction. A leaf
+# crate already in this binary's tree via `decdn-common` — no new bloat and
+# the iroh-blobs/AWS-free invariant (#578) holds. `url` (already in the tree
+# via config-types) classifies the flag's spelling — http(s)/file/s3 — before
+# the per-kind guard runs.
+decdn-config-types = { workspace = true }
+url = { workspace = true }
 # `key-gen` (this crate) and the runtime loader in `decdn-node` both load
 # the eth keystore via `decdn_incentive::eth_identity` (#406). Lives in
 # `incentive` per `appendix-poc-production-seams.md` §Seam 1 — clients
