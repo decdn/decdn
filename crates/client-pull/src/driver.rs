@@ -1342,7 +1342,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_top_up_is_followed_by_an_immediate_reopen_not_a_settle_wait() {
         // The buyer starts under-deposited, so the first open's genuine
         // `SpendingCapExhausted` refusal is corroborated by the buyer's OWN
@@ -1350,8 +1350,10 @@ mod tests {
         // up. Before the fix, `BudgetPacer::decide` proactively returned `Wait`
         // right after that top-up, and the driver slept the WHOLE settle
         // budget (`max_settle_waits * settle_backoff`) before even retrying the
-        // open. Set a settle_backoff large enough that a real wait would blow
-        // past a tight elapsed-time budget, and assert it does not.
+        // open. The clock is paused, so only a real `tokio::time::sleep`
+        // advances it: the settle-wait costs a full `settle_backoff` of virtual
+        // time, while the CPU cost of the fetch itself costs none. That makes
+        // the elapsed-time assertion below exact instead of machine-dependent.
         let total = 2 * GROUP;
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
@@ -1379,7 +1381,7 @@ mod tests {
             settle_backoff: std::time::Duration::from_secs(2),
         };
 
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         drive(
             &store,
             &source,
@@ -1415,9 +1417,10 @@ mod tests {
             "exactly one reactive top-up funded the genuine exhaustion"
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
+            elapsed < drive_config.settle_backoff,
             "the re-open must follow the top-up immediately, not after a settle-wait \
-             sleep (settle_backoff was 2s per step): elapsed {elapsed:?}"
+             sleep (settle_backoff was {:?} per step): elapsed {elapsed:?}",
+            drive_config.settle_backoff
         );
 
         assert!(store.is_complete().await.expect("is_complete"));
