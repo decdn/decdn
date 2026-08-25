@@ -44,10 +44,7 @@ import tomllib  # noqa: E402  (must follow the version guard)
 # "<path to the .rs file>" -> "<embedded path, relative to the repo root>".
 # Entries must stay exact: an unlisted warning fails, and a listed one that no
 # longer fires also fails, so this cannot rot into a stale allowlist.
-KNOWN_TEST_ONLY = {
-    "crates/cli/src/commands/config.rs": "examples/configs/arbitrum-sepolia.toml",
-    "crates/common/src/config/mod.rs": "examples/configs/arbitrum-sepolia.toml",
-}
+KNOWN_TEST_ONLY: dict[str, str] = {}
 
 # Rust accepts all three delimiters and rustfmt does not normalise them, so
 # keying only on `(` would miss `include_str!["…"]` entirely — a miss, not the

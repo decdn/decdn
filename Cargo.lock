@@ -2731,6 +2731,7 @@ dependencies = [
  "decdn-cache",
  "decdn-client-pull",
  "decdn-common",
+ "decdn-config-types",
  "decdn-incentive",
  "decdn-node",
  "decdn-protocol",
