@@ -66,7 +66,7 @@ use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
 use decdn_e2e::bindings::{Erc20, SlashJudge, SlashJudgeBlacklist};
 use decdn_e2e::chain::{ChainFixture, region_key};
-use decdn_e2e::client::ClientFixture;
+use decdn_e2e::client::{ClientFixture, PoolSession};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 use decdn_e2e::time;
@@ -227,21 +227,41 @@ async fn assert_refused_as_blacklisted(
     Ok(())
 }
 
-/// Return the `Display` message of a paid fetch that is expected to fail — the
-/// text carrying the wire refusal code (`delivery refused: {code:?}`). Bails if
-/// the fetch unexpectedly succeeds.
-async fn refusal_message(
-    chain: &ChainFixture,
-    node: &NodeFixture,
+/// Poll a reused pool session until a single-attempt fetch of `hash` is refused
+/// with a code whose `Display` contains `needle` and (if given) not `excludes`,
+/// or `budget` elapses. Returns whether it converged.
+///
+/// Uses [`ClientFixture::fetch_once`], not [`ClientFixture::fetch`]: `fetch`
+/// retries a *retryable* refusal (and `EvictedSinceProbe` is one) for 45s and
+/// opens a fresh on-chain pool each call, so polling it would burn the budget
+/// before a code transition could ever be observed. `fetch_once` is one attempt
+/// on the existing session — an open-time refusal advances no watermark, so the
+/// session stays reusable across attempts.
+async fn poll_refusal_contains(
+    client: &ClientFixture,
+    session: &mut PoolSession,
     hash: Hash,
-) -> anyhow::Result<String> {
-    let err = ClientFixture::new(chain)
-        .await?
-        .fetch(chain, node, hash, alloy::primitives::U256::ZERO)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("fetch of an evicted blob must fail"))?;
-    Ok(format!("{err:#}"))
+    needle: &str,
+    excludes: Option<&str>,
+    budget: Duration,
+) -> anyhow::Result<bool> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let msg = match client
+            .fetch_once(session, hash, 0, alloy::primitives::U256::ZERO)
+            .await
+        {
+            Ok(_) => anyhow::bail!("fetch of a refused blob unexpectedly succeeded"),
+            Err(e) => format!("{e:#}"),
+        };
+        if msg.contains(needle) && excludes.is_none_or(|x| !msg.contains(x)) {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// The `removeHashGlobal` reversal (an appeal / wrongful-entry override) lifts the
@@ -256,19 +276,28 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
         .try_init();
 
     let chain = ChainFixture::launch().await?;
-    let payload = vec![0x8Bu8; 2 * MIB];
-    let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
+    let payload = vec![0x8Bu8; 2 * MIB]; // H — blacklisted, then removed.
+    // W — never blacklisted; keeps the pool session live so every H probe below is
+    // a cheap `fetch_once` reusing one pool rather than opening a fresh one.
+    let warmup = vec![0x8Cu8; MIB];
+    let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&payload, &warmup]).await?;
+    let hash = hashes[0];
+    let warmup_hash = hashes[1];
     let admin = node.admin_client()?;
     let hash_key = to_b256(hash);
 
-    // Baseline: the node holds and serves H.
+    // Baseline: the node holds H.
     assert!(
         evict_was_present(&admin, hash).await?,
         "node must hold H before blacklisting"
     );
 
-    // Blacklist H globally, let the watcher evict it, and confirm the delivery
-    // refusal carries the blacklist code.
+    // One session, proven live by the warm-up fetch of the never-blacklisted W,
+    // reused for every H probe below.
+    let client = ClientFixture::new(&chain).await?;
+    let (mut session, _warm) = client.open_session(&chain, &node, warmup_hash).await?;
+
+    // Blacklist H globally and let the watcher evict it.
     chain.add_hash_global(hash_key).await?;
     time::increase_time(chain.admin(), 3600).await?;
     let evicted = poll(Duration::from_secs(60), || async {
@@ -279,19 +308,35 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
         evicted.is_some(),
         "node never evicted the blacklisted blob H"
     );
-    assert_refused_as_blacklisted(&chain, &node, hash).await?;
+
+    // While the entry stands, delivery is refused with the blacklist code.
+    assert!(
+        poll_refusal_contains(
+            &client,
+            &mut session,
+            hash,
+            "HashBlacklisted",
+            None,
+            Duration::from_secs(30),
+        )
+        .await?,
+        "delivery must be refused as HashBlacklisted while the entry stands"
+    );
 
     // Governance removes the entry (the appeal / wrongful-entry slow path). The
     // watcher lifts the governance deny — via the `HashRemoved` tail event and the
     // periodic re-scope — so the refusal code reverts to the sticky-eviction one.
     chain.remove_hash_global(hash_key).await?;
-    let reverted = poll(Duration::from_secs(60), || async {
-        let msg = refusal_message(&chain, &node, hash).await?;
-        Ok((msg.contains("EvictedSinceProbe") && !msg.contains("HashBlacklisted")).then_some(()))
-    })
-    .await?;
     assert!(
-        reverted.is_some(),
+        poll_refusal_contains(
+            &client,
+            &mut session,
+            hash,
+            "EvictedSinceProbe",
+            Some("HashBlacklisted"),
+            Duration::from_secs(60),
+        )
+        .await?,
         "removal must lift the governance deny so the refusal reverts to EvictedSinceProbe"
     );
 
