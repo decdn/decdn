@@ -159,9 +159,9 @@ as `decdn fetch`):
   sibling path needs bytes).
 - **Concurrency** is bounded by `--jobs` (over distinct blobs). A payment pool's vouchers
   use a strictly increasing cumulative amount, so fetches that share one provider's
-  lane are serialized by a per-provider lock (which also makes the
-  lazy open-or-reuse first-touch race-free); distinct providers proceed
-  in parallel.
+  lane are serialized by a per-provider lock; distinct providers proceed
+  in parallel. A blob that clears the multi-source gate fans out to its
+  admitted holders per [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1).
 - **Output** files are written under `-o <dir>` at each entry's relative
   path, resolved with the § Path-safety rules above (`..`, absolute, and
   escaping paths rejected). Writes are atomic (temp-then-rename after the

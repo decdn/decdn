@@ -874,6 +874,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             &args.output,
             targets.size_hint,
             Some(&on_progress),
+            // One fetch at a time: no cross-fetch pool opens to serialize.
+            None,
         )
         .await;
         bar.finish_and_clear();
@@ -1071,6 +1073,59 @@ pub(crate) const fn should_multi_source(
     admissible: usize,
 ) -> bool {
     enabled && total_bytes > min_bytes && admissible >= 2
+}
+
+/// The engagement-gate conditions decidable without a probe: the kill switch,
+/// the operator-distinct holder count, and the probe-reported size floor.
+/// Returns `true` when multi-source must not engage — and says which condition
+/// declined, since a user who passed `--multi-source --max-sources 8` and then
+/// watches the blob arrive over one connection has no other way to tell the
+/// size floor from the operator-spread filter from the kill switch.
+///
+/// Shared by [`try_multi_source_fetch`] and `bundle_pull`'s multi-source
+/// pre-branch, which needs the answer BEFORE taking its lane lock-set: taking
+/// the locks for a fetch the gate then declines would block concurrent
+/// bundle entries sharing those providers for no fan-out.
+///
+/// `admitted` must be `discovery::admit_sources(candidates.to_vec(),
+/// common.max_sources)` — the operator-distinct set the fan-out would actually
+/// use. Passing it in avoids recomputing the same admission in the caller
+/// (bundle pull needs it for its lane-lock set) and inside this gate.
+pub(crate) fn multi_source_gate_declines(
+    common: &cli::ClientFetchArgs,
+    candidates: &[NodeCandidate],
+    admitted: &[NodeCandidate],
+    size_hint: Option<u64>,
+) -> bool {
+    if !common.multi_source_enabled() {
+        return true;
+    }
+    if admitted.len() < 2 {
+        eprintln!(
+            "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
+             and fan-out needs two (one lane per operator: two nodes of one operator would \
+             share a voucher lane)",
+            admitted.len(),
+            candidates.len()
+        );
+        return true;
+    }
+    // The size floor, applied against discovery's probe-reported hint when there
+    // is one, so a below-floor blob declines here instead of after a pool open
+    // and a throwaway header stream the single-source path then repeats. The
+    // hint is unsigned, so it only ever DECLINES: an overstated one falls
+    // through to the authoritative header check in `try_multi_source_fetch`.
+    if let Some(hint) = size_hint
+        && !should_multi_source(true, hint, common.multi_source_min_bytes, admitted.len())
+    {
+        eprintln!(
+            "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
+             floor (--multi-source-min-bytes)",
+            common.multi_source_min_bytes
+        );
+        return true;
+    }
+    false
 }
 
 // Failover classification (`retry_disposition` / `RetryDisposition`) is shared
@@ -1315,6 +1370,14 @@ fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> Endpoi
 /// seed a ledger from that lane's persisted cumulative, and wrap a [`PeerSource`]
 /// over it. Mirrors the single-source per-candidate construction in `fetch()`'s
 /// failover loop, hoisted so the whole admitted set is built up front.
+///
+/// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
+/// [`build_ctx_for_fetch`] against other fetches sharing the one on-chain pool
+/// (bundle pull's cross-entry concurrency, #1774); the guard is dropped before
+/// any streaming, and skipped entirely on the delegated path, which opens
+/// nothing on-chain. Callers must already hold every provider lock for the
+/// fetch's admitted set, so the lock order stays provider-locks → `open_lock`
+/// and no hold-and-wait cycle can form.
 #[allow(clippy::too_many_arguments)]
 async fn build_multi_lane<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
@@ -1323,24 +1386,37 @@ async fn build_multi_lane<'a, P>(
     voucher_dom: &Eip712Domain,
     candidate: &NodeCandidate,
     relays: &[RelayUrl],
+    open_lock: Option<&tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<MultiLane<'a>>
 where
     P: alloy::providers::Provider + Clone,
 {
     let provider = candidate.eth_address;
-    let ctx = build_ctx_for_fetch(
-        grant,
-        deps.store,
-        deps.contract,
-        deps.rpc,
-        signer,
-        voucher_dom,
-        provider,
-        deps.self_address,
-        deps.chain,
-        deps.endpoint,
-    )
-    .await?;
+    let ctx = {
+        // Bundle pull funnels every entry — and every lane of a multi-source
+        // entry — through the one shared `PaymentPool` deposit, so the
+        // open-or-reuse serializes across the whole bundle. The delegated path
+        // opens nothing on-chain (`build_delegated_pool_ctx` adopts the owner's
+        // pool), so it skips the guard: holding the bundle-wide lock there
+        // would serialize unrelated fetches for no mutual-exclusion win.
+        let _open_guard = match (open_lock, grant) {
+            (Some(lock), None) => Some(lock.lock().await),
+            _ => None,
+        };
+        build_ctx_for_fetch(
+            grant,
+            deps.store,
+            deps.contract,
+            deps.rpc,
+            signer,
+            voucher_dom,
+            provider,
+            deps.self_address,
+            deps.chain,
+            deps.endpoint,
+        )
+        .await?
+    };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
     // One ledger per lane, seeded from its persisted `(signer, provider)`
@@ -1386,6 +1462,11 @@ where
 /// on the one shared pool deposit, gated on the aggregate remaining so no lane
 /// over-draws it (ADR 039 § Payment model). On completion each lane's voucher
 /// watermark is persisted independently.
+///
+/// `open_lock` serializes every lane's pool open-or-reuse against other fetches
+/// drawing on the same on-chain pool: `bundle pull` runs many entries
+/// concurrently over ONE shared deposit, so it passes its bundle-wide lock;
+/// `decdn fetch` runs one fetch at a time and passes `None`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn try_multi_source_fetch<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -1399,46 +1480,59 @@ pub(crate) async fn try_multi_source_fetch<P>(
     output: &Path,
     size_hint: Option<u64>,
     progress: Option<&ProgressCallback>,
+    open_lock: Option<&tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
 {
     // Spread the ranked candidate set across distinct operators (ADR 039
     // § Source diversity and reputation). Every gate that can be decided without
-    // a probe short-circuits BEFORE any chain/network work — and says which
-    // condition it was, since a user who passed `--multi-source --max-sources 8`
-    // and then watches the blob arrive over one connection has no other way to
-    // tell the size floor from the operator-spread filter from the kill switch.
-    if !common.multi_source_enabled() {
+    // a probe short-circuits BEFORE any chain/network work. Admission is computed
+    // once and reused for the gate and the lane set.
+    let admitted = discovery::admit_sources(candidates.to_vec(), common.max_sources);
+    if multi_source_gate_declines(common, candidates, &admitted, size_hint) {
         return Ok(None);
     }
-    let admissible = discovery::admit_sources(candidates.to_vec(), common.max_sources);
-    if admissible.len() < 2 {
-        eprintln!(
-            "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
-             and fan-out needs two (one lane per operator: two nodes of one operator would \
-             share a voucher lane)",
-            admissible.len(),
-            candidates.len()
-        );
-        return Ok(None);
-    }
-    // The size floor, applied against discovery's probe-reported hint when there
-    // is one, so a below-floor blob declines here instead of after a pool open
-    // and a throwaway header stream the single-source path then repeats. The
-    // hint is unsigned, so it only ever DECLINES: an overstated one falls
-    // through to the authoritative header check below.
-    if let Some(hint) = size_hint
-        && !should_multi_source(true, hint, common.multi_source_min_bytes, admissible.len())
-    {
-        eprintln!(
-            "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
-             floor (--multi-source-min-bytes)",
-            common.multi_source_min_bytes
-        );
-        return Ok(None);
-    }
-    let Some((first_candidate, rest_candidates)) = admissible.split_first() else {
+    try_multi_source_fetch_from_admitted(
+        deps,
+        common,
+        grant,
+        signer,
+        voucher_dom,
+        admitted,
+        relays,
+        hash,
+        output,
+        progress,
+        open_lock,
+    )
+    .await
+}
+
+/// Inner multi-source fetch that assumes admission and the pre-probe gate have
+/// already been decided. `admitted` is the operator-distinct set
+/// `discovery::admit_sources(candidates, max_sources)` would have produced;
+/// the caller must have already confirmed the gate would engage. This lets
+/// `bundle_pull::PullCtx::try_multi_source` reuse the same `admitted` it used
+/// for its lane-lock set without recomputing `admit_sources` inside the fan-out.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn try_multi_source_fetch_from_admitted<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    common: &cli::ClientFetchArgs,
+    grant: Option<&CapabilityGrant>,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    admitted: Vec<NodeCandidate>,
+    relays: &[RelayUrl],
+    hash: [u8; 32],
+    output: &Path,
+    progress: Option<&ProgressCallback>,
+    open_lock: Option<&tokio::sync::Mutex<()>>,
+) -> anyhow::Result<Option<u64>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let Some((first_candidate, rest_candidates)) = admitted.split_first() else {
         return Ok(None);
     };
 
@@ -1446,7 +1540,16 @@ where
     // admitted holder — the same handshake `drive_fetch` performs (no voucher is
     // signed, so it pays nothing). This also opens/reuses that holder's pool,
     // which the lane built below reuses, so the probe is not wasted work.
-    let first = build_multi_lane(deps, grant, signer, voucher_dom, first_candidate, relays).await?;
+    let first = build_multi_lane(
+        deps,
+        grant,
+        signer,
+        voucher_dom,
+        first_candidate,
+        relays,
+        open_lock,
+    )
+    .await?;
     let probe_target = multi_source_target(first_candidate, relays);
     let (header, first_pull) = {
         let ctx = first
@@ -1469,7 +1572,6 @@ where
             deps.max_rate_per_mb,
             deps.deadlines,
             0,
-            // One long-lived runtime: this connection's driver outlives the fetch.
             None,
         )
         .await
@@ -1488,7 +1590,7 @@ where
         common.multi_source_enabled(),
         total_bytes,
         common.multi_source_min_bytes,
-        admissible.len(),
+        admitted.len(),
     ) {
         eprintln!(
             "multi-source: not engaging — the blob is {total_bytes} bytes, below the {} byte \
@@ -1501,7 +1603,18 @@ where
     // Build the rest of the lanes (the first is already built + probed).
     let mut lanes = vec![first];
     for candidate in rest_candidates {
-        lanes.push(build_multi_lane(deps, grant, signer, voucher_dom, candidate, relays).await?);
+        lanes.push(
+            build_multi_lane(
+                deps,
+                grant,
+                signer,
+                voucher_dom,
+                candidate,
+                relays,
+                open_lock,
+            )
+            .await?,
+        );
     }
 
     // The `.partial` store beside `output`, keyed on `(hash, total_bytes)`; a
@@ -1518,8 +1631,6 @@ where
         rpc: deps.rpc,
         store: deps.store,
         owner: deps.self_address,
-        // Every lane shares one pool, so the funder tops up that pool regardless
-        // of which lane's exhaustion triggered it; the first lane's id names it.
         pool_id: lanes.first().map_or(PoolId::ZERO, |l| l.pool_id),
         token: deps.token,
         payment_pool_addr: deps.chain.payment_pool,
@@ -1575,14 +1686,6 @@ where
         _ => err,
     })?;
 
-    // Promote the assembled blob (mirrors `drive`'s own completion promotion,
-    // which `multi_source_fetch` leaves to the caller). `is_complete` can fail —
-    // a poisoned present lock, an alignment error — and absorbing that failure
-    // into "not complete" would skip `finalize`'s verify sweep and the
-    // `.partial` -> output promote while STILL reporting the byte count as
-    // fetched: the caller prints success, exits 0, and there is no output file.
-    // The blob was paid for in full, so a scripted pipeline proceeding on that
-    // exit code is the worst outcome available here.
     anyhow::ensure!(
         ranged_store
             .is_complete()
