@@ -610,13 +610,19 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// fan-out — acquired in one global order so a concurrent entry with an
     /// overlapping provider set waits rather than deadlocks — and the bundle's
     /// `open_lock` is passed through so every lane's pool open-or-reuse still
-    /// serializes against the other entries sharing the one on-chain pool.
+    /// serializes against the other entries sharing the one on-chain pool. The
+    /// pre-probe gate (kill switch, holder count, size-hint floor) runs BEFORE
+    /// the lock-set: a fetch the gate declines never fans out, so taking the
+    /// lanes would only block concurrent entries sharing those providers.
     async fn try_multi_source(
         &self,
         order: &fetch::ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
     ) -> anyhow::Result<Option<()>> {
+        if fetch::multi_source_gate_declines(self.common, &order.candidates, order.size_hint) {
+            return Ok(None);
+        }
         // The same admission `try_multi_source_fetch` recomputes internally;
         // computing it here too is what lets the entry lock its lanes BEFORE the
         // fan-out starts (a lane that began streaming unlocked would race a
@@ -684,11 +690,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // fetch` runs. One entry engages N provider lanes at once, so it takes
         // the lane locks for its whole admitted set — in one global order, so
         // two entries with overlapping sets cannot deadlock — then fans out. A
-        // `None` gate (kill switch off, too few admissible holders, below the
-        // size floor) drops the guards and falls through to the single-source
-        // failover loop below unchanged; a retryable fan-out failure does the
-        // same, resuming the entry's `.partial` so nothing paid for is
-        // re-bought.
+        // declined gate (kill switch off, too few admissible holders, below the
+        // size floor) is decided BEFORE the locks are taken and falls through
+        // to the single-source failover loop below unchanged; a retryable
+        // fan-out failure does the same, resuming the entry's `.partial` so
+        // nothing paid for is re-bought.
         if self.common.multi_source_enabled() {
             match self.try_multi_source(&order, hash, staging).await {
                 Ok(Some(())) => return Ok(()),

@@ -1075,6 +1075,54 @@ pub(crate) const fn should_multi_source(
     enabled && total_bytes > min_bytes && admissible >= 2
 }
 
+/// The engagement-gate conditions decidable without a probe: the kill switch,
+/// the operator-distinct holder count, and the probe-reported size floor.
+/// Returns `true` when multi-source must not engage — and says which condition
+/// declined, since a user who passed `--multi-source --max-sources 8` and then
+/// watches the blob arrive over one connection has no other way to tell the
+/// size floor from the operator-spread filter from the kill switch.
+///
+/// Shared by [`try_multi_source_fetch`] and `bundle_pull`'s multi-source
+/// pre-branch, which needs the answer BEFORE taking its lane lock-set: taking
+/// the locks for a fetch the gate then declines would block concurrent
+/// bundle entries sharing those providers for no fan-out.
+pub(crate) fn multi_source_gate_declines(
+    common: &cli::ClientFetchArgs,
+    candidates: &[NodeCandidate],
+    size_hint: Option<u64>,
+) -> bool {
+    if !common.multi_source_enabled() {
+        return true;
+    }
+    let admissible = discovery::admit_sources(candidates.to_vec(), common.max_sources);
+    if admissible.len() < 2 {
+        eprintln!(
+            "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
+             and fan-out needs two (one lane per operator: two nodes of one operator would \
+             share a voucher lane)",
+            admissible.len(),
+            candidates.len()
+        );
+        return true;
+    }
+    // The size floor, applied against discovery's probe-reported hint when there
+    // is one, so a below-floor blob declines here instead of after a pool open
+    // and a throwaway header stream the single-source path then repeats. The
+    // hint is unsigned, so it only ever DECLINES: an overstated one falls
+    // through to the authoritative header check in `try_multi_source_fetch`.
+    if let Some(hint) = size_hint
+        && !should_multi_source(true, hint, common.multi_source_min_bytes, admissible.len())
+    {
+        eprintln!(
+            "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
+             floor (--multi-source-min-bytes)",
+            common.multi_source_min_bytes
+        );
+        return true;
+    }
+    false
+}
+
 // Failover classification (`retry_disposition` / `RetryDisposition`) is shared
 // with the multi-source scheduler, so it lives in `decdn_client_pull::retry` and
 // is imported above — the single-source loop below and the scheduler classify
@@ -1321,9 +1369,10 @@ fn multi_source_target(candidate: &NodeCandidate, relays: &[RelayUrl]) -> Endpoi
 /// `open_lock`, when `Some`, serializes the pool open-or-reuse inside
 /// [`build_ctx_for_fetch`] against other fetches sharing the one on-chain pool
 /// (bundle pull's cross-entry concurrency, #1774); the guard is dropped before
-/// any streaming. Callers must already hold every provider lock for the fetch's
-/// admitted set, so the lock order stays provider-locks → `open_lock` and no
-/// hold-and-wait cycle can form.
+/// any streaming, and skipped entirely on the delegated path, which opens
+/// nothing on-chain. Callers must already hold every provider lock for the
+/// fetch's admitted set, so the lock order stays provider-locks → `open_lock`
+/// and no hold-and-wait cycle can form.
 #[allow(clippy::too_many_arguments)]
 async fn build_multi_lane<'a, P>(
     deps: &DriveFetchDeps<'a, P>,
@@ -1342,10 +1391,12 @@ where
         // Bundle pull funnels every entry — and every lane of a multi-source
         // entry — through the one shared `PaymentPool` deposit, so the
         // open-or-reuse serializes across the whole bundle. The delegated path
-        // opens nothing on-chain; taking the guard there is a harmless no-op.
-        let _open_guard = match open_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        // opens nothing on-chain (`build_delegated_pool_ctx` adopts the owner's
+        // pool), so it skips the guard: holding the bundle-wide lock there
+        // would serialize unrelated fetches for no mutual-exclusion win.
+        let _open_guard = match (open_lock, grant) {
+            (Some(lock), None) => Some(lock.lock().await),
+            _ => None,
         };
         build_ctx_for_fetch(
             grant,
@@ -1431,39 +1482,11 @@ where
 {
     // Spread the ranked candidate set across distinct operators (ADR 039
     // § Source diversity and reputation). Every gate that can be decided without
-    // a probe short-circuits BEFORE any chain/network work — and says which
-    // condition it was, since a user who passed `--multi-source --max-sources 8`
-    // and then watches the blob arrive over one connection has no other way to
-    // tell the size floor from the operator-spread filter from the kill switch.
-    if !common.multi_source_enabled() {
+    // a probe short-circuits BEFORE any chain/network work.
+    if multi_source_gate_declines(common, candidates, size_hint) {
         return Ok(None);
     }
     let admissible = discovery::admit_sources(candidates.to_vec(), common.max_sources);
-    if admissible.len() < 2 {
-        eprintln!(
-            "multi-source: not engaging — {} operator-distinct holder(s) among {} candidate(s), \
-             and fan-out needs two (one lane per operator: two nodes of one operator would \
-             share a voucher lane)",
-            admissible.len(),
-            candidates.len()
-        );
-        return Ok(None);
-    }
-    // The size floor, applied against discovery's probe-reported hint when there
-    // is one, so a below-floor blob declines here instead of after a pool open
-    // and a throwaway header stream the single-source path then repeats. The
-    // hint is unsigned, so it only ever DECLINES: an overstated one falls
-    // through to the authoritative header check below.
-    if let Some(hint) = size_hint
-        && !should_multi_source(true, hint, common.multi_source_min_bytes, admissible.len())
-    {
-        eprintln!(
-            "multi-source: not engaging — the blob is ~{hint} bytes, below the {} byte fan-out \
-             floor (--multi-source-min-bytes)",
-            common.multi_source_min_bytes
-        );
-        return Ok(None);
-    }
     let Some((first_candidate, rest_candidates)) = admissible.split_first() else {
         return Ok(None);
     };
