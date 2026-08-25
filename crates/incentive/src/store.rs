@@ -6,11 +6,10 @@
 //! delivery — see issue #527 and
 //! [ADR 003 §Off-chain voucher state persistence](../../../adr/003-payments.md).
 //!
-//! This module defines the [`PoolStateStore`] seam: a sync trait the
-//! [`crate::lane::LaneState::apply_voucher`] path commits to before advancing
-//! in-memory state and delivering further bytes. The wiring layer
-//! (`crates/node`) provides a `redb`-backed persistent implementation; tests use
-//! [`MemoryPoolStateStore`].
+//! This module defines the [`PoolStateStore`] seam: a sync trait that takes each
+//! accepted lane state into a working set and makes it durable on an explicit
+//! [`PoolStateStore::flush`]. The wiring layer (`crates/node`) provides a
+//! `redb`-backed persistent implementation; tests use [`MemoryPoolStateStore`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -21,11 +20,14 @@ use crate::lane::{LaneKey, LaneState, PoolId};
 
 /// Durable backing store for [`LaneState`], keyed by [`LaneKey`].
 ///
-/// The trait is intentionally synchronous: it's invoked from
-/// [`LaneState::apply_voucher`], which is itself sync. Callers running on a
-/// Tokio runtime should invoke the voucher-acceptance path from
-/// `tokio::task::spawn_blocking` — same shape as the `KeyStore` seam in
-/// `adr/appendix-poc-production-seams.md` §1.
+/// The trait is intentionally synchronous. `record` and `forget` mutate a working
+/// set and MAY defer durability to [`flush`](PoolStateStore::flush); an
+/// implementation is equally free to commit inside `record` instead, so the cost
+/// of any one call is the implementation's to document. A caller on a Tokio
+/// runtime therefore decides per implementation what to run from
+/// `tokio::task::spawn_blocking`: against the runtime's redb store, `record` and
+/// `forget` are map writes cheap enough to call inline, and `flush` is the one
+/// that fsyncs.
 pub trait PoolStateStore: Send + Sync {
     /// Load every persisted lane. Called once during node bring-up so the
     /// runtime can hydrate its in-memory map before the voucher-accepting

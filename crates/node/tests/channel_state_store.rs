@@ -393,7 +393,8 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
     anyhow::ensure!(final_a == U256::from(5_000u64));
     anyhow::ensure!(final_b == U256::from(10_000u64));
 
-    // Both lanes' final state is durable.
+    // Both lanes' final state is in the store's working set (`load_all` reads the
+    // buffer; this test does not exercise the flush).
     let all = store.load_all()?;
     anyhow::ensure!(all.len() == 2, "expected two lanes, got {}", all.len());
     let a_final = all
@@ -611,7 +612,7 @@ fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
 /// precisely because it contends with the voucher flush on this file, yet the two
 /// paths were never driven concurrently. Three tasks interleave on redb's
 /// exclusive writer slot: a lane driving 50 monotonic vouchers through
-/// `apply_voucher` (each a durable lane write), a pool walking its dead-charge
+/// `apply_voucher` (each a buffered lane write), a pool walking its dead-charge
 /// total upward through raising and non-raising (abort-path) `record_loss` calls,
 /// and a pool cycling record/forget. Lane state, the monotonic loss total, and
 /// the forget tombstone must each land intact.

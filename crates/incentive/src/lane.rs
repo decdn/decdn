@@ -10,8 +10,9 @@
 //! In-memory state alone is insufficient: without persistence a node restart
 //! resets `last_amount` to zero and a client can resubmit a previously-accepted
 //! voucher (issue #527). [`LaneState::apply_voucher`] therefore requires a
-//! [`PoolStateStore`] and writes the post-acceptance state durably before
-//! advancing in-memory fields or returning `Ok` — see
+//! [`PoolStateStore`] and records the post-acceptance state to it before
+//! advancing in-memory fields or returning `Ok`; the store makes that record
+//! durable on its own flush cadence — see
 //! [ADR 003 §Off-chain voucher state persistence](../../../adr/003-payments.md)
 //! and [`crate::store`].
 
@@ -46,13 +47,15 @@ pub struct LaneKey {
 /// capability's spending cap — vouchers exceeding it are invalid because
 /// `PaymentPool.redeem` would itself revert (ADR 003 §Capability delegation).
 ///
-/// **Field invariant (#527):** the `last_*` fields MUST only be advanced
-/// through [`LaneState::apply_voucher`] (the validated, persisted-commit path)
-/// or hydrated from a [`PoolStateStore`] (the trusted on-disk path). Direct
-/// field assignment from outside this crate would bypass the voucher-replay
-/// guard from ADR 003 §Off-chain voucher state persistence, so the three
-/// replay-critical fields are **private** and reachable only through the getters
-/// ([`Self::last_amount`] et al.) and the two trusted writers; the cross-crate
+/// **Field invariant (#527):** the `last_*` fields MUST only be advanced through
+/// this type's validated advance methods ([`LaneState::apply_voucher`], or a
+/// pure successor from [`LaneState::stage_voucher`] /
+/// [`LaneState::advance_presigned`] that the caller records and swaps in) or
+/// hydrated from a [`PoolStateStore`] (the trusted on-disk path). Direct field
+/// assignment from outside this crate would bypass the voucher-replay guard from
+/// ADR 003 §Off-chain voucher state persistence, so the three replay-critical
+/// fields are **private** and reachable only through the getters
+/// ([`Self::last_amount`] et al.) and those trusted writers; the cross-crate
 /// hydration path (`decdn-node` reading the pool store) goes through
 /// [`Self::hydrate`] rather than a struct literal (#751).
 ///
@@ -525,9 +528,9 @@ impl LaneState {
         (!root.is_zero() && root == self.chain.chain_root).then_some(self.chain)
     }
 
-    /// Validate `signed` against this lane's invariants and, on success, durably
-    /// persist the post-acceptance state via `store` before advancing the
-    /// in-memory `last_*` fields.
+    /// Validate `signed` against this lane's invariants and, on success, record
+    /// the post-acceptance state to `store` before advancing the in-memory
+    /// `last_*` fields.
     ///
     /// Mirrors the on-chain `PaymentPool.redeem` checks:
     /// - `voucher.pool_id == self.pool_id`
@@ -559,8 +562,9 @@ impl LaneState {
     ) -> Result<VoucherApplied, PoolError> {
         // INVARIANT (#527): validate + advance on a CLONE, record the clone,
         // swap on `Ok` only. `stage_voucher` produces the advanced successor
-        // without persisting; the record-then-swap here is the durable-commit
-        // point. Do NOT swap before the `?` on `record`: that's the literal
+        // without recording; the record-then-swap here is the commit point — the
+        // store takes the row into its working set and flushes it on its own
+        // cadence. Do NOT swap before the `?` on `record`: that's the literal
         // #527 replay window in code form.
         let (next, applied) = self.stage_voucher(signed, domain)?;
         store.record(&next)?;
@@ -852,11 +856,10 @@ pub enum PoolError {
     /// Signature is malformed or signed by the wrong address.
     #[error(transparent)]
     Signature(#[from] VoucherError),
-    /// Persistent-store write (or fsync) failed; in-memory state is unchanged.
-    /// See [`StoreError`] for the underlying cause. This is surfaced to the
-    /// caller so the client resends the same voucher instead of proceeding on
-    /// state that was never durably committed (#527, ADR 003 §Off-chain voucher
-    /// state persistence).
+    /// Lane-store write failed; in-memory state is unchanged. See [`StoreError`]
+    /// for the underlying cause. This is surfaced to the caller so the client
+    /// resends the same voucher instead of proceeding on state the store never
+    /// took (#527, ADR 003 §Off-chain voucher state persistence).
     ///
     /// PROTOCOL NOTE: this is the only `PoolError` variant for which the client
     /// SHOULD retry the same voucher unchanged. The validation variants mean the

@@ -13,12 +13,12 @@ impl ClientHandler {
     /// regardless, and the periodic lane flush mirrors the watermark to disk.
     ///
     /// The receipt is handed to [`ReceiptSink::record`](super::ReceiptSink::record), a **non-blocking**
-    /// enqueue: the actual `write_all` + `flush` runs off the hot path in the
-    /// background receipt writer, so this never blocks before delivery continues and a
-    /// slow or full disk cannot back-pressure delivery (the bug in #803).
-    /// Receipts are enqueued in voucher-acceptance order and the single writer
-    /// drains them FIFO, preserving the audit ordering and shutdown-tail
-    /// guarantees CLAUDE.md / ADR 003 require.
+    /// enqueue: the actual `write_all` runs off the hot path in the background
+    /// receipt writer, so this never blocks before delivery continues and a slow or
+    /// full disk cannot back-pressure delivery (the bug in #803). Receipts are
+    /// enqueued in voucher-acceptance order and the single writer drains them FIFO,
+    /// so the log reads in acceptance order and a graceful shutdown writes the tail
+    /// (see [`crate::receipt_log`] §Durability).
     ///
     /// The `voucher_amount` is widened to a `uint256` from the `u64` wire
     /// amount (the pool voucher's cumulative amount — its sole ordering key,
