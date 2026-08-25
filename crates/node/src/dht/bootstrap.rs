@@ -27,6 +27,7 @@ use std::time::Duration;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 
+use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
 use crate::dht::staker_set::StakerSet;
@@ -96,7 +97,8 @@ pub async fn bootstrap(
     // during which content discovery is unavailable" — inbound DHT
     // traffic (probes, FindNode queries from other nodes) immediately
     // routes through this seed set.
-    if let Ok(mut table) = routing.lock() {
+    outcome.seeds_inserted = with_lock(routing, "dht routing table", |table| {
+        let mut inserted = 0usize;
         for &peer in &seeds {
             if peer == self_node_id {
                 // Self-id is rejected by `RoutingTable::insert` anyway,
@@ -104,12 +106,11 @@ pub async fn bootstrap(
                 continue;
             }
             if table.insert(peer) {
-                outcome.seeds_inserted += 1;
+                inserted += 1;
             }
         }
-    } else {
-        tracing::error!("dht bootstrap: routing-table mutex poisoned at startup");
-    }
+        inserted
+    });
 
     // Step 2: parallel self-lookup against a fan-out of the seed set.
     // The `StakerSet` trait contract (line 30 of staker_set.rs) says:
@@ -159,16 +160,18 @@ pub async fn bootstrap(
                 // as probe candidates by design (not authenticated peers);
                 // the `AuthenticatedNodeId` boundary covers the handler's
                 // recency refresh, not this discovery path.
-                if let Ok(mut table) = routing.lock() {
+                outcome.closer_peers_inserted += with_lock(routing, "dht routing table", |table| {
+                    let mut inserted = 0usize;
                     for peer in resp.closer_nodes.into_inner() {
                         if peer == self_node_id {
                             continue;
                         }
                         if table.insert(peer) {
-                            outcome.closer_peers_inserted += 1;
+                            inserted += 1;
                         }
                     }
-                }
+                    inserted
+                });
             }
             Ok((peer, Err(e))) => {
                 outcome.find_node_err += 1;

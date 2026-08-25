@@ -528,13 +528,15 @@ const SWEEP_RUNNING: u8 = 1;
 /// A worker owns the slot and a further sweep is queued behind it.
 const SWEEP_QUEUED: u8 = 2;
 
-/// RAII release for the sweep slot, for the panic path only.
+/// RAII release for the sweep slot, for the abandon paths only.
 ///
 /// The clean path releases through a `SWEEP_RUNNING -> SWEEP_IDLE`
 /// compare-exchange and then disarms this, because releasing and re-checking
 /// the queue MUST be one atomic step — a plain store would clobber a request
-/// published between the check and the release. On panic there is nothing to
-/// re-check: no worker survives, so an unconditional release is right.
+/// published between the check and the release. On the abandon paths —
+/// shutdown, and a walk task cancelled under the worker at runtime teardown —
+/// there is nothing to re-check: no worker survives them, so an unconditional
+/// release is right.
 struct SweepSlotGuard<'a> {
     state: &'a std::sync::atomic::AtomicU8,
     armed: bool,
@@ -588,13 +590,11 @@ struct SweepSlot<'a> {
 /// the running worker's release is a compare-exchange that fails if a request
 /// landed first.
 ///
-/// Two paths discard a queued request instead of running it. Shutdown does so
-/// deliberately — the next boot re-seeds. A panic inside the walk does so
-/// because `SweepSlotGuard` can only release the slot, not resume it, and the
-/// unwinding worker has nothing left to run the pass with; those commits then
-/// wait for a later lag or a restart. The guard still prefers that to the
-/// alternative it exists for, a stranded slot that disables every later sweep
-/// for the process lifetime.
+/// Only shutdown discards a queued request instead of running it, and does so
+/// deliberately — the next boot re-seeds. A panic inside the walk does not:
+/// the walk runs in its own task, so the worker observes the panic as a failed
+/// join rather than unwinding through it, takes its normal release path, and a
+/// queued request earns its further pass.
 fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     use std::sync::atomic::Ordering;
     loop {
@@ -643,54 +643,118 @@ fn spawn_lag_sweep(slot: &SweepSlot<'_>) {
     let state = Arc::clone(slot.state);
     let shutdown = slot.shutdown.clone();
     let relay_foreign_namespaces = slot.relay_foreign_namespaces;
-    tokio::spawn(async move {
-        // RAII for the two paths that leave without a successful release CAS:
-        // shutdown, and a panic inside the walk (iroh-blobs is outside the
-        // workspace anti-panic lints). Either would otherwise strand the slot and
-        // disable every later sweep for the process lifetime, while
-        // `lag_sweeps_total` kept climbing — a wedge that reads as health.
-        let mut guard = SweepSlotGuard {
-            state: &state,
-            armed: true,
-        };
-        loop {
-            let outcome = tokio::select! {
-                biased;
-                // Shutdown wins: the store is about to be flushed and closed,
-                // so a walk that continues here reports its own teardown as a
-                // store-walk failure. The slot guard releases on the way out.
-                () = shutdown.cancelled() => {
-                    tracing::debug!(
-                        "dht republish: shutdown during a lag sweep; abandoning the walk"
-                    );
-                    return;
-                }
-                outcome = lag_sweep(&cache, relay_foreign_namespaces, &scheduler, &metrics) => outcome,
-            };
-            tracing::info!(
-                reseeded = outcome.reseeded,
-                degraded = outcome.degraded,
-                "dht republish: lag sweep complete"
-            );
-            if state
-                .compare_exchange(
-                    SWEEP_RUNNING,
-                    SWEEP_IDLE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                // Released cleanly with nothing queued. The guard must not
-                // store again: a producer may already have claimed the slot.
-                guard.armed = false;
+    tokio::spawn(run_sweep_worker(
+        state,
+        cache,
+        scheduler,
+        metrics,
+        shutdown,
+        relay_foreign_namespaces,
+    ));
+}
+
+/// One sweep worker: walk passes until a clean release or an abandon path.
+/// Owns the `SWEEP_RUNNING` slot its spawner claimed; split from
+/// [`spawn_lag_sweep`] so the slot-claim protocol and the worker loop each
+/// stay readable on their own.
+//
+// Linear "spawn walk → join → release-or-repeat" loop. Splitting further
+// would scatter the slot protocol's release invariant across helpers; the
+// function body is one state machine.
+#[allow(clippy::cognitive_complexity)]
+async fn run_sweep_worker(
+    state: Arc<std::sync::atomic::AtomicU8>,
+    cache: decdn_cache::CacheEngine,
+    scheduler: Arc<RepublishScheduler>,
+    metrics: Arc<crate::metrics::Metrics>,
+    shutdown: CancellationToken,
+    relay_foreign_namespaces: bool,
+) {
+    use std::sync::atomic::Ordering;
+    // RAII for the paths that leave without a successful release CAS:
+    // shutdown, and a walk task cancelled under this worker at runtime
+    // teardown. Either would otherwise strand the slot and disable every
+    // later sweep for the process lifetime, while `lag_sweeps_total` kept
+    // climbing — a wedge that reads as health.
+    let mut guard = SweepSlotGuard {
+        state: &state,
+        armed: true,
+    };
+    loop {
+        // The walk runs in its own task so a panic inside it (`iter_hashes`
+        // goes through iroh-blobs, which sits outside the workspace
+        // anti-panic lints) surfaces below as `JoinError::is_panic` rather
+        // than unwinding through this worker. The worker then takes its
+        // normal release path, which consumes a queued request instead of
+        // discarding it. Same join-and-branch pattern as the runtime,
+        // admin, and buyer-channel layers (`Cargo.toml`'s
+        // `panic = "unwind"` note).
+        let mut walk = tokio::spawn({
+            let cache = cache.clone();
+            let scheduler = Arc::clone(&scheduler);
+            let metrics = Arc::clone(&metrics);
+            async move { lag_sweep(&cache, relay_foreign_namespaces, &scheduler, &metrics).await }
+        });
+        let joined = tokio::select! {
+            biased;
+            // Shutdown wins: the store is about to be flushed and closed,
+            // so a walk that continues here reports its own teardown as a
+            // store-walk failure. Abort it — nothing awaits it after this
+            // — and let the slot guard release on the way out.
+            () = shutdown.cancelled() => {
+                walk.abort();
+                tracing::debug!(
+                    "dht republish: shutdown during a lag sweep; abandoning the walk"
+                );
                 return;
             }
-            // The CAS can only fail because a request arrived, so consume it
-            // and take another pass.
-            state.store(SWEEP_RUNNING, Ordering::Release);
+            joined = &mut walk => joined,
+        };
+        match joined {
+            Ok(outcome) => {
+                tracing::info!(
+                    reseeded = outcome.reseeded,
+                    degraded = outcome.degraded,
+                    "dht republish: lag sweep complete"
+                );
+            }
+            Err(err) if err.is_panic() => {
+                metrics.dht_republish_lag_sweep_panicked();
+                tracing::error!(
+                    error = %err,
+                    "dht republish: lag sweep panicked; whatever the walk \
+                     seeded before it died stays scheduled, and a queued \
+                     request still runs"
+                );
+            }
+            // Cancelled without this worker aborting it: the runtime is
+            // tearing down. Leave through the guard, as on shutdown.
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "dht republish: lag sweep walk cancelled; abandoning"
+                );
+                return;
+            }
         }
-    });
+        if state
+            .compare_exchange(
+                SWEEP_RUNNING,
+                SWEEP_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // Released cleanly with nothing queued. The guard must not
+            // store again: a producer may already have claimed the slot.
+            guard.armed = false;
+            return;
+        }
+        // The CAS can only fail because a request arrived, so consume it
+        // and take another pass.
+        state.store(SWEEP_RUNNING, Ordering::Release);
+    }
 }
 
 /// Long-running task: consumes a [`broadcast::Receiver<Hash>`] from
@@ -801,12 +865,29 @@ pub async fn run_republish(
                 // the still-held hashes; drop evicted ones from the
                 // scheduler instead of re-adding them.
                 let mut held = Vec::with_capacity(due.len());
+                let mut store_faults = 0usize;
                 for hash in due {
-                    if cache_still_holds(&cache, &hash).await {
-                        held.push(hash);
-                    } else {
-                        scheduler.unschedule(&hash);
+                    match cache_still_holds(&cache, &hash).await {
+                        Some(true) => held.push(hash),
+                        Some(false) => scheduler.unschedule(&hash),
+                        // A store fault is not eviction evidence: keep the
+                        // hash scheduled with a fresh steady-state draw and
+                        // skip this cycle's publish, rather than advertising
+                        // content the serve path cannot confirm — or worse,
+                        // unscheduling it for the process lifetime.
+                        None => {
+                            store_faults = store_faults.saturating_add(1);
+                            scheduler.schedule_steady(hash);
+                        }
                     }
+                }
+                if store_faults > 0 {
+                    tracing::warn!(
+                        faults = store_faults,
+                        "dht republish: store queries faulted at the due-time \
+                         gate; the affected hashes stay scheduled and retry on \
+                         their next cycle"
+                    );
                 }
                 if !held.is_empty() {
                     // Re-schedule with the steady-state jitter window first
@@ -838,9 +919,11 @@ pub async fn run_republish(
     }
 }
 
-/// True iff this node would still answer `has_blob` for `hash`. The due-time
-/// gate that stops the scheduler from re-publishing content LRU drift or an
-/// operator-evict already removed.
+/// Whether this node would still answer `has_blob` for `hash` — `Some(true)`
+/// or `Some(false)` when the caches can answer, `None` when the store query
+/// faulted and the question has no answer. The due-time gate that stops the
+/// scheduler from re-publishing content LRU drift or an operator-evict already
+/// removed.
 ///
 /// Origin-held counts, not just the local store. `CacheEngine::has` consults
 /// only the iroh-blobs store, but the probe path advertises origin-held content
@@ -849,16 +932,36 @@ pub async fn run_republish(
 /// first due time, publishing no `Store` at all. Both bulk seeds feed exactly
 /// that content in, so a store-only check silently discards what they schedule.
 ///
+/// A store error is `None`, never `Some(false)`: eviction is the only honest
+/// reason to stop republishing, and a fault is not eviction evidence. Folding
+/// it into "no longer held" would have the tick path `unschedule` the hash —
+/// dropping it from the announce set for the process lifetime on a transient
+/// store blip, with every signal green.
+///
 /// Both reads are in-memory or local; the live origin probe is deliberately not
 /// used, because this runs per hash per republish cycle.
-async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> bool {
+async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> Option<bool> {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     if cache.refuses(h) {
-        return false;
+        return Some(false);
     }
     // `origin_held_size` applies the live refusal filter itself, so a
-    // blacklisted or operator-evicted hash cannot re-enter through it.
-    cache.has(h).await.unwrap_or(false) || cache.origin_held_size(h).is_some()
+    // blacklisted or operator-evicted hash cannot re-enter through it. It is
+    // an in-memory index read that cannot fault, so it answers first.
+    if cache.origin_held_size(h).is_some() {
+        return Some(true);
+    }
+    match cache.has(h).await {
+        Ok(held) => Some(held),
+        Err(err) => {
+            tracing::debug!(
+                hash = ?hash,
+                error = %err,
+                "dht republish: store query faulted at the due-time gate"
+            );
+            None
+        }
+    }
 }
 
 /// Send a `Store` to the K+3 closest peers for `hash` in parallel.
@@ -1537,15 +1640,44 @@ mod tests {
         );
 
         let hash = ContentHash::from_bytes(*origin_only.as_bytes());
-        assert!(
+        assert_eq!(
             cache_still_holds(&cache, &hash).await,
+            Some(true),
             "origin-held content must survive the due-time gate"
         );
 
         let absent = ContentHash::from_bytes(*decdn_cache::Hash::new(b"held-nowhere").as_bytes());
-        assert!(
-            !cache_still_holds(&cache, &absent).await,
+        assert_eq!(
+            cache_still_holds(&cache, &absent).await,
+            Some(false),
             "content held nowhere must still be dropped"
+        );
+        Ok(())
+    }
+
+    /// A store fault at the due-time gate answers neither way (#1815): folding
+    /// it into `Some(false)` would have the tick path `unschedule` the hash —
+    /// dropping it from the announce set for the process lifetime on a
+    /// transient store blip.
+    #[tokio::test]
+    async fn cache_still_holds_reports_a_store_fault_as_unknown() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let held = decdn_cache::Hash::new(b"held-store-fault");
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![foreign_stub_origin(b"held-store-fault")],
+            16,
+        )
+        .await?;
+        cache.get(held).await?;
+        // Close the store under the gate: the next `has` query faults.
+        cache.shutdown().await?;
+
+        let hash = ContentHash::from_bytes(*held.as_bytes());
+        assert_eq!(
+            cache_still_holds(&cache, &hash).await,
+            None,
+            "a store fault is not eviction evidence"
         );
         Ok(())
     }
@@ -1786,6 +1918,129 @@ mod tests {
             text.lines()
                 .any(|l| l == "decdn_dht_republish_seed_store_walk_failures_total 0"),
             "a shutdown is not a store-walk degradation:\n{text}"
+        );
+        Ok(())
+    }
+
+    /// `size` blocks on `gate`, then panics — the injection point for the
+    /// walk-panic path. Under the origin-only policy the ownership probe is
+    /// the only origin call a sweep makes, and `size` is that probe; the gate
+    /// makes the panic's timing deterministic so a test can queue a second
+    /// pass behind the first before either fires.
+    #[derive(Debug)]
+    struct PanickingSizeOrigin {
+        data: bytes::Bytes,
+        hash: decdn_cache::Hash,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl decdn_cache::Origin for PanickingSizeOrigin {
+        fn kind(&self) -> decdn_cache::OriginKind {
+            decdn_cache::OriginKind::Filesystem
+        }
+
+        fn fetch(
+            &self,
+            hash: decdn_cache::Hash,
+            _max_bytes: u64,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let result = if hash == self.hash {
+                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
+            } else {
+                Ok(decdn_cache::OriginFetch::NotFound)
+            };
+            Box::pin(async move { result })
+        }
+
+        fn size(
+            &self,
+            _hash: decdn_cache::Hash,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+        > {
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                let _permit = gate.acquire().await;
+                panic!("synthetic walk panic");
+            })
+        }
+    }
+
+    /// A panic inside the walk must not discard a queued pass (#1814): the
+    /// worker observes it as a failed join, meters it, and takes its normal
+    /// release path — so the queued request still runs, and the slot ends
+    /// idle rather than stranded.
+    #[tokio::test]
+    async fn a_panicking_walk_consumes_the_queued_pass_and_releases_the_slot() -> anyhow::Result<()>
+    {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir()?;
+        let payload: &[u8] = b"panic-sweep";
+        let held = decdn_cache::Hash::new(payload);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let cache = decdn_cache::CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(PanickingSizeOrigin {
+                data: bytes::Bytes::from_static(payload),
+                hash: held,
+                gate: Arc::clone(&gate),
+            })],
+            16,
+        )
+        .await?;
+        cache.get(held).await?;
+
+        let scheduler = Arc::new(RepublishScheduler::new());
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(SWEEP_IDLE));
+        let shutdown = CancellationToken::new();
+        let slot = SweepSlot {
+            state: &state,
+            cache: &cache,
+            scheduler: &scheduler,
+            metrics: &metrics,
+            shutdown: &shutdown,
+            // Origin-only, so the walk puts the stored hash to `size` — the
+            // gate-then-panic injection point.
+            relay_foreign_namespaces: false,
+        };
+
+        // First lag claims the slot synchronously; its walk blocks on the
+        // gate inside `size`. Second lag queues behind it — deterministic,
+        // because the walk cannot finish until the gate opens.
+        spawn_lag_sweep(&slot);
+        assert_eq!(state.load(Ordering::Acquire), SWEEP_RUNNING);
+        spawn_lag_sweep(&slot);
+        assert_eq!(state.load(Ordering::Acquire), SWEEP_QUEUED);
+
+        // Open the gate for both passes. The first panics; the worker must
+        // consume the queued request and run the second, which panics too —
+        // two metered panics prove the queued pass ran rather than being
+        // discarded.
+        gate.add_permits(2);
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if state.load(Ordering::Acquire) == SWEEP_IDLE {
+                break;
+            }
+        }
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            SWEEP_IDLE,
+            "the slot must recover after a panicking walk"
+        );
+        let text = metrics.encode()?;
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_dht_republish_lag_sweep_panics_total 2"),
+            "both passes must run and both panics must count:\n{text}"
         );
         Ok(())
     }
