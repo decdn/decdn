@@ -39,7 +39,8 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units
+    clippy::duration_suboptimal_units,
+    clippy::similar_names
 )]
 
 use std::time::Duration;
