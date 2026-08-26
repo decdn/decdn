@@ -1178,6 +1178,19 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_load_shed_miss_total`: cache-miss serves shed
     /// under node overload (concurrency pressure or per-client fairness).
     pub serve_stream_rejected_load_shed_miss: Counter,
+    /// `decdn_serve_frame_accounting_fault_total`: a serve leg refused to cut or
+    /// frame a `ChunkData` because its own byte accounting did not add up — a zero
+    /// frame target, a `queued`/`queue` desync, a payload whose chunks disagree with
+    /// the length the header would declare, or a header the encoder rejected.
+    ///
+    /// Every one of those is a node-side bug, never peer behaviour, and each aborts
+    /// the delivery without `StreamEnd` so the client neither receives a mislabelled
+    /// frame nor pays the closing voucher. The refusals are correct; this counter
+    /// exists because they are otherwise invisible — the stream simply ends, which
+    /// reads to an operator as a client that hung up. Any nonzero value is a
+    /// **latent-bug report, not a degradation**: alert on `> 0` and file it rather
+    /// than tuning anything.
+    pub serve_frame_accounting_fault: Counter,
     /// `decdn_load_shed_egress_bps`: current measured egress EWMA, bytes/sec.
     pub load_shed_egress_bps: Gauge,
     /// `decdn_load_shed_pressure_active`: 1 while the load-shed policy considers
@@ -1941,6 +1954,10 @@ recorders! {
     /// Record a `serve_stream` cache-miss request refused by the load-shed policy
     /// (concurrency pressure or per-client fairness).
     serve_stream_rejected_load_shed_miss => serve_stream_rejected_load_shed_miss.inc();
+
+    /// Record a serve leg refusing to cut or frame a `ChunkData` because its own
+    /// byte accounting did not add up. Node-side bug, never peer behaviour.
+    serve_frame_accounting_fault => serve_frame_accounting_fault.inc();
 
     /// Record the current measured egress EWMA, bytes/sec.
     load_shed_egress_bps(bps: i64) => load_shed_egress_bps.set(bps);

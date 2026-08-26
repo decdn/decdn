@@ -234,7 +234,12 @@ fn build_server(
 /// (paid serve). Bytes survive both hops and both off-chain channels advance.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
-    let payload = vec![0xABu8; PAYLOAD_LEN];
+    // Position-varying, not a constant fill: a vectored write that permuted chunks
+    // WITHIN one frame would still compare equal against a uniform payload, and this
+    // is the only large blob the miss leg carries end to end.
+    let payload: Vec<u8> = (0..PAYLOAD_LEN)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
     let hash = decdn_cache::Hash::new(&payload);
 
     // --- Node A: upstream holder + server ---------------------------------

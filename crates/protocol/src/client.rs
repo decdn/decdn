@@ -582,9 +582,9 @@ impl StreamResponse {
 /// loops without making application-level progress, and the `cumulative >
 /// expected_wire` overrun guard — which only ever trips on bytes — never fires.
 /// An empty frame cannot be obtained at all — [`ChunkData::new`], the `try_from` decode
-/// gate, and the three `encode_chunk_*` helpers ([`encode_chunk_frame`],
-/// `encode_chunk_data_header`, [`encode_chunk_frame_headers`]) each reject one, and
-/// between them they are every route to a frame body. That is the invariant the pull
+/// gate, and every `encode_chunk_*` helper ([`encode_chunk_frame`],
+/// [`encode_chunk_frame_headers`], and the crate-private one the latter builds on)
+/// each reject one, and between them they are every route to a frame body. That is the invariant the pull
 /// paths' inactivity deadline rests on: with empty frames banned, "a frame arrived" and
 /// "bytes made progress" are the same statement, so a peer cannot refresh the deadline
 /// with padding.
@@ -601,7 +601,7 @@ impl StreamResponse {
 /// receive loop remembering to call it and every emitter avoiding an empty frame — and
 /// the serve side avoids one only *incidentally*, differently on each path:
 ///
-/// each serve path coalesces its byte stream into frames and emits whatever has
+/// each serve path cuts its byte stream into frames and emits whatever has
 /// accumulated, so an empty frame is avoided only because an exhausted stream yields
 /// nothing to emit. The empty blob (whose bao encoding is zero bytes — see
 /// `decdn_bao_range::align_range`) reaches [`ClientMessage::StreamEnd`] the same way,
@@ -704,7 +704,8 @@ const CHUNK_DATA_DISCRIMINANT: u8 = 2;
 pub(crate) const CHUNK_DATA_HEADER_MAX: usize = 6;
 
 /// Stack-buffer size for the full framing + `ChunkData` header: varint
-/// `postcard_len` + `CHUNK_DATA_DISCRIMINANT` (1) + varint `payload_len`. Sized to
+/// `postcard_len` + the one-byte `ChunkData` discriminant + varint `payload_len`.
+/// Sized to
 /// the unconditioned `u32` varint width — 5 + 1 + 5 — for the same reason as the
 /// `ChunkData` header buffer; the cap keeps the bytes actually written to at most 9.
 pub const CHUNK_FRAME_HEADERS_MAX: usize = 11;
@@ -736,7 +737,9 @@ pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationEr
     // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload.len());
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     }
     // Discriminant, then the `Vec<u8>` field's postcard length prefix, then the
     // bytes. Postcard writes a sequence length as a LEB128 varint: seven bits per
@@ -781,23 +784,31 @@ pub(crate) fn encode_chunk_data_header(
     // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload_len);
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     }
     // The cap above bounds `payload_len` well inside `u32`, so this conversion and
     // the `get_mut` guards below cannot fail. They are `indexing_slicing` lint
     // appeasement; each still errors rather than writing a short header, so a future
     // cap change cannot turn one into a wrong length prefix.
-    let payload_len_u32 = u32::try_from(payload_len)
-        .map_err(|_| MessageValidationError::ChunkTooLarge { len: postcard_len })?;
+    let payload_len_u32 =
+        u32::try_from(payload_len).map_err(|_| MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        })?;
     let Some(slot) = out.get_mut(0) else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     *slot = CHUNK_DATA_DISCRIMINANT;
     let mut varint_buf = [0u8; 5];
     let varint_len = crate::framing::encode_varint_u32(payload_len_u32, &mut varint_buf);
     let total = 1usize.saturating_add(varint_len);
     let (Some(dst), Some(src)) = (out.get_mut(1..total), varint_buf.get(..varint_len)) else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     dst.copy_from_slice(src);
     Ok(total)
@@ -830,30 +841,40 @@ pub fn encode_chunk_frame_headers(
     let hdr_len = encode_chunk_data_header(payload_len, &mut hdr)?;
     let postcard_len = hdr_len.saturating_add(payload_len);
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     }
     // As in `encode_chunk_data_header`: the cap bounds this inside `u32` and the
     // slice guards below cannot fail, but each errors rather than writing a short
     // header so a future cap change cannot turn one into a wrong length prefix.
-    let postcard_len_u32 = u32::try_from(postcard_len)
-        .map_err(|_| MessageValidationError::ChunkTooLarge { len: postcard_len })?;
+    let postcard_len_u32 =
+        u32::try_from(postcard_len).map_err(|_| MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        })?;
     let mut framing_buf = [0u8; 5];
     let framing_len = crate::framing::encode_varint_u32(postcard_len_u32, &mut framing_buf);
     let total = framing_len.saturating_add(hdr_len);
     let (Some(dst), Some(src)) = (out.get_mut(..framing_len), framing_buf.get(..framing_len))
     else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     dst.copy_from_slice(src);
     let (Some(dst), Some(src)) = (out.get_mut(framing_len..total), hdr.get(..hdr_len)) else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     dst.copy_from_slice(src);
     Ok(total)
 }
 
 /// Length of the postcard payload (`CHUNK_DATA_DISCRIMINANT` + varint
-/// `payload_len` + payload) for a given `payload_len`. Used to size framing.
+/// `payload_len` + payload) for a given `payload_len`. This is the size gate the
+/// encoders admit on; `encode_chunk_frame_headers` sizes its framing varint from the
+/// header it measured rather than from a second guess at the same number.
 ///
 /// Every caller rejects `payload_len == 0` before reaching here, but the answer for
 /// it is still right: postcard writes a zero-length sequence as a single `0x00`
@@ -1951,10 +1972,11 @@ mod tests {
 
     #[test]
     fn encode_chunk_frame_matches_the_generic_encoder() -> Result<(), Box<dyn std::error::Error>> {
-        // The delivery loop encodes frames with `encode_chunk_frame` to skip one copy,
-        // so it bypasses `ChunkData` and postcard entirely. That is only sound while the
-        // two produce the same bytes. Sizes straddle every varint width boundary of the
-        // length prefix: 1 byte below 128, 2 below 16384, 3 above it.
+        // `encode_chunk_frame` builds a frame body without a `ChunkData`, bypassing
+        // postcard entirely, and the hot-path header encoders are pinned against it.
+        // That is only sound while it and the generic encoder produce the same bytes.
+        // Sizes straddle every varint width boundary of the length prefix: 1 byte
+        // below 128, 2 below 16384, 3 above it.
         for len in [
             1usize,
             2,
@@ -2005,6 +2027,28 @@ mod tests {
             crate::client::encode_chunk_frame(&[]),
             Err(MessageValidationError::EmptyChunk)
         );
+    }
+
+    /// The public single-buffer door carries the ADR 013 ceiling too, and reports the
+    /// FRAME length it refused rather than the payload length it was handed.
+    ///
+    /// Without this the ceiling is only pinned on the two hot-path encoders, and this
+    /// is the one an out-of-tree caller reaches. It is also the boundary where the
+    /// equivalence with `encode_message` stops holding: the generic path builds an
+    /// oversized frame happily and only `write_frame` refuses it.
+    #[test]
+    fn encode_chunk_frame_rejects_a_frame_past_max_message_size() {
+        let max = crate::framing::MAX_MESSAGE_SIZE as usize;
+        // A 2^24 cap gives a 4-byte payload varint, so the header is 5 and the largest
+        // frame that fits carries 5 fewer payload bytes.
+        let largest = max - 5;
+        assert_eq!(chunk_frame_postcard_len(largest), max);
+
+        let over = vec![0u8; largest + 1];
+        assert!(matches!(
+            crate::client::encode_chunk_frame(&over),
+            Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
+        ));
     }
 
     #[tokio::test]
@@ -2065,12 +2109,13 @@ mod tests {
         Ok(())
     }
 
-    /// The floor and the ceiling of the hot-path encoders, which no longer inherit
-    /// either from `encode_chunk_frame`.
+    /// The floor and the ceiling of the hot-path encoders, which inherit neither
+    /// from `encode_chunk_frame`.
     ///
-    /// The floor is ADR 005 §Non-empty chunk (#1088): these two are the doors the
-    /// serve paths actually use, so the invariant the pull-side inactivity deadline
-    /// rests on is only as good as their own rejection.
+    /// The floor is ADR 005 §Non-empty chunk (#1088): `encode_chunk_frame_headers` is
+    /// the door the serve paths use and it is built on `encode_chunk_data_header`, so
+    /// the invariant the pull-side inactivity deadline rests on is only as good as
+    /// their own rejection.
     ///
     /// The ceiling is a *frame* length, not a payload length — `ChunkTooLarge`
     /// reports `postcard_len` (header + payload), so the largest accepted payload is
@@ -2101,11 +2146,11 @@ mod tests {
         let over = largest + 1;
         assert!(matches!(
             encode_chunk_data_header(over, &mut data_hdr),
-            Err(MessageValidationError::ChunkTooLarge { len }) if len == max + 1
+            Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
         ));
         assert!(matches!(
             encode_chunk_frame_headers(over, &mut frame_hdr),
-            Err(MessageValidationError::ChunkTooLarge { len }) if len == max + 1
+            Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
         ));
     }
 

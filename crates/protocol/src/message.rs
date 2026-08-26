@@ -138,18 +138,27 @@ pub enum MessageValidationError {
     /// one: an empty frame advances neither the receiver's cumulative byte count
     /// nor its voucher accounting, so an unbounded run of them drives the receive
     /// loop without application-level progress (#1088). Enforced by
-    /// [`crate::client::ChunkData::new`], the `try_from` decode gate, and the three
-    /// `encode_chunk_*` helpers ([`crate::client::encode_chunk_frame`],
-    /// `encode_chunk_data_header`, [`crate::client::encode_chunk_frame_headers`]) —
-    /// every route to a frame body.
+    /// [`crate::client::ChunkData::new`], the `try_from` decode gate, and every
+    /// `encode_chunk_*` helper ([`crate::client::encode_chunk_frame`],
+    /// [`crate::client::encode_chunk_frame_headers`], and the crate-private one the
+    /// latter builds on) — every route to a frame body.
     #[error(
         "ChunkData carries a zero-length payload (ADR 005: a chunk must carry at least 1 byte)"
     )]
     EmptyChunk,
-    /// A [`crate::client::ChunkData`] frame (header + payload) exceeds
-    /// [`crate::framing::MAX_MESSAGE_SIZE`] (ADR 013 §Wire Framing).
-    #[error("ChunkData frame length {len} exceeds MAX_MESSAGE_SIZE ({max})", max = crate::framing::MAX_MESSAGE_SIZE)]
-    ChunkTooLarge { len: usize },
+    /// The postcard message body of a [`crate::client::ChunkData`] frame —
+    /// discriminant + length prefix + payload, which is the length the framing prefix
+    /// announces — exceeds [`crate::framing::MAX_MESSAGE_SIZE`] (ADR 013 §Wire
+    /// Framing).
+    ///
+    /// The field is named for what it holds: this is always larger than the
+    /// `payload_len` the caller passed in, so comparing it against that is a category
+    /// error.
+    #[error("ChunkData frame length {frame_len} exceeds MAX_MESSAGE_SIZE ({max})", max = crate::framing::MAX_MESSAGE_SIZE)]
+    ChunkTooLarge {
+        /// The refused frame-body length, in bytes.
+        frame_len: usize,
+    },
     /// A wire [`crate::client::WireCapability`]'s `owner_signature` is empty.
     /// The EOA form is exactly [`crate::client::VOUCHER_SIG_LEN`] bytes but an
     /// ERC-1271 contract-signer form may be longer, so only the non-empty
