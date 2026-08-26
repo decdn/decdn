@@ -85,7 +85,19 @@ impl ClientHandler {
                 }
                 Some(res) = inflight.next(), if !inflight.is_empty() => {
                     if let Err(e) = res {
-                        tracing::debug!(error = %e, "client stream ended with error");
+                        // A node-side fault (an encode fault, an alignment error, a
+                        // store fault, a framing fault) is the operator's only signal
+                        // that a delivery was abandoned — the client only ever sees a
+                        // short stream. Log it at `error!`. An ordinary peer
+                        // disconnect or a client payment fault (marked
+                        // `ClientDisconnect` / `ClientPaymentFault`) stays at `debug!`.
+                        if e.is::<super::wire::ClientDisconnect>()
+                            || e.is::<super::wire::ClientPaymentFault>()
+                        {
+                            tracing::debug!(error = %e, "client stream ended with error");
+                        } else {
+                            tracing::error!(error = %e, "client stream ended with a node-side fault");
+                        }
                     }
                 }
             }
@@ -93,7 +105,13 @@ impl ClientHandler {
         // Drain any streams still finishing after the connection closed.
         while let Some(res) = inflight.next().await {
             if let Err(e) = res {
-                tracing::debug!(error = %e, "client stream ended with error");
+                if e.is::<super::wire::ClientDisconnect>()
+                    || e.is::<super::wire::ClientPaymentFault>()
+                {
+                    tracing::debug!(error = %e, "client stream ended with error");
+                } else {
+                    tracing::error!(error = %e, "client stream ended with a node-side fault");
+                }
             }
         }
         Ok(())
@@ -118,7 +136,10 @@ impl ClientHandler {
             Ok(first) => first,
             Err(StreamReadError { err, app_code }) => {
                 reset_stream(&mut send, &mut recv, app_code);
-                return Err(err);
+                // A request-read failure is peer-side (a timeout, a malformed
+                // frame, a decode fault), not a node-side bug — mark it so the
+                // dispatch sink logs it at `debug!` rather than `error!`.
+                return Err(anyhow::Error::new(super::wire::ClientDisconnect).context(err));
             }
         };
 

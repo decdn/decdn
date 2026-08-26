@@ -217,7 +217,7 @@ impl ClientHandler {
     ) -> anyhow::Result<()> {
         write_frame(send, payload)
             .await
-            .map_err(|e| anyhow::anyhow!("write failed: {e}"))
+            .map_err(|e| anyhow::Error::new(ClientDisconnect).context(format!("write failed: {e}")))
     }
 
     /// Meter a serve-side frame-accounting fault and hand the error back unchanged.
@@ -247,9 +247,9 @@ impl ClientHandler {
         send: &mut SendStream,
         mut bufs: Vec<Bytes>,
     ) -> anyhow::Result<()> {
-        send.write_all_chunks(&mut bufs)
-            .await
-            .map_err(|e| anyhow::anyhow!("write chunk frame: {e}"))
+        send.write_all_chunks(&mut bufs).await.map_err(|e| {
+            anyhow::Error::new(ClientDisconnect).context(format!("write chunk frame: {e}"))
+        })
     }
 
     /// Assemble one `ChunkData` frame and write it. The cache-hit leg's door;
@@ -353,6 +353,49 @@ impl std::fmt::Display for FrameAccountingFault {
 }
 
 impl std::error::Error for FrameAccountingFault {}
+
+/// Marker for a serve-stream error that is an ordinary peer hang-up rather than a
+/// node-side fault.
+///
+/// The dispatch sink logs every `serve_stream` error; without a marker it cannot
+/// tell a node bug (an encode fault, an alignment error, a store fault, a framing
+/// fault) from a client that simply disconnected — so it logs everything at
+/// `debug!`, below the project's default `RUST_LOG=info`, and the node bugs
+/// become invisible. Wrapping the I/O write errors (the peer-disconnect shape)
+/// with this type lets the sink log a node fault at `error!` while a peer
+/// disconnect stays at `debug!`. Attach it with [`anyhow::Error::context`] and
+/// recover it with `anyhow::Error::is`.
+#[derive(Debug)]
+pub(super) struct ClientDisconnect;
+
+impl std::fmt::Display for ClientDisconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client disconnected")
+    }
+}
+
+impl std::error::Error for ClientDisconnect {}
+
+/// Marker for a serve-stream error that is a client-attributable payment fault
+/// (an underpaying voucher, a voucher that fails the rate check) rather than a
+/// node-side fault.
+///
+/// The dispatch sink logs every `serve_stream` error; without a marker it would
+/// file a client's underpayment under "node-side fault" at `error!`, which is
+/// misleading and noisy under a misbehaving client. Wrapping the client-side
+/// payment bails with this type lets the sink log them at `debug!` while a real
+/// node fault stays at `error!`. Attach it with [`anyhow::Error::context`] and
+/// recover it with `anyhow::Error::is`.
+#[derive(Debug)]
+pub(super) struct ClientPaymentFault;
+
+impl std::fmt::Display for ClientPaymentFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client payment fault")
+    }
+}
+
+impl std::error::Error for ClientPaymentFault {}
 
 /// Cut up to `target` bytes off the front of `queue` into the `Bytes` slices that
 /// make up one wire frame, returning them and their total. `queued` is the queue's

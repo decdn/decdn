@@ -148,7 +148,7 @@ impl ClientHandler {
             offset,
             end,
             total_bytes,
-        );
+        )?;
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.

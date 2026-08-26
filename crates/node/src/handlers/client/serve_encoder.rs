@@ -103,10 +103,16 @@ impl AsyncSliceReader for AwaitingDataReader {
         let need = len as u64;
         // The chunk range this read needs, for the "any live fill still covers it?"
         // termination check. An align error (never for an in-bounds encoder read)
-        // yields an empty range, which reads as "no live coverer" and fails cleanly
-        // rather than hanging.
+        // is a real fault, not an empty range: an empty range would read as "no
+        // live coverer" and surface as a misleading "every covering pull ended"
+        // that blames the pull leg for an alignment bug.
         let range = align_range(offset, need, self.total)
-            .map_or_else(|_| ChunkRanges::empty(), |a| a.chunk_ranges().clone());
+            .map(|a| a.chunk_ranges().clone())
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "serve read [{offset}, +{need}) does not align: {e}"
+                ))
+            })?;
         loop {
             if self.present_covers(offset, need).await? {
                 break;
@@ -262,19 +268,31 @@ impl CoherentFrameProducer {
     /// Build the producer for request range `[offset, end)` of `hash` (a
     /// `total`-byte blob), reading data from `store` (awaiting the pull) and proof
     /// nodes from a [`decdn_cache::SessionOutboardReader`] minted from the shared `session`.
+    ///
+    /// # Errors
+    ///
+    /// An unalignable request — `offset` past the blob end, or an explicit end
+    /// that overflows or exceeds the blob size — is a bad request, not an empty
+    /// one. It propagates here rather than substituting an empty range, which
+    /// would make the encoder emit zero bytes and the serve loop write `StreamEnd`
+    /// for a non-empty request. The legitimate `end == offset` empty request is
+    /// handled separately below and never errors.
     pub(super) fn new(
         store: NodeRangedStore,
         session: Arc<FillSession>,
         offset: u64,
         end: u64,
         total: u64,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         // The chunk-group-aligned ranges the client's verified stream covers (ADR
         // 038). `end == offset` (empty request) yields empty ranges — an empty
-        // stream — handled naturally by the encoder.
+        // stream — handled naturally by the encoder. A non-empty request that
+        // fails to align is a bad request, propagated rather than flattened to an
+        // empty range.
         let ranges = if end > offset {
             align_range(offset, end - offset, total)
-                .map_or_else(|_| ChunkRanges::empty(), |a| a.chunk_ranges().clone())
+                .map(|a| a.chunk_ranges().clone())
+                .map_err(|e| anyhow::anyhow!("serve range [{offset}, {end}) does not align: {e}"))?
         } else {
             ChunkRanges::empty()
         };
@@ -294,14 +312,14 @@ impl CoherentFrameProducer {
                 .map_err(|e| anyhow::anyhow!("coherent range encode failed: {e}"))
         });
 
-        Self {
+        Ok(Self {
             enc: Some(enc),
             rx,
             queue: VecDeque::new(),
             queued: 0,
             faulted: false,
             hash,
-        }
+        })
     }
 
     /// The next wire frame as a set of `Bytes` chunks, totalling up to `target`
@@ -618,7 +636,8 @@ mod tests {
         session.mark_ended(Err(FillError::new("upstream pull died")));
 
         let store = NodeRangedStore::new(engine.clone(), hash, total);
-        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
+            .expect("align");
 
         let first = producer.next_frame_chunks(1024).await;
         assert!(first.is_err(), "the encode fault must surface, not park");
@@ -657,7 +676,8 @@ mod tests {
         .await;
 
         let store = NodeRangedStore::new(engine.clone(), hash, total);
-        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
+            .expect("align");
         let (chunks, frame_total) = producer
             .next_frame_chunks(total as usize)
             .await
@@ -699,13 +719,53 @@ mod tests {
         .await;
 
         let store = NodeRangedStore::new(engine.clone(), hash, total);
-        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total)
+            .expect("align");
         let err = producer
             .next_frame_chunks(0)
             .await
             .expect_err("a zero target must not read as end-of-range");
         assert!(
             err.to_string().contains("zero-length frame"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An unalignable request — an offset past the blob end — is a bad request,
+    /// not an empty one. `CoherentFrameProducer::new` must propagate the
+    /// alignment error rather than substitute an empty range, which would make the
+    /// encoder emit zero bytes and the serve loop write `StreamEnd` for a
+    /// non-empty request.
+    #[tokio::test]
+    async fn an_unalignable_request_errors_at_construction_not_as_an_empty_range() {
+        let total = 2 * G;
+        let (root, _plaintext, _outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        // An offset at the blob end with a positive length cannot align (the end
+        // exceeds the blob size).
+        let err = match CoherentFrameProducer::new(
+            store,
+            Arc::clone(&session),
+            total,
+            total + 1,
+            total,
+        ) {
+            Ok(_) => panic!("an out-of-bounds request must error at construction"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("does not align"),
             "unexpected error: {err}"
         );
     }
@@ -775,7 +835,8 @@ mod tests {
         // B serves the WHOLE [2g,5g) before its remainder lands: it must deliver the
         // overlap from A's fill, then PARK awaiting [3g,5g) — never wedge.
         let store = NodeRangedStore::new(engine.clone(), hash, total);
-        let producer = CoherentFrameProducer::new(store, Arc::clone(&b_owner), 2 * G, 5 * G, total);
+        let producer = CoherentFrameProducer::new(store, Arc::clone(&b_owner), 2 * G, 5 * G, total)
+            .expect("align");
         let serve = tokio::spawn(drain(producer));
         tokio::task::yield_now().await;
         assert!(

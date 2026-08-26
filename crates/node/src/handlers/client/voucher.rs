@@ -156,7 +156,9 @@ impl ClientHandler {
         let proof = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("proof read timed out after {VOUCHER_READ_TIMEOUT:?}")
+                anyhow::Error::new(super::wire::ClientDisconnect).context(format!(
+                    "proof read timed out after {VOUCHER_READ_TIMEOUT:?}"
+                ))
             })??;
 
         let wire = match proof {
@@ -246,7 +248,10 @@ impl ClientHandler {
             }
             Err(VerifyStop::Bail(msg)) => {
                 drop(guard);
-                return Err(anyhow::anyhow!(msg));
+                // A bail is a buyer underpayment (ADR 003 §Voucher withholding) —
+                // a client-attributable payment fault, not a node-side bug. Mark it
+                // so the dispatch sink logs it at `debug!` rather than `error!`.
+                return Err(anyhow::Error::new(super::wire::ClientPaymentFault).context(msg));
             }
         };
 
