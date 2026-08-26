@@ -8301,6 +8301,116 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
     Ok(())
 }
 
+/// ADR 041: a completed serve credits the warming source through the SHIPPED
+/// path — the bounded channel and background aggregator the runtime wires — not
+/// just through the inline test sink.
+///
+/// Every other ADR 041 test here reads the ledger synchronously and so uses
+/// `DirectWarmingCreditSink`. That leaves the production wiring
+/// (`credit_warming_serve` -> resolve the source -> `try_send` -> aggregator ->
+/// `credit_source`) proven by unit tests alone: a regression that dropped the
+/// runtime's `spawn_warming_creditor` call, or an aggregator that never drained,
+/// would keep every one of them green. This drives the real sink end-to-end over
+/// a real paid fetch, and polls because the apply is asynchronous by design.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_completed_serve_credits_the_source_through_the_background_aggregator()
+-> anyhow::Result<()> {
+    const SOURCE: [u8; 32] = [0xA1u8; 32];
+    const OP_BPS: u16 = 6000;
+
+    let payload = vec![0x5Cu8; 64 * 1024];
+    let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+
+    // Tag the blob to SOURCE with a one-unit speculative debit: the source reads
+    // as spent until a serve credits it, and any positive margin vindicates it.
+    // So `available` flips exactly when the aggregator applies the credit, which
+    // is the signal this test waits on.
+    let warming = Arc::new(decdn_node::warming_allowance::WarmingAllowance::new(
+        1_000_000, 0,
+    ));
+    warming.debit_speculative(SOURCE, *hash.as_bytes(), 1);
+    anyhow::ensure!(
+        !warming.available(SOURCE),
+        "precondition: the speculative buy must leave the source spent"
+    );
+
+    let creditor_shutdown = tokio_util::sync::CancellationToken::new();
+    let (warming_credit, creditor) = decdn_node::warming_allowance::spawn_warming_creditor(
+        Arc::clone(&warming),
+        Arc::clone(&metrics),
+        creditor_shutdown.clone(),
+    );
+
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store.clone(),
+        RATE_PER_MB,
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.warming_credit = warming_credit;
+            deps.operator_shares = decdn_node::fee_shares::OperatorShares::new(OP_BPS);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let own_node_id = B256::from(*client_ep.id().as_bytes());
+    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
+    let ctx =
+        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00c0_dec0,
+        Duration::from_secs(20),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delivered bytes mismatch"
+    );
+
+    let mut credited = false;
+    for _ in 0..500 {
+        if warming.available(SOURCE) {
+            credited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::ensure!(
+        credited,
+        "the serve credit never reached the ledger through the channel sink"
+    );
+
+    creditor_shutdown.cancel();
+    anyhow::ensure!(creditor.await.is_ok(), "the aggregator must exit cleanly");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// #1115 control: the SAME setup WITHOUT a client binding is refused. An
 /// unauthenticated request fails `pull_authorized`, so the buffered pull-through
 /// never runs and the origin-only blob is a clean `CacheMiss` delivery refusal —

@@ -3006,8 +3006,13 @@ impl CacheEngine {
         self.inner.access_times.get(&hash).map(|e| *e.value())
     }
 
-    /// Return a snapshot of all recorded access times. Eviction logic can
-    /// sort by value to determine LRU ordering.
+    /// Collect every recorded access time. Eviction logic can sort by value to
+    /// determine LRU ordering.
+    ///
+    /// Not a point-in-time snapshot: the map is sharded and this walks it shard
+    /// by shard, so a record that lands mid-walk may or may not appear (see the
+    /// `access_times` field docs). Recency is advisory input to eviction
+    /// ordering, so a hash missed by one walk is seen by the next.
     ///
     /// **Note:** this snapshot is the *raw* access map and includes pinned
     /// hashes. Eviction implementations should use
@@ -5636,8 +5641,12 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
 
-        // Pin a scan inside one shard by holding the write guard that a walk of
-        // that shard takes.
+        // Stand in for a scan sitting inside one shard by holding a guard on
+        // that shard. `get_mut` takes the write guard rather than the read guard
+        // `eviction_candidates`' walk takes, which is the stronger hold: if a
+        // record can land against an exclusive guard on another shard, it can
+        // land against a shared one. What is pinned is the shard, which is the
+        // property under test.
         let scanned = Hash::new(b"the shard under scan");
         engine.inner.access_times.insert(scanned, Instant::now());
         let Some(scan_guard) = engine.inner.access_times.get_mut(&scanned) else {
@@ -5681,6 +5690,57 @@ mod tests {
         anyhow::ensure!(
             engine.last_accessed(completing).is_some(),
             "the recorded access must be readable once the scan releases"
+        );
+        Ok(())
+    }
+
+    /// A concurrent record must not make the eviction sweep *lose* a candidate.
+    ///
+    /// The sharded walk gave up point-in-time atomicity on purpose: a record
+    /// landing mid-walk may or may not appear. What it must never do is drop a
+    /// hash that was already in the map when the walk started, because
+    /// `eviction_candidates` is the only source of eviction candidates — a hash
+    /// silently skipped by every sweep is a blob that is never reclaimed, which
+    /// is unbounded disk growth. `DashMap::iter` holds each shard's read guard
+    /// for that shard's traversal, so a concurrent insert can add to a shard the
+    /// walk has not reached but cannot remove from one it has. This pins that.
+    #[tokio::test]
+    async fn a_scan_never_loses_a_candidate_to_a_concurrent_record() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+
+        // Seed enough hashes to spread across every shard.
+        let seeded: Vec<Hash> = (0..512u32).map(|i| Hash::new(i.to_le_bytes())).collect();
+        for h in &seeded {
+            engine.inner.access_times.insert(*h, Instant::now());
+        }
+
+        // Hammer the map with fresh hashes for the duration of the walk.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let engine = engine.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut i = 1_000_000u32;
+                while !stop.load(Ordering::Relaxed) {
+                    engine.observe_hit(Hash::new(i.to_le_bytes()));
+                    i = i.saturating_add(1);
+                }
+            })
+        };
+
+        let candidates = engine.eviction_candidates();
+        stop.store(true, Ordering::Relaxed);
+        anyhow::ensure!(writer.join().is_ok(), "the recording thread panicked");
+
+        let missing = seeded
+            .iter()
+            .filter(|h| !candidates.contains_key(h))
+            .count();
+        anyhow::ensure!(
+            missing == 0,
+            "the sweep dropped {missing} of {} pre-existing candidates",
+            seeded.len()
         );
         Ok(())
     }

@@ -323,8 +323,9 @@ pub struct NodeOriginConfig {
     /// above-floor buys per upstream source node. The buy loop reads
     /// `available(source)` to pick the warm-at-market vs amortized-floor regime,
     /// and debits the full buy cost on a successful speculative pull. The SAME
-    /// `Arc` is shared with the serve path (which credits realized margin on each
-    /// re-serve) and the eviction path (which forgets a dropped hash's tag).
+    /// `Arc` is shared with the eviction path (which forgets a dropped hash's
+    /// tag) and with the warming-credit aggregator, which applies the realized
+    /// margin the serve path enqueues on each re-serve.
     pub warming: Arc<crate::warming_allowance::WarmingAllowance>,
 }
 

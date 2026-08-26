@@ -406,6 +406,17 @@ pub struct DecdnMetrics {
     /// records are being lost. Operator-visible name:
     /// `decdn_receipt_writes_dropped_total`.
     pub receipt_writes_dropped: Counter,
+    /// ADR 041 warming serve credits dropped before they reached the ledger,
+    /// counted once per dropped credit. Either the bounded aggregator queue was
+    /// full (`try_send` → `Full`) or the aggregator was gone (`Closed`). A drop
+    /// is conservative — it leaves the source's ledger more negative than
+    /// reality, never more positive — so it can only block speculative warming,
+    /// never over-fund it. But a sustained non-zero rate means warming is being
+    /// throttled by lost bookkeeping rather than by real losses, and a rate that
+    /// tracks the serve rate exactly means the aggregator task is gone and every
+    /// source will drift to blocked. Operator-visible name:
+    /// `decdn_warming_credits_dropped_total`.
+    pub warming_credits_dropped: Counter,
     /// Redemption attempts (`try_redeem`) that returned an error — a failed
     /// `getChannel`/`withdraw` RPC or receipt wait (#751). Each is otherwise
     /// only a single `warn!`; a sustained rate means accrued earnings are not
@@ -1636,6 +1647,12 @@ recorders! {
     /// affects settlement; a sustained rate means the writer is not keeping up
     /// with disk I/O and audit records are being lost.
     receipt_write_dropped => receipt_writes_dropped.inc();
+
+    /// An ADR 041 warming serve credit was dropped before it reached the ledger
+    /// — the bounded aggregator queue was full, or the aggregator was gone. The
+    /// drop is conservative (the source ledger stays more negative than
+    /// reality), but a sustained rate throttles speculative warming.
+    warming_credit_dropped => warming_credits_dropped.inc();
 
     /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
     /// (#751). Pairs with the `warn!` in `redeemer_loop`.
@@ -3050,6 +3067,28 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_receipt_writes_dropped_total", 1),
             "expected one dropped-receipt event:\n{text}"
+        );
+    }
+
+    #[test]
+    fn warming_credits_dropped_metric_starts_at_zero_and_increments() {
+        // ADR 041. Exposed at zero on a fresh registry so an alert can be
+        // written against it before the first drop ever happens, and bumped once
+        // per credit that never reached the ledger. A rate that tracks the serve
+        // rate means the aggregator is gone and warming will stop node-wide.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_warming_credits_dropped_total", 0),
+            "warming-credit-dropped counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.warming_credit_dropped();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_warming_credits_dropped_total", 1),
+            "expected one dropped-warming-credit event:\n{text}"
         );
     }
 

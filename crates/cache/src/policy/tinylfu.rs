@@ -16,6 +16,12 @@ use std::sync::Arc;
 /// estimate locks the one shard its hash routes to. Serve completions and
 /// admission reads for different hashes therefore proceed in parallel, and the
 /// periodic aging pass touches a single shard rather than the whole array.
+///
+/// Aging still runs on one node-wide clock across all shards. Both readers
+/// below compare estimates on a shared scale — [`ProbationAdmission`] against a
+/// node-wide threshold, [`TinyLfuEviction`] by ranking candidates from
+/// different shards against each other — so counters are only meaningful if
+/// every one of them has been aged the same number of times.
 #[derive(Debug)]
 pub struct TinyLfuEstimator {
     inner: ShardedCountMinSketch,
@@ -24,6 +30,9 @@ pub struct TinyLfuEstimator {
 impl TinyLfuEstimator {
     /// Size the sketch to roughly `sketch_bytes` of counters: one `u8` per
     /// counter over `ROWS` rows, so `cols = bytes / 4`, floored at 64 columns.
+    /// The floor also keeps the width well above
+    /// [`super::sketch::SHARDS`], below which a sharded sketch degenerates to
+    /// one column per shard (see [`ShardedCountMinSketch::new`]).
     #[must_use]
     pub fn new(sketch_bytes: usize) -> Self {
         // one u8 per counter, ROWS(=4) rows: cols = bytes / 4.
