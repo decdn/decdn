@@ -729,10 +729,7 @@ pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationEr
     if payload.is_empty() {
         return Err(MessageValidationError::EmptyChunk);
     }
-    if payload.len() > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: payload.len() });
-    }
-    // Postcard payload length `1 + varint(payload_len) + payload_len` must also fit.
+    // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload.len());
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
         return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
@@ -777,8 +774,10 @@ pub fn encode_chunk_data_header(
     if payload_len == 0 {
         return Err(MessageValidationError::EmptyChunk);
     }
-    if payload_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+    // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
+    let postcard_len = chunk_frame_postcard_len(payload_len);
+    if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
     }
     // Discriminant.
     if let Some(slot) = out.get_mut(0) {
@@ -823,9 +822,6 @@ pub fn encode_chunk_frame_headers(
 ) -> Result<usize, MessageValidationError> {
     if payload_len == 0 {
         return Err(MessageValidationError::EmptyChunk);
-    }
-    if payload_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
     }
     // First encode the ChunkData header into a temporary to measure it.
     let mut hdr = [0u8; CHUNK_DATA_HEADER_MAX];
