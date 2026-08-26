@@ -183,6 +183,11 @@ pub struct ResolvedBlockchain {
     /// remaining on-chain balance minus `M` can no longer cover the next
     /// credit window. Defaults to 1 USDC (`1_000_000` `µUSDC`).
     pub pool_min_remaining_deposit_micro_usdc: u64,
+    /// Share of a pool's refundable headroom (`remaining − M`), in basis points,
+    /// that any one capability signer may hold as un-vouchered floor credit
+    /// (ADR 003 § Pool solvency, per-signer floor isolation). Guaranteed in
+    /// `1..=10_000` (the resolver rejects anything else). Defaults to `2500`.
+    pub pool_floor_signer_share_bps: u64,
 }
 
 /// Resolved cache fields.

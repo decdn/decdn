@@ -223,6 +223,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  pool_floor_signer_share_bps: {}",
+        resolved.blockchain.pool_floor_signer_share_bps
+    )?;
+    writeln!(
+        w,
         "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     )?;
@@ -907,6 +912,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
+# pool_floor_signer_share_bps = 2500              # share of a pool's remaining-M headroom any ONE capability signer may hold as un-vouchered floor credit (ADR 003 § Pool solvency); 1..=10000, default 2500 (a quarter each); 10000 disables the sub-cap
 # CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -1165,6 +1171,7 @@ mod tests {
             buyer_working_deposit_micro_usdc,
             buyer_max_approve,
             pool_min_remaining_deposit_micro_usdc,
+            pool_floor_signer_share_bps,
             swap_venue,
             swap_router_address,
             swap_quoter_address,
@@ -1239,6 +1246,10 @@ mod tests {
             (
                 "pool_min_remaining_deposit_micro_usdc =",
                 pool_min_remaining_deposit_micro_usdc.is_none(),
+            ),
+            (
+                "pool_floor_signer_share_bps =",
+                pool_floor_signer_share_bps.is_none(),
             ),
             ("swap_venue =", swap_venue.is_none()),
             ("swap_router_address =", swap_router_address.is_none()),

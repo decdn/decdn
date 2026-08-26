@@ -270,6 +270,20 @@ pub struct BlockchainConfig {
     /// scale; sizing this precisely per ADR 003 is governance/ops policy, not a
     /// build-time constant.
     pub pool_min_remaining_deposit_micro_usdc: Option<u64>,
+    /// Share of a pool's refundable headroom (`remaining − M`), in basis points,
+    /// that any ONE capability signer may hold as un-vouchered floor credit
+    /// (ADR 003 § Pool solvency, per-signer floor isolation). The node bounds a
+    /// signer's live reservations plus its permanent `dead_charge` to
+    /// `max((remaining − M) · bps / 10_000, one credit window)`, underneath the
+    /// unchanged pool-wide `remaining − M` ceiling, so one capability-holder that
+    /// opens and abandons streams cannot consume the headroom its co-tenants on
+    /// the shared pool need. This throttles unpaid credit, not paid throughput: a
+    /// signer that pays its vouchers releases its reservation and cycles through
+    /// its share indefinitely. Node-local risk policy — it needs no pool-owner
+    /// cooperation. Must be in `1..=10_000`; `10_000` makes the sub-cap equal to
+    /// the pool ceiling, i.e. a no-op. Absent => default (`2500`, a quarter of the
+    /// headroom each).
+    pub pool_floor_signer_share_bps: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
     /// operator funds the bond in TOKEN directly). Consumed only by the CLI

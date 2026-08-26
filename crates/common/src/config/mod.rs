@@ -117,6 +117,17 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
+/// Default per-signer share of a pool's refundable headroom for the floor
+/// sub-cap: `2500` bps, a quarter of `remaining − M` each. ADR 003 § Pool
+/// solvency makes this node-local risk policy — the node's own bad-debt budget
+/// per counterparty — so the default targets a modest fan-out (four active
+/// signers per pool) rather than any protocol quantity. An operator serving
+/// wide-fan-out publishers lowers it; one serving single-signer pools raises it
+/// toward `10_000`, where the sub-cap becomes the pool ceiling.
+pub const DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS: u64 = 2_500;
+/// Basis-point denominator for [`DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS`] and the
+/// bound the resolver enforces on a configured share.
+pub const BPS_DENOMINATOR: u64 = 10_000;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -1556,6 +1567,27 @@ fn resolve_blockchain_into(
         .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
+    // The per-signer share of `remaining − M` (ADR 003 § Pool solvency). Bounded
+    // on both sides: `0` would give every signer a zero sub-cap and refuse every
+    // stream, and a share above the whole headroom is not a share at all. The
+    // node still floors the resulting cap at one credit window, so a legal small
+    // value throttles rather than wedges.
+    let pool_floor_signer_share_bps = file
+        .and_then(|b| b.pool_floor_signer_share_bps)
+        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS);
+    bag.check_with(
+        (1..=BPS_DENOMINATOR).contains(&pool_floor_signer_share_bps),
+        "blockchain.pool_floor_signer_share_bps",
+        || {
+            let bound = format!("must be in 1..={BPS_DENOMINATOR}");
+            format!(
+                "blockchain.pool_floor_signer_share_bps {bound} (0 gives every signer a zero \
+                 floor sub-cap and refuses every stream; {BPS_DENOMINATOR} makes the sub-cap \
+                 equal to the per-pool ceiling)"
+            )
+        },
+    );
+
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
     // the runtime loader: if the operator passes a stale path the failure
@@ -1588,6 +1620,7 @@ fn resolve_blockchain_into(
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
+        pool_floor_signer_share_bps,
     }
 }
 
@@ -9386,6 +9419,60 @@ swap_pool_address = \"0xPool\"
             msg.contains("blockchain.buyer_working_deposit_micro_usdc"),
             "error should name the field: {msg}"
         );
+        Ok(())
+    }
+
+    /// The per-signer floor share (ADR 003 § Pool solvency) defaults to a quarter
+    /// of a pool's headroom, threads an explicit value through, and is rejected
+    /// outside `1..=10_000` on BOTH sides: `0` would give every signer a zero
+    /// sub-cap and refuse every stream, and a share above the whole headroom is
+    /// not a share.
+    #[test]
+    fn pool_floor_signer_share_defaults_threads_and_bounds() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_pool_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(
+            resolved.pool_floor_signer_share_bps,
+            DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS
+        );
+
+        let explicit = types::BlockchainConfig {
+            pool_floor_signer_share_bps: Some(10_000),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&explicit), dir.path())?;
+        assert_eq!(resolved.pool_floor_signer_share_bps, 10_000);
+
+        for bad in [0u64, 10_001] {
+            let file = types::BlockchainConfig {
+                pool_floor_signer_share_bps: Some(bad),
+                slash_judge_address: Some(GOOD_ADDR.to_string()),
+                content_blacklist_address: Some(GOOD_ADDR.to_string()),
+                ..Default::default()
+            };
+            let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+                anyhow::bail!("expected error for a signer share of {bad}");
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("blockchain.pool_floor_signer_share_bps"),
+                "error should name the field: {msg}"
+            );
+        }
         Ok(())
     }
 

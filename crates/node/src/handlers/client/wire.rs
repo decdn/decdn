@@ -149,6 +149,9 @@ impl ClientHandler {
             ServeRejectReason::LaneAtCapacity => {
                 self.metrics.serve_stream_rejected_lane_at_capacity();
             }
+            ServeRejectReason::SignerFloorAtCap => {
+                self.metrics.serve_stream_rejected_signer_floor_at_cap();
+            }
             ServeRejectReason::LoadShedHit => self.metrics.serve_stream_rejected_load_shed_hit(),
             ServeRejectReason::LoadShedMiss => self.metrics.serve_stream_rejected_load_shed_miss(),
             ServeRejectReason::RangeNotSatisfiable => {

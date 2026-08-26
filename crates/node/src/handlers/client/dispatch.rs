@@ -657,8 +657,17 @@ impl ClientHandler {
                     };
                     let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
                     let pool_id = B256::from(req.pool_id);
-                    match self.try_reserve_floor(pool_id, status.remaining, reserved) {
-                        None => {
+                    // `known_lane.is_some()` above proves a verified signer, so the
+                    // lane key resolved; an unbound request never reaches this tier.
+                    let signer = lane_key.map_or(Address::ZERO, |k| k.signer);
+                    match self.try_reserve_floor(
+                        pool_id,
+                        signer,
+                        status.remaining,
+                        rate_per_mb,
+                        reserved,
+                    ) {
+                        Err(refusal) => {
                             let headroom = status
                                 .remaining
                                 .saturating_sub(self.pool_min_remaining_deposit);
@@ -667,12 +676,12 @@ impl ClientHandler {
                                 .respond_error(
                                     &mut send,
                                     &req,
-                                    ServeRejectReason::InsufficientDeposit,
+                                    refusal.reject_reason(),
                                     rate_per_mb,
                                 )
                                 .await;
                         }
-                        Some(guard) => floor_reservation = Some(guard),
+                        Ok(guard) => floor_reservation = Some(guard),
                     }
                 }
 
@@ -1057,21 +1066,35 @@ impl ClientHandler {
         if let Some(status) = pool_status {
             let refused = if floor_reservation.is_none() {
                 let reserved = decdn_incentive::min_payment(guard_bytes, rate_per_mb);
-                match self.try_reserve_floor(B256::from(req.pool_id), status.remaining, reserved) {
-                    Some(guard) => {
-                        floor_reservation = Some(guard);
-                        false
-                    }
-                    None => true,
-                }
-            } else {
-                !self.pool_budget_covers_reserve(
+                match self.try_reserve_floor(
                     B256::from(req.pool_id),
+                    lane_key.signer,
                     status.remaining,
-                    U256::ZERO,
-                )
+                    rate_per_mb,
+                    reserved,
+                ) {
+                    Ok(guard) => {
+                        floor_reservation = Some(guard);
+                        None
+                    }
+                    Err(refusal) => Some(refusal.reject_reason()),
+                }
+            } else if self.floor_budget_covers(
+                B256::from(req.pool_id),
+                lane_key.signer,
+                status.remaining,
+                rate_per_mb,
+                U256::ZERO,
+            ) {
+                None
+            } else {
+                // A miss-fill stream already holds its reservation, so the re-check
+                // cannot say WHICH cap moved against it without re-reading both.
+                // `InsufficientDeposit` is the conservative label: the reservation
+                // it holds is already counted at both levels.
+                Some(ServeRejectReason::InsufficientDeposit)
             };
-            if refused {
+            if let Some(reason) = refused {
                 let headroom = status
                     .remaining
                     .saturating_sub(self.pool_min_remaining_deposit);
@@ -1082,12 +1105,7 @@ impl ClientHandler {
                     decdn_incentive::min_payment(guard_bytes, rate_per_mb),
                 );
                 return self
-                    .respond_error(
-                        &mut send,
-                        &req,
-                        ServeRejectReason::InsufficientDeposit,
-                        rate_per_mb,
-                    )
+                    .respond_error(&mut send, &req, reason, rate_per_mb)
                     .await;
             }
         }
