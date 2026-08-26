@@ -9750,22 +9750,53 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     });
 
     // The two misses race, exactly as two cache misses for different blobs do.
-    let (first, second) = tokio::join!(
-        Origin::fetch(&origin, hash, u64::MAX),
-        Origin::fetch(&origin, hash2, u64::MAX),
-    );
+    // Bound the join so a hung channel-open leaves a clear verdict instead of the
+    // nextest `slow-timeout` (issue #1826: 12.9s under llvm-cov looked like StaleNonce).
+    let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            Origin::fetch(&origin, hash, u64::MAX),
+            Origin::fetch(&origin, hash2, u64::MAX),
+        )
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "concurrent ledger pulls hung past 30s — likely CHANNEL_OPEN_CALLER_BUDGET (5s) \
+             expiry under llvm-cov contention, not StaleNonce; pending={} timeout={} stalled={} \
+             recorded={:?} retired={:?}",
+            counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+            counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
+            counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
+            recorded.lock().map_or(usize::MAX, |v| v.len()),
+            retired.lock().map_or(usize::MAX, |v| v.len())
+        )
+    })?;
     let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(first, OriginFetch::AlreadyAdmitted),
-        "the first concurrent pull returned NOTHING — its voucher collided with the \
-         other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+        "first concurrent pull returned {first:?} (expected AlreadyAdmitted); StaleNonce would retire \
+         the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
+         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
+         timeout={} stalled={} recorded={:?} retired={:?}",
+        counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
+        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
+        retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
     let got1 = engine.get(hash).await?;
     let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(second, OriginFetch::AlreadyAdmitted),
-        "the second concurrent pull returned NOTHING — its voucher collided with the \
-         other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+        "second concurrent pull returned {second:?} (expected AlreadyAdmitted); StaleNonce would retire \
+         the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
+         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
+         timeout={} stalled={} recorded={:?} retired={:?}",
+        counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
+        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
+        retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
     let got2 = engine.get(hash2).await?;
     anyhow::ensure!(got1.as_ref() == payload.as_slice(), "blob 1 bytes mismatch");
@@ -13318,18 +13349,39 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
         )
     })
     .await
-    .map_err(|_| anyhow::anyhow!("concurrent top-up pulls never finished"))?;
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "concurrent top-up pulls never finished within 2m — likely stalled frontier or \
+             wedge; topups={:?} pending={} stalled={} timeout={}",
+            topup_log(&fixture.opener).unwrap_or_default(),
+            counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+            counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
+            counter_value(&fixture.metrics, "node_pull_timeout_total").unwrap_or(0)
+        )
+    })?;
 
     let got_a = got_a.map_err(|e| anyhow::anyhow!("fetch A: {e}"))?;
     anyhow::ensure!(
         matches!(got_a, OriginFetch::AlreadyAdmitted),
-        "pull A must deliver, not NotFound"
+        "pull A returned {got_a:?} (expected AlreadyAdmitted); a frontier overshoot past the \
+         delivered bytes splices a gap and surfaces NotFound after the hash check, while a \
+         stalled/timeout budget expiry leaves topup_log empty — got topups={:?} stalled={} \
+         pending={}",
+        topup_log(&fixture.opener).unwrap_or_default(),
+        counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
+        counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0)
     );
     let bytes_a = fixture.engine.get(hash_a).await?;
     let got_b = got_b.map_err(|e| anyhow::anyhow!("fetch B: {e}"))?;
     anyhow::ensure!(
         matches!(got_b, OriginFetch::AlreadyAdmitted),
-        "pull B must deliver, not NotFound"
+        "pull B returned {got_b:?} (expected AlreadyAdmitted); a frontier overshoot past the \
+         delivered bytes splices a gap and surfaces NotFound after the hash check, while a \
+         stalled/timeout budget expiry leaves topup_log empty — got topups={:?} stalled={} \
+         pending={}",
+        topup_log(&fixture.opener).unwrap_or_default(),
+        counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
+        counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0)
     );
     let bytes_b = fixture.engine.get(hash_b).await?;
     // EXACT bytes, which is the whole point: an overshot frontier assembles a blob

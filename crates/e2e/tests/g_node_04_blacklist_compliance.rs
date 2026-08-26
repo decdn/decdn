@@ -75,10 +75,14 @@ use jsonrpsee::http_client::HttpClient;
 
 const MIB: usize = 1024 * 1024;
 
-/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). Its
-/// longest internal poll ladder is 60+60s (the regional leg), which stays under
-/// the ~150s threshold for the heavy tier. Cleanup runs on drop even on timeout.
+/// Journey tiers (see [`decdn_e2e::timeout`] for the tier rule).
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
+/// `removal_lifts_the_deny_but_eviction_is_sticky` needs the heavy tier: its
+/// internal ladder is `60s` evict + `30s` blacklist + `180s` removal convergence
+/// (`60+30+180=270s`), which exceeds the `~150s` heavy threshold and would crowd
+/// the `2×120s=240s` deploy ladder inside `STANDARD 300s` under
+/// `--test-threads 2` contention.
+const REMOVAL_OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 /// EIP-712 typehash string for `ProbeResponse` — must byte-match
 /// `SlashJudge.PROBE_TYPEHASH`.
@@ -115,7 +119,7 @@ async fn regional_scope_transition() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn removal_lifts_the_deny_but_eviction_is_sticky() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_removal_reversal()))
+    tokio::time::timeout(REMOVAL_OVERALL_TIMEOUT, Box::pin(run_removal_reversal()))
         .await
         .context("removal-reversal e2e exceeded the overall timeout")??;
     Ok(())
@@ -334,8 +338,12 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     // free from its `increase_time`; a lone removal tx does not), and mining each
     // round also keeps the watcher's periodic re-scope ticking. The assertion is
     // the robust half — the refusal stops being `HashBlacklisted` while the blob
-    // stays refused — not the exact post-deny code.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    // stays refused — not the exact post-deny code. `180s` survives the `10s`
+    // `isHashBlacklistedForOperator` RPC timeout plus `eth_getLogs` poll jitter
+    // under `--test-threads 2` (previously `90s` flaked, see #1827).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    #[allow(unused_assignments)]
+    let mut last_msg = String::new();
     let mut reverted = false;
     loop {
         time::mine(chain.admin()).await?;
@@ -346,6 +354,7 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
             Ok(_) => anyhow::bail!("fetch of a removed-but-evicted blob unexpectedly succeeded"),
             Err(e) => format!("{e:#}"),
         };
+        last_msg.clone_from(&msg);
         if !msg.contains("HashBlacklisted") {
             reverted = true;
             break;
@@ -358,7 +367,8 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     assert!(
         reverted,
         "removal must lift the governance deny — the refusal must stop being HashBlacklisted \
-         (it returns to the sticky-eviction code) once the entry is gone"
+         (it returns to the sticky-eviction code) once the entry is gone; last refusal was: \
+         {last_msg}"
     );
 
     // The eviction itself is sticky and one-way: the blob is still gone and the
