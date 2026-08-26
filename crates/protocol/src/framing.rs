@@ -237,11 +237,15 @@ async fn read_varint_u32<R: AsyncRead + Unpin>(r: &mut R) -> Result<u32, FrameEr
     Err(FrameError::Varint)
 }
 
-/// Encode `value` as a postcard varint into `out`, returning the number of
-/// bytes written (1..=5). `out` must be at least 5 bytes; the caller
-/// typically uses a stack `[u8; 5]`.
+/// Encode `value` as a postcard varint into the caller's stack buffer, returning
+/// the number of bytes written (1..=5).
+///
+/// A `u32` encodes to at most 5 varint bytes (`ceil(32/7) = 5`), which is why the
+/// buffer is a fixed `[u8; 5]`. The `out.get_mut(idx)` guards exist only to satisfy
+/// the `indexing_slicing` clippy lint — they are unreachable given that bound, and
+/// the `debug_assert` below asserts it.
 #[must_use]
-pub fn encode_varint_u32(mut value: u32, out: &mut [u8; 5]) -> usize {
+pub(crate) fn encode_varint_u32(mut value: u32, out: &mut [u8; 5]) -> usize {
     let mut idx = 0usize;
     loop {
         let byte = (value & 0x7F) as u8;

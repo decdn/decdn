@@ -116,14 +116,11 @@ impl decdn_protocol::client::WireCapability
 pub const fn decdn_protocol::client::WireCapability::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_BYTES: u64
-pub const decdn_protocol::client::CHUNK_DATA_HEADER_MAX: usize
 pub const decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX: usize
 pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
-pub const fn decdn_protocol::client::chunk_frame_postcard_len(usize) -> usize
-pub fn decdn_protocol::client::encode_chunk_data_header(usize, &mut [u8; 6]) -> core::result::Result<usize, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::client::encode_chunk_frame(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::client::encode_chunk_frame_headers(usize, &mut [u8; 11]) -> core::result::Result<usize, decdn_protocol::message::MessageValidationError>
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
@@ -208,7 +205,6 @@ impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMes
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::framing::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::framing::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
-pub fn decdn_protocol::framing::encode_varint_u32(u32, &mut [u8; 5]) -> usize
 pub fn decdn_protocol::framing::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
 pub fn decdn_protocol::framing::parse_frame(&[u8]) -> core::result::Result<core::option::Option<(usize, usize)>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::framing::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
