@@ -869,18 +869,6 @@ async fn run_e2e() -> anyhow::Result<()> {
             auth_after_first.expiry
         )
     })?;
-    // Ensure the persisted `registered_until` is visible to the next
-    // `plan_lanes` before the second delivery. A fixed 100ms sleep previously
-    // masked the race where `store.get` already showed the value but the next
-    // `load_all` snapshot still raced; polling is deterministic.
-    let _ = poll_until(Duration::from_secs(5), || {
-        let store = Arc::clone(&store);
-        async move {
-            let st = store.get(lane_key).ok().flatten()?;
-            (st.registered_until != 0).then_some(())
-        }
-    })
-    .await;
     let watermark_after_first = watermark
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?

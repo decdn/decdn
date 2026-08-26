@@ -9773,10 +9773,10 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     })?;
     let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
-        matches!(first, OriginFetch::AlreadyAdmitted),
+        matches!(&first, OriginFetch::AlreadyAdmitted),
         "first concurrent pull returned {first:?} (expected AlreadyAdmitted); StaleNonce would retire \
          the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
-         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
+          expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
          timeout={} stalled={} recorded={:?} retired={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
@@ -9787,7 +9787,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     let got1 = engine.get(hash).await?;
     let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
-        matches!(second, OriginFetch::AlreadyAdmitted),
+        matches!(&second, OriginFetch::AlreadyAdmitted),
         "second concurrent pull returned {second:?} (expected AlreadyAdmitted); StaleNonce would retire \
          the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
          expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
@@ -13362,7 +13362,7 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
 
     let got_a = got_a.map_err(|e| anyhow::anyhow!("fetch A: {e}"))?;
     anyhow::ensure!(
-        matches!(got_a, OriginFetch::AlreadyAdmitted),
+        matches!(&got_a, OriginFetch::AlreadyAdmitted),
         "pull A returned {got_a:?} (expected AlreadyAdmitted); a frontier overshoot past the \
          delivered bytes splices a gap and surfaces NotFound after the hash check, while a \
          stalled/timeout budget expiry leaves topup_log empty — got topups={:?} stalled={} \
@@ -13374,7 +13374,7 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
     let bytes_a = fixture.engine.get(hash_a).await?;
     let got_b = got_b.map_err(|e| anyhow::anyhow!("fetch B: {e}"))?;
     anyhow::ensure!(
-        matches!(got_b, OriginFetch::AlreadyAdmitted),
+        matches!(&got_b, OriginFetch::AlreadyAdmitted),
         "pull B returned {got_b:?} (expected AlreadyAdmitted); a frontier overshoot past the \
          delivered bytes splices a gap and surfaces NotFound after the hash check, while a \
          stalled/timeout budget expiry leaves topup_log empty — got topups={:?} stalled={} \
