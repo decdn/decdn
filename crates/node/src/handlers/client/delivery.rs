@@ -9,7 +9,7 @@ use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::voucher::StreamAnchor;
-use super::wire::drain_frame;
+use super::wire::{FrameAccountingFault, drain_frame};
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
     Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
@@ -127,7 +127,9 @@ impl ChunkFramer {
         // least one, and the room term floors at a bao chunk group. This restates
         // that floor where the damage would otherwise be silent or misattributed.
         if target == 0 {
-            anyhow::bail!("refusing to cut a zero-length frame");
+            tracing::error!(hash = %self.hash, "serve loop asked for a zero-length frame");
+            return Err(anyhow::Error::new(FrameAccountingFault)
+                .context("refusing to cut a zero-length frame"));
         }
         while !self.drained && self.queued < target {
             match self.stream.next().await {
@@ -160,11 +162,17 @@ impl ChunkFramer {
             return Ok(None);
         }
         let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, target) else {
-            anyhow::bail!(
+            tracing::error!(
+                hash = %self.hash,
+                queued = self.queued,
+                target,
+                "queued byte count disagrees with the queue; refusing to cut a frame"
+            );
+            return Err(anyhow::Error::new(FrameAccountingFault).context(format!(
                 "cut no chunks from {} queued bytes at target {target}; refusing to \
                  report the blob as fully delivered",
                 self.queued
-            );
+            )));
         };
         Ok(Some(frame))
     }
@@ -306,7 +314,8 @@ impl ClientHandler {
         let opening_window = self.credit_window(chunk_bytes, 0);
         let mut next_chunk = chunks
             .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
-            .await?;
+            .await
+            .map_err(|e| self.meter_frame_fault(e))?;
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
         // 003 §Pool solvency). Start the clock at loop entry — admission already
@@ -359,7 +368,8 @@ impl ClientHandler {
                 let room = window.saturating_sub(delivered.saturating_sub(paid));
                 next_chunk = chunks
                     .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
-                    .await?;
+                    .await
+                    .map_err(|e| self.meter_frame_fault(e))?;
             }
             let done_delivering = next_chunk.is_none();
 

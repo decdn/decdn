@@ -155,7 +155,8 @@ impl ClientHandler {
         let opening_window = self.credit_window(chunk_bytes, 0);
         let mut next_chunk = producer
             .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
-            .await?;
+            .await
+            .map_err(|e| self.meter_frame_fault(e))?;
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
         // 003 §Pool solvency). Start the clock at loop entry — admission already
@@ -192,7 +193,8 @@ impl ClientHandler {
                 // Assemble before the write, and outside the metered block: a framing
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
-                let mut bufs = chunk_frame_bufs(&chunk_vec, clen)?;
+                let mut bufs =
+                    chunk_frame_bufs(&chunk_vec, clen).map_err(|e| self.meter_frame_fault(e))?;
                 // A downstream drop surfaces here as `Err` (#856 client-disconnect
                 // shape); meter the client-abandon, then propagate so the caller drops
                 // the pull leg.
@@ -214,7 +216,8 @@ impl ClientHandler {
                 let room = window.saturating_sub(delivered.saturating_sub(paid));
                 next_chunk = producer
                     .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
-                    .await?;
+                    .await
+                    .map_err(|e| self.meter_frame_fault(e))?;
             }
             let done_delivering = next_chunk.is_none();
 

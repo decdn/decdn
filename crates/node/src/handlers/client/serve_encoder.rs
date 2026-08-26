@@ -38,7 +38,7 @@ use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{Notify, mpsc};
 
-use super::wire::drain_frame;
+use super::wire::{FrameAccountingFault, drain_frame};
 
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
 /// first chunk group) before a present-range watch can be opened.
@@ -251,6 +251,11 @@ pub(super) struct CoherentFrameProducer {
     /// is being abandoned, so cutting another frame would bill the client for a
     /// transfer that can never complete. The cache-hit path holds the same rule.
     faulted: bool,
+    /// The blob being served, for the fault log. An encode fault is a node-side
+    /// failure the client only ever sees as a short delivery, so this line is the
+    /// operator's only signal — the cache-hit framer carries the same field for the
+    /// same reason.
+    hash: decdn_cache::Hash,
 }
 
 impl CoherentFrameProducer {
@@ -275,6 +280,7 @@ impl CoherentFrameProducer {
         };
 
         let outboard = session.outboard_reader();
+        let hash = store.hash();
         let data = AwaitingDataReader::new(store, total, session);
         let (tx, rx) = mpsc::channel(ENCODE_CHANNEL_CAP);
         let writer = ChannelWriter { tx };
@@ -294,6 +300,7 @@ impl CoherentFrameProducer {
             queue: VecDeque::new(),
             queued: 0,
             faulted: false,
+            hash,
         }
     }
 
@@ -328,7 +335,9 @@ impl CoherentFrameProducer {
         // term floors at a bao chunk group. This restates that floor where the
         // failure would otherwise be misattributed.
         if target == 0 {
-            anyhow::bail!("refusing to cut a zero-length frame");
+            tracing::error!(hash = %self.hash, "serve leg asked for a zero-length frame");
+            return Err(anyhow::Error::new(FrameAccountingFault)
+                .context("refusing to cut a zero-length frame"));
         }
         loop {
             if self.queued >= target {
@@ -337,9 +346,19 @@ impl CoherentFrameProducer {
             let pumped = match self.pump().await {
                 Ok(v) => v,
                 Err(e) => {
+                    // Poison, and drop the queued bytes: this delivery is over, so
+                    // any further frame would bill for a transfer that cannot
+                    // complete. The client only ever sees a short delivery, so this
+                    // line is the operator's only signal — the cache-hit framer logs
+                    // its own fault the same way.
                     self.faulted = true;
                     self.queue.clear();
                     self.queued = 0;
+                    tracing::error!(
+                        hash = %self.hash,
+                        error = %e,
+                        "coherent range encode faulted; abandoning the delivery"
+                    );
                     return Err(e);
                 }
             };
@@ -365,11 +384,17 @@ impl CoherentFrameProducer {
     /// returning it would tell the serve leg the range is fully delivered.
     fn cut(&mut self, take: usize) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
         let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, take) else {
-            anyhow::bail!(
+            tracing::error!(
+                hash = %self.hash,
+                queued = self.queued,
+                target = take,
+                "queued byte count disagrees with the queue; refusing to cut a frame"
+            );
+            return Err(anyhow::Error::new(FrameAccountingFault).context(format!(
                 "cut no chunks from {} queued bytes at target {take}; refusing to \
                  report the range as fully delivered",
                 self.queued
-            );
+            )));
         };
         Ok(Some(frame))
     }

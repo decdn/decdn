@@ -220,6 +220,18 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("write failed: {e}"))
     }
 
+    /// Meter a serve-side frame-accounting fault and hand the error back unchanged.
+    ///
+    /// Anything else — a store fault, an encode fault, a peer disconnect — passes
+    /// through untouched, so the counter stays a node-bug report rather than a
+    /// mixed-cause one. Wrap every `?` that can surface a [`FrameAccountingFault`].
+    pub(super) fn meter_frame_fault(&self, e: anyhow::Error) -> anyhow::Error {
+        if e.is::<FrameAccountingFault>() {
+            self.metrics.serve_frame_accounting_fault();
+        }
+        e
+    }
+
     /// Put one already-assembled `ChunkData` frame on the wire.
     ///
     /// Every error is an I/O error, which is what lets the cache-miss leg meter a
@@ -253,7 +265,8 @@ impl ClientHandler {
         payload_chunks: &[Bytes],
         total_len: usize,
     ) -> anyhow::Result<()> {
-        let mut bufs = chunk_frame_bufs(payload_chunks, total_len)?;
+        let mut bufs =
+            chunk_frame_bufs(payload_chunks, total_len).map_err(|e| self.meter_frame_fault(e))?;
         self.write_chunk_bufs(send, &mut bufs).await
     }
 }
@@ -284,7 +297,8 @@ pub(super) fn chunk_frame_bufs(
 ) -> anyhow::Result<Vec<Bytes>> {
     if payload_chunks.is_empty() {
         tracing::error!(total_len, "framer handed over an empty chunk payload");
-        anyhow::bail!("refusing to serve an empty chunk payload");
+        return Err(anyhow::Error::new(FrameAccountingFault)
+            .context("refusing to serve an empty chunk payload"));
     }
     let actual: usize = payload_chunks.iter().map(Bytes::len).sum();
     if actual != total_len {
@@ -293,19 +307,51 @@ pub(super) fn chunk_frame_bufs(
             total_len,
             "framer byte count disagrees with its chunks"
         );
-        anyhow::bail!("payload_chunks sum {actual} does not match total_len {total_len}");
+        return Err(anyhow::Error::new(FrameAccountingFault).context(format!(
+            "payload_chunks sum {actual} does not match total_len {total_len}"
+        )));
     }
     let mut hdr = [0u8; decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX];
-    let hdr_len = decdn_protocol::client::encode_chunk_frame_headers(total_len, &mut hdr)
-        .map_err(|e| anyhow::anyhow!("encode chunk header: {e}"))?;
+    let hdr_len =
+        decdn_protocol::client::encode_chunk_frame_headers(total_len, &mut hdr).map_err(|e| {
+            tracing::error!(total_len, error = %e, "chunk header encoder refused a frame");
+            anyhow::Error::new(FrameAccountingFault).context(format!("encode chunk header: {e}"))
+        })?;
     let Some(header) = hdr.get(..hdr_len) else {
-        anyhow::bail!("chunk header length {hdr_len} exceeds its buffer");
+        tracing::error!(
+            hdr_len,
+            cap = decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX,
+            "chunk header encoder reported more bytes than its buffer holds"
+        );
+        return Err(anyhow::Error::new(FrameAccountingFault)
+            .context(format!("chunk header length {hdr_len} exceeds its buffer")));
     };
     let mut bufs = Vec::with_capacity(payload_chunks.len().saturating_add(1));
     bufs.push(Bytes::copy_from_slice(header));
     bufs.extend_from_slice(payload_chunks);
     Ok(bufs)
 }
+
+/// A serve-side refusal caused by the node's own byte accounting rather than by the
+/// store, the encoder, or the peer: a zero frame target, a `queued`/`queue` desync, a
+/// payload whose chunks disagree with the length its header would declare, or a
+/// header the encoder refused.
+///
+/// Every one of those is correct to refuse and therefore silent — the delivery just
+/// ends, which reads to an operator as a client that hung up. Carrying the cause as a
+/// type lets both serve loops meter it (`serve_frame_accounting_fault`) without
+/// misfiling a store fault or a peer disconnect as a node bug. Attach it with
+/// [`anyhow::Error::context`] and recover it with `anyhow::Error::is`.
+#[derive(Debug)]
+pub(super) struct FrameAccountingFault;
+
+impl std::fmt::Display for FrameAccountingFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("serve-side frame accounting fault")
+    }
+}
+
+impl std::error::Error for FrameAccountingFault {}
 
 /// Cut up to `target` bytes off the front of `queue` into the `Bytes` slices that
 /// make up one wire frame, returning them and their total. `queued` is the queue's

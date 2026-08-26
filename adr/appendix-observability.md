@@ -99,6 +99,7 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_streams_failed_total` | Counter | M | planned | `direction, reason` | Failed streams. `reason` values: `hash_mismatch`, `channel_insufficient`, `rate_mismatch`, `blob_too_large`, `evicted`, `timeout`, `protocol_error`, `other`. |
 | `decdn_bytes_served_total` | Counter | M | planned | — | Bytes delivered to clients and downstream nodes (inbound streams from the requester's perspective). |
 | `decdn_bytes_received_total` | Counter | M | planned | — | Bytes received as a client in node-to-node cache-miss pulls. |
+| `decdn_serve_frame_accounting_fault_total` | Counter | R | live | — | Times a serve leg refused to cut or frame a `ChunkData` because its own byte accounting did not add up: a zero frame target, a `queued`/`queue` desync, a payload whose chunks disagree with the length the header would declare, or a header the encoder refused. Each refusal is correct — the delivery aborts without `StreamEnd`, so the client gets no mislabelled frame and pays no closing voucher — which is exactly why it is otherwise invisible: the stream simply ends, and that reads as a client that hung up. This is a **latent-bug report, not a degradation**. Alert on `> 0` and file it rather than tuning anything. |
 
 #### Cache Metrics
 
