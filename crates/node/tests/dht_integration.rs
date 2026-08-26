@@ -165,20 +165,33 @@ impl TestServer {
         (self.accept_task, self.endpoint)
     }
 
-    /// Reap the accept loop and close the endpoint under
-    /// [`support::shutdown`]'s deadline, so the peer is genuinely
-    /// unreachable by the time this returns — the "handler dropped
+    /// Reap the accept loop, close the endpoint under
+    /// [`support::shutdown`]'s deadline, and VERIFY the close landed — so the
+    /// peer is genuinely unreachable by the time this returns.
+    ///
+    /// The check is the point. [`support::shutdown`] warns rather than fails
+    /// when its deadline is breached, because the stranded-driver half of that
+    /// breach is a known open defect (#1675) no test here can fix. For teardown
+    /// that is the right trade. This is not teardown: the "handler dropped
     /// mid-lookup" simulation in `find_providers_tolerates_unreachable_peer`
-    /// reads that ordering as its precondition, and the deadline is what
-    /// stops a stalled close from parking the test until the
+    /// reads "this peer is down" as its PRECONDITION, and a breach would leave
+    /// the peer answering while the scenario passed having exercised nothing.
+    /// Asserting the postcondition keeps that failure loud, and the deadline
+    /// still stops a stalled close from parking the test until the
     /// `.config/nextest.toml` backstop.
     ///
     /// # Errors
     ///
-    /// The accept loop panicked.
+    /// The accept loop panicked, or the endpoint did not close.
     async fn shutdown(self) -> anyhow::Result<()> {
         let (task, endpoint) = self.into_teardown_parts();
-        support::shutdown([task], [&endpoint]).await
+        support::shutdown([task], [&endpoint]).await?;
+        anyhow::ensure!(
+            endpoint.is_closed(),
+            "the peer must be unreachable before the scenario runs, but its endpoint \
+             did not close within the teardown deadline"
+        );
+        Ok(())
     }
 }
 
@@ -267,6 +280,13 @@ async fn prime_iroh_cache(
 /// so the round drain never aborts a peer the RPC layer is still willing
 /// to wait for. These scenarios assert routing, not speed.
 const CONVERGENCE_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The ordering above is the whole point of the constant, so it is pinned here
+/// rather than left to the prose. A `DHT_CLIENT_TIMEOUT` raised past this budget
+/// would silently restore what the split fixes: the round drain pre-empting a
+/// peer the RPC layer is still willing to wait for, with both convergence
+/// scenarios back to measuring loopback latency and still green.
+const _: () = assert!(CONVERGENCE_ROUND_TIMEOUT.as_secs() > client::DHT_CLIENT_TIMEOUT.as_secs());
 
 /// Round budget for [`find_providers_tolerates_unreachable_peer`], where
 /// waiting a round out on a dead peer IS the scenario. Short, so the dead
@@ -465,7 +485,7 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
 /// folds in the live provider's record. The `find_providers` call is
 /// bounded by a wall-clock guard so a regression that *hangs* on an
 /// unresponsive peer surfaces as a clear failure rather than a stuck
-/// test (the lookup legitimately waits rounds out while the dead peer's
+/// test (the lookup legitimately waits a round out while the dead peer's
 /// dial fails, then converges).
 #[tokio::test(flavor = "multi_thread")]
 async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
@@ -507,11 +527,14 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
     let neg = NegativeProbeCache::new();
 
-    // Guard against a hang regression. The dead peer costs the lookup a
-    // full round, and the pass that follows finds no candidates, so this
-    // legitimately spends two `UNREACHABLE_ROUND_TIMEOUT` rounds — see
-    // `UNREACHABLE_HANG_GUARD` for why the guard clears the lookup's own
-    // worst case rather than sitting on it.
+    // Guard against a hang regression. The routing table holds two peers and
+    // `alpha` is 3, so round one queries both: the provider answers at once and
+    // the dead peer never does, which spends one whole
+    // `UNREACHABLE_ROUND_TIMEOUT` on the drain. The next pass then has no
+    // unqueried candidates and breaks BEFORE arming a second round, so one
+    // round is the real cost here — see `UNREACHABLE_HANG_GUARD` for why the
+    // guard is nonetheless sized against the lookup's `MAX_LOOKUP_ROUNDS`
+    // ceiling rather than against this scenario's own path.
     let providers = tokio::time::timeout(
         UNREACHABLE_HANG_GUARD,
         find_providers(

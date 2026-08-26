@@ -1738,10 +1738,8 @@ mod tests {
     /// work future that stays pending for several short intervals, and the
     /// store's `flush_present_record` must fire ONCE PER ELAPSED INTERVAL before
     /// the work resolves — so a crash between the last flush and completion loses
-    /// at most one interval, never the whole in-flight fetch. It also pins the
-    /// single-writer property: only the interval owner flushes (the work future
-    /// never does), and the flushed record equals the durable checkpointed
-    /// prefix reopened from disk.
+    /// at most one interval, never the whole in-flight fetch. The flushed record
+    /// equals the durable checkpointed prefix reopened from disk.
     ///
     /// `start_paused` is what makes the flush count an arithmetic fact rather
     /// than a scheduling one. On the real clock the work future's sleep and the
@@ -1749,9 +1747,10 @@ mod tests {
     /// past the work's deadline finds it already elapsed, and the `biased` select
     /// in `drive_with_interval_flush` prefers completion — so the loop can exit
     /// having flushed once, failing an assertion about periodicity for a reason
-    /// that has nothing to do with periodicity. Under the virtual clock the
-    /// interval's deadlines are the only thing that can advance time, so the tick
-    /// count is fixed by the two durations below.
+    /// that has nothing to do with periodicity. Under the virtual clock time
+    /// advances only to a registered deadline — here the interval's ticks and the
+    /// work's own sleep, and nothing else — so the tick count is fixed by the two
+    /// durations below.
     #[tokio::test(start_paused = true)]
     async fn interval_flush_persists_progress_before_completion() {
         let total = 8 * 1024 * 1024;
@@ -1782,10 +1781,10 @@ mod tests {
 
         // Six ticks, exactly: the immediate first tick is consumed before the
         // loop, leaving deadlines at 20..=120 ms inside the work's 130 ms, and
-        // the virtual clock advances only to those deadlines. The flush is
-        // periodic, not a single completion flush — and an exact count also pins
-        // the single-writer property, since a work future that flushed too would
-        // push this over six.
+        // the virtual clock advances only to those deadlines. 130 is not a
+        // multiple of 20, so the `biased` select never has to adjudicate a tie
+        // at the boundary. The flush is periodic, not a single completion flush;
+        // dropping the pre-loop tick consumption would read as seven.
         let count = flushes.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             count, 6,
