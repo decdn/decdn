@@ -193,12 +193,12 @@ impl ClientHandler {
                 // Assemble before the write, and outside the metered block: a framing
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
-                let mut bufs =
+                let bufs =
                     chunk_frame_bufs(&chunk_vec, clen).map_err(|e| self.meter_frame_fault(e))?;
                 // A downstream drop surfaces here as `Err` (#856 client-disconnect
                 // shape); meter the client-abandon, then propagate so the caller drops
                 // the pull leg.
-                if let Err(e) = self.write_chunk_bufs(send, &mut bufs).await {
+                if let Err(e) = self.write_chunk_bufs(send, bufs).await {
                     self.metrics.node_pull_through_client_abandoned();
                     return Err(e);
                 }

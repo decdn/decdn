@@ -241,26 +241,27 @@ async fn read_varint_u32<R: AsyncRead + Unpin>(r: &mut R) -> Result<u32, FrameEr
 /// the number of bytes written (1..=5).
 ///
 /// A `u32` encodes to at most 5 varint bytes (`ceil(32/7) = 5`), which is why the
-/// buffer is a fixed `[u8; 5]`. The `out.get_mut(idx)` guards exist only to satisfy
-/// the `indexing_slicing` clippy lint — they are unreachable given that bound, and
-/// the `debug_assert` below asserts it.
+/// buffer is a fixed `[u8; 5]` and why the count returned always fits it.
+///
+/// The `out.get_mut(idx)` guards exist to satisfy the `indexing_slicing` clippy lint.
+/// Each one stops the encode rather than dropping a byte and counting it anyway: the
+/// returned length is bytes *written*, never bytes intended, so no caller can be
+/// handed a count that outruns the bytes behind it.
 #[must_use]
 pub(crate) fn encode_varint_u32(mut value: u32, out: &mut [u8; 5]) -> usize {
     let mut idx = 0usize;
     loop {
         let byte = (value & 0x7F) as u8;
         value >>= 7;
-        if value == 0 {
-            if let Some(slot) = out.get_mut(idx) {
-                *slot = byte;
-            }
-            idx = idx.saturating_add(1);
+        let last = value == 0;
+        let Some(slot) = out.get_mut(idx) else {
+            break;
+        };
+        *slot = if last { byte } else { byte | 0x80 };
+        idx = idx.saturating_add(1);
+        if last {
             break;
         }
-        if let Some(slot) = out.get_mut(idx) {
-            *slot = byte | 0x80;
-        }
-        idx = idx.saturating_add(1);
     }
     debug_assert!(idx <= 5, "u32 varint must fit in 5 bytes, idx={idx}");
     idx
@@ -269,7 +270,18 @@ pub(crate) fn encode_varint_u32(mut value: u32, out: &mut [u8; 5]) -> usize {
 async fn write_varint_u32<W: AsyncWrite + Unpin>(w: &mut W, value: u32) -> std::io::Result<()> {
     let mut buf = [0u8; 5];
     let idx = encode_varint_u32(value, &mut buf);
-    w.write_all(buf.get(..idx).unwrap_or(&[])).await
+    // A length prefix that silently shortens to nothing is worse than a failed write:
+    // `write_frame` would put the payload on the wire behind it, the peer would read
+    // the payload's first byte as the length, and the stream — and the cumulative
+    // wire-byte count vouchers are paid against — would desync with no error on
+    // either side. Unreachable while `buf` is `[u8; 5]`; refuse rather than rely on it.
+    let Some(bytes) = buf.get(..idx) else {
+        return Err(std::io::Error::other(format!(
+            "varint length prefix wants {idx} bytes but only {} were encoded",
+            buf.len()
+        )));
+    };
+    w.write_all(bytes).await
 }
 
 #[cfg(test)]

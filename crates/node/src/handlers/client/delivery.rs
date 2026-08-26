@@ -159,6 +159,16 @@ impl ChunkFramer {
             }
         }
         if self.queued == 0 {
+            // `None` is how the serve loop learns the blob is complete, so it must
+            // rest on the queue itself and not only on its counter: an under-counting
+            // `queued` would end a truncated delivery with `StreamEnd` and collect the
+            // closing voucher for it.
+            anyhow::ensure!(
+                self.queue.is_empty(),
+                "queued reads 0 with {} chunks still queued; refusing to report the \
+                 blob as fully delivered",
+                self.queue.len()
+            );
             return Ok(None);
         }
         let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, target) else {

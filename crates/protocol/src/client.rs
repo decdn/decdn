@@ -737,7 +737,9 @@ pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationEr
     // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload.len());
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     }
     // Discriminant, then the `Vec<u8>` field's postcard length prefix, then the
     // bytes. Postcard writes a sequence length as a LEB128 varint: seven bits per
@@ -782,23 +784,31 @@ pub(crate) fn encode_chunk_data_header(
     // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload_len);
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     }
     // The cap above bounds `payload_len` well inside `u32`, so this conversion and
     // the `get_mut` guards below cannot fail. They are `indexing_slicing` lint
     // appeasement; each still errors rather than writing a short header, so a future
     // cap change cannot turn one into a wrong length prefix.
-    let payload_len_u32 = u32::try_from(payload_len)
-        .map_err(|_| MessageValidationError::ChunkTooLarge { len: postcard_len })?;
+    let payload_len_u32 =
+        u32::try_from(payload_len).map_err(|_| MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        })?;
     let Some(slot) = out.get_mut(0) else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     *slot = CHUNK_DATA_DISCRIMINANT;
     let mut varint_buf = [0u8; 5];
     let varint_len = crate::framing::encode_varint_u32(payload_len_u32, &mut varint_buf);
     let total = 1usize.saturating_add(varint_len);
     let (Some(dst), Some(src)) = (out.get_mut(1..total), varint_buf.get(..varint_len)) else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     dst.copy_from_slice(src);
     Ok(total)
@@ -831,23 +841,31 @@ pub fn encode_chunk_frame_headers(
     let hdr_len = encode_chunk_data_header(payload_len, &mut hdr)?;
     let postcard_len = hdr_len.saturating_add(payload_len);
     if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     }
     // As in `encode_chunk_data_header`: the cap bounds this inside `u32` and the
     // slice guards below cannot fail, but each errors rather than writing a short
     // header so a future cap change cannot turn one into a wrong length prefix.
-    let postcard_len_u32 = u32::try_from(postcard_len)
-        .map_err(|_| MessageValidationError::ChunkTooLarge { len: postcard_len })?;
+    let postcard_len_u32 =
+        u32::try_from(postcard_len).map_err(|_| MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        })?;
     let mut framing_buf = [0u8; 5];
     let framing_len = crate::framing::encode_varint_u32(postcard_len_u32, &mut framing_buf);
     let total = framing_len.saturating_add(hdr_len);
     let (Some(dst), Some(src)) = (out.get_mut(..framing_len), framing_buf.get(..framing_len))
     else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     dst.copy_from_slice(src);
     let (Some(dst), Some(src)) = (out.get_mut(framing_len..total), hdr.get(..hdr_len)) else {
-        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+        return Err(MessageValidationError::ChunkTooLarge {
+            frame_len: postcard_len,
+        });
     };
     dst.copy_from_slice(src);
     Ok(total)
@@ -2106,11 +2124,11 @@ mod tests {
         let over = largest + 1;
         assert!(matches!(
             encode_chunk_data_header(over, &mut data_hdr),
-            Err(MessageValidationError::ChunkTooLarge { len }) if len == max + 1
+            Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
         ));
         assert!(matches!(
             encode_chunk_frame_headers(over, &mut frame_hdr),
-            Err(MessageValidationError::ChunkTooLarge { len }) if len == max + 1
+            Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
         ));
     }
 

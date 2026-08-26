@@ -346,19 +346,11 @@ impl CoherentFrameProducer {
             let pumped = match self.pump().await {
                 Ok(v) => v,
                 Err(e) => {
-                    // Poison, and drop the queued bytes: this delivery is over, so
-                    // any further frame would bill for a transfer that cannot
-                    // complete. The client only ever sees a short delivery, so this
-                    // line is the operator's only signal — the cache-hit framer logs
-                    // its own fault the same way.
-                    self.faulted = true;
-                    self.queue.clear();
-                    self.queued = 0;
-                    tracing::error!(
-                        hash = %self.hash,
-                        error = %e,
-                        "coherent range encode faulted; abandoning the delivery"
-                    );
+                    // `pump` poisons on an encode fault, but it is not the only way to
+                    // arrive here, so make the rule hold for every route out.
+                    if !self.faulted {
+                        self.poison(&e);
+                    }
                     return Err(e);
                 }
             };
@@ -372,6 +364,16 @@ impl CoherentFrameProducer {
                 // Encoder finished and channel drained: flush any final partial
                 // frame, then signal completion.
                 if self.queued == 0 {
+                    // `None` is how the serve leg learns the range is complete, so it
+                    // must rest on the queue itself and not only on its counter: an
+                    // under-counting `queued` would end a truncated delivery with
+                    // `StreamEnd` and collect the closing voucher for it.
+                    anyhow::ensure!(
+                        self.queue.is_empty(),
+                        "queued reads 0 with {} chunks still queued; refusing to \
+                         report the range as fully delivered",
+                        self.queue.len()
+                    );
                     return Ok(None);
                 }
                 return self.cut(self.queued);
@@ -428,19 +430,53 @@ impl CoherentFrameProducer {
                     tokio::select! {
                         biased;
                         res = fut.as_mut() => {
-                            // Encoder finished: do NOT re-store `fut`, so its channel
-                            // sender drops and the receiver will drain then end.
-                            res?;
+                            // Either way `fut` is NOT re-stored, so its channel sender
+                            // drops and the receiver drains then ends. That makes a
+                            // finished encoder and a faulted one look identical from
+                            // here, and a later call would read the drained channel as
+                            // "range complete" and answer `None` — which `serve_leg`
+                            // turns into `StreamEnd` over a truncation. Poison on the
+                            // way out so the terminal state cannot be forgotten.
+                            if let Err(e) = res {
+                                self.poison(&e);
+                                return Err(e);
+                            }
                         }
                         recv = self.rx.recv() => {
                             self.enc = Some(fut); // still encoding — keep the future
-                            return Ok(recv);
+                            // The encode future owns the only sender, so while it is
+                            // live the channel cannot close. If it ever did, `None`
+                            // here would read as end-of-range rather than as the
+                            // contradiction it is.
+                            let Some(bytes) = recv else {
+                                anyhow::bail!(
+                                    "coherent encode channel closed while the encoder is still running"
+                                );
+                            };
+                            return Ok(Some(bytes));
                         }
                     }
                 }
                 None => return Ok(self.rx.recv().await),
             }
         }
+    }
+
+    /// Mark the encode terminal and drop the queued bytes.
+    ///
+    /// Not because those bytes are suspect, but because the delivery is being
+    /// abandoned, so cutting another frame would bill the client for a transfer that
+    /// can never complete. The client only ever sees a short delivery, so this log is
+    /// the operator's only signal — the cache-hit framer poisons itself the same way.
+    fn poison(&mut self, e: &anyhow::Error) {
+        self.faulted = true;
+        self.queue.clear();
+        self.queued = 0;
+        tracing::error!(
+            hash = %self.hash,
+            error = %e,
+            "coherent range encode faulted; abandoning the delivery"
+        );
     }
 }
 

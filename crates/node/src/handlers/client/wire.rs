@@ -238,15 +238,16 @@ impl ClientHandler {
     /// failure here as a client abandon (#856) without misfiling a node-side framing
     /// bug as one. Build `bufs` with [`chunk_frame_bufs`] first.
     ///
-    /// `write_all_chunks` empties the `Bytes` it writes, so `bufs` is spent
-    /// afterwards. On `Err` part of the frame may already be on the wire, so the
-    /// caller abandons the delivery rather than retrying.
+    /// `write_all_chunks` empties the `Bytes` it writes, so it takes `bufs` by value:
+    /// what it leaves behind still looks like a frame and is all zero-length, and no
+    /// caller has any use for that. On `Err` part of the frame may already be on the
+    /// wire, so the caller abandons the delivery rather than retrying.
     pub(super) async fn write_chunk_bufs(
         &self,
         send: &mut SendStream,
-        bufs: &mut [Bytes],
+        mut bufs: Vec<Bytes>,
     ) -> anyhow::Result<()> {
-        send.write_all_chunks(bufs)
+        send.write_all_chunks(&mut bufs)
             .await
             .map_err(|e| anyhow::anyhow!("write chunk frame: {e}"))
     }
@@ -265,9 +266,9 @@ impl ClientHandler {
         payload_chunks: &[Bytes],
         total_len: usize,
     ) -> anyhow::Result<()> {
-        let mut bufs =
+        let bufs =
             chunk_frame_bufs(payload_chunks, total_len).map_err(|e| self.meter_frame_fault(e))?;
-        self.write_chunk_bufs(send, &mut bufs).await
+        self.write_chunk_bufs(send, bufs).await
     }
 }
 
@@ -377,21 +378,32 @@ pub(super) fn drain_frame(
         if front_len == 0 {
             break;
         }
+        // `checked_sub`, not `saturating_sub`: clamping `queued` to zero behind a
+        // desync is what would let a later call answer `None` and end a truncated
+        // delivery with `StreamEnd`. Stopping here instead yields a short frame whose
+        // header and billing both match the bytes actually moved, and leaves `queued`
+        // non-zero so the caller's own guard names the desync.
         if front_len <= remaining {
-            let Some(bytes) = queue.pop_front() else {
+            let (Some(next_queued), Some(bytes)) =
+                (queued.checked_sub(front_len), queue.pop_front())
+            else {
                 break;
             };
             remaining = remaining.saturating_sub(front_len);
             total = total.saturating_add(front_len);
-            *queued = queued.saturating_sub(front_len);
+            *queued = next_queued;
             out.push(bytes);
         } else {
-            let Some(front) = queue.front_mut() else {
+            // Check before the split: `split_to` mutates the queue, so bailing after
+            // it would drop the bytes it took.
+            let (Some(next_queued), Some(front)) =
+                (queued.checked_sub(remaining), queue.front_mut())
+            else {
                 break;
             };
             let taken = front.split_to(remaining);
             total = total.saturating_add(taken.len());
-            *queued = queued.saturating_sub(taken.len());
+            *queued = next_queued;
             out.push(taken);
             remaining = 0;
         }

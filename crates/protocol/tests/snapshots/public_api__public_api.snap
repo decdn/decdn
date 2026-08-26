@@ -232,7 +232,7 @@ pub const decdn_protocol::identity::ID_LEN: usize
 pub mod decdn_protocol::message
 pub enum decdn_protocol::message::MessageValidationError
 pub decdn_protocol::message::MessageValidationError::ChunkTooLarge
-pub decdn_protocol::message::MessageValidationError::ChunkTooLarge::len: usize
+pub decdn_protocol::message::MessageValidationError::ChunkTooLarge::frame_len: usize
 pub decdn_protocol::message::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::message::MessageValidationError::EmptyChunk
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
@@ -324,7 +324,7 @@ pub decdn_protocol::FrameError::TooLarge(u32)
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::MessageValidationError
 pub decdn_protocol::MessageValidationError::ChunkTooLarge
-pub decdn_protocol::MessageValidationError::ChunkTooLarge::len: usize
+pub decdn_protocol::MessageValidationError::ChunkTooLarge::frame_len: usize
 pub decdn_protocol::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::MessageValidationError::EmptyChunk
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
