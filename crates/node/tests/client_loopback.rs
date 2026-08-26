@@ -3169,10 +3169,9 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
 }
 
 /// Reused channel: two sequential streams on one channel. The second stream
-/// must resume from the first's cumulative voucher state (nonce/bytes/amount),
-/// not restart at zero — otherwise the node rejects the second voucher as
-/// `StaleNonce`/`BytesRegression`. Validates the `PoolContext.prior_*`
-/// resume fields.
+/// must resume from the first's cumulative voucher state (bytes/amount), not
+/// restart at zero — otherwise the node rejects the second voucher as
+/// `AmountRegression`. Validates the `PoolContext.prior_*` resume fields.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     let payload = vec![0x33u8; 4096];
@@ -3599,12 +3598,12 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 
 /// #1516 pre-serve deposit gate: a known, owned channel whose deposit cannot
 /// cover the first credit window is refused *before* the node signs `ok: true`.
-/// Previously the node signed and streamed a whole window (one voucher
-/// accounting interval) before `stage_voucher`'s `AmountExceedsDeposit` could
-/// fire at the first voucher boundary — a free interval per request, on every
-/// request. The blob exceeds the window, so the gate is what stops the
-/// stream, not the blob running out. The deposit sits one base unit under the
-/// window's cost at `RATE_PER_MB`.
+/// Without the gate the node signs and streams a whole window (one voucher
+/// accounting interval) before the first voucher's pool-solvency check can fire
+/// (`PoolExhausted`) — a free interval per request, on every request. The blob
+/// exceeds the window, so the gate is what stops the stream, not the blob
+/// running out. The deposit sits one base unit under the window's cost at
+/// `RATE_PER_MB`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
     // 6 MiB — larger than one credit window (the ramp floor, one chunk).

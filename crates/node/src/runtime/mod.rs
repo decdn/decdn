@@ -2077,7 +2077,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     // pull on it (#1145 review). Built here, at the single place the pull
                     // paths' deps are assembled, so both paths necessarily share it —
                     // which is the point: a per-pull ledger makes concurrent pulls collide
-                    // on `prior_nonce + 1`. See `buyer_ledgers::BuyerLedgers`.
+                    // on the same cumulative amount. See `buyer_ledgers::BuyerLedgers`.
                     ledgers: Arc::new(crate::buyer_ledgers::BuyerLedgers::default()),
                     // Providers suppressed after a lane-terminal voucher rejection, skipped in
                     // ranking for a fixed window (#1145 review). In-memory, like the negative

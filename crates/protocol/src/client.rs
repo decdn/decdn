@@ -1159,9 +1159,9 @@ pub enum VoucherRejectReason {
     /// a capability voucher scoped to one node redeemed against another.
     /// `PoolError::WrongProvider`.
     WrongProvider,
-    /// Cumulative amount regressed. `PoolError::AmountDecreasing`.
+    /// Cumulative amount regressed. `PoolError::AmountRegression`.
     AmountRegression,
-    /// Cumulative bytes delivered regressed. `PoolError::BytesDecreasing`.
+    /// Cumulative bytes delivered regressed. `PoolError::BytesRegression`.
     BytesRegression,
     /// The signer's remaining spending cap is exhausted — the voucher amount
     /// exceeds what the capability has left to spend (`cap − spent`).
