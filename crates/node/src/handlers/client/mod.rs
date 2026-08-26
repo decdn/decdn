@@ -883,13 +883,15 @@ pub struct ClientHandlerDeps {
     /// drop. `None` (the default and in tests) keeps the floor accounting in-memory
     /// only.
     pub floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
-    /// ADR 041 per-source warming allowance — the SAME `Arc` the buy loop
-    /// ([`crate::node_origin::NodeOriginConfig`]) and eviction hold. On each clean
-    /// serve the handler credits the realized operator margin back to the source
-    /// that speculatively warmed the blob (a no-op for an untagged / non-speculative
-    /// hash). Defaults to a fresh zero-budget allowance (tests): a fresh allowance
-    /// tags nothing, so its credit is inert.
-    pub warming: Arc<crate::warming_allowance::WarmingAllowance>,
+    /// ADR 041 serve-credit boundary in front of the per-source warming
+    /// allowance — the ledger the buy loop
+    /// ([`crate::node_origin::NodeOriginConfig`]) debits and eviction forgets. On
+    /// each clean serve the handler enqueues the realized operator margin for the
+    /// source that speculatively warmed the blob (a no-op for an untagged /
+    /// non-speculative hash), so the stream task never waits on the ledger lock.
+    /// Defaults to an inline sink over a fresh zero-budget allowance (tests): a
+    /// fresh allowance tags nothing, so its credit is inert.
+    pub warming_credit: Arc<dyn crate::warming_allowance::WarmingCreditSink>,
     /// Live operator fee-share (basis points) cell (`FeeRouter.getShares()[0]`), the
     /// `(1 − f)` numerator the ADR 041 serve credit realizes. Defaults to zero
     /// (tests): a zero share credits nothing.
@@ -963,7 +965,9 @@ impl ClientHandlerDeps {
             idle_timeout: None,
             pool_recheck_interval: None,
             floor_loss_store: None,
-            warming: Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
+            warming_credit: Arc::new(crate::warming_allowance::DirectWarmingCreditSink::new(
+                Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
+            )),
             operator_shares: crate::fee_shares::OperatorShares::new(0),
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
         }
@@ -1121,10 +1125,10 @@ pub struct ClientHandler {
     /// [`crate::pool_view::POOL_RECHECK_INTERVAL`]; a shorter value is set at
     /// construction via [`ClientHandlerDeps`] only by tests.
     pool_recheck_interval: Option<Duration>,
-    /// ADR 041 per-source warming allowance, shared with the buy loop and eviction.
-    /// Credited the realized operator margin on each clean serve (a no-op for an
-    /// untagged hash).
-    warming: Arc<crate::warming_allowance::WarmingAllowance>,
+    /// ADR 041 serve-credit sink in front of the per-source warming allowance the
+    /// buy loop and eviction share. Enqueues the realized operator margin on each
+    /// clean serve (a no-op for an untagged hash) without taking the ledger lock.
+    warming_credit: Arc<dyn crate::warming_allowance::WarmingCreditSink>,
     /// Live operator fee-share (basis points), the ADR 041 serve-credit numerator.
     operator_shares: crate::fee_shares::OperatorShares,
     /// Origin-only policy (#1759), set at construction via
@@ -1242,7 +1246,7 @@ impl ClientHandler {
             deposit_refusal_suppressed: AtomicU64::new(0),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
-            warming: deps.warming,
+            warming_credit: deps.warming_credit,
             operator_shares: deps.operator_shares,
             relay_foreign_namespaces: deps.relay_foreign_namespaces,
         })
@@ -1252,16 +1256,19 @@ impl ClientHandler {
     /// speculatively warmed `hash`, for a clean serve of `served_bytes`. The credit
     /// is `(operator_bps / 10_000) · P_sell · MB(served_bytes)`, matching the
     /// buy-loop debit's units. A no-op for an untagged hash (own-namespace or
-    /// non-speculative), so calling it unconditionally on every serve is correct and
-    /// costs one map lookup.
+    /// non-speculative), so calling it unconditionally on every serve is correct.
+    ///
+    /// The arithmetic runs here and the ledger update is enqueued, so this — the
+    /// stream task's last act on a clean completion — costs one bounded
+    /// `try_send` and never waits on the buy loop or the eviction driver.
     fn credit_warming_serve(&self, hash: Hash, served_bytes: u64) {
         let (sell_rate, _floor) = self.rate_bounds.raise_to_floor(self.rate_per_mb);
         let margin_per_mb = sell_rate
             .saturating_mul(u64::from(self.operator_shares.bps()))
             .saturating_div(10_000);
         let mb = served_bytes.div_ceil(decdn_protocol::MB_BYTES);
-        self.warming
-            .credit_serve(*hash.as_bytes(), mb.saturating_mul(margin_per_mb));
+        self.warming_credit
+            .credit(*hash.as_bytes(), mb.saturating_mul(margin_per_mb));
     }
 
     /// The wall-clock cadence for the mid-stream pool-solvency re-check (ADR 003

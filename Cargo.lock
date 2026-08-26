@@ -2697,6 +2697,7 @@ dependencies = [
  "bao-tree",
  "bytes",
  "chacha20poly1305",
+ "dashmap",
  "decdn-bao-range",
  "decdn-config-types",
  "decdn-protocol",

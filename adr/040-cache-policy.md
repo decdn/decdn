@@ -125,6 +125,22 @@ the sketch, and the probationary segment (see below) already serves that
 role. Frequency tracking stays whole-blob; the sketch keys on hash, not on
 byte range.
 
+The sketch is sharded. The counter array is split into independently locked
+shards. A fifth disjoint slice of the key selects the shard. An increment or an
+estimate locks one shard only. Two readers that touch different hashes usually
+do not contend. This matters because the serve path increments the sketch once
+per completed request, and the fill path reads an estimate on each admission
+decision.
+
+Aging uses one node-wide observation clock, not a clock per shard. The node
+counts all observations. Each shard halves its own counters when it is next
+touched, by the number of windows that passed since it last aged. The work stays
+per shard. The cadence stays global. This is necessary because the policies
+compare estimates on one scale: admission tests an estimate against a node-wide
+threshold, and eviction ranks candidates from different shards against each
+other. A shard clocked on its own traffic would age at a rate set by key skew,
+and two blobs of equal true frequency would then get different estimates.
+
 ### Probationary admission (mechanism C)
 
 First sighting of a cache miss admits to the probationary segment. The engine

@@ -765,11 +765,21 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// Live operator fee-share (basis points) cell, seeded from chain at
     /// startup and kept current by the fee-shares watcher.
     operator_shares: crate::fee_shares::OperatorShares,
-    /// ADR 041 per-source warming allowance. The SAME `Arc` the client handler holds
-    /// (for the serve-side realized-margin credit) and the eviction path holds (to
-    /// forget a dropped hash's tag), threaded to
-    /// [`crate::node_origin::NodeOriginConfig`] for the buy-side debit.
+    /// ADR 041 per-source warming allowance. The SAME `Arc` the eviction path
+    /// holds (to forget a dropped hash's tag) and the warming-credit aggregator
+    /// applies serve credits to, threaded to
+    /// [`crate::node_origin::NodeOriginConfig`] for the buy-side debit. The
+    /// client handler reaches it only through a
+    /// [`crate::warming_allowance::WarmingCreditSink`], never directly.
     warming: Arc<crate::warming_allowance::WarmingAllowance>,
+    /// Stop signal for the ADR 041 warming-credit aggregator. Cancelled after
+    /// the router drains on shutdown so the aggregator flushes the credits
+    /// already queued by in-flight serves before it exits.
+    warming_creditor_shutdown: CancellationToken,
+    /// Handle for that aggregator, awaited at shutdown. Held rather than
+    /// detached so a task that died shows up as a join error instead of as
+    /// credits that quietly stop landing.
+    warming_creditor: tokio::task::JoinHandle<()>,
 }
 
 /// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
@@ -1296,9 +1306,17 @@ async fn build_chain_and_handlers(
     // Hint the settlement service on each accepted voucher so a lane's accrued
     // claim is planned into a chunk promptly rather than waiting the self-tick.
     client_deps.redeem_hint = Some(redeem_tx.clone());
-    // ADR 041 serve-credit inputs: the SAME warming allowance the buy loop debits
-    // and the eviction path forgets, plus the live operator fee-share cell.
-    client_deps.warming = Arc::clone(&warming);
+    // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
+    // allowance the buy loop debits and the eviction path forgets, plus the live
+    // operator fee-share cell. The background aggregator behind the sink is what
+    // keeps a serve's final step off the bucket lock those two passes take.
+    let warming_creditor_shutdown = CancellationToken::new();
+    let (warming_credit, warming_creditor) = crate::warming_allowance::spawn_warming_creditor(
+        Arc::clone(&warming),
+        Arc::clone(&infra.node_metrics),
+        warming_creditor_shutdown.clone(),
+    );
+    client_deps.warming_credit = warming_credit;
     client_deps.operator_shares = operator_shares.clone();
     // Origin-only policy (#1759): backend-authoritative own/foreign decision.
     client_deps.relay_foreign_namespaces = cfg.cache.relay_foreign_namespaces;
@@ -1482,6 +1500,8 @@ async fn build_chain_and_handlers(
         serve_economics,
         operator_shares,
         warming,
+        warming_creditor_shutdown,
+        warming_creditor,
     })
 }
 
@@ -2297,8 +2317,10 @@ pub async fn run(
         rpc_watchdog: bg.rpc_watchdog,
         poller: ch.poller,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
+        warming_creditor_shutdown: ch.warming_creditor_shutdown,
         payment_service: ch.payment_service,
         receipt_writer: infra.receipt_writer,
+        warming_creditor: ch.warming_creditor,
         lane_flush_task: infra.lane_flush_task,
         channel_state_store: infra.channel_state_store,
         node_metrics: infra.node_metrics,
@@ -2334,8 +2356,14 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// through drain — see the cancel site in [`shutdown`].
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
     receipt_writer_shutdown: CancellationToken,
+    /// Stop signal for the ADR 041 warming-credit aggregator, cancelled beside
+    /// the receipt writer's once the router has drained.
+    warming_creditor_shutdown: CancellationToken,
     payment_service: PoolSettlementService<P>,
     receipt_writer: tokio::task::JoinHandle<()>,
+    /// The warming-credit aggregator, awaited in the drain phase so the serve
+    /// credits already queued land in the ledger before the runtime returns.
+    warming_creditor: tokio::task::JoinHandle<()>,
     /// Periodic lane-store flush timer, aborted below after one final durable
     /// flush of `channel_state_store`.
     lane_flush_task: tokio::task::JoinHandle<()>,
@@ -2374,8 +2402,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
         rpc_watchdog,
         poller,
         receipt_writer_shutdown,
+        warming_creditor_shutdown,
         payment_service,
         receipt_writer,
+        warming_creditor,
         lane_flush_task,
         channel_state_store,
         node_metrics,
@@ -2506,6 +2536,11 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // is already enqueued and exit; it is awaited in the drain phase below so
     // the audit tail survives shutdown (#803).
     receipt_writer_shutdown.cancel();
+    // Same reasoning for the ADR 041 warming-credit aggregator: no further
+    // serves complete, so no further credits are produced. Let it apply what is
+    // already queued and exit; it is awaited in the drain phase below so a
+    // completed serve's credit is not lost to shutdown timing.
+    warming_creditor_shutdown.cancel();
 
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers arrive and the persisted lane state is final. A pool is
@@ -2589,6 +2624,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // The receipt writer also lives outside `tasks`; same fire-and-forget abort
     // backstop if the drain overruns the deadline (#803).
     let receipt_writer_abort = receipt_writer.abort_handle();
+    // The warming-credit aggregator is in the same position: outside `tasks`,
+    // cancelled above, awaited in the drain, aborted if the drain overruns.
+    let warming_creditor_abort = warming_creditor.abort_handle();
 
     let drain = async {
         while let Some(result) = tasks.join_next().await {
@@ -2599,6 +2637,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
         // and return cleanly; a panic surfaces at `warn` and a cancellation at
         // `debug`, matching how every other drained task is logged.
         log_join_result(receipt_writer.await, "receipt-writer-shutdown");
+        // Await the aggregator for the same reason, and so that a task that
+        // died earlier in the run surfaces here as a join error rather than as
+        // credits that silently stopped landing.
+        log_join_result(warming_creditor.await, "warming-creditor-shutdown");
         // Await the RPC watchdog. We signalled it via oneshot above, so
         // a healthy run resolves cleanly here. A panic surfaces as a
         // warning; cancellation is silent (same as the receipt writer).
@@ -2614,7 +2656,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     } else {
         tracing::warn!(
             deadline = ?SHUTDOWN_DEADLINE,
-            out_of_joinset_aborts = usize::from(watchdog_abort.is_some()) + 1,
+            out_of_joinset_aborts = usize::from(watchdog_abort.is_some()) + 2,
             "graceful shutdown timed out; aborting remaining tasks",
         );
         tasks.abort_all();
@@ -2636,6 +2678,17 @@ async fn shutdown<P: Provider + Clone + 'static>(
             "receipt writer aborted at shutdown deadline; enqueued audit receipts may be lost"
         );
         receipt_writer_abort.abort();
+        // Aborting the aggregator mid-drain discards the still-queued warming
+        // credits. Conservative in the same direction as a `Full` drop — the
+        // affected sources stay more negative than reality until the time refill
+        // catches up — and the allowance is in-memory bookkeeping a restart
+        // rebuilds anyway.
+        tracing::warn!(
+            event = "warming_creditor_aborted",
+            "warming-credit aggregator aborted at shutdown deadline; \
+             queued serve credits are lost"
+        );
+        warming_creditor_abort.abort();
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "abort");
         }

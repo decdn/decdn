@@ -413,8 +413,8 @@ impl AdminState {
     /// Attach the shared ADR 041 warming allowance so `admin_v1_evict` can
     /// forget an evicted hash's `source_of` provenance tag (issue #1751
     /// review). The production runtime calls this once after `new` with the
-    /// SAME `Arc` the buy loop, serve path, and eviction driver share; without
-    /// it, an admin evict leaves the tag in place.
+    /// SAME `Arc` the buy loop, the eviction driver, and the warming-credit
+    /// aggregator share; without it, an admin evict leaves the tag in place.
     #[must_use]
     pub fn with_warming(
         mut self,

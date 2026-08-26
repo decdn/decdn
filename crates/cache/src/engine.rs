@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use bao_tree::ChunkRanges;
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
@@ -183,7 +184,19 @@ struct Inner {
     breakers: Vec<OriginBreaker>,
     max_blob_bytes: u64,
     /// Per-hash last-access timestamps for LRU eviction ordering.
-    access_times: Mutex<HashMap<Hash, Instant>>,
+    ///
+    /// Sharded. A serve completion's [`CacheEngine::record_access`] takes one
+    /// shard's lock, so its cost is independent of the cached-blob count and it
+    /// never queues behind a full-map scan. The scans — `eviction_candidates`
+    /// and `access_times_snapshot` — walk shard by shard and hold one shard at a
+    /// time, so a completion contends only when it lands on the shard the scan
+    /// is inside at that moment.
+    ///
+    /// A scan therefore reads a shard-by-shard view rather than one instant: a
+    /// record that lands while the walk is in progress may or may not appear in
+    /// its result. Recency is advisory input to eviction ordering, and a hash
+    /// missed by one sweep is seen by the next.
+    access_times: DashMap<Hash, Instant>,
     /// In-flight pull-through requests. When a pull is in progress for a hash,
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
@@ -856,13 +869,10 @@ async fn gc_protect_inner(
         // - `evicted` and `probe_holds` recover silently everywhere; for
         //   `evicted` that is load-bearing (skipping would resume serving
         //   a DMCA-takedown hash) and written up at `evict`/`is_evicted`.
-        // - `access_times` is mixed: it recovers where a lost update is
-        //   durability-relevant (`evict`, the LRU delete path) and skips on
-        //   the read/observability paths (`last_accessed`,
-        //   `access_times_snapshot`, `eviction_candidates`, `record_access`). That
-        //   split is a gap, not a design — a poisoned `access_times` makes
-        //   `eviction_candidates` return empty, which stops LRU eviction
-        //   and fills the disk. Tracked separately from #1517.
+        // - `access_times` has no entry here: it is a `DashMap`, so no
+        //   poisoning decision exists to make. A panic while one of its shards
+        //   is locked leaves that shard usable, and every reader and writer
+        //   takes one shard at a time.
         // - `origin_probe_memo` recovers silently via `probe_memo_lock`.
         // - `prev_pre_sweep` (here) is the only metrics-only one: recover
         //   + `warn!`, since the next cycle re-establishes a baseline.
@@ -1155,7 +1165,7 @@ impl CacheEngine {
                 origins,
                 breakers,
                 max_blob_bytes,
-                access_times: Mutex::new(HashMap::new()),
+                access_times: DashMap::new(),
                 inflight: Mutex::new(HashMap::new()),
                 inflight_poison_logged: AtomicBool::new(false),
                 pinned: ArcSwap::from(Arc::new(
@@ -2107,11 +2117,7 @@ impl CacheEngine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(hash);
-        self.inner
-            .access_times
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&hash);
+        self.inner.access_times.remove(&hash);
         self.inner
             .segments
             .lock()
@@ -2237,7 +2243,7 @@ impl CacheEngine {
     ///
     /// Lock structure: the three in-memory probes hit independent
     /// synchronization primitives — `evicted` (`Mutex<HashSet>`),
-    /// `access_times` (`Mutex<HashMap>`), and `pinned` (`ArcSwap`).
+    /// `access_times` (`DashMap`, one shard), and `pinned` (`ArcSwap`).
     /// Each is held for an O(1) lookup; merging them into a single
     /// lock acquisition would require either combining the underlying
     /// data structures (a much larger refactor that would couple
@@ -3353,15 +3359,16 @@ impl CacheEngine {
     /// Return the last access time for `hash`, or `None` if the hash has
     /// never been accessed through [`Self::get`].
     pub fn last_accessed(&self, hash: Hash) -> Option<Instant> {
-        self.inner
-            .access_times
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get(&hash).copied())
+        self.inner.access_times.get(&hash).map(|e| *e.value())
     }
 
-    /// Return a snapshot of all recorded access times. Eviction logic can
-    /// sort by value to determine LRU ordering.
+    /// Collect every recorded access time. Eviction logic can sort by value to
+    /// determine LRU ordering.
+    ///
+    /// Not a point-in-time snapshot: the map is sharded and this walks it shard
+    /// by shard, so a record that lands mid-walk may or may not appear (see the
+    /// `access_times` field docs). Recency is advisory input to eviction
+    /// ordering, so a hash missed by one walk is seen by the next.
     ///
     /// **Note:** this snapshot is the *raw* access map and includes pinned
     /// hashes. Eviction implementations should use
@@ -3370,10 +3377,11 @@ impl CacheEngine {
     /// exposed because tests and observability paths sometimes want the
     /// unfiltered view.
     pub fn access_times_snapshot(&self) -> HashMap<Hash, Instant> {
-        let Ok(guard) = self.inner.access_times.lock() else {
-            return HashMap::new();
-        };
-        guard.clone()
+        self.inner
+            .access_times
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect()
     }
 
     /// Walk every committed blob in the local iroh-blobs store and return its
@@ -3471,7 +3479,7 @@ impl CacheEngine {
         // + governance-denied hash would sit on disk (unservable, since `refuses`
         // blocks it) until the watcher's `evict()` happened to run. These are the
         // lock-free deny halves of `refuses`; `is_evicted` is deliberately NOT
-        // consulted — it would take a second mutex under the `access_times` guard
+        // consulted — it would take a mutex per candidate during the shard walk
         // below for nothing, since `evict` removes the `access_times` entry, so an
         // already-evicted hash is never in this map to begin with.
         let denied = self.inner.denied.load();
@@ -3486,12 +3494,12 @@ impl CacheEngine {
             g.retain(|_, exp| *exp > now);
             g.keys().copied().collect()
         };
-        let Ok(guard) = self.inner.access_times.lock() else {
-            return EvictionCandidates(HashMap::new());
-        };
-        let map = guard
+        let map = self
+            .inner
+            .access_times
             .iter()
-            .filter_map(|(h, t)| {
+            .filter_map(|entry| {
+                let (h, t) = (entry.key(), entry.value());
                 // `held` short-circuits BEFORE the deny carve-out, so a probe-held
                 // hash stays excluded even when denied: a probe-hold is transient
                 // (seconds, self-expiring) and the takedown `evict()` is the
@@ -3539,9 +3547,7 @@ impl CacheEngine {
     /// candidate without counting as a hit sighting; the paired serve emits the
     /// one sighting through [`Self::observe_hit`].
     fn record_access(&self, hash: Hash) {
-        if let Ok(mut guard) = self.inner.access_times.lock() {
-            guard.insert(hash, Instant::now());
-        }
+        self.inner.access_times.insert(hash, Instant::now());
     }
 
     /// Snapshot every on-disk blob keyed by hash with its byte size
@@ -3623,11 +3629,7 @@ impl CacheEngine {
                 return Err(err);
             }
         };
-        self.inner
-            .access_times
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&hash);
+        self.inner.access_times.remove(&hash);
         self.inner
             .segments
             .lock()
@@ -6095,9 +6097,7 @@ mod tests {
         let _ = engine.get(hash).await?;
 
         // Clear the access time so the next get proves a cache-hit path.
-        if let Ok(mut guard) = engine.inner.access_times.lock() {
-            guard.clear();
-        }
+        engine.inner.access_times.clear();
 
         // Read again — this time it's a local hit.
         let _ = engine.get(hash).await?;
@@ -6400,6 +6400,124 @@ mod tests {
         anyhow::ensure!(
             snap.contains_key(&hash),
             "snapshot should contain the accessed hash"
+        );
+        Ok(())
+    }
+
+    /// A serve completion's access record must not wait on a scan of the rest of
+    /// the access map.
+    ///
+    /// `observe_hit` -> `record_access` is the terminal bookkeeping of every
+    /// completed serve, and `eviction_candidates` walks every entry on the
+    /// eviction sweep. The map is sharded, so the two meet on one shard at a
+    /// time: with a scan pinned inside one shard, a record for a hash that lives
+    /// in another shard still lands. Under one map-wide lock that record waits
+    /// for the whole scan, and the bounded wait below expires.
+    #[tokio::test]
+    async fn record_access_does_not_wait_on_a_scan_of_another_shard() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+
+        // Stand in for a scan sitting inside one shard by holding a guard on
+        // that shard. `get_mut` takes the write guard rather than the read guard
+        // `eviction_candidates`' walk takes, which is the stronger hold: if a
+        // record can land against an exclusive guard on another shard, it can
+        // land against a shared one. What is pinned is the shard, which is the
+        // property under test.
+        let scanned = Hash::new(b"the shard under scan");
+        engine.inner.access_times.insert(scanned, Instant::now());
+        let Some(scan_guard) = engine.inner.access_times.get_mut(&scanned) else {
+            anyhow::bail!("the seeded access-time entry must be present");
+        };
+
+        // Find a hash that lives outside the pinned shard: `try_get` reports
+        // `Locked` for that shard alone and `Absent` for every other one.
+        let completing = (0..1024u32).map(|i| Hash::new(i.to_le_bytes())).find(|h| {
+            !matches!(
+                engine.inner.access_times.try_get(h),
+                dashmap::try_result::TryResult::Locked
+            )
+        });
+        let Some(completing) = completing else {
+            anyhow::bail!("no candidate hash landed outside the pinned shard");
+        };
+
+        // Record the completion from another thread so a wait is observable as a
+        // timeout rather than a hung test.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let recorder = {
+            let engine = engine.clone();
+            std::thread::spawn(move || {
+                engine.observe_hit(completing);
+                let _ = tx.send(());
+            })
+        };
+        let landed = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+
+        // Release the scan and reap the recorder before asserting, so a failure
+        // reports rather than leaks the thread.
+        drop(scan_guard);
+        let joined = recorder.join().is_ok();
+
+        anyhow::ensure!(
+            landed,
+            "a serve completion's access record waited on a scan of another shard"
+        );
+        anyhow::ensure!(joined, "the recording thread panicked");
+        anyhow::ensure!(
+            engine.last_accessed(completing).is_some(),
+            "the recorded access must be readable once the scan releases"
+        );
+        Ok(())
+    }
+
+    /// A concurrent record must not make the eviction sweep *lose* a candidate.
+    ///
+    /// The sharded walk gave up point-in-time atomicity on purpose: a record
+    /// landing mid-walk may or may not appear. What it must never do is drop a
+    /// hash that was already in the map when the walk started, because
+    /// `eviction_candidates` is the only source of eviction candidates — a hash
+    /// silently skipped by every sweep is a blob that is never reclaimed, which
+    /// is unbounded disk growth. `DashMap::iter` holds each shard's read guard
+    /// for that shard's traversal, so a concurrent insert can add to a shard the
+    /// walk has not reached but cannot remove from one it has. This pins that.
+    #[tokio::test]
+    async fn a_scan_never_loses_a_candidate_to_a_concurrent_record() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
+
+        // Seed enough hashes to spread across every shard.
+        let seeded: Vec<Hash> = (0..512u32).map(|i| Hash::new(i.to_le_bytes())).collect();
+        for h in &seeded {
+            engine.inner.access_times.insert(*h, Instant::now());
+        }
+
+        // Hammer the map with fresh hashes for the duration of the walk.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let engine = engine.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut i = 1_000_000u32;
+                while !stop.load(Ordering::Relaxed) {
+                    engine.observe_hit(Hash::new(i.to_le_bytes()));
+                    i = i.saturating_add(1);
+                }
+            })
+        };
+
+        let candidates = engine.eviction_candidates();
+        stop.store(true, Ordering::Relaxed);
+        anyhow::ensure!(writer.join().is_ok(), "the recording thread panicked");
+
+        let missing = seeded
+            .iter()
+            .filter(|h| !candidates.contains_key(h))
+            .count();
+        anyhow::ensure!(
+            missing == 0,
+            "the sweep dropped {missing} of {} pre-existing candidates",
+            seeded.len()
         );
         Ok(())
     }
@@ -7012,10 +7130,14 @@ mod tests {
 
         // Touch both hashes via direct access-time insertion (we don't
         // need actual blob content for this test).
-        if let Ok(mut g) = engine.inner.access_times.lock() {
-            g.insert(pinned_hash, Instant::now());
-            g.insert(evictable_hash, Instant::now());
-        }
+        engine
+            .inner
+            .access_times
+            .insert(pinned_hash, Instant::now());
+        engine
+            .inner
+            .access_times
+            .insert(evictable_hash, Instant::now());
 
         let raw = engine.access_times_snapshot();
         anyhow::ensure!(raw.len() == 2, "raw snapshot must include pinned");
@@ -7058,10 +7180,11 @@ mod tests {
             PinnedHashes::new(pinned_set),
         )
         .await?;
-        if let Ok(mut g) = engine.inner.access_times.lock() {
-            g.insert(clean_hash, Instant::now());
-            g.insert(denied_hash, Instant::now());
-        }
+        engine.inner.access_times.insert(clean_hash, Instant::now());
+        engine
+            .inner
+            .access_times
+            .insert(denied_hash, Instant::now());
 
         anyhow::ensure!(
             engine.set_chain_denied_one(denied_hash, true),
@@ -7098,9 +7221,7 @@ mod tests {
             PinnedHashes::new([from_store_hash(hash)].into_iter().collect()),
         )
         .await?;
-        if let Ok(mut g) = engine.inner.access_times.lock() {
-            g.insert(hash, Instant::now());
-        }
+        engine.inner.access_times.insert(hash, Instant::now());
         engine.set_denied(&denied(&[hash]));
         anyhow::ensure!(
             engine.eviction_candidates().contains_key(&hash),
@@ -7116,10 +7237,8 @@ mod tests {
         let h2 = Hash::new(b"two");
 
         let engine = CacheEngine::open(tmp.path(), Vec::new(), 10).await?;
-        if let Ok(mut g) = engine.inner.access_times.lock() {
-            g.insert(h1, Instant::now());
-            g.insert(h2, Instant::now());
-        }
+        engine.inner.access_times.insert(h1, Instant::now());
+        engine.inner.access_times.insert(h2, Instant::now());
 
         // No pinning yet — both candidates.
         anyhow::ensure!(engine.eviction_candidates().len() == 2);
