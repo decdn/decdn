@@ -307,7 +307,7 @@ impl SignerFloorState {
     }
 }
 
-/// Per-pool floor-credit accounting (ADR 003 §Pool solvency). `live_reservation`
+/// One pool's floor-credit accounting (ADR 003 §Pool solvency). `live_reservation`
 /// is the `µUSDC` currently reserved by in-flight streams — ephemeral, cleared on
 /// restart since no stream is live then; `dead_charge` is the durable, cumulative
 /// unrecoverable floor loss, persisted in a [`decdn_incentive::PoolFloorLossStore`]
@@ -319,11 +319,6 @@ impl SignerFloorState {
 /// the sum of the signer entries: every charge and release touches both levels
 /// under one lock hold, and bring-up rebuilds the pool total by folding the
 /// persisted signer rows.
-// The floor accumulator, its RAII guard, and their accessors form the serve
-// path's pool-solvency surface. They are self-contained and unit-tested on their
-// own; the serve loop is their only caller and does not reach them yet, so
-// `dead_code` is allowed on the not-yet-called surface.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub(super) struct PoolFloorState {
     live_reservation: U256,
@@ -362,7 +357,6 @@ impl PoolFloorState {
 /// then persists the new dead total best-effort. Mirrors [`LaneSlot`]: the
 /// reservation is owned by the guard and never adjusted by hand, and every counter
 /// update saturates.
-#[allow(dead_code)]
 pub(super) struct FloorReservation {
     map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
     store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
@@ -392,7 +386,6 @@ pub(super) struct FloorReservation {
     settled: AtomicBool,
 }
 
-#[allow(dead_code)]
 impl FloorReservation {
     /// Reserve `reserved` `µUSDC` of the pool's budget. Charges
     /// `live_reservation += reserved` (saturating) under the sync lock — an O(1) map
@@ -400,6 +393,13 @@ impl FloorReservation {
     /// serve path (mirrors `lane_metrics_refresh`). A poisoned lock recovers the
     /// guard rather than panicking; the reservation is best-effort accounting, never
     /// a safety gate.
+    ///
+    /// The standalone increment-then-build form, used only by the accumulator's
+    /// own unit tests. The serve path admits through
+    /// [`ClientHandler::try_reserve_floor`] instead, which needs the increment to
+    /// happen inside its own check-and-reserve lock hold and so builds the guard
+    /// via [`Self::new_charged`].
+    #[allow(dead_code)]
     fn reserve(
         map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
         store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
@@ -1140,17 +1140,15 @@ pub struct ClientHandler {
     /// overwrites a fresher lane count with its own staler read. Held across a map
     /// length read and one gauge set, never across an `.await`.
     lane_metrics_refresh: Mutex<()>,
-    /// Per-pool floor-credit accumulator (ADR 003 §Pool solvency). Guards an O(1)
+    /// Two-level floor-credit accumulator (ADR 003 §Pool solvency): per pool, and
+    /// per signer within each pool. Guards an O(1)
     /// map only and is never held across `.await` — a plain `std::sync::Mutex`, so
     /// a [`FloorReservation`]'s `Drop` can reconcile under it (a tokio mutex cannot
     /// be locked in `Drop`). Hydrated from `floor_loss_store` at construction.
-    #[allow(dead_code)]
-    // read by the serve path via `reserve_floor` / `pool_budget_covers_reserve`
     pool_floor: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>>,
     /// Durable mirror of each pool's `dead_charge`; `None` in tests (in-memory
     /// only). A [`FloorReservation`]'s `Drop` writes the new dead total here
     /// best-effort.
-    #[allow(dead_code)] // handed to each `FloorReservation` by `reserve_floor`
     floor_loss_store: Option<Arc<dyn decdn_incentive::PoolFloorLossStore>>,
     /// Per-signer share of a pool's refundable headroom, in basis points
     /// (see [`ClientHandlerDeps::pool_floor_signer_share_bps`]). Read by
@@ -1820,9 +1818,12 @@ impl ClientHandler {
     /// stream. The serve loop holds the returned guard for the stream's lifetime:
     /// it notes the stream's unpaid balance as it delivers and releases the
     /// reservation once a floor is repaid; on drop the guard reconciles the live
-    /// reservation and any residual dead charge against the per-pool accumulator
-    /// (and the durable [`Self::floor_loss_store`]).
-    #[allow(dead_code)] // the serve loop opens a reservation per admitted stream
+    /// reservation and any residual dead charge against BOTH levels of the
+    /// accumulator — the pool total and this signer's entry — and against the
+    /// durable [`Self::floor_loss_store`].
+    // Test-only: the serve path admits through `try_reserve_floor`, which checks
+    // both floor caps and reserves under one lock hold.
+    #[allow(dead_code)]
     pub(super) fn reserve_floor(
         &self,
         pool_id: B256,
@@ -1875,7 +1876,6 @@ impl ClientHandler {
     /// signer identities draw on the pool. The signer sub-cap is isolation: it stops
     /// one capability-holder's abandoned streams from consuming the headroom its
     /// co-tenants need.
-    #[allow(dead_code)] // the serve-path admission gate consults this before reserving
     pub(super) fn floor_budget_covers(
         &self,
         pool_id: B256,
@@ -1968,16 +1968,17 @@ impl ClientHandler {
     }
 
     /// Drop a reclaimed pool's floor-credit accounting: remove its in-memory
-    /// `PoolFloorState` and its durable `dead_charge` row. Called once when a pool
-    /// is reclaimed on-chain; a reclaimed `pool_id` never recurs (monotonic open
-    /// nonce), so its accumulated `dead_charge` is permanently moot.
+    /// `PoolFloorState`, which carries every signer entry with it, and every one of
+    /// its durable `dead_charge` rows. Called once when a pool is reclaimed
+    /// on-chain; a reclaimed `pool_id` never recurs (monotonic open nonce), so the
+    /// `dead_charge` accumulated against it by any signer is permanently moot.
     ///
     /// A [`FloorReservation`] drop that snapshotted its total before the in-memory
     /// remove here can still have its `record_loss` in flight when the durable
     /// delete commits. The store closes that window, not this method:
-    /// `forget_loss` tombstones the pool id, so the late write is a no-op instead
-    /// of resurrecting a row for a closed pool that nothing would ever delete
-    /// again (#1781).
+    /// `forget_loss` tombstones the pool id — pool-wide, covering every signer on
+    /// it — so the late write is a no-op instead of resurrecting a row for a closed
+    /// pool that nothing would ever delete again (#1781).
     pub(crate) async fn forget_pool_floor(&self, pool_id: B256) {
         {
             let mut guard = self

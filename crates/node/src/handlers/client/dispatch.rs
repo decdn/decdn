@@ -1043,11 +1043,12 @@ impl ClientHandler {
         // A direct-serve HIT reaches this gate with no reservation yet (the miss
         // legs, which spend, open theirs pre-fill above). Open it HERE, span-capped
         // to `guard_bytes`, via [`ClientHandler::try_reserve_floor`] — its
-        // `remaining − M ≥ committed + reserved` check both admits the stream and
-        // bounds the pool's cumulative cross-lane floor credit. A miss-fill stream
+        // two-level check — `remaining − M ≥ committed + reserved` pool-wide, and
+        // this signer's own share — both admits the stream and bounds the pool's
+        // cumulative cross-lane floor credit. A miss-fill stream
         // already holds its reservation, so re-validate solvency against the pool's
         // already-committed floor credit (`live_reservation + dead_charge`) via
-        // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
+        // [`ClientHandler::floor_budget_covers`] with `new_reserve = 0` — the
         // same stateful check the mid-stream gate applies, so a `dead_charge` that
         // grew since the reservation refuses here rather than serving a free interval.
         //
