@@ -783,7 +783,7 @@ pub fn encode_chunk_data_header(
     if let Some(slot) = out.get_mut(0) {
         *slot = CHUNK_DATA_DISCRIMINANT;
     } else {
-        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
     }
     let mut varint_buf = [0u8; 5];
     let varint_len = crate::framing::encode_varint_u32(
@@ -792,7 +792,7 @@ pub fn encode_chunk_data_header(
     );
     let total = 1usize.saturating_add(varint_len);
     if total > out.len() {
-        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
     }
     if let Some(dst) = out.get_mut(1..total)
         && let Some(src) = varint_buf.get(..varint_len)
