@@ -5974,22 +5974,19 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
 
     // Both silent candidates were classified as stalls (not as our own deadline firing),
     // which is what proves they were abandoned on the STALL bound — the stage whose budget
-    // this test exists to protect — rather than on some other clock. `counter_value`
-    // with a short poll absorbs the one-tick delay between the pull finishing and the
-    // metrics scrape under `cargo llvm-cov` parallel load.
-    let stalled = {
+    // this test exists to protect — rather than on some other clock. Poll for the exact
+    // count to absorb the one-tick delay between the pull finishing and the metrics
+    // scrape under `cargo llvm-cov` parallel load, but keep the guard strict at
+    // exactly 2 — extra stalls would indicate a regression.
+    {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
         let mut v = counter_value(&b_metrics, "node_pull_stalled_total")?;
-        while v < 2 && tokio::time::Instant::now() < deadline {
+        while v != 2 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
             v = counter_value(&b_metrics, "node_pull_stalled_total")?;
         }
-        v
-    };
-    anyhow::ensure!(
-        stalled >= 2,
-        "expected at least 2 stalled candidates, got {stalled}"
-    );
+    }
+    assert_counter(&b_metrics, "node_pull_stalled_total", 2)?;
     assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
 
     shutdown([task_a, task_s1, task_s2], [&ep_b, &ep_a, &ep_s1, &ep_s2]).await?;
