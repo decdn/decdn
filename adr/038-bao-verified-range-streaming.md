@@ -7,7 +7,7 @@
 
 `cdn/client/v1` currently verifies integrity with a **flat, sequential** BLAKE3 hash: the receiver feeds bytes into one `blake3::Hasher` in order and compares the digest to the requested content hash, either after `StreamEnd` (buffered) or at finalization (progressive). A flat digest commits only to the whole blob and is inherently sequential — byte `N` cannot be verified without bytes `0..N`. This blocks two needed capabilities:
 
-- **Verified resume.** [ADR 005 § `cdn/client/v1`](005-protocol.md#cdnclientv1--paid-delivery-protocol) has a failover requester "resume from the last BLAKE3-verified byte." A flat hasher cannot honor this: a request starting at `byte_offset > 0` has no earlier bytes to hash, so a corrupt tail on a resumed range cannot be rejected until the client eventually holds the entire blob.
+- **Verified resume.** [ADR 005 § Seek and resume](005-protocol.md#seek-and-resume) has a failover requester "resume from the last BLAKE3-verified byte." A flat hasher cannot honor this: a request starting at `byte_offset > 0` has no earlier bytes to hash, so a corrupt tail on a resumed range cannot be rejected until the client eventually holds the entire blob.
 - **Parallel multi-source fetch.** Disjoint ranges from different nodes cannot be checked against the content address independently, so one lying source poisons the assembled result with no localized rejection.
 
 BLAKE3 is a Merkle tree, not a flat hash: the requested content hash **is** the root of a binary tree over the blob's chunks. Given the interior nodes (the **outboard**), any range verifies against the root with an `O(log n)` proof, no earlier bytes required. This is the bao verified-streaming format, and it closes both gaps.
@@ -83,7 +83,7 @@ Range-addressed discovery — advertising "I hold bytes `[a, b)` of `H`" on `cdn
 ## Cross-ADR Impact
 
 - [ADR 002 § Content Addressing](002-content-addressing.md#adr-002-content-addressing): the "verify every received blob against its known hash" invariant becomes per-range Merkle verification against the BLAKE3 root, not only a whole-blob digest. Content-addressing identity and hash canonicity are unchanged.
-- [ADR 005 § `cdn/client/v1`](005-protocol.md#cdnclientv1--paid-delivery-protocol): `ChunkData` carries the bao interleaved encoding rather than raw bytes — the concrete realization of the "Relationship to iroh-blobs" note and the resume-from-last-verified-byte guarantee. The envelope is unchanged.
+- [ADR 005 § `cdn/client/v1`](005-protocol.md#cdnclientv1--paid-delivery-protocol): `ChunkData` carries the bao interleaved encoding rather than raw bytes — the concrete realization of the "Relationship to iroh-blobs" note and the [§ Seek and resume](005-protocol.md#seek-and-resume) resume-from-last-verified-byte guarantee. The envelope is unchanged.
 - [ADR 037 § Node serving](037-regional-proxy-warming.md#node-serving-window-paced-pull-through): supplies the partial-blob bao range store/serving that proxy-warming names first-class but defers — a resumed cache-miss (`byte_offset > 0`) is served and verified as a range instead of the buffered whole-blob path. Window-paced pull-through and its ramped credit window are unchanged.
 - [ADR 022 § Content Discovery](022-content-discovery.md#adr-022--content-discovery-at-scale): unchanged. Discovery stays hash-level; range-addressed availability stays deferred, and the [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1) scheduler operates over full holders only.
 

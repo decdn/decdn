@@ -14,8 +14,8 @@
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
 //!     signed body fields `{hash, ok, rate_per_mb, total_bytes, pool_id,
-//!     timestamp_us}` (ADR 014 §1), produced by the stream-response
-//!     slash signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
+//!     timestamp_us}` (ADR 014 §1), produced by the stream-response slash
+//!     signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
 //!     `error` is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
 //!     carries `{signature, amount}` and the receiver reconstructs the full typed

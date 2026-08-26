@@ -14,9 +14,9 @@
 //! contract recovers signatures against. `hash` and `channel_id` are
 //! request-context fields (from the `StreamRequest`); in this implementation's
 //! wire shape they are echoed back in
-//! `decdn_protocol::StreamResponseBody.{hash,channel_id}` and are part of the
-//! EIP-712 signed set — a verifier reconstructs the typed data from the
-//! response body's own fields.
+//! `decdn_protocol::StreamResponseBody.{hash,pool_id}` — the contract names the
+//! latter `channelId` — and are part of the EIP-712 signed set: a verifier
+//! reconstructs the typed data from the response body's own fields.
 //!
 //! # Domain
 //!

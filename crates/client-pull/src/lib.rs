@@ -13,17 +13,16 @@
 //! Mirrors [`probe::probe_once`] in spirit, but for the paid path: it signs
 //! vouchers, so it needs the incentive layer and a signer.
 //!
-//! # Scope
+//! # Bao verified-range decoding (ADR 038)
 //!
-//! - **Bao verified-range decoding** (ADR 038): the `ChunkData` payload is bao's
-//!   interleaved verified-stream encoding, not raw bytes. The buffered path feeds
-//!   the reassembled stream to a `bao-tree` verifying decoder that checks every
-//!   chunk group against the requested content-hash root, so a range fetched at
-//!   any `byte_offset > 0` self-verifies (a corrupt tail is rejected) with no
-//!   dependency on earlier bytes — closing the old resume gap. The progressive
-//!   (window pull-through) path forwards the bao stream verbatim and tees it into
-//!   the cache's verifying decoder (`import_and_verify_stream`), which checks the
-//!   cached copy against the same root.
+//! The `ChunkData` payload is bao's interleaved verified-stream encoding, not
+//! raw bytes. The buffered path feeds the reassembled stream to a `bao-tree`
+//! verifying decoder that checks every chunk group against the requested
+//! content-hash root, so a range fetched at any `byte_offset > 0` self-verifies
+//! (a corrupt tail is rejected) with no dependency on earlier bytes. The
+//! progressive (window pull-through) path forwards the bao stream verbatim and
+//! tees it into the cache's verifying decoder (`import_and_verify_stream`),
+//! which checks the cached copy against the same root.
 
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.

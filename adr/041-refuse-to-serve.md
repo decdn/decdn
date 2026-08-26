@@ -149,8 +149,8 @@ When no candidate clears the ceiling, or when discovery returns no holder at
 all, the node refuses and closes. The node returns the same `NotFound` the wire
 already uses for a miss, so the node's pricing floor does not leak. The node
 distinguishes the below-margin case from an empty miss only in a local metric,
-never on the wire. The node emits no route hint. A redirect field would be an
-attack surface: a node could steer clients to a colluding, expensive peer.
+never on the wire. The node emits no route hint. A route hint is an attack
+surface, because a node can steer clients to a colluding, expensive peer.
 Clients stay trustless of node routing advice and re-route through their own
 failover ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality),
 [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
