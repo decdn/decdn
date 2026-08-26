@@ -641,6 +641,7 @@ impl ClientHandler {
                 // Skipped for an unknown lane — `pull_authorized` refuses those
                 // before every tier, so no spend happens there anyway.
                 if known_lane.is_some()
+                    && let Some(key) = lane_key
                     && let Some(status) = pool_status
                 {
                     // Reserve the un-self-funded credit this stream fronts before it
@@ -657,12 +658,9 @@ impl ClientHandler {
                     };
                     let reserved = decdn_incentive::min_payment(reserved_bytes, rate_per_mb);
                     let pool_id = B256::from(req.pool_id);
-                    // `known_lane.is_some()` above proves a verified signer, so the
-                    // lane key resolved; an unbound request never reaches this tier.
-                    let signer = lane_key.map_or(Address::ZERO, |k| k.signer);
                     match self.try_reserve_floor(
                         pool_id,
-                        signer,
+                        key.signer,
                         status.remaining,
                         rate_per_mb,
                         reserved,
