@@ -189,26 +189,26 @@ impl EvictionPolicy for TinyLfuEviction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn h(b: u8) -> Hash {
-        Hash::from([b; 32])
+    fn h(i: u32) -> Hash {
+        Hash::new(i.to_le_bytes())
     }
 
     #[test]
     fn observe_and_estimate_round_trip() {
         let est = TinyLfuEstimator::new(1024);
         for _ in 0..3 {
-            est.observe(h(42));
+            est.observe(h(42u32));
         }
-        assert!(est.estimate(h(42)) >= 3);
-        assert_eq!(est.estimate(h(43)), 0);
+        assert!(est.estimate(h(42u32)) >= 3);
+        assert_eq!(est.estimate(h(43u32)), 0);
     }
 
     #[test]
     fn tinylfu_evicts_least_frequent_first_not_least_recent() {
         let freq: std::sync::Arc<dyn FrequencyEstimator> =
             std::sync::Arc::new(TinyLfuEstimator::new(4096));
-        let hot = h(1);
-        let cold = h(2);
+        let hot = h(1u32);
+        let cold = h(2u32);
         for _ in 0..20 {
             freq.observe(hot);
         } // hot: high frequency, touched long ago
@@ -251,7 +251,7 @@ mod tests {
             promotion_threshold: 2,
         };
         let ctx = crate::policy::AdmissionContext {
-            hash: h(1),
+            hash: h(1u32),
             known_size: None,
         };
         assert!(matches!(
@@ -260,8 +260,8 @@ mod tests {
                 segment: crate::policy::Segment::Probation
             }
         ));
-        freq.observe(h(1));
-        freq.observe(h(1));
+        freq.observe(h(1u32));
+        freq.observe(h(1u32));
         assert!(matches!(
             pol.admit(&ctx),
             crate::policy::AdmissionDecision::Store {
@@ -273,8 +273,8 @@ mod tests {
     #[test]
     fn plan_promotes_hot_probation_member() {
         let freq: Arc<dyn FrequencyEstimator> = Arc::new(TinyLfuEstimator::new(4096));
-        let hot = h(1);
-        let cold = h(2);
+        let hot = h(1u32);
+        let cold = h(2u32);
         freq.observe(hot);
         freq.observe(hot); // hot: estimate >= threshold(2)
         // cold: estimate 0 (< threshold)
@@ -303,8 +303,8 @@ mod tests {
     #[test]
     fn plan_caps_probation() {
         let freq: Arc<dyn FrequencyEstimator> = Arc::new(TinyLfuEstimator::new(4096));
-        let a = h(1);
-        let b = h(2);
+        let a = h(1u32);
+        let b = h(2u32);
         // both cold, no promotion. sizes push probation footprint over cap.
         let now = std::time::Instant::now();
         let mut cmap = std::collections::HashMap::new();
