@@ -855,11 +855,10 @@ where
 /// the top of `serve` and observes `APP_ERR_RATE_LIMITED` on its
 /// `CONNECTION_CLOSE`.
 ///
-/// Draining the bucket directly — rather than via a throwaway first connection
-/// that races a second one — keeps this deterministic: the earlier
-/// two-connection form flaked under `nextest` because the second connection's
-/// establishment raced the first's teardown on the shared client endpoint, and
-/// the accept loop assumed it would receive exactly two `Incoming`s.
+/// Draining the bucket out of band is what keeps this deterministic: the test
+/// opens no throwaway connection to charge the bucket, so nothing races the one
+/// live connection's establishment, and the accept loop assumes no connection
+/// count.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()> {
     let server_sk = fresh_key();
@@ -896,10 +895,11 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
-    // Accept in a loop: `observe_rate_limit_close` may open more than one
-    // connection to ride out the rare loopback close-frame race (#1594), so the
-    // server must service each. Per-connection errors are swallowed so one
-    // transient teardown never tears down the accept loop.
+    // Accept in a loop, with no assumption about how many connections arrive:
+    // `observe_rate_limit_close` may open more than one to ride out the rare
+    // loopback close-frame race (#1594), so the server must service each.
+    // Per-connection errors are swallowed so one transient teardown never tears
+    // down the accept loop.
     let accept_task = tokio::spawn(async move {
         while let Some(incoming) = server_ep_bg.accept().await {
             let Ok(connecting) = incoming.accept() else {
@@ -960,9 +960,9 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
 /// `NodeId` is pre-drained out-of-band via `ProbeRateLimiter::check` (the
 /// per-peer layer is keyed by `NodeId` independent of IP, so this is robust to
 /// loopback path selection). The single live connection from that `NodeId` is
-/// then unconditionally rejected at the per-peer layer. Draining directly —
-/// rather than via a throwaway first connection — keeps this deterministic, the
-/// same rationale as `probe_rate_limit_returns_rate_limited_close_code`.
+/// then unconditionally rejected at the per-peer layer. Draining out of band
+/// keeps this deterministic, the same rationale as
+/// `probe_rate_limit_returns_rate_limited_close_code`.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
     let server_sk = fresh_key();
@@ -1008,9 +1008,10 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
-    // Loop-accept for the same reason as the per-source test: the bounded retry
-    // in `observe_rate_limit_close` may open more than one connection to ride
-    // out the #1594 close-frame race.
+    // Loop-accept for the same reason as the per-source test, and with the same
+    // absence of a count assumption: the bounded retry in
+    // `observe_rate_limit_close` may open more than one connection to ride out
+    // the #1594 close-frame race.
     let accept_task = tokio::spawn(async move {
         while let Some(incoming) = server_ep_bg.accept().await {
             let Ok(connecting) = incoming.accept() else {

@@ -139,7 +139,18 @@ pub async fn local_endpoint(
 }
 
 /// How long teardown has, in total, to reap every task and drain every endpoint.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// It must CLEAR `node_origin::abandon_drain::ABANDON_DRAIN_CAP`, not match it. An
+/// abandoned pull leg waits up to that cap for its upstream connections to reach
+/// their drained state, and [`Endpoint::close`] waits on the same event — so an
+/// equal budget lets one ceilinged drain consume the whole of teardown before the
+/// first close is even attempted, and the breach line then reports `0/M endpoints
+/// closed` for a run in which nothing was wedged. That is a false stranded-driver
+/// report on the one channel that keeps #1675 visible. The margin here is what
+/// keeps the two readings distinguishable; it tracks
+/// `runtime::SHUTDOWN_DEADLINE`, and both sit far below the
+/// `.config/nextest.toml` backstop.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Own a test's whole iroh teardown: abort `tasks`, reap them, then close
 /// `endpoints` — all under one shared deadline.

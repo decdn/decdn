@@ -85,11 +85,21 @@ impl NegativeProbeCache {
     ///
     /// Production code uses [`Self::new`] (the ADR 001 § Probe cache
     /// 1024-entry, 5-minute defaults); this constructor is the test /
-    /// tuning seam. Integration tests in particular need it: the TTL
+    /// tuning seam, and it is for a test whose subject is the
+    /// CACHE-WIDE TTL itself. `node_origin`'s refusal suite is that
+    /// case: it shrinks the cache TTL below
+    /// `node_origin::REFUSAL_SUPPRESSION_TTL` to invert the production
+    /// order, which is the only arrangement in which the two
+    /// suppression arms have visibly different lifetimes.
+    ///
+    /// A test that needs one ENTRY expired does not need this. The TTL
     /// is anchored on [`std::time::Instant`], so `tokio::time` pause /
-    /// advance has no effect on it, and the only way to exercise
-    /// expiry deterministically without a multi-minute wall-clock wait
-    /// is to inject a short TTL here. `cap` is clamped to ≥ 1.
+    /// advance has no effect on it — but entries hold an absolute
+    /// expiry, so [`Self::record_failure_with_ttl`] with
+    /// [`Duration::ZERO`] stamps an already-elapsed expiry on a single
+    /// key, and [`Self::contains_active`] sweeps it on the next read.
+    ///
+    /// `cap` is clamped to ≥ 1.
     #[must_use]
     pub fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
         let cap = cap.max(1);
