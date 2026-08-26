@@ -1874,8 +1874,11 @@ impl ClientHandler {
     ///
     /// The pool ceiling is the solvency bound and holds regardless of how many
     /// signer identities draw on the pool. The signer sub-cap is isolation: it stops
-    /// one capability-holder's abandoned streams from consuming the headroom its
-    /// co-tenants need.
+    /// one capability-holder's abandoned streams from consuming the WHOLE pool's
+    /// floor budget. It bounds each identity's draw rather than guaranteeing any
+    /// co-tenant a slice — the caps sum to `N × share` across `N` signers, so on a
+    /// pool with more than `10_000 / share_bps` of them the pool ceiling still binds
+    /// first.
     pub(super) fn floor_budget_covers(
         &self,
         pool_id: B256,
