@@ -493,6 +493,13 @@ mod tests {
 
     /// Cutting a frame moves whole items and splits only the one the frame ends in,
     /// leaving `queued` equal to the bytes still in the queue.
+    ///
+    /// The chunk COUNTS are the load-bearing assertions. `total` is computed from the
+    /// same lengths a sum over the result would re-add, so checking one against the
+    /// other proves nothing; what the zero-copy path actually rests on is that a frame
+    /// spanning two queued items arrives as two `Bytes` rather than one coalesced
+    /// buffer. A `drain_frame` rewritten to concatenate would satisfy every other
+    /// assertion in this file.
     #[test]
     fn drain_frame_cuts_at_the_target_and_keeps_the_remainder() {
         let mut queue: std::collections::VecDeque<Bytes> =
@@ -503,17 +510,97 @@ mod tests {
 
         let (chunks, total) = drain_frame(&mut queue, &mut queued, 6).expect("6 of 8 bytes");
         assert_eq!(total, 6);
-        assert_eq!(chunks.iter().map(Bytes::len).sum::<usize>(), total);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "a frame spanning two items must stay two uncopied slices"
+        );
+        assert_eq!(
+            chunks.concat(),
+            b"aaaabb",
+            "the cut is an in-order prefix of the queue"
+        );
         assert_eq!(queued, 2, "the split remainder stays queued");
 
         let (rest, rest_total) = drain_frame(&mut queue, &mut queued, 6).expect("the remainder");
         assert_eq!(rest_total, 2, "a short final frame, not a padded one");
-        assert_eq!(rest.iter().map(Bytes::len).sum::<usize>(), rest_total);
+        assert_eq!(rest.len(), 1, "the remainder is what is left of one item");
+        assert_eq!(rest.concat(), b"bb");
         assert_eq!(queued, 0);
 
         assert!(
             drain_frame(&mut queue, &mut queued, 6).is_none(),
             "an empty queue is the only `None`"
+        );
+    }
+
+    /// A frame that ends exactly on an item boundary takes whole items and splits
+    /// nothing — the case where an off-by-one in the `front_len <= remaining` branch
+    /// would show up as a spurious extra chunk or a dropped byte.
+    #[test]
+    fn drain_frame_ends_on_an_item_boundary_without_splitting() {
+        let mut queue: std::collections::VecDeque<Bytes> = (0..4u8)
+            .map(|i| Bytes::from(vec![i; 4]))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect();
+        let mut queued = 16usize;
+
+        let (chunks, total) = drain_frame(&mut queue, &mut queued, 8).expect("two whole items");
+        assert_eq!(total, 8);
+        assert_eq!(chunks.len(), 2, "two items moved whole, none split");
+        assert_eq!(chunks.concat(), [0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(queued, 8);
+        assert_eq!(queue.len(), 2, "the untouched items stay whole");
+    }
+
+    /// A target past everything queued yields one short frame of exactly what is
+    /// there, not a parked call and not a padded frame.
+    #[test]
+    fn drain_frame_takes_everything_when_the_target_exceeds_the_queue() {
+        let mut queue: std::collections::VecDeque<Bytes> =
+            [Bytes::from_static(b"ab"), Bytes::from_static(b"cde")]
+                .into_iter()
+                .collect();
+        let mut queued = 5usize;
+
+        let (chunks, total) = drain_frame(&mut queue, &mut queued, 1024).expect("all 5 bytes");
+        assert_eq!(total, 5);
+        assert_eq!(chunks.len(), 2, "both items ride uncopied");
+        assert_eq!(chunks.concat(), b"abcde");
+        assert_eq!(queued, 0);
+        assert!(queue.is_empty());
+    }
+
+    /// A `queued` that under-counts the queue must not be clamped to zero: that is the
+    /// direction that would let a later call answer `None`, which the serve loops read
+    /// as a fully delivered blob and follow with `StreamEnd` over a truncation.
+    ///
+    /// Unreachable while both framers keep the two in lockstep. Pinned because the
+    /// failure is otherwise self-consistent and silent — the short frame it produces
+    /// is correctly labelled and correctly billed.
+    #[test]
+    fn drain_frame_leaves_an_under_counting_queued_non_zero() {
+        let mut queue: std::collections::VecDeque<Bytes> =
+            [Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]
+                .into_iter()
+                .collect();
+        // Deliberately wrong: 8 bytes are queued, the counter claims 4.
+        let mut queued = 4usize;
+
+        let (chunks, total) = drain_frame(&mut queue, &mut queued, 8).expect("what it can cut");
+        assert_eq!(total, 4, "it cuts only what the counter admits");
+        assert_eq!(chunks.concat(), b"aaaa");
+        assert_eq!(queued, 0);
+        // The bytes it could not account for are still there, so the next call cuts
+        // rather than reporting the blob complete.
+        assert!(
+            drain_frame(&mut queue, &mut queued, 8).is_none(),
+            "a zero counter cuts nothing"
+        );
+        assert!(
+            !queue.is_empty(),
+            "the unaccounted bytes are not silently lost"
         );
     }
 }

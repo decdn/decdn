@@ -2029,6 +2029,28 @@ mod tests {
         );
     }
 
+    /// The public single-buffer door carries the ADR 013 ceiling too, and reports the
+    /// FRAME length it refused rather than the payload length it was handed.
+    ///
+    /// Without this the ceiling is only pinned on the two hot-path encoders, and this
+    /// is the one an out-of-tree caller reaches. It is also the boundary where the
+    /// equivalence with `encode_message` stops holding: the generic path builds an
+    /// oversized frame happily and only `write_frame` refuses it.
+    #[test]
+    fn encode_chunk_frame_rejects_a_frame_past_max_message_size() {
+        let max = crate::framing::MAX_MESSAGE_SIZE as usize;
+        // A 2^24 cap gives a 4-byte payload varint, so the header is 5 and the largest
+        // frame that fits carries 5 fewer payload bytes.
+        let largest = max - 5;
+        assert_eq!(chunk_frame_postcard_len(largest), max);
+
+        let over = vec![0u8; largest + 1];
+        assert!(matches!(
+            crate::client::encode_chunk_frame(&over),
+            Err(MessageValidationError::ChunkTooLarge { frame_len }) if frame_len == max + 1
+        ));
+    }
+
     #[tokio::test]
     async fn encode_chunk_frame_headers_matches_framed_encode_chunk_frame()
     -> Result<(), Box<dyn std::error::Error>> {

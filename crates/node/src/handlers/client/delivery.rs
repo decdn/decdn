@@ -698,6 +698,34 @@ mod tests {
         Ok(())
     }
 
+    /// A frame wider than one export item must arrive as several `Bytes`, not as one
+    /// coalesced buffer. That is the whole zero-copy claim, and nothing else in this
+    /// module observes it: every other assertion here compares byte sequences, which a
+    /// framer that concatenated would satisfy exactly as well.
+    #[tokio::test]
+    async fn a_frame_spanning_several_export_items_rides_uncopied() -> anyhow::Result<()> {
+        // Four 64-byte proof-node-sized items; one 200-byte frame spans three of them
+        // and splits the fourth.
+        let items = vec![vec![1u8; 64], vec![2u8; 64], vec![3u8; 64], vec![4u8; 64]];
+        let mut framer = ChunkFramer::new(stream_of(items), Hash::new(b"spanning-test"));
+
+        let (chunks, total) = framer
+            .next_frame_chunks(200)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("expected a frame"))?;
+        anyhow::ensure!(total == 200, "expected a full 200-byte frame, got {total}");
+        anyhow::ensure!(
+            chunks.len() == 4,
+            "a frame over four export items must stay four slices, got {}",
+            chunks.len()
+        );
+        anyhow::ensure!(
+            chunks.iter().map(Bytes::len).collect::<Vec<_>>() == vec![64, 64, 64, 8],
+            "only the boundary item is split"
+        );
+        Ok(())
+    }
+
     /// A mid-export fault — including the truncation refusal, which the streaming
     /// export can only report after its last item — must propagate out of
     /// `next_frame_chunks` rather than being swallowed into a short-but-clean
@@ -744,11 +772,19 @@ mod tests {
         // put on the wire as if they were good — and the client billed for them.
         // `Ok(None)` would be just as wrong: it reads as a clean end of blob.
         let after = framer.next_frame(1024).await;
+        let err = match after {
+            Err(e) => e,
+            Ok(o) => anyhow::bail!(
+                "a faulted framer must refuse further frames, got {:?}",
+                o.map(|b| b.len())
+            ),
+        };
         anyhow::ensure!(
-            after.is_err(),
-            "a faulted framer must refuse further frames, got {:?}",
-            after.map(|o| o.map(|b| b.len()))
+            err.to_string().contains("already faulted"),
+            "the second call must refuse by name, not re-report the export fault: {err}"
         );
+        anyhow::ensure!(framer.queued == 0, "a fault drops the queued bytes");
+        anyhow::ensure!(framer.queue.is_empty(), "a fault clears the queue");
         Ok(())
     }
 }

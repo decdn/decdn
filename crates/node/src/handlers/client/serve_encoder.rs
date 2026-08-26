@@ -633,6 +633,48 @@ mod tests {
         assert!(producer.queue.is_empty(), "a fault clears the queue");
     }
 
+    /// A frame wider than one encoder output chunk must arrive as several `Bytes`.
+    /// The coherent encoder emits 64-byte proof pairs ahead of its leaves, so any
+    /// frame past the first proof node spans items — the zero-copy claim this path
+    /// rests on, and the one a coalescing rewrite would silently break.
+    #[tokio::test]
+    async fn a_frame_spanning_several_encoder_chunks_rides_uncopied() {
+        let total = 2 * G;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+        admit(
+            &engine, hash, root, &plaintext, &outboard, total, 0, total, &session,
+        )
+        .await;
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total);
+        let (chunks, frame_total) = producer
+            .next_frame_chunks(total as usize)
+            .await
+            .expect("the encode runs")
+            .expect("a frame");
+        assert!(
+            chunks.len() > 1,
+            "a whole-range frame must stay several uncopied slices, got {}",
+            chunks.len()
+        );
+        assert_eq!(
+            chunks.iter().map(Bytes::len).sum::<usize>(),
+            frame_total,
+            "the reported total counts the bytes actually handed over"
+        );
+    }
+
     /// A zero target must be refused by name. It cuts nothing, so `cut` below would
     /// refuse it anyway — but as a `queued`/`queue` desync, blaming the bookkeeping
     /// for a bad argument. `frame_target` never returns zero, so this pins the floor
