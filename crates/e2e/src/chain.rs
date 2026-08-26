@@ -1452,7 +1452,6 @@ impl ChainFixture {
             total_bytes,
             channel_id,
             timestamp_us: stream_ts_us,
-            redirect: B256::ZERO,
         };
         let domain = slash_judge_domain(self.chain_id, self.addrs.slash_judge);
         let probe_sig = probe
@@ -1503,7 +1502,6 @@ impl ChainFixture {
             totalBytes: total_bytes,
             channelId: channel_id,
             timestampUs: stream_ts_us,
-            redirect: B256::ZERO,
         };
         let receipt = crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
             .submitRateChallenge(
@@ -1701,7 +1699,6 @@ impl ChainFixture {
             totalBytes: stream_data.total_bytes,
             channelId: stream_data.channel_id,
             timestampUs: stream_data.timestamp_us,
-            redirect: stream_data.redirect,
         };
         // The daemon's own signatures, forwarded byte-for-byte.
         let probe_sig = Bytes::from(probe.slash_sig.clone());

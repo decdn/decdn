@@ -149,7 +149,7 @@ When no candidate clears the ceiling, or when discovery returns no holder at
 all, the node refuses and closes. The node returns the same `NotFound` the wire
 already uses for a miss, so the node's pricing floor does not leak. The node
 distinguishes the below-margin case from an empty miss only in a local metric,
-never on the wire. The node emits no redirect and no route hint. A redirect is an
+never on the wire. The node emits no route hint. A redirect field would be an
 attack surface: a node could steer clients to a colluding, expensive peer.
 Clients stay trustless of node routing advice and re-route through their own
 failover ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality),
@@ -293,7 +293,7 @@ deposit.
    eviction, or `margin` serve-economics is active; each feature enables it
    independently and none is inert without another.
 8. When no candidate clears the ceiling, or discovery finds no holder, the node
-   returns `NotFound` and emits no redirect or route hint.
+   returns `NotFound` and emits no route hint.
 9. Own-origin legs, which buy at rate zero, bypass the gate.
 10. An unknown policy name, a `discount` outside `(0, 1]`, an `n_max` of zero, or
     a non-positive `warming_budget` is a config error at load, with no silent

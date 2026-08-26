@@ -14,7 +14,7 @@
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
 //!     signed body fields `{hash, ok, rate_per_mb, total_bytes, pool_id,
-//!     timestamp_us, redirect}` (ADR 014 §1), produced by the stream-response
+//!     timestamp_us}` (ADR 014 §1), produced by the stream-response
 //!     slash signer in `decdn_incentive` (analogous to its `ProbeSlashData`).
 //!     `error` is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
@@ -38,7 +38,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::NodeId;
 use crate::message::{MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 
 /// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
@@ -522,10 +521,6 @@ pub struct StreamResponseBody {
     /// Requester-generated microsecond timestamp from the [`StreamRequest`],
     /// echoed back unchanged.
     pub timestamp_us: u64,
-    /// Alternate provider to retry when this node cannot serve — a `NodeId`,
-    /// never an external URL (ADR 005). Signed as `bytes32(0)` when `None` by the
-    /// `decdn_incentive` stream slash signer (analogous to its `ProbeSlashData`).
-    pub redirect: Option<NodeId>,
 }
 
 impl StreamResponse {
@@ -1280,7 +1275,6 @@ mod tests {
             total_bytes: 4096,
             pool_id: [9u8; 32],
             timestamp_us: 1_700_000_000_000_000,
-            redirect: None,
         }
     }
 
@@ -1451,21 +1445,6 @@ mod tests {
     #[test]
     fn stream_response_roundtrip() -> Result<(), postcard::Error> {
         let resp = sample_response();
-        let bytes = postcard::to_allocvec(&resp)?;
-        let decoded: StreamResponse = postcard::from_bytes(&bytes)?;
-        assert_eq!(resp, decoded);
-        Ok(())
-    }
-
-    #[test]
-    fn stream_response_redirect_some_roundtrip() -> Result<(), postcard::Error> {
-        let resp = StreamResponse {
-            body: StreamResponseBody {
-                redirect: Some(NodeId::from_bytes([0x5Au8; 32])),
-                ..sample_body()
-            },
-            ..sample_response()
-        };
         let bytes = postcard::to_allocvec(&resp)?;
         let decoded: StreamResponse = postcard::from_bytes(&bytes)?;
         assert_eq!(resp, decoded);
@@ -1732,7 +1711,6 @@ mod tests {
                 total_bytes: 5,
                 pool_id: [6u8; 32],
                 timestamp_us: 7,
-                redirect: None,
             },
             slash_sig: vec![0xABu8; SLASH_SIG_LEN],
         };
@@ -1744,7 +1722,6 @@ mod tests {
         expected.push(5u8); // body.total_bytes varint
         expected.extend_from_slice(&[6u8; 32]); // body.pool_id
         expected.push(7u8); // body.timestamp_us varint
-        expected.push(0u8); // body.redirect = None
         expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
         expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
         assert_eq!(bytes, expected);

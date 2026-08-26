@@ -1071,7 +1071,6 @@ impl ClientHandler {
             total_bytes,
             pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
-            redirect: None,
         };
         let (resp, resp_ext) = self.sign_response(body, None)?;
         self.write_stream_response(&mut send, &resp, &resp_ext)

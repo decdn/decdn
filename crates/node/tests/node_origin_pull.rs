@@ -1569,7 +1569,6 @@ async fn serve_wrong_bytes(
         total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
         pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
-        redirect: None,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
@@ -1702,7 +1701,6 @@ async fn serve_gated_correct_bytes(
             total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
             pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
-            redirect: None,
         };
         let slash_sig = StreamSlashData::from_response_body(&body)
             .sign(eth.as_ref(), slash)
@@ -1899,7 +1897,6 @@ async fn serve_then_reject_voucher(
         total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
         pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
-        redirect: None,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
@@ -1987,7 +1984,6 @@ async fn serve_then_error_on_voucher(
         total_bytes: u64::try_from(served.len()).unwrap_or(u64::MAX),
         pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
-        redirect: None,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
@@ -4092,7 +4088,6 @@ fn signed_response(
         total_bytes,
         pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
-        redirect: None,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)
@@ -8996,7 +8991,6 @@ async fn serve_wire_paced(
         total_bytes,
         pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
-        redirect: None,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)

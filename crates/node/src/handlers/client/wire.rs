@@ -168,7 +168,6 @@ impl ClientHandler {
             total_bytes: 0,
             pool_id: req.pool_id,
             timestamp_us: req.timestamp_us,
-            redirect: None,
         };
         let (resp, resp_ext) = self.sign_response(body, Some(error))?;
         self.write_stream_response(send, &resp, &resp_ext).await?;

@@ -162,7 +162,7 @@ contract SlashJudgeTest is Test {
         keccak256("ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)");
     bytes32 internal constant STREAM_TYPEHASH = keccak256(
         "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,"
-        "bytes32 channelId,uint64 timestampUs,bytes32 redirect)"
+        "bytes32 channelId,uint64 timestampUs)"
     );
 
     uint64 internal probeTs;
@@ -209,8 +209,7 @@ contract SlashJudgeTest is Test {
             ratePerMb: ratePerMb,
             totalBytes: 1_048_576,
             channelId: bytes32(uint256(1)),
-            timestampUs: ts,
-            redirect: bytes32(0)
+            timestampUs: ts
         });
     }
 
@@ -219,9 +218,8 @@ contract SlashJudgeTest is Test {
     }
 
     function _streamStructHash(SlashJudge.StreamMsg memory s) internal pure returns (bytes32) {
-        return keccak256(
-            abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs, s.redirect)
-        );
+        return
+            keccak256(abi.encode(STREAM_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs));
     }
 
     function _digest(bytes32 structHash) internal view returns (bytes32) {

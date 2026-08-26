@@ -58,7 +58,6 @@ mod sol_types {
                 uint64 totalBytes;
                 bytes32 channelId;
                 uint64 timestampUs;
-                bytes32 redirect;
             }
 
             /// Governable challenger bond (base units), refunded on a valid slash.
