@@ -50,12 +50,6 @@ impl ShedState {
             counter,
         }
     }
-
-    /// Number of distinct clients currently tracked (test/observability).
-    #[must_use]
-    pub fn tracked_clients(&self) -> usize {
-        self.per_client.len()
-    }
 }
 
 /// RAII place for one admitted serve. `Drop` releases the node-wide and
@@ -120,10 +114,10 @@ mod tests {
     fn zeroed_client_entry_is_pruned() {
         let state = ShedState::new();
         let a = state.acquire(client(9));
-        assert_eq!(state.tracked_clients(), 1);
+        assert_eq!(state.per_client.len(), 1);
         drop(a);
         assert_eq!(
-            state.tracked_clients(),
+            state.per_client.len(),
             0,
             "per-client map must not leak zeroed entries"
         );
@@ -134,21 +128,17 @@ mod tests {
         let state = ShedState::new();
         let a = state.acquire(client(7));
         assert_eq!(state.counts(client(7)), (1, 1));
-        assert_eq!(state.tracked_clients(), 1);
+        assert_eq!(state.per_client.len(), 1);
         drop(a);
         assert_eq!(state.counts(client(7)), (0, 0));
-        assert_eq!(
-            state.tracked_clients(),
-            0,
-            "entry must be pruned after drop"
-        );
+        assert_eq!(state.per_client.len(), 0, "entry must be pruned after drop");
 
         // Reacquire for the same client: gets a fresh entry, counts only the new slot.
         let b = state.acquire(client(7));
         assert_eq!(state.counts(client(7)), (1, 1));
-        assert_eq!(state.tracked_clients(), 1);
+        assert_eq!(state.per_client.len(), 1);
         drop(b);
         assert_eq!(state.counts(client(7)), (0, 0));
-        assert_eq!(state.tracked_clients(), 0);
+        assert_eq!(state.per_client.len(), 0);
     }
 }

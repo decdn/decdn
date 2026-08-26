@@ -22,7 +22,6 @@
 //! buckets via `FindNode` probes of random per-bucket targets.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
@@ -41,11 +40,6 @@ use crate::dht::staker_set::StakerSet;
 /// rate ADR 022 §Routing Table prescribes (one refresh per bucket
 /// per hour).
 pub const BOOTSTRAP_FANOUT: usize = 8;
-
-/// Per-seed `FindNode` timeout. Longer than [`client::DHT_CLIENT_TIMEOUT`]
-/// would just queue up dead seeds; shorter would lose responsive seeds
-/// on a flaky network. 8s is the same as the client-side default.
-pub const BOOTSTRAP_TIMEOUT: Duration = client::DHT_CLIENT_TIMEOUT;
 
 /// Summary of a bootstrap run, returned for logs + tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

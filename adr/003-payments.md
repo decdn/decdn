@@ -989,7 +989,6 @@ function reclaimNodeId(
 ) external;
 
 // Views
-function getNode(bytes32 nodeId) external view returns (NodeInfo memory);
 function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
 function isActiveNode(bytes32 nodeId) external view returns (bool);
 function getRegisteredNodeCount() external view returns (uint256);

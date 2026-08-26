@@ -1844,31 +1844,6 @@ impl ClientHandler {
         reset_stream(send, recv, APP_ERR_NO_ERROR);
     }
 
-    /// Snapshot the latest tracked [`LaneState`] for `key`, or `None` if this
-    /// node does not track the lane.
-    ///
-    /// No daemon path calls it; the only caller is a unit test.
-    ///
-    /// Reads the in-memory row, which the voucher-accept path advances as it
-    /// verifies each proof — before the periodic lane flush mirrors that advance
-    /// to disk. The snapshot therefore reports the strongest proof this process
-    /// has verified and still holds the signature for: at least as strong as the
-    /// row the lane store holds, and leading the last flushed row by up to one
-    /// flush interval. It is not a read of persisted state. A crash before the
-    /// next flush drops the un-mirrored advance, and the restarted node then
-    /// snapshots the weaker hydrated row; losing frontier that way is safe
-    /// (ADR 003 §Off-chain voucher state persistence).
-    ///
-    /// Reading the store instead buys nothing here: [`PoolStateStore::get`] serves
-    /// the same buffered working set. Only [`PoolStateStore::flush`] puts a row on
-    /// disk, which is why [`crate::payment_settlement`] flushes before it submits
-    /// rather than reading a floor back out.
-    pub async fn lane_state_snapshot(&self, key: LaneKey) -> Option<LaneState> {
-        let entry = self.lanes.get(&key).map(|e| Arc::clone(e.value()))?;
-        let guard = entry.lock().await;
-        Some(guard.state.clone())
-    }
-
     async fn refresh_lane_metrics(&self) {
         let _refresh = self.lane_metrics_refresh.lock().await;
         let open = self.lanes.len();
@@ -2495,7 +2470,10 @@ mod tests {
             let handler = Arc::clone(&handler);
             let key = *key;
             resolve.push(tokio::spawn(async move {
-                handler.lane_state_snapshot(key).await.map(|s| s.key())
+                match handler.lanes.get(&key).map(|e| Arc::clone(e.value())) {
+                    Some(entry) => Some(entry.lock().await.state.key()),
+                    None => None,
+                }
             }));
         }
         for (task, key) in resolve.into_iter().zip(keys.iter()) {

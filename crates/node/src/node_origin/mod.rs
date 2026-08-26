@@ -26,8 +26,8 @@
 //! `admit_bao_stream`), so a dishonest provider is detected (and scored
 //! [`Outcome::Corruption`]) rather than surfaced to the caller. On the window
 //! path the corruption detector is the cache TEE's verifying decoder; its
-//! verdict reaches the scorer via [`NodeProgressivePull::finish`]'s
-//! [`TeeVerdict`] / `abandon_corrupt` (#915).
+//! verdict reaches the scorer via the pull leg's post-drive `record_outcome`
+//! (#915).
 //!
 //! # Deferred initialisation
 //!
@@ -70,7 +70,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
-use bytes::Bytes;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
 use decdn_client_pull::driver::DriveConfig;
@@ -90,10 +89,9 @@ use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
     BlobTooLargeClaim, Cumulative, HashMismatch, LocalPullFault, PoolContext, PoolLedger,
-    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamPull,
-    UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    effective_rate_ceiling, open_progressive_pull as open_progressive_upstream,
-    sign_client_binding,
+    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    open_progressive_pull as open_progressive_upstream, sign_client_binding,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -101,7 +99,7 @@ use crate::dht::{
     LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
     ProbedProvider, StakerSet,
 };
-use crate::metrics::{Metrics, StreamGuard};
+use crate::metrics::Metrics;
 use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_candidates};
 
 /// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
@@ -547,573 +545,6 @@ impl NodeOrigin {
     /// [`SettleOnDrop`] already carries across a drop.
     pub(crate) fn deps_arc(&self) -> Arc<OnceLock<NodeOriginDeps>> {
         Arc::clone(&self.deps)
-    }
-
-    /// Open a window-paced progressive pull for `hash` (#856), the streaming
-    /// counterpart of [`Origin::fetch`]'s buffered pull. Runs the same
-    /// cached-first discover → probe → rank → open-channel pipeline (ADR 001
-    /// §Probe cache — this path shares the cache with the buffered one, since
-    /// both feed off the same `probe_and_rank` chokepoint), but instead of
-    /// buffering the whole blob it returns the upstream header (so the caller
-    /// can sign its own `StreamResponse`) and a live [`NodeProgressivePull`] the
-    /// caller drives chunk-by-chunk — forwarding each chunk to the paying
-    /// downstream client and teeing it into the cache — so per-request
-    /// speculative exposure is bounded to the caller's window rather than the
-    /// entire upstream cost.
-    ///
-    /// Candidate fallback happens at OPEN time only: it walks the ranked
-    /// candidates until one successfully opens (handshake + verified response),
-    /// because once the caller starts forwarding it is committed to that
-    /// upstream's `total_bytes`.
-    ///
-    /// # Errors
-    ///
-    /// The [`PullMiss`] the failure is, when pull-through is unprovisioned, no
-    /// provider is reachable, or every candidate declined. The caller needs the
-    /// distinction to pick its own wire answer: a [`PullMiss::LocalFault`] must not
-    /// be signed to a client as a clean `NotFound` about the content (#1560).
-    pub async fn open_progressive_pull(
-        &self,
-        hash: Hash,
-        namespace_id: U256,
-    ) -> Result<(UpstreamPullHeader, NodeProgressivePull), PullMiss> {
-        // Unprovisioned pull-through: nothing was attempted, so nothing can have
-        // faulted — this is the honest empty answer.
-        let deps = self.deps.get().ok_or(PullMiss::Clean)?;
-        let hash_bytes = *hash.as_bytes();
-        let target = DhtHash::from_bytes(hash_bytes);
-        // ONE budget for the whole call, spent across both phases — see `Origin::fetch`'s
-        // twin of this flow.
-        let mut budget = MAX_PROVIDER_ATTEMPTS;
-        // Mirrors `Origin::fetch`'s `attempt_metered`: one orchestration per call however
-        // many candidate lists it walks.
-        let mut attempt_metered = false;
-        // Latched across BOTH walks, like `attempt_metered` — a local fault on the
-        // cached list is still this node's fault when the fresh list also comes up
-        // empty (#1560).
-        let mut miss = PullMiss::Clean;
-
-        // ADR 001 §Probe cache: "On a cache miss the requester checks the probe cache
-        // first; if a valid entry exists, it skips DHT lookup and goes straight to
-        // selection."
-        if let Some(cached) = cached_candidates(deps, target).await {
-            deps.metrics.probe_cache_hit();
-            deps.metrics.node_pull_attempt();
-            attempt_metered = true;
-            let outcome = self
-                .open_from_candidates(deps, &cached, hash_bytes, namespace_id, budget)
-                .await;
-            match outcome.payload {
-                Ok(opened) => return Ok(opened),
-                Err(failed) => miss = miss.or(failed),
-            }
-            budget = budget.saturating_sub(outcome.attempts);
-            // Every cached provider we had budget to open from failed. Disproved by
-            // actual pull attempts, which outrank a probe — drop the entry rather
-            // than let it keep hitting (any untried tail beyond `budget` is
-            // forfeited with it; a fresh probe is cheaper than trusting a list
-            // whose top-ranked members just failed).
-            deps.probe_cache.invalidate(&target);
-            if budget == 0 {
-                // Ends the call as a miss — carrying whether the exhausted attempts
-                // failed on US, so the serve path does not sign a `NotFound` over our
-                // own broken signer (#1560). The twin of `Origin::fetch`'s
-                // budget-exhaustion arm.
-                debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
-                return Err(miss);
-            }
-        } else {
-            deps.metrics.probe_cache_miss();
-        }
-
-        // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-        let providers = discover(deps, hash_bytes, namespace_id).await;
-        if providers.is_empty() {
-            // `node_pull_no_providers` means "the blob is unavailable on the
-            // network, NOT a pull failure" — mutually exclusive with
-            // `node_pull_attempts` per fetch. A hit-then-fallthrough call already
-            // TRIED cached providers (and metered the attempt), so an empty
-            // re-discovery here is a pull story, not an availability one.
-            if !attempt_metered {
-                deps.metrics.node_pull_no_providers();
-            }
-            debug!(%hash, "node-origin: no providers discovered for window-paced pull");
-            return Err(miss);
-        }
-        if !attempt_metered {
-            deps.metrics.node_pull_attempt();
-        }
-        // Writes the probe cache at its tail.
-        let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-        self.open_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget)
-            .await
-            .payload
-            .map_err(|failed| miss.or(failed))
-    }
-
-    /// The window twin of [`try_pull`]: walk the ranked candidates, opening from
-    /// each until one succeeds, bounded by `budget` remaining attempts. Returns
-    /// the opened pull (if any) and how many candidates were tried, as a
-    /// [`PullOutcome`] whose payload is the opened header + driver.
-    async fn open_from_candidates(
-        &self,
-        deps: &NodeOriginDeps,
-        ranked: &[Candidate],
-        hash_bytes: [u8; 32],
-        namespace_id: U256,
-        budget: usize,
-    ) -> PullOutcome<(UpstreamPullHeader, NodeProgressivePull)> {
-        let mut attempts = 0;
-        let mut miss = PullMiss::Clean;
-        for candidate in ranked.iter().take(budget) {
-            attempts += 1;
-            match self
-                .open_from_candidate(deps, candidate, hash_bytes, namespace_id)
-                .await
-            {
-                Ok(opened) => {
-                    return PullOutcome {
-                        payload: Ok(opened),
-                        attempts,
-                    };
-                }
-                Err(failed) => miss = miss.or(failed),
-            }
-        }
-        PullOutcome {
-            payload: Err(miss),
-            attempts,
-        }
-    }
-
-    /// Resolve, open/reuse a channel, and open a progressive upstream pull from
-    /// one candidate. Returns the header + driver on a clean open; otherwise the
-    /// [`PullMiss`] this failure is — an unresolvable address, a channel-open
-    /// failure, or a declined/erroring response (classified like the buffered
-    /// path). Either way the caller tries the next candidate.
-    // The window twin of `pull_from_candidate`, and inflated past the line threshold for the
-    // same reason: a sequential resolve → open → bind → fetch → classify pipeline whose every
-    // stage carries the comment explaining which failure it owns. Splitting it would scatter
-    // one linear flow across helpers that each mean nothing alone.
-    #[allow(clippy::too_many_lines)]
-    async fn open_from_candidate(
-        &self,
-        deps: &NodeOriginDeps,
-        candidate: &Candidate,
-        hash_bytes: [u8; 32],
-        namespace_id: U256,
-    ) -> Result<(UpstreamPullHeader, NodeProgressivePull), PullMiss> {
-        let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
-            return Err(PullMiss::Clean);
-        };
-        let Some(provider_addr) = deps
-            .addr_resolver
-            .address_of(&DhtNodeId::from_bytes(candidate.node_id))
-        else {
-            debug!("node-origin: candidate has no resolvable operator address; skipping");
-            return Err(PullMiss::Clean);
-        };
-        // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
-        // ceiling BEFORE opening a channel to it, so a refusal costs nothing on the
-        // wire. A skip folds into the walk as `BelowMargin`.
-        let heat = heat_of(deps, hash_bytes);
-        let (rate_ceiling, speculative) =
-            match economic_ceiling(deps, candidate.node_id, heat, candidate.rate_per_mb) {
-                EconGate::Allow {
-                    rate_ceiling,
-                    speculative,
-                } => (rate_ceiling, speculative),
-                EconGate::Skip => return Err(PullMiss::BelowMargin),
-            };
-        let ctx = match deps
-            .buyer
-            // Bounded by its OWN budget, not the per-candidate one (#1143). A wedged
-            // open does not consume the whole outer deadline: we stop waiting and try
-            // candidate #2, while the open keeps running in the background and its
-            // channel is reused if it lands. It is deliberately the smaller budget —
-            // this stage and the stream open below are sequential, and
-            // `outer_pull_deadline` has to cover both for every candidate.
-            .open_or_reuse_pool(provider_addr, crate::selection::CHANNEL_OPEN_CALLER_BUDGET)
-            .await
-        {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                // Not blanket-`Clean`: a channel open can fail because THIS node's buyer
-                // side is broken for every provider, and that must not be signed to a
-                // client as an absent blob (#1560). See `record_pool_open_failure`.
-                return Err(record_pool_open_failure(deps, provider_addr, &err));
-            }
-        };
-        // #1117: bind the request so the upstream can chain a reactive pull.
-        let ctx = match bind_upstream_ctx(deps, ctx) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                // A LOCAL signing fault — classify it so it is metered as ours and the
-                // peer is not scored for a key WE cannot use. No channel: the bind failed
-                // before we could present a voucher on one.
-                let verdict =
-                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return Err(PullMiss::for_verdict(verdict));
-            }
-        };
-        // The OPEN stage is bounded by `deadlines.open` INSIDE `open_progressive_upstream`
-        // (→ `open_stream`, #1134): a candidate that accepts the connection and then goes
-        // quiet during the handshake / verified response is cut off at `deadlines.open`,
-        // which emits a typed `PullTimeout { after: deadlines.open }`. That is the SOLE
-        // per-candidate open bound — the header handshake in `pull_from_candidate` (below)
-        // drives its open the same way with no outer wrap. A second
-        // `tokio::time::timeout(pull_timeout, …)` wrap here would be redundant: both clocks
-        // source from `pull_timeout`, so the double-bound would do nothing but risk
-        // drift — an open-specific timeout knob could make a candidate
-        // cost up to `pull_timeout + deadlines.open` while `outer_pull_deadline`
-        // (`MAX_PROVIDER_ATTEMPTS × (channel open + pull_timeout + stall) + slack`, #859)
-        // still budgets a single `pull_timeout`, starving the fallback loop.
-        //
-        // The typed `PullTimeout` flows into the `Err` arm's `classify_pull_failure`, which
-        // exonerates the peer (our deadline is not evidence it is bad, #857) and meters
-        // `node_pull_timeout`. The STREAMING stage that follows is bounded by inactivity
-        // instead (`stall_timeout`, carried into the returned `UpstreamPull`, #1134): a wall
-        // clock over the bytes would cap the blob size this node can pull through.
-        // A zero budget is OUR misconfiguration, not the peer's fault — and the loud failure
-        // mode is the wrong one to reach for, because a zero stall would score `Unreachable`
-        // about every honest peer this node touches (#1145 review).
-        let deadlines = match deps.config.deadlines() {
-            Ok(deadlines) => deadlines,
-            Err(err) => {
-                let verdict =
-                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return Err(PullMiss::for_verdict(verdict));
-            }
-        };
-        let ledger = lane_ledger(deps, provider_addr, &ctx);
-        let stream_guard = deps.metrics.outbound_stream_guard();
-        match open_progressive_upstream(
-            &deps.endpoint,
-            EndpointAddr::new(pk),
-            &ctx,
-            Arc::clone(&ledger),
-            &deps.slash_domain,
-            provider_addr,
-            hash_bytes,
-            // The served client's namespace, threaded onto this leg so a
-            // directory-discovered cold origin's pull-through authorized-origin gate
-            // resolves and it fills from its own backend (#1401 review). A
-            // DHT-discovered holder ignores it — it serves from cache. Converted to
-            // the wire's big-endian `[u8; 32]` at this node/protocol boundary.
-            namespace_id.to_be_bytes(),
-            0,
-            now_micros(),
-            deps.config.max_blob_size_bytes,
-            // Refuse a stream quote above the lower of the candidate's probe rate,
-            // the configured absolute ceiling, and — under the `margin` policy — the
-            // economic buy cap, before paying (#1375, ADR 041). `candidate.rate_per_mb
-            // >= 1` always: `ProbeResponse::validate` rejects a zero rate (`RateIsZero`)
-            // and `probe_candidate` drops any candidate that fails `validate`, so
-            // `effective_rate_ceiling` never treats the probe bound as unbounded here —
-            // a probe-rate-0 bait-and-switch cannot select through this path.
-            rate_ceiling,
-            deadlines,
-            // Whole-tail fetch; a bounded gap request is the gap-driven driver's
-            // (#1608) `source::PeerSource`, not this candidate-fallback open.
-            0,
-            // Outer runtime: nothing to strand, so no dial observer.
-            None,
-        )
-        .await
-        {
-            Ok((header, pull)) => Ok((
-                header,
-                NodeProgressivePull {
-                    deps: Arc::clone(&self.deps),
-                    pull,
-                    pk,
-                    provider_addr,
-                    pool_id: ctx.pool_id,
-                    started: Instant::now(),
-                    delivered: 0,
-                    hash_bytes,
-                    speculative,
-                    buy_rate_per_mb: candidate.rate_per_mb,
-                    settle: SettleOnDrop {
-                        deps: Arc::clone(&self.deps),
-                        provider_addr,
-                        pool_id: ctx.pool_id,
-                        prior_amount: ctx.prior_amount,
-                        ledger,
-                    },
-                    stream_guard,
-                },
-            )),
-            Err(err) => {
-                // No bytes were forwarded and no voucher was paid yet, so there is
-                // nothing to persist; just classify and try the next candidate.
-                let verdict = classify_pull_failure(
-                    deps,
-                    pk,
-                    provider_addr,
-                    hash_bytes,
-                    Some(ctx.pool_id),
-                    &err,
-                );
-                Err(PullMiss::for_verdict(verdict))
-            }
-        }
-    }
-}
-
-/// The cache tee's integrity verdict for a window pull-through fill (#915,
-/// ADR 038). Under bao streaming the TEE's verifying decoder — not the wire
-/// pull — is the corruption detector (`UpstreamPull::finish` checks only
-/// wire-byte completeness), so the serve handler settles the tee first and
-/// passes its verdict into [`NodeProgressivePull::finish`] for reputation
-/// scoring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TeeVerdict {
-    /// The teed bao stream verified against the content root — or failed only
-    /// for a local, non-integrity reason (store fault, size cap), which says
-    /// nothing bad about the upstream.
-    Verified,
-    /// The teed bao stream FAILED verification: the upstream served bytes that
-    /// do not hash to the requested root (`CacheError::HashMismatch`).
-    Corrupt,
-}
-
-/// A live window-paced node→node pull (#856) handed to the `cdn/client/v1`
-/// serve path. Wraps the [`UpstreamPull`] transport with the node-origin
-/// bookkeeping (buyer-watermark persistence #852, reputation scoring) so the
-/// serve handler only has to pump chunks and call one terminal method. Obtain
-/// via [`NodeOrigin::open_progressive_pull`].
-///
-/// # No reactive top-up here, deliberately (#1530)
-///
-/// The populate-path miss pull resumes across a mid-pull deposit top-up
-/// (`pull_from_candidate`'s gap-driven `drive` loop); this path does not, and the
-/// asymmetry is structural rather than an oversight.
-///
-/// The downstream client already holds a signed `StreamResponse { ok: true }` and is
-/// being fed a single continuous stream. Re-opening upstream at `byte_offset > 0`
-/// produces a NEW bao range encoding with its own root→offset proof path — not a
-/// suffix of the one in flight — so splicing it in corrupts what the client is
-/// decoding, and the wire protocol has no way to pause a client mid-delivery while we
-/// go to chain. Nor is exhaustion the binding constraint here: this path fronts at
-/// most one window speculatively and recoups a downstream voucher per window, so its
-/// upstream spend tracks downstream payment instead of racing ahead of it.
-///
-/// If mid-window exhaustion ever does bite, the fix belongs BEFORE the open — raise
-/// the pre-open floor, or force the proactive refill — not mid-stream.
-#[derive(Debug)]
-pub struct NodeProgressivePull {
-    deps: Arc<OnceLock<NodeOriginDeps>>,
-    pull: UpstreamPull,
-    pk: PublicKey,
-    provider_addr: Address,
-    pool_id: B256,
-    started: Instant,
-    /// Bytes pulled (and forwarded) on this stream — the reputation count.
-    delivered: u64,
-    /// Blob hash, for failure classification and provider scoring.
-    hash_bytes: [u8; 32],
-    /// ADR 041: this buy was priced above the amortized profit-guaranteed floor, so
-    /// a clean completion debits the source's warming allowance by the full buy cost.
-    speculative: bool,
-    /// The candidate's per-MB buy rate, for the speculative warming debit.
-    buy_rate_per_mb: u64,
-    /// Settles the voucher watermark on EVERY exit, including a drop.
-    ///
-    /// A field rather than a `Drop` impl on this struct, because the terminal methods
-    /// destructure `self` — which Rust forbids on a type that implements `Drop`. Holding the
-    /// guard as a field gets the same guarantee: every exit, terminal or not, drops it.
-    ///
-    /// This is load-bearing on THIS path specifically. The serve loop drives this pull as a
-    /// future on the iroh `accept` task (it borrows `&self`, so it cannot be `tokio::spawn`ed);
-    /// a node shutdown or a downstream connection reset drops that future outright, and no
-    /// terminal method runs (#1145 review).
-    settle: SettleOnDrop,
-    /// Keeps the outbound stream gauge raised through every terminal/drop path.
-    stream_guard: StreamGuard,
-}
-
-impl NodeProgressivePull {
-    /// The promised **wire** byte count of this pull — the bao-encoded size of
-    /// the blob (content plus interleaved proof, ADR 038), forwarded verbatim to
-    /// the downstream client. The window serve loop uses it as the pull budget
-    /// `total`, since the forwarded/metered quantities are wire bytes.
-    #[must_use]
-    pub const fn expected_wire_bytes(&self) -> u64 {
-        self.pull.expected_wire_bytes()
-    }
-
-    /// Read and forward the next upstream chunk, paying the upstream per voucher
-    /// interval. `Ok(None)` signals the upstream `StreamEnd`. Tracks delivered
-    /// bytes for the success-path reputation scoring.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`UpstreamPull::next_chunk`] errors (chunk-size / overrun /
-    /// mid-stream `StreamError` / voucher rejection).
-    pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
-        let chunk = self.pull.next_chunk().await?;
-        if let Some(bytes) = &chunk {
-            self.delivered = self.delivered.saturating_add(bytes.len() as u64);
-        }
-        Ok(chunk)
-    }
-
-    /// Finalize a cleanly-completed pull: run the upstream wire-byte
-    /// completeness check, persist the buyer watermark (#852), and score the
-    /// provider. Under ADR 038 the wire `finish` carries no content
-    /// verification — the CACHE TEE's bao decoder is the integrity detector —
-    /// so the caller passes the tee's verdict in and the score reflects it:
-    /// `Delivered` for a verified fill, `Corruption` for a wire-complete stream
-    /// whose bytes failed bao verification (the paid-but-corrupt case).
-    ///
-    /// # Errors
-    ///
-    /// A short wire delivery or stream/protocol error from
-    /// [`UpstreamPull::finish`] (classified as a transport failure — a tee
-    /// `Corrupt` verdict cannot normally co-occur with a wire error, since a
-    /// truncated tee feed classifies as transport, not corruption). The
-    /// watermark is persisted either way. A `Corrupt` verdict on a complete
-    /// wire returns `Ok` — the caller already holds the tee error and decides
-    /// the wire-protocol consequence (no `StreamEnd`).
-    pub async fn finish(self, tee_verdict: TeeVerdict) -> anyhow::Result<()> {
-        let Self {
-            deps,
-            pull,
-            pk,
-            provider_addr,
-            pool_id,
-            started,
-            delivered,
-            hash_bytes,
-            speculative,
-            buy_rate_per_mb,
-            settle,
-            stream_guard,
-        } = self;
-        let verify = pull.finish().await;
-        drop(stream_guard);
-        let elapsed = started.elapsed();
-        // Settle before scoring, and via the guard rather than by hand: it reads the
-        // watermark from the channel ledger, which outlives the consumed `pull`, so a
-        // paid-but-corrupt delivery is still persisted (#852). Dropped here — not left to
-        // the end of the function — so the blocking
-        // store write is not folded into `elapsed`, which feeds the delivery-speed
-        // reputation signal (same reason as the buffered path).
-        drop(settle);
-        let Some(deps) = deps.get() else {
-            // Unprovisioned under us (cannot happen in practice — we got here via
-            // a provisioned open) — surface the verify result without scoring.
-            return verify.map(|_| ());
-        };
-        match verify {
-            Ok(_) => {
-                match tee_verdict {
-                    TeeVerdict::Verified => {
-                        // ADR 041: a clean speculative pull debits the source's warming
-                        // allowance by the full buy cost. `delivered` is wire bytes; the
-                        // debit accounts them in whole MB at the candidate's buy rate.
-                        if speculative {
-                            deps.config.warming.debit_speculative(
-                                *pk.as_bytes(),
-                                hash_bytes,
-                                buy_rate_per_mb.saturating_mul(mb_of(delivered)),
-                            );
-                        }
-                        record_outcome(
-                            deps,
-                            pk,
-                            &Outcome::Delivered {
-                                bytes: delivered,
-                                elapsed,
-                            },
-                        );
-                    }
-                    TeeVerdict::Corrupt => {
-                        // Paid-but-corrupt: the upstream delivered the promised
-                        // wire bytes but they failed bao verification. Score the
-                        // corruption against the PROVIDER (it is the party that
-                        // served the bytes), not this node — without this, a lying
-                        // upstream banks a `Delivered` while the downstream client
-                        // blames US for the corrupt forward (#915 review).
-                        warn!(
-                            provider = %pk, %provider_addr, delivered,
-                            "window pull-through upstream served wire-complete but bao-corrupt bytes; scoring Corruption"
-                        );
-                        record_outcome(deps, pk, &Outcome::Corruption);
-                    }
-                }
-                Ok(())
-            }
-            Err(err) => {
-                // The verdict is dropped deliberately: the `StreamResponse` went out
-                // `ok: true` long ago, so there is no refusal code left to pick — see
-                // `classify_pull_failure`'s own note (#1560).
-                let _ =
-                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), &err);
-                Err(err)
-            }
-        }
-    }
-
-    /// Abandon the pull because the teed bao stream failed verification
-    /// MID-fill (#915): the tee's import rejected a chunk group while the
-    /// forward loop was still writing, so the upstream was paid for bytes that
-    /// do not hash to the content root. Persists the watermark (#852), scores
-    /// the provider `Corruption`, and closes the upstream connection. The
-    /// mid-stream sibling of the `TeeVerdict::Corrupt` arm of [`Self::finish`].
-    pub fn abandon_corrupt(self) {
-        let Self {
-            deps,
-            pull,
-            pk,
-            provider_addr,
-            settle,
-            ..
-        } = self;
-        // Closes the upstream connection. The watermark it returns is redundant now: the
-        // guard reads the same value from the channel ledger, on this path and on the drop
-        // path the terminal methods cannot cover.
-        let _ = pull.abort();
-        drop(settle);
-        let Some(deps) = deps.get() else {
-            return;
-        };
-        warn!(
-            provider = %pk, %provider_addr,
-            "window pull-through upstream served bao-corrupt bytes mid-stream; scoring Corruption"
-        );
-        record_outcome(deps, pk, &Outcome::Corruption);
-    }
-
-    /// Abandon the pull (the downstream client dropped, underpaid, or a
-    /// `next_chunk` errored). Persists whatever was paid (#852) and, when a
-    /// `cause` error is supplied, scores the provider for it. Closes the upstream
-    /// connection so we stop receiving and paying immediately.
-    pub fn abandon(self, cause: Option<&anyhow::Error>) {
-        let Self {
-            deps,
-            pull,
-            pk,
-            provider_addr,
-            pool_id,
-            hash_bytes,
-            settle,
-            ..
-        } = self;
-        // As `abandon_corrupt`: close the stream, and let the one guard settle. A
-        // paid-but-abandoned pull still advanced the watermark (#852) and still spent
-        // (#820); both are recorded by the guard, on this path and on the drop path.
-        let _ = pull.abort();
-        drop(settle);
-        let Some(deps) = deps.get() else {
-            return;
-        };
-        if let Some(err) = cause {
-            // Verdict dropped for the same reason as in `finish`: this pull was
-            // already answered on the wire (#1560).
-            let _ = classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(pool_id), err);
-        }
     }
 }
 
@@ -1594,10 +1025,9 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
 /// reports what was spent.
 ///
 /// Generic over the payload so both walkers share it: [`try_pull`] returns
-/// `PullOutcome<Bytes>` (the buffered blob), [`NodeOrigin::open_from_candidates`]
-/// returns `PullOutcome<(UpstreamPullHeader, NodeProgressivePull)>` (the opened
-/// stream). A plain type parameter — no future is generic here, only the value a
-/// successful walk hands back.
+/// `PullOutcome<Bytes>` (the buffered blob) and the pull leg's candidate walk
+/// returns the opened leg. A plain type parameter — no future is generic here,
+/// only the value a successful walk hands back.
 struct PullOutcome<T> {
     /// The delivered payload, or why the walk produced none.
     payload: Result<T, PullMiss>,
@@ -2298,13 +1728,12 @@ async fn pull_from_candidate(
 /// a cancelled transfer is our decision, not the provider's misconduct.
 ///
 /// `Debug` is hand-written: `NodeOriginDeps` is not `Debug`-derivable (it is a bag of trait
-/// objects), and the guard is a field of the `Debug`-deriving [`NodeProgressivePull`].
+/// objects), and the guard is a field of `Debug`-deriving pull state.
 ///
-/// BOTH pull paths settle through this and only this. Settling in the three terminal
-/// methods instead (`finish` / `abandon` / `abandon_corrupt`) would lose the
-/// watermark: the serve loop drives that pull as a future on the iroh `accept` task,
-/// and a node shutdown or a downstream reset DROPS it, so no terminal method runs
-/// (#1145 review).
+/// BOTH pull paths settle through this and only this. Settling in terminal
+/// methods instead would lose the watermark: the serve loop drives a pull as a
+/// future on the iroh `accept` task, and a node shutdown or a downstream reset
+/// DROPS it, so no terminal method runs (#1145 review).
 struct SettleOnDrop {
     /// The runtime deps, reached through the shared `OnceLock`. Holding the `Arc`
     /// (not a borrow) lets the guard cross onto a pull thread and outlive the future
@@ -2351,9 +1780,9 @@ impl Drop for SettleOnDrop {
 /// have advanced the upstream's accepted-voucher watermark. Skipping this lets
 /// the channel re-sign a stale voucher on its next reuse and be rejected. The
 /// bytes are already paid for, so a persist failure must not fail the pull;
-/// surface it loudly instead (it breaks the next reuse). Shared by the buffered
-/// [`pull_from_candidate`] (via [`SettleOnDrop`]) and the window-paced
-/// [`NodeProgressivePull`] (#856).
+/// surface it loudly instead (it breaks the next reuse). Both the buffered
+/// [`pull_from_candidate`] and the window-paced pull leg reach it via
+/// [`SettleOnDrop`].
 fn persist_buyer_progress(
     deps: &NodeOriginDeps,
     provider_addr: Address,
@@ -2775,8 +2204,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
 /// silence: without it every non-hit looks identical to the serve path, and a fault in
 /// this node is signed to a client as a clean `NotFound` about the content.
 ///
-/// A caller that has already answered on the wire may drop the verdict. Both mid-stream
-/// sites do ([`NodeProgressivePull::finish`] and [`NodeProgressivePull::abandon`]): by then
+/// A caller that has already answered on the wire may drop the verdict: by then
 /// the `StreamResponse` is signed `ok: true` and sent, so the failure is an abort, not a
 /// refusal code, and there is no answer left to pick. A caller that has NOT yet answered
 /// owes the verdict a [`PullMiss`]; dropping it there signs this node's own fault to a

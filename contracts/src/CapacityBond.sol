@@ -1391,10 +1391,6 @@ contract CapacityBond is
         return activeBond[operator];
     }
 
-    function getBondMultiple(address operator) external view returns (uint256) {
-        return activeBond[operator] / minBond;
-    }
-
     function isActive(address operator) public view returns (bool) {
         // slither-disable-next-line incorrect-equality
         return _nodes[operator].active && activeBond[operator] >= minBond && unbondingOf[operator].amount == 0
@@ -1467,11 +1463,6 @@ contract CapacityBond is
     function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active) {
         nodeId = addressToNodeId[operator];
         active = isActive(operator);
-    }
-
-    function getNode(bytes32 nodeId) external view returns (NodeInfo memory) {
-        address ethAddress = nodeIdToAddress[nodeId];
-        return _nodes[ethAddress];
     }
 
     function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory) {

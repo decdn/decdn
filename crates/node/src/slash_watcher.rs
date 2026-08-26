@@ -329,10 +329,7 @@ fn slash_route_topic0s() -> Vec<B256> {
 /// durable cursor and no historical scan. Split out from [`bootstrap`] so the
 /// cursor shape is unit-testable without a provider.
 const fn slash_cursor_start(snapshot_block: u64) -> CursorStart {
-    CursorStart::Seeded {
-        at: snapshot_block,
-        persist: None,
-    }
+    CursorStart::Seeded { at: snapshot_block }
 }
 
 /// Applies operator-filtered `SlashRecorded` logs to the in-memory store and
@@ -549,7 +546,7 @@ mod tests {
         let start = slash_cursor_start(12_345);
         assert_eq!(start.seed(), Some(12_345));
         assert!(
-            matches!(start, CursorStart::Seeded { persist: None, .. }),
+            matches!(start, CursorStart::Seeded { .. }),
             "must not carry a durable checkpoint"
         );
     }

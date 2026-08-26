@@ -286,7 +286,7 @@ async fn fetch_5xx_classifies_as_transient_with_no_internal_retry() -> anyhow::R
 /// via the SDK. With the engine's default policy (3 retries), the cache
 /// drives 3 total dispatches against the mock — proving (a) the
 /// `Transient` classification from `S3Origin::fetch` correctly engages
-/// `retry_fetch`, and (b) the SDK's own retry layer is disabled (a 12-
+/// the retry loop, and (b) the SDK's own retry layer is disabled (a 12-
 /// dispatch storm would fail the `num_calls() == 3` assertion).
 #[tokio::test]
 async fn cache_engine_retries_transient_via_origin_retry_policy() -> anyhow::Result<()> {

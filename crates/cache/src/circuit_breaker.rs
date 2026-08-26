@@ -133,7 +133,7 @@ impl Clock for ManualClock {
 
 /// The health of a single per-origin pull-through attempt, as seen by
 /// the breaker. The engine maps each origin's
-/// `run_with_retry` result onto exactly one of these.
+/// `run_with_retry_classified` result onto exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginOutcome {
     /// The origin responded usefully — bytes committed, a definitive

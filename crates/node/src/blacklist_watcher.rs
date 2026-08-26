@@ -1172,10 +1172,7 @@ fn blacklist_route_topic0s() -> Vec<B256> {
 /// from the snapshot. Split out from [`bootstrap`] so the cursor shape is
 /// unit-testable without a provider.
 const fn blacklist_cursor_start(snapshot_block: u64) -> CursorStart {
-    CursorStart::Seeded {
-        at: snapshot_block,
-        persist: None,
-    }
+    CursorStart::Seeded { at: snapshot_block }
 }
 
 #[cfg(test)]
@@ -1219,7 +1216,7 @@ mod tests {
         let start = blacklist_cursor_start(99_999);
         assert_eq!(start.seed(), Some(99_999));
         assert!(
-            matches!(start, CursorStart::Seeded { persist: None, .. }),
+            matches!(start, CursorStart::Seeded { .. }),
             "must not carry a durable checkpoint"
         );
     }
