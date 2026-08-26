@@ -103,7 +103,13 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Pinned to a concrete patch (v2.1.1) rather than the bare major `v2`
+      # so a future v2 release can't silently change the check's behavior
+      # (the major tag already excludes v3). Dependabot's github-actions
+      # ecosystem still bumps it. The action caches the cargo registry and
+      # its own check cache internally, so no Swatinem/rust-cache partition
+      # is needed here.
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
 
   doc:
     name: cargo doc
@@ -426,17 +432,56 @@ jobs:
           path: lcov.info
           retention-days: 90
 
-      - name: Download coverage baseline
+      # The official actions/download-artifact needs an explicit run-id to fetch
+      # from a different workflow run (it cannot auto-resolve "latest successful
+      # run of ci.yml on main" the way dawidd6 did). Resolve that run-id here
+      # via the workflow-runs API, then hand it to the download step below.
+      # It also confirms the artifact exists in that run: the official action
+      # FAILS when the named artifact is absent (no `if_no_artifact_found:
+      # warn` like dawidd6), so without this check an expired (90-day
+      # retention) or deleted baseline would fail the download step on every
+      # PR. A resolution failure (no successful main run yet) or a missing
+      # artifact leaves run_id empty and the download step skips — same
+      # graceful "no baseline" outcome as before.
+      - name: Resolve latest coverage baseline run
+        id: resolve
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: dawidd6/action-download-artifact@v23
+        uses: actions/github-script@v9
         with:
-          workflow: ci.yml
-          branch: main
-          workflow_conclusion: success
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 1,
+            });
+            const run = data.workflow_runs[0];
+            if (!run) {
+              core.setOutput('run_id', '');
+              return;
+            }
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+              per_page: 100,
+            });
+            const has = arts.data.artifacts.some(a => a.name === 'coverage-lcov');
+            core.setOutput('run_id', has ? String(run.id) : '');
+
+      - name: Download coverage baseline
+        if: github.event_name == 'pull_request' && steps.resolve.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
           name: coverage-lcov
           path: baseline/
-          if_no_artifact_found: warn
+          repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
 
       # Read the existing sticky comment (if any) so coverage-diff.py can
       # extract the prior per-commit history block and append a new row.
@@ -1101,36 +1146,78 @@ jobs:
           retention-days: 90
 
       # PR: download the baseline so the comment script can render a delta.
-      # `if_no_artifact_found: warn` keeps the job green on a first-ever
-      # PR or after an artifact has expired.
-      - name: Download coverage baseline
-        id: dl_baseline
+      # The official actions/download-artifact needs an explicit run-id to fetch
+      # from a different workflow run, so resolve the latest successful
+      # ci.yml run on main first. It also confirms the artifact exists in that
+      # run: the official action FAILS when the named artifact is absent (it has
+      # no `if_no_artifact_found: warn` like dawidd6), so without this check an
+      # expired (90-day retention) or deleted baseline would be misreported as a
+      # download failure rather than "no baseline". A resolution failure (no
+      # successful main run yet) or a missing artifact leaves run_id empty and
+      # the download step skips — the "Tag baseline status" step below then
+      # records it as not-found, keeping the job green on a first-ever PR or
+      # after an artifact has expired.
+      - name: Resolve latest coverage baseline run
+        id: resolve
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        # SHA-pinned (v21); rebind would require a deliberate ref change.
-        uses: dawidd6/action-download-artifact@57aa996fc1713cc1579039614f4645a7f4841fd4
+        uses: actions/github-script@v9
         with:
-          workflow: ci.yml
-          branch: main
-          workflow_conclusion: success
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 1,
+            });
+            const run = data.workflow_runs[0];
+            if (!run) {
+              core.setOutput('run_id', '');
+              return;
+            }
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+              per_page: 100,
+            });
+            const has = arts.data.artifacts.some(a => a.name === 'contracts-coverage-lcov');
+            core.setOutput('run_id', has ? String(run.id) : '');
+
+      - name: Download coverage baseline
+        id: dl_baseline
+        if: github.event_name == 'pull_request' && steps.resolve.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
           name: contracts-coverage-lcov
-          # action-download-artifact resolves `path:` relative to
+          # actions/download-artifact resolves `path:` relative to
           # GITHUB_WORKSPACE, not the job-default working-directory,
           # so this lands the file at contracts/baseline/lcov.info.
           path: contracts/baseline/
-          if_no_artifact_found: warn
+          repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.resolve.outputs.run_id }}
 
       # Record WHY the baseline is absent so the comment script can
       # distinguish "first PR / artifact expired" from "download failed
       # with the artifact available" — otherwise an artifact-API outage
-      # looks identical to a legitimate first PR.
+      # looks identical to a legitimate first PR. A skipped download
+      # (no successful main run, or the artifact is absent from it) is
+      # the same as not-found; a download that ran and failed against a
+      # present artifact, or a resolve step that itself hit an API
+      # outage, is a real download-failed.
       - name: Tag baseline status
         if: github.event_name == 'pull_request'
         run: |
           mkdir -p baseline
           if [[ -s baseline/lcov.info ]]; then
             rm -f baseline/.absent-reason
-          elif [[ "${{ steps.dl_baseline.outcome }}" == "success" ]]; then
+          elif [[ "${{ steps.resolve.outcome }}" == "failure" ]]; then
+            printf 'download-failed\n' > baseline/.absent-reason
+          elif [[ "${{ steps.dl_baseline.outcome }}" == "success" || "${{ steps.dl_baseline.outcome }}" == "skipped" ]]; then
             printf 'not-found\n' > baseline/.absent-reason
           else
             printf 'download-failed\n' > baseline/.absent-reason
