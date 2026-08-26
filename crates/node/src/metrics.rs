@@ -1191,6 +1191,16 @@ pub struct DecdnMetrics {
     /// **latent-bug report, not a degradation**: alert on `> 0` and file it rather
     /// than tuning anything.
     pub serve_frame_accounting_fault: Counter,
+    /// `decdn_serve_stream_node_fault_total`: a `cdn/client/v1` delivery ended on a
+    /// fault this node caused — an encode fault, an alignment error, a store fault,
+    /// a framing fault — rather than on a peer hang-up or a client payment fault.
+    ///
+    /// The client sees only a short stream, so without this counter the whole class
+    /// is visible solely in the `error!` log line beside it. Any nonzero value is a
+    /// **latent-bug report, not a degradation**: alert on `> 0` and file it. It is a
+    /// superset of `decdn_serve_frame_accounting_fault_total`, which meters one of
+    /// the four classes on its own.
+    pub serve_stream_node_fault: Counter,
     /// `decdn_load_shed_egress_bps`: current measured egress EWMA, bytes/sec.
     pub load_shed_egress_bps: Gauge,
     /// `decdn_load_shed_pressure_active`: 1 while the load-shed policy considers
@@ -1958,6 +1968,11 @@ recorders! {
     /// Record a serve leg refusing to cut or frame a `ChunkData` because its own
     /// byte accounting did not add up. Node-side bug, never peer behaviour.
     serve_frame_accounting_fault => serve_frame_accounting_fault.inc();
+
+    /// Record a `cdn/client/v1` delivery that ended on a node-side fault rather than
+    /// on a peer hang-up or a client payment fault. Node-side bug, never peer
+    /// behaviour.
+    serve_stream_node_fault => serve_stream_node_fault.inc();
 
     /// Record the current measured egress EWMA, bytes/sec.
     load_shed_egress_bps(bps: i64) => load_shed_egress_bps.set(bps);
