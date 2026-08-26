@@ -45,10 +45,9 @@ use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
 
 // Teardown is routed through the shared bounded helper rather than a bare
-// `Endpoint::close().await`, which has no deadline of its own. Called fully
-// qualified: `TestServer` carries a `shutdown` method of its own, and a bare
-// `shutdown(...)` beside `provider.shutdown()` reads ambiguously.
+// `Endpoint::close().await`, which has no deadline of its own.
 mod support;
+use support::shutdown;
 
 fn fresh_key() -> SecretKey {
     SecretKey::generate()
@@ -122,8 +121,8 @@ struct TestServer {
 impl TestServer {
     /// The two halves teardown needs: the accept loop's handle and the
     /// endpoint it accepts on. A test that tears several servers down
-    /// together hands these to one [`support::shutdown`] call, so the
-    /// whole teardown costs one deadline rather than one per endpoint.
+    /// together hands these to one [`shutdown`] call, so the whole
+    /// teardown costs one deadline rather than one per endpoint.
     ///
     /// The routing / record handles belong to the test, not to teardown,
     /// and are dropped here.
@@ -282,7 +281,7 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
     assert_eq!(providers, vec![NodeId::from_bytes(*provider.id.as_bytes())]);
 
     let (provider_task, provider_ep) = provider.into_teardown_parts();
-    support::shutdown([provider_task], [&client_ep, &provider_ep]).await?;
+    shutdown([provider_task], [&client_ep, &provider_ep]).await?;
     Ok(())
 }
 
@@ -337,7 +336,7 @@ async fn find_providers_drops_providers_in_negative_cache() -> anyhow::Result<()
     );
 
     let (provider_task, provider_ep) = provider.into_teardown_parts();
-    support::shutdown([provider_task], [&client_ep, &provider_ep]).await?;
+    shutdown([provider_task], [&client_ep, &provider_ep]).await?;
     Ok(())
 }
 
@@ -389,7 +388,7 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
     );
 
     let (provider_task, provider_ep) = provider.into_teardown_parts();
-    support::shutdown([provider_task], [&client_ep, &provider_ep]).await?;
+    shutdown([provider_task], [&client_ep, &provider_ep]).await?;
     Ok(())
 }
 
@@ -421,7 +420,7 @@ async fn find_providers_with_empty_routing_table_returns_empty() -> anyhow::Resu
 
     assert!(providers.is_empty());
 
-    support::shutdown([], [&client_ep]).await?;
+    shutdown([], [&client_ep]).await?;
     Ok(())
 }
 
@@ -475,6 +474,12 @@ async fn find_providers_stops_at_the_round_ceiling_even_while_still_finding_clos
     for _ in 0..6 {
         servers.push(spin_up_server(HashSet::new()).await?);
     }
+    // Fixed-size from here on: teardown hands `shutdown` a `[_; 6]` of accept
+    // tasks and a `[_; 7]` of endpoints, and an array carries those lengths
+    // rather than re-checking them at the end of the test.
+    let mut servers: [TestServer; 6] = servers
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("six servers"))?;
     servers.sort_by_key(|s| xor_distance(s.id.as_bytes(), &target));
     // Farthest first: the client starts at the far end and walks inward.
     servers.reverse();
@@ -554,21 +559,12 @@ async fn find_providers_stops_at_the_round_ceiling_even_while_still_finding_clos
         "a truncated lookup must be metered, not just logged at debug!; got:\n{encoded}"
     );
 
-    let mut server_tasks = Vec::new();
-    let mut server_eps = Vec::new();
-    for s in servers {
-        let (task, ep) = s.into_teardown_parts();
-        server_tasks.push(task);
-        server_eps.push(ep);
-    }
-    let tasks: [tokio::task::JoinHandle<()>; 6] = server_tasks
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected six server tasks"))?;
-    let mut eps = vec![&client_ep];
-    eps.extend(server_eps.iter());
-    let eps: [&Endpoint; 7] = eps
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("expected seven endpoints"))?;
-    support::shutdown(tasks, eps).await?;
+    let [(t0, e0), (t1, e1), (t2, e2), (t3, e3), (t4, e4), (t5, e5)] =
+        servers.map(TestServer::into_teardown_parts);
+    shutdown(
+        [t0, t1, t2, t3, t4, t5],
+        [&client_ep, &e0, &e1, &e2, &e3, &e4, &e5],
+    )
+    .await?;
     Ok(())
 }
