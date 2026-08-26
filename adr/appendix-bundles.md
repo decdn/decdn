@@ -7,8 +7,8 @@
 > mechanisms (tarballs and the like) remain valid for their own use
 > cases.
 
-**Date:** 2026-05-07 — **Status:** Accepted (`bundle create`
-ships; `bundle pull` deferred). **Touches:** `decdn` CLI, content
+**Date:** 2026-05-07 — **Status:** Accepted (`bundle create` and
+`bundle pull` both ship). **Touches:** `decdn` CLI, content
 publishing workflow.
 
 ## Context
@@ -44,9 +44,9 @@ is load-bearing — see [Determinism](#determinism).
   rejected at create time.
 - `hash` — `b3:` followed by the 64-character lowercase hex of the
   file's BLAKE3. See [Hash format](#hash-format).
-- `size` — file size in bytes, unsigned 64-bit integer. Currently
-  informational; reserved for `bundle pull` (progress + pre-flight)
-  once the fetch primitive ships.
+- `size` — file size in bytes, unsigned 64-bit integer. Optional and
+  informational on the read side: `bundle pull` uses it for the dry-run
+  plan and size hints, and fetches without it.
 
 ## Hash format
 

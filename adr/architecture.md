@@ -130,8 +130,6 @@ Appendices document patterns, reference implementations, and operational guidanc
 6. [Local Admin HTTP Surface](appendix-local-admin-http.md#appendix-local-admin-http-surface) — loopback-bound admin API for operator runbook automation
 7. [Operator Key Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) — sequenced procedure for rotating the operator's iroh node-key, Ethereum signing key, and (production) session keys via `bindNodeId`, deregister-and-re-stake, or `erc7579/smartsessions`
 8. [Operator Protocol-Upgrade Runbook](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) — tier-independent safe-restart drain procedure plus Tier 1/2 operator checklists for compatible in-version releases; Tier 3 migrations are defined with the concrete breaking change
-9. [Permissionless Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis) — optional, anyone-can-run off-chain analysis of public redemption/settlement flows for self-routing and wash-trading patterns, feeding governance parameter-tuning
-
 ## Architectural Decisions
 
 Numeric per-ADR index.
@@ -248,6 +246,10 @@ The system relies on several infrastructure-level assumptions beyond the cryptog
 ## Origin Backends
 
 Origin-backed nodes hold the canonical bytes and are pulled only on cache miss; whether an operator is *recognized* as origin is governed on-chain via `OriginAssignment`, where governance vets the publisher wallet and the vetted publisher seats its own operators (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Configuring an origin backend locally without DAO authorization simply means the operator's bytes are served as cache. Supported backends — any S3-compatible object store (AWS S3, Cloudflare R2, Backblaze B2, self-hosted MinIO), an NFS mount, or local disk — and how a node maps a hash to its stored object are purely operational: the protocol only requires that a node deliver the correct bytes for a given hash.
+
+## Observability
+
+The daemon serves an OpenMetrics `/metrics` endpoint (loopback, default `:9090`) and a loopback JSON-RPC admin surface (default `:9191`, see [Local Admin HTTP Surface](appendix-local-admin-http.md#appendix-local-admin-http-surface)). Informally, the load-bearing series are the stream counters (`streams_active`, `streams_completed`, `streams_failed`), the payment counters (`vouchers_signed`, `vouchers_received`, `channels_open` — canonically `decdn_lanes_open`), the probe-hold gauges (`probe_hold_slots_used`, `probe_hold_violations`), and the rate-bounds clamp counter (`rate_bounds_clamp_events`). The canonical `decdn_`-prefixed registry, the naming convention, the mandatory-vs-recommended split, and the slash-risk alert thresholds live in [Observability and Metrics](appendix-observability.md#appendix-observability-and-metrics).
 
 ## Non-Goals
 

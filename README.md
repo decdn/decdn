@@ -85,7 +85,7 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Dual currency:** USDC for payments, TOKEN for staking/governance
 - **No exposed origins:** Origin backends (S3/R2/B2) are opaque per-node config
 - **Encryption-agnostic protocol:** publishers may encrypt content before upload; the CDN content-addresses and delivers the resulting bytes, while key distribution stays outside the protocol ([ADR 002](adr/002-content-addressing.md#adr-002-content-addressing)).
-- **Stale-close defense:** in-process dispute monitor + permissionless `disputeChannel` submission; optional [fraud-detection layer](adr/appendix-fraud-detection.md) anyone can run for `SlashJudge`-bonded challenges
+- **Settlement:** provider-only redemption — no party submits a value on another's behalf, so an owner's `closePool` cannot understate a node's earnings; the node's periodic redeem sweep runs inside the close grace window to collect earned vouchers before the owner can reclaim ([ADR 003](adr/003-payments.md#adr-003-payment-model))
 - **Discovery:** `cdn/dht/v1` Kademlia DHT for content discovery from PoC onward; broadcast probe fan-out as bootstrap fallback
 - **Reputation:** Interaction-weighted scoring ([ADR 008](adr/008-reputation.md)); local per-peer EWMA today, gossip aggregation deferred
 - **Governance:** Single day-one governance contract surface (`DecdnGovernor` + `TimelockController`); served-bytes-weighted operator voting with hardcoded safety bounds — only the process evolves by phase (admin key → bootstrap multisig → DAO), not the contract set

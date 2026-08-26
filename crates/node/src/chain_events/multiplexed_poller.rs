@@ -3,9 +3,9 @@
 //!
 //! [`resumable_watcher`](super::resumable_watcher) gives every watcher its own
 //! cursor loop and its own `eth_getLogs` call each tick. That is right when a
-//! watcher's filter genuinely differs from its siblings', but five watchers on
-//! this node scan disjoint `(address, topic0)` slices of the *same* three
-//! contracts — so five independent loops cost five `eth_getLogs` calls per tick
+//! watcher's filter genuinely differs from its siblings', but six watchers on
+//! this node scan disjoint `(address, topic0)` slices of the *same* four
+//! contracts — so six independent loops cost six `eth_getLogs` calls per tick
 //! where one merged call, demuxed after the fact, would do. [`MultiplexedPoller`]
 //! is that merge: one filter, one `eth_getLogs` per window, fanned out by
 //! `(address, topic0)` into each watcher's own [`ErasedSink`].
@@ -40,7 +40,7 @@
 //! checkpoint-load floor derivation, or the merged `get_logs` call): those fail
 //! the *whole* tick before any route-specific step runs, so [`fail_whole_tick`]
 //! fires `on_backoff` for every route directly at the failure site — every route
-//! is equally down, just as five independent watchers all convoyed into backoff
+//! is equally down, just as six independent watchers all convoyed into backoff
 //! together when every one read the shared head through
 //! [`super::shared_head::SharedHead`].
 //!
@@ -49,9 +49,9 @@
 //! token must not flip a readiness gate open), while `on_tick_success` keeps
 //! stamping unconditionally.
 //!
-//! The runtime registers all five `eth_getLogs` watchers' [`Route`]s on one
+//! The runtime registers all six `eth_getLogs` watchers' [`Route`]s on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
-//! place of five independent per-watcher loops.
+//! place of six independent per-watcher loops.
 //!
 //! This module is `pub` only so `Route` can appear in the `pub` watcher
 //! `bootstrap` signatures and the external settlement e2e can drive `spawn`; its
@@ -503,8 +503,9 @@ fn advance_routes(poller: &mut MultiplexedPoller, end: u64) {
     }
 }
 
-/// End-of-tick reconcile per route (blacklist re-scope, origin deferred
-/// re-reads, capacity-bond/slash resync, rate-bounds hourly re-read). A
+/// End-of-tick reconcile per route (blacklist re-scope — origin blacklisting
+/// rides the blacklist route — capacity-bond/slash resync, rate-bounds and
+/// fee-shares safety-net re-reads). A
 /// reconcile `Err` marks that route errored (holds its cursor, retries).
 async fn reconcile_routes(poller: &mut MultiplexedPoller) {
     for r in &mut poller.routes {
