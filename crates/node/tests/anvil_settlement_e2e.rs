@@ -846,25 +846,41 @@ async fn run_e2e() -> anyhow::Result<()> {
         signer: client_addr,
         provider: node_addr,
     };
-    let lane_after_first = store.get(lane_key)?.ok_or_else(|| {
-        anyhow::anyhow!("lane state missing from the store after the first redeem")
+    // The redeem's on-chain confirmation (`getWatermark` above) is observable
+    // via `eth_call` immediately after the block is mined, but the redeemer's
+    // `store.set_registered_until` (crates/node/src/payment_settlement.rs:1232)
+    // runs in the same task after `TxOutcome::Landed`. Poll the store so the
+    // assertion does not race the buffered write — an immediate check flaked
+    // under load (run 32915992488).
+    let lane_after_first = poll_until(Duration::from_secs(10), || {
+        let store = Arc::clone(&store);
+        async move {
+            let st = store.get(lane_key).ok().flatten()?;
+            (st.registered_until != 0).then_some(st)
+        }
+    })
+    .await
+    .ok_or_else(|| {
+        let snapshot = store.get(lane_key).ok().flatten();
+        anyhow::anyhow!(
+            "registered_until must be persisted once the first redeem's CapabilityReg lands; \
+             got lane={snapshot:?} auth_cap={} auth_expiry={}",
+            auth_after_first.cap,
+            auth_after_first.expiry
+        )
     })?;
-    anyhow::ensure!(
-        lane_after_first.registered_until != 0,
-        "registered_until must be persisted once the first redeem's CapabilityReg lands"
-    );
-    // Brief settle window before the second delivery. Observed empirically:
-    // firing the second delivery back-to-back with the first — within the
-    // same scheduler tick the first redeem's on-chain confirmation lands —
-    // is occasionally still followed by the second sweep attaching a
-    // CapabilityReg, even though `store.get` just above already shows
-    // `registered_until` durably set at that instant. A 100ms gap here made
-    // it reproduce 0/10 vs. non-trivially otherwise; not fully root-caused
-    // (this test does not diagnose the redeemer's internals), but no real
-    // client re-delivers on an identical lane within the same tick, so a
-    // brief pacing gap is a realistic and cheap way to avoid asserting on
-    // that razor's-edge window.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Ensure the persisted `registered_until` is visible to the next
+    // `plan_lanes` before the second delivery. A fixed 100ms sleep previously
+    // masked the race where `store.get` already showed the value but the next
+    // `load_all` snapshot still raced; polling is deterministic.
+    let _ = poll_until(Duration::from_secs(5), || {
+        let store = Arc::clone(&store);
+        async move {
+            let st = store.get(lane_key).ok().flatten()?;
+            (st.registered_until != 0).then_some(())
+        }
+    })
+    .await;
     let watermark_after_first = watermark
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?
@@ -941,13 +957,23 @@ async fn run_e2e() -> anyhow::Result<()> {
             && auth_after_second.expiry == auth_after_first.expiry,
         "Authorization must not change across the second, already-registered sweep"
     );
-    let lane_after_second = store.get(lane_key)?.ok_or_else(|| {
-        anyhow::anyhow!("lane state missing from the store after the second redeem")
+    // Poll for the same reason as `lane_after_first`: the second redeem's
+    // `store.set_registered_until` (if any) and the watcher `paid` update race
+    // the `getWatermark` poll above.
+    let _lane_after_second = poll_until(Duration::from_secs(10), || {
+        let store = Arc::clone(&store);
+        async move {
+            let st = store.get(lane_key).ok().flatten()?;
+            (st.registered_until != 0).then_some(st)
+        }
+    })
+    .await
+    .ok_or_else(|| {
+        let snapshot = store.get(lane_key).ok().flatten();
+        anyhow::anyhow!(
+            "registered_until must remain persisted after the second sweep; got lane={snapshot:?}"
+        )
     })?;
-    anyhow::ensure!(
-        lane_after_second.registered_until != 0,
-        "registered_until must remain persisted after the second sweep"
-    );
 
     // THE REGRESSION-CATCHING ASSERTION: locate the two on-chain transactions
     // that landed the two redeems, and read back the redeemer's own
@@ -973,7 +999,16 @@ async fn run_e2e() -> anyhow::Result<()> {
         redeem_scan_from,
     )
     .await?;
-    let cap_count_first = cap_count_for_tx(&cap_count_log, tx_first)?;
+    // `CapCountLayer` is fed by `submit_chunk`'s `info!(cap_count)` which runs
+    // after `store.set_registered_until` in the same task, so poll for its
+    // capture to avoid racing the log layer's `on_event` delivery.
+    let cap_count_first = poll_until(Duration::from_secs(10), || {
+        let captured = Arc::clone(&cap_count_log);
+        let tx = tx_first;
+        async move { cap_count_for_tx(&captured, tx).ok() }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("no captured cap_count log line for redeem tx {tx_first}"))?;
     anyhow::ensure!(
         cap_count_first == 1,
         "first redeem must attach exactly one CapabilityReg (the signer registers on-chain \
@@ -987,7 +1022,13 @@ async fn run_e2e() -> anyhow::Result<()> {
         block_first + 1,
     )
     .await?;
-    let cap_count_second = cap_count_for_tx(&cap_count_log, tx_second)?;
+    let cap_count_second = poll_until(Duration::from_secs(10), || {
+        let captured = Arc::clone(&cap_count_log);
+        let tx = tx_second;
+        async move { cap_count_for_tx(&captured, tx).ok() }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("no captured cap_count log line for redeem tx {tx_second}"))?;
     anyhow::ensure!(
         cap_count_second == 0,
         "second sweep must attach NO CapabilityReg — registration is already known from the \
