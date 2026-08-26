@@ -37,10 +37,12 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 # `tests/support::shutdown`, which bounds its own work and names the stage it
 # stalled in. This cap does not have to absorb a teardown wedge, so it catches only
 # a hang that predates teardown and can sit close to the suite's real cost: the
-# slowest test in the package measures ~13s uninstrumented, and no test here drives
-# `selection::outer_pull_deadline` at the defaults the header cites. 180s leaves
-# room for coverage instrumentation and a loaded runner while naming a wedge 120s
-# sooner than the global backstop, with the first `SLOW` line at 60s.
+# slowest test in the package measures ~13s uninstrumented, and
+# `silent_upstreams_do_not_starve_the_candidate_loop` drives
+# `selection::outer_pull_deadline` at `5s+5s` budgets for `77.5s` to survive
+# `cargo llvm-cov` slowdown. `180s` (60s×3) still leaves room for that outer
+# deadline plus instrumentation and a loaded runner while naming a wedge 120s
+# sooner than the global `300s` (60s×5) backstop, with the first `SLOW` line at 60s.
 #
 # `success-output` is what makes a teardown breach visible: `shutdown` warns rather
 # than failing (the stranded-driver half is a known open defect no test can fix),

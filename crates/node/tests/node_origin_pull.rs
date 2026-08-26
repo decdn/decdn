@@ -45,7 +45,9 @@ use decdn_node::dht::{
 };
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, PullMiss, TeeVerdict};
-use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
+use decdn_node::selection::{
+    CHANNEL_OPEN_CALLER_BUDGET, MAX_PROVIDER_ATTEMPTS, outer_pull_deadline,
+};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
     StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
@@ -5801,10 +5803,15 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
-    // Small budgets: the deadline arithmetic is asserted in the unit test named above, so
-    // what these buy is a fast, non-flaky exercise of the real failover path.
-    let per_candidate = Duration::from_secs(2);
-    let stall_budget = Duration::from_secs(2);
+    // Budgets sized so the two silent candidates are abandoned on their own STALL
+    // bound with room to spare under `cargo llvm-cov` instrumentation on a 4-core
+    // runner — a budget too tight for that load lets them starve the outer deadline
+    // before the healthy fallback is dialled, and the stall counter reads `0`. `5s`
+    // keeps the shape (three sequential bounded stages per candidate) at a `77.5s`
+    // outer deadline, which is what `selection::outer_pull_deadline` requires and
+    // what the `.config/nextest.toml` cap for this package is sized around (#1826).
+    let per_candidate = Duration::from_secs(5);
+    let stall_budget = Duration::from_secs(5);
 
     let payload = vec![0x5Eu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
@@ -5970,7 +5977,18 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
 
     // Both silent candidates were classified as stalls (not as our own deadline firing),
     // which is what proves they were abandoned on the STALL bound — the stage whose budget
-    // this test exists to protect — rather than on some other clock.
+    // this test exists to protect — rather than on some other clock. Poll for the exact
+    // count to absorb the one-tick delay between the pull finishing and the metrics
+    // scrape under `cargo llvm-cov` parallel load, but keep the guard strict at
+    // exactly 2 — extra stalls would indicate a regression.
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let mut v = counter_value(&b_metrics, "node_pull_stalled_total")?;
+        while v != 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            v = counter_value(&b_metrics, "node_pull_stalled_total")?;
+        }
+    }
     assert_counter(&b_metrics, "node_pull_stalled_total", 2)?;
     assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
 
@@ -9732,22 +9750,59 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     });
 
     // The two misses race, exactly as two cache misses for different blobs do.
-    let (first, second) = tokio::join!(
-        Origin::fetch(&origin, hash, u64::MAX),
-        Origin::fetch(&origin, hash2, u64::MAX),
-    );
+    // Bound the join so a hung channel-open leaves a clear verdict instead of the
+    // opaque nextest `slow-timeout` kill (#1826). The bound is a diagnostic, not a
+    // performance assertion: it sits far enough above the honest cost of two
+    // channel opens under `cargo llvm-cov` contention that a slow-but-correct run
+    // still passes, and far enough below this binary's `60s x 3` nextest cap that
+    // the named verdict is what CI reports.
+    let join_budget = Duration::from_mins(1);
+    let (first, second) = tokio::time::timeout(join_budget, async {
+        tokio::join!(
+            Origin::fetch(&origin, hash, u64::MAX),
+            Origin::fetch(&origin, hash2, u64::MAX),
+        )
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "concurrent ledger pulls hung past {join_budget:?} — likely \
+             CHANNEL_OPEN_CALLER_BUDGET={CHANNEL_OPEN_CALLER_BUDGET:?} expiry under llvm-cov \
+             contention, not StaleNonce; pending={} timeout={} stalled={} recorded={:?} \
+             retired={:?}",
+            counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+            counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
+            counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
+            recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
+            retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
+        )
+    })?;
     let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
-        matches!(first, OriginFetch::AlreadyAdmitted),
-        "the first concurrent pull returned NOTHING — its voucher collided with the \
-         other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+        matches!(&first, OriginFetch::AlreadyAdmitted),
+        "first concurrent pull returned {first:?} (expected AlreadyAdmitted); StaleNonce would retire \
+         the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
+         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
+         timeout={} stalled={} recorded={:?} retired={:?}",
+        counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
+        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
+        retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
     let got1 = engine.get(hash).await?;
     let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
-        matches!(second, OriginFetch::AlreadyAdmitted),
-        "the second concurrent pull returned NOTHING — its voucher collided with the \
-         other pull's on `prior_nonce + 1` and the upstream rejected it StaleNonce"
+        matches!(&second, OriginFetch::AlreadyAdmitted),
+        "second concurrent pull returned {second:?} (expected AlreadyAdmitted); StaleNonce would retire \
+         the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
+         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
+         timeout={} stalled={} recorded={:?} retired={:?}",
+        counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
+        counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
+        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
+        retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
     let got2 = engine.get(hash2).await?;
     anyhow::ensure!(got1.as_ref() == payload.as_slice(), "blob 1 bytes mismatch");
@@ -13300,18 +13355,39 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Res
         )
     })
     .await
-    .map_err(|_| anyhow::anyhow!("concurrent top-up pulls never finished"))?;
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "concurrent top-up pulls never finished within 2m — likely stalled frontier or \
+             wedge; topups={:?} pending={} stalled={} timeout={}",
+            topup_log(&fixture.opener).unwrap_or_default(),
+            counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
+            counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
+            counter_value(&fixture.metrics, "node_pull_timeout_total").unwrap_or(0)
+        )
+    })?;
 
     let got_a = got_a.map_err(|e| anyhow::anyhow!("fetch A: {e}"))?;
     anyhow::ensure!(
-        matches!(got_a, OriginFetch::AlreadyAdmitted),
-        "pull A must deliver, not NotFound"
+        matches!(&got_a, OriginFetch::AlreadyAdmitted),
+        "pull A returned {got_a:?} (expected AlreadyAdmitted); a frontier overshoot past the \
+         delivered bytes splices a gap and surfaces NotFound after the hash check, while a \
+         stalled/timeout budget expiry leaves topup_log empty — got topups={:?} stalled={} \
+         pending={}",
+        topup_log(&fixture.opener).unwrap_or_default(),
+        counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
+        counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0)
     );
     let bytes_a = fixture.engine.get(hash_a).await?;
     let got_b = got_b.map_err(|e| anyhow::anyhow!("fetch B: {e}"))?;
     anyhow::ensure!(
-        matches!(got_b, OriginFetch::AlreadyAdmitted),
-        "pull B must deliver, not NotFound"
+        matches!(&got_b, OriginFetch::AlreadyAdmitted),
+        "pull B returned {got_b:?} (expected AlreadyAdmitted); a frontier overshoot past the \
+         delivered bytes splices a gap and surfaces NotFound after the hash check, while a \
+         stalled/timeout budget expiry leaves topup_log empty — got topups={:?} stalled={} \
+         pending={}",
+        topup_log(&fixture.opener).unwrap_or_default(),
+        counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
+        counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0)
     );
     let bytes_b = fixture.engine.get(hash_b).await?;
     // EXACT bytes, which is the whole point: an overshot frontier assembles a blob
