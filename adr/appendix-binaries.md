@@ -10,15 +10,14 @@ A deCDN deployment has two unrelated jobs:
 - run a long-lived cache-node daemon (lives in containers, runs under
   systemd, reachable on QUIC `:4433` and metrics `:9090`), and
 - run one-shot human commands an operator or publisher types in a
-  terminal — `probe`, `node region-stats`, `key-gen`, `config validate`, and
-  the deferred `pull`, `bundle …`, `fetch`, `publish`, `pool`,
-  `wallet`.
+  terminal — `probe`, `fetch`, `bundle …`, `publish`, `pool`,
+  `node status`, `key-gen`, `config validate`.
 
 Threat surface, dependency footprint, and update cadence differ
 between the two. A single fused binary would force every operator
 deployment to ship publisher tooling, every publisher install to drag
 in the daemon's runtime, and contaminate features like
-`decdn bundle …` and `decdn pull` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) with a "which
+`decdn bundle …` and `decdn fetch` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) with a "which
 binary owns this?" question absent from `dockerd` + `docker`,
 `kubelet` + `kubectl`, or `containerd` + `nerdctl`.
 
@@ -31,9 +30,11 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   easy to containerise, minimal supply-chain surface.
 - **`decdn`** (`crates/cli`, package `decdn-cli`) — single
   human-facing CLI. Carries every command anyone types: `probe`,
-  `node {health,region-stats,evict,reload,drain}`, `key-gen`,
-  `config {init,validate}`, and the deferred `pull`, `bundle …`,
-  `fetch`, `publish`, `pool`, `wallet`.
+  `fetch`, `bundle {create,pull}`, `publish`, `pool`, `appeal`,
+  `setup`, `key-gen`, `config {init,validate}`, and the `node`
+  admin/on-chain subcommands (health, status, lanes, evict, reload,
+  drain, top, lookup, register, deregister, bond, unbond,
+  rotate-key).
 - **`decdn-common`** (`crates/common`) — shared types both binaries
   need: the TOML config schema and resolver, identity loading, the
   `AdminRpc` trait + DTOs, and clap argument structs. No runtime, no
@@ -102,7 +103,7 @@ and would silently miss data on a prefix rename.
 
 ## Cross-ADR Impact
 
-- `decdn bundle …` and `decdn pull` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) land directly
+- `decdn bundle …` and `decdn fetch` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) land directly
   on `decdn`; no binary-placement question remains for either.
 - Shell completions and man pages are deferred — both binaries should
   generate them via `clap_complete`. Tracked as follow-up issues.

@@ -23,17 +23,6 @@
 //! [`buyer_pool`]): the runtime bootstraps the approval and the reclaim
 //! sweep, and its node-to-node pull-through origin drives pool open/reuse
 //! and voucher signing on a miss.
-//!
-//! Stale-close defense is the one payment surface this crate does not reach,
-//! and it is not built on either side yet. Per
-//! `adr/appendix-fraud-detection.md` it needs no watchtower role, no escrow
-//! contract, and no wire protocol: redemption against an owner's
-//! `PoolCloseInitiated` grace window is permissionless, so the primary
-//! mechanism is a local in-process monitor that follows the event on the
-//! node's own pools and re-submits its latest voucher (operator-arranged
-//! redundancy and the dispute window back it). That monitor is deferred
-//! (#324) — the runtime observes the event but never redeems on its own
-//! behalf outside the normal path.
 
 pub mod bind_sig;
 pub mod buyer_pool;

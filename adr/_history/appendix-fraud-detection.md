@@ -1,5 +1,7 @@
 # Appendix: Permissionless Settlement Analysis
 
+> **Status:** Retired 2026-08-26 under the stale design-ahead cleanup (#1845). The appendix described a permissionless off-chain settlement-analysis role: subscribing to the public `PaymentPool.PoolRedeemed` / `FeeRouter.Settled` events and looking for self-routing patterns. It specified no protocol surface — no wire interface, registration, or economics — and everything load-bearing in it lives elsewhere: there is no stale-close vector under the shared pool and node self-protection is the periodic redeem sweep inside the close grace window ([ADR 003 § Redemption and Close](../003-payments.md#redemption-and-close), implemented in the `decdn-node` runtime), while the structural wash-trading deterrent is the 40% non-base skim plus the per-operator vote cap ([ADR 036](../036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)). Anyone can still analyze the public events; a role description for doing so is not a design artifact. Original body preserved verbatim below for historical reference; do not link to from canonical ADRs.
+
 > **This is an appendix, not a core protocol ADR.** It describes the operational role of running an off-chain analyzer of on-chain settlement flows — a permissionless side-effect of the pool's redemption events being public.
 
 ## Context

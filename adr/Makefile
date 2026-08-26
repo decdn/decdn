@@ -83,7 +83,7 @@ BOOK_SRCS := \
   appendix-l2-deployment.md \
   appendix-poc-production-seams.md appendix-binaries.md \
   appendix-local-admin-http.md appendix-operator-key-rotation.md \
-  appendix-operator-upgrade-path.md appendix-fraud-detection.md \
+  appendix-operator-upgrade-path.md \
   glossary.md
 
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
