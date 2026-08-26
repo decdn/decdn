@@ -39,10 +39,11 @@ use decdn_client_pull::sink::content_paid_frontier;
 
 use super::MAX_PROOFS_PER_CHUNK;
 use super::voucher::StreamAnchor;
+use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
     Hash, LaneDeliveryState, LaneKey, Mutex, Ordering, RecvStream, SendStream, U256, VecDeque,
-    VoucherRejectReason, VoucherStop, encode_chunk_frame,
+    VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -153,7 +154,7 @@ impl ClientHandler {
         // that ends `Err` here fails the serve rather than hanging.
         let opening_window = self.credit_window(chunk_bytes, 0);
         let mut next_chunk = producer
-            .next_frame(self.frame_target(0, chunk_bytes, opening_window))
+            .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
             .await?;
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
@@ -184,22 +185,24 @@ impl ClientHandler {
                 if delivered.saturating_sub(paid) >= window {
                     break;
                 }
-                let Some(chunk) = next_chunk.take() else {
+                let Some((chunk_vec, clen)) = next_chunk.take() else {
                     break;
                 };
-                let clen = chunk.len() as u64;
-                let payload = encode_chunk_frame(&chunk)
-                    .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
+                let clen_u64 = clen as u64;
+                // Assemble before the write, and outside the metered block: a framing
+                // fault here is the node's own bug, and metering it as a client
+                // abandon would file it under the peer's behaviour.
+                let mut bufs = chunk_frame_bufs(&chunk_vec, clen)?;
                 // A downstream drop surfaces here as `Err` (#856 client-disconnect
                 // shape); meter the client-abandon, then propagate so the caller drops
                 // the pull leg.
-                if let Err(e) = self.write_payload(send, &payload).await {
+                if let Err(e) = self.write_chunk_bufs(send, &mut bufs).await {
                     self.metrics.node_pull_through_client_abandoned();
                     return Err(e);
                 }
-                delivered = delivered.saturating_add(clen);
-                self.shed.record_egress(clen);
-                unvouchered = unvouchered.saturating_add(clen);
+                delivered = delivered.saturating_add(clen_u64);
+                self.shed.record_egress(clen_u64);
+                unvouchered = unvouchered.saturating_add(clen_u64);
                 if unvouchered >= chunk_bytes {
                     pending.push_back(unvouchered);
                     unvouchered = 0;
@@ -210,7 +213,7 @@ impl ClientHandler {
                 // exit to recoup before they can be pulled.
                 let room = window.saturating_sub(delivered.saturating_sub(paid));
                 next_chunk = producer
-                    .next_frame(self.frame_target(unvouchered, chunk_bytes, room))
+                    .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
                     .await?;
             }
             let done_delivering = next_chunk.is_none();

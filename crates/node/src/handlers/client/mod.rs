@@ -47,8 +47,8 @@ use decdn_protocol::client::{
     StreamResponseBody, StreamResponseExt, VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
-    ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_chunk_frame,
-    encode_message, is_unknown_variant, read_frame, write_frame,
+    ALPN_CLIENT, APP_ERR_RATE_LIMITED, CHUNK_BYTES, FrameError, decode_message, encode_message,
+    is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};

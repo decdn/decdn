@@ -1,5 +1,9 @@
 //! Small leaf helpers: rate clamping, response signing, wire writes, receipts.
 
+use std::collections::VecDeque;
+
+use bytes::Bytes;
+
 use super::{
     B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, SendStream, ServeRejectReason,
     StreamError, StreamRequest, StreamResponse, StreamResponseBody, StreamResponseExt,
@@ -213,5 +217,234 @@ impl ClientHandler {
         write_frame(send, payload)
             .await
             .map_err(|e| anyhow::anyhow!("write failed: {e}"))
+    }
+
+    /// Put one already-assembled `ChunkData` frame on the wire.
+    ///
+    /// Every error is an I/O error, which is what lets the cache-miss leg meter a
+    /// failure here as a client abandon (#856) without misfiling a node-side framing
+    /// bug as one. Build `bufs` with [`chunk_frame_bufs`] first.
+    ///
+    /// `write_all_chunks` empties the `Bytes` it writes, so `bufs` is spent
+    /// afterwards.
+    pub(super) async fn write_chunk_bufs(
+        &self,
+        send: &mut SendStream,
+        bufs: &mut [Bytes],
+    ) -> anyhow::Result<()> {
+        send.write_all_chunks(bufs)
+            .await
+            .map_err(|e| anyhow::anyhow!("write chunk frame: {e}"))
+    }
+
+    /// Assemble one `ChunkData` frame and write it. The cache-hit leg's door;
+    /// the miss leg splits the two halves so it can tell them apart when metering.
+    pub(super) async fn write_chunk_payload_multi(
+        &self,
+        send: &mut SendStream,
+        payload_chunks: &[Bytes],
+        total_len: usize,
+    ) -> anyhow::Result<()> {
+        let mut bufs = chunk_frame_bufs(payload_chunks, total_len)?;
+        self.write_chunk_bufs(send, &mut bufs).await
+    }
+}
+
+/// The vectored write buffers for one `ChunkData` frame: the header, then the
+/// payload chunks untouched.
+///
+/// The payload is the bao-verified stream bytes (content + interleaved proof nodes
+/// per ADR 038), already split across the `Bytes` items one frame spans. Only the
+/// header is copied — onto the stack, then once into a small `Bytes` — so the
+/// payload reaches the wire without a coalescing copy. The bytes this produces
+/// equal `encode_chunk_frame(&concat)` + `write_frame`, pinned by
+/// `chunk_frame_bufs_match_the_single_buffer_encoder`.
+///
+/// # Errors
+///
+/// An empty `payload_chunks`, or one whose lengths do not sum to `total_len`. Both
+/// mean the framer's byte accounting disagrees with the bytes it handed over —
+/// `total_len` is what the header declares to the client *and* what the serve loop
+/// bills for, so a mismatch must not reach the wire. `total_len == 0` is refused
+/// one door further down, by the encoder's own ADR 005 non-empty floor.
+pub(super) fn chunk_frame_bufs(
+    payload_chunks: &[Bytes],
+    total_len: usize,
+) -> anyhow::Result<Vec<Bytes>> {
+    if payload_chunks.is_empty() {
+        tracing::error!(total_len, "framer handed over an empty chunk payload");
+        anyhow::bail!("refusing to serve an empty chunk payload");
+    }
+    let actual: usize = payload_chunks.iter().map(Bytes::len).sum();
+    if actual != total_len {
+        tracing::error!(
+            actual,
+            total_len,
+            "framer byte count disagrees with its chunks"
+        );
+        anyhow::bail!("payload_chunks sum {actual} does not match total_len {total_len}");
+    }
+    let mut hdr = [0u8; decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX];
+    let hdr_len = decdn_protocol::client::encode_chunk_frame_headers(total_len, &mut hdr)
+        .map_err(|e| anyhow::anyhow!("encode chunk header: {e}"))?;
+    let Some(header) = hdr.get(..hdr_len) else {
+        anyhow::bail!("chunk header length {hdr_len} exceeds its buffer");
+    };
+    let mut bufs = Vec::with_capacity(payload_chunks.len().saturating_add(1));
+    bufs.push(Bytes::copy_from_slice(header));
+    bufs.extend_from_slice(payload_chunks);
+    Ok(bufs)
+}
+
+/// Cut up to `target` bytes off the front of `queue` into the `Bytes` slices that
+/// make up one wire frame, returning them and their total. `queued` is the queue's
+/// running byte count and drops by exactly what is taken.
+///
+/// Nothing is copied: whole items move across, and a frame that ends mid-item splits
+/// it with `Bytes::split_to`, which reslices the same allocation.
+///
+/// `None` only when the queue is empty. Both framers hold `queued` in lockstep with
+/// `queue`, and `target >= 1` at every call site, so a non-empty queue always yields
+/// at least one chunk — a caller that sees `None` with bytes still queued is looking
+/// at a bookkeeping bug, not at the end of the blob.
+pub(super) fn drain_frame(
+    queue: &mut VecDeque<Bytes>,
+    queued: &mut usize,
+    target: usize,
+) -> Option<(Vec<Bytes>, usize)> {
+    let mut remaining = target.min(*queued);
+    let mut out: Vec<Bytes> = Vec::with_capacity(queue.len().min(remaining));
+    let mut total = 0usize;
+    while remaining > 0 {
+        let front_len = queue.front().map_or(0, Bytes::len);
+        if front_len == 0 {
+            break;
+        }
+        if front_len <= remaining {
+            let Some(bytes) = queue.pop_front() else {
+                break;
+            };
+            remaining = remaining.saturating_sub(front_len);
+            total = total.saturating_add(front_len);
+            *queued = queued.saturating_sub(front_len);
+            out.push(bytes);
+        } else {
+            let Some(front) = queue.front_mut() else {
+                break;
+            };
+            let taken = front.split_to(remaining);
+            total = total.saturating_add(taken.len());
+            *queued = queued.saturating_sub(taken.len());
+            out.push(taken);
+            remaining = 0;
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some((out, total))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)] // tests
+mod tests {
+    use bytes::Bytes;
+
+    use super::{chunk_frame_bufs, drain_frame};
+
+    /// The vectored buffers must lay down exactly the bytes the single-buffer
+    /// encoder would, whatever the payload is split into.
+    ///
+    /// This is the claim the whole zero-copy path rests on: the serve loops no
+    /// longer build a `ChunkData` frame at all, so nothing else proves the header
+    /// they emit still matches `encode_chunk_frame` + `write_frame`. The chunk
+    /// counts span what a real frame looks like — one queued item, a handful, and
+    /// the ~130 a default 1 MiB frame spans over 64 B proof nodes and 16 KiB leaves.
+    #[tokio::test]
+    async fn chunk_frame_bufs_match_the_single_buffer_encoder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for count in [1usize, 2, 4, 5, 130] {
+            for chunk_len in [1usize, 64, 16 * 1024] {
+                let chunks: Vec<Bytes> = (0..count)
+                    .map(|i| Bytes::from(vec![u8::try_from(i % 251).unwrap_or(0); chunk_len]))
+                    .collect();
+                let total: usize = chunks.iter().map(Bytes::len).sum();
+
+                let bufs = chunk_frame_bufs(&chunks, total)?;
+                let mut via_bufs = Vec::new();
+                for b in &bufs {
+                    via_bufs.extend_from_slice(b);
+                }
+
+                let mut concat = Vec::with_capacity(total);
+                for c in &chunks {
+                    concat.extend_from_slice(c);
+                }
+                let postcard = decdn_protocol::encode_chunk_frame(&concat)?;
+                let mut via_encoder = Vec::new();
+                decdn_protocol::write_frame(&mut via_encoder, &postcard).await?;
+
+                assert_eq!(
+                    via_bufs, via_encoder,
+                    "diverged at {count} chunks of {chunk_len} bytes"
+                );
+                assert_eq!(
+                    bufs.len(),
+                    count + 1,
+                    "the payload must ride uncopied: one buf per chunk, plus the header"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `total_len` is both what the header declares to the client and what the serve
+    /// loop bills for, so a framer whose byte count disagrees with the bytes it
+    /// handed over must fail loudly here rather than put a mislabelled frame on the
+    /// wire and charge for it.
+    #[test]
+    fn chunk_frame_bufs_refuses_a_payload_that_does_not_match_its_length() {
+        let chunks = vec![Bytes::from_static(b"abcd"), Bytes::from_static(b"ef")];
+        assert!(chunk_frame_bufs(&chunks, 6).is_ok(), "6 is the true sum");
+        assert!(chunk_frame_bufs(&chunks, 5).is_err(), "under-count refused");
+        assert!(chunk_frame_bufs(&chunks, 7).is_err(), "over-count refused");
+        // ADR 005 §Non-empty chunk (#1088), at the last door before the wire.
+        assert!(chunk_frame_bufs(&[], 0).is_err(), "no chunks at all");
+        assert!(
+            chunk_frame_bufs(&[Bytes::new()], 0).is_err(),
+            "one empty chunk is still a zero-length frame"
+        );
+    }
+
+    /// Cutting a frame moves whole items and splits only the one the frame ends in,
+    /// leaving `queued` equal to the bytes still in the queue.
+    #[test]
+    fn drain_frame_cuts_at_the_target_and_keeps_the_remainder() {
+        let mut queue: std::collections::VecDeque<Bytes> =
+            [Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]
+                .into_iter()
+                .collect();
+        let mut queued = 8usize;
+
+        let (chunks, total) = drain_frame(&mut queue, &mut queued, 6).expect("6 of 8 bytes");
+        assert_eq!(total, 6);
+        assert_eq!(chunks.iter().map(Bytes::len).sum::<usize>(), total);
+        assert_eq!(queued, 2, "the split remainder stays queued");
+
+        let (rest, rest_total) = drain_frame(&mut queue, &mut queued, 6).expect("the remainder");
+        assert_eq!(rest_total, 2, "a short final frame, not a padded one");
+        assert_eq!(rest.iter().map(Bytes::len).sum::<usize>(), rest_total);
+        assert_eq!(queued, 0);
+
+        assert!(
+            drain_frame(&mut queue, &mut queued, 6).is_none(),
+            "an empty queue is the only `None`"
+        );
     }
 }

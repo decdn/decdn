@@ -1,18 +1,19 @@
 //! Blob delivery: export the requested range and stream it as paid chunks.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use decdn_cache::CacheResult;
 use futures_util::{Stream, StreamExt};
 
 use super::MAX_PROOFS_PER_CHUNK;
-use super::encode_chunk_frame;
 use super::voucher::StreamAnchor;
+use super::wire::drain_frame;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, FloorReservation,
-    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VecDeque,
-    VoucherRejectReason, VoucherStop,
+    Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
+    VoucherStop,
 };
 
 /// The byte stream [`CacheEngine::export_bao_range_stream`] hands back.
@@ -29,21 +30,25 @@ type BaoExportStream = Pin<Box<dyn Stream<Item = CacheResult<Bytes>> + Send>>;
 /// O(target + one export item) rather than O(blob size). It guarantees two
 /// load-bearing properties:
 ///
-/// - **Never an empty frame.** [`encode_chunk_frame`] rejects one (#1088), and the
-///   inactivity deadline on both receive loops rests on "a frame arrived" and
-///   "bytes made progress" being the same statement.
+/// - **Never an empty frame.** `decdn_protocol::client::encode_chunk_frame_headers`
+///   rejects one (#1088), and the inactivity deadline on both receive loops
+///   rests on "a frame arrived" and "bytes made progress" being the same statement.
 /// - **No frames at all for an empty export.** The 0-byte blob (#1054) must go
 ///   straight to `StreamEnd` rather than send a zero-length frame first.
 struct ChunkFramer {
     stream: BaoExportStream,
-    /// Export bytes not yet cut into a frame. Bounded by one export item plus the
-    /// sub-frame remainder — it never grows with blob size, which is the whole
-    /// point of the type.
-    buf: BytesMut,
-    /// The export stream has yielded its last item; `buf` is all that remains.
+    /// Export bytes not yet cut into a frame, as a queue of reference-counted
+    /// chunks. The queue holds `O(target)` bytes (target + one export item at
+    /// most), never `O(blob size)`, which is the whole point of the type.
+    /// `Bytes` chunks are kept `Bytes`-native so a spanning frame can be sent
+    /// via a vectored QUIC write without copying payload bytes.
+    queue: VecDeque<Bytes>,
+    /// Total bytes currently queued.
+    queued: usize,
+    /// The export stream has yielded its last item; `queue` is all that remains.
     drained: bool,
-    /// The export faulted. Terminal: `buf` is cleared and no further frame is
-    /// ever cut. Not because those bytes are suspect — `buf` only ever holds
+    /// The export faulted. Terminal: `queue` is cleared and no further frame is
+    /// ever cut. Not because those bytes are suspect — `queue` only ever holds
     /// WHOLE export items, and they came from the store's own bao encoder — but
     /// because the delivery is being abandoned, so cutting another frame would
     /// bill the client for a transfer that can never complete.
@@ -65,20 +70,29 @@ impl ChunkFramer {
     fn new(stream: BaoExportStream, hash: Hash) -> Self {
         Self {
             stream,
-            buf: BytesMut::new(),
+            queue: VecDeque::new(),
+            queued: 0,
             drained: false,
             faulted: false,
             hash,
         }
     }
 
-    /// The next wire frame: up to `target` bytes, or the shorter final remainder
-    /// once the export is exhausted, then `None`.
+    /// The next wire frame as a set of `Bytes` chunks, totalling up to `target`
+    /// bytes (or the shorter final remainder once the export is exhausted), then
+    /// `None`.
     ///
-    /// `target` is a per-call argument, not a field, because the serve loop clamps it
-    /// to the credit window's remaining room. The window bound is "delivered − paid
-    /// never exceeds the window by more than one frame", so a frame sized past the
-    /// remaining room widens the node's unrecouped exposure by exactly that excess.
+    /// This is the zero-copy serve path: the returned `Vec<Bytes>` holds
+    /// reference-counted slices of the export items, so the caller can send them
+    /// via a single vectored QUIC write alongside a small stack-encoded header
+    /// without copying payload bytes. A frame that straddles two export items
+    /// splits the boundary item with `Bytes::split_to`, which is also zero-copy.
+    ///
+    /// `target` is a per-call argument, not a field, because the serve loop
+    /// clamps it to the credit window's remaining room. The window bound is
+    /// "delivered − paid never exceeds the window by more than one frame", so a
+    /// frame sized past the remaining room widens the node's unrecouped exposure
+    /// by exactly that excess.
     ///
     /// # Errors
     ///
@@ -87,19 +101,36 @@ impl ChunkFramer {
     /// the buffered export it can fire when frames are already on the wire. The
     /// caller must abort the delivery (skipping `StreamEnd`) so the client sees a
     /// short delivery and does not pay the closing voucher.
-    async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
+    async fn next_frame_chunks(
+        &mut self,
+        target: usize,
+    ) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
         if self.faulted {
             anyhow::bail!("bao export already faulted; refusing to serve further frames");
         }
-        while !self.drained && self.buf.len() < target {
+        // A zero target cuts a zero-length frame, which ADR 005 bans, and a `None`
+        // here would tell the serve loop the blob is complete and send `StreamEnd`
+        // over a truncated delivery. `frame_target` floors at one bao chunk group,
+        // so this is the floor restated where the damage would be silent.
+        if target == 0 {
+            anyhow::bail!("refusing to cut a zero-length frame");
+        }
+        while !self.drained && self.queued < target {
             match self.stream.next().await {
-                Some(Ok(bytes)) => self.buf.extend_from_slice(&bytes),
+                Some(Ok(bytes)) => {
+                    let len = bytes.len();
+                    if len > 0 {
+                        self.queued = self.queued.saturating_add(len);
+                        self.queue.push_back(bytes);
+                    }
+                }
                 Some(Err(e)) => {
                     // Poison, and drop the buffered remainder: this delivery is
                     // over, so any further frame would bill for a transfer that
                     // cannot complete.
                     self.faulted = true;
-                    self.buf.clear();
+                    self.queue.clear();
+                    self.queued = 0;
                     tracing::error!(
                         hash = %self.hash,
                         error = %e,
@@ -111,11 +142,37 @@ impl ChunkFramer {
                 None => self.drained = true,
             }
         }
-        if self.buf.is_empty() {
+        if self.queued == 0 {
             return Ok(None);
         }
-        let take = self.buf.len().min(target);
-        Ok(Some(self.buf.split_to(take).freeze()))
+        let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, target) else {
+            anyhow::bail!(
+                "cut no chunks from {} queued bytes at target {target}; refusing to \
+                 report the blob as fully delivered",
+                self.queued
+            );
+        };
+        Ok(Some(frame))
+    }
+
+    /// Test-only coalescing view of [`Self::next_frame_chunks`], for assertions that
+    /// compare a whole frame against one contiguous slice. Copies once when the frame
+    /// spans several queued chunks.
+    #[cfg(test)]
+    async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
+        let Some((chunks, total)) = self.next_frame_chunks(target).await? else {
+            return Ok(None);
+        };
+        if chunks.len() == 1 {
+            // Single chunk — no copy.
+            let mut iter = chunks.into_iter();
+            return Ok(iter.next());
+        }
+        let mut out = bytes::BytesMut::with_capacity(total);
+        for c in chunks {
+            out.extend_from_slice(&c);
+        }
+        Ok(Some(out.freeze()))
     }
 }
 
@@ -223,18 +280,18 @@ impl ClientHandler {
         let mut anchor = StreamAnchor::default();
 
         // `ChunkFramer` yields no frames for an empty export and never a
-        // zero-length frame, so `encode_chunk_frame` cannot reject one here — the
-        // empty blob makes no pass through the deliver phase and goes straight to
-        // `StreamEnd` (#1054). The `?` on the encode is the floor being restated at
-        // the last door, not a live failure mode; the `?` on `next_frame` IS live —
-        // that is where a mid-export store fault or the truncation refusal surfaces,
-        // because the export streams (#1132).
+        // zero-length frame, so the empty-payload refusal inside
+        // `write_chunk_payload_multi` is the floor restated at the last door, not a
+        // live failure mode — the empty blob makes no pass through the deliver phase
+        // and goes straight to `StreamEnd` (#1054). The `?` on `next_frame_chunks` IS
+        // live — that is where a mid-export store fault or the truncation refusal
+        // surfaces, because the export streams (#1132).
         let mut chunks = ChunkFramer::new(data, hash);
         // Nothing is delivered, paid, or vouchered yet, so the opening frame may run
         // a whole interval against the whole opening window.
         let opening_window = self.credit_window(chunk_bytes, 0);
         let mut next_chunk = chunks
-            .next_frame(self.frame_target(0, chunk_bytes, opening_window))
+            .next_frame_chunks(self.frame_target(0, chunk_bytes, opening_window))
             .await?;
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
@@ -261,7 +318,7 @@ impl ClientHandler {
             // stop short of a full interval, and at the one-interval floor
             // (`window == interval`) it would never complete one, starving the
             // recoup phase of a voucher to collect and deadlocking the loop. ---
-            // The pre-fetched frame is owned `Bytes`, so it cannot be copied out of
+            // The pre-fetched frame is owned, so it cannot be copied out of
             // `next_chunk` and left behind on the window `break` — the window check
             // therefore runs BEFORE the `take`, keeping the un-sent frame in
             // `next_chunk` for the next pass and for the `done_delivering` read below.
@@ -269,13 +326,12 @@ impl ClientHandler {
                 if delivered.saturating_sub(paid) >= window {
                     break;
                 }
-                let Some(chunk) = next_chunk.take() else {
+                let Some((chunk_vec, clen)) = next_chunk.take() else {
                     break;
                 };
-                let len = chunk.len() as u64;
-                let payload = encode_chunk_frame(&chunk)
-                    .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
-                self.write_payload(send, &payload).await?;
+                let len = clen as u64;
+                self.write_chunk_payload_multi(send, &chunk_vec, clen)
+                    .await?;
                 delivered = delivered.saturating_add(len);
                 self.shed.record_egress(len);
                 unvouchered = unvouchered.saturating_add(len);
@@ -288,7 +344,7 @@ impl ClientHandler {
                 // counters are already updated.
                 let room = window.saturating_sub(delivered.saturating_sub(paid));
                 next_chunk = chunks
-                    .next_frame(self.frame_target(unvouchered, chunk_bytes, room))
+                    .next_frame_chunks(self.frame_target(unvouchered, chunk_bytes, room))
                     .await?;
             }
             let done_delivering = next_chunk.is_none();
@@ -585,6 +641,32 @@ mod tests {
     /// `next_frame` rather than being swallowed into a short-but-clean delivery.
     /// That is what makes the caller abort without `StreamEnd`, so the client
     /// rejects the delivery and never pays the closing voucher.
+    /// A zero target would cut a zero-length frame, which ADR 005 bans, and the
+    /// serve loop reads `None` as "the blob is fully delivered" — so answering a zero
+    /// target with `None` would send `StreamEnd` over a truncation and let the client
+    /// pay the closing voucher for it. `frame_target` floors at one bao chunk group;
+    /// this is that floor restated where the failure would otherwise be silent.
+    #[tokio::test]
+    async fn a_zero_frame_target_is_refused_not_read_as_end_of_blob() -> anyhow::Result<()> {
+        let mut framer = ChunkFramer::new(
+            stream_of(vec![vec![9u8; 4096]]),
+            Hash::new(b"zero-target-test"),
+        );
+        let err = match framer.next_frame_chunks(0).await {
+            Ok(Some(_)) => anyhow::bail!("a zero target must not cut a frame"),
+            Ok(None) => anyhow::bail!("a zero target must not read as end-of-blob"),
+            Err(e) => e,
+        };
+        anyhow::ensure!(
+            err.to_string().contains("zero-length frame"),
+            "unexpected error: {err}"
+        );
+        // The bytes are still there: the refusal is about the target, not the export.
+        let frame = framer.next_frame(4096).await?;
+        anyhow::ensure!(frame.is_some(), "the export survives a refused target");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_mid_export_fault_propagates() -> anyhow::Result<()> {
         let stream: BaoExportStream = Box::pin(futures_util::stream::iter(vec![

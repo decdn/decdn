@@ -13,15 +13,16 @@
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
 //!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture;
 //! - the encoded bytes are pushed through a bounded channel ([`ChannelWriter`]) and
-//!   coalesced into `cdn/client/v1` frames of a caller-chosen target size by
+//!   cut into `cdn/client/v1` frames of a caller-chosen target size by
 //!   [`CoherentFrameProducer`].
 //!
 //! The encode future and the frame consumer run CONCURRENTLY on the one serve task
 //! (the bounded channel backpressures the encoder), so `CoherentFrameProducer`
-//! exposes a `next_frame()` frame-pull interface to the serve loop. Everything here
+//! exposes a `next_frame_chunks()` frame-pull interface to the serve loop. Everything here
 //! is `Send` (the iroh accept bound): the cache streams are `Send`, held only behind
 //! `&mut self`.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -30,12 +31,14 @@ use std::time::Duration;
 
 use bao_tree::ChunkRanges;
 use bao_tree::io::fsm::encode_ranges_validated;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use decdn_bao_range::{RangedStore, align_range};
 use decdn_cache::{FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
 use futures_util::StreamExt;
 use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{Notify, mpsc};
+
+use super::wire::drain_frame;
 
 /// How long the data reader polls for the store to MATERIALIZE the blob (admit its
 /// first chunk group) before a present-range watch can be opened.
@@ -227,18 +230,27 @@ impl AsyncStreamWriter for ChannelWriter {
     }
 }
 
-/// Drives the coherent whole-range encode and coalesces its output into wire
-/// frames. [`Self::next_frame`] yields the next
-/// wire frame, `None` once the whole range is delivered, `Err` on an encode fault
-/// (a gap the pull could not fill, or a proof/verify error) — on which the serve
-/// leg must not send `StreamEnd`.
+/// Drives the coherent whole-range encode and cuts its output into wire
+/// frames. [`Self::next_frame_chunks`] yields the next wire frame, `None` once
+/// the whole range is delivered, `Err` on an encode fault (a gap the pull could
+/// not fill, or a proof/verify error) — on which the serve leg must not send
+/// `StreamEnd`.
 pub(super) struct CoherentFrameProducer {
     /// The running encode future, taken out while polled and re-stored if it parks.
     /// `None` once it has completed (its channel sender is then dropped, so the
     /// receiver drains and ends).
     enc: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>>,
     rx: mpsc::Receiver<Bytes>,
-    frame_buf: BytesMut,
+    /// Queue of encoded bytes not yet cut into a frame, kept `Bytes`-native for a
+    /// vectored QUIC write without copying payload bytes.
+    queue: VecDeque<Bytes>,
+    /// Total bytes currently queued.
+    queued: usize,
+    /// The encode faulted. Terminal: the queue is cleared and no further frame is
+    /// ever cut — not because the queued bytes are suspect, but because the delivery
+    /// is being abandoned, so cutting another frame would bill the client for a
+    /// transfer that can never complete. The cache-hit path holds the same rule.
+    faulted: bool,
 }
 
 impl CoherentFrameProducer {
@@ -279,32 +291,95 @@ impl CoherentFrameProducer {
         Self {
             enc: Some(enc),
             rx,
-            frame_buf: BytesMut::new(),
+            queue: VecDeque::new(),
+            queued: 0,
+            faulted: false,
         }
     }
 
-    /// The next wire frame of up to `target` bytes (or the shorter final remainder),
-    /// `None` once the whole range is delivered.
+    /// The next wire frame as a set of `Bytes` chunks, totalling up to `target`
+    /// bytes (or the shorter final remainder), then `None` once the whole range
+    /// is delivered.
     ///
-    /// `target` is per-call for the same reason as its twin on the cache-hit path: the
-    /// serve loop clamps it to the credit window's remaining room.
-    pub(super) async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
+    /// Zero-copy: returned `Vec<Bytes>` holds reference-counted slices of the
+    /// encoder's output, so the caller can send them via a single vectored QUIC
+    /// write without copying payload bytes.
+    pub(super) async fn next_frame_chunks(
+        &mut self,
+        target: usize,
+    ) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
+        if self.faulted {
+            anyhow::bail!("coherent encode already faulted; refusing to serve further frames");
+        }
+        // A zero target cuts a zero-length frame, which ADR 005 bans, and would
+        // short-circuit below before the encoder is pumped even once — the serve leg
+        // would read that as a whole blob delivered and send `StreamEnd` over
+        // nothing. `frame_target` floors at one bao chunk group; this restates that
+        // floor where the damage would be silent.
+        if target == 0 {
+            anyhow::bail!("refusing to cut a zero-length frame");
+        }
         loop {
-            if self.frame_buf.len() >= target {
-                let take = self.frame_buf.len().min(target);
-                return Ok(Some(self.frame_buf.split_to(take).freeze()));
+            if self.queued >= target {
+                return self.cut(target);
             }
-            if let Some(bytes) = self.pump().await? {
-                self.frame_buf.extend_from_slice(&bytes);
+            let pumped = match self.pump().await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.faulted = true;
+                    self.queue.clear();
+                    self.queued = 0;
+                    return Err(e);
+                }
+            };
+            if let Some(bytes) = pumped {
+                let len = bytes.len();
+                if len > 0 {
+                    self.queued = self.queued.saturating_add(len);
+                    self.queue.push_back(bytes);
+                }
             } else {
                 // Encoder finished and channel drained: flush any final partial
                 // frame, then signal completion.
-                if self.frame_buf.is_empty() {
+                if self.queued == 0 {
                     return Ok(None);
                 }
-                return Ok(Some(self.frame_buf.split().freeze()));
+                return self.cut(self.queued);
             }
         }
+    }
+
+    /// Cut one frame of up to `take` bytes off the queue, which holds at least one
+    /// byte. `None` from [`drain_frame`] there is a `queued`/`queue` desync, and
+    /// returning it would tell the serve leg the range is fully delivered.
+    fn cut(&mut self, take: usize) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
+        let Some(frame) = drain_frame(&mut self.queue, &mut self.queued, take) else {
+            anyhow::bail!(
+                "cut no chunks from {} queued bytes at target {take}; refusing to \
+                 report the range as fully delivered",
+                self.queued
+            );
+        };
+        Ok(Some(frame))
+    }
+
+    /// Test-only coalescing view of [`Self::next_frame_chunks`], for assertions that
+    /// compare a whole frame against one contiguous slice. Copies once when the frame
+    /// spans several queued chunks.
+    #[cfg(test)]
+    pub(super) async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
+        let Some((chunks, total)) = self.next_frame_chunks(target).await? else {
+            return Ok(None);
+        };
+        if chunks.len() == 1 {
+            let mut iter = chunks.into_iter();
+            return Ok(iter.next());
+        }
+        let mut out = bytes::BytesMut::with_capacity(total);
+        for c in chunks {
+            out.extend_from_slice(&c);
+        }
+        Ok(Some(out.freeze()))
     }
 
     /// Advance the encode and/or receive its next output chunk. `Some(bytes)` when a
@@ -348,7 +423,7 @@ mod tests {
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use bytes::Bytes;
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
-    use decdn_cache::{CacheEngine, FillClaim, FillSession, Hash, NodeRangedStore};
+    use decdn_cache::{CacheEngine, FillClaim, FillError, FillSession, Hash, NodeRangedStore};
     use iroh_io::AsyncStreamReader;
 
     use super::CoherentFrameProducer;
@@ -442,6 +517,83 @@ mod tests {
             out.extend_from_slice(&frame);
         }
         Ok(out)
+    }
+
+    /// An encode fault is terminal, and a second call must say so rather than report
+    /// the range as delivered.
+    ///
+    /// The distinction is the whole point: `serve_leg` reads `Ok(None)` as
+    /// `done_delivering` and writes `StreamEnd`, so a producer that answered a second
+    /// call with `None` would tell the client a truncated blob was complete — and the
+    /// client would pay the closing voucher for it. The cache-hit twin pins the same
+    /// rule in `a_mid_export_fault_propagates`.
+    #[tokio::test]
+    async fn a_coherent_encode_fault_is_terminal() {
+        let total = 4 * G;
+        let (root, _plaintext, _outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+        // The pull dies before admitting a byte, so no live fill covers the range and
+        // the encode's first leaf read fails.
+        session.mark_ended(Err(FillError::new("upstream pull died")));
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total);
+
+        let first = producer.next_frame_chunks(1024).await;
+        assert!(first.is_err(), "the encode fault must surface, not park");
+
+        let second = producer.next_frame_chunks(1024).await;
+        let err = second.expect_err("a faulted producer must not answer again");
+        assert!(
+            err.to_string().contains("already faulted"),
+            "the second call must refuse, not report the range delivered: {err}"
+        );
+        assert_eq!(producer.queued, 0, "a fault drops the queued bytes");
+        assert!(producer.queue.is_empty(), "a fault clears the queue");
+    }
+
+    /// A zero target would cut a zero-length frame — banned by ADR 005 — and, worse,
+    /// would return before the encoder is pumped at all, which `serve_leg` reads as a
+    /// fully delivered range. `frame_target` floors at one chunk group; this is that
+    /// floor restated where the failure would otherwise be silent.
+    #[tokio::test]
+    async fn a_zero_frame_target_is_refused_not_read_as_end_of_range() {
+        let total = 2 * G;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+        let hash = Hash::from(root);
+        let a_root = bao_tree::blake3::Hash::from(root);
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 64).await.unwrap();
+
+        let FillClaim::Owner { session, lease: _l } =
+            engine.claim_fill(hash, 0, total, total, || FillSession::new(a_root, total))
+        else {
+            panic!("sole claimant owns its whole request");
+        };
+        admit(
+            &engine, hash, root, &plaintext, &outboard, total, 0, total, &session,
+        )
+        .await;
+
+        let store = NodeRangedStore::new(engine.clone(), hash, total);
+        let mut producer = CoherentFrameProducer::new(store, Arc::clone(&session), 0, total, total);
+        let err = producer
+            .next_frame_chunks(0)
+            .await
+            .expect_err("a zero target must not read as end-of-range");
+        assert!(
+            err.to_string().contains("zero-length frame"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Two partially-overlapping serve-misses share ONE fill for the overlap: client A

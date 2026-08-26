@@ -2691,7 +2691,8 @@ pub fn resolve_payment_into(
     // — an operator who sets 8 MiB expecting bigger frames deserves to be told the
     // value is unreachable, not to watch for a change that never comes. `0` is
     // rejected for the opposite reason: it would ask the framers for zero-length
-    // frames, and an empty `ChunkData` is a protocol error.
+    // frames, and an empty `ChunkData` is a protocol error. The framers refuse a
+    // zero target themselves, so this is the first of two doors, not the only one.
     let frame_target_bytes = file
         .and_then(|p| p.frame_target_bytes.as_ref())
         .map_or(DEFAULT_FRAME_TARGET_BYTES, |b| b.get());
