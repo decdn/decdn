@@ -103,11 +103,12 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
-      # Pinned to a concrete minor (v2.1.1) rather than the bare major `v2`
-      # so a new major release can't silently change the check's behavior.
-      # Dependabot's github-actions ecosystem still bumps it. The action
-      # caches the cargo registry and its own check cache internally, so no
-      # Swatinem/rust-cache partition is needed here.
+      # Pinned to a concrete patch (v2.1.1) rather than the bare major `v2`
+      # so a future v2 release can't silently change the check's behavior
+      # (the major tag already excludes v3). Dependabot's github-actions
+      # ecosystem still bumps it. The action caches the cargo registry and
+      # its own check cache internally, so no Swatinem/rust-cache partition
+      # is needed here.
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
 
   doc:
