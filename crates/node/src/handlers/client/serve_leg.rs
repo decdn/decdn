@@ -74,9 +74,13 @@ impl ClientHandler {
     /// # Errors
     ///
     /// A client disconnect (the write / voucher-collect surfaces it), an
-    /// underpayment bail, an `encode_range` fault, or a gap the pull leg could not
-    /// fill. On any error the caller drops the pull leg, which stops the upstream
-    /// spend and persists the buyer watermark.
+    /// underpayment bail, an `encode_range` fault, an offset at or past the blob
+    /// end, or a gap the pull leg could not fill. On any error the caller drops the
+    /// pull leg, which stops the upstream spend and persists the buyer watermark.
+    /// The peer-attributable errors carry
+    /// [`PeerFault`](super::wire::PeerFault) or
+    /// [`ClientPaymentFault`](super::wire::ClientPaymentFault); the rest reach the
+    /// dispatch sink's `error!` as node faults.
     // One linear, ADR-ordered miss-leg serve loop; splitting it would scatter the
     // ordering invariants across helpers (same rationale as `deliver`).
     #[allow(
@@ -101,6 +105,18 @@ impl ClientHandler {
         total_bytes: u64,
         floor_reservation: Option<&FloorReservation>,
     ) -> anyhow::Result<()> {
+        // An offset at or past the blob end has no bytes to deliver, and the
+        // clamp below would fold it into the legitimate `end == offset` empty
+        // request — a signed non-empty promise answered with zero bytes and a
+        // clean `StreamEnd`. Refuse it instead. `dispatch`'s bounds gate already
+        // refuses the same ranges with `RangeNotSatisfiable` before it signs, so
+        // this is a backstop for a caller that skips that gate; it mirrors
+        // `align_range`'s own bound.
+        anyhow::ensure!(
+            total_bytes == 0 || offset < total_bytes,
+            "serve offset {offset} is at or past the {total_bytes}-byte blob end"
+        );
+
         // Resolve the request end. `len == 0` ⇒ to the blob end (driver
         // convention); otherwise clamp to the tree size.
         let end = if len == 0 {
@@ -148,7 +164,7 @@ impl ClientHandler {
             offset,
             end,
             total_bytes,
-        );
+        )?;
 
         // The first frame — awaiting the pull leg if `R` opens on a gap. A pull
         // that ends `Err` here fails the serve rather than hanging.
@@ -289,10 +305,14 @@ impl ClientHandler {
                             attempts = attempts.saturating_add(1);
                             if attempts >= MAX_PROOFS_PER_CHUNK {
                                 self.metrics.node_pull_through_client_abandoned();
-                                anyhow::bail!(
-                                    "payer sent {attempts} proofs that credited nothing for one \
-                                 outstanding chunk"
-                                );
+                                // A payer that spends its per-chunk proof budget
+                                // without settling anything is a client payment
+                                // fault, not a node bug.
+                                return Err(anyhow::Error::new(super::wire::ClientPaymentFault)
+                                    .context(format!(
+                                        "payer sent {attempts} proofs that credited nothing for \
+                                         one outstanding chunk"
+                                    )));
                             }
                         }
                         VoucherStop::Continue { credited_bytes } => {

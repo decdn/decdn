@@ -5,10 +5,13 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
+use iroh::endpoint::WriteError;
+
 use super::{
-    B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, SendStream, ServeRejectReason,
-    StreamError, StreamRequest, StreamResponse, StreamResponseBody, StreamResponseExt,
-    StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message, write_frame,
+    B256, ClientHandler, ClientMessage, DownloadReceipt, FrameError, Hash, SendStream,
+    ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
+    StreamResponseExt, StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
+    write_frame,
 };
 
 impl ClientHandler {
@@ -215,9 +218,7 @@ impl ClientHandler {
         send: &mut SendStream,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        write_frame(send, payload)
-            .await
-            .map_err(|e| anyhow::anyhow!("write failed: {e}"))
+        write_frame(send, payload).await.map_err(write_frame_error)
     }
 
     /// Meter a serve-side frame-accounting fault and hand the error back unchanged.
@@ -234,9 +235,11 @@ impl ClientHandler {
 
     /// Put one already-assembled `ChunkData` frame on the wire.
     ///
-    /// Every error is an I/O error, which is what lets the cache-miss leg meter a
-    /// failure here as a client abandon (#856) without misfiling a node-side framing
-    /// bug as one. Build `bufs` with [`chunk_frame_bufs`] first.
+    /// The frame is already assembled, so no framing bug can surface here — which
+    /// is what lets the cache-miss leg meter a failure as a client abandon (#856).
+    /// Build `bufs` with [`chunk_frame_bufs`] first. A write that fails because the
+    /// peer went away carries [`PeerFault`]; a write against this node's own
+    /// finished or reset stream does not, since that one is a node bug.
     ///
     /// `write_all_chunks` empties the `Bytes` it writes, so it takes `bufs` by value:
     /// what it leaves behind still looks like a frame and is all zero-length, and no
@@ -249,7 +252,7 @@ impl ClientHandler {
     ) -> anyhow::Result<()> {
         send.write_all_chunks(&mut bufs)
             .await
-            .map_err(|e| anyhow::anyhow!("write chunk frame: {e}"))
+            .map_err(write_chunk_error)
     }
 
     /// Assemble one `ChunkData` frame and write it. The cache-hit leg's door;
@@ -333,6 +336,41 @@ pub(super) fn chunk_frame_bufs(
     Ok(bufs)
 }
 
+/// Whether a finished serve stream's error is the peer's doing rather than this
+/// node's — a [`PeerFault`] or a [`ClientPaymentFault`].
+///
+/// The dispatch sink's sole classifier: a `false` here is what routes an error to
+/// `error!` and the node-fault counter.
+pub(super) fn is_peer_attributable(e: &anyhow::Error) -> bool {
+    e.is::<PeerFault>() || e.is::<ClientPaymentFault>()
+}
+
+/// Attribute a framed-write failure.
+///
+/// An oversized frame is this node's own encoding bug — it never reached the
+/// wire — so it carries no marker. Everything else is the transport under a peer
+/// that went away.
+fn write_frame_error(e: FrameError) -> anyhow::Error {
+    match e {
+        FrameError::TooLarge(len) => anyhow::anyhow!("refusing to write a {len}-byte frame"),
+        e => anyhow::Error::new(PeerFault).context(format!("write failed: {e}")),
+    }
+}
+
+/// Attribute a vectored `ChunkData` write failure.
+///
+/// Writing to a stream this node already finished or reset, and a 0-RTT rejection
+/// on a stream this node opened, are both faults in this node's own stream state
+/// machine, so they carry no marker. A stop or a lost connection is the peer.
+fn write_chunk_error(e: WriteError) -> anyhow::Error {
+    match e {
+        e @ (WriteError::ClosedStream | WriteError::ZeroRttRejected) => {
+            anyhow::anyhow!("write chunk frame: {e}")
+        }
+        e => anyhow::Error::new(PeerFault).context(format!("write chunk frame: {e}")),
+    }
+}
+
 /// A serve-side refusal caused by the node's own byte accounting rather than by the
 /// store, the encoder, or the peer: a zero frame target, a `queued`/`queue` desync, a
 /// payload whose chunks disagree with the length its header would declare, or a
@@ -353,6 +391,59 @@ impl std::fmt::Display for FrameAccountingFault {
 }
 
 impl std::error::Error for FrameAccountingFault {}
+
+/// Marker for a serve-stream error attributable to the peer rather than to this
+/// node: a hang-up, a stream reset, a read timeout, or a malformed request.
+///
+/// The dispatch sink logs every `serve_stream` error at one of two levels. A node
+/// bug — an encode fault, an alignment error, a store fault, a framing fault —
+/// is the operator's only signal that a delivery was abandoned, so it belongs at
+/// `error!`. A peer that hangs up or sends garbage is routine and belongs at
+/// `debug!`, below the project's default `RUST_LOG=info`. This marker is what
+/// separates the two. Attach it with [`anyhow::Error::context`] and recover it
+/// with `anyhow::Error::is`.
+///
+/// The attach sites are the peer-attributable arms of the wire writes
+/// ([`ClientHandler::write_payload`], [`ClientHandler::write_chunk_bufs`]), the
+/// proof reads ([`BufferedProofReader::read`](super::BufferedProofReader::read)
+/// and its gather timeout), and the opening request read. A write or read fault
+/// this node caused — an oversized frame it encoded, a write after its own
+/// `finish`/`reset` — stays unmarked and reaches `error!`.
+#[derive(Debug)]
+pub(super) struct PeerFault;
+
+impl std::fmt::Display for PeerFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("peer-side fault")
+    }
+}
+
+impl std::error::Error for PeerFault {}
+
+/// Marker for a serve-stream error that is a client-attributable payment fault:
+/// a voucher that underpays for its delivered-byte span, one that fails the
+/// advertised-rate check, or a payer that spends its per-chunk proof budget
+/// without settling anything.
+///
+/// The dispatch sink files an unmarked error under "node-side fault" at
+/// `error!`. A client's underpayment is neither a node bug nor a disconnect, and
+/// under a misbehaving client it is noisy, so it carries its own marker and lands
+/// at `debug!`. Attach it with [`anyhow::Error::context`] and recover it with
+/// `anyhow::Error::is`.
+///
+/// It marks only the client-attributable stops. The defensive node-invariant
+/// bail beside them — a `RetrySignal` from a path that touches no store — stays
+/// unmarked, because that one IS a node bug.
+#[derive(Debug)]
+pub(super) struct ClientPaymentFault;
+
+impl std::fmt::Display for ClientPaymentFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client payment fault")
+    }
+}
+
+impl std::error::Error for ClientPaymentFault {}
 
 /// Cut up to `target` bytes off the front of `queue` into the `Bytes` slices that
 /// make up one wire frame, returning them and their total. `queued` is the queue's
@@ -425,7 +516,70 @@ pub(super) fn drain_frame(
 mod tests {
     use bytes::Bytes;
 
-    use super::{chunk_frame_bufs, drain_frame};
+    use super::{
+        ClientPaymentFault, FrameError, PeerFault, WriteError, chunk_frame_bufs, drain_frame,
+        is_peer_attributable, write_chunk_error, write_frame_error,
+    };
+
+    /// The whole classification rests on a marker staying recoverable under the
+    /// context layers callers stack on the way up to the dispatch sink. This file
+    /// re-wraps errors with `anyhow!("...: {e}")` in many places; the day one of
+    /// those lands on a marked error the marker is gone, and the only thing that
+    /// would notice is this test.
+    #[test]
+    fn a_marker_survives_the_context_layers_stacked_above_it() {
+        let e = anyhow::Error::new(PeerFault)
+            .context("write failed: connection lost")
+            .context("serve leg gave up");
+        assert!(is_peer_attributable(&e), "marker lost under context");
+        // The alternate form is what the sink logs, so the cause must still read.
+        let rendered = format!("{e:#}");
+        assert!(
+            rendered.contains("connection lost"),
+            "cause dropped from the log line: {rendered}"
+        );
+    }
+
+    /// An unmarked error is a node fault. Nothing else may reach `debug!`.
+    #[test]
+    fn an_unmarked_error_is_a_node_fault() {
+        assert!(!is_peer_attributable(&anyhow::anyhow!("store read failed")));
+        assert!(is_peer_attributable(
+            &anyhow::Error::new(ClientPaymentFault).context("voucher underpays")
+        ));
+    }
+
+    /// A frame this node encoded too large never reached the wire, so it is this
+    /// node's bug — not the peer-disconnect shape the rest of `write_frame`'s
+    /// errors carry.
+    #[test]
+    fn an_oversized_frame_is_a_node_fault_but_a_write_io_error_is_the_peer() {
+        let too_large = write_frame_error(FrameError::TooLarge(1 << 30));
+        assert!(
+            !is_peer_attributable(&too_large),
+            "an oversized frame must reach error!: {too_large}"
+        );
+
+        let io = write_frame_error(FrameError::Io(std::io::Error::other("reset by peer")));
+        assert!(is_peer_attributable(&io), "a write I/O error is the peer");
+    }
+
+    /// Writing to a stream this node already finished is a fault in this node's own
+    /// stream state machine; a peer that stopped the stream is not.
+    #[test]
+    fn a_write_after_close_is_a_node_fault_but_a_peer_stop_is_not() {
+        let closed = write_chunk_error(WriteError::ClosedStream);
+        assert!(
+            !is_peer_attributable(&closed),
+            "a write after our own finish must reach error!: {closed}"
+        );
+
+        let stopped = write_chunk_error(WriteError::Stopped(iroh::endpoint::VarInt::from_u32(0)));
+        assert!(
+            is_peer_attributable(&stopped),
+            "a peer stop is the peer: {stopped}"
+        );
+    }
 
     /// The vectored buffers must lay down exactly the bytes the single-buffer
     /// encoder would, whatever the payload is split into.

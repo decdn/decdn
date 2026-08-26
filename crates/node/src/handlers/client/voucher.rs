@@ -78,7 +78,12 @@ enum VerifyStop {
     Reject(VoucherRejectReason, Option<WatermarkBundle>),
     /// Fail the stream — there is no wire reason for this fault (a buyer
     /// underpayment), and delivery simply stops (ADR 003 §Voucher withholding).
-    Bail(String),
+    ///
+    /// The error carries its own attribution: a client-attributable stop is
+    /// marked [`ClientPaymentFault`](super::wire::ClientPaymentFault), and a
+    /// node-invariant stop carries no marker so the dispatch sink logs it at
+    /// `error!`.
+    Bail(anyhow::Error),
 }
 
 /// Whether a voucher's signed `chunk_price` is the price this node quoted
@@ -156,7 +161,9 @@ impl ClientHandler {
         let proof = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
             .await
             .map_err(|_| {
-                anyhow::anyhow!("proof read timed out after {VOUCHER_READ_TIMEOUT:?}")
+                anyhow::Error::new(super::wire::PeerFault).context(format!(
+                    "proof read timed out after {VOUCHER_READ_TIMEOUT:?}"
+                ))
             })??;
 
         let wire = match proof {
@@ -244,9 +251,9 @@ impl ClientHandler {
                 self.write_reject(send, reason, bundle).await?;
                 return Ok(VoucherStop::Rejected);
             }
-            Err(VerifyStop::Bail(msg)) => {
+            Err(VerifyStop::Bail(e)) => {
                 drop(guard);
-                return Err(anyhow::anyhow!(msg));
+                return Err(e);
             }
         };
 
@@ -497,11 +504,15 @@ impl ClientHandler {
                     Ok(()) => {}
                     Err(RateError::Underpayment { .. }) => {
                         return Err(VerifyStop::Bail(
-                            "voucher underpays for its delivered-byte span".to_string(),
+                            anyhow::Error::new(super::wire::ClientPaymentFault)
+                                .context("voucher underpays for its delivered-byte span"),
                         ));
                     }
                     Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
-                        return Err(VerifyStop::Bail(format!("voucher fails rate check: {e}")));
+                        return Err(VerifyStop::Bail(
+                            anyhow::Error::new(super::wire::ClientPaymentFault)
+                                .context(format!("voucher fails rate check: {e}")),
+                        ));
                     }
                 }
 
@@ -561,10 +572,12 @@ impl ClientHandler {
                 let reason = match voucher_reject_reason(&e) {
                     Ok(reason) => reason,
                     Err(RetrySignal) => {
-                        return Err(VerifyStop::Bail(
+                        // Unmarked: a `RetrySignal` from a path that touches no
+                        // store is a broken node invariant, so it belongs at
+                        // `error!` in the dispatch sink.
+                        return Err(VerifyStop::Bail(anyhow::anyhow!(
                             "advance_presigned touches no store; unexpected RetrySignal"
-                                .to_string(),
-                        ));
+                        )));
                     }
                 };
                 // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
@@ -912,7 +925,7 @@ mod tests {
                 decdn_protocol::client::VoucherRejectReason::BytesRegression,
                 "divergent equal-amount voucher rejects as BytesRegression"
             ),
-            super::VerifyStop::Bail(msg) => panic!("expected a Reject, got Bail({msg})"),
+            super::VerifyStop::Bail(e) => panic!("expected a Reject, got Bail({e})"),
         }
     }
 

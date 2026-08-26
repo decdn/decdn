@@ -451,10 +451,14 @@ impl ClientHandler {
                         VoucherStop::Continue { .. } => {
                             attempts = attempts.saturating_add(1);
                             if attempts >= MAX_PROOFS_PER_CHUNK {
-                                anyhow::bail!(
-                                    "payer sent {attempts} proofs that credited nothing for one \
-                                     outstanding chunk"
-                                );
+                                // A payer that spends its per-chunk proof budget
+                                // without settling anything is a client payment
+                                // fault, not a node bug.
+                                return Err(anyhow::Error::new(super::wire::ClientPaymentFault)
+                                    .context(format!(
+                                        "payer sent {attempts} proofs that credited nothing for \
+                                         one outstanding chunk"
+                                    )));
                             }
                         }
                         VoucherStop::Rejected => return Ok(()),

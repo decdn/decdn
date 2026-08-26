@@ -2061,28 +2061,16 @@ impl BufferedProofReader {
     /// These two variants are the entire payer→node vocabulary after the
     /// opening `StreamRequest`, so this is the one place every proof passes
     /// through. Anything else on this stream is a protocol error.
+    ///
+    /// # Errors
+    ///
+    /// Everything the peer controls — a reset stream, a hang-up mid-frame, a
+    /// malformed frame, an undecodable or unexpected message — carries
+    /// [`PeerFault`](wire::PeerFault), so the dispatch sink logs it at `debug!`.
+    /// The two bounds checks do not: those are this node's own invariants.
     pub(super) async fn read(&mut self, recv: &mut RecvStream) -> anyhow::Result<Proof> {
         loop {
-            if let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
-                .map_err(|e| anyhow::anyhow!("proof frame parse failed: {e}"))?
-            {
-                let total = header_len.saturating_add(payload_len);
-                let payload = self
-                    .buf
-                    .get(header_len..total)
-                    .ok_or_else(|| anyhow::anyhow!("proof frame bounds out of range"))?;
-                let decoded = decode_message::<ClientMessage>(payload);
-                // Consume the frame's bytes regardless of decode outcome so a
-                // single bad frame cannot wedge the buffer.
-                let result = match decoded {
-                    Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
-                    Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
-                    Ok((_, _)) => Err(anyhow::anyhow!(
-                        "expected ClientMessage::Voucher or ClientMessage::ChunkPreimage"
-                    )),
-                    Err(e) => Err(anyhow::anyhow!("proof decode failed: {e}")),
-                };
-                self.buf.drain(..total);
+            if let Some(result) = self.take_buffered()? {
                 return result;
             }
             // Need more bytes. Use tokio's `AsyncReadExt::read` (explicitly, since
@@ -2091,17 +2079,60 @@ impl BufferedProofReader {
             // append to `self.buf` before the next await, so no bytes are ever lost
             // to a gather timeout. `0` is EOF.
             let mut scratch = [0u8; 4096];
-            let n = AsyncReadExt::read(recv, &mut scratch)
-                .await
-                .map_err(|e| anyhow::anyhow!("proof stream read failed: {e}"))?;
+            let n = AsyncReadExt::read(recv, &mut scratch).await.map_err(|e| {
+                anyhow::Error::new(wire::PeerFault)
+                    .context(format!("proof stream read failed: {e}"))
+            })?;
             if n == 0 {
-                anyhow::bail!("proof stream closed mid-frame");
+                // The dominant abandon shape: the client finished its send side
+                // and walked away between intervals.
+                return Err(
+                    anyhow::Error::new(wire::PeerFault).context("proof stream closed mid-frame")
+                );
             }
             let chunk = scratch
                 .get(..n)
                 .ok_or_else(|| anyhow::anyhow!("short read length out of range"))?;
             self.buf.extend_from_slice(chunk);
         }
+    }
+
+    /// Take the next whole frame out of the buffer, if one is there.
+    ///
+    /// `Ok(None)` means the buffer holds less than a frame and the caller must
+    /// read more. The inner `Result` is the frame's own outcome: its bytes are
+    /// consumed either way, so one bad frame cannot wedge the buffer.
+    ///
+    /// A malformed length prefix, an undecodable body, and a message that is
+    /// neither a `Voucher` nor a `ChunkPreimage` are all the peer's doing and
+    /// carry [`PeerFault`](wire::PeerFault). The bounds check between them is this
+    /// node's own invariant and carries no marker.
+    fn take_buffered(&mut self) -> anyhow::Result<Option<anyhow::Result<Proof>>> {
+        let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
+            .map_err(|e| {
+                anyhow::Error::new(wire::PeerFault)
+                    .context(format!("proof frame parse failed: {e}"))
+            })?
+        else {
+            return Ok(None);
+        };
+        let total = header_len.saturating_add(payload_len);
+        let payload = self
+            .buf
+            .get(header_len..total)
+            .ok_or_else(|| anyhow::anyhow!("proof frame bounds out of range"))?;
+        let decoded = decode_message::<ClientMessage>(payload);
+        let result =
+            match decoded {
+                Ok((ClientMessage::Voucher(v), _)) => Ok(Proof::Voucher(v)),
+                Ok((ClientMessage::ChunkPreimage(p), _)) => Ok(Proof::Preimage(p)),
+                Ok((_, _)) => Err(anyhow::Error::new(wire::PeerFault)
+                    .context("expected ClientMessage::Voucher or ClientMessage::ChunkPreimage")),
+                Err(e) => Err(anyhow::Error::new(wire::PeerFault)
+                    .context(format!("proof decode failed: {e}"))),
+            };
+        self.buf.drain(..total);
+        Ok(Some(result))
     }
 }
 
@@ -2168,6 +2199,51 @@ pub(super) async fn handler_over_store(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A client that sends garbage on the proof stream is a peer fault, not a node
+    /// bug: it must reach `debug!`, not the node-fault counter. The `ProbeRequest`
+    /// stands in for any `ClientMessage` variant that is not a proof.
+    #[tokio::test]
+    async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {
+        let mut reader = BufferedProofReader::default();
+        assert!(
+            reader
+                .take_buffered()
+                .expect("an empty buffer is not a fault")
+                .is_none(),
+            "an empty buffer holds no frame"
+        );
+
+        // An undecodable body behind a well-formed length prefix.
+        let mut framed = Vec::new();
+        framed.push(3u8);
+        framed.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+        reader.buf = framed;
+        let e = reader
+            .take_buffered()
+            .expect("a bad body is the frame's outcome, not the buffer's")
+            .expect("the frame is whole")
+            .expect_err("an undecodable body must fail");
+        assert!(wire::is_peer_attributable(&e), "unexpected: {e:#}");
+        assert!(
+            reader.buf.is_empty(),
+            "a bad frame must not wedge the buffer"
+        );
+
+        // A well-formed `ClientMessage` that is not a proof.
+        let payload = encode_message(&ClientMessage::StreamEnd).expect("StreamEnd encodes");
+        let mut framed = Vec::new();
+        write_frame(&mut framed, &payload)
+            .await
+            .expect("a Vec sink never fails");
+        reader.buf = framed;
+        let e = reader
+            .take_buffered()
+            .expect("a non-proof message is the frame's outcome, not the buffer's")
+            .expect("the frame is whole")
+            .expect_err("a non-proof message must fail");
+        assert!(wire::is_peer_attributable(&e), "unexpected: {e:#}");
+    }
 
     /// A frame must never cross a payment-chunk boundary, whatever the configured
     /// target. Both sides meter the same frame sequence and exchange one preimage per

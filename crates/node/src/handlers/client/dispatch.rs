@@ -85,7 +85,7 @@ impl ClientHandler {
                 }
                 Some(res) = inflight.next(), if !inflight.is_empty() => {
                     if let Err(e) = res {
-                        tracing::debug!(error = %e, "client stream ended with error");
+                        self.log_stream_end(&e);
                     }
                 }
             }
@@ -93,10 +93,35 @@ impl ClientHandler {
         // Drain any streams still finishing after the connection closed.
         while let Some(res) = inflight.next().await {
             if let Err(e) = res {
-                tracing::debug!(error = %e, "client stream ended with error");
+                self.log_stream_end(&e);
             }
         }
         Ok(())
+    }
+
+    /// File one finished serve stream's error by who caused it.
+    ///
+    /// A node-side fault — an encode fault, an alignment error, a store fault, a
+    /// framing fault — is the operator's only signal that a delivery was
+    /// abandoned, since the client only ever sees a short stream. It logs at
+    /// `error!` and bumps `decdn_serve_stream_node_fault_total`, so the rate is
+    /// alertable rather than only greppable. A peer-attributable error
+    /// ([`PeerFault`](super::wire::PeerFault)) or a client payment fault
+    /// ([`ClientPaymentFault`](super::wire::ClientPaymentFault)) is routine and
+    /// logs at `debug!`.
+    ///
+    /// `{e:#}` rather than `{e}`: the marker sits in the chain, so the alternate
+    /// form is what prints the cause beside it.
+    fn log_stream_end(&self, e: &anyhow::Error) {
+        if super::wire::is_peer_attributable(e) {
+            tracing::debug!(error = %format_args!("{e:#}"), "client stream ended with error");
+        } else {
+            self.metrics.serve_stream_node_fault();
+            tracing::error!(
+                error = %format_args!("{e:#}"),
+                "client stream ended with a node-side fault"
+            );
+        }
     }
 
     /// Serve one delivery stream end to end.
@@ -118,7 +143,11 @@ impl ClientHandler {
             Ok(first) => first,
             Err(StreamReadError { err, app_code }) => {
                 reset_stream(&mut send, &mut recv, app_code);
-                return Err(err);
+                // A request-read failure is peer-side (a timeout, a malformed
+                // frame, a decode fault), not a node-side bug — mark it so the
+                // dispatch sink logs it at `debug!` rather than `error!`. The
+                // marker rides as context so `err` keeps its own chain.
+                return Err(err.context(super::wire::PeerFault));
             }
         };
 
