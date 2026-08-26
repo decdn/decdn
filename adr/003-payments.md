@@ -40,6 +40,20 @@ Key parameters:
 - Fee routing: each redemption forwards the paid amount to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`, and the three-bucket split (60% operator base, 30% buyback, 10% treasury) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the payment contract.
 
+### Capability delegation
+
+The pool owner authorizes each voucher signer with a **capability**. The capability is an owner-signed object over `{ signer, spending_cap, pool_id, expiry }`. It lets `signer` spend up to `spending_cap` from `pool_id` until `expiry`. It names no node, so one capability is valid at every node.
+
+The owner issues one capability for each key it authorizes. That key is the owner's own key, a per-device key, or a per-session key. Each signer draws against its own `spending_cap`. The sum of the caps can exceed the deposit, so one signer draws heavily while another draws nothing (see [Deposit Economics](#deposit-economics)).
+
+Delegation bounds the damage a compromised key does. The `spending_cap` bounds what that key authorizes. The `expiry` retires the key when the owner does not renew it. The owner keeps sole control of `topUp` and `closePool`.
+
+Three sections give the rules in full:
+
+- [Redemption and Close](#redemption-and-close) — the first redemption for `(poolId, signer)` registers the signer. The contract verifies the owner signature and stores `{cap, expiry, spent}`. Each later redemption for that signer carries the voucher alone.
+- [Revocation](#revocation) — the `expiry` is the only time bound the contract applies at redemption. A stop-serving signal refuses future service to a key, and it does not void a voucher the node already earned.
+- [EIP-712 Voucher Signature](#eip-712-voucher-signature) — the `Capability` typehash, and how redemption recovers the capability against `pool.owner`.
+
 ### Deposit Economics
 
 A pool is opened once and reused. There is no per-node, per-fetch, or per-client open, and no pool close on the client's fetch path. The on-chain footprint of a pool is one open plus occasional top-ups, independent of how many nodes it pays or how many signers it delegates. A node registers each new signer's capability once on first redemption; every later redemption for that signer is voucher-only. On-chain cost is therefore independent of client count: many clients collapse to one pool plus lazy per-`(signer, provider)` register slots for active pairs only.
