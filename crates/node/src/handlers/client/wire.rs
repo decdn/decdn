@@ -1,4 +1,5 @@
-//! Small leaf helpers: rate clamping, response signing, wire writes, receipts.
+//! Leaf helpers: rate clamping, response signing, wire writes, receipts, and the
+//! frame cutting the serve loops pull their `ChunkData` payloads from.
 
 use std::collections::VecDeque;
 
@@ -226,7 +227,8 @@ impl ClientHandler {
     /// bug as one. Build `bufs` with [`chunk_frame_bufs`] first.
     ///
     /// `write_all_chunks` empties the `Bytes` it writes, so `bufs` is spent
-    /// afterwards.
+    /// afterwards. On `Err` part of the frame may already be on the wire, so the
+    /// caller abandons the delivery rather than retrying.
     pub(super) async fn write_chunk_bufs(
         &self,
         send: &mut SendStream,
@@ -239,6 +241,12 @@ impl ClientHandler {
 
     /// Assemble one `ChunkData` frame and write it. The cache-hit leg's door;
     /// the miss leg splits the two halves so it can tell them apart when metering.
+    ///
+    /// # Errors
+    ///
+    /// Either a framing fault from [`chunk_frame_bufs`] — a node-side bug — or an I/O
+    /// error from the write. The hit leg does not distinguish them because it meters
+    /// neither; the miss leg calls the two halves separately so that it can.
     pub(super) async fn write_chunk_payload_multi(
         &self,
         send: &mut SendStream,
@@ -265,8 +273,11 @@ impl ClientHandler {
 /// An empty `payload_chunks`, or one whose lengths do not sum to `total_len`. Both
 /// mean the framer's byte accounting disagrees with the bytes it handed over —
 /// `total_len` is what the header declares to the client *and* what the serve loop
-/// bills for, so a mismatch must not reach the wire. `total_len == 0` is refused
-/// one door further down, by the encoder's own ADR 005 non-empty floor.
+/// bills for, so a mismatch must not reach the wire. A `total_len` of zero and a
+/// frame past [`decdn_protocol::framing::MAX_MESSAGE_SIZE`] are both refused one
+/// door further down, by `encode_chunk_frame_headers`' own ADR 005 floor and ADR 013
+/// ceiling; neither is reachable while `payment.frame_target_bytes` is capped at one
+/// payment chunk.
 pub(super) fn chunk_frame_bufs(
     payload_chunks: &[Bytes],
     total_len: usize,
@@ -303,10 +314,10 @@ pub(super) fn chunk_frame_bufs(
 /// Nothing is copied: whole items move across, and a frame that ends mid-item splits
 /// it with `Bytes::split_to`, which reslices the same allocation.
 ///
-/// `None` only when the queue is empty. Both framers hold `queued` in lockstep with
-/// `queue`, and `target >= 1` at every call site, so a non-empty queue always yields
-/// at least one chunk — a caller that sees `None` with bytes still queued is looking
-/// at a bookkeeping bug, not at the end of the blob.
+/// `None` when `target.min(*queued)` is zero. Both framers hold `queued` in lockstep
+/// with `queue` and pass `target >= 1`, so for them that means an empty queue — one
+/// of them seeing `None` with bytes still queued is looking at a bookkeeping bug, not
+/// at the end of the blob.
 pub(super) fn drain_frame(
     queue: &mut VecDeque<Bytes>,
     queued: &mut usize,
@@ -361,9 +372,9 @@ mod tests {
     /// The vectored buffers must lay down exactly the bytes the single-buffer
     /// encoder would, whatever the payload is split into.
     ///
-    /// This is the claim the whole zero-copy path rests on: the serve loops no
-    /// longer build a `ChunkData` frame at all, so nothing else proves the header
-    /// they emit still matches `encode_chunk_frame` + `write_frame`. The chunk
+    /// This is the claim the whole zero-copy path rests on: the serve loops build no
+    /// `ChunkData` frame at all, so nothing else proves the header they emit matches
+    /// `encode_chunk_frame` + `write_frame`. The chunk
     /// counts span what a real frame looks like — one queued item, a handful, and
     /// the ~130 a default 1 MiB frame spans over 64 B proof nodes and 16 KiB leaves.
     #[tokio::test]

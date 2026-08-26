@@ -30,9 +30,11 @@ type BaoExportStream = Pin<Box<dyn Stream<Item = CacheResult<Bytes>> + Send>>;
 /// O(target + one export item) rather than O(blob size). It guarantees two
 /// load-bearing properties:
 ///
-/// - **Never an empty frame.** `decdn_protocol::client::encode_chunk_frame_headers`
-///   rejects one (#1088), and the inactivity deadline on both receive loops
-///   rests on "a frame arrived" and "bytes made progress" being the same statement.
+/// - **Never an empty frame.** [`super::wire::chunk_frame_bufs`] refuses an empty
+///   payload and [`decdn_protocol::client::encode_chunk_frame_headers`] refuses a
+///   zero `payload_len` behind it (#1088), and the inactivity deadline on both
+///   receive loops rests on "a frame arrived" and "bytes made progress" being the
+///   same statement.
 /// - **No frames at all for an empty export.** The 0-byte blob (#1054) must go
 ///   straight to `StreamEnd` rather than send a zero-length frame first.
 struct ChunkFramer {
@@ -82,6 +84,9 @@ impl ChunkFramer {
     /// bytes (or the shorter final remainder once the export is exhausted), then
     /// `None`.
     ///
+    /// The `usize` beside the chunks is their total byte count, which is both what
+    /// the frame header declares to the client and what the serve loop bills for.
+    ///
     /// This is the zero-copy serve path: the returned `Vec<Bytes>` holds
     /// reference-counted slices of the export items, so the caller can send them
     /// via a single vectored QUIC write alongside a small stack-encoded header
@@ -101,6 +106,12 @@ impl ChunkFramer {
     /// the buffered export it can fire when frames are already on the wire. The
     /// caller must abort the delivery (skipping `StreamEnd`) so the client sees a
     /// short delivery and does not pay the closing voucher.
+    ///
+    /// Also errors on a `target` of zero, on a `queued`/`queue` desync, and on any
+    /// call after a fault. Those three are node-side bugs rather than store faults,
+    /// but the caller's response is the same: abort without `StreamEnd`. A fault is
+    /// terminal — the queue is dropped and later calls error rather than answering
+    /// `None`, because `None` is how the serve loop learns the blob is complete.
     async fn next_frame_chunks(
         &mut self,
         target: usize,
@@ -108,10 +119,13 @@ impl ChunkFramer {
         if self.faulted {
             anyhow::bail!("bao export already faulted; refusing to serve further frames");
         }
-        // A zero target cuts a zero-length frame, which ADR 005 bans, and a `None`
-        // here would tell the serve loop the blob is complete and send `StreamEnd`
-        // over a truncated delivery. `frame_target` floors at one bao chunk group,
-        // so this is the floor restated where the damage would be silent.
+        // A zero target can never cut a frame. On an empty queue it would answer
+        // `None`, which the serve loop reads as a fully delivered blob and follows
+        // with `StreamEnd` over a truncated delivery; on a non-empty one the cut
+        // below refuses, but names a `queued`/`queue` desync — the wrong cause.
+        // `frame_target` never returns zero: every term it minimizes over is at
+        // least one, and the room term floors at a bao chunk group. This restates
+        // that floor where the damage would otherwise be silent or misattributed.
         if target == 0 {
             anyhow::bail!("refusing to cut a zero-length frame");
         }
@@ -636,16 +650,13 @@ mod tests {
         Ok(())
     }
 
-    /// A mid-export fault — including the truncation refusal, which the streaming
-    /// export can only report after its last item — must propagate out of
-    /// `next_frame` rather than being swallowed into a short-but-clean delivery.
-    /// That is what makes the caller abort without `StreamEnd`, so the client
-    /// rejects the delivery and never pays the closing voucher.
-    /// A zero target would cut a zero-length frame, which ADR 005 bans, and the
-    /// serve loop reads `None` as "the blob is fully delivered" — so answering a zero
-    /// target with `None` would send `StreamEnd` over a truncation and let the client
-    /// pay the closing voucher for it. `frame_target` floors at one bao chunk group;
-    /// this is that floor restated where the failure would otherwise be silent.
+    /// A zero target must be refused by name. The serve loop reads `None` as "the
+    /// blob is fully delivered", so on an empty queue a zero target would send
+    /// `StreamEnd` over a truncation and let the client pay the closing voucher for
+    /// it; on a non-empty queue the cut refuses anyway, but blames a `queued`/`queue`
+    /// desync for what is a bad argument. `frame_target` never returns zero, so this
+    /// pins the floor restated where the failure would otherwise be silent or
+    /// misattributed.
     #[tokio::test]
     async fn a_zero_frame_target_is_refused_not_read_as_end_of_blob() -> anyhow::Result<()> {
         let mut framer = ChunkFramer::new(
@@ -667,13 +678,23 @@ mod tests {
         Ok(())
     }
 
+    /// A mid-export fault — including the truncation refusal, which the streaming
+    /// export can only report after its last item — must propagate out of
+    /// `next_frame_chunks` rather than being swallowed into a short-but-clean
+    /// delivery. That is what makes the caller abort without `StreamEnd`, so the
+    /// client rejects the delivery and never pays the closing voucher.
+    ///
+    /// The fault is also terminal: the queue is dropped and every later call errors
+    /// rather than answering `None`, which the serve loop would read as a clean end
+    /// of blob. The coherent twin pins the same rule in
+    /// `a_coherent_encode_fault_is_terminal`.
     #[tokio::test]
     async fn a_mid_export_fault_propagates() -> anyhow::Result<()> {
         let stream: BaoExportStream = Box::pin(futures_util::stream::iter(vec![
             // 1500, deliberately NOT a multiple of the 1024 target used below: one
-            // full frame is cuttable, leaving 476 bytes buffered when the fault
-            // lands. With a multiple the buffer would be empty at that point and the
-            // `buf.clear()` below would be unobservable.
+            // full frame is cuttable, leaving 476 bytes queued when the fault
+            // lands. With a multiple the queue would already be empty at that point
+            // and the fault's `queue.clear()` would be unobservable.
             Ok(Bytes::from(vec![7u8; 1500])),
             Err(CacheError::Store(anyhow::anyhow!(
                 "export_bao stream for deadbeef ended without Done; refusing truncated export"

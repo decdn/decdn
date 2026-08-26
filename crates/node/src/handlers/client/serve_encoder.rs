@@ -303,7 +303,17 @@ impl CoherentFrameProducer {
     ///
     /// Zero-copy: returned `Vec<Bytes>` holds reference-counted slices of the
     /// encoder's output, so the caller can send them via a single vectored QUIC
-    /// write without copying payload bytes.
+    /// write without copying payload bytes. The `usize` beside them is their total
+    /// byte count, which is both what the frame header declares to the client and
+    /// what the serve leg bills for.
+    ///
+    /// # Errors
+    ///
+    /// An encode fault (a gap the pull could not fill, or a proof/verify error), a
+    /// `target` of zero, a `queued`/`queue` desync, or any call after a fault. A
+    /// fault is terminal — the queue is dropped and later calls error rather than
+    /// answering `None`, because `None` is how the serve leg learns the range is
+    /// complete. On any of these the serve leg must not send `StreamEnd`.
     pub(super) async fn next_frame_chunks(
         &mut self,
         target: usize,
@@ -311,11 +321,12 @@ impl CoherentFrameProducer {
         if self.faulted {
             anyhow::bail!("coherent encode already faulted; refusing to serve further frames");
         }
-        // A zero target cuts a zero-length frame, which ADR 005 bans, and would
-        // short-circuit below before the encoder is pumped even once — the serve leg
-        // would read that as a whole blob delivered and send `StreamEnd` over
-        // nothing. `frame_target` floors at one bao chunk group; this restates that
-        // floor where the damage would be silent.
+        // A zero target can never cut a frame: it short-circuits below before the
+        // encoder is pumped even once, and `cut` then refuses — but names a
+        // `queued`/`queue` desync, which is the wrong cause. `frame_target` never
+        // returns zero: every term it minimizes over is at least one, and the room
+        // term floors at a bao chunk group. This restates that floor where the
+        // failure would otherwise be misattributed.
         if target == 0 {
             anyhow::bail!("refusing to cut a zero-length frame");
         }
@@ -561,10 +572,10 @@ mod tests {
         assert!(producer.queue.is_empty(), "a fault clears the queue");
     }
 
-    /// A zero target would cut a zero-length frame — banned by ADR 005 — and, worse,
-    /// would return before the encoder is pumped at all, which `serve_leg` reads as a
-    /// fully delivered range. `frame_target` floors at one chunk group; this is that
-    /// floor restated where the failure would otherwise be silent.
+    /// A zero target must be refused by name. It cuts nothing, so `cut` below would
+    /// refuse it anyway — but as a `queued`/`queue` desync, blaming the bookkeeping
+    /// for a bad argument. `frame_target` never returns zero, so this pins the floor
+    /// restated where the failure would otherwise be misattributed.
     #[tokio::test]
     async fn a_zero_frame_target_is_refused_not_read_as_end_of_range() {
         let total = 2 * G;
