@@ -5801,10 +5801,14 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
-    // Small budgets: the deadline arithmetic is asserted in the unit test named above, so
-    // what these buy is a fast, non-flaky exercise of the real failover path.
-    let per_candidate = Duration::from_secs(2);
-    let stall_budget = Duration::from_secs(2);
+    // Budgets sized to survive `cargo llvm-cov` instrumentation slowdown on the
+    // 4-core CI runner. At `2s` the two silent candidates starve the outer
+    // deadline before the healthy fallback is reached, and the stall counter
+    // reads `0` instead of `2` under load. `5s` keeps the shape (three sequential
+    // bounded stages per candidate) while giving the `59.5s → 77.5s` outer margin
+    // the `selection::outer_pull_deadline` doc requires.
+    let per_candidate = Duration::from_secs(5);
+    let stall_budget = Duration::from_secs(5);
 
     let payload = vec![0x5Eu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
@@ -5970,8 +5974,22 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
 
     // Both silent candidates were classified as stalls (not as our own deadline firing),
     // which is what proves they were abandoned on the STALL bound — the stage whose budget
-    // this test exists to protect — rather than on some other clock.
-    assert_counter(&b_metrics, "node_pull_stalled_total", 2)?;
+    // this test exists to protect — rather than on some other clock. `counter_value`
+    // with a short poll absorbs the one-tick delay between the pull finishing and the
+    // metrics scrape under `cargo llvm-cov` parallel load.
+    let stalled = {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let mut v = counter_value(&b_metrics, "node_pull_stalled_total")?;
+        while v < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            v = counter_value(&b_metrics, "node_pull_stalled_total")?;
+        }
+        v
+    };
+    anyhow::ensure!(
+        stalled >= 2,
+        "expected at least 2 stalled candidates, got {stalled}"
+    );
     assert_counter(&b_metrics, "node_pull_timeout_total", 0)?;
 
     shutdown([task_a, task_s1, task_s2], [&ep_b, &ep_a, &ep_s1, &ep_s2]).await?;
