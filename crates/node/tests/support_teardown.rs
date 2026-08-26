@@ -7,8 +7,9 @@
 //! each integration binary, so a test living in it would be collected and run once
 //! per binary.
 //!
-//! `start_paused` throughout — the deadline paths assert on a 10s timeout that
-//! auto-advances the instant every task is idle, so none of this costs wall clock.
+//! `start_paused` throughout — the deadline paths assert on behavior rather than on
+//! `support::SHUTDOWN_TIMEOUT`'s value, and the virtual clock auto-advances the
+//! instant every task is idle, so none of this costs wall clock.
 
 #![allow(clippy::expect_used, clippy::panic)]
 

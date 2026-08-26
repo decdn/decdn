@@ -85,11 +85,30 @@ impl NegativeProbeCache {
     ///
     /// Production code uses [`Self::new`] (the ADR 001 § Probe cache
     /// 1024-entry, 5-minute defaults); this constructor is the test /
-    /// tuning seam. Integration tests in particular need it: the TTL
-    /// is anchored on [`std::time::Instant`], so `tokio::time` pause /
-    /// advance has no effect on it, and the only way to exercise
-    /// expiry deterministically without a multi-minute wall-clock wait
-    /// is to inject a short TTL here. `cap` is clamped to ≥ 1.
+    /// tuning seam. The TTL is anchored on [`std::time::Instant`], so
+    /// `tokio::time` pause / advance has no effect on it, and a short
+    /// injected TTL is how a test exercises expiry without a
+    /// multi-minute wall-clock wait. Two kinds of test want that:
+    ///
+    /// - One whose subject is TTL SEMANTICS — that expiry sweeps on
+    ///   read, that a read-hit does not re-stamp the window, that a
+    ///   re-record does. This module's own unit tests are those, and
+    ///   their wall-clock sleeps are the measurement, not overhead.
+    /// - One whose subject is the CACHE-WIDE TTL as a quantity.
+    ///   `node_origin`'s refusal suite is that case: it shrinks the
+    ///   cache TTL below `node_origin::REFUSAL_SUPPRESSION_TTL` to
+    ///   invert the production order, which is the only arrangement in
+    ///   which the two suppression arms have visibly different
+    ///   lifetimes.
+    ///
+    /// A test that needs one ENTRY expired as a precondition — rather
+    /// than as its subject — wants neither. Entries hold an absolute
+    /// expiry, so [`Self::record_failure_with_ttl`] with
+    /// [`Duration::ZERO`] stamps an already-elapsed expiry on a single
+    /// key, [`Self::contains_active`] sweeps it on the next read, and
+    /// the rest of the cache keeps production behaviour.
+    ///
+    /// `cap` is clamped to ≥ 1.
     #[must_use]
     pub fn with_capacity_and_ttl(cap: usize, ttl: Duration) -> Self {
         let cap = cap.max(1);

@@ -38,16 +38,20 @@
 //!    of the feature, otherwise only covered by the pure `fold_response`
 //!    unit tests.
 //!
-//! 4. **Negative-cache TTL expiry.** A `(provider, target)` pair in
-//!    the negative cache suppresses the provider on the first lookup,
-//!    but once its TTL elapses the entry is swept and the *same* cache
-//!    no longer suppresses the provider — expiry must not poison
-//!    future lookups. The negative cache is anchored on
-//!    `std::time::Instant`, so `tokio::time` pause/advance cannot drive
-//!    it; the test injects a short TTL via
-//!    `NegativeProbeCache::with_capacity_and_ttl` and waits on the real
-//!    clock, in the same generous-wall-clock style as the
-//!    `negative_cache` unit tests.
+//! 4. **Negative-cache expiry.** A `(provider, target)` pair in the
+//!    negative cache suppresses the provider on the first lookup, and
+//!    once the entry expires the *same* cache no longer suppresses it
+//!    — a stale entry must not poison future lookups. The cache is
+//!    anchored on `std::time::Instant`, so `tokio::time` pause/advance
+//!    cannot drive it, and this scenario is a real multi-threaded
+//!    lookup over loopback QUIC in any case. It therefore keeps the
+//!    clock out of the assertion: suppression runs under the
+//!    production TTL, which no runner can outlive, and expiry is
+//!    forced on the one entry under test by re-recording its key with
+//!    a `Duration::ZERO` TTL. Wall-clock TTL arithmetic belongs to the
+//!    `negative_cache` unit tests; what this scenario owns is that a
+//!    live `find_providers` consults the cache on every pass and
+//!    recovers once the entry is gone.
 
 #![allow(
     clippy::unwrap_used,
@@ -74,6 +78,12 @@ use decdn_node::metrics::Metrics;
 use decdn_protocol::{ALPN_DHT, ContentHash, NodeId};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey, endpoint::presets};
+
+// Teardown is routed through the shared bounded helper rather than a bare
+// `Endpoint::close().await`, which has no deadline of its own. Called fully
+// qualified: `TestServer` carries a `shutdown` method of its own, and a bare
+// `shutdown(...)` beside `provider.shutdown()` reads ambiguously.
+mod support;
 
 fn fresh_key() -> SecretKey {
     SecretKey::generate()
@@ -140,25 +150,48 @@ struct TestServer {
     id: iroh::PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
     records: Arc<Mutex<RecordStore>>,
-    accept_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    accept_task: tokio::task::JoinHandle<()>,
 }
 
 impl TestServer {
-    /// Abort the accept loop and close the endpoint, awaiting the
-    /// close so the peer is genuinely unreachable by the time this
-    /// returns — the "handler dropped mid-lookup" simulation in
-    /// `find_providers_tolerates_unreachable_peer` relies on this.
-    async fn shutdown(self) {
-        self.accept_task.abort();
-        self.endpoint.close().await;
+    /// The two halves teardown needs: the accept loop's handle and the
+    /// endpoint it accepts on. A test that tears several servers down
+    /// together hands these to one [`support::shutdown`] call, so the
+    /// whole teardown costs one deadline rather than one per endpoint.
+    ///
+    /// The routing / record handles belong to the test, not to teardown,
+    /// and are dropped here.
+    fn into_teardown_parts(self) -> (tokio::task::JoinHandle<()>, Endpoint) {
+        (self.accept_task, self.endpoint)
     }
 
-    /// Fire-and-forget close for servers whose teardown ordering
-    /// doesn't matter to the assertion.
-    fn shutdown_detached(self) {
-        self.accept_task.abort();
-        let ep = self.endpoint.clone();
-        tokio::spawn(async move { ep.close().await });
+    /// Reap the accept loop, close the endpoint under
+    /// [`support::shutdown`]'s deadline, and VERIFY the close landed — so the
+    /// peer is genuinely unreachable by the time this returns.
+    ///
+    /// The check is the point. [`support::shutdown`] warns rather than fails
+    /// when its deadline is breached, because the stranded-driver half of that
+    /// breach is a known open defect (#1675) no test here can fix. For teardown
+    /// that is the right trade. This is not teardown: the "handler dropped
+    /// mid-lookup" simulation in `find_providers_tolerates_unreachable_peer`
+    /// reads "this peer is down" as its PRECONDITION, and a breach would leave
+    /// the peer answering while the scenario passed having exercised nothing.
+    /// Asserting the postcondition keeps that failure loud, and the deadline
+    /// still stops a stalled close from parking the test until the
+    /// `.config/nextest.toml` backstop.
+    ///
+    /// # Errors
+    ///
+    /// The accept loop panicked, or the endpoint did not close.
+    async fn shutdown(self) -> anyhow::Result<()> {
+        let (task, endpoint) = self.into_teardown_parts();
+        support::shutdown([task], [&endpoint]).await?;
+        anyhow::ensure!(
+            endpoint.is_closed(),
+            "the peer must be unreachable before the scenario runs, but its endpoint \
+             did not close within the teardown deadline"
+        );
+        Ok(())
     }
 }
 
@@ -202,7 +235,6 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
                 let _ = h.accept(conn).await;
             });
         }
-        Ok::<_, anyhow::Error>(())
     });
     Ok(TestServer {
         endpoint,
@@ -235,14 +267,56 @@ async fn prime_iroh_cache(
     Ok(())
 }
 
-fn lookup_cfg_for_test() -> LookupConfig {
-    // Short round timeout so a wedged test (or the deliberately
-    // unreachable peer in `find_providers_tolerates_unreachable_peer`)
-    // fails fast instead of waiting out the 8s production default.
+/// Round budget for a lookup that must SUCCEED against a reachable
+/// loopback peer — the two convergence scenarios, the second of which
+/// needs two sequential rounds.
+///
+/// `dht::client::DHT_CLIENT_TIMEOUT` (8s) already caps a single outbound
+/// exchange, so this is a belt over that cap rather than an independent
+/// budget. A smaller value asserts loopback LATENCY, which llvm-cov
+/// instrumentation on a contended runner is entitled to break; a much
+/// larger one is inert, because the per-RPC timeout binds first. Sitting
+/// just above the per-RPC cap keeps that timeout the binding constraint,
+/// so the round drain never aborts a peer the RPC layer is still willing
+/// to wait for. These scenarios assert routing, not speed.
+const CONVERGENCE_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The ordering above is the whole point of the constant, so it is pinned here
+/// rather than left to the prose. A `DHT_CLIENT_TIMEOUT` raised past this budget
+/// would silently restore what the split fixes: the round drain pre-empting a
+/// peer the RPC layer is still willing to wait for, with both convergence
+/// scenarios back to measuring loopback latency and still green.
+const _: () = assert!(CONVERGENCE_ROUND_TIMEOUT.as_secs() > client::DHT_CLIENT_TIMEOUT.as_secs());
+
+/// Round budget for [`find_providers_tolerates_unreachable_peer`], where
+/// waiting a round out on a dead peer IS the scenario. Short, so the dead
+/// peer costs a 3s round rather than the 8s production default; nothing
+/// there has to answer within it, so no reachable peer's latency rides on
+/// this number.
+const UNREACHABLE_ROUND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Wedge detector for [`find_providers_tolerates_unreachable_peer`], not
+/// a latency budget.
+///
+/// `find_providers` bounds itself at `MAX_LOOKUP_ROUNDS` ×
+/// `round_timeout` — 4 × 3s = 12s there — so a guard set to that figure
+/// fails a lookup that is merely slow. This sits well clear of it, which
+/// leaves it able to catch only a lookup that never returns, and still
+/// names the failure at the assertion rather than 150s later at the
+/// `.config/nextest.toml` backstop.
+const UNREACHABLE_HANG_GUARD: Duration = Duration::from_secs(30);
+
+fn lookup_cfg_with_round_timeout(round_timeout: Duration) -> LookupConfig {
     LookupConfig {
-        round_timeout: Duration::from_secs(3),
+        round_timeout,
         ..LookupConfig::default()
     }
+}
+
+/// The file default: the convergence budget. A scenario that wants a
+/// round to time out names [`UNREACHABLE_ROUND_TIMEOUT`] explicitly.
+fn lookup_cfg_for_test() -> LookupConfig {
+    lookup_cfg_with_round_timeout(CONVERGENCE_ROUND_TIMEOUT)
 }
 
 fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32]) {
@@ -394,8 +468,8 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
         "lookup must converge to the surviving provider after a departure"
     );
 
-    client_ep.close().await;
-    provider.shutdown_detached();
+    let (provider_task, provider_ep) = provider.into_teardown_parts();
+    support::shutdown([provider_task], [&client_ep, &provider_ep]).await?;
     Ok(())
 }
 
@@ -411,8 +485,8 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
 /// folds in the live provider's record. The `find_providers` call is
 /// bounded by a wall-clock guard so a regression that *hangs* on an
 /// unresponsive peer surfaces as a clear failure rather than a stuck
-/// test (the lookup legitimately waits out one `round_timeout` while
-/// the dead peer's dial fails, then converges).
+/// test (the lookup legitimately waits a round out while the dead peer's
+/// dial fails, then converges).
 #[tokio::test(flavor = "multi_thread")]
 async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     let client_sk = fresh_key();
@@ -436,7 +510,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     insert_record(&provider.records, target, *provider.id.as_bytes());
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;
 
-    dead.shutdown().await;
+    dead.shutdown().await?;
 
     let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
         *client_id.as_bytes(),
@@ -453,11 +527,16 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
     let neg = NegativeProbeCache::new();
 
-    // Guard against a hang regression: the lookup waits out at most one
-    // `round_timeout` (3s) on the dead peer, so 12s is comfortable
-    // headroom while still failing fast on an unbounded stall.
+    // Guard against a hang regression. The routing table holds two peers and
+    // `alpha` is 3, so round one queries both: the provider answers at once and
+    // the dead peer never does, which spends one whole
+    // `UNREACHABLE_ROUND_TIMEOUT` on the drain. The next pass then has no
+    // unqueried candidates and breaks BEFORE arming a second round, so one
+    // round is the real cost here — see `UNREACHABLE_HANG_GUARD` for why the
+    // guard is nonetheless sized against the lookup's `MAX_LOOKUP_ROUNDS`
+    // ceiling rather than against this scenario's own path.
     let providers = tokio::time::timeout(
-        Duration::from_secs(12),
+        UNREACHABLE_HANG_GUARD,
         find_providers(
             &client_ep,
             &routing,
@@ -465,7 +544,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
             &neg,
             NodeId::from_bytes(*client_id.as_bytes()),
             ContentHash::from_bytes(target),
-            lookup_cfg_for_test(),
+            lookup_cfg_with_round_timeout(UNREACHABLE_ROUND_TIMEOUT),
             None,
         ),
     )
@@ -482,8 +561,8 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
         "the unreachable peer must never appear as a provider"
     );
 
-    client_ep.close().await;
-    provider.shutdown_detached();
+    let (provider_task, provider_ep) = provider.into_teardown_parts();
+    support::shutdown([provider_task], [&client_ep, &provider_ep]).await?;
     Ok(())
 }
 
@@ -547,15 +626,25 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
         "lookup must follow the seed's closer_node to the holder and converge"
     );
 
-    client_ep.close().await;
-    seed.shutdown_detached();
-    holder.shutdown_detached();
+    let (seed_task, seed_ep) = seed.into_teardown_parts();
+    let (holder_task, holder_ep) = holder.into_teardown_parts();
+    support::shutdown([seed_task, holder_task], [&client_ep, &seed_ep, &holder_ep]).await?;
     Ok(())
 }
 
-/// Scenario 4: a negative-cache entry suppresses a provider only until
-/// its TTL elapses. After expiry, the *same* cache no longer suppresses
-/// the provider — a stale entry must not poison future lookups.
+/// Scenario 4: a negative-cache entry suppresses a provider only while
+/// it is live. Once the entry expires, the *same* cache stops
+/// suppressing that provider — a stale entry must not poison future
+/// lookups.
+///
+/// Both lookups are real QUIC round trips against a live provider; only
+/// the clock leaves the assertion. Suppression runs under the production
+/// TTL, so no runner — instrumented, contended, or both — can outlive it
+/// and turn the first assertion into a latency race. Expiry is then
+/// forced on exactly the key under test: entries hold an ABSOLUTE
+/// expiry, so re-recording the key with a `Duration::ZERO` TTL restamps
+/// it to now, and `contains_active` reads `expiry <= now` as elapsed and
+/// evicts.
 #[tokio::test(flavor = "multi_thread")]
 async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()> {
     let target: [u8; 32] = [0xC3; 32];
@@ -580,18 +669,13 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
 
-    // Short TTL injected via the test/tuning seam. The cache is anchored
-    // on `Instant`, so this waits on the real clock (TTL 750ms, sleep
-    // 1100ms) in the same generous-wall-clock style as the
-    // `negative_cache` unit tests. The 1100ms sleep alone exceeds the
-    // 750ms TTL, so the margin doesn't depend on the first lookup's
-    // duration.
-    let ttl = Duration::from_millis(750);
-    let neg = NegativeProbeCache::with_capacity_and_ttl(16, ttl);
-    neg.record_failure(
-        NodeId::from_bytes(*provider.id.as_bytes()),
-        ContentHash::from_bytes(target),
-    );
+    // The production defaults: ADR 001 § Probe cache's 1024 entries and
+    // 5-minute TTL. Nothing this test does comes near that window, so the
+    // suppression assertion below does not ride on how long a lookup takes.
+    let neg = NegativeProbeCache::new();
+    let provider_node = NodeId::from_bytes(*provider.id.as_bytes());
+    let target_hash = ContentHash::from_bytes(target);
+    neg.record_failure(provider_node, target_hash);
 
     // First lookup: the pre-recorded failure suppresses the provider.
     let suppressed = find_providers(
@@ -600,7 +684,7 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         &staker_set,
         &neg,
         NodeId::from_bytes(*client_id.as_bytes()),
-        ContentHash::from_bytes(target),
+        target_hash,
         lookup_cfg_for_test(),
         None,
     )
@@ -610,8 +694,17 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         "provider must be suppressed while the negative entry is live: {suppressed:?}"
     );
 
-    // Let the negative entry expire.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // Expire the entry. `shift_insert` on an existing key updates that
+    // key's value in place, so this restamps the pair's absolute expiry to
+    // now rather than adding a second entry, and `contains_active` treats
+    // `expiry <= now` as elapsed and sweeps it on the next read.
+    neg.record_failure_with_ttl(provider_node, target_hash, Duration::ZERO);
+    assert_eq!(
+        neg.len(),
+        1,
+        "the expiring re-record must land on the SAME key — a second entry \
+         would leave the original live and prove nothing"
+    );
 
     // Second lookup with the SAME cache: the entry has expired, so the
     // provider is no longer suppressed.
@@ -621,18 +714,22 @@ async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()>
         &staker_set,
         &neg,
         NodeId::from_bytes(*client_id.as_bytes()),
-        ContentHash::from_bytes(target),
+        target_hash,
         lookup_cfg_for_test(),
         None,
     )
     .await;
     assert_eq!(
         recovered,
-        vec![NodeId::from_bytes(*provider.id.as_bytes())],
+        vec![provider_node],
         "expired negative entry must not poison the follow-up lookup"
     );
+    assert!(
+        neg.is_empty(),
+        "the lookup must sweep the expired entry it steps over, not accumulate it"
+    );
 
-    client_ep.close().await;
-    provider.shutdown_detached();
+    let (provider_task, provider_ep) = provider.into_teardown_parts();
+    support::shutdown([provider_task], [&client_ep, &provider_ep]).await?;
     Ok(())
 }
