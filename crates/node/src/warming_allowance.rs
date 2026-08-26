@@ -131,18 +131,24 @@ impl WarmingAllowance {
     /// hash with its source so a later serve can credit the right ledger. The
     /// loss is floored at `-budget`, bounding the total possible drain from
     /// one source to one grief-cap's worth.
+    ///
+    /// The tag lands before the debit. The tag map and the bucket ledger are
+    /// separate locks, so the two writes are not one atomic step; ordering them
+    /// this way makes the only observable interleaving the harmless one. A
+    /// serve that resolves the tag between the two sees the source and credits
+    /// it, which is what the accounting wants. The reverse order would let a
+    /// serve see a committed debit with no tag yet and silently drop its
+    /// credit.
     pub fn debit_speculative(&self, source: [u8; 32], hash: [u8; 32], units: u64) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let bucket = state.buckets.entry(source).or_insert_with(Bucket::fresh);
-            self.refill(bucket);
-            let units = i64::try_from(units).unwrap_or(i64::MAX);
-            bucket.remaining = bucket
-                .remaining
-                .saturating_sub(units)
-                .max(self.budget.saturating_neg());
-        }
         self.source_of.insert(hash, source);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let bucket = state.buckets.entry(source).or_insert_with(Bucket::fresh);
+        self.refill(bucket);
+        let units = i64::try_from(units).unwrap_or(i64::MAX);
+        bucket.remaining = bucket
+            .remaining
+            .saturating_sub(units)
+            .max(self.budget.saturating_neg());
     }
 
     /// The source that speculatively bought `hash`, or `None` if the hash was
