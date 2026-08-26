@@ -75,7 +75,10 @@ use jsonrpsee::http_client::HttpClient;
 
 const MIB: usize = 1024 * 1024;
 
-/// Journey tiers (see [`decdn_e2e::timeout`] for the tier rule).
+/// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). The
+/// longest internal poll ladder among the journeys that take it is 60+60s (the
+/// regional leg), which stays under the ~150s threshold for the heavy tier.
+/// Cleanup runs on drop even on timeout.
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// `removal_lifts_the_deny_but_eviction_is_sticky` needs the heavy tier: its
 /// internal ladder is `60s` evict + `30s` blacklist + `180s` removal convergence
@@ -338,14 +341,12 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     // free from its `increase_time`; a lone removal tx does not), and mining each
     // round also keeps the watcher's periodic re-scope ticking. The assertion is
     // the robust half — the refusal stops being `HashBlacklisted` while the blob
-    // stays refused — not the exact post-deny code. `180s` survives the `10s`
+    // stays refused — not the exact post-deny code. `180s` covers the `10s`
     // `isHashBlacklistedForOperator` RPC timeout plus `eth_getLogs` poll jitter
-    // under `--test-threads 2` (previously `90s` flaked, see #1827).
+    // under `--test-threads 2` contention (#1826).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    // Allow: initial `String::new()` is overwritten before first read — binding must be
-    // initialized for the post-loop assert, but the loop's first `clone_from` overwrites
-    // it without a prior read.
-    #[allow(unused_assignments)]
+    // Carries the last refusal into the post-loop assert, so an exhausted deadline
+    // names the code the node actually returned.
     let mut last_msg = String::new();
     let mut reverted = false;
     loop {

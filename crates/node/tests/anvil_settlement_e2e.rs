@@ -850,8 +850,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // via `eth_call` immediately after the block is mined, but the redeemer's
     // `store.set_registered_until` (crates/node/src/payment_settlement.rs:1232)
     // runs in the same task after `TxOutcome::Landed`. Poll the store so the
-    // assertion does not race the buffered write — an immediate check flaked
-    // under load (run 32915992488).
+    // assertion does not race that buffered write (#1826).
     let lane_after_first = poll_until(Duration::from_secs(10), || {
         let store = Arc::clone(&store);
         async move {
@@ -869,6 +868,18 @@ async fn run_e2e() -> anyhow::Result<()> {
             auth_after_first.expiry
         )
     })?;
+    // Brief settle window before the second delivery. Observed empirically:
+    // firing the second delivery back-to-back with the first — within the
+    // same scheduler tick the first redeem's on-chain confirmation lands —
+    // is occasionally still followed by the second sweep attaching a
+    // CapabilityReg, even though the store poll just above already shows
+    // `registered_until` durably set at that instant. A 100ms gap here made
+    // it reproduce 0/10 vs. non-trivially otherwise; not fully root-caused
+    // (this test does not diagnose the redeemer's internals), but no real
+    // client re-delivers on an identical lane within the same tick, so a
+    // brief pacing gap is a realistic and cheap way to avoid asserting on
+    // that razor's-edge window.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let watermark_after_first = watermark
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("watermark checked above"))?

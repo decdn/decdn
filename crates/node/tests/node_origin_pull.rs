@@ -5803,12 +5803,13 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
-    // Budgets sized to survive `cargo llvm-cov` instrumentation slowdown on the
-    // 4-core CI runner. At `2s` the two silent candidates starve the outer
-    // deadline before the healthy fallback is reached, and the stall counter
-    // reads `0` instead of `2` under load. `5s` keeps the shape (three sequential
-    // bounded stages per candidate) while giving the `59.5s → 77.5s` outer margin
-    // the `selection::outer_pull_deadline` doc requires.
+    // Budgets sized so the two silent candidates are abandoned on their own STALL
+    // bound with room to spare under `cargo llvm-cov` instrumentation on a 4-core
+    // runner — a budget too tight for that load lets them starve the outer deadline
+    // before the healthy fallback is dialled, and the stall counter reads `0`. `5s`
+    // keeps the shape (three sequential bounded stages per candidate) at a `77.5s`
+    // outer deadline, which is what `selection::outer_pull_deadline` requires and
+    // what the `.config/nextest.toml` cap for this package is sized around (#1826).
     let per_candidate = Duration::from_secs(5);
     let stall_budget = Duration::from_secs(5);
 
@@ -9750,8 +9751,13 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
 
     // The two misses race, exactly as two cache misses for different blobs do.
     // Bound the join so a hung channel-open leaves a clear verdict instead of the
-    // nextest `slow-timeout` (issue #1826: 12.9s under llvm-cov looked like StaleNonce).
-    let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
+    // opaque nextest `slow-timeout` kill (#1826). The bound is a diagnostic, not a
+    // performance assertion: it sits far enough above the honest cost of two
+    // channel opens under `cargo llvm-cov` contention that a slow-but-correct run
+    // still passes, and far enough below this binary's `60s x 3` nextest cap that
+    // the named verdict is what CI reports.
+    let join_budget = Duration::from_mins(1);
+    let (first, second) = tokio::time::timeout(join_budget, async {
         tokio::join!(
             Origin::fetch(&origin, hash, u64::MAX),
             Origin::fetch(&origin, hash2, u64::MAX),
@@ -9760,15 +9766,15 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     .await
     .map_err(|_| {
         anyhow::anyhow!(
-            "concurrent ledger pulls hung past 30s — likely CHANNEL_OPEN_CALLER_BUDGET={:?} \
-             expiry under llvm-cov contention, not StaleNonce; pending={} timeout={} stalled={} \
-             recorded={:?} retired={:?}",
-            CHANNEL_OPEN_CALLER_BUDGET,
+            "concurrent ledger pulls hung past {join_budget:?} — likely \
+             CHANNEL_OPEN_CALLER_BUDGET={CHANNEL_OPEN_CALLER_BUDGET:?} expiry under llvm-cov \
+             contention, not StaleNonce; pending={} timeout={} stalled={} recorded={:?} \
+             retired={:?}",
             counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
-            recorded.lock().map_or(usize::MAX, |v| v.len()),
-            retired.lock().map_or(usize::MAX, |v| v.len())
+            recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
+            retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
         )
     })?;
     let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
@@ -9776,7 +9782,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         matches!(&first, OriginFetch::AlreadyAdmitted),
         "first concurrent pull returned {first:?} (expected AlreadyAdmitted); StaleNonce would retire \
          the channel and cap cumulative at one pull's wire bytes, while CHANNEL_OPEN_CALLER_BUDGET \
-          expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
+         expiry increments node_pull_pool_open_pending_total and surfaces NotFound — check pending={} \
          timeout={} stalled={} recorded={:?} retired={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
