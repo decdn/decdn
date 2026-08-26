@@ -695,6 +695,15 @@ impl ChunkData {
 /// Pinned by `client_message_discriminants_are_frozen`.
 const CHUNK_DATA_DISCRIMINANT: u8 = 2;
 
+/// Maximum bytes needed to encode a `ChunkData` header (discriminant + varint
+/// payload length). 1 + 5 (max varint for `u32`-range `MAX_MESSAGE_SIZE`).
+pub const CHUNK_DATA_HEADER_MAX: usize = 6;
+
+/// Maximum bytes needed for the full framing + `ChunkData` header:
+/// varint `postcard_len` (≤5) + `CHUNK_DATA_DISCRIMINANT` (1) + varint
+/// `payload_len` (≤5). Stack buffer for the zero-copy write path.
+pub const CHUNK_FRAME_HEADERS_MAX: usize = 11;
+
 /// Encode one [`ClientMessage::ChunkData`] frame body directly from its payload.
 ///
 /// Byte-identical to `encode_message(&ClientMessage::ChunkData(ChunkData::new(payload)?))`
@@ -713,10 +722,20 @@ const CHUNK_DATA_DISCRIMINANT: u8 = 2;
 ///
 /// # Errors
 ///
-/// [`MessageValidationError::EmptyChunk`] for a zero-length payload.
+/// [`MessageValidationError::EmptyChunk`] for a zero-length payload, or
+/// [`MessageValidationError::ChunkTooLarge`] if the frame would exceed
+/// [`crate::framing::MAX_MESSAGE_SIZE`].
 pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationError> {
     if payload.is_empty() {
         return Err(MessageValidationError::EmptyChunk);
+    }
+    if payload.len() > crate::framing::MAX_MESSAGE_SIZE as usize {
+        return Err(MessageValidationError::ChunkTooLarge { len: payload.len() });
+    }
+    // Postcard payload length `1 + varint(payload_len) + payload_len` must also fit.
+    let postcard_len = chunk_frame_postcard_len(payload.len());
+    if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
     }
     // Discriminant, then the `Vec<u8>` field's postcard length prefix, then the
     // bytes. Postcard writes a sequence length as a LEB128 varint: seven bits per
@@ -737,6 +756,125 @@ pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationEr
     }
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+/// Encode only the `ChunkData` header (discriminant + varint payload length)
+/// into `out`, returning the number of bytes written.
+///
+/// This is the zero-copy helper for the serve hot path: the header is a small
+/// stack buffer (≈6 B) that is sent alongside the payload `Bytes` via a
+/// vectored QUIC write, so the payload is never copied into a heap buffer.
+///
+/// # Errors
+///
+/// [`MessageValidationError::EmptyChunk`] for `payload_len == 0`, or
+/// [`MessageValidationError::ChunkTooLarge`] if the payload would exceed
+/// [`crate::framing::MAX_MESSAGE_SIZE`] or the header would not fit in `out`.
+pub fn encode_chunk_data_header(
+    payload_len: usize,
+    out: &mut [u8; CHUNK_DATA_HEADER_MAX],
+) -> Result<usize, MessageValidationError> {
+    if payload_len == 0 {
+        return Err(MessageValidationError::EmptyChunk);
+    }
+    if payload_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+    }
+    // Discriminant.
+    if let Some(slot) = out.get_mut(0) {
+        *slot = CHUNK_DATA_DISCRIMINANT;
+    } else {
+        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+    }
+    let mut varint_buf = [0u8; 5];
+    let varint_len = crate::framing::encode_varint_u32(
+        u32::try_from(payload_len).unwrap_or(u32::MAX),
+        &mut varint_buf,
+    );
+    let total = 1usize.saturating_add(varint_len);
+    if total > out.len() {
+        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+    }
+    if let Some(dst) = out.get_mut(1..total)
+        && let Some(src) = varint_buf.get(..varint_len)
+    {
+        dst.copy_from_slice(src);
+    }
+    Ok(total)
+}
+
+/// Encode the full frame headers for a `ChunkData` payload of `payload_len`
+/// bytes: the framing varint `postcard_len` followed by the `ChunkData` header
+/// (discriminant + varint `payload_len`). The payload itself is **not**
+/// included — the caller sends it as `Bytes` alongside this header via a
+/// vectored write.
+///
+/// Returns the number of header bytes written into `out` (≤
+/// [`CHUNK_FRAME_HEADERS_MAX`]).
+///
+/// # Errors
+///
+/// [`MessageValidationError::EmptyChunk`] for `payload_len == 0`, or
+/// [`MessageValidationError::ChunkTooLarge`] if the frame would exceed
+/// [`crate::framing::MAX_MESSAGE_SIZE`] or the headers would not fit in `out`.
+pub fn encode_chunk_frame_headers(
+    payload_len: usize,
+    out: &mut [u8; CHUNK_FRAME_HEADERS_MAX],
+) -> Result<usize, MessageValidationError> {
+    if payload_len == 0 {
+        return Err(MessageValidationError::EmptyChunk);
+    }
+    if payload_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+        return Err(MessageValidationError::ChunkTooLarge { len: payload_len });
+    }
+    // First encode the ChunkData header into a temporary to measure it.
+    let mut hdr = [0u8; CHUNK_DATA_HEADER_MAX];
+    let hdr_len = encode_chunk_data_header(payload_len, &mut hdr)?;
+    let postcard_len = hdr_len.saturating_add(payload_len);
+    if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+        return Err(MessageValidationError::ChunkTooLarge { len: postcard_len });
+    }
+    let pl_u32 = u32::try_from(postcard_len).unwrap_or(u32::MAX);
+    let mut framing_buf = [0u8; 5];
+    let framing_len = crate::framing::encode_varint_u32(pl_u32, &mut framing_buf);
+    let total = framing_len.saturating_add(hdr_len);
+    if total > out.len() {
+        return Err(MessageValidationError::ChunkTooLarge { len: total });
+    }
+    if let Some(dst) = out.get_mut(..framing_len)
+        && let Some(src) = framing_buf.get(..framing_len)
+    {
+        dst.copy_from_slice(src);
+    }
+    if let Some(dst) = out.get_mut(framing_len..total)
+        && let Some(src) = hdr.get(..hdr_len)
+    {
+        dst.copy_from_slice(src);
+    }
+    Ok(total)
+}
+
+/// Length of the postcard payload (`CHUNK_DATA_DISCRIMINANT` + varint
+/// `payload_len` + payload) for a given `payload_len`. Used to size framing.
+#[must_use]
+pub const fn chunk_frame_postcard_len(payload_len: usize) -> usize {
+    // `payload_len == 0` would error; for sizing we assume non-empty. Degenerate
+    // empty case counted as 1 byte discriminant + 1 byte varint.
+    let hdr_len = if payload_len == 0 {
+        2
+    } else {
+        let mut len = payload_len;
+        let mut varint = 0usize;
+        loop {
+            varint = varint.saturating_add(1);
+            len >>= 7;
+            if len == 0 {
+                break;
+            }
+        }
+        1usize.saturating_add(varint)
+    };
+    hdr_len.saturating_add(payload_len)
 }
 
 /// Payer → node cumulative payment voucher (ADR 005 §Voucher wire format).
@@ -1872,6 +2010,53 @@ mod tests {
             crate::client::encode_chunk_frame(&[]),
             Err(MessageValidationError::EmptyChunk)
         );
+    }
+
+    #[tokio::test]
+    async fn encode_chunk_frame_headers_matches_framed_encode_chunk_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Hot-path headers must be wire-identical to the generic
+        // `encode_chunk_frame` + `write_frame` pair. This pins both
+        // `encode_chunk_data_header` and `encode_chunk_frame_headers` across
+        // every varint width boundary the reviewer flagged as missing.
+        for len in [
+            1usize,
+            2,
+            127,
+            128,
+            129,
+            300,
+            16_383,
+            16_384,
+            16_385,
+            1024,
+            64 * 1024,
+            1024 * 1024,
+        ] {
+            let payload = vec![0xABu8; len];
+            let mut frame_hdr = [0u8; crate::client::CHUNK_FRAME_HEADERS_MAX];
+            let frame_hdr_len =
+                crate::client::encode_chunk_frame_headers(payload.len(), &mut frame_hdr)?;
+            let mut via_headers = frame_hdr.get(..frame_hdr_len).unwrap_or(&[]).to_vec();
+            via_headers.extend_from_slice(&payload);
+            let postcard = crate::client::encode_chunk_frame(&payload)?;
+            let mut via_framing = Vec::new();
+            crate::framing::write_frame(&mut via_framing, &postcard).await?;
+            assert_eq!(
+                via_headers, via_framing,
+                "encode_chunk_frame_headers diverged at len {len}"
+            );
+            // Also pin the bare ChunkData header against the postcard prefix.
+            let mut data_hdr = [0u8; crate::client::CHUNK_DATA_HEADER_MAX];
+            let data_hdr_len =
+                crate::client::encode_chunk_data_header(payload.len(), &mut data_hdr)?;
+            assert_eq!(
+                data_hdr.get(..data_hdr_len).unwrap_or(&[]),
+                postcard.get(..data_hdr_len).unwrap_or(&[]),
+                "encode_chunk_data_header diverged at len {len}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

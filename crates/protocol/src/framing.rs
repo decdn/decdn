@@ -237,28 +237,34 @@ async fn read_varint_u32<R: AsyncRead + Unpin>(r: &mut R) -> Result<u32, FrameEr
     Err(FrameError::Varint)
 }
 
-async fn write_varint_u32<W: AsyncWrite + Unpin>(w: &mut W, mut value: u32) -> std::io::Result<()> {
-    // u32 encodes to at most 5 varint bytes (ceil(32/7) = 5). The `buf.get_mut`
-    // + `buf.get(..idx)` guards exist only to satisfy the `indexing_slicing`
-    // clippy lint — they are unreachable given this bound, so assert it.
-    let mut buf = [0u8; 5];
+/// Encode `value` as a postcard varint into `out`, returning the number of
+/// bytes written (1..=5). `out` must be at least 5 bytes; the caller
+/// typically uses a stack `[u8; 5]`.
+#[must_use]
+pub fn encode_varint_u32(mut value: u32, out: &mut [u8; 5]) -> usize {
     let mut idx = 0usize;
     loop {
         let byte = (value & 0x7F) as u8;
         value >>= 7;
         if value == 0 {
-            if let Some(slot) = buf.get_mut(idx) {
+            if let Some(slot) = out.get_mut(idx) {
                 *slot = byte;
             }
-            idx += 1;
+            idx = idx.saturating_add(1);
             break;
         }
-        if let Some(slot) = buf.get_mut(idx) {
+        if let Some(slot) = out.get_mut(idx) {
             *slot = byte | 0x80;
         }
-        idx += 1;
+        idx = idx.saturating_add(1);
     }
     debug_assert!(idx <= 5, "u32 varint must fit in 5 bytes, idx={idx}");
+    idx
+}
+
+async fn write_varint_u32<W: AsyncWrite + Unpin>(w: &mut W, value: u32) -> std::io::Result<()> {
+    let mut buf = [0u8; 5];
+    let idx = encode_varint_u32(value, &mut buf);
     w.write_all(buf.get(..idx).unwrap_or(&[])).await
 }
 

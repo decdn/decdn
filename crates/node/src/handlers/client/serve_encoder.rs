@@ -22,6 +22,7 @@
 //! is `Send` (the iroh accept bound): the cache streams are `Send`, held only behind
 //! `&mut self`.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -30,7 +31,7 @@ use std::time::Duration;
 
 use bao_tree::ChunkRanges;
 use bao_tree::io::fsm::encode_ranges_validated;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use decdn_bao_range::{RangedStore, align_range};
 use decdn_cache::{FillSession, NodeRangedStore, PresentRangeWatch, ServeStore};
 use futures_util::StreamExt;
@@ -228,17 +229,23 @@ impl AsyncStreamWriter for ChannelWriter {
 }
 
 /// Drives the coherent whole-range encode and coalesces its output into wire
-/// frames. [`Self::next_frame`] yields the next
-/// wire frame, `None` once the whole range is delivered, `Err` on an encode fault
-/// (a gap the pull could not fill, or a proof/verify error) — on which the serve
-/// leg must not send `StreamEnd`.
+/// frames. [`Self::next_frame_chunks`] yields the next wire frame, `None` once
+/// the whole range is delivered, `Err` on an encode fault (a gap the pull could
+/// not fill, or a proof/verify error) — on which the serve leg must not send
+/// `StreamEnd`.
 pub(super) struct CoherentFrameProducer {
     /// The running encode future, taken out while polled and re-stored if it parks.
     /// `None` once it has completed (its channel sender is then dropped, so the
     /// receiver drains and ends).
     enc: Option<Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>>,
     rx: mpsc::Receiver<Bytes>,
-    frame_buf: BytesMut,
+    /// Queue of encoded bytes not yet cut into a frame, kept `Bytes`-native for a
+    /// vectored QUIC write without copying payload bytes.
+    queue: VecDeque<Bytes>,
+    queued: usize,
+    /// The encode faulted. Terminal: queue is cleared and no further frame is
+    /// ever cut, mirroring `ChunkFramer::faulted`.
+    faulted: bool,
 }
 
 impl CoherentFrameProducer {
@@ -279,7 +286,96 @@ impl CoherentFrameProducer {
         Self {
             enc: Some(enc),
             rx,
-            frame_buf: BytesMut::new(),
+            queue: VecDeque::new(),
+            queued: 0,
+            faulted: false,
+        }
+    }
+
+    /// The next wire frame as a set of `Bytes` chunks, totalling up to `target`
+    /// bytes (or the shorter final remainder), then `None` once the whole range
+    /// is delivered.
+    ///
+    /// Zero-copy: returned `Vec<Bytes>` holds reference-counted slices of the
+    /// encoder's output, so the caller can send them via a single vectored QUIC
+    /// write without copying payload bytes.
+    pub(super) async fn next_frame_chunks(
+        &mut self,
+        target: usize,
+    ) -> anyhow::Result<Option<(Vec<Bytes>, usize)>> {
+        if self.faulted {
+            anyhow::bail!("coherent encode already faulted; refusing to serve further frames");
+        }
+        loop {
+            if self.queued >= target {
+                return Ok(Self::drain_queue(&mut self.queue, &mut self.queued, target));
+            }
+            let pumped = match self.pump().await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.faulted = true;
+                    self.queue.clear();
+                    self.queued = 0;
+                    return Err(e);
+                }
+            };
+            if let Some(bytes) = pumped {
+                let len = bytes.len();
+                if len > 0 {
+                    self.queued = self.queued.saturating_add(len);
+                    self.queue.push_back(bytes);
+                }
+            } else {
+                // Encoder finished and channel drained: flush any final partial
+                // frame, then signal completion.
+                if self.queued == 0 {
+                    return Ok(None);
+                }
+                let take = self.queued;
+                return Ok(Self::drain_queue(&mut self.queue, &mut self.queued, take));
+            }
+        }
+    }
+
+    /// Drain up to `take` bytes from `queue`, returning the chunks and total.
+    /// `take` is capped to `*queued` by the caller.
+    fn drain_queue(
+        queue: &mut VecDeque<Bytes>,
+        queued: &mut usize,
+        take: usize,
+    ) -> Option<(Vec<Bytes>, usize)> {
+        if *queued == 0 || queue.is_empty() {
+            return None;
+        }
+        let mut out: Vec<Bytes> = Vec::new();
+        let mut remaining = take.min(*queued);
+        let mut total = 0usize;
+        while remaining > 0 {
+            let front_len = queue.front().map_or(0, Bytes::len);
+            if front_len == 0 {
+                break;
+            }
+            if front_len <= remaining {
+                if let Some(bytes) = queue.pop_front() {
+                    let len = bytes.len();
+                    remaining = remaining.saturating_sub(len);
+                    total = total.saturating_add(len);
+                    *queued = queued.saturating_sub(len);
+                    out.push(bytes);
+                }
+            } else if let Some(front) = queue.front_mut() {
+                let taken = front.split_to(remaining);
+                let len = taken.len();
+                total = total.saturating_add(len);
+                *queued = queued.saturating_sub(len);
+                out.push(taken);
+                remaining = 0;
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some((out, total))
         }
     }
 
@@ -288,23 +384,24 @@ impl CoherentFrameProducer {
     ///
     /// `target` is per-call for the same reason as its twin on the cache-hit path: the
     /// serve loop clamps it to the credit window's remaining room.
+    ///
+    /// This is the compatibility path for tests that expect a single contiguous
+    /// buffer. The production serve path uses [`Self::next_frame_chunks`] to avoid
+    /// the copy via a vectored write.
+    #[cfg(test)]
     pub(super) async fn next_frame(&mut self, target: usize) -> anyhow::Result<Option<Bytes>> {
-        loop {
-            if self.frame_buf.len() >= target {
-                let take = self.frame_buf.len().min(target);
-                return Ok(Some(self.frame_buf.split_to(take).freeze()));
-            }
-            if let Some(bytes) = self.pump().await? {
-                self.frame_buf.extend_from_slice(&bytes);
-            } else {
-                // Encoder finished and channel drained: flush any final partial
-                // frame, then signal completion.
-                if self.frame_buf.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(self.frame_buf.split().freeze()));
-            }
+        let Some((chunks, total)) = self.next_frame_chunks(target).await? else {
+            return Ok(None);
+        };
+        if chunks.len() == 1 {
+            let mut iter = chunks.into_iter();
+            return Ok(iter.next());
         }
+        let mut out = bytes::BytesMut::with_capacity(total);
+        for c in chunks {
+            out.extend_from_slice(&c);
+        }
+        Ok(Some(out.freeze()))
     }
 
     /// Advance the encode and/or receive its next output chunk. `Some(bytes)` when a

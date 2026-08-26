@@ -1,5 +1,7 @@
 //! Small leaf helpers: rate clamping, response signing, wire writes, receipts.
 
+use bytes::Bytes;
+
 use super::{
     B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, SendStream, ServeRejectReason,
     StreamError, StreamRequest, StreamResponse, StreamResponseBody, StreamResponseExt,
@@ -213,5 +215,88 @@ impl ClientHandler {
         write_frame(send, payload)
             .await
             .map_err(|e| anyhow::anyhow!("write failed: {e}"))
+    }
+
+    /// Write one `ChunkData` frame without copying the payload.
+    ///
+    /// The payload is the bao-verified stream bytes (content + interleaved proof
+    /// nodes per ADR 038). The header (framing varint + discriminant + varint of
+    /// payload length) is encoded on the stack (≤11 B) and sent alongside the
+    /// payload `Bytes` via a single vectored QUIC write, so the payload is never
+    /// copied into a heap buffer. The wire bytes are identical to
+    /// `encode_chunk_frame(&payload)` + `write_frame`; this is a transport
+    /// optimization, not a format change.
+    #[allow(dead_code)]
+    pub(super) async fn write_chunk_payload(
+        &self,
+        send: &mut SendStream,
+        payload: Bytes,
+    ) -> anyhow::Result<()> {
+        let len = payload.len();
+        let mut hdr = [0u8; decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX];
+        let hdr_len = decdn_protocol::client::encode_chunk_frame_headers(len, &mut hdr)
+            .map_err(|e| anyhow::anyhow!("encode chunk header: {e}"))?;
+        // Small header is copied once into a `Bytes` (≤11 B); the payload stays
+        // reference-counted.
+        let header = Bytes::copy_from_slice(hdr.get(..hdr_len).unwrap_or(&[]));
+        let mut bufs = [header, payload];
+        send.write_all_chunks(&mut bufs)
+            .await
+            .map_err(|e| anyhow::anyhow!("write chunk frame: {e}"))
+    }
+
+    /// Vectored variant of [`Self::write_chunk_payload`] for a payload that is
+    /// already split across multiple `Bytes` chunks (e.g. the queued export
+    /// items that make up one frame). The chunks are sent together with the
+    /// header in a single vectored write, so no coalescing copy is needed.
+    ///
+    /// `payload_chunks` must sum to `total_len` and be non-empty; `total_len`
+    /// is the `ChunkData` payload length the header encodes.
+    pub(super) async fn write_chunk_payload_multi(
+        &self,
+        send: &mut SendStream,
+        payload_chunks: &[Bytes],
+        total_len: usize,
+    ) -> anyhow::Result<()> {
+        if payload_chunks.is_empty() {
+            anyhow::bail!("refusing to serve an empty chunk payload");
+        }
+        let actual: usize = payload_chunks.iter().map(Bytes::len).sum();
+        if actual != total_len {
+            anyhow::bail!("payload_chunks sum {actual} does not match total_len {total_len}");
+        }
+        let mut hdr = [0u8; decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX];
+        let hdr_len = decdn_protocol::client::encode_chunk_frame_headers(total_len, &mut hdr)
+            .map_err(|e| anyhow::anyhow!("encode chunk header: {e}"))?;
+        let header = Bytes::copy_from_slice(hdr.get(..hdr_len).unwrap_or(&[]));
+        // Avoid a heap allocation when the frame is built from only a few
+        // `Bytes` chunks (common when the credit window is small or the frame
+        // was cut from a single queued item). A stack array of 5 covers header
+        // + up to 4 payload chunks; larger frames fall back to a `Vec`.
+        if payload_chunks.len() <= 4 {
+            let mut stack: [Bytes; 5] = std::array::from_fn(|_| Bytes::new());
+            if let Some(slot) = stack.get_mut(0) {
+                *slot = header;
+            }
+            for (i, chunk) in payload_chunks.iter().enumerate() {
+                if let Some(slot) = stack.get_mut(1usize.saturating_add(i)) {
+                    *slot = chunk.clone();
+                }
+            }
+            let total_bufs = 1usize.saturating_add(payload_chunks.len());
+            if let Some(slice) = stack.get_mut(..total_bufs) {
+                send.write_all_chunks(slice)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("write chunk frame multi: {e}"))?;
+            }
+        } else {
+            let mut bufs: Vec<Bytes> = Vec::with_capacity(payload_chunks.len().saturating_add(1));
+            bufs.push(header);
+            bufs.extend_from_slice(payload_chunks);
+            send.write_all_chunks(&mut bufs[..])
+                .await
+                .map_err(|e| anyhow::anyhow!("write chunk frame multi: {e}"))?;
+        }
+        Ok(())
     }
 }
