@@ -465,11 +465,11 @@ pub struct DecdnMetrics {
     pub redeem_hints_dropped: Counter,
     /// Download-receipt audit writes dropped because the bounded writer queue
     /// was full (`try_send` → `Full`, #803), counted once per dropped receipt.
-    /// The receipt log is audit-only and the payment already committed to the
-    /// fsynced channel store, so a drop never affects settlement — but a
-    /// sustained non-zero rate means the receipt writer cannot keep up with disk
-    /// I/O (a slow or full `data_dir`, the end-state of #802) and audit/dispute
-    /// records are being lost. Operator-visible name:
+    /// The receipt log is audit-only and the payment already advanced the lane
+    /// watermark, so a drop never affects settlement — but a sustained non-zero
+    /// rate means the receipt writer cannot keep up with disk I/O (a slow or full
+    /// `data_dir`, the end-state of #802) and audit/dispute records are being
+    /// lost. Operator-visible name:
     /// `decdn_receipt_writes_dropped_total`.
     pub receipt_writes_dropped: Counter,
     /// Redemption attempts (`try_redeem`) that returned an error — a failed

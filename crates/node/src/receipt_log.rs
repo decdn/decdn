@@ -2,9 +2,9 @@
 //!
 //! A node enqueues one structured [`DownloadReceipt`] per served-and-paid blob
 //! at the voucher-acceptance point (see
-//! [`crate::handlers::client::ClientHandler`]); the durable write happens off
-//! the delivery path in a background writer (see the Seam note below, #803). The
-//! log gives the operator a durable, off-chain record of which blobs were
+//! [`crate::handlers::client::ClientHandler`]); the disk write happens off the
+//! delivery path in a background writer (see the Seam note below, #803). The
+//! log gives the operator an on-disk, off-chain record of which blobs were
 //! delivered and paid for — enabling revenue audit, cross-restart double-spend
 //! triage, and dispute evidence without relying solely on on-chain state.
 //!
@@ -24,26 +24,38 @@
 //!
 //! # Durability
 //!
-//! Each [`ReceiptLog::append`] writes one line and flushes it to the OS
-//! (`write_all` + `flush`) but does **not** fsync per record. The receipt log
-//! is an *audit* artifact, not the voucher-replay guard. That guard is the lane
-//! watermark in [`crate::channel_store::PersistentPoolStateStore`], which
+//! Each [`ReceiptLog::append`] writes one line straight to the file — one
+//! `write_all`, which lands the bytes in the OS page cache — and does **not**
+//! fsync per record. The receipt log is an *audit* artifact, not the
+//! voucher-replay guard. That guard is the lane watermark in
+//! [`crate::channel_store::PersistentPoolStateStore`], which
 //! advances **in memory** the moment a voucher or preimage is accepted, reaches
 //! disk on the runtime's periodic lane flush
-//! (`payment.voucher_commit_interval_ms`, 5 s by default), and is additionally
-//! flushed unconditionally before any on-chain redemption.
+//! (`payment.voucher_commit_interval_ms`, 5 s by default), and is flushed again
+//! before every on-chain redemption.
 //!
-//! Neither side fsyncs on the delivery path, so after a hard crash the two
-//! tails can disagree in either direction. In particular the audit log can be
-//! **ahead** of the lane store: a receipt line reaches disk while the lane
-//! advance it records is still buffered, so a restart can find a receipt whose
-//! watermark the lane store no longer holds. That direction costs revenue, not
-//! safety — the node forfeits at most one flush interval of *frontier* (value
-//! it has not yet redeemed), which ADR 003 §Off-chain voucher state persistence
-//! accepts, while replay protection rests on the *redeemed* watermark that the
-//! mandatory pre-redemption flush floors. The other direction, a lost receipt
-//! tail, is a gap in the audit record and nothing more. Skipping the per-line
-//! fsync keeps the cost off the hot delivery path (see CLAUDE.md / ADR 003).
+//! Neither side fsyncs on the delivery path, so after a crash the two tails
+//! **can** disagree, in either direction, and neither direction is guaranteed.
+//! The audit log runs ahead when the background writer has already written a
+//! line whose lane advance is still buffered — a restart then finds a receipt
+//! whose watermark the lane store no longer holds. It runs behind when the
+//! crash catches receipts still queued in [`RECEIPT_LOG_CAPACITY`] (that queue
+//! is process memory and dies with the process, and only a graceful shutdown
+//! drains it), or when a hard crash drops page-cache lines the 5 s lane flush
+//! had already fsynced past.
+//!
+//! Both directions are safe. Ahead costs revenue, not correctness: the node
+//! forfeits at most one flush interval of *frontier* (value it has not yet
+//! redeemed), which ADR 003 §Off-chain voucher state persistence accepts.
+//! Behind is a gap in the audit record and nothing more.
+//!
+//! Replay protection rests on the *redeemed* watermark instead, which the
+//! pre-redemption flush floors. That floor holds wherever the node can afford
+//! to wait for it: the periodic sweep and the redeem-hint path skip their
+//! submit when the flush fails, while a forced close or shutdown redeems
+//! anyway, because forfeiting the whole claim at the deadline is worse than a
+//! bounded re-serve risk (see [`crate::payment_settlement`]). Skipping the
+//! per-line fsync keeps the cost off the hot delivery path (ADR 003).
 //!
 //! The append is also crash-atomic at the line level only in the usual POSIX
 //! sense (a torn final line is possible after a hard crash); JSONL readers MUST
@@ -520,8 +532,10 @@ impl ReceiptLog for JsonlReceiptLog {
         match guard
             .file
             .write_all(line.as_bytes())
-            // Flush to the OS so the line survives a clean process exit; no
-            // fsync — see the module-level durability note.
+            // `File::flush` is a no-op: `write_all` above is what hands the
+            // bytes to the OS. Kept so the call reads as a complete write
+            // sequence if the sink ever grows a buffered writer. No fsync — see
+            // the module-level durability note.
             .and_then(|()| guard.file.flush())
         {
             Ok(()) => {
@@ -545,9 +559,9 @@ impl ReceiptLog for JsonlReceiptLog {
 /// A [`ReceiptLog`] that drops every receipt. Used as the runtime fallback when
 /// [`JsonlReceiptLog::open`] fails at bring-up: the audit log is best-effort, so
 /// the node serves paid delivery without it rather than refusing to start (the
-/// replay guard lives in the separate lane store, which the periodic flush and
-/// the pre-redemption flush make durable). The operator gets one `error!` at
-/// startup naming the open failure.
+/// replay guard lives in the separate lane store, which the periodic flush
+/// mirrors to disk). The operator gets one `error!` at startup naming the open
+/// failure.
 #[derive(Debug, Default)]
 pub struct NoopReceiptLog;
 
@@ -564,10 +578,9 @@ impl ReceiptLog for NoopReceiptLog {
 /// is accepted (acceptance is implicit — delivery simply continues), so the
 /// implementation MUST NOT block on disk I/O: a backed-up sink drops the
 /// receipt (best-effort, audit-only) rather than stall the payment, which
-/// already advanced the lane watermark. The runtime
-/// uses [`ChannelReceiptSink`] (hands off to the background
-/// [`spawn_receipt_writer`] task); tests use a synchronous fake behind
-/// [`DirectReceiptSink`].
+/// already advanced the lane watermark. The runtime uses [`ChannelReceiptSink`]
+/// (hands off to the background [`spawn_receipt_writer`] task); tests use a
+/// synchronous fake behind [`DirectReceiptSink`].
 pub trait ReceiptSink: Send + Sync {
     /// Best-effort, non-blocking record of one receipt. Never blocks the caller
     /// on disk and never fails delivery — a sink that cannot accept the receipt
@@ -581,8 +594,8 @@ pub trait ReceiptSink: Send + Sync {
 /// end-state of #802) is worked off, without ever back-pressuring paid
 /// delivery. On overflow the *audit* receipt is dropped (counted via
 /// [`Metrics::receipt_write_dropped`]) rather than the *payment* stalling — the
-/// payment already advanced the lane watermark. Rotation (#802)
-/// bounds the log on disk; this bounds it in memory.
+/// payment already advanced the lane watermark. Rotation (#802) bounds the log
+/// on disk; this bounds it in memory.
 pub const RECEIPT_LOG_CAPACITY: usize = 1024;
 
 /// Production [`ReceiptSink`]: enqueues to the background writer over a bounded
@@ -713,9 +726,9 @@ async fn receipt_writer_loop(
             () = shutdown.cancelled() => break,
         }
     }
-    // Tail-drain: flush every receipt already enqueued before exiting so the
-    // audit tail is not lost on shutdown — the audit-tail guarantee (CLAUDE.md /
-    // ADR 003). `try_recv` yields `Empty` once
+    // Tail-drain: write every receipt already enqueued before exiting, so a
+    // graceful shutdown does not drop the audit tail the way a crash does.
+    // `try_recv` yields `Empty` once
     // the buffer is drained (and `Disconnected` if the senders are gone); either
     // ends the drain.
     while let Ok(receipt) = rx.try_recv() {

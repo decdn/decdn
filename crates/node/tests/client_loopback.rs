@@ -653,7 +653,7 @@ async fn a_released_preimage_pays_for_a_chunk_and_resumes_delivery() -> anyhow::
     read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
     assert_parked_awaiting_voucher(&mut recv).await?;
 
-    // And it is durable, on the same lane record a signature would advance.
+    // And it is recorded, on the same lane row a signature would advance.
     let lane = store
         .get(lane_key(signer.address()))?
         .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
@@ -4193,8 +4193,10 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
         .is_err(),
         "a store record failure must not complete the fetch"
     );
-    // The lane's watermark never advanced past the seed — the record failure
-    // never reached the durable side, so nothing was ever accepted.
+    // The stored row never advanced past the seed — the record failure never
+    // reached the store, so nothing was ever accepted. (The handler's in-memory
+    // lane does advance before the record; the aborted stream is what stops it
+    // mattering.)
     let persisted = store
         .get(lane_key(client_signer.address()))?
         .ok_or_else(|| anyhow::anyhow!("lane row missing"))?;
@@ -5971,8 +5973,8 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
         .await
     });
 
-    // Wait for the first accepted PROOF — the store is written durably on every
-    // acceptance, so a non-zero `owed` means delivery is under way.
+    // Wait for the first accepted PROOF — the store is written on every acceptance,
+    // so a non-zero `owed` means delivery is under way.
     //
     // `owed`, not `last_amount`: under `PayWord` the signed cumulative does not
     // move per chunk. A reveal advances the lane's claim without a signature, so

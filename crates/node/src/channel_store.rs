@@ -12,9 +12,10 @@
 //!
 //! See [`decdn_incentive::store`] for the trait contract and
 //! [ADR 003 §Off-chain voucher state persistence] for the protocol rule
-//! this implements: a node MUST persist `(last_amount, last_bytes_delivered)`
-//! per lane before continuing delivery, otherwise a restart re-opens the lane
-//! at amount zero and a client can replay a previously-accepted voucher for a
+//! this implements: a node MUST advance `(last_amount, last_bytes_delivered)`
+//! for the lane before it continues delivery, and mirror the advance to disk on
+//! a background timer. Without the on-disk mirror a restart re-opens the lane at
+//! amount zero and a client can replay a previously-accepted voucher for a
 //! second byte delivery (issue #527).
 //!
 //! The record persists the latest voucher's signature (so the seller
@@ -1149,7 +1150,7 @@ impl PersistentPoolStateStore {
             .db
             .begin_write()
             .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        // Force fsync-on-commit, same durability discipline as `record`: the
+        // Force fsync-on-commit, same durability discipline as the other tables: the
         // pool is already closing on-chain by the time an entry is written here,
         // so a post-close crash that lost it would strand the settlement
         // obligation — the very gap this fsync guards.
