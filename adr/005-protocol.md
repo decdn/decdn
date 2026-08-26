@@ -107,7 +107,7 @@ sequenceDiagram
     participant D as Delivering Node
 
     P->>D: StreamRequest {hash, namespace_id, pool_id, byte_offset, timestamp_us}
-    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, slash_sig} ++ Ext {error?}
+    D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?}
 
     alt ok = true
         P->>D: Voucher {sig, amt, chain_root, chunk_price} (opens the chain)
@@ -117,8 +117,6 @@ sequenceDiagram
         end
         P->>D: Voucher {sig, amt, chain_root: 0, chunk_price} (closing amount-voucher)
         P->>D: StreamEnd
-    else redirect
-        Note over P: Connect to redirect NodeId and retry<br/>(max 3 hops, cycle detection)
     end
 ```
 
@@ -144,7 +142,7 @@ The client includes `ethereum_address` and `binding_signature` in the first `Str
 
 **Voucher wire format:** `Voucher {sig, amt, chain_root, chunk_price}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md#adr-003-payment-model): `{poolId, signer, provider, amount, bytesDelivered, chainRoot, chunkPrice}`. The fields `signature`, `amount`, `chain_root`, and `chunk_price` are transmitted on the wire; the rest are derived from stream context — `pool_id` is in `StreamRequest`, `signer` is the requester's verified Ethereum address (from the ephemeral `StreamRequestExt` binding when present, otherwise from the requester's on-chain registration, as in node-to-node pulls), `provider` is the delivering node, and `bytesDelivered` is the node's per-lane cumulative byte counter. Vouchers carry no nonce — ordering and replay are handled by the monotone cumulative `amount` alone, and preimages by their chain index (see [ADR 003 § Voucher ordering](003-payments.md#voucher-ordering)). The receiver reconstructs the full typed data to verify the signature.
 
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node — no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us, redirect}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — `ok` and `redirect` are message-integrity fields that ensure a node cannot silently alter delivery status or routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds); the ordering check prevents unsigned integer underflow in the on-chain verifier, which computes this delta from the signed messages alone (both `timestamp_us` requester-generated) with no wall-clock reference, external time oracle, or clock-skew sensitivity. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node — no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — `ok` is a message-integrity field that ensures a node cannot silently alter delivery status without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds); the ordering check prevents unsigned integer underflow in the on-chain verifier, which computes this delta from the signed messages alone (both `timestamp_us` requester-generated) with no wall-clock reference, external time oracle, or clock-skew sensitivity.
 
 #### Namespace routing
 
@@ -157,13 +155,7 @@ The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer 
 
 Like `byte_len`, `namespace_id` is part of the base `StreamRequest` (every node routes on it), and because `cdn/client/v1` is pre-finalisation it is a straight in-place addition with no version bump or compatibility shim.
 
-#### Redirect loop prevention
-
-The requester MUST enforce:
-
-1. **Hop limit:** maximum 3 redirects per original request. After 3 redirects, the request is treated as failed (no more redirects followed).
-2. **Cycle detection:** the requester tracks the set of NodeIds visited for each request; a redirect to an already-visited NodeId is rejected immediately.
-3. **Failure handling:** when the redirect limit is reached or a cycle is detected, the requester falls back to the next-best node from the original probe results (same as a `ok: false` response).
+#### Seek and resume
 
 `byte_offset` supports seek and resume: on failover, the requester reconnects to a different node and resumes from the last BLAKE3-verified byte.
 
@@ -393,15 +385,12 @@ The error code is **not** covered by `slash_sig` — it is informational only an
 
 ```
 AwaitingResponse ──StreamResponse{ok: true}──► Streaming
-       │                    │                          │
-       │ StreamResponse     │ StreamResponse           ├── ChunkData ──► Streaming (loop)
-       │ {error}            │ {redirect}               ├── StreamEnd ──► Completed
-       │ or timeout         ▼                          └── StreamError ──► Failed
-       ▼              Redirecting
-    Failed                  │
-                            ▼
-                  (new StreamRequest
-                   to redirect target)
+       │                                            │
+       │ StreamResponse                             ├── ChunkData ──► Streaming (loop)
+       │ {error}                                    ├── StreamEnd ──► Completed
+       │ or timeout                                 └── StreamError ──► Failed
+       ▼
+    Failed
 ```
 
 **Transition rules:**
@@ -434,7 +423,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - ALPN separation means a single iroh `Endpoint` dispatches all connection types without ambiguity
 - Probing in parallel before committing means no payment pool is opened with a slow or unresponsive node
 - `cdn/client/v1` is reused for all paid delivery — no separate protocol needed for node→node pulls
-- `redirect` always points to a NodeId, never an external URL; the backend topology of origin-backed nodes is fully hidden from the network
+- `StreamResponse` carries no route hint of any kind, so the backend topology of origin-backed nodes is fully hidden from the network
 - The delivery protocol is self-enforcing — payment and data flow are coupled by design
 - `byte_offset` in `StreamRequest` makes failover transparent; the requester resumes without restarting the stream
 - QUIC stream multiplexing allows concurrent blob requests to the same node without additional connection overhead — one handshake cost regardless of how many blobs are fetched

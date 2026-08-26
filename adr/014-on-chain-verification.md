@@ -30,13 +30,13 @@ The Ethereum key is the same secp256k1 key the node already holds for staking an
 
 ```
 ProbeResponse {has_blob, rate_per_mb, timestamp_us, slash_sig} ++ Ext {total_bytes?}
-StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, slash_sig} ++ Ext {error?}
+StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, slash_sig} ++ Ext {error?}
 ```
 
 - **ProbeResponse slash_sig covers:** `{hash, has_blob, rate_per_mb, timestamp_us}`
-- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us, redirect}`
+- **StreamResponse slash_sig covers:** `{hash, ok, rate_per_mb, total_bytes, pool_id, timestamp_us}`
 
-`hash` and `pool_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. When `redirect` is absent (common case), it is encoded as `bytes32(0)`. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
+`hash` and `pool_id` are request-context fields (from `ProbeRequest` and `StreamRequest` respectively), not transmitted in the response body — implementers must include them when building and verifying the EIP-712 typed data. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
 
 #### EIP-712 Type Definitions
 
@@ -46,7 +46,7 @@ bytes32 constant PROBE_RESPONSE_TYPEHASH = keccak256(
 );
 
 bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
-    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs,bytes32 redirect)"
+    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs)"
 );
 ```
 

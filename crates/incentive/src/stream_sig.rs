@@ -14,9 +14,9 @@
 //! contract recovers signatures against. `hash` and `channel_id` are
 //! request-context fields (from the `StreamRequest`); in this implementation's
 //! wire shape they are echoed back in
-//! `decdn_protocol::StreamResponseBody.{hash,channel_id}` and are part of the
-//! EIP-712 signed set — a verifier reconstructs the typed data from the
-//! response body's own fields. `redirect` is `bytes32(0)` when absent.
+//! `decdn_protocol::StreamResponseBody.{hash,pool_id}` — the contract names the
+//! latter `channelId` — and are part of the EIP-712 signed set: a verifier
+//! reconstructs the typed data from the response body's own fields.
 //!
 //! # Domain
 //!
@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,
-//!                bytes32 channelId,uint64 timestampUs,bytes32 redirect)
+//!                bytes32 channelId,uint64 timestampUs)
 //! ```
 
 use alloy::dyn_abi::Eip712Domain;
@@ -60,7 +60,6 @@ mod sol_types {
             uint64 totalBytes;
             bytes32 channelId;
             uint64 timestampUs;
-            bytes32 redirect;
         }
     }
 }
@@ -71,8 +70,8 @@ use sol_types::StreamResponse as StreamResponseSol;
 ///
 /// `hash` and `channel_id` are request-context fields echoed back in the
 /// response body; `timestamp_us` is the requester-generated timestamp echoed
-/// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, `total_bytes`,
-/// and `redirect`, these are exactly the fields the on-chain `SlashJudge`
+/// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, and
+/// `total_bytes`, these are exactly the fields the on-chain `SlashJudge`
 /// reconstructs to verify rate-manipulation and blacklist-violation evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSlashData {
@@ -88,14 +87,10 @@ pub struct StreamSlashData {
     pub channel_id: B256,
     /// Requester-generated microsecond timestamp echoed from the request.
     pub timestamp_us: u64,
-    /// Alternate provider `NodeId`, or `B256::ZERO` when there is no redirect.
-    pub redirect: B256,
 }
 
 impl StreamSlashData {
-    /// Build the signed-field view from a wire [`StreamResponseBody`]. Maps
-    /// `redirect: Option<NodeId>` to `B256::ZERO` (`None`) or the `NodeId` bytes
-    /// (`Some`), exactly as the on-chain verifier expects (ADR 014 §1).
+    /// Build the signed-field view from a wire [`StreamResponseBody`].
     #[must_use]
     pub fn from_response_body(body: &StreamResponseBody) -> Self {
         Self {
@@ -105,9 +100,6 @@ impl StreamSlashData {
             total_bytes: body.total_bytes,
             channel_id: B256::from(body.pool_id),
             timestamp_us: body.timestamp_us,
-            redirect: body
-                .redirect
-                .map_or(B256::ZERO, |id| B256::from(id.to_bytes())),
         }
     }
 
@@ -119,7 +111,6 @@ impl StreamSlashData {
             totalBytes: self.total_bytes,
             channelId: self.channel_id,
             timestampUs: self.timestamp_us,
-            redirect: self.redirect,
         }
     }
 
@@ -237,7 +228,6 @@ mod tests {
             total_bytes: 1_048_576,
             channel_id: B256::repeat_byte(0x33),
             timestamp_us: 1_700_000_000_000_000,
-            redirect: B256::ZERO,
         }
     }
 
@@ -350,7 +340,7 @@ mod tests {
         let data = sample_data();
         let sig = data.sign(&signer, &domain)?;
 
-        let mutations: [StreamSlashData; 7] = [
+        let mutations: [StreamSlashData; 6] = [
             StreamSlashData {
                 hash: B256::ZERO,
                 ..data
@@ -372,10 +362,6 @@ mod tests {
                 timestamp_us: data.timestamp_us + 1,
                 ..data
             },
-            StreamSlashData {
-                redirect: B256::repeat_byte(0x99),
-                ..data
-            },
         ];
         for (i, m) in mutations.into_iter().enumerate() {
             let err = err_of(m.verify_signer(&sig, signer.address(), &domain))?;
@@ -387,26 +373,13 @@ mod tests {
         Ok(())
     }
 
-    /// `redirect: None` (encoded as `B256::ZERO`) and `Some(..)` must produce
-    /// different digests — the redirect field is genuinely covered.
-    #[test]
-    fn redirect_none_differs_from_some() {
-        let domain = sample_domain();
-        let none = sample_data(); // redirect == ZERO
-        let some = StreamSlashData {
-            redirect: B256::repeat_byte(0x5A),
-            ..none
-        };
-        assert_ne!(none.signing_hash(&domain), some.signing_hash(&domain));
-    }
-
     /// Lock the EIP-712 type hash to the exact ADR 014 wording. If this breaks,
     /// either the ADR changed or the `sol!` macro's canonical encoding shifted
     /// — both warrant a coordinated update with the `SlashJudge` contract.
     #[test]
     fn stream_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
         use alloy::primitives::keccak256;
-        let canonical: &[u8] = b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs,bytes32 redirect)";
+        let canonical: &[u8] = b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs)";
         let expected = keccak256(canonical);
         let actual = StreamResponseSol::eip712_type_hash(&sample_data().to_sol());
         anyhow::ensure!(
@@ -430,11 +403,11 @@ mod tests {
         let domain = sample_domain();
 
         let type_hash = keccak256(
-            b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs,bytes32 redirect)",
+            b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs)",
         );
         // EIP-712 encodeData: each field as a 32-byte ABI word, prefixed by the
         // type hash. All fields here are static, so abi_encode of the tuple is
-        // exactly 8 × 32 bytes.
+        // exactly 7 × 32 bytes.
         let struct_hash = keccak256(
             (
                 type_hash,
@@ -444,7 +417,6 @@ mod tests {
                 data.total_bytes,
                 data.channel_id,
                 data.timestamp_us,
-                data.redirect,
             )
                 .abi_encode(),
         );
@@ -462,31 +434,19 @@ mod tests {
         Ok(())
     }
 
-    /// `from_response_body` maps the wire body into the signed-field view,
-    /// including the `redirect: Option<NodeId>` → `bytes32` mapping.
+    /// `from_response_body` maps the wire body into the signed-field view.
     #[test]
-    fn from_response_body_maps_redirect() {
+    fn from_response_body_maps_fields() {
         use decdn_protocol::StreamResponseBody;
-        use decdn_protocol::identity::NodeId;
 
-        let none = StreamResponseBody {
+        let body = StreamResponseBody {
             hash: [0x7Au8; 32],
             ok: true,
             rate_per_mb: 10_000,
             total_bytes: 1_048_576,
             pool_id: [0x33u8; 32],
             timestamp_us: 1_700_000_000_000_000,
-            redirect: None,
         };
-        assert_eq!(StreamSlashData::from_response_body(&none), sample_data());
-
-        let some = StreamResponseBody {
-            redirect: Some(NodeId::from_bytes([0x5Au8; 32])),
-            ..none
-        };
-        assert_eq!(
-            StreamSlashData::from_response_body(&some).redirect,
-            B256::repeat_byte(0x5A)
-        );
+        assert_eq!(StreamSlashData::from_response_body(&body), sample_data());
     }
 }

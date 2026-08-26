@@ -637,7 +637,6 @@ async fn lying_upstream(
             .map_err(|_| anyhow::anyhow!("served len overflows u64"))?,
         pool_id: req.pool_id,
         timestamp_us: req.timestamp_us,
-        redirect: None,
     };
     let slash_sig = StreamSlashData::from_response_body(&body)
         .sign(eth.as_ref(), slash)

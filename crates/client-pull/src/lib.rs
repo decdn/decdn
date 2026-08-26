@@ -13,21 +13,16 @@
 //! Mirrors [`probe::probe_once`] in spirit, but for the paid path: it signs
 //! vouchers, so it needs the incentive layer and a signer.
 //!
-//! # Scope
+//! # Bao verified-range decoding (ADR 038)
 //!
-//! - **Redirects** (`StreamResponse.redirect`) are detected and rejected, not
-//!   followed: resolving a redirect `NodeId` to a dialable address needs the
-//!   provider-discovery layer (ADR 001 / 022), which is out of scope. A #317
-//!   server always sends `redirect: None`.
-//! - **Bao verified-range decoding** (ADR 038): the `ChunkData` payload is bao's
-//!   interleaved verified-stream encoding, not raw bytes. The buffered path feeds
-//!   the reassembled stream to a `bao-tree` verifying decoder that checks every
-//!   chunk group against the requested content-hash root, so a range fetched at
-//!   any `byte_offset > 0` self-verifies (a corrupt tail is rejected) with no
-//!   dependency on earlier bytes — closing the old resume gap. The progressive
-//!   (window pull-through) path forwards the bao stream verbatim and tees it into
-//!   the cache's verifying decoder (`import_and_verify_stream`), which checks the
-//!   cached copy against the same root.
+//! The `ChunkData` payload is bao's interleaved verified-stream encoding, not
+//! raw bytes. The buffered path feeds the reassembled stream to a `bao-tree`
+//! verifying decoder that checks every chunk group against the requested
+//! content-hash root, so a range fetched at any `byte_offset > 0` self-verifies
+//! (a corrupt tail is rejected) with no dependency on earlier bytes. The
+//! progressive (window pull-through) path forwards the bao stream verbatim and
+//! tees it into the cache's verifying decoder (`import_and_verify_stream`),
+//! which checks the cached copy against the same root.
 
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
@@ -1946,9 +1941,6 @@ async fn fetch_inner_once(
     if !resp.body.ok {
         return Err(UpstreamRefused::open(resp, &resp_ext));
     }
-    if resp.body.redirect.is_some() {
-        anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
-    }
     // Reject an oversized server-claimed `total_bytes` before allocating or
     // entering the receive loop — `total_bytes` is server-controlled and
     // `StreamResponse::validate()` does not bound it, so the in-loop
@@ -2469,9 +2461,6 @@ pub async fn open_progressive_pull(
     .await?;
     if !resp.body.ok {
         return Err(UpstreamRefused::open(resp, &resp_ext));
-    }
-    if resp.body.redirect.is_some() {
-        anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
     }
     // Same buyer-side ceiling as `fetch_inner`: reject an inflated `total_bytes`
     // before forwarding/allocating anything (#840). Typed sentinel so the pull
@@ -4110,7 +4099,6 @@ mod tests {
             total_bytes: 0,
             pool_id: [0x77u8; 32],
             timestamp_us: 1_700_000_000_000_000,
-            redirect: None,
         };
         let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
         let response = StreamResponse {
@@ -4177,7 +4165,6 @@ mod tests {
                 total_bytes: 0,
                 pool_id: [0x77u8; 32],
                 timestamp_us: 1_700_000_000_000_000,
-                redirect: None,
             },
             slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
         };

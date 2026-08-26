@@ -419,8 +419,7 @@ contract CapacityBondRegionE2ETest is Test {
             ratePerMb: 10,
             totalBytes: 1_048_576,
             channelId: bytes32(uint256(1)),
-            timestampUs: tsUs,
-            redirect: bytes32(0)
+            timestampUs: tsUs
         });
     }
 
@@ -429,14 +428,7 @@ contract CapacityBondRegionE2ETest is Test {
     function _streamStructHash(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes32) {
         return keccak256(
             abi.encode(
-                judge.STREAM_RESPONSE_TYPEHASH(),
-                s.hash,
-                s.ok,
-                s.ratePerMb,
-                s.totalBytes,
-                s.channelId,
-                s.timestampUs,
-                s.redirect
+                judge.STREAM_RESPONSE_TYPEHASH(), s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs
             )
         );
     }
