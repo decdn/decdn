@@ -342,6 +342,9 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     // `isHashBlacklistedForOperator` RPC timeout plus `eth_getLogs` poll jitter
     // under `--test-threads 2` (previously `90s` flaked, see #1827).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    // Allow: initial `String::new()` is overwritten before first read — binding must be
+    // initialized for the post-loop assert, but the loop's first `clone_from` overwrites
+    // it without a prior read.
     #[allow(unused_assignments)]
     let mut last_msg = String::new();
     let mut reverted = false;

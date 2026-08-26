@@ -45,7 +45,9 @@ use decdn_node::dht::{
 };
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, PullMiss, TeeVerdict};
-use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
+use decdn_node::selection::{
+    CHANNEL_OPEN_CALLER_BUDGET, MAX_PROVIDER_ATTEMPTS, outer_pull_deadline,
+};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
     StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
@@ -9758,9 +9760,10 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     .await
     .map_err(|_| {
         anyhow::anyhow!(
-            "concurrent ledger pulls hung past 30s — likely CHANNEL_OPEN_CALLER_BUDGET (5s) \
+            "concurrent ledger pulls hung past 30s — likely CHANNEL_OPEN_CALLER_BUDGET={:?} \
              expiry under llvm-cov contention, not StaleNonce; pending={} timeout={} stalled={} \
              recorded={:?} retired={:?}",
+            CHANNEL_OPEN_CALLER_BUDGET,
             counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
