@@ -363,7 +363,10 @@ groups:
 
       # #1520. Three deposit guards route through this one counter (the miss floor,
       # the window ceiling, the direct-serve ceiling), so it cannot say WHICH — the
-      # node's throttled `warn!` names that.
+      # node's throttled `warn!` names that. The per-signer floor sub-cap does NOT
+      # route here: it has its own
+      # `decdn_serve_stream_rejected_signer_floor_at_cap_total`, so this rule stays
+      # a pool-solvency signal and its two causes below remain the whole story.
       #
       # A raw rate, not a ratio, because the node exports no serve-ATTEMPT counter:
       # `decdn_serve_stream_rejected_*` is a per-reason family with no success

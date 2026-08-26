@@ -1568,10 +1568,10 @@ fn resolve_blockchain_into(
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
     // The per-signer share of `remaining − M` (ADR 003 § Pool solvency). Bounded
-    // on both sides: `0` would give every signer a zero sub-cap and refuse every
-    // stream, and a share above the whole headroom is not a share at all. The
-    // node still floors the resulting cap at one credit window, so a legal small
-    // value throttles rather than wedges.
+    // on both sides. `0` is rejected as meaningless rather than dangerous: the
+    // node floors the resulting cap at one credit window, so `0` would clamp back
+    // to exactly one window and behave as `1` while reading as "off". A share
+    // above the whole headroom is not a share at all.
     let pool_floor_signer_share_bps = file
         .and_then(|b| b.pool_floor_signer_share_bps)
         .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS);
@@ -1581,9 +1581,9 @@ fn resolve_blockchain_into(
         || {
             let bound = format!("must be in 1..={BPS_DENOMINATOR}");
             format!(
-                "blockchain.pool_floor_signer_share_bps {bound} (0 gives every signer a zero \
-                 floor sub-cap and refuses every stream; {BPS_DENOMINATOR} makes the sub-cap \
-                 equal to the per-pool ceiling)"
+                "blockchain.pool_floor_signer_share_bps {bound} (0 clamps to the same \
+                 one-credit-window floor as 1, so it cannot express \"no sub-cap\"; \
+                 {BPS_DENOMINATOR} lifts the sub-cap to the per-pool ceiling, i.e. a no-op)"
             )
         },
     );
@@ -9424,9 +9424,9 @@ swap_pool_address = \"0xPool\"
 
     /// The per-signer floor share (ADR 003 § Pool solvency) defaults to a quarter
     /// of a pool's headroom, threads an explicit value through, and is rejected
-    /// outside `1..=10_000` on BOTH sides: `0` would give every signer a zero
-    /// sub-cap and refuse every stream, and a share above the whole headroom is
-    /// not a share.
+    /// outside `1..=10_000` on BOTH sides: `0` clamps back to the one-credit-window
+    /// floor and so cannot express "no sub-cap", and a share above the whole
+    /// headroom is not a share.
     #[test]
     fn pool_floor_signer_share_defaults_threads_and_bounds() -> anyhow::Result<()> {
         let dir = data_dir_with_keystore()?;

@@ -135,7 +135,7 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 const POOL_FLOOR_LOSS_TABLE: TableDefinition<&[u8; POOL_SIGNER_KEY_LEN], u128> =
     TableDefinition::new("pool_floor_loss_v2");
 
-/// redb table of tombstones for pools whose floor-loss row was
+/// redb table of tombstones for pools whose floor-loss rows were
 /// [`PoolFloorLossStore::forget_loss`]-ed. A reservation drop reads its
 /// cumulative total under the in-memory floor lock but persists it from an
 /// independent blocking task, so a `record_loss` can land AFTER the pool's
@@ -185,8 +185,9 @@ fn pool_signer_key_bytes(pool_id: B256, signer: Address) -> [u8; POOL_SIGNER_KEY
     out
 }
 
-/// Split a `[u8; 52]` `(pool_id, signer)` table key back into its parts. Both
-/// slices are fixed-width, so the indexing is total.
+/// Split a `[u8; 52]` `(pool_id, signer)` table key back into its parts. The input
+/// is fixed-width and both ranges are constants inside it, so neither the slicing
+/// nor the `copy_from_slice` can fail.
 fn pool_signer_key_parts(bytes: &[u8; POOL_SIGNER_KEY_LEN]) -> (B256, Address) {
     let mut pool = [0u8; 32];
     pool.copy_from_slice(&bytes[..32]);
@@ -1306,8 +1307,10 @@ fn floor_loss_backend_err(
 /// Delete every signer row of one pool from an OPEN floor-loss table, inside the
 /// caller's write transaction. redb cannot remove while a range iterator borrows
 /// the table, so the keys are collected first — the same collect-then-remove shape
-/// [`PoolFloorLossStore::sweep_forgotten`] uses. A pool holds one row per signer
-/// that ever accrued a dead charge, so the collected set is small.
+/// [`PoolFloorLossStore::sweep_forgotten`] uses. Every row implies at least one
+/// admitted floor charge against the pool, so the count is bounded by
+/// `remaining − M` divided by one floor — small for an honest pool, and bounded by
+/// the pool's own budget for one that sprays signer identities.
 fn remove_pool_floor_rows(
     table: &mut redb::Table<'_, &'static [u8; POOL_SIGNER_KEY_LEN], u128>,
     pool_id: B256,
@@ -2247,6 +2250,38 @@ mod tests {
         anyhow::ensure!(
             store.load_losses()? == vec![(live, s1, 900u128)],
             "the sweep does not disturb live rows"
+        );
+        Ok(())
+    }
+
+    /// `forget_loss` clears a pool's rows at BOTH inclusive bounds of the key range.
+    /// Every other test uses interior signer addresses, so nothing else would catch
+    /// `..` in place of `..=` in `pool_signer_key_range` — and the all-`0xff` row it
+    /// would strand belongs to a pool that is now tombstoned, so `record_loss` can
+    /// never overwrite it and no later `forget_loss` ever deletes it again. That is
+    /// the #1781 leak, reintroduced for exactly one address.
+    #[test]
+    fn forget_loss_clears_both_inclusive_bounds_of_the_key_range() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let pool = sample(9).pool_id;
+        let neighbour = sample(10).pool_id;
+        let lowest = Address::from([0x00u8; 20]);
+        let highest = Address::from([0xffu8; 20]);
+        store.record_loss(pool, lowest, 11)?;
+        store.record_loss(pool, highest, 22)?;
+        // A neighbouring pool at both bounds too, so the range cannot simply be
+        // deleting everything.
+        store.record_loss(neighbour, lowest, 33)?;
+        store.record_loss(neighbour, highest, 44)?;
+        anyhow::ensure!(store.load_losses()?.len() == 4);
+
+        store.forget_loss(pool)?;
+        let mut left = store.load_losses()?;
+        left.sort_by_key(|&(_, signer, _)| signer);
+        anyhow::ensure!(
+            left == vec![(neighbour, lowest, 33u128), (neighbour, highest, 44u128)],
+            "forget must clear the pool's rows at both bounds and neither neighbour's, got {left:?}"
         );
         Ok(())
     }

@@ -331,6 +331,12 @@
           "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_internal_error_total{instance=~\"$instance\"}[5m]))",
           "legendFormat": "internal error",
           "refId": "E"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_signer_floor_at_cap_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "signer floor at cap",
+          "refId": "F"
         }
       ],
       "title": "Payment-class serve refusals (all collapse to NotFound)",

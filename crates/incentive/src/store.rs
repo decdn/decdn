@@ -477,9 +477,10 @@ impl PendingSettleStore for MemoryPendingSettleStore {
 /// tombstones; it is safe only at bring-up, before any reservation exists, when no
 /// persist can be in flight.
 ///
-/// Any write that raises the total MUST commit durably (fsync, on disk-backed
-/// impls) before returning `Ok`, mirroring the [`PoolStateStore`] contract. A call
-/// that raises nothing may skip the commit: the durable value already satisfies it.
+/// Any write that raises a `(pool_id, signer)` total MUST commit durably (fsync, on
+/// disk-backed impls) before returning `Ok`, mirroring the [`PoolStateStore`]
+/// contract. A call that raises nothing may skip the commit: the durable value
+/// already satisfies it.
 pub trait PoolFloorLossStore: Send + Sync {
     /// Raise this `(pool_id, signer)` lane's cumulative dead-charge total to
     /// `micro_usdc`. A total at or below the stored one is a no-op, so a late,

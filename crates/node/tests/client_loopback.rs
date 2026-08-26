@@ -4973,11 +4973,6 @@ async fn spawn_pool_server_with_signer_share(
     Ok((target, server_ep, server_task, loss))
 }
 
-/// Poll `loss` until [`pool_id`]'s recorded dead charge in `µUSDC` reaches the target
-/// `want`, or bail on overshoot / a 10 s stall. The dead-charge fold is a best-effort `Drop`
-/// side effect persisted off-task via `spawn_blocking`, so a test cannot know the
-/// exact instant it lands — it waits for the value, never for a fixed duration,
-/// which keeps the assertion deterministic under parallel load.
 /// Fold a [`decdn_incentive::PoolFloorLossStore::load_losses`] dump into
 /// [`pool_id`]'s total dead charge. Rows are keyed per `(pool, signer)` since the
 /// per-signer floor sub-cap (ADR 003 §Pool solvency), and the pool total is their
@@ -4992,6 +4987,11 @@ fn pool_dead_charge_total(
         .fold(0u128, u128::saturating_add)
 }
 
+/// Poll `loss` until [`pool_id`]'s recorded dead charge in `µUSDC` reaches the target
+/// `want`, or bail on overshoot / a 10 s stall. The dead-charge fold is a best-effort `Drop`
+/// side effect persisted off-task via `spawn_blocking`, so a test cannot know the
+/// exact instant it lands — it waits for the value, never for a fixed duration,
+/// which keeps the assertion deterministic under parallel load.
 async fn await_pool_dead_charge(
     loss: &decdn_incentive::MemoryPoolFloorLossStore,
     want: u128,
@@ -5132,9 +5132,9 @@ async fn sequential_distinct_lanes_bounded_to_pool_deposit() -> anyhow::Result<(
 
 /// CORE security property (per-signer isolation, #1841): one signer that opens and
 /// abandons streams is locked out by its OWN share of the pool's free-floor budget,
-/// while a co-tenant signer on the SAME pool is still served. Before the sub-cap the
-/// abandoning signer's `dead_charge` was pool-wide, so it took the whole pool's
-/// headroom with it and the co-tenant was refused too.
+/// while a co-tenant signer on the SAME pool is still served. The abandoning
+/// signer's `dead_charge` is charged to its own entry, so it exhausts that signer's
+/// share without reaching the co-tenant's.
 ///
 /// `remaining = 4 floors + slack`, `M = 0`, share `2500` bps: a quarter of the
 /// headroom is one floor, so each signer's sub-cap is one floor. Signer A withholds

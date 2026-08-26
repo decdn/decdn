@@ -1290,7 +1290,7 @@ async fn build_chain_and_handlers(
             as Arc<dyn decdn_incentive::PoolFloorLossStore>);
     // Per-signer floor sub-cap (ADR 003 §Pool solvency, per-signer floor
     // isolation): the node's own bad-debt budget per capability-holder, underneath
-    // the unchanged per-pool `remaining − M` ceiling.
+    // the per-pool `remaining − M` ceiling.
     client_deps.pool_floor_signer_share_bps = cfg.blockchain.pool_floor_signer_share_bps;
     // Event-fed pool view (owner + remaining) for the floor-`M` solvency gate and
     // the ADR 011 funder gate. The settlement watcher below folds every

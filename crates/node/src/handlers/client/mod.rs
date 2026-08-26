@@ -333,6 +333,30 @@ impl PoolFloorState {
         self.live_reservation.saturating_add(self.dead_charge)
     }
 
+    /// Drop a signer's entry once it commits nothing — no live reservation and no
+    /// dead charge. A row that has fallen back to zero carries no information: an
+    /// unseen signer reads as zero anyway ([`Self::signer_committed`]), so keeping
+    /// it changes no decision.
+    ///
+    /// Without this the map only ever grows. ADR 003 §Revocation makes short-expiry
+    /// session keys the intended usage, so a busy publisher mints signer identities
+    /// steadily, and every one that reserves and pays cleanly would leave a zero row
+    /// alive until the pool is reclaimed on-chain — inside a map locked on every
+    /// admission.
+    ///
+    /// Safe against a live guard: a repaid guard's `Drop` returns before touching
+    /// the map at all, and an unrepaid guard holds `live_reservation > 0`, so
+    /// neither can have its row pruned out from under it.
+    fn prune_spent(&mut self, signer: Address) {
+        if self
+            .signers
+            .get(&signer)
+            .is_some_and(|lane| lane.committed().is_zero())
+        {
+            self.signers.remove(&signer);
+        }
+    }
+
     /// This signer's committed floor credit; an unseen signer has committed
     /// nothing.
     fn signer_committed(&self, signer: Address) -> U256 {
@@ -490,6 +514,7 @@ impl FloorReservation {
             if let Some(lane) = entry.signers.get_mut(&self.signer) {
                 lane.live_reservation = lane.live_reservation.saturating_sub(self.reserved);
             }
+            entry.prune_spent(self.signer);
         }
     }
 
@@ -551,7 +576,9 @@ impl Drop for FloorReservation {
             let lane = entry.signers.entry(self.signer).or_default();
             lane.live_reservation = lane.live_reservation.saturating_sub(self.reserved);
             lane.dead_charge = lane.dead_charge.saturating_add(dead_add);
-            lane.dead_charge
+            let signer_dead = lane.dead_charge;
+            entry.prune_spent(self.signer);
+            signer_dead
         };
         // A fully-repaid or fully-settled stream folds nothing: skip the durable
         // write entirely so a sub-interval request does not fsync a value already
@@ -672,12 +699,32 @@ pub(super) enum FloorRefusal {
     SignerAtCap,
 }
 
-impl FloorRefusal {
-    /// The refusal reason a serve-path admission gate reports for this cap.
-    const fn reject_reason(self) -> ServeRejectReason {
-        match self {
-            Self::PoolExhausted => ServeRejectReason::InsufficientDeposit,
-            Self::SignerAtCap => ServeRejectReason::SignerFloorAtCap,
+/// What a floor-admission refusal needs to describe itself
+/// ([`ClientHandler::log_floor_refusal`]). Grouped rather than passed positionally
+/// because the two messages read different fields: the pool arm wants the pool's
+/// headroom against the reserved `ceiling`, the signer arm wants the signer and its
+/// cap. `remaining` is the raw `getPool` value, so the callee derives both rather
+/// than every call site deriving one of them.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FloorRefusalSite {
+    pub pool_id: B256,
+    pub signer: Address,
+    pub hash: Hash,
+    pub remaining: U256,
+    pub rate_per_mb: u64,
+    /// The `µUSDC` this admission asked to reserve.
+    pub ceiling: U256,
+}
+
+impl From<FloorRefusal> for ServeRejectReason {
+    /// The refusal reason a serve-path admission gate reports for this cap. Keeping
+    /// the mapping on the conversion makes an inconsistent cap/reason pairing
+    /// unrepresentable at the call sites, exactly as
+    /// [`ServeRejectReason::wire_error`] does for the wire codes.
+    fn from(refusal: FloorRefusal) -> Self {
+        match refusal {
+            FloorRefusal::PoolExhausted => Self::InsufficientDeposit,
+            FloorRefusal::SignerAtCap => Self::SignerFloorAtCap,
         }
     }
 }
@@ -1670,6 +1717,55 @@ impl ClientHandler {
         )
     }
 
+    /// Emit the observable side of a floor-admission refusal, picking the message
+    /// the refusing cap actually justifies.
+    ///
+    /// The two caps need different words and different remedies.
+    /// [`FloorRefusal::PoolExhausted`] is the pool running dry, which
+    /// [`Self::log_deposit_refusal`] already describes. [`FloorRefusal::SignerAtCap`]
+    /// is the opposite situation: `try_reserve_floor` tests the pool ceiling FIRST,
+    /// so reaching the sub-cap proves the pool can pay. Reporting it as a deposit
+    /// shortfall would print a headroom that visibly exceeds the ceiling beside a
+    /// sentence denying it, and would send the operator to check RPC health while one
+    /// capability-holder quietly holds a lockout that no top-up clears.
+    fn log_floor_refusal(&self, refusal: FloorRefusal, at: FloorRefusalSite) {
+        let FloorRefusalSite {
+            pool_id,
+            signer,
+            hash,
+            remaining,
+            rate_per_mb,
+            ceiling,
+        } = at;
+        let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
+        match refusal {
+            FloorRefusal::PoolExhausted => {
+                self.log_deposit_refusal(pool_id, hash, headroom, ceiling);
+            }
+            FloorRefusal::SignerAtCap => {
+                let signer_cap = self.signer_floor_cap(remaining, rate_per_mb);
+                tracing::debug!(
+                    %pool_id, %signer, %hash, %signer_cap, %ceiling, %headroom,
+                    "refusing delivery: this capability signer's un-vouchered floor credit fills \
+                     its share of the pool budget; the pool itself can still pay"
+                );
+                if let Some(suppressed) = self.note_deposit_refusal() {
+                    tracing::warn!(
+                        %pool_id, %signer, %signer_cap, %headroom, suppressed,
+                        interval = ?Self::DEPOSIT_REFUSAL_WARN_INTERVAL,
+                        "refusing a paying client: one capability signer holds its whole share of \
+                         this pool's un-vouchered floor credit while the pool is solvent. A \
+                         sustained rate means that signer is abandoning streams, or running more \
+                         concurrent un-vouchered streams than its share covers. Its dead charge is \
+                         permanent until the pool is reclaimed on-chain, so a top-up does not \
+                         clear it: rotate the session key, or raise \
+                         blockchain.pool_floor_signer_share_bps — see docs/runbook.md"
+                    );
+                }
+            }
+        }
+    }
+
     /// Emit the observable side of an insufficient-deposit refusal (#1520).
     ///
     /// Unconditional `debug!` so a support ticket is answerable at all, plus a
@@ -1845,40 +1941,96 @@ impl ClientHandler {
     /// dead_charge` any ONE capability signer may hold against this pool.
     ///
     /// A share of the pool's own refundable headroom, `remaining − M`, scaled by
-    /// the node-local `pool_floor_signer_share_bps` policy, and floored at ONE ramp
-    /// credit window priced at this request's rate. The floor matters: without it a
-    /// pool whose headroom is smaller than `10_000 / share_bps` windows would refuse
-    /// every signer, so a small pool that works today would stop working. With it a
-    /// lone signer is admitted exactly as before and the sub-cap only bites once a
-    /// signer holds more than one window of un-vouchered credit. A share of
-    /// `10_000` bps makes the sub-cap equal to the pool ceiling, i.e. a no-op.
+    /// the node-local `pool_floor_signer_share_bps` policy, and floored at the
+    /// ramp-start credit window priced at this request's rate — one chunk normally,
+    /// the full `credit_max` when `credit_ramp_divisor == 0`, which is exactly what
+    /// a fresh stream reserves either way.
+    ///
+    /// The floor matters: without it a pool whose headroom is smaller than
+    /// `10_000 / share_bps` windows gives every signer a sub-window cap and serves
+    /// nobody. With it the node admits a lone signer's first stream on any pool, and
+    /// the sub-cap binds only once a signer holds more than one window of
+    /// un-vouchered credit. A share of `10_000` bps leaves the sub-cap at least as
+    /// loose as the pool ceiling, i.e. a no-op.
     ///
     /// Pure and total (saturating), so it is testable without any chain access.
     pub(super) fn signer_floor_cap(&self, remaining: U256, rate_per_mb: u64) -> U256 {
         let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
-        // `wrapping_div` never divides by zero here — the divisor is the literal
-        // basis-point denominator — and it is the total form U256 offers.
+        // `wrapping_div` never divides by zero here — `BPS_DENOMINATOR` is a nonzero
+        // constant — and it is the total form U256 offers. Share the constant with
+        // the resolver that bounds the knob, so validation and arithmetic cannot
+        // drift apart.
         let share = headroom
             .saturating_mul(U256::from(self.pool_floor_signer_share_bps))
-            .wrapping_div(U256::from(10_000u64));
+            .wrapping_div(U256::from(decdn_common::config::BPS_DENOMINATOR));
         let one_window = min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb);
         share.max(one_window)
     }
 
-    /// Stateful-B floor solvency at BOTH levels: does the pool's `remaining − M`
-    /// cover its already-committed floor credit (`live_reservation + dead_charge`)
-    /// plus `new_reserve`, AND does this signer's own share cover its slice of the
-    /// same? Reads the floor accumulator; pure arithmetic otherwise. A poisoned
-    /// accumulator lock recovers the guard rather than panicking (the reservation is
-    /// best-effort accounting, never a safety gate).
+    /// Stateful-B POOL solvency: does the pool's `remaining − M` cover its
+    /// already-committed floor credit (`live_reservation + dead_charge`) across every
+    /// signer, plus `new_reserve`? Reads the floor accumulator; pure arithmetic
+    /// otherwise. A poisoned accumulator lock recovers the guard rather than
+    /// panicking: every critical section over this mutex is panic-free by
+    /// construction — saturating `U256` arithmetic and infallible map operations
+    /// only, no indexing and no `unwrap` — so a poison cannot originate from a holder
+    /// of this lock, and a recovered guard cannot observe a torn pool/signer split.
+    /// Do NOT add a fallible or panicking call under this lock; that argument is what
+    /// the recovery rests on, now that the pool total and the signer entries must
+    /// agree.
     ///
-    /// The pool ceiling is the solvency bound and holds regardless of how many
-    /// signer identities draw on the pool. The signer sub-cap is isolation: it stops
-    /// one capability-holder's abandoned streams from consuming the WHOLE pool's
-    /// floor budget. It bounds each identity's draw rather than guaranteeing any
-    /// co-tenant a slice — the caps sum to `N × share` across `N` signers, so on a
-    /// pool with more than `10_000 / share_bps` of them the pool ceiling still binds
-    /// first.
+    /// (The recovery is not justified by the accumulator being "best-effort": it
+    /// gates whether the node fronts upstream USDC.)
+    ///
+    /// Deliberately the pool level ONLY, which is what makes it the right check for a
+    /// stream already in flight. The per-signer sub-cap is an ADMISSION control: a
+    /// signer's cap is a share of `remaining − M`, so it shrinks as co-tenants draw
+    /// the pool down, and testing a live stream against the shrunken cap would
+    /// terminate a paying stream on a solvent pool — reporting `PoolExhausted` for a
+    /// pool that can still pay. An admitted stream's reservation is already counted
+    /// at both levels, so leaving the sub-cap out of the mid-stream re-check bounds
+    /// nothing less. [`Self::try_reserve_floor`] is where both caps apply.
+    pub(super) fn pool_budget_covers_reserve(
+        &self,
+        pool_id: B256,
+        remaining: U256,
+        new_reserve: U256,
+    ) -> bool {
+        let committed = {
+            let guard = self
+                .pool_floor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .get(&pool_id)
+                .map_or(U256::ZERO, PoolFloorState::committed)
+        };
+        decdn_incentive::pool_budget_covers(
+            remaining,
+            self.pool_min_remaining_deposit,
+            committed,
+            new_reserve,
+        )
+    }
+
+    /// Re-validate BOTH floor caps for a stream that already holds its reservation,
+    /// reporting which cap refuses it. The admission-time twin of
+    /// [`Self::pool_budget_covers_reserve`]: a miss-fill stream opened its guard
+    /// pre-fill, so the direct-serve gate re-checks solvency with `new_reserve = 0`
+    /// rather than reserving again.
+    ///
+    /// Returns the refusing cap rather than a bare `bool` so the per-reason metric
+    /// stays honest. Both committed values are read under ONE lock hold, so naming
+    /// the cap costs nothing over answering yes/no.
+    ///
+    /// This is an ADMISSION check. The mid-stream re-check deliberately uses the
+    /// pool level only — see [`Self::pool_budget_covers_reserve`] for why.
+    ///
+    /// # Errors
+    /// [`FloorRefusal::PoolExhausted`] when `remaining − M` cannot cover the floor
+    /// credit committed across every signer on the pool, or
+    /// [`FloorRefusal::SignerAtCap`] when the pool can still pay but this signer's
+    /// own share is full.
     pub(super) fn floor_budget_covers(
         &self,
         pool_id: B256,
@@ -1886,7 +2038,7 @@ impl ClientHandler {
         remaining: U256,
         rate_per_mb: u64,
         new_reserve: U256,
-    ) -> bool {
+    ) -> Result<(), FloorRefusal> {
         let (committed, signer_committed) = {
             let guard = self
                 .pool_floor
@@ -1896,13 +2048,20 @@ impl ClientHandler {
                 (s.committed(), s.signer_committed(signer))
             })
         };
-        decdn_incentive::pool_budget_covers(
+        if !decdn_incentive::pool_budget_covers(
             remaining,
             self.pool_min_remaining_deposit,
             committed,
             new_reserve,
-        ) && signer_committed.saturating_add(new_reserve)
-            <= self.signer_floor_cap(remaining, rate_per_mb)
+        ) {
+            return Err(FloorRefusal::PoolExhausted);
+        }
+        if signer_committed.saturating_add(new_reserve)
+            > self.signer_floor_cap(remaining, rate_per_mb)
+        {
+            return Err(FloorRefusal::SignerAtCap);
+        }
+        Ok(())
     }
 
     /// Atomically check BOTH floor caps and reserve one `floor` against the pool's
@@ -2585,7 +2744,7 @@ mod tests {
             .await
             .expect("cache");
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-        let deps = ClientHandlerDeps::new(
+        let mut deps = ClientHandlerDeps::new(
             iroh::SecretKey::generate().public(),
             Arc::clone(metrics),
             Arc::new(ConnectionLimiter::new(
@@ -2615,7 +2774,6 @@ mod tests {
             pool_min_remaining_deposit,
             always_admit_shed(),
         );
-        let mut deps = deps;
         deps.pool_floor_signer_share_bps = pool_floor_signer_share_bps;
         let handler = ClientHandler::new(deps).expect("handler");
         (Arc::new(handler), dir)
@@ -2929,6 +3087,11 @@ mod tests {
             ServeRejectReason::UnknownChannel,
             ServeRejectReason::OwnerMismatch,
             ServeRejectReason::InsufficientDeposit,
+            // A distinct wire code here would hand a prober an oracle: with
+            // throwaway signer keys it could binary-search per-signer headroom and
+            // reconstruct `remaining − M`, the pool-balance map this collapse exists
+            // to hide.
+            ServeRejectReason::SignerFloorAtCap,
             ServeRejectReason::RangeNotSatisfiable,
         ] {
             assert_eq!(
@@ -3289,24 +3452,30 @@ mod tests {
         let floor = decdn_incentive::floor_micro(1_000_000);
         // Empty pool, M = 0: remaining must cover the new reserve exactly.
         anyhow::ensure!(
-            handler.floor_budget_covers(pool, TEST_SIGNER, floor, TEST_RATE, floor),
+            handler
+                .floor_budget_covers(pool, TEST_SIGNER, floor, TEST_RATE, floor)
+                .is_ok(),
             "remaining equal to the reserve is covered"
         );
         anyhow::ensure!(
-            !handler.floor_budget_covers(
-                pool,
-                TEST_SIGNER,
-                floor.saturating_sub(U256::from(1u64)),
-                TEST_RATE,
-                floor
-            ),
+            handler
+                .floor_budget_covers(
+                    pool,
+                    TEST_SIGNER,
+                    floor.saturating_sub(U256::from(1u64)),
+                    TEST_RATE,
+                    floor
+                )
+                .is_err(),
             "remaining one below the reserve is not covered"
         );
         // A live reservation consumes the budget: the same remaining no longer
         // covers a second identical reserve.
         let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor);
         anyhow::ensure!(
-            !handler.floor_budget_covers(pool, TEST_SIGNER, floor, TEST_RATE, floor),
+            handler
+                .floor_budget_covers(pool, TEST_SIGNER, floor, TEST_RATE, floor)
+                .is_err(),
             "an in-flight floor reservation is committed against the budget"
         );
         Ok(())
@@ -3426,10 +3595,9 @@ mod tests {
         Ok(())
     }
 
-    /// One signer's permanent `dead_charge` locks ITSELF out and leaves a co-tenant's
-    /// guaranteed share intact. Before the sub-cap, an abandoned stream's dead charge
-    /// was pool-wide, so it shrank every co-tenant's usable headroom; now it is the
-    /// abandoning signer that pays for it first.
+    /// One signer's permanent `dead_charge` is charged to its own entry as well as to
+    /// the pool total, so it locks that signer out before it reaches any co-tenant's
+    /// share.
     #[test]
     fn one_signers_dead_charge_does_not_consume_a_co_tenants_share() -> anyhow::Result<()> {
         let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
@@ -3459,7 +3627,7 @@ mod tests {
         );
         anyhow::ensure!(
             st.signer_committed(TEST_SIGNER_B) == U256::ZERO,
-            "a co-tenant's share is untouched by another signer's dead charge"
+            "a co-tenant's entry is untouched by another signer's dead charge"
         );
         Ok(())
     }
@@ -3496,6 +3664,83 @@ mod tests {
             handler.signer_floor_cap(wide, TEST_RATE)
                 == one_window.saturating_mul(U256::from(25u64)),
             "above the clamp the cap is the configured share of the headroom"
+        );
+        Ok(())
+    }
+
+    /// Headroom below one credit window: the one-window clamp then returns a cap
+    /// LARGER than the pool's entire headroom, and only the pool ceiling running
+    /// first keeps the node from admitting past the refundable minimum `M` the pool
+    /// owner is guaranteed. Pins that order — the refusal must be `PoolExhausted`,
+    /// never `Ok`, at any share.
+    #[tokio::test]
+    async fn pool_ceiling_refuses_below_one_window_whatever_the_share() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        for share in [1u64, 2_500, 10_000] {
+            let (handler, _dir) =
+                handler_for_tests_with_signer_share(&metrics, U256::ZERO, share).await;
+            let pool = B256::repeat_byte(0x36);
+            let one_window =
+                decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+            let remaining = one_window.saturating_sub(U256::from(1u64));
+            anyhow::ensure!(
+                handler.signer_floor_cap(remaining, TEST_RATE) > remaining,
+                "share {share}: the clamp does exceed the headroom, which is what makes \
+                 the check order load-bearing"
+            );
+            anyhow::ensure!(
+                handler
+                    .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, one_window)
+                    .err()
+                    == Some(FloorRefusal::PoolExhausted),
+                "share {share}: a reserve past remaining − M must be refused by the pool \
+                 ceiling, not admitted through the clamped sub-cap"
+            );
+        }
+        Ok(())
+    }
+
+    /// A signer that reserves, pays, and leaves takes its row with it. Without the
+    /// prune the map only grows: ADR 003 §Revocation makes short-expiry session keys
+    /// the intended usage, so a busy publisher mints signer identities steadily and
+    /// every one that pays cleanly would leave a zero row alive until the pool is
+    /// reclaimed on-chain — inside a map locked on every admission.
+    #[tokio::test]
+    async fn a_paid_out_signer_leaves_no_row_behind() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_tests(&metrics).await; // M = 0
+        let pool = B256::repeat_byte(0x37);
+        let floor = decdn_incentive::floor_micro(1_000_000);
+        let guard = handler
+            .try_reserve_floor(pool, TEST_SIGNER, floor, TEST_RATE, floor)
+            .map_err(|e| anyhow::anyhow!("refused: {e:?}"))?;
+        {
+            let map = handler
+                .pool_floor
+                .lock()
+                .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))?;
+            anyhow::ensure!(
+                map.get(&pool)
+                    .is_some_and(|s| s.signers.contains_key(&TEST_SIGNER)),
+                "the row exists while the reservation is live"
+            );
+        }
+        // Paid in full, then dropped: the live reservation is released and no dead
+        // charge folds, so the row commits nothing and is pruned.
+        guard.release_live_repaid();
+        drop(guard);
+        let map = handler
+            .pool_floor
+            .lock()
+            .map_err(|e| anyhow::anyhow!("floor map poisoned: {e}"))?;
+        let entry = map.get(&pool).cloned().unwrap_or_default();
+        anyhow::ensure!(
+            !entry.signers.contains_key(&TEST_SIGNER),
+            "a signer that committed nothing must not keep a row for the pool's lifetime"
+        );
+        anyhow::ensure!(
+            entry.committed() == U256::ZERO,
+            "and the pool total still agrees with the (now empty) signer set"
         );
         Ok(())
     }

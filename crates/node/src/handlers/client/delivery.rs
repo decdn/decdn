@@ -523,11 +523,9 @@ impl ClientHandler {
             if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
                 last_pool_check = std::time::Instant::now();
                 if let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
-                    && !self.floor_budget_covers(
+                    && !self.pool_budget_covers_reserve(
                         lane_key.pool_id,
-                        lane_key.signer,
                         status.remaining,
-                        rate_per_mb,
                         U256::ZERO,
                     )
                 {
@@ -539,7 +537,7 @@ impl ClientHandler {
                     // takedown re-check below, which also logs).
                     tracing::warn!(
                         pool_id = %lane_key.pool_id, signer = %lane_key.signer, %hash,
-                        "mid-stream PoolExhausted: pool can no longer fund committed floor credit for this signer; owner should top up the deposit"
+                        "mid-stream PoolExhausted: pool can no longer fund the floor credit committed across its signers; owner should top up the deposit"
                     );
                     return Ok(());
                 }

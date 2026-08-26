@@ -4,10 +4,10 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex, OwnedSemaphorePermit,
-    REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
-    StreamReadError, StreamResponseBody, U256, VarInt, read_first_message, reset_stream,
-    verify_binding,
+    FirstMessage, FloorRefusalSite, FloorReservation, Hash, LaneKey, LaneSlot, Mutex,
+    OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream,
+    ServeRejectReason, StreamReadError, StreamResponseBody, U256, VarInt, read_first_message,
+    reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 use std::sync::atomic::Ordering;
@@ -666,15 +666,22 @@ impl ClientHandler {
                         reserved,
                     ) {
                         Err(refusal) => {
-                            let headroom = status
-                                .remaining
-                                .saturating_sub(self.pool_min_remaining_deposit);
-                            self.log_deposit_refusal(pool_id, hash, headroom, reserved);
+                            self.log_floor_refusal(
+                                refusal,
+                                FloorRefusalSite {
+                                    pool_id,
+                                    signer: key.signer,
+                                    hash,
+                                    remaining: status.remaining,
+                                    rate_per_mb,
+                                    ceiling: reserved,
+                                },
+                            );
                             return self
                                 .respond_error(
                                     &mut send,
                                     &req,
-                                    refusal.reject_reason(),
+                                    ServeRejectReason::from(refusal),
                                     rate_per_mb,
                                 )
                                 .await;
@@ -1076,35 +1083,45 @@ impl ClientHandler {
                         floor_reservation = Some(guard);
                         None
                     }
-                    Err(refusal) => Some(refusal.reject_reason()),
+                    Err(refusal) => Some(refusal),
                 }
-            } else if self.floor_budget_covers(
-                B256::from(req.pool_id),
-                lane_key.signer,
-                status.remaining,
-                rate_per_mb,
-                U256::ZERO,
-            ) {
-                None
             } else {
-                // A miss-fill stream already holds its reservation, so the re-check
-                // cannot say WHICH cap moved against it without re-reading both.
-                // `InsufficientDeposit` is the conservative label: the reservation
-                // it holds is already counted at both levels.
-                Some(ServeRejectReason::InsufficientDeposit)
-            };
-            if let Some(reason) = refused {
-                let headroom = status
-                    .remaining
-                    .saturating_sub(self.pool_min_remaining_deposit);
-                self.log_deposit_refusal(
+                // A miss-fill stream already holds its reservation, counted at both
+                // levels, so this re-validates rather than reserves (`new_reserve =
+                // 0`). It still reports WHICH cap moved against it since the last
+                // check: a `dead_charge` that grew on this signer refuses as
+                // `SignerFloorAtCap`, one that grew pool-wide as
+                // `InsufficientDeposit`. Collapsing the two here would blind the
+                // per-reason metric on the miss path — the tier that fronts real
+                // upstream USDC, and so the one the sub-cap most exists to bound.
+                self.floor_budget_covers(
                     B256::from(req.pool_id),
-                    hash,
-                    headroom,
-                    decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                    lane_key.signer,
+                    status.remaining,
+                    rate_per_mb,
+                    U256::ZERO,
+                )
+                .err()
+            };
+            if let Some(refusal) = refused {
+                self.log_floor_refusal(
+                    refusal,
+                    FloorRefusalSite {
+                        pool_id: B256::from(req.pool_id),
+                        signer: lane_key.signer,
+                        hash,
+                        remaining: status.remaining,
+                        rate_per_mb,
+                        ceiling: decdn_incentive::min_payment(guard_bytes, rate_per_mb),
+                    },
                 );
                 return self
-                    .respond_error(&mut send, &req, reason, rate_per_mb)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::from(refusal),
+                        rate_per_mb,
+                    )
                     .await;
             }
         }

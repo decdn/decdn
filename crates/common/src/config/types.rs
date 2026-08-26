@@ -275,14 +275,21 @@ pub struct BlockchainConfig {
     /// (ADR 003 § Pool solvency, per-signer floor isolation). The node bounds a
     /// signer's live reservations plus its permanent `dead_charge` to
     /// `max((remaining − M) · bps / 10_000, one credit window)`, underneath the
-    /// unchanged pool-wide `remaining − M` ceiling, so one capability-holder that
-    /// opens and abandons streams cannot consume the headroom its co-tenants on
-    /// the shared pool need. This throttles unpaid credit, not paid throughput: a
-    /// signer that pays its vouchers releases its reservation and cycles through
-    /// its share indefinitely. Node-local risk policy — it needs no pool-owner
-    /// cooperation. Must be in `1..=10_000`; `10_000` makes the sub-cap equal to
-    /// the pool ceiling, i.e. a no-op. Absent => default (`2500`, a quarter of the
-    /// headroom each).
+    /// pool-wide `remaining − M` ceiling, so one capability-holder that opens and
+    /// abandons streams cannot take the whole pool's floor budget from its
+    /// co-tenants. The credit window is one chunk normally, the full `credit_max`
+    /// when `credit_ramp_divisor == 0`.
+    ///
+    /// This throttles unpaid credit, not paid throughput: a signer that pays its
+    /// vouchers releases that stream's reservation, so its share recycles and a
+    /// stream already under way is never slowed. What the share does bound is how
+    /// many streams one signer may hold un-vouchered at once — roughly
+    /// `share ÷ one credit window` concurrently.
+    ///
+    /// Node-local risk policy — it needs no pool-owner cooperation. Must be in
+    /// `1..=10_000`; `10_000` leaves the sub-cap at least as loose as the pool
+    /// ceiling, i.e. a no-op. Absent => default (`2500`, a quarter of the headroom
+    /// each).
     pub pool_floor_signer_share_bps: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the

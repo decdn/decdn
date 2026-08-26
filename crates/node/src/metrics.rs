@@ -1113,7 +1113,10 @@ pub struct DecdnMetrics {
     ///
     /// It does not distinguish them, so a spike cannot be attributed to a layer
     /// from this series alone — the log line at the refusal site is what says
-    /// which. Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
+    /// which. Guards (1) and (3) also split by CAP: both run the two-level floor
+    /// check, and its per-signer arm bumps `serve_stream_rejected_signer_floor_at_cap`
+    /// instead, so this counter is the pool-ceiling half of them.
+    /// Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
     /// this server-side counter is the only place the *reason* lives at all — now
     /// more load-bearing, since a third refusal path routes through it.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
@@ -1131,8 +1134,10 @@ pub struct DecdnMetrics {
     /// its share of the pool budget, while the pool itself can still pay (ADR 003
     /// §Pool solvency, per-signer floor isolation). Wire-indistinguishable from
     /// `insufficient_deposit` (both signed as `NotFound`), so this counter is the
-    /// only place the distinction lives — a rising value separates one signer
-    /// abandoning streams on a shared pool from the pool genuinely running dry.
+    /// only place the distinction lives — a rising value means one signer holds its
+    /// whole share un-vouchered while the pool as a whole is solvent, either by
+    /// abandoning streams or by running more concurrent un-vouchered streams than
+    /// its share covers.
     /// Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,
