@@ -204,7 +204,7 @@ pub(crate) const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u6
 }
 
 /// Drain `stream` into a contiguous `Bytes`, capping the buffer at
-/// `cap` bytes. Mirrors [`OriginFetch::collect_to_bytes`] but adds:
+/// `cap` bytes. Mirrors [`crate::origin::OriginFetch::collect_to_bytes`] but adds:
 ///
 /// - A running cap: chunks past `cap` produce an `io::Error` whose
 ///   inner is a [`BlobTooLargeMarker`], so the caller can downcast and
