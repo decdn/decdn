@@ -727,7 +727,9 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     bind_domain: alloy::dyn_abi::Eip712Domain,
     payment_pool_addr: alloy::primitives::Address,
     staker_set: Arc<dyn StakerSet>,
-    /// The single multiplexed chain-event poller driving all six watcher routes.
+    /// The single multiplexed chain-event poller driving every registered
+    /// watcher route — six with the fee-shares route, which registers only
+    /// when the startup `feeRouter()` read succeeds.
     /// Stopped once, late in shutdown (after `router.shutdown`), because the
     /// capacity-bond route's staker set gates DHT admission through drain.
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -2460,7 +2462,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // flush by a poll — it just cannot report anything once cancelled.
     republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
-    // The six chain watchers are now one multiplexed poller with one shutdown
+    // The chain watchers are now one multiplexed poller with one shutdown
     // token, so the previous staggered per-watcher stops collapse to a SINGLE
     // `poller.shutdown()` at the LATE point below (after `router.shutdown`). The
     // blacklist and rate-bounds routes, which used to stop here early, move to
@@ -2511,7 +2513,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
-    // The ONE multiplexed poller driving all six watcher routes stops here,
+    // The ONE multiplexed poller driving all registered watcher routes stops here,
     // once. It exits cooperatively — cancelling its loop at the next await
     // boundary and flushing every persisting route's checkpoint (settlement's
     // `PoolOpened`) before returning — with its `WatcherHandle`'s `AbortOnDrop`

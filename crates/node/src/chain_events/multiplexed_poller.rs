@@ -49,9 +49,11 @@
 //! token must not flip a readiness gate open), while `on_tick_success` keeps
 //! stamping unconditionally.
 //!
-//! The runtime registers all six `eth_getLogs` watchers' [`Route`]s on one
+//! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
-//! place of six independent per-watcher loops.
+//! place of six independent per-watcher loops (five when the fee-shares
+//! route is absent: it registers only when the startup `feeRouter()` read
+//! succeeds).
 //!
 //! This module is `pub` only so `Route` can appear in the `pub` watcher
 //! `bootstrap` signatures and the external settlement e2e can drive `spawn`; its
