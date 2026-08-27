@@ -188,6 +188,10 @@ pub struct ResolvedBlockchain {
     /// (ADR 003 § Pool solvency, per-signer floor isolation). Guaranteed in
     /// `1..=10_000` (the resolver rejects anything else). Defaults to `2500`.
     pub pool_floor_signer_share_bps: u64,
+    /// Absolute ceiling on the per-signer floor sub-cap, in ramp-start credit
+    /// windows (ADR 003 § Pool solvency, per-signer floor isolation). `0` disables
+    /// the ceiling. Defaults to `16`.
+    pub pool_floor_signer_max_windows: u64,
 }
 
 /// Resolved cache fields.

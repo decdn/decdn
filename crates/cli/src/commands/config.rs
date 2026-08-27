@@ -228,6 +228,11 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  pool_floor_signer_max_windows: {}",
+        resolved.blockchain.pool_floor_signer_max_windows
+    )?;
+    writeln!(
+        w,
         "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     )?;
@@ -913,6 +918,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
 # pool_floor_signer_share_bps = 2500              # share of a pool's remaining-M headroom any ONE capability signer may hold as un-vouchered floor credit (ADR 003 § Pool solvency); 1..=10000, default 2500 (a quarter each); 10000 disables the sub-cap
+# pool_floor_signer_max_windows = 16              # absolute ceiling on that share, in ramp-start credit windows — the unit honest need is actually denominated in, so one bad session key costs a constant, not a share of the deposit; 0 disables the ceiling; default 16
 # CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -1172,6 +1178,7 @@ mod tests {
             buyer_max_approve,
             pool_min_remaining_deposit_micro_usdc,
             pool_floor_signer_share_bps,
+            pool_floor_signer_max_windows,
             swap_venue,
             swap_router_address,
             swap_quoter_address,
@@ -1250,6 +1257,10 @@ mod tests {
             (
                 "pool_floor_signer_share_bps =",
                 pool_floor_signer_share_bps.is_none(),
+            ),
+            (
+                "pool_floor_signer_max_windows =",
+                pool_floor_signer_max_windows.is_none(),
             ),
             ("swap_venue =", swap_venue.is_none()),
             ("swap_router_address =", swap_router_address.is_none()),

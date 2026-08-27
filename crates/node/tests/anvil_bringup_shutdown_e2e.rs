@@ -353,6 +353,7 @@ fn build_config(
             buyer_max_approve: false,
             pool_min_remaining_deposit_micro_usdc: 1_000_000,
             pool_floor_signer_share_bps: 10_000,
+            pool_floor_signer_max_windows: 0,
             slash_judge_address: addrs.slash_judge.to_string(),
             content_blacklist_address: Some(addrs.content_blacklist.to_string()),
             content_blacklist_poll_interval_sec: 600,

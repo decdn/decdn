@@ -125,6 +125,12 @@ pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
 /// wide-fan-out publishers lowers it; one serving single-signer pools raises it
 /// toward `10_000`, where the sub-cap becomes the pool ceiling.
 pub const DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS: u64 = 2_500;
+/// Default ceiling on the per-signer floor sub-cap: `16` ramp-start credit windows.
+/// The window is what a signer's honest need is denominated in — one admission
+/// reserves at most one window, and a paying stream releases it — so sixteen leaves
+/// room for a highly concurrent publisher while keeping the damage one compromised
+/// session key can do constant rather than proportional to the pool's deposit.
+pub const DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS: u64 = 16;
 /// Basis-point denominator for [`DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS`] and the
 /// bound the resolver enforces on a configured share.
 pub const BPS_DENOMINATOR: u64 = 10_000;
@@ -1575,6 +1581,13 @@ fn resolve_blockchain_into(
     let pool_floor_signer_share_bps = file
         .and_then(|b| b.pool_floor_signer_share_bps)
         .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS);
+    // The absolute ceiling on that share, in credit windows. `0` is the documented
+    // disable sentinel, so there is no lower bound to enforce and no upper one that
+    // means anything — a ceiling above the pool's own headroom is simply never the
+    // binding constraint.
+    let pool_floor_signer_max_windows = file
+        .and_then(|b| b.pool_floor_signer_max_windows)
+        .unwrap_or(DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS);
     bag.check_with(
         (1..=BPS_DENOMINATOR).contains(&pool_floor_signer_share_bps),
         "blockchain.pool_floor_signer_share_bps",
@@ -1621,6 +1634,7 @@ fn resolve_blockchain_into(
         buyer_max_approve,
         pool_min_remaining_deposit_micro_usdc,
         pool_floor_signer_share_bps,
+        pool_floor_signer_max_windows,
     }
 }
 
@@ -9447,15 +9461,23 @@ swap_pool_address = \"0xPool\"
             resolved.pool_floor_signer_share_bps,
             DEFAULT_POOL_FLOOR_SIGNER_SHARE_BPS
         );
+        assert_eq!(
+            resolved.pool_floor_signer_max_windows,
+            DEFAULT_POOL_FLOOR_SIGNER_MAX_WINDOWS
+        );
 
         let explicit = types::BlockchainConfig {
             pool_floor_signer_share_bps: Some(10_000),
+            // `0` is the documented disable sentinel for the window ceiling, so it
+            // must survive resolution rather than being replaced by the default.
+            pool_floor_signer_max_windows: Some(0),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             content_blacklist_address: Some(GOOD_ADDR.to_string()),
             ..Default::default()
         };
         let resolved = resolve_blockchain(&cli, Some(&explicit), dir.path())?;
         assert_eq!(resolved.pool_floor_signer_share_bps, 10_000);
+        assert_eq!(resolved.pool_floor_signer_max_windows, 0);
 
         for bad in [0u64, 10_001] {
             let file = types::BlockchainConfig {

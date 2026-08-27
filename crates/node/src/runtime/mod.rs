@@ -1292,6 +1292,7 @@ async fn build_chain_and_handlers(
     // isolation): the node's own bad-debt budget per capability-holder, underneath
     // the per-pool `remaining − M` ceiling.
     client_deps.pool_floor_signer_share_bps = cfg.blockchain.pool_floor_signer_share_bps;
+    client_deps.pool_floor_signer_max_windows = cfg.blockchain.pool_floor_signer_max_windows;
     // Event-fed pool view (owner + remaining) for the floor-`M` solvency gate and
     // the ADR 011 funder gate. The settlement watcher below folds every
     // `PaymentPool` event into this projection, so a serve request reads
@@ -3880,6 +3881,7 @@ mod tests {
                 buyer_max_approve: true,
                 pool_min_remaining_deposit_micro_usdc: 1_000_000,
                 pool_floor_signer_share_bps: 10_000,
+                pool_floor_signer_max_windows: 0,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
                 content_blacklist_address: None,
                 content_blacklist_poll_interval_sec: 600,

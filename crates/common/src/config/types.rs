@@ -291,6 +291,22 @@ pub struct BlockchainConfig {
     /// ceiling, i.e. a no-op. Absent => default (`2500`, a quarter of the headroom
     /// each).
     pub pool_floor_signer_share_bps: Option<u64>,
+    /// Absolute ceiling on the per-signer floor sub-cap, counted in ramp-start
+    /// credit windows (ADR 003 § Pool solvency, per-signer floor isolation). The cap
+    /// is `clamp(share, one window, this × one window)`.
+    ///
+    /// The window is the unit actually being rationed. A signer's legitimate need for
+    /// un-vouchered floor credit does not scale with the pool's size: every admission
+    /// reserves at most one window per stream, and a paying stream releases its
+    /// reservation as soon as it covers it, so honest need is `concurrent
+    /// un-vouchered streams × one window` whether the pool holds ten dollars or a
+    /// hundred thousand. Without this ceiling a share alone is loose in both
+    /// directions on a large pool: one session key could hold millions of windows,
+    /// while a constant `10_000 / share_bps` keys would still strand the whole floor.
+    ///
+    /// `0` disables the ceiling, leaving the share as the only bound. Absent =>
+    /// default (`16`).
+    pub pool_floor_signer_max_windows: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
     /// operator funds the bond in TOKEN directly). Consumed only by the CLI

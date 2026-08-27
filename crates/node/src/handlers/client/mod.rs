@@ -1043,6 +1043,13 @@ pub struct ClientHandlerDeps {
     /// of `10_000` makes the sub-cap equal to the pool ceiling, i.e. a no-op, which
     /// is what unit tests that only exercise the pool-wide bound want.
     pub pool_floor_signer_share_bps: u64,
+    /// Absolute ceiling on that share, in ramp-start credit windows (ADR 003 §Pool
+    /// solvency, per-signer floor isolation). The runtime sets it from
+    /// `blockchain.pool_floor_signer_max_windows`; the default of `0` disables the
+    /// ceiling, which together with the `10_000` bps share default leaves the
+    /// sub-cap a no-op for every construction path that does not go through the
+    /// runtime.
+    pub pool_floor_signer_max_windows: u64,
     /// ADR 041 serve-credit boundary in front of the per-source warming
     /// allowance — the ledger the buy loop
     /// ([`crate::node_origin::NodeOriginConfig`]) debits and eviction forgets. On
@@ -1129,6 +1136,7 @@ impl ClientHandlerDeps {
             // a caller that never sets it keeps the pool-wide ceiling as the only
             // floor bound.
             pool_floor_signer_share_bps: 10_000,
+            pool_floor_signer_max_windows: 0,
             warming_credit: Arc::new(crate::warming_allowance::DirectWarmingCreditSink::new(
                 Arc::new(crate::warming_allowance::WarmingAllowance::new(0, 0)),
             )),
@@ -1201,6 +1209,9 @@ pub struct ClientHandler {
     /// (see [`ClientHandlerDeps::pool_floor_signer_share_bps`]). Read by
     /// [`Self::signer_floor_cap`] on every admission and mid-stream re-check.
     pool_floor_signer_share_bps: u64,
+    /// Absolute ceiling on that share, in ramp-start credit windows; `0` disables it
+    /// (see [`ClientHandlerDeps::pool_floor_signer_max_windows`]).
+    pool_floor_signer_max_windows: u64,
     /// Redeem-hint sender to the on-chain settlement service (#327), set at
     /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
     /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
@@ -1404,6 +1415,7 @@ impl ClientHandler {
             pool_floor: Arc::new(std::sync::Mutex::new(pool_floor)),
             floor_loss_store: deps.floor_loss_store,
             pool_floor_signer_share_bps: deps.pool_floor_signer_share_bps,
+            pool_floor_signer_max_windows: deps.pool_floor_signer_max_windows,
             redeem_hint: deps.redeem_hint,
             pull_through: deps.pull_through,
             local_populate: deps.local_populate,
@@ -1940,18 +1952,34 @@ impl ClientHandler {
     /// solvency, per-signer floor isolation): the most `live_reservation +
     /// dead_charge` any ONE capability signer may hold against this pool.
     ///
-    /// A share of the pool's own refundable headroom, `remaining − M`, scaled by
-    /// the node-local `pool_floor_signer_share_bps` policy, and floored at the
+    /// `clamp(share, one window, max_windows × one window)`, where the share is a
+    /// fraction of the pool's own refundable headroom `remaining − M` scaled by the
+    /// node-local `pool_floor_signer_share_bps` policy, and one window is the
     /// ramp-start credit window priced at this request's rate — one chunk normally,
     /// the full `credit_max` when `credit_ramp_divisor == 0`, which is exactly what
     /// a fresh stream reserves either way.
     ///
-    /// The floor matters: without it a pool whose headroom is smaller than
-    /// `10_000 / share_bps` windows gives every signer a sub-window cap and serves
-    /// nobody. With it the node admits a lone signer's first stream on any pool, and
-    /// the sub-cap binds only once a signer holds more than one window of
-    /// un-vouchered credit. A share of `10_000` bps leaves the sub-cap at least as
-    /// loose as the pool ceiling, i.e. a no-op.
+    /// **The window is the unit being rationed.** A signer's honest need for
+    /// un-vouchered floor credit does not scale with the pool's size: every admission
+    /// reserves at most one window, and a paying stream releases its reservation as
+    /// soon as it covers it, so honest need is `concurrent un-vouchered streams ×
+    /// one window` whether the pool holds ten dollars or a hundred thousand. A share
+    /// alone is therefore loose in both directions on a large pool — one session key
+    /// could hold millions of windows, while a constant `10_000 / share_bps` keys
+    /// would still strand the whole floor, which is exactly the case a shared pool
+    /// exists for (one publisher, many session keys).
+    ///
+    /// The LOWER clamp keeps small pools usable: without it, a pool whose headroom is
+    /// under `10_000 / share_bps` windows gives every signer a sub-window cap and
+    /// serves nobody. With it the node admits a lone signer's first stream on any
+    /// pool.
+    ///
+    /// The UPPER clamp is what makes the damage one compromised key can do constant
+    /// rather than proportional to the deposit, and makes the number of keys needed
+    /// to strand the floor scale with the deposit (`headroom / (k × window)`) instead
+    /// of being a constant. `pool_floor_signer_max_windows = 0` disables it, which
+    /// with a `10_000` bps share leaves the sub-cap at least as loose as the pool
+    /// ceiling, i.e. a no-op.
     ///
     /// Pure and total (saturating), so it is testable without any chain access.
     pub(super) fn signer_floor_cap(&self, remaining: U256, rate_per_mb: u64) -> U256 {
@@ -1964,7 +1992,16 @@ impl ClientHandler {
             .saturating_mul(U256::from(self.pool_floor_signer_share_bps))
             .wrapping_div(U256::from(decdn_common::config::BPS_DENOMINATOR));
         let one_window = min_payment(self.credit_window(CHUNK_BYTES, 0), rate_per_mb);
-        share.max(one_window)
+        let floored = share.max(one_window);
+        if self.pool_floor_signer_max_windows == 0 {
+            return floored;
+        }
+        // Saturating, so a ceiling wide enough to overflow simply never binds — the
+        // same direction as disabling it. The ceiling is at least one window
+        // whenever it is enabled, so it can never pull the cap below the lower
+        // clamp and wedge a lone signer.
+        let ceiling = one_window.saturating_mul(U256::from(self.pool_floor_signer_max_windows));
+        floored.min(ceiling)
     }
 
     /// Stateful-B POOL solvency: does the pool's `remaining − M` cover its
@@ -2739,6 +2776,24 @@ mod tests {
         pool_min_remaining_deposit: U256,
         pool_floor_signer_share_bps: u64,
     ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+        handler_for_tests_with_floor_policy(
+            metrics,
+            pool_min_remaining_deposit,
+            pool_floor_signer_share_bps,
+            0,
+        )
+        .await
+    }
+
+    /// [`handler_for_tests_with_signer_share`] plus the absolute ceiling on the
+    /// sub-cap, in credit windows. `0` — what every share-only test uses — disables
+    /// the ceiling, so the share is the only bound.
+    async fn handler_for_tests_with_floor_policy(
+        metrics: &Arc<Metrics>,
+        pool_min_remaining_deposit: U256,
+        pool_floor_signer_share_bps: u64,
+        pool_floor_signer_max_windows: u64,
+    ) -> (Arc<ClientHandler>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
             .await
@@ -2775,6 +2830,7 @@ mod tests {
             always_admit_shed(),
         );
         deps.pool_floor_signer_share_bps = pool_floor_signer_share_bps;
+        deps.pool_floor_signer_max_windows = pool_floor_signer_max_windows;
         let handler = ClientHandler::new(deps).expect("handler");
         (Arc::new(handler), dir)
     }
@@ -3741,6 +3797,118 @@ mod tests {
         anyhow::ensure!(
             entry.committed() == U256::ZERO,
             "and the pool total still agrees with the (now empty) signer set"
+        );
+        Ok(())
+    }
+
+    /// The window ceiling makes one signer's exposure constant instead of
+    /// deposit-proportional (#1857). A share of a large pool's headroom is worth
+    /// many windows; the ceiling caps it at `k` of them, and — the point — `k` does
+    /// not move when the deposit grows.
+    #[tokio::test]
+    async fn signer_cap_is_capped_at_a_window_count_not_a_slice_of_the_deposit()
+    -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) =
+            handler_for_tests_with_floor_policy(&metrics, U256::ZERO, 2_500, 16).await;
+        let one_window =
+            decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+        let ceiling = one_window.saturating_mul(U256::from(16u64));
+
+        // A quarter of 400 windows is 100 windows; the ceiling cuts it to 16.
+        let wide = one_window.saturating_mul(U256::from(400u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(wide, TEST_RATE) == ceiling,
+            "a share worth more than the ceiling is cut to the ceiling"
+        );
+        // Ten times the deposit, same cap. This is the property the share alone
+        // could not give: damage per compromised key stops tracking pool size.
+        let wider = one_window.saturating_mul(U256::from(4_000u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(wider, TEST_RATE) == ceiling,
+            "growing the deposit tenfold must not grow one signer's cap"
+        );
+        // Below the ceiling the share still governs: a quarter of 8 windows is 2.
+        let narrow = one_window.saturating_mul(U256::from(8u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(narrow, TEST_RATE)
+                == one_window.saturating_mul(U256::from(2u64)),
+            "under the ceiling the configured share is what applies"
+        );
+        // And the lower clamp still wins beneath one window, so the ceiling can
+        // never wedge a lone signer off a small pool.
+        anyhow::ensure!(
+            handler.signer_floor_cap(one_window / U256::from(2u64), TEST_RATE) == one_window,
+            "the ceiling never pulls the cap below one credit window"
+        );
+        Ok(())
+    }
+
+    /// The window ceiling scales the number of distinct signers needed to strand a
+    /// pool's floor budget with the deposit. Under a bare 2500 bps share exactly four
+    /// signers fill any pool, however large; with a 16-window ceiling on a pool
+    /// holding 144 windows of headroom it takes nine — and eighteen if the deposit
+    /// doubles again.
+    #[tokio::test]
+    async fn window_ceiling_scales_the_signers_needed_to_strand_the_floor() -> anyhow::Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) =
+            handler_for_tests_with_floor_policy(&metrics, U256::ZERO, 2_500, 16).await;
+        let pool = B256::repeat_byte(0x38);
+        let one_window =
+            decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+        let remaining = one_window.saturating_mul(U256::from(144u64));
+        let ceiling = one_window.saturating_mul(U256::from(16u64));
+        anyhow::ensure!(
+            handler.signer_floor_cap(remaining, TEST_RATE) == ceiling,
+            "a quarter of 144 windows is 36, so the 16-window ceiling is what binds"
+        );
+
+        // Eight signers each fill their own ceiling and stop there. The pool keeps a
+        // spare ceiling's worth of headroom throughout (8 × 16 == 128 of 144), so
+        // every refusal in this loop is the sub-cap and not the pool running out.
+        let mut held = Vec::new();
+        for i in 0u8..8 {
+            let signer = Address::new([i.saturating_add(1); 20]);
+            held.push(
+                handler
+                    .try_reserve_floor(pool, signer, remaining, TEST_RATE, ceiling)
+                    .map_err(|e| anyhow::anyhow!("signer {i} refused early: {e:?}"))?,
+            );
+            anyhow::ensure!(
+                handler
+                    .try_reserve_floor(pool, signer, remaining, TEST_RATE, one_window)
+                    .err()
+                    == Some(FloorRefusal::SignerAtCap),
+                "signer {i} must stop at its window ceiling, not at a share of the deposit"
+            );
+        }
+        // A ninth signer takes the last ceiling's worth, and only then is the pool
+        // itself spent — after nine signers, not the four a bare quarter-share would
+        // have needed however large the deposit.
+        held.push(
+            handler
+                .try_reserve_floor(
+                    pool,
+                    Address::new([0x9au8; 20]),
+                    remaining,
+                    TEST_RATE,
+                    ceiling,
+                )
+                .map_err(|e| anyhow::anyhow!("the ninth signer's own share must fit: {e:?}"))?,
+        );
+        anyhow::ensure!(
+            handler
+                .try_reserve_floor(
+                    pool,
+                    Address::new([0xeeu8; 20]),
+                    remaining,
+                    TEST_RATE,
+                    one_window
+                )
+                .err()
+                == Some(FloorRefusal::PoolExhausted),
+            "the pool ceiling still bounds the aggregate once every share is spent"
         );
         Ok(())
     }

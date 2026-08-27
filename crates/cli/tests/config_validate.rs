@@ -351,6 +351,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             buyer_max_approve: true,
             pool_min_remaining_deposit_micro_usdc: 100_000,
             pool_floor_signer_share_bps: 10_000,
+            pool_floor_signer_max_windows: 0,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
             content_blacklist_poll_interval_sec: 600,
