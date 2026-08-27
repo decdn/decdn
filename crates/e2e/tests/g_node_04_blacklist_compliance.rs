@@ -70,7 +70,7 @@ use decdn_e2e::client::{ClientFixture, PoolSession};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 use decdn_e2e::time;
-use decdn_incentive::{ProbeSlashData, slash_judge_domain};
+use decdn_incentive::{PROBE_RESPONSE_TYPEHASH, ProbeSlashData, slash_judge_domain};
 use jsonrpsee::http_client::HttpClient;
 
 const MIB: usize = 1024 * 1024;
@@ -87,10 +87,6 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// `--test-threads 2` contention.
 const REMOVAL_OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
-/// EIP-712 typehash string for `ProbeResponse` — must byte-match
-/// `SlashJudge.PROBE_TYPEHASH`.
-const PROBE_TYPE: &[u8] =
-    b"ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)";
 /// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Rate, Blacklist).
 const OFFENSE_BLACKLIST: u8 = 1;
 /// The daemon config's quoted rate; echoed into the probe evidence.
@@ -619,7 +615,7 @@ async fn drive_blacklist_slash(
     // structHash = keccak(abi.encode(PROBE_TYPEHASH, fields)) — mirrors SlashJudge.
     let struct_hash = keccak256(
         (
-            keccak256(PROBE_TYPE),
+            PROBE_RESPONSE_TYPEHASH,
             hash_key,
             true,
             RATE_PER_MB,
