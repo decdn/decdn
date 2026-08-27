@@ -83,7 +83,6 @@ use support::{
     cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, read_client_msg,
     read_stream_response, shutdown, spawn_server, write_client_msg,
 };
-use tokio_util::sync::CancellationToken;
 
 const CHAIN_ID: u64 = 421_614;
 const RATE_PER_MB: u64 = 10;
@@ -3012,11 +3011,9 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
     // The production sink: a bounded channel feeding a background writer whose
     // log blocks on every append until we release it.
     let blocking_log = Arc::new(BlockingReceiptLog::default());
-    let writer_shutdown = CancellationToken::new();
     let (receipt_sink, writer_handle) = spawn_receipt_writer(
         Arc::clone(&blocking_log) as Arc<dyn decdn_node::receipt_log::ReceiptLog>,
         Arc::clone(&metrics),
-        writer_shutdown.clone(),
     );
     let handler = build_handler_full_with_sink(
         server_id,
@@ -3064,8 +3061,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
 
     // Release the stall and drain the writer; the audit receipts are not lost.
     blocking_log.release();
-    writer_shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(10), writer_handle)
+    tokio::time::timeout(Duration::from_secs(10), writer_handle.shutdown())
         .await
         .map_err(|_| anyhow::anyhow!("receipt writer did not drain after release"))??;
     let recorded = blocking_log.snapshot();
@@ -8352,11 +8348,9 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
         "precondition: the speculative buy must leave the source spent"
     );
 
-    let creditor_shutdown = tokio_util::sync::CancellationToken::new();
     let (warming_credit, creditor) = decdn_node::warming_allowance::spawn_warming_creditor(
         Arc::clone(&warming),
         Arc::clone(&metrics),
-        creditor_shutdown.clone(),
     );
 
     let handler = build_handler_limited_configured(
@@ -8415,8 +8409,10 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
         "the serve credit never reached the ledger through the channel sink"
     );
 
-    creditor_shutdown.cancel();
-    anyhow::ensure!(creditor.await.is_ok(), "the aggregator must exit cleanly");
+    anyhow::ensure!(
+        creditor.shutdown().await.is_ok(),
+        "the aggregator must exit cleanly"
+    );
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }

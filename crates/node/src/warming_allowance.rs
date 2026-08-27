@@ -47,10 +47,10 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::Metrics;
+use crate::stop_handle::StopHandle;
 
 /// One source node's warming ledger. `remaining` is a signed, zero-centered net
 /// P&L: negative means the source is in the hole (blocked), positive means it
@@ -305,7 +305,7 @@ impl WarmingCreditSink for DirectWarmingCreditSink {
 
 /// Spawn the single background task that owns the credit queue and applies each
 /// credit to `allowance`, returning the [`WarmingCreditSink`] the serve path
-/// enqueues through and the task's handle.
+/// enqueues through and the [`StopHandle`] that stops the task.
 ///
 /// This is what takes the bucket lock off the stream task (see the module
 /// Seam): a serve completion resolves the source from a lock-free tag map and
@@ -314,15 +314,19 @@ impl WarmingCreditSink for DirectWarmingCreditSink {
 ///
 /// The handle is returned rather than detached so shutdown can await the drain
 /// and a task that died is visible as a join error instead of as credits that
-/// quietly stop landing. `shutdown` ends the loop after it flushes whatever is
-/// already queued; the loop also ends if every sink is dropped first.
+/// quietly stop landing. [`StopHandle::shutdown`] ends the loop after it
+/// flushes whatever is already queued (the handle owns the stop token beside
+/// the task, so the join cannot hang on the sinks the client handler holds);
+/// the loop also ends if every sink is dropped first.
 pub fn spawn_warming_creditor(
     allowance: Arc<WarmingAllowance>,
     metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
-) -> (Arc<dyn WarmingCreditSink>, JoinHandle<()>) {
+) -> (Arc<dyn WarmingCreditSink>, StopHandle) {
     let (tx, rx) = mpsc::channel(WARMING_CREDIT_CAPACITY);
-    let handle = tokio::spawn(warming_creditor_loop(rx, Arc::clone(&allowance), shutdown));
+    let handle = {
+        let allowance = Arc::clone(&allowance);
+        StopHandle::spawn(move |shutdown| warming_creditor_loop(rx, allowance, shutdown))
+    };
     (
         Arc::new(ChannelWarmingCreditSink {
             tx,
@@ -369,13 +373,9 @@ mod tests {
     /// for the tests that only care about the credit landing.
     fn creditor(
         allowance: &Arc<WarmingAllowance>,
-    ) -> (Arc<dyn WarmingCreditSink>, JoinHandle<()>, Arc<Metrics>) {
+    ) -> (Arc<dyn WarmingCreditSink>, StopHandle, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::new());
-        let (sink, handle) = spawn_warming_creditor(
-            Arc::clone(allowance),
-            Arc::clone(&metrics),
-            CancellationToken::new(),
-        );
+        let (sink, handle) = spawn_warming_creditor(Arc::clone(allowance), Arc::clone(&metrics));
         (sink, handle, metrics)
     }
 
@@ -571,17 +571,14 @@ mod tests {
     async fn a_closed_queue_drops_and_counts_without_failing_the_serve() {
         let allowance = Arc::new(WarmingAllowance::new(1000, 0));
         let metrics = Arc::new(Metrics::new());
-        let shutdown = CancellationToken::new();
-        let (sink, handle) = spawn_warming_creditor(
-            Arc::clone(&allowance),
-            Arc::clone(&metrics),
-            shutdown.clone(),
-        );
+        let (sink, handle) = spawn_warming_creditor(Arc::clone(&allowance), Arc::clone(&metrics));
         allowance.debit_speculative(S1, H1, 1000);
 
         // Stop the aggregator and let it finish, so the channel is closed.
-        shutdown.cancel();
-        assert!(handle.await.is_ok(), "the aggregator must exit cleanly");
+        assert!(
+            handle.shutdown().await.is_ok(),
+            "the aggregator must exit cleanly"
+        );
 
         sink.credit(H1, 600);
         assert!(
@@ -600,18 +597,15 @@ mod tests {
     async fn shutdown_flushes_the_queued_tail() {
         let allowance = Arc::new(WarmingAllowance::new(1000, 0));
         let metrics = Arc::new(Metrics::new());
-        let shutdown = CancellationToken::new();
-        let (sink, handle) = spawn_warming_creditor(
-            Arc::clone(&allowance),
-            Arc::clone(&metrics),
-            shutdown.clone(),
-        );
+        let (sink, handle) = spawn_warming_creditor(Arc::clone(&allowance), Arc::clone(&metrics));
         allowance.debit_speculative(S1, H1, 1000);
         sink.credit(H1, 600);
         sink.credit(H1, 600);
 
-        shutdown.cancel();
-        assert!(handle.await.is_ok(), "the aggregator must exit cleanly");
+        assert!(
+            handle.shutdown().await.is_ok(),
+            "the aggregator must exit cleanly"
+        );
         assert!(
             allowance.available(S1),
             "credits enqueued before the stop signal must still be applied"
