@@ -26,7 +26,11 @@ mod retry;
 pub use bytes::Bytes;
 pub use circuit_breaker::CircuitBreakerPolicy;
 pub use decompress::DecompressMode;
-pub use defaults::{DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT};
+pub use defaults::{
+    DEFAULT_MAX_PROBE_HOLDS, DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
+    DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC, DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+    DEFAULT_ORIGIN_PROBE_TTL_SEC, DEFAULT_USER_AGENT,
+};
 pub use hash::{DeniedHashes, Hash, HashParseError, PinDiff, PinnedHashes};
 pub use origin_kind::OriginKind;
 pub use origin_url::{OriginUrl, parse_origin_url, redact_for_log};

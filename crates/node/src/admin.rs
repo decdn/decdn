@@ -127,6 +127,10 @@ pub struct AdminState {
     /// `AdminState` cannot confirm registration, and the optimistic answer would
     /// tell an operator their node is registered when nothing checked.
     staker_set: Option<Arc<dyn crate::dht::staker_set::StakerSet>>,
+    /// The live content denylist, attached via [`AdminState::with_denylist`].
+    /// `None` (unit tests that don't wire it) reports `chain_denied_origins:
+    /// 0` — an unwired `AdminState` has no chain-origin deny-set to count.
+    denylist: Option<Arc<crate::content_deny::ContentDenylist>>,
 }
 
 /// Read-only lane handles the `admin_v1_lanes` handler snapshots (issue
@@ -335,6 +339,7 @@ impl AdminState {
             binding: BindingReport::unknown(),
             warming: None,
             staker_set: None,
+            denylist: None,
         }
     }
 
@@ -421,6 +426,17 @@ impl AdminState {
         warming: Arc<crate::warming_allowance::WarmingAllowance>,
     ) -> Self {
         self.warming = Some(warming);
+        self
+    }
+
+    /// Attach the live content denylist so `admin_v1_status` can report the
+    /// current on-chain origin deny-set size (`chain_denied_origins`). The
+    /// production runtime calls this once after `new` with the SAME `Arc` the
+    /// client handler and blacklist watcher hold; without it, `status`
+    /// reports `0`.
+    #[must_use]
+    pub fn with_denylist(mut self, denylist: Arc<crate::content_deny::ContentDenylist>) -> Self {
+        self.denylist = Some(denylist);
         self
     }
 }
@@ -687,6 +703,9 @@ impl AdminRpcServer for AdminRpcImpl {
             republish: RepublishHealth {
                 scheduled_records: u64::try_from(dht.republish.len()).unwrap_or(u64::MAX),
             },
+            chain_denied_origins: self.state.denylist.as_ref().map_or(0, |d| {
+                u64::try_from(d.chain_origin_count()).unwrap_or(u64::MAX)
+            }),
         })
     }
 

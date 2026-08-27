@@ -24,20 +24,26 @@ use std::time::{Duration, Instant};
 use crate::Hash;
 
 /// Default TTL for a memoised positive origin-probe answer
-/// (`cache.origin_probe_ttl_sec`).
-pub const DEFAULT_ORIGIN_PROBE_TTL: Duration = Duration::from_secs(15);
+/// (`cache.origin_probe_ttl_sec`). Canonical seconds value from
+/// `decdn-config-types`, wrapped as a `Duration`.
+pub const DEFAULT_ORIGIN_PROBE_TTL: Duration =
+    Duration::from_secs(decdn_config_types::DEFAULT_ORIGIN_PROBE_TTL_SEC);
 /// Default negative TTL (`cache.origin_probe_negative_ttl_sec`). Short on
 /// purpose: it bounds how long a stale `Absent` can hide newly-available own
 /// content. A random-hash flood never repeats a hash within any window, so a
 /// short negative TTL barely changes the flood cost while capping the
 /// fresh-content dark window.
-pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL: Duration = Duration::from_secs(2);
+pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL: Duration =
+    Duration::from_secs(decdn_config_types::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC);
 /// Default per-probe live-`HEAD` ceiling (`cache.origin_probe_timeout_ms`) — a
 /// slow origin must never stall the probe hot path.
-pub const DEFAULT_ORIGIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_ORIGIN_PROBE_TIMEOUT: Duration =
+    Duration::from_millis(decdn_config_types::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
 /// Default cap on distinct memoised hashes (`cache.origin_probe_memo_capacity`).
 /// Bounds memory under a random-hash probe flood.
-pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: usize = 4096;
+#[allow(clippy::cast_possible_truncation)] // 4096 fits usize on every supported target.
+pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: usize =
+    decdn_config_types::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY as usize;
 
 /// A memoised existence answer for a hash against the configured origins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

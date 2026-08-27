@@ -20,7 +20,7 @@ use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_common::admin::{
     AdminRpcClient, BindingStatus, DrainRequest, DrainResponse, EvictRequest, EvictResponse,
-    HealthResponse, LaneSnapshot, LanesResponse, ReloadResponse, StatusResponse,
+    HealthResponse, LaneSnapshot, LanesResponse, ReloadResponse, SlashesResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -63,6 +63,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
+        cli::NodeCommand::Slashes(s) => slashes(s, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
         cli::NodeCommand::Drain(d) => drain(d, global_config).await,
@@ -663,6 +664,76 @@ fn format_usdc(micro: u64) -> String {
     format!("{whole}.{frac:06}")
 }
 
+/// `decdn node slashes`: call `admin_v1_slashes` on the running node and
+/// print every detected slash against its operator (#1032). Plain text by
+/// default (a summary line + a per-slash table), or pretty JSON with
+/// `--json`.
+pub async fn slashes(args: &cli::SlashesArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+
+    let config_path = args.config.as_deref().or(global_config);
+    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(args.timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+
+    let parsed: SlashesResponse = client
+        .slashes()
+        .await
+        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&parsed).context("failed to encode slashes as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        write_slashes_table(&mut stdout, &parsed).context("failed to write slashes table")?;
+    }
+
+    Ok(())
+}
+
+/// Write the slash table to `w`. Pure function (takes `&mut impl
+/// Write`) so the formatting is unit-testable without an HTTP hop,
+/// mirroring [`write_lanes_table`]. A summary line carries the count as a
+/// stable `key=value` token; the per-slash table follows.
+fn write_slashes_table(w: &mut impl io::Write, resp: &SlashesResponse) -> io::Result<()> {
+    writeln!(w, "slashes={}", resp.slashes.len())?;
+    if resp.slashes.is_empty() {
+        return writeln!(w, "(no slashes detected)");
+    }
+    writeln!(
+        w,
+        "{:<20} {:>6} {:>14} {:>10} {:>10} APPEAL_CLOSE",
+        "SLASH_ID", "TYPE", "AMOUNT", "BLOCK", "EVIDENCE",
+    )?;
+    for s in &resp.slashes {
+        let block = s
+            .block_number
+            .map_or_else(|| "?".to_string(), |b| b.to_string());
+        let close = s
+            .appeal_window_close
+            .map_or_else(|| "?".to_string(), |c| c.to_string());
+        writeln!(
+            w,
+            "{:<20} {:>6} {:>14} {:>10} {:>10} {close}",
+            s.slash_id,
+            s.offense_type,
+            s.amount,
+            block,
+            short_node_id(&s.evidence_hash),
+        )?;
+    }
+    Ok(())
+}
+
 /// Map a `jsonrpsee` client error into the three operator-actionable
 /// classes the previous reqwest path exposed:
 ///
@@ -947,6 +1018,7 @@ fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::
         "republish scheduled_records={}",
         s.republish.scheduled_records
     )?;
+    writeln!(w, "chain_denied_origins={}", s.chain_denied_origins)?;
 
     if s.routing.buckets.is_empty() {
         return writeln!(w, "(routing table empty — no buckets populated)");
@@ -1255,6 +1327,7 @@ impl From<&LookupRow> for LookupJson {
 )]
 mod tests {
     use super::*;
+    use decdn_common::admin::SlashRecordDto;
 
     fn health_response(binding: BindingStatus, bound: Option<&str>) -> HealthResponse {
         health_response_with_registry(binding, bound, true)
@@ -1500,6 +1573,7 @@ mod tests {
             republish: RepublishHealth {
                 scheduled_records: 5,
             },
+            chain_denied_origins: 3,
         }
     }
 
@@ -1519,6 +1593,7 @@ mod tests {
         // Record-store utilization: 50000/100000 → 50%.
         assert!(s.contains("record_store records=50000/100000 (50%)"), "{s}");
         assert!(s.contains("republish scheduled_records=5"), "{s}");
+        assert!(s.contains("chain_denied_origins=3"), "{s}");
         // Bucket table: header + a full bucket at 100%.
         assert!(s.contains("BUCKET"), "{s}");
         assert!(s.contains("FILL%"), "{s}");
@@ -1839,6 +1914,59 @@ mod tests {
         );
         // Second row: no activity → "never", not eligible → "no".
         assert!(s.contains("never"), "never sentinel missing: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_slashes_table_empty_emits_sentinel() -> anyhow::Result<()> {
+        let resp = SlashesResponse {
+            slashes: Vec::new(),
+        };
+        let mut buf = Vec::<u8>::new();
+        write_slashes_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("slashes=0"), "{s}");
+        assert!(s.contains("(no slashes detected)"), "{s}");
+        // No table header when there are no rows.
+        assert!(!s.contains("SLASH_ID"), "header must be omitted: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
+        let resp = SlashesResponse {
+            slashes: vec![
+                SlashRecordDto {
+                    slash_id: "42".to_string(),
+                    offense_type: 0,
+                    amount: "1_000_000".to_string(),
+                    evidence_hash: format!("0x{}", "a".repeat(64)),
+                    block_number: Some(1_234_567),
+                    appeal_window_close: Some(1_700_000_000),
+                },
+                SlashRecordDto {
+                    slash_id: "43".to_string(),
+                    offense_type: 1,
+                    amount: "2_500_000".to_string(),
+                    evidence_hash: format!("0x{}", "c".repeat(64)),
+                    block_number: None,
+                    appeal_window_close: None,
+                },
+            ],
+        };
+        let mut buf = Vec::<u8>::new();
+        write_slashes_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("slashes=2"), "{s}");
+        assert!(s.contains("SLASH_ID"), "header missing: {s}");
+        assert!(s.contains("APPEAL_CLOSE"), "header missing: {s}");
+        // First row: slash id, offense type, amount, block, evidence preview.
+        assert!(s.contains("42"), "slash id missing: {s}");
+        assert!(s.contains("1_000_000"), "amount missing: {s}");
+        assert!(s.contains("1234567"), "block number missing: {s}");
+        assert!(s.contains("0xaaaaaaaaaa"), "evidence preview missing: {s}");
+        // Second row: missing block / appeal close render as "?".
+        assert!(s.contains('?'), "missing-value sentinel missing: {s}");
         Ok(())
     }
 
