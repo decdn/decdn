@@ -86,10 +86,10 @@ use alloy::primitives::U256;
 use iroh_blobs::Hash;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::Metrics;
+use crate::stop_handle::StopHandle;
 
 /// File name of the receipt log within `data_dir`. Canonical name lives in
 /// `decdn_common` so the daemon writer and the `config validate` summary can't
@@ -682,7 +682,8 @@ impl ReceiptSink for DirectReceiptSink {
 
 /// Spawn the single background task that owns the on-disk [`ReceiptLog`] and
 /// drains the receipt queue, returning the [`ReceiptSink`] the delivery path
-/// enqueues through plus the task `JoinHandle` for graceful shutdown.
+/// enqueues through plus the [`StopHandle`] that stops the task at graceful
+/// shutdown.
 ///
 /// Decouples the audit write from the paid-delivery hot path (#803): the
 /// voucher-accept path does only a non-blocking [`ReceiptSink::record`] (a
@@ -693,17 +694,19 @@ impl ReceiptSink for DirectReceiptSink {
 /// caller of [`ReceiptLog::append`], so the log's internal mutex sees no
 /// cross-stream contention.
 ///
-/// On `shutdown` cancellation (fired after the router has drained, so no further
-/// receipts are produced) the task flushes whatever is already enqueued and
-/// exits; await the returned handle within the shutdown deadline to preserve the
-/// audit tail.
+/// On its stop signal ([`StopHandle::cancel`], fired after the router has
+/// drained, so no further receipts are produced) the task flushes whatever is
+/// already enqueued and exits; complete [`StopHandle::shutdown`] within the
+/// shutdown deadline to preserve the audit tail. The `StopHandle` owns the stop
+/// token beside the task handle, so the join cannot hang on sinks that outlive
+/// shutdown — [`crate::handlers::client::ClientHandler`] holds one for the
+/// whole runtime.
 pub fn spawn_receipt_writer(
     log: Arc<dyn ReceiptLog>,
     metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
-) -> (Arc<dyn ReceiptSink>, JoinHandle<()>) {
+) -> (Arc<dyn ReceiptSink>, StopHandle) {
     let (tx, rx) = mpsc::channel(RECEIPT_LOG_CAPACITY);
-    let handle = tokio::spawn(receipt_writer_loop(rx, log, shutdown));
+    let handle = StopHandle::spawn(move |shutdown| receipt_writer_loop(rx, log, shutdown));
     (Arc::new(ChannelReceiptSink { tx, metrics }), handle)
 }
 
@@ -842,17 +845,11 @@ mod tests {
     async fn writer_drains_all_queued_receipts_then_stops_on_cancel() -> anyhow::Result<()> {
         let log = Arc::new(RecordingLog::default());
         let metrics = Arc::new(Metrics::new());
-        let token = CancellationToken::new();
-        let (sink, handle) = spawn_receipt_writer(
-            Arc::clone(&log) as Arc<dyn ReceiptLog>,
-            metrics,
-            token.clone(),
-        );
+        let (sink, handle) = spawn_receipt_writer(Arc::clone(&log) as Arc<dyn ReceiptLog>, metrics);
         for tag in 0..8u8 {
             sink.record(sample(tag));
         }
-        token.cancel();
-        handle.await?;
+        handle.shutdown().await?;
         let seen = log.snapshot();
         anyhow::ensure!(
             seen.len() == 8,
@@ -878,17 +875,11 @@ mod tests {
             ..RecordingLog::default()
         });
         let metrics = Arc::new(Metrics::new());
-        let token = CancellationToken::new();
-        let (sink, handle) = spawn_receipt_writer(
-            Arc::clone(&log) as Arc<dyn ReceiptLog>,
-            metrics,
-            token.clone(),
-        );
+        let (sink, handle) = spawn_receipt_writer(Arc::clone(&log) as Arc<dyn ReceiptLog>, metrics);
         for tag in 0..5u8 {
             sink.record(sample(tag));
         }
-        token.cancel();
-        handle.await?;
+        handle.shutdown().await?;
         let seen = log.snapshot();
         let sizes: Vec<u64> = seen.iter().map(DownloadReceipt::size).collect();
         anyhow::ensure!(

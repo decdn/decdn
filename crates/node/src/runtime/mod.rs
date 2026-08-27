@@ -36,6 +36,7 @@ use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePoli
 use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
 use crate::payment_settlement::PoolSettlementService;
+use crate::stop_handle::StopHandle;
 use alloy::network::EthereumWallet;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -346,9 +347,11 @@ struct Infra {
     concrete_channel_store: Arc<PersistentPoolStateStore>,
     channel_state_store: Arc<dyn PoolStateStore>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
-    receipt_writer_shutdown: CancellationToken,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
-    receipt_writer: tokio::task::JoinHandle<()>,
+    /// Stop handle for the background receipt writer: cancelled after the
+    /// router drains on shutdown, then awaited in the drain phase so the audit
+    /// tail survives shutdown (#803).
+    receipt_writer: StopHandle,
     /// Periodic lane-store flush timer (ADR 003 §Off-chain voucher state
     /// persistence). Aborted after one final durable flush on shutdown.
     lane_flush_task: tokio::task::JoinHandle<()>,
@@ -499,15 +502,11 @@ async fn build_infra(
     // Decouple the audit write from the paid-delivery hot path (#803): a single
     // background task owns the receipt log and drains a bounded queue, so the
     // voucher-accept path only does a non-blocking enqueue before it continues
-    // delivery and a slow/full disk can never back-pressure delivery. The token is
-    // cancelled after the router drains on shutdown (below) so the writer
-    // flushes its tail before exiting.
-    let receipt_writer_shutdown = CancellationToken::new();
-    let (receipt_sink, receipt_writer) = crate::receipt_log::spawn_receipt_writer(
-        receipt_log,
-        Arc::clone(&node_metrics),
-        receipt_writer_shutdown.clone(),
-    );
+    // delivery and a slow/full disk can never back-pressure delivery. The
+    // writer's stop handle is cancelled after the router drains on shutdown
+    // (below) so the writer flushes its tail before exiting.
+    let (receipt_sink, receipt_writer) =
+        crate::receipt_log::spawn_receipt_writer(receipt_log, Arc::clone(&node_metrics));
 
     // Background lane-store flush (ADR 003 §Off-chain voucher state persistence):
     // mirror the in-memory voucher watermark to disk every
@@ -619,7 +618,6 @@ async fn build_infra(
         concrete_channel_store,
         channel_state_store,
         watcher_checkpoint_store,
-        receipt_writer_shutdown,
         receipt_sink,
         receipt_writer,
         lane_flush_task,
@@ -783,14 +781,12 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// client handler reaches it only through a
     /// [`crate::warming_allowance::WarmingCreditSink`], never directly.
     warming: Arc<crate::warming_allowance::WarmingAllowance>,
-    /// Stop signal for the ADR 041 warming-credit aggregator. Cancelled after
+    /// Stop handle for the ADR 041 warming-credit aggregator. Cancelled after
     /// the router drains on shutdown so the aggregator flushes the credits
-    /// already queued by in-flight serves before it exits.
-    warming_creditor_shutdown: CancellationToken,
-    /// Handle for that aggregator, awaited at shutdown. Held rather than
+    /// already queued by in-flight serves, then awaited — held rather than
     /// detached so a task that died shows up as a join error instead of as
     /// credits that quietly stop landing.
-    warming_creditor: tokio::task::JoinHandle<()>,
+    warming_creditor: StopHandle,
 }
 
 /// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
@@ -1321,11 +1317,9 @@ async fn build_chain_and_handlers(
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
     // keeps a serve's final step off the bucket lock those two passes take.
-    let warming_creditor_shutdown = CancellationToken::new();
     let (warming_credit, warming_creditor) = crate::warming_allowance::spawn_warming_creditor(
         Arc::clone(&warming),
         Arc::clone(&infra.node_metrics),
-        warming_creditor_shutdown.clone(),
     );
     client_deps.warming_credit = warming_credit;
     client_deps.operator_shares = operator_shares.clone();
@@ -1511,7 +1505,6 @@ async fn build_chain_and_handlers(
         serve_economics,
         operator_shares,
         warming,
-        warming_creditor_shutdown,
         warming_creditor,
     })
 }
@@ -2352,8 +2345,6 @@ pub async fn run(
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
         poller: ch.poller,
-        receipt_writer_shutdown: infra.receipt_writer_shutdown,
-        warming_creditor_shutdown: ch.warming_creditor_shutdown,
         payment_service: ch.payment_service,
         receipt_writer: infra.receipt_writer,
         warming_creditor: ch.warming_creditor,
@@ -2392,15 +2383,15 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// `router.shutdown`), because its capacity-bond route gates DHT admission
     /// through drain — see the cancel site in [`shutdown`].
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
-    receipt_writer_shutdown: CancellationToken,
-    /// Stop signal for the ADR 041 warming-credit aggregator, cancelled beside
-    /// the receipt writer's once the router has drained.
-    warming_creditor_shutdown: CancellationToken,
     payment_service: PoolSettlementService<P>,
-    receipt_writer: tokio::task::JoinHandle<()>,
-    /// The warming-credit aggregator, awaited in the drain phase so the serve
-    /// credits already queued land in the ledger before the runtime returns.
-    warming_creditor: tokio::task::JoinHandle<()>,
+    /// The background receipt writer, cancelled once the router has drained
+    /// and awaited in the drain phase so the audit tail survives shutdown
+    /// (#803).
+    receipt_writer: StopHandle,
+    /// The ADR 041 warming-credit aggregator, cancelled beside the receipt
+    /// writer and awaited in the drain phase so the serve credits already
+    /// queued land in the ledger before the runtime returns.
+    warming_creditor: StopHandle,
     /// Periodic lane-store flush timer, aborted below after one final durable
     /// flush of `channel_state_store`.
     lane_flush_task: tokio::task::JoinHandle<()>,
@@ -2439,8 +2430,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         mut admin_stop_tx,
         rpc_watchdog,
         poller,
-        receipt_writer_shutdown,
-        warming_creditor_shutdown,
         payment_service,
         receipt_writer,
         warming_creditor,
@@ -2576,13 +2565,15 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so
-    // the audit tail survives shutdown (#803).
-    receipt_writer_shutdown.cancel();
+    // the audit tail survives shutdown (#803). The early cancel overlaps the
+    // tail flush with the settlement and store teardown between here and the
+    // drain; the `shutdown().await` there cancels again as a no-op.
+    receipt_writer.cancel();
     // Same reasoning for the ADR 041 warming-credit aggregator: no further
     // serves complete, so no further credits are produced. Let it apply what is
     // already queued and exit; it is awaited in the drain phase below so a
     // completed serve's credit is not lost to shutdown timing.
-    warming_creditor_shutdown.cancel();
+    warming_creditor.cancel();
 
     // Redeem on shutdown (#327): now that the router has drained, no further
     // vouchers arrive and the persisted lane state is final. A pool is
@@ -2674,15 +2665,20 @@ async fn shutdown<P: Provider + Clone + 'static>(
         while let Some(result) = tasks.join_next().await {
             log_join_result(result, "shutdown");
         }
-        // Await the receipt writer so the runtime doesn't return while it's
-        // still flushing its tail. The cancel (above) makes it drain the queue
-        // and return cleanly; a panic surfaces at `warn` and a cancellation at
-        // `debug`, matching how every other drained task is logged.
-        log_join_result(receipt_writer.await, "receipt-writer-shutdown");
-        // Await the aggregator for the same reason, and so that a task that
-        // died earlier in the run surfaces here as a join error rather than as
-        // credits that silently stopped landing.
-        log_join_result(warming_creditor.await, "warming-creditor-shutdown");
+        // Stop-and-await the receipt writer so the runtime doesn't return while
+        // it's still flushing its tail. `StopHandle::shutdown` cancels before
+        // it joins (a no-op after the early cancel above), so the join cannot
+        // hang on the sinks the client handler holds; a panic surfaces at
+        // `warn` and a cancellation at `debug`, matching how every other
+        // drained task is logged.
+        log_join_result(receipt_writer.shutdown().await, "receipt-writer-shutdown");
+        // Stop-and-await the aggregator for the same reason, and so that a task
+        // that died earlier in the run surfaces here as a join error rather
+        // than as credits that silently stopped landing.
+        log_join_result(
+            warming_creditor.shutdown().await,
+            "warming-creditor-shutdown",
+        );
         // Await the RPC watchdog. We signalled it via oneshot above, so
         // a healthy run resolves cleanly here. A panic surfaces as a
         // warning; cancellation is silent (same as the receipt writer).

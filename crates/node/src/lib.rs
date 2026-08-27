@@ -41,4 +41,5 @@ pub mod runtime;
 pub mod selection;
 pub mod serve_economics;
 pub mod slash_watcher;
+pub mod stop_handle;
 pub mod warming_allowance;
