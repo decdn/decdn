@@ -348,9 +348,8 @@ impl std::fmt::Debug for OutboardFetch {
 /// retried (HTTP 5xx/408/429, transient I/O), and
 /// [`OriginPullError::Permanent`] for failures that won't be cured by
 /// retrying (HTTP 4xx other than 404, encoding/cap breaches, permission
-/// denied). The cache engine drives the retry loop in
-/// [`crate::retry::retry_fetch`] off this distinction. `NotFound` is *not*
-/// an error — adapters return [`OriginFetch::NotFound`].
+/// denied). The cache engine's retry loop keys off this distinction.
+/// `NotFound` is *not* an error — adapters return [`OriginFetch::NotFound`].
 pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// Fetch the blob with the given hash. `max_bytes` is an advisory cap —
     /// implementations should short-circuit if they can cheaply detect the

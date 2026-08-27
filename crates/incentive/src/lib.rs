@@ -96,9 +96,8 @@ pub use rate::{
     verify_rate,
 };
 pub use store::{
-    CheckpointKey, KeyedCheckpointStore, MemoryPendingSettleStore, MemoryPoolFloorLossStore,
-    MemoryPoolStateStore, PendingSettle, PendingSettleStore, PoolFloorLossStore, PoolStateStore,
-    StoreError,
+    CheckpointKey, KeyedCheckpointStore, MemoryPoolFloorLossStore, MemoryPoolStateStore,
+    PendingSettle, PendingSettleStore, PoolFloorLossStore, PoolStateStore, StoreError,
 };
 pub use stream_sig::{StreamSlashData, StreamSlashError};
 pub use swap_balancer::BalancerV3Venue;

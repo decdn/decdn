@@ -370,7 +370,7 @@ const fn is_transient_status(status: u16) -> bool {
 /// 5xx/408/429) become `Transient`; everything else (other 4xx,
 /// construction failures, response-parse failures, Glacier-cold objects)
 /// becomes `Permanent`. The cache engine's retry loop
-/// (`crate::retry::run_with_retry`) drives the retry budget off
+/// (`crate::retry::run_with_retry_classified`) drives the retry budget off
 /// this distinction.
 ///
 /// `SdkError` is `#[non_exhaustive]`. The catch-all arm classifies

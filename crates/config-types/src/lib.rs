@@ -20,7 +20,6 @@ mod defaults;
 mod hash;
 mod origin_kind;
 mod origin_url;
-mod percent;
 mod retry;
 
 pub use bytes::Bytes;
@@ -34,5 +33,4 @@ pub use defaults::{
 pub use hash::{DeniedHashes, Hash, HashParseError, PinDiff, PinnedHashes};
 pub use origin_kind::OriginKind;
 pub use origin_url::{OriginUrl, parse_origin_url, redact_for_log};
-pub use percent::Percent;
 pub use retry::{RetryPolicy, default_buffered_max_bytes};

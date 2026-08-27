@@ -53,7 +53,6 @@ pub mod ranged_store;
 /// failure is terminal or worth retrying against another provider/lane. Shared by
 /// the CLI single-source loop and the multi-source scheduler.
 pub mod retry;
-pub mod rtt_map;
 /// Client-only multi-source fetch scheduler (spec §5.3): fan a request across
 /// several paid sources over one shared store, with bao-aligned segmentation
 /// and tail-stealing. Drives [`driver::fill_gap`] per range.
@@ -63,7 +62,7 @@ mod scheduler;
 mod segment;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
-// module's own links (`ResponseDecoder`, `resume_offset`, …) would go unresolved
+// module's own links (`content_paid_frontier`, …) would go unresolved
 // and fail the `-D warnings` doc gate.
 pub mod sink;
 /// The two sourcing axes of the gap-driven driver (#1608): [`source::BlobSource`]

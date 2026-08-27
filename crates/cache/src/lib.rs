@@ -84,8 +84,8 @@ pub use serve_store::{EncodeStream, PresentRangeWatch, ServeStore};
 pub use decdn_config_types::Hash as LeafHash;
 pub use decdn_config_types::{
     Bytes, CircuitBreakerPolicy, DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode,
-    DeniedHashes, HashParseError, OriginKind, OriginUrl, Percent, PinDiff, PinnedHashes,
-    RetryPolicy, parse_origin_url, redact_for_log,
+    DeniedHashes, HashParseError, OriginKind, OriginUrl, PinDiff, PinnedHashes, RetryPolicy,
+    parse_origin_url, redact_for_log,
 };
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the

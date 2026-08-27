@@ -437,20 +437,6 @@ impl ClientRangedStore {
         &self.ranges_path
     }
 
-    /// Shared handle to the current data file path, for `admit`'s and
-    /// `finalize`'s `spawn_blocking` closures.
-    #[must_use]
-    pub fn data_path_handle(&self) -> Arc<Mutex<PathBuf>> {
-        Arc::clone(&self.data_path)
-    }
-
-    /// Shared handle to the in-memory present set, for `admit`'s and
-    /// `finalize`'s `spawn_blocking` closures.
-    #[must_use]
-    pub fn present_handle(&self) -> Arc<Mutex<ChunkRanges>> {
-        Arc::clone(&self.present)
-    }
-
     fn present_snapshot(&self) -> Result<ChunkRanges, RangedStoreError> {
         let guard = self.present.lock().map_err(|_| lock_poisoned("present"))?;
         Ok(guard.clone())

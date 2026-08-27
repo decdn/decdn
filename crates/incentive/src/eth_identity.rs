@@ -37,15 +37,6 @@ use zeroize::Zeroizing;
 /// loader.
 pub const KEYSTORE_PASSWORD_ENV: &str = "DECDN_KEYSTORE_PASSWORD";
 
-/// Arbitrum Sepolia chain id — decdn's initial network target. Bound on
-/// every `PrivateKeySigner` used in the runtime (and the test helpers) so
-/// EIP-712 signing and any `eth_sendTransaction` paths inherit a
-/// deterministic value. To target a different chain, thread the value
-/// through `ResolvedBlockchain` next to `rpc_url` (chain-id-keyed config
-/// is already a seam pattern; see `appendix-poc-production-seams.md`
-/// §Seam 8).
-pub const ARBITRUM_SEPOLIA_CHAIN_ID: u64 = 421_614;
-
 const KEYSTORE_FILE_NAME: &str = "keystore.json";
 /// Forbid any group/world bit on the keystore file. Encrypted at rest, but a
 /// readable ciphertext + a leaked or weak password is enough for offline
@@ -729,12 +720,12 @@ mod tests {
         let written = generate_and_persist(tmp.path(), TEST_PASSWORD, false).unwrap();
         let signer = load_signer(&keystore_path(tmp.path()), TEST_PASSWORD)
             .unwrap()
-            .with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID));
+            .with_chain_id(Some(421_614));
 
         let domain = eip712_domain! {
             name: "decdn-test",
             version: "1",
-            chain_id: ARBITRUM_SEPOLIA_CHAIN_ID,
+            chain_id: 421_614,
             verifying_contract: Address::ZERO,
         };
         let binding = BindNodeId {

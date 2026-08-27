@@ -1,11 +1,10 @@
 //! A byte-quantity config value (#894).
 //!
 //! A transparent newtype around `u64` so a byte quantity cannot be silently
-//! transposed with a same-width value carrying a *different* unit — most
-//! notably the seed-leech [`Percent`](crate::Percent) share ratio threaded
-//! alongside it through the same structs. The two are distinct types, so a
-//! bytes↔percent swap is a compile error rather than a saturating-arithmetic
-//! mis-pricing that compiles and runs (the seam #894 closes).
+//! transposed with a same-width value carrying a *different* unit threaded
+//! alongside it through the same structs. Distinct types make such a swap a
+//! compile error rather than a saturating-arithmetic mis-pricing that compiles
+//! and runs (the seam #894 closes).
 //!
 //! `#[serde(transparent)]` keeps the TOML/JSON wire form an unchanged bare
 //! integer, so wrapping an existing `u64` config field is a non-breaking

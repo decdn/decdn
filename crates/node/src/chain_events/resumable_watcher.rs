@@ -40,9 +40,8 @@ use tracing::warn;
 use super::AbortOnDrop;
 
 /// A durable per-key scan checkpoint: the store plus the key it reads and writes
-/// under. Carried by the [`CursorStart`] variants that persist their cursor
-/// forward — and, for [`CursorStart::FromCheckpoint`], the source its resume
-/// floor is read from.
+/// under. Carried by [`CursorStart::FromCheckpoint`], which persists its cursor
+/// forward and reads its resume floor back from the same key.
 pub(crate) struct Checkpoint {
     pub(crate) store: Arc<dyn KeyedCheckpointStore>,
     pub(crate) key: CheckpointKey,
@@ -68,15 +67,10 @@ pub(crate) enum ColdStart {
 
 pub(crate) enum CursorStart {
     /// Start at an explicit block — a bootstrap snapshot head, already covered
-    /// by an out-of-band enumeration. Bypasses floor derivation entirely.
-    /// `persist` carries the cursor forward when the projection has a durable
-    /// checkpoint (the origin watcher's former cursor) and is `None` for an
-    /// ephemeral live-follow rebuilt from its enumeration each boot (the
-    /// capacity-bond staker set).
-    Seeded {
-        at: u64,
-        persist: Option<Checkpoint>,
-    },
+    /// by an out-of-band enumeration. Bypasses floor derivation entirely and
+    /// never persists: a seeded projection is an ephemeral live-follow rebuilt
+    /// from its enumeration each boot (the capacity-bond staker set).
+    Seeded { at: u64 },
     /// Resume from a durable checkpoint, rewound by `reorg_margin`, persisting
     /// forward each window. This is the only start that reads a checkpoint to
     /// derive its floor (settlement `ChannelOpened`, blacklist deny-set).
@@ -117,9 +111,8 @@ impl CursorStart {
     /// [`Self::FromCheckpoint`], reads its resume floor from), if any.
     const fn checkpoint(&self) -> Option<&Checkpoint> {
         match self {
-            Self::Seeded { persist, .. } => persist.as_ref(),
             Self::FromCheckpoint { checkpoint, .. } => Some(checkpoint),
-            Self::HeadMinusWindow { .. } => None,
+            Self::Seeded { .. } | Self::HeadMinusWindow { .. } => None,
         }
     }
 
@@ -179,7 +172,7 @@ impl CursorStart {
     }
 
     /// Durably record `block` as scanned (no-op for the non-persisting
-    /// [`Self::HeadMinusWindow`] and unpersisted [`Self::Seeded`] starts).
+    /// [`Self::HeadMinusWindow`] and [`Self::Seeded`] starts).
     /// Best-effort: a lost write only widens the next rescan (see the store's
     /// monotonic-floor contract).
     pub(crate) fn persist(&self, block: u64) {
@@ -464,47 +457,10 @@ mod tests {
     /// every other start resolves its floor on the first tick (`seed` → `None`).
     #[test]
     fn seed_is_some_only_for_seeded() {
-        assert_eq!(
-            CursorStart::Seeded {
-                at: 42,
-                persist: None
-            }
-            .seed(),
-            Some(42)
-        );
+        assert_eq!(CursorStart::Seeded { at: 42 }.seed(), Some(42));
         assert_eq!(
             CursorStart::HeadMinusWindow { window_blocks: 10 }.seed(),
             None
-        );
-    }
-
-    /// A `Seeded { persist: Some(_) }` start writes its cursor forward (origin's
-    /// checkpoint, which no production watcher does today. A `persist: None` seed records nothing
-    /// (capacity-bond, rebuilt each boot).
-    #[test]
-    fn seeded_persist_drives_the_forward_checkpoint() {
-        let store = Arc::new(MemoryCheckpointStore::default());
-        let persisting = CursorStart::Seeded {
-            at: 0,
-            persist: Some(Checkpoint {
-                store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
-                key: CheckpointKey::Origin,
-            }),
-        };
-        persisting.persist(99);
-        assert_eq!(
-            store.load_checkpoint(CheckpointKey::Origin).ok().flatten(),
-            Some(99),
-            "a persisting seed records its cursor forward"
-        );
-
-        let ephemeral = CursorStart::Seeded {
-            at: 0,
-            persist: None,
-        };
-        assert!(
-            ephemeral.checkpoint().is_none(),
-            "a None-persist seed has no durable checkpoint"
         );
     }
 
@@ -523,10 +479,7 @@ mod tests {
     /// floor rather than panicking.
     #[test]
     fn seeded_initial_from_defensive_fallback_is_the_deploy_floor() {
-        let start = CursorStart::Seeded {
-            at: 5_000,
-            persist: None,
-        };
+        let start = CursorStart::Seeded { at: 5_000 };
         assert_eq!(start.initial_from(500, 20_000).ok(), Some(500));
     }
 

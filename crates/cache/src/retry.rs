@@ -74,7 +74,7 @@ use iroh_blobs::Hash;
 
 use crate::error::{OriginError, OriginPullError};
 use crate::metrics::CacheMetrics;
-use crate::origin::{BlobTooLargeMarker, Origin, OriginByteStream, OriginFetch};
+use crate::origin::{BlobTooLargeMarker, OriginByteStream};
 
 /// Compute the backoff delay before the `attempt`-th retry (0-indexed:
 /// `attempt = 0` is the first retry, immediately after the initial
@@ -106,47 +106,13 @@ fn delay_for(policy: RetryPolicy, attempt: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Drive a per-attempt closure through the retry policy.
-///
-/// This is the single retry-loop primitive in the cache crate. Both
-/// [`retry_fetch`] (which wraps just `origin.fetch`) and the engine's
-/// `pull_through_attempt` (which wraps origin.fetch + stream-and-commit)
-/// build on it; sharing the loop ensures the same `max_retries` budget,
-/// exhaustion-counter accounting, and tracing shape applies to headers-
-/// phase, drain-phase, and streaming-phase failures uniformly.
-///
-/// The closure is re-invoked for each attempt — callers must not capture
-/// state that can only be consumed once. Returns:
-/// - `Ok(T)` on first success.
-/// - `Err(OriginPullError::Permanent)` on any non-retriable failure or
-///   when `max_retries` is exhausted (the final transient is rewrapped
-///   into the same variant the engine collapses into `CacheError`).
-///
-/// `metrics`, when present, has its `origin_retry_exhausted_total`
-/// counter bumped when the budget is burned through. Per-attempt
-/// visibility is via `tracing::warn!`/`tracing::error!` lines.
-pub(crate) async fn run_with_retry<F, Fut, T>(
-    policy: RetryPolicy,
-    metrics: Option<&Arc<CacheMetrics>>,
-    hash: Hash,
-    attempt_fn: F,
-) -> Result<T, OriginPullError>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, OriginPullError>>,
-{
-    run_with_retry_classified(policy, metrics, hash, attempt_fn)
-        .await
-        .0
-}
-
 /// Whether a terminal pull-through failure left the origin looking
 /// *unreachable* (a transient that exhausted the retry budget) or merely
 /// unable to serve *this* object (an immediate permanent — 4xx, decode,
 /// cap). Used by the per-origin circuit-breaker (#963) to decide whether
-/// an attempt counts toward the trip threshold; `run_with_retry` itself
-/// collapses both into `OriginPullError::Permanent`, erasing the
-/// distinction the breaker needs.
+/// an attempt counts toward the trip threshold; the plain `Result` the
+/// engine folds this into collapses both into `OriginPullError::Permanent`,
+/// erasing the distinction the breaker needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalFailure {
     /// The terminal error was a transient that exhausted `max_retries`
@@ -158,7 +124,7 @@ pub(crate) enum TerminalFailure {
     Permanent,
 }
 
-/// [`run_with_retry`] plus a terminal-failure classification for the
+/// The retry loop, with a terminal-failure classification for the
 /// circuit-breaker (#963). On `Ok`, the second tuple element is `None`.
 /// On `Err`, it carries whether the failure was a transient-exhaustion
 /// (origin-unavailable) or an immediate permanent (per-object).
@@ -223,57 +189,6 @@ where
     }
 }
 
-/// Drive a single origin fetch through the retry policy, with optional
-/// small-blob buffer-then-commit (#519).
-///
-/// Returns:
-/// - `Ok(OriginFetch::NotFound)` when the origin signals not-found
-///   (deterministic answer, never retried).
-/// - `Ok(OriginFetch::Found { stream, size_hint })` when the origin
-///   advertised a `size_hint > policy.buffered_max_bytes` or set it to
-///   `None` — caller takes the streaming path.
-/// - `Ok(OriginFetch::Found { stream: <one-shot>, size_hint: Some(n) })`
-///   when the body fit under `buffered_max_bytes` and was drained
-///   in-loop. The returned stream yields the buffered bytes once and
-///   then completes.
-/// - `Ok(OriginFetch::AlreadyAdmitted)` when the origin admitted the blob
-///   into the store itself — passed through unchanged, nothing to buffer.
-/// - `Err(OriginPullError::Permanent)` on permanent or exhausted
-///   failure.
-pub async fn retry_fetch(
-    origin: &Arc<dyn Origin>,
-    hash: Hash,
-    max_bytes: u64,
-    policy: RetryPolicy,
-    metrics: Option<&Arc<CacheMetrics>>,
-) -> Result<OriginFetch, OriginPullError> {
-    run_with_retry(policy, metrics, hash, || async {
-        let fetch = origin.fetch(hash, max_bytes).await?;
-        let (stream, size_hint) = match fetch {
-            OriginFetch::Found { stream, size_hint } => (stream, size_hint),
-            OriginFetch::NotFound => return Ok(OriginFetch::NotFound),
-            // The origin already admitted the blob into the store directly
-            // (node-to-node pull, #1682) — nothing here to buffer or retry
-            // classification for; pass it straight through.
-            OriginFetch::AlreadyAdmitted => return Ok(OriginFetch::AlreadyAdmitted),
-        };
-        if should_buffer(size_hint, policy.buffered_max_bytes) {
-            // Pre-stream cap: a `size_hint` over `max_bytes` should
-            // already have surfaced as `OriginPullError::Permanent`
-            // inside the adapter, but enforce here too so the drain
-            // budget can never exceed the engine-level blob cap.
-            let drain_cap = policy.buffered_max_bytes.min(max_bytes);
-            match drain_to_bytes(stream, drain_cap, metrics).await {
-                Ok(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
-                Err(e) => Err(classify_io_error(e)),
-            }
-        } else {
-            Ok(OriginFetch::Found { stream, size_hint })
-        }
-    })
-    .await
-}
-
 /// True when the origin's advertised `size_hint` is small enough to
 /// buffer in memory for body-phase retry classification. Unknown
 /// (`None`) hint falls through to streaming — buffering an unknown-size
@@ -289,7 +204,7 @@ pub(crate) const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u6
 }
 
 /// Drain `stream` into a contiguous `Bytes`, capping the buffer at
-/// `cap` bytes. Mirrors [`OriginFetch::collect_to_bytes`] but adds:
+/// `cap` bytes. Mirrors [`crate::origin::OriginFetch::collect_to_bytes`] but adds:
 ///
 /// - A running cap: chunks past `cap` produce an `io::Error` whose
 ///   inner is a [`BlobTooLargeMarker`], so the caller can downcast and

@@ -1101,15 +1101,7 @@ mod tests {
         // the merged scan range is dragged down to B's floor and includes
         // blocks below A's.
         let (route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
-        let (route_b, sink_b) = seeded_route(
-            "b",
-            ADDR_B,
-            TOPIC_B,
-            CursorStart::Seeded {
-                at: 0,
-                persist: None,
-            },
-        );
+        let (route_b, sink_b) = seeded_route("b", ADDR_B, TOPIC_B, CursorStart::Seeded { at: 0 });
         let built =
             MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
                 .max_backfill_span(10)
@@ -1534,24 +1526,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
 
         // Both routes seeded past head -> no get_logs issued this tick.
-        let (route_a, sink_a) = seeded_route(
-            "a",
-            ADDR_A,
-            TOPIC_A,
-            CursorStart::Seeded {
-                at: 100,
-                persist: None,
-            },
-        );
-        let (route_b, sink_b) = seeded_route(
-            "b",
-            ADDR_B,
-            TOPIC_B,
-            CursorStart::Seeded {
-                at: 100,
-                persist: None,
-            },
-        );
+        let (route_a, sink_a) = seeded_route("a", ADDR_A, TOPIC_A, CursorStart::Seeded { at: 100 });
+        let (route_b, sink_b) = seeded_route("b", ADDR_B, TOPIC_B, CursorStart::Seeded { at: 100 });
         let built =
             MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
                 .route(route_a)
@@ -2133,17 +2109,26 @@ mod tests {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let store = Arc::new(MemoryCheckpointStore::default());
+        // Pre-recorded cursor 1 with a zero reorg margin: the first tick's floor
+        // resolves to block 1, giving the three-window script below. The memory
+        // store's record is infallible; assert rather than expect (anti-panic lint).
+        assert!(
+            store
+                .record_checkpoint(CheckpointKey::PoolOpened, 1)
+                .is_ok()
+        );
 
         let (route_a, sink_a) = seeded_route(
             "a",
             ADDR_A,
             TOPIC_A,
-            CursorStart::Seeded {
-                at: 1,
-                persist: Some(Checkpoint {
+            CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
                     store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
                     key: CheckpointKey::PoolOpened,
-                }),
+                },
+                reorg_margin: 0,
+                cold_start: ColdStart::Head,
             },
         );
         // Fail on the 2nd apply (0-indexed): window [1,1] succeeds, window

@@ -135,20 +135,6 @@ pub fn pool_id(owner: Address, owner_pool_nonce: u64) -> B256 {
     alloy::primitives::keccak256(&packed)
 }
 
-/// The next pool nonce `openPool` will assign to `owner` (the public mapping
-/// getter), so a test can derive the resulting `poolId` ahead of the open.
-pub async fn owner_pool_nonce<P: Provider>(
-    provider: &P,
-    payment_pool: Address,
-    owner: Address,
-) -> anyhow::Result<U256> {
-    PaymentPool::new(payment_pool, provider)
-        .ownerPoolNonce(owner)
-        .call()
-        .await
-        .context("ownerPoolNonce")
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

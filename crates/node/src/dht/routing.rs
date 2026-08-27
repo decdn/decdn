@@ -67,15 +67,6 @@ pub fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; NODE_ID_LEN] {
     xor_distance_bytes(a.as_bytes(), b.as_bytes())
 }
 
-/// Compare two `NodeId`s by XOR distance to `target`. `Less` means `a` is
-/// strictly closer to `target` than `b`. Used to sort candidate sets during
-/// iterative lookup and to enforce the "strictly closer" invariant on
-/// `closer_nodes` (ADR 022 §Lookup integrity step 1).
-#[must_use]
-pub fn cmp_by_distance(a: &NodeId, b: &NodeId, target: &NodeId) -> std::cmp::Ordering {
-    xor_distance(a, target).cmp(&xor_distance(b, target))
-}
-
 /// Index of the bucket that holds peers at XOR distance `d` from the
 /// routing-table's own node id. The bucket index is the position of the
 /// most-significant set bit in `d` (counted from the high end), so peers
@@ -567,20 +558,6 @@ mod tests {
         let fills = rt.non_empty_bucket_fills();
         // Only the two populated buckets, ascending by index, with real counts.
         assert_eq!(fills, vec![(10, 3), (200, 1)]);
-    }
-
-    #[test]
-    fn cmp_by_distance_orders_closer_first() {
-        let target = id(0);
-        // a is closer to target than b.
-        let a = id(1);
-        let b = id(0xFF);
-        assert_eq!(cmp_by_distance(&a, &b, &target), std::cmp::Ordering::Less);
-        assert_eq!(
-            cmp_by_distance(&b, &a, &target),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(cmp_by_distance(&a, &a, &target), std::cmp::Ordering::Equal);
     }
 }
 

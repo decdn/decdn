@@ -421,23 +421,6 @@ fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
     end
 }
 
-/// Convenience wrapper around [`rank_candidates`]: returns the top `n`
-/// ranked candidates, where the caller will iterate them in order and stop
-/// after the first successful pull.
-///
-/// Returns fewer than `n` results when the candidate pool is smaller.
-///
-/// Note this is **not** how the node's pull path bounds its work:
-/// [`MAX_PROVIDER_ATTEMPTS`] is a fetch-wide budget spent across every
-/// candidate list a fetch consults, not a per-list cap (#1165), so
-/// `node_origin`'s ranker deliberately does not truncate. Do not reach for
-/// `top_n(candidates, MAX_PROVIDER_ATTEMPTS)` on that path.
-pub fn top_n(candidates: Vec<Candidate>, n: usize) -> Vec<RankedCandidate> {
-    let mut ranked = rank_candidates(candidates);
-    ranked.truncate(n);
-    ranked
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
@@ -925,41 +908,6 @@ mod tests {
             }
         }
         assert!(saw_ab && saw_ba, "expected both orderings across 32 seeds");
-    }
-
-    #[test]
-    fn top_n_returns_at_most_n() {
-        let cs: Vec<Candidate> = (0..5)
-            .map(|i| make_candidate(i, 100 + u64::from(i), 10, 1.0))
-            .collect();
-        let out = top_n(cs, MAX_PROVIDER_ATTEMPTS);
-        assert_eq!(out.len(), MAX_PROVIDER_ATTEMPTS);
-    }
-
-    #[test]
-    fn top_n_caps_at_input_length_when_smaller() {
-        let cs = vec![make_candidate(1, 100, 10, 1.0)];
-        let out = top_n(cs, MAX_PROVIDER_ATTEMPTS);
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn top_n_returns_lowest_score_first() {
-        let cheap = make_candidate(1, 1, 10, 1.0); // score 10
-        let mid = make_candidate(2, 10, 10, 1.0); // score 100
-        let dear = make_candidate(3, 100, 10, 1.0); // score 1000
-        let out = top_n(vec![dear, cheap, mid], 2);
-        let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
-        assert_eq!(ids, vec![1, 2]);
-    }
-
-    #[test]
-    fn top_n_with_zero_returns_empty() {
-        // Boundary: n = 0 produces an empty result. Locks the contract against
-        // a future change like `truncate(n.max(1))`.
-        let cs: Vec<Candidate> = (0..3).map(|i| make_candidate(i, 100, 10, 1.0)).collect();
-        let out = top_n(cs, 0);
-        assert!(out.is_empty());
     }
 
     #[test]
