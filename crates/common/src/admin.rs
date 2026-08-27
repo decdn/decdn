@@ -359,6 +359,11 @@ pub struct StatusResponse {
     pub record_store: RecordStoreHealth,
     /// Republish-scheduler depth.
     pub republish: RepublishHealth,
+    /// Number of origins currently in the on-chain origin deny-set
+    /// (`ContentBlacklist` origin blacklist, ADR 011). Read from the live
+    /// denylist the client handler and blacklist watcher share; `0` when no
+    /// denylist is wired.
+    pub chain_denied_origins: u64,
 }
 
 /// JSON view of one lane this node provides against a `PaymentPool`,
@@ -739,6 +744,7 @@ mod tests {
             republish: RepublishHealth {
                 scheduled_records: 5,
             },
+            chain_denied_origins: 3,
         };
         let json = serde_json::to_string(&resp).expect("serialize StatusResponse");
         let back: StatusResponse = serde_json::from_str(&json).expect("deserialize StatusResponse");
@@ -750,6 +756,7 @@ mod tests {
         assert_eq!(back.known_stakers, 7);
         assert_eq!(back.record_store.capacity, 100_000);
         assert_eq!(back.republish.scheduled_records, 5);
+        assert_eq!(back.chain_denied_origins, 3);
     }
 
     /// `LanesResponse` round-trips through serde unchanged — guards the
