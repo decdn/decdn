@@ -11,12 +11,12 @@
 //!
 //! The signed payload follows ADR 014 §EIP-712 Type Definitions exactly so an
 //! off-chain Rust signature byte-matches what the on-chain `SlashJudge`
-//! contract recovers signatures against. `hash` and `channel_id` are
+//! contract recovers signatures against. `hash` and `pool_id` are
 //! request-context fields (from the `StreamRequest`); in this implementation's
 //! wire shape they are echoed back in
-//! `decdn_protocol::StreamResponseBody.{hash,pool_id}` — the contract names the
-//! latter `channelId` — and are part of the EIP-712 signed set: a verifier
-//! reconstructs the typed data from the response body's own fields.
+//! `decdn_protocol::StreamResponseBody.{hash,pool_id}` and are part of the
+//! EIP-712 signed set: a verifier reconstructs the typed data from the
+//! response body's own fields.
 //!
 //! # Domain
 //!
@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,
-//!                bytes32 channelId,uint64 timestampUs)
+//!                bytes32 poolId,uint64 timestampUs)
 //! ```
 
 use alloy::dyn_abi::Eip712Domain;
@@ -58,7 +58,7 @@ mod sol_types {
             bool ok;
             uint64 ratePerMb;
             uint64 totalBytes;
-            bytes32 channelId;
+            bytes32 poolId;
             uint64 timestampUs;
         }
     }
@@ -66,9 +66,22 @@ mod sol_types {
 
 use sol_types::StreamResponse as StreamResponseSol;
 
+/// Pinned keccak256 digest of the canonical `StreamResponse` EIP-712 type
+/// string (ADR 014 §EIP-712 Type Definitions):
+///
+/// ```text
+/// StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs)
+/// ```
+///
+/// The Solidity suite pins `SlashJudge.STREAM_RESPONSE_TYPEHASH` to the same
+/// digest (`contracts/test/SlashJudge.t.sol`), so a one-sided edit of either
+/// side's type string fails default CI on both sides (#1843).
+pub const STREAM_RESPONSE_TYPEHASH: B256 =
+    alloy::primitives::b256!("0xc6d9e65c3527b52698988cae3aea61d5d8df64b415de933cc7e9762bc600eb3e");
+
 /// The signed field set of a `StreamResponse` (ADR 014 §1).
 ///
-/// `hash` and `channel_id` are request-context fields echoed back in the
+/// `hash` and `pool_id` are request-context fields echoed back in the
 /// response body; `timestamp_us` is the requester-generated timestamp echoed
 /// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, and
 /// `total_bytes`, these are exactly the fields the on-chain `SlashJudge`
@@ -83,8 +96,8 @@ pub struct StreamSlashData {
     pub rate_per_mb: u64,
     /// Total blob size in bytes.
     pub total_bytes: u64,
-    /// The payment channel this response is bound to.
-    pub channel_id: B256,
+    /// The shared payment pool this response is bound to.
+    pub pool_id: B256,
     /// Requester-generated microsecond timestamp echoed from the request.
     pub timestamp_us: u64,
 }
@@ -98,7 +111,7 @@ impl StreamSlashData {
             ok: body.ok,
             rate_per_mb: body.rate_per_mb,
             total_bytes: body.total_bytes,
-            channel_id: B256::from(body.pool_id),
+            pool_id: B256::from(body.pool_id),
             timestamp_us: body.timestamp_us,
         }
     }
@@ -109,7 +122,7 @@ impl StreamSlashData {
             ok: self.ok,
             ratePerMb: self.rate_per_mb,
             totalBytes: self.total_bytes,
-            channelId: self.channel_id,
+            poolId: self.pool_id,
             timestampUs: self.timestamp_us,
         }
     }
@@ -226,7 +239,7 @@ mod tests {
             ok: true,
             rate_per_mb: 10_000,
             total_bytes: 1_048_576,
-            channel_id: B256::repeat_byte(0x33),
+            pool_id: B256::repeat_byte(0x33),
             timestamp_us: 1_700_000_000_000_000,
         }
     }
@@ -355,7 +368,7 @@ mod tests {
                 ..data
             },
             StreamSlashData {
-                channel_id: B256::ZERO,
+                pool_id: B256::ZERO,
                 ..data
             },
             StreamSlashData {
@@ -373,18 +386,23 @@ mod tests {
         Ok(())
     }
 
-    /// Lock the EIP-712 type hash to the exact ADR 014 wording. If this breaks,
-    /// either the ADR changed or the `sol!` macro's canonical encoding shifted
-    /// — both warrant a coordinated update with the `SlashJudge` contract.
+    /// Lock the EIP-712 type hash to the exact ADR 014 wording and to the
+    /// pinned [`STREAM_RESPONSE_TYPEHASH`] digest the Solidity suite also
+    /// asserts. If this breaks, either the ADR changed or the `sol!` macro's
+    /// canonical encoding shifted — both warrant a coordinated update with the
+    /// `SlashJudge` contract and its deployment manifests.
     #[test]
     fn stream_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
         use alloy::primitives::keccak256;
-        let canonical: &[u8] = b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs)";
-        let expected = keccak256(canonical);
+        let canonical: &[u8] = b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 poolId,uint64 timestampUs)";
+        anyhow::ensure!(
+            keccak256(canonical) == STREAM_RESPONSE_TYPEHASH,
+            "pinned STREAM_RESPONSE_TYPEHASH does not match the ADR 014 type string"
+        );
         let actual = StreamResponseSol::eip712_type_hash(&sample_data().to_sol());
         anyhow::ensure!(
-            actual == expected,
-            "StreamResponse type hash drifted: actual={actual} expected={expected}"
+            actual == STREAM_RESPONSE_TYPEHASH,
+            "StreamResponse type hash drifted: actual={actual} expected={STREAM_RESPONSE_TYPEHASH}"
         );
         Ok(())
     }
@@ -402,20 +420,17 @@ mod tests {
         let data = sample_data();
         let domain = sample_domain();
 
-        let type_hash = keccak256(
-            b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,bytes32 channelId,uint64 timestampUs)",
-        );
         // EIP-712 encodeData: each field as a 32-byte ABI word, prefixed by the
-        // type hash. All fields here are static, so abi_encode of the tuple is
-        // exactly 7 × 32 bytes.
+        // pinned type hash. All fields here are static, so abi_encode of the
+        // tuple is exactly 7 × 32 bytes.
         let struct_hash = keccak256(
             (
-                type_hash,
+                STREAM_RESPONSE_TYPEHASH,
                 data.hash,
                 data.ok,
                 data.rate_per_mb,
                 data.total_bytes,
-                data.channel_id,
+                data.pool_id,
                 data.timestamp_us,
             )
                 .abi_encode(),

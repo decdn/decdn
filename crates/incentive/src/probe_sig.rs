@@ -73,6 +73,19 @@ mod sol_types {
 
 use sol_types::ProbeResponse as ProbeResponseSol;
 
+/// Pinned keccak256 digest of the canonical `ProbeResponse` EIP-712 type
+/// string (ADR 014 §EIP-712 Type Definitions):
+///
+/// ```text
+/// ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)
+/// ```
+///
+/// The Solidity suite pins `SlashJudge.PROBE_RESPONSE_TYPEHASH` to the same
+/// digest (`contracts/test/SlashJudge.t.sol`), so a one-sided edit of either
+/// side's type string fails default CI on both sides (#1843).
+pub const PROBE_RESPONSE_TYPEHASH: B256 =
+    alloy::primitives::b256!("0x4638cb019b77f8677ac7015556f19e56f0be5a6a0d9392006a7fb5b8acd587e5");
+
 /// Construct the EIP-712 domain used to sign probe responses for a given
 /// `SlashJudge` deployment.
 #[must_use]
@@ -409,20 +422,24 @@ mod tests {
         Ok(())
     }
 
-    /// Lock the EIP-712 type hash to the exact ADR 014 wording. If this
-    /// breaks, either the ADR changed or the `sol!` macro's canonical
-    /// encoding shifted — both warrant a coordinated update with the
-    /// `SlashJudge` Solidity contract.
+    /// Lock the EIP-712 type hash to the exact ADR 014 wording and to the
+    /// pinned [`PROBE_RESPONSE_TYPEHASH`] digest the Solidity suite also
+    /// asserts. If this breaks, either the ADR changed or the `sol!` macro's
+    /// canonical encoding shifted — both warrant a coordinated update with the
+    /// `SlashJudge` contract and its deployment manifests.
     #[test]
     fn probe_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
         use alloy::primitives::keccak256;
         let canonical: &[u8] =
             b"ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)";
-        let expected = keccak256(canonical);
+        anyhow::ensure!(
+            keccak256(canonical) == PROBE_RESPONSE_TYPEHASH,
+            "pinned PROBE_RESPONSE_TYPEHASH does not match the ADR 014 type string"
+        );
         let actual = ProbeResponseSol::eip712_type_hash(&sample_data().to_sol());
         anyhow::ensure!(
-            actual == expected,
-            "ProbeResponse type hash drifted: actual={actual} expected={expected}"
+            actual == PROBE_RESPONSE_TYPEHASH,
+            "ProbeResponse type hash drifted: actual={actual} expected={PROBE_RESPONSE_TYPEHASH}"
         );
         Ok(())
     }

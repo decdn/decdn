@@ -56,8 +56,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         keccak256("ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)");
 
     bytes32 public constant STREAM_RESPONSE_TYPEHASH = keccak256(
-        "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes,"
-        "bytes32 channelId,uint64 timestampUs)"
+        "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 totalBytes," "bytes32 poolId,uint64 timestampUs)"
     );
 
     // -----------------------------------------------------------------
@@ -154,7 +153,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         bool ok;
         uint64 ratePerMb;
         uint64 totalBytes;
-        bytes32 channelId;
+        bytes32 poolId;
         uint64 timestampUs;
     }
 
@@ -418,7 +417,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
 
     function _streamStructHash(StreamMsg memory s) internal pure returns (bytes32) {
         return keccak256(
-            abi.encode(STREAM_RESPONSE_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs)
+            abi.encode(STREAM_RESPONSE_TYPEHASH, s.hash, s.ok, s.ratePerMb, s.totalBytes, s.poolId, s.timestampUs)
         );
     }
 
