@@ -4,9 +4,9 @@
 //! that an operator must triage differently:
 //!
 //! - **`InsufficientDeposit`** — a *misconfiguration*: the node's USDC balance
-//!   or standing allowance cannot cover the deposit, the deposit is zero —
+//!   or standing allowance cannot cover the deposit; or the deposit is zero —
 //!   either as requested, or as the balance delta actually received under a
-//!   fee-on-transfer token — or the credited deposit is below the
+//!   fee-on-transfer token; or the credited deposit is below the
 //!   governance-set `minDeposit` Sybil floor. (A zero deposit cannot be
 //!   requested: both the daemon
 //!   and the CLI validate `buyer_working_deposit_micro_usdc` / the
@@ -84,9 +84,9 @@ sol! {
 /// share one aggregate and one budget axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolOpenFailureReason {
-    /// The node's USDC balance/allowance cannot cover the deposit, the
+    /// The node's USDC balance/allowance cannot cover the deposit; or the
     /// deposit is zero — as requested, or as the received balance delta under
-    /// a fee-on-transfer token — or the credited deposit is below the
+    /// a fee-on-transfer token; or the credited deposit is below the
     /// network's `minDeposit`. An operator misconfiguration either way.
     /// Metric label `insufficient_deposit`.
     InsufficientDeposit,
