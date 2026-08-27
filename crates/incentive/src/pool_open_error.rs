@@ -4,13 +4,15 @@
 //! that an operator must triage differently:
 //!
 //! - **`InsufficientDeposit`** — a *misconfiguration*: the node's USDC balance
-//!   or standing allowance cannot cover the deposit, or the deposit is zero —
+//!   or standing allowance cannot cover the deposit, the deposit is zero —
 //!   either as requested, or as the balance delta actually received under a
-//!   fee-on-transfer token. (A zero deposit cannot be requested: both the daemon
+//!   fee-on-transfer token — or the credited deposit is below the
+//!   governance-set `minDeposit` Sybil floor. (A zero deposit cannot be
+//!   requested: both the daemon
 //!   and the CLI validate `buyer_working_deposit_micro_usdc` / the
 //!   `--working-deposit-micro-usdc` flag `> 0` at config load, so the reachable
-//!   zero here is the received-delta one.) The fix is operator-side (fund the
-//!   deposit), not infrastructure.
+//!   zero here is the received-delta one.) The fix is operator-side (fund or
+//!   resize the deposit), not infrastructure.
 //! - **`ContractRevert`** — any *other* deterministic on-chain revert (a
 //!   paused contract, a future revert reason). The deposit was not escrowed;
 //!   the cause is on-chain state, not this node's wallet or RPC.
@@ -50,6 +52,12 @@ sol! {
     /// open path alone; widening its use would need this checked.
     error ZeroAmount();
 
+    /// `PaymentPool.openPool` reverts this when the credited deposit — the
+    /// received balance delta — is below the governance-set `minDeposit`
+    /// Sybil floor. The fix is operator-side: raise
+    /// `buyer_working_deposit_micro_usdc` to at least the network minimum.
+    error BelowMinDeposit(uint256 received, uint256 minDeposit);
+
     /// `OpenZeppelin` v5 `ERC20`: the spender's balance is below the transfer
     /// amount. `openPool`'s `safeTransferFrom` bubbles this up verbatim when
     /// the node's USDC balance cannot cover the deposit.
@@ -76,10 +84,11 @@ sol! {
 /// share one aggregate and one budget axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolOpenFailureReason {
-    /// The node's USDC balance/allowance cannot cover the deposit, or the
-    /// deposit is zero — as requested, or as the received balance delta under a
-    /// fee-on-transfer token. An operator misconfiguration either way. Metric
-    /// label `insufficient_deposit`.
+    /// The node's USDC balance/allowance cannot cover the deposit, the
+    /// deposit is zero — as requested, or as the received balance delta under
+    /// a fee-on-transfer token — or the credited deposit is below the
+    /// network's `minDeposit`. An operator misconfiguration either way.
+    /// Metric label `insufficient_deposit`.
     InsufficientDeposit,
     /// Any other deterministic on-chain revert (the deposit was not escrowed).
     /// Metric label `contract_revert`.
@@ -140,6 +149,7 @@ fn is_insufficient_deposit_selector(revert_data: &[u8]) -> bool {
         return false;
     };
     selector == ZeroAmount::SELECTOR
+        || selector == BelowMinDeposit::SELECTOR
         || selector == ERC20InsufficientBalance::SELECTOR
         || selector == ERC20InsufficientAllowance::SELECTOR
 }
@@ -172,6 +182,21 @@ mod tests {
     #[test]
     fn zero_amount_is_insufficient_deposit() {
         let data = Bytes::from(ZeroAmount {}.abi_encode());
+        assert_eq!(
+            PoolOpenFailureReason::classify_revert_data(Some(&data)),
+            PoolOpenFailureReason::InsufficientDeposit
+        );
+    }
+
+    #[test]
+    fn below_min_deposit_is_insufficient_deposit() {
+        let data = Bytes::from(
+            BelowMinDeposit {
+                received: U256::from(1_000_000u64),
+                minDeposit: U256::from(5_000_000u64),
+            }
+            .abi_encode(),
+        );
         assert_eq!(
             PoolOpenFailureReason::classify_revert_data(Some(&data)),
             PoolOpenFailureReason::InsufficientDeposit

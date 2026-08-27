@@ -51,5 +51,10 @@ contract PaymentPoolInterfaceFreezeTest is Test {
             PaymentPool.setDisputeWindow.selector, bytes4(keccak256("setDisputeWindow(uint256)")), "setDisputeWindow"
         );
         assertEq(PaymentPool.setRateBounds.selector, bytes4(keccak256("setRateBounds(uint256)")), "setRateBounds");
+        assertEq(PaymentPool.setMinDeposit.selector, bytes4(keccak256("setMinDeposit(uint64)")), "setMinDeposit");
+        // `minDeposit` is a public variable — its auto-generated getter
+        // selector is exposed only through an instance's function value, not
+        // the type itself.
+        assertEq(PaymentPool(address(0)).minDeposit.selector, bytes4(keccak256("minDeposit()")), "minDeposit");
     }
 }
