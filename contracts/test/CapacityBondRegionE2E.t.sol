@@ -414,12 +414,7 @@ contract CapacityBondRegionE2ETest is Test {
 
     function _stream(uint64 tsUs) internal pure returns (SlashJudge.StreamMsg memory) {
         return SlashJudge.StreamMsg({
-            hash: BLOB,
-            ok: true,
-            ratePerMb: 10,
-            totalBytes: 1_048_576,
-            channelId: bytes32(uint256(1)),
-            timestampUs: tsUs
+            hash: BLOB, ok: true, ratePerMb: 10, totalBytes: 1_048_576, poolId: bytes32(uint256(1)), timestampUs: tsUs
         });
     }
 
@@ -428,7 +423,7 @@ contract CapacityBondRegionE2ETest is Test {
     function _streamStructHash(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes32) {
         return keccak256(
             abi.encode(
-                judge.STREAM_RESPONSE_TYPEHASH(), s.hash, s.ok, s.ratePerMb, s.totalBytes, s.channelId, s.timestampUs
+                judge.STREAM_RESPONSE_TYPEHASH(), s.hash, s.ok, s.ratePerMb, s.totalBytes, s.poolId, s.timestampUs
             )
         );
     }
