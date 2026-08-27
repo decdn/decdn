@@ -1327,6 +1327,7 @@ impl From<&LookupRow> for LookupJson {
 )]
 mod tests {
     use super::*;
+    use decdn_common::admin::SlashRecordDto;
 
     fn health_response(binding: BindingStatus, bound: Option<&str>) -> HealthResponse {
         health_response_with_registry(binding, bound, true)
@@ -1913,6 +1914,59 @@ mod tests {
         );
         // Second row: no activity → "never", not eligible → "no".
         assert!(s.contains("never"), "never sentinel missing: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_slashes_table_empty_emits_sentinel() -> anyhow::Result<()> {
+        let resp = SlashesResponse {
+            slashes: Vec::new(),
+        };
+        let mut buf = Vec::<u8>::new();
+        write_slashes_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("slashes=0"), "{s}");
+        assert!(s.contains("(no slashes detected)"), "{s}");
+        // No table header when there are no rows.
+        assert!(!s.contains("SLASH_ID"), "header must be omitted: {s}");
+        Ok(())
+    }
+
+    #[test]
+    fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
+        let resp = SlashesResponse {
+            slashes: vec![
+                SlashRecordDto {
+                    slash_id: "42".to_string(),
+                    offense_type: 0,
+                    amount: "1_000_000".to_string(),
+                    evidence_hash: format!("0x{}", "a".repeat(64)),
+                    block_number: Some(1_234_567),
+                    appeal_window_close: Some(1_700_000_000),
+                },
+                SlashRecordDto {
+                    slash_id: "43".to_string(),
+                    offense_type: 1,
+                    amount: "2_500_000".to_string(),
+                    evidence_hash: format!("0x{}", "c".repeat(64)),
+                    block_number: None,
+                    appeal_window_close: None,
+                },
+            ],
+        };
+        let mut buf = Vec::<u8>::new();
+        write_slashes_table(&mut buf, &resp)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("slashes=2"), "{s}");
+        assert!(s.contains("SLASH_ID"), "header missing: {s}");
+        assert!(s.contains("APPEAL_CLOSE"), "header missing: {s}");
+        // First row: slash id, offense type, amount, block, evidence preview.
+        assert!(s.contains("42"), "slash id missing: {s}");
+        assert!(s.contains("1_000_000"), "amount missing: {s}");
+        assert!(s.contains("1234567"), "block number missing: {s}");
+        assert!(s.contains("0xaaaaaaaaaa"), "evidence preview missing: {s}");
+        // Second row: missing block / appeal close render as "?".
+        assert!(s.contains('?'), "missing-value sentinel missing: {s}");
         Ok(())
     }
 

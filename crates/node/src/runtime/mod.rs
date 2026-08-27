@@ -2490,8 +2490,8 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = probe_rate_limit_gc_stop_tx.send(());
     // Best-effort, same rationale as the GC sweeps above: the reputation
-    // evict tick only exits early on a panic, which surfaces through
-    // `JoinSet::join_next` during the drain phase below.
+    // evict tick exits on this stop signal (or a panic, which surfaces
+    // through `JoinSet::join_next` during the drain phase below).
     let _ = reputation_evict_stop_tx.send(());
     // Cancels the republisher AND any lag sweep it left detached. The cancel is
     // ordered strictly before the `cache.shutdown()` flush below, which is what
