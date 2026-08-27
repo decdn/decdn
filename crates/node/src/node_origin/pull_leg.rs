@@ -221,9 +221,9 @@ impl NodeOrigin {
     /// free open — no bytes pulled, no vouchers — so the abandoned probe pull costs
     /// only one round trip.
     ///
-    /// Shares [`Self::open_progressive_pull`]'s cached-first discover → probe → rank
-    /// pipeline and its open-time candidate fallback, but stops at channel-open +
-    /// header instead of returning a live progressive pull.
+    /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first discover → probe →
+    /// rank pipeline and its open-time candidate fallback, but stops at channel-open +
+    /// header instead of pulling any bytes.
     ///
     /// # Errors
     ///

@@ -84,6 +84,15 @@ const DHT_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 /// Separate constant so a future tune to one limiter doesn't drag the other.
 const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
+/// Period between periodic sweeps of the local per-peer reputation store
+/// (ADR 008 §Local Score Calculation). `LocalReputation::evict` drops
+/// entries for peers that have been idle long enough that their EWMA is
+/// no longer a useful ranking signal, so the store does not grow
+/// unbounded with every peer ever observed. 1h matches the DHT
+/// bucket-refresh cadence — reputation and routing-table hygiene share
+/// the same operator mental model for peer-state cleanup.
+const REPUTATION_EVICT_INTERVAL: Duration = Duration::from_hours(1);
+
 /// QUIC-level idle timeout: the transport closes a connection if no
 /// packets arrive for this long. Set to match ADR 005's 30s
 /// connection-lifetime ceiling.
@@ -727,7 +736,9 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     bind_domain: alloy::dyn_abi::Eip712Domain,
     payment_pool_addr: alloy::primitives::Address,
     staker_set: Arc<dyn StakerSet>,
-    /// The single multiplexed chain-event poller driving all five watcher routes.
+    /// The single multiplexed chain-event poller driving every registered
+    /// watcher route — six with the fee-shares route, which registers only
+    /// when the startup `feeRouter()` read succeeds.
     /// Stopped once, late in shutdown (after `router.shutdown`), because the
     /// capacity-bond route's staker set gates DHT admission through drain.
     poller: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -853,9 +864,9 @@ async fn build_chain_and_handlers(
         event_poll_interval,
     ));
     // Every on-chain watcher registers a `Route` on ONE shared multiplexed
-    // poller instead of running its own `eth_getLogs` loop: five watchers scan
-    // disjoint `(address, topic0)` slices of the same three contracts, so one
-    // merged `get_logs` per tick — demuxed after the fact — replaces five. The
+    // poller instead of running its own `eth_getLogs` loop: six watchers scan
+    // disjoint `(address, topic0)` slices of the same four contracts, so one
+    // merged `get_logs` per tick — demuxed after the fact — replaces six. The
     // routes are collected as each watcher bootstraps below and spawned once (see
     // `build`/`spawn` near the end of this function). The poller mints one
     // shutdown token; the runtime drives graceful stop through the single handle.
@@ -1527,6 +1538,7 @@ struct Background {
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    reputation_evict_stop_tx: oneshot::Sender<()>,
     republish_stop: CancellationToken,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
@@ -1959,6 +1971,23 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .context("local reputation config invalid")?,
     );
 
+    // Periodic local-reputation eviction (ADR 008 §Local Score Calculation).
+    // The store is written by the node-origin pull path; without this sweep
+    // it would retain an entry for every peer ever ranked. `evict` is
+    // synchronous and cheap (a bounded walk of idle entries), so it rides
+    // `spawn_periodic`'s sync `FnMut` like the other GC sweeps.
+    let reputation_evict_stop_tx = {
+        let rep = Arc::clone(&local_reputation);
+        spawn_periodic(
+            &mut tasks,
+            "reputation_evict",
+            REPUTATION_EVICT_INTERVAL,
+            move || {
+                rep.evict();
+            },
+        )
+    };
+
     // Buyer-side PaymentPool bootstrap + node-to-node pull-through
     // provisioning (#831), fully backgrounded off the startup critical path
     // (#1109). The USDC `approve` receipt that `bootstrap` awaits could hang for
@@ -2198,7 +2227,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // gate reads, so `decdn node health` cannot report a node as servable
         // while `serve_stream` is refusing it — and an operator who has just run
         // `decdn setup` sees `registry_active` flip without a restart.
-        .with_staker_set(Arc::clone(&ch.staker_set));
+        .with_staker_set(Arc::clone(&ch.staker_set))
+        // Live content denylist for `admin_v1_status`'s
+        // `chain_denied_origins` (ADR 011). The SAME `Arc` the client
+        // handler and blacklist watcher hold, so the reported on-chain
+        // origin deny-set size is always current.
+        .with_denylist(reload_state.content_denylist());
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
                 tracing::error!(%err, "admin server exited with error");
@@ -2238,6 +2272,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
+        reputation_evict_stop_tx,
         republish_stop,
         bucket_refresh_stop_tx,
         buyer_bootstrap_stop_tx,
@@ -2316,6 +2351,7 @@ pub async fn run(
         eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
+        reputation_evict_stop_tx: bg.reputation_evict_stop_tx,
         republish_stop: bg.republish_stop,
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
         admin_stop_tx: bg.admin_stop_tx,
@@ -2352,6 +2388,7 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    reputation_evict_stop_tx: oneshot::Sender<()>,
     republish_stop: CancellationToken,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
@@ -2401,6 +2438,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
+        reputation_evict_stop_tx,
         republish_stop,
         bucket_refresh_stop_tx,
         mut admin_stop_tx,
@@ -2456,6 +2494,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = eviction_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = probe_rate_limit_gc_stop_tx.send(());
+    // Best-effort, same rationale as the GC sweeps above: the reputation
+    // evict tick exits on this stop signal (or a panic, which surfaces
+    // through `JoinSet::join_next` during the drain phase below).
+    let _ = reputation_evict_stop_tx.send(());
     // Cancels the republisher AND any lag sweep it left detached. The cancel is
     // ordered strictly before the `cache.shutdown()` flush below, which is what
     // the sweep needs: its `select!` is `biased` on this token, so a worker
@@ -2465,7 +2507,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // flush by a poll — it just cannot report anything once cancelled.
     republish_stop.cancel();
     let _ = bucket_refresh_stop_tx.send(());
-    // The five chain watchers are now one multiplexed poller with one shutdown
+    // The chain watchers are now one multiplexed poller with one shutdown
     // token, so the previous staggered per-watcher stops collapse to a SINGLE
     // `poller.shutdown()` at the LATE point below (after `router.shutdown`). The
     // blacklist and rate-bounds routes, which used to stop here early, move to
@@ -2516,7 +2558,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     if let Err(err) = router.shutdown().await {
         tracing::warn!(%err, "router shutdown reported an error");
     }
-    // The ONE multiplexed poller driving all five watcher routes stops here,
+    // The ONE multiplexed poller driving all registered watcher routes stops here,
     // once. It exits cooperatively — cancelling its loop at the next await
     // boundary and flushing every persisting route's checkpoint (settlement's
     // `PoolOpened`) before returning — with its `WatcherHandle`'s `AbortOnDrop`

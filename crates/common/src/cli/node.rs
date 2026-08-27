@@ -75,6 +75,14 @@ pub enum NodeCommand {
     /// liquidity risk — without scraping metrics or reading logs. Same
     /// admin-URL resolution and timeout semantics as `decdn node health`.
     Lanes(LanesArgs),
+    /// Print every slash the node's watcher has detected against its own
+    /// operator via `admin_v1_slashes` (#1032, G-NODE-05): per slash the
+    /// `slashId`, offense type, amount, evidence digest, block, and the
+    /// 30-day appeal-window close time. Lets operators (or keeper scripts)
+    /// notice a slash and file `decdn appeal slash` within the window
+    /// without watching the chain directly. Same admin-URL resolution and
+    /// timeout semantics as `decdn node health`.
+    Slashes(SlashesArgs),
     /// Forcibly remove a single blob from the local cache (issue #279).
     /// Useful for DMCA takedown, corruption recovery, and storage
     /// reclamation.
@@ -278,6 +286,38 @@ pub struct LanesArgs {
 
     /// Emit the admin response body as JSON instead of the human-readable
     /// summary + lane table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+}
+
+/// `decdn node slashes` — list detected slashes against this node's
+/// operator via `admin_v1_slashes` (#1032). Same admin-URL resolution and
+/// timeout semantics as `decdn node health`.
+#[derive(Args, Debug)]
+pub struct SlashesArgs {
+    /// Base URL of the node's admin HTTP surface.
+    ///
+    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
+    /// var into this field. If still unset, the admin port is derived
+    /// from `observability.admin_port` in the config file (see
+    /// `--config`). Example: `http://127.0.0.1:9191`.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file used to derive the admin URL when
+    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Takes precedence
+    /// over the top-level `decdn --config`; if neither is set,
+    /// resolution falls through to `~/.decdn/node.toml` and then the
+    /// built-in default port.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the admin response body as JSON instead of the human-readable
+    /// summary + slash table.
     #[arg(long)]
     pub json: bool,
 

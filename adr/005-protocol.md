@@ -19,7 +19,7 @@ Three core protocols negotiated via ALPN:
 | `cdn/client/v1` | payer ↔ delivering node | Paid blob delivery with payment vouchers (client→node, node→node on cache miss) |
 | `cdn/dht/v1` | any node ↔ any node | Kademlia content discovery (FIND_VALUE / STORE / FIND_NODE) — see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
 
-There is no protocol-level role for settlement monitoring — anyone may run an off-chain analyzer against the L2 chain ([Appendix: Settlement Analysis](appendix-fraud-detection.md#appendix-permissionless-settlement-analysis)).
+There is no protocol-level role for settlement monitoring — settlement events are public on the L2 chain, so anyone may analyze them off-chain.
 
 ### Rate discovery
 

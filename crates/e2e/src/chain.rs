@@ -852,28 +852,6 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "addOrigin")
     }
 
-    /// Unseat one operator from `namespace`'s active origin set as the namespace
-    /// owner. Takes effect immediately and emits `OriginRemoved` — the event
-    /// `ChainOriginDirectory` consumes to re-close the authorized-origin gate for
-    /// a fresh backend-only hash (#1373).
-    pub async fn remove_origin(
-        &self,
-        owner: &PrivateKeySigner,
-        namespace: U256,
-        operator: Address,
-    ) -> anyhow::Result<()> {
-        let provider = self.provider_for(owner);
-        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &provider)
-            .removeOrigin(namespace, operator)
-            .send()
-            .await
-            .context("removeOrigin send")?
-            .get_receipt()
-            .await
-            .context("removeOrigin receipt")?;
-        crate::ensure_mined(&receipt, "removeOrigin")
-    }
-
     /// Vet `publisher` through the genesis `ManualVettingPolicy`. Governance
     /// (the Timelock) admins `VETTER_ROLE`, so the fixture impersonates the
     /// Timelock to grant itself `VETTER_ROLE` (idempotent) and then calls
@@ -1243,18 +1221,6 @@ impl ChainFixture {
             .await
             .context("updateRegion receipt")?;
         crate::ensure_mined(&receipt, "updateRegion")
-    }
-
-    /// Read the `addedAt` second-timestamp of the `(region, hash)` entry (`0`
-    /// means not blacklisted). Serving a response timestamped after this is
-    /// slashable while the entry is live.
-    pub async fn blacklist_added_at(&self, region: B256, hash: B256) -> anyhow::Result<u64> {
-        let entry = ContentBlacklist::new(self.addrs.content_blacklist, &self.admin)
-            .getHashEntry(region, hash)
-            .call()
-            .await
-            .context("getHashEntry")?;
-        Ok(entry.addedAt)
     }
 
     /// `CapacityBond.unbondingOf(operator)` — the in-flight unbonding request

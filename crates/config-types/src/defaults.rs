@@ -17,3 +17,28 @@ pub const DEFAULT_USER_AGENT: &str = concat!("decdn-node/", env!("CARGO_PKG_VERS
 /// engine starts rejecting new probe holds (#276 / ADR 005). Shared so
 /// the config default and the cache engine's own default cannot drift.
 pub const DEFAULT_MAX_PROBE_HOLDS: usize = 256;
+
+/// Default TTL in seconds for a memoised live-origin probe answer
+/// (#1130 pt3). Long enough that a burst of probes for the same object
+/// costs one `HEAD`/`HeadObject`, short enough to track an origin
+/// deletion within the probe-hold horizon. Canonical u64 form shared by
+/// `decdn-common` (config default) and `decdn-cache` (wrapped as a
+/// `Duration`).
+pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
+
+/// Default TTL in seconds for a memoised `Absent` live-origin probe
+/// answer. Short on purpose: it bounds how long a stale `Absent` can
+/// hide newly-available own content from a probe, while a random-hash
+/// flood never repeats a hash within any window so the short TTL barely
+/// changes flood cost.
+pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
+
+/// Default per-probe ceiling in milliseconds on the live-origin
+/// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the
+/// probe hot path; on overrun the probe answers `has_blob: false` and
+/// memoises the miss.
+pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
+
+/// Default cap on distinct hashes in the live-origin probe memo
+/// (#1130 pt3). Bounds memo memory under a random-hash probe flood.
+pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;

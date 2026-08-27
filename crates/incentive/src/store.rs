@@ -169,11 +169,6 @@ pub trait PendingSettleStore: Send + Sync {
 pub enum CheckpointKey {
     /// Redemption watcher `PoolOpened` high-water block.
     PoolOpened,
-    /// Origin-directory watcher scan cursor (#1108). The origin watcher no
-    /// longer persists one (it re-enumerates the namespace set every boot,
-    /// #1504); the key remains the second checkpoint key the store's
-    /// multi-watcher tests exercise.
-    Origin,
 }
 
 impl CheckpointKey {
@@ -183,7 +178,6 @@ impl CheckpointKey {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PoolOpened => "pool_opened_last_block",
-            Self::Origin => "origin_directory_last_block",
         }
     }
 }
@@ -397,56 +391,6 @@ impl PoolStateStore for MemoryPoolStateStore {
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         Ok(guard.get(&key).cloned())
-    }
-}
-
-/// In-memory [`PendingSettleStore`] for tests and the trait's reference
-/// semantics. Not durable — drops with the process. The runtime uses the
-/// redb-backed impl in `crates/node`.
-#[derive(Debug, Default)]
-pub struct MemoryPendingSettleStore {
-    inner: Mutex<HashMap<B256, u64>>,
-}
-
-impl MemoryPendingSettleStore {
-    /// Construct an empty store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl PendingSettleStore for MemoryPendingSettleStore {
-    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.insert(entry.pool_id, entry.settle_after);
-        Ok(())
-    }
-
-    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        Ok(guard
-            .iter()
-            .map(|(&pool_id, &settle_after)| PendingSettle {
-                pool_id,
-                settle_after,
-            })
-            .collect())
-    }
-
-    fn forget_pending(&self, pool_id: B256) -> Result<(), StoreError> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.remove(&pool_id);
-        Ok(())
     }
 }
 
@@ -745,45 +689,6 @@ mod tests {
         // Volatile store: flush has nothing to do and must succeed.
         store.flush()?;
         anyhow::ensure!(store.len() == 1);
-        Ok(())
-    }
-
-    fn pending(pool_id_byte: u8, settle_after: u64) -> PendingSettle {
-        let mut bytes = [0u8; 32];
-        bytes[31] = pool_id_byte;
-        PendingSettle {
-            pool_id: bytes.into(),
-            settle_after,
-        }
-    }
-
-    #[test]
-    fn pending_store_round_trip_and_overwrite() -> anyhow::Result<()> {
-        let store = MemoryPendingSettleStore::new();
-        store.record_pending(&pending(1, 1_000))?;
-        store.record_pending(&pending(2, 2_000))?;
-        // A re-close re-stamps the deadline for the same pool.
-        store.record_pending(&pending(1, 1_500))?;
-
-        let mut all = store.load_pending()?;
-        all.sort_by_key(|p| p.pool_id);
-        anyhow::ensure!(all.len() == 2, "overwrite must not add a row");
-        let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
-        anyhow::ensure!(first.settle_after == 1_500, "re-close re-stamps deadline");
-        Ok(())
-    }
-
-    #[test]
-    fn pending_store_forget_removes_entry() -> anyhow::Result<()> {
-        let store = MemoryPendingSettleStore::new();
-        let entry = pending(3, 5_000);
-        store.record_pending(&entry)?;
-        store.forget_pending(entry.pool_id)?;
-        anyhow::ensure!(store.load_pending()?.is_empty());
-        // Forgetting a never-recorded pool is a no-op.
-        store.forget_pending(b256!(
-            "2222222222222222222222222222222222222222222222222222222222222222"
-        ))?;
         Ok(())
     }
 

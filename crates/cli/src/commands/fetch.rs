@@ -390,9 +390,6 @@ pub(crate) async fn probe_and_order(
                 candidate: cand.clone(),
                 rtt_ms,
                 total_bytes: resp_ext.total_bytes,
-                // No per-provider funding distinction in the pool model — see
-                // the doc comment above.
-                has_live_channel: false,
             });
         } else if warming.enabled {
             warming_pool.push(discovery::WarmingCandidate {
@@ -462,9 +459,7 @@ struct FailoverOrder {
 /// request routes through the nearest one (it serves via window-paced
 /// pull-through and becomes the first regional copy) and falls over through the
 /// remaining proxies to the direct holder. RTT-only ranking; never a gamble (an
-/// empty proxy order leaves the list as just the holders). `has_live_channel` is
-/// uniformly `false` in the pool model, so the RTT sort matches
-/// `discovery::rank`'s single pick at its head.
+/// empty proxy order leaves the list as just the holders).
 fn failover_order(
     mut holders: Vec<discovery::Probed>,
     warming_pool: &[discovery::WarmingCandidate],
@@ -2337,7 +2332,6 @@ mod tests {
             },
             rtt_ms,
             total_bytes,
-            has_live_channel: false,
         }
     }
 

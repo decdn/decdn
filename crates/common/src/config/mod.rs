@@ -211,27 +211,14 @@ pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 /// the periodic rescan (startup + reload still run one).
 pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 
-/// Default TTL in seconds for a memoised live-origin probe answer (#1130 pt3).
-/// Long enough that a burst of probes for the same object costs one
-/// `HEAD`/`HeadObject`, short enough to track an origin deletion within the
-/// probe-hold horizon.
-pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
-
-/// Default TTL in seconds for a memoised `Absent` live-origin probe answer.
-/// Short on purpose: it bounds how long a stale `Absent` can hide
-/// newly-available own content from a probe, while a random-hash flood never
-/// repeats a hash within any window so the short TTL barely changes flood
-/// cost.
-pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
-
-/// Default per-probe ceiling in milliseconds on the live-origin
-/// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the probe hot
-/// path; on overrun the probe answers `has_blob: false` and memoises the miss.
-pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
-
-/// Default cap on distinct hashes in the live-origin probe memo (#1130 pt3).
-/// Bounds memo memory under a random-hash probe flood.
-pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
+// Live-origin probe memo defaults (#1130 pt3). Canonical u64 values live in
+// `decdn-config-types` so `decdn-cache` (which wraps them as `Duration`s) and
+// this crate agree from a single source; re-exported here so the existing
+// `crate::config::DEFAULT_ORIGIN_PROBE_*` paths keep resolving.
+pub use decdn_config_types::{
+    DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY, DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC,
+    DEFAULT_ORIGIN_PROBE_TIMEOUT_MS, DEFAULT_ORIGIN_PROBE_TTL_SEC,
+};
 
 /// Fallback for `cache.relay_foreign_namespaces` (#1759) on a node with no
 /// origin configured. The resolver's effective default is role-derived, not

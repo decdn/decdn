@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use decdn_protocol::{
-    ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message, read_frame,
-    write_frame,
+    ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message,
+    encode_store_request, read_frame, write_frame,
 };
 use iroh::endpoint::{ConnectOptions, Connection};
 use iroh::{Endpoint, EndpointAddr};
@@ -74,8 +74,14 @@ pub async fn store(
     hash: ContentHash,
     holder: NodeId,
 ) -> anyhow::Result<wire::StoreAck> {
-    let request = wire::DhtMessage::Store(wire::StoreRequest { hash, holder });
-    let response = exchange(endpoint, target, &request).await?;
+    let request = wire::StoreRequest { hash, holder };
+    // Encode through the typed two-phase helper (ADR 013 §Tier 1) so the
+    // client half mirrors the server's `parse_store_request_ext` seam: the
+    // `StoreRequestExt` is appended here (empty today) and the payload is
+    // sent as pre-encoded bytes via `exchange_payload`.
+    let payload =
+        encode_store_request(&request, None).context("dht client: encode store request")?;
+    let response = exchange_payload(endpoint, target, &payload).await?;
     match response {
         wire::DhtMessage::StoreAck(a) => Ok(a),
         other => anyhow::bail!(
@@ -153,13 +159,26 @@ async fn exchange(
     request: &wire::DhtMessage,
 ) -> anyhow::Result<wire::DhtMessage> {
     let payload = encode_message(request).context("dht client: encode request")?;
+    exchange_payload(endpoint, target, &payload).await
+}
+
+/// Inner: connect, `open_bi`, write a pre-encoded request frame, read
+/// response frame, decode. The payload is already encoded so a caller
+/// that needs a typed two-phase encode (e.g. `store` via
+/// [`encode_store_request`]) can hand over its bytes directly, keeping
+/// the connect/exchange plumbing in one place.
+async fn exchange_payload(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    payload: &[u8],
+) -> anyhow::Result<wire::DhtMessage> {
     let response = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
         let connecting = endpoint
             .connect_with_opts(target, ALPN_DHT, ConnectOptions::new())
             .await
             .context("dht client: connect failed")?;
         let conn = connecting.await.context("dht client: handshake failed")?;
-        let resp = exchange_on(&conn, &payload).await?;
+        let resp = exchange_on(&conn, payload).await?;
         // `0u32` = "no app error"; matches the server's normal-close
         // code so the peer's `conn.closed()` arm reads the same way
         // it does for a probe.

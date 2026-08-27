@@ -9,7 +9,7 @@ A deCDN node has two observation points today:
 - A loopback-only `/metrics` HTTP endpoint (hyper on `observability.metrics_port`, default `9090`) emitting OpenMetrics text — text-only, aggregate, read-only by design.
 - The `cdn/probe/v1` ALPN, hittable by any remote iroh peer for latency/availability checks — not a local control channel, no auth beyond "anyone with an iroh connection".
 
-Neither fits when a same-host operator must **read live internal state** (readiness, lane state) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this appendix pins its shape so the first method (`admin_v1_health`) and future ones (drain, region-stats, config reload, …) share a common transport.
+Neither fits when a same-host operator must **read live internal state** (readiness, lane state) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this appendix pins its shape so every `admin_v1_…` method shares a common transport.
 
 ## Decision
 
@@ -17,17 +17,17 @@ A running deCDN node exposes a **loopback-only JSON-RPC 2.0 server** on a config
 
 The surface version lives in the namespace prefix (`admin_v1_...`), not a URL path segment, since JSON-RPC dispatches on the envelope's `method` field. Within `v1`, routes accrete fields backwards-compatibly; a breaking change cuts over to `admin_v2_...`.
 
-Initial method set:
+Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 
-| Method              | Params | Result             |
-| ------------------- | ------ | ------------------ |
-| `admin_v1_health`   | none   | `HealthResponse`   |
-
-Future methods **expected** to use this surface (not designed here):
-
-- `admin_v1_drain` — graceful drain.
-- `admin_v1_regionStats` — served-byte totals by region.
-- `admin_v1_configReload` — reload mutable config sections.
+| Method             | Params                  | Result            |
+| ------------------ | ----------------------- | ----------------- |
+| `admin_v1_health`  | none                    | `HealthResponse`  |
+| `admin_v1_status`  | none                    | `StatusResponse`  |
+| `admin_v1_drain`   | `DrainRequest` (optional) | `DrainResponse`   |
+| `admin_v1_evict`   | `EvictRequest`          | `EvictResponse`   |
+| `admin_v1_reload`  | none                    | `ReloadResponse`  |
+| `admin_v1_lanes`   | none                    | `LanesResponse`   |
+| `admin_v1_slashes` | none                    | `SlashesResponse` |
 
 Response format:
 
@@ -62,7 +62,7 @@ CLI shape:
 
 ### Why JSON-RPC, not REST-style routes?
 
-- The surface dispatches named operations, not resource state. Actions like `drain` or `configReload` are neither `GET` nor `PUT` on a resource; REST's verb/URI model adds friction without benefit.
+- The surface dispatches named operations, not resource state. Actions like `drain` or `reload` are neither `GET` nor `PUT` on a resource; REST's verb/URI model adds friction without benefit.
 - jsonrpsee's `#[rpc(server, client)]` macro makes the Rust trait the single source of truth: server impl and client bindings generate together, so the two sides cannot drift on method name, params, or return shape. A hand-written hyper route table would need separately maintained `handle(&req)` branches and reqwest JSON parsing.
 - Cleaner error modeling: JSON-RPC carries errors in a structured `{ code, message, data }` object on a `200`; route-based HTTP conflates transport `404` (missing route) with application `404` (peer not found) unless the server is careful.
 - Modest cost: jsonrpsee is a larger dependency than a hand-rolled hyper service, but as the surface accretes methods the per-method cost is one trait method vs. one handler plus a routing entry.

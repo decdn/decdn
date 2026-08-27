@@ -3,9 +3,9 @@
 //!
 //! [`resumable_watcher`](super::resumable_watcher) gives every watcher its own
 //! cursor loop and its own `eth_getLogs` call each tick. That is right when a
-//! watcher's filter genuinely differs from its siblings', but five watchers on
-//! this node scan disjoint `(address, topic0)` slices of the *same* three
-//! contracts — so five independent loops cost five `eth_getLogs` calls per tick
+//! watcher's filter genuinely differs from its siblings', but six watchers on
+//! this node scan disjoint `(address, topic0)` slices of the *same* four
+//! contracts — so six independent loops cost six `eth_getLogs` calls per tick
 //! where one merged call, demuxed after the fact, would do. [`MultiplexedPoller`]
 //! is that merge: one filter, one `eth_getLogs` per window, fanned out by
 //! `(address, topic0)` into each watcher's own [`ErasedSink`].
@@ -40,7 +40,7 @@
 //! checkpoint-load floor derivation, or the merged `get_logs` call): those fail
 //! the *whole* tick before any route-specific step runs, so [`fail_whole_tick`]
 //! fires `on_backoff` for every route directly at the failure site — every route
-//! is equally down, just as five independent watchers all convoyed into backoff
+//! is equally down, just as six independent watchers all convoyed into backoff
 //! together when every one read the shared head through
 //! [`super::shared_head::SharedHead`].
 //!
@@ -49,9 +49,11 @@
 //! token must not flip a readiness gate open), while `on_tick_success` keeps
 //! stamping unconditionally.
 //!
-//! The runtime registers all five `eth_getLogs` watchers' [`Route`]s on one
+//! The runtime registers each `eth_getLogs` watcher's [`Route`] on one
 //! poller in `build_chain_and_handlers` and spawns it once — one merged loop in
-//! place of five independent per-watcher loops.
+//! place of six independent per-watcher loops (five when the fee-shares
+//! route is absent: it registers only when the startup `feeRouter()` read
+//! succeeds).
 //!
 //! This module is `pub` only so `Route` can appear in the `pub` watcher
 //! `bootstrap` signatures and the external settlement e2e can drive `spawn`; its
@@ -503,8 +505,9 @@ fn advance_routes(poller: &mut MultiplexedPoller, end: u64) {
     }
 }
 
-/// End-of-tick reconcile per route (blacklist re-scope, origin deferred
-/// re-reads, capacity-bond/slash resync, rate-bounds hourly re-read). A
+/// End-of-tick reconcile per route (blacklist re-scope — origin blacklisting
+/// rides the blacklist route — capacity-bond/slash resync, rate-bounds and
+/// fee-shares safety-net re-reads). A
 /// reconcile `Err` marks that route errored (holds its cursor, retries).
 async fn reconcile_routes(poller: &mut MultiplexedPoller) {
     for r in &mut poller.routes {
@@ -1098,15 +1101,7 @@ mod tests {
         // the merged scan range is dragged down to B's floor and includes
         // blocks below A's.
         let (route_a, sink_a) = head_route("a", ADDR_A, TOPIC_A);
-        let (route_b, sink_b) = seeded_route(
-            "b",
-            ADDR_B,
-            TOPIC_B,
-            CursorStart::Seeded {
-                at: 0,
-                persist: None,
-            },
-        );
+        let (route_b, sink_b) = seeded_route("b", ADDR_B, TOPIC_B, CursorStart::Seeded { at: 0 });
         let built =
             MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
                 .max_backfill_span(10)
@@ -1531,24 +1526,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
 
         // Both routes seeded past head -> no get_logs issued this tick.
-        let (route_a, sink_a) = seeded_route(
-            "a",
-            ADDR_A,
-            TOPIC_A,
-            CursorStart::Seeded {
-                at: 100,
-                persist: None,
-            },
-        );
-        let (route_b, sink_b) = seeded_route(
-            "b",
-            ADDR_B,
-            TOPIC_B,
-            CursorStart::Seeded {
-                at: 100,
-                persist: None,
-            },
-        );
+        let (route_a, sink_a) = seeded_route("a", ADDR_A, TOPIC_A, CursorStart::Seeded { at: 100 });
+        let (route_b, sink_b) = seeded_route("b", ADDR_B, TOPIC_B, CursorStart::Seeded { at: 100 });
         let built =
             MultiplexedPollerBuilder::new(shared_head(provider.clone()), Duration::from_secs(1))
                 .route(route_a)
@@ -2130,17 +2109,26 @@ mod tests {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let store = Arc::new(MemoryCheckpointStore::default());
+        // Pre-recorded cursor 1 with a zero reorg margin: the first tick's floor
+        // resolves to block 1, giving the three-window script below. The memory
+        // store's record is infallible; assert rather than expect (anti-panic lint).
+        assert!(
+            store
+                .record_checkpoint(CheckpointKey::PoolOpened, 1)
+                .is_ok()
+        );
 
         let (route_a, sink_a) = seeded_route(
             "a",
             ADDR_A,
             TOPIC_A,
-            CursorStart::Seeded {
-                at: 1,
-                persist: Some(Checkpoint {
+            CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
                     store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
                     key: CheckpointKey::PoolOpened,
-                }),
+                },
+                reorg_margin: 0,
+                cold_start: ColdStart::Head,
             },
         );
         // Fail on the 2nd apply (0-indexed): window [1,1] succeeds, window

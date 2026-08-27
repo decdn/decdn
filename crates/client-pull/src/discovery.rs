@@ -664,11 +664,6 @@ pub async fn bootstrap_nodes(
 /// keeps the probe fan-out cheap while still giving the ranker a choice.
 pub const SELECT_K: usize = 5;
 
-/// RTT tolerance for preferring an already-open channel over the strictly
-/// nearest node (decision 4): reuse a node the client holds a live channel with
-/// when its RTT is within this multiple of the best observed RTT. Tunable.
-pub const RTT_REUSE_TOLERANCE: f64 = 1.5;
-
 /// Order `candidates` for probing (decision 3): same-region candidates first
 /// (equality on `region_hint` — locality, not geo distance), then the rest,
 /// capped at `k`. When `client_region` is `None`, empty, or not an accepted
@@ -747,8 +742,7 @@ pub fn admit_sources(ordered: Vec<NodeCandidate>, max_sources: usize) -> Vec<Nod
     out
 }
 
-/// A probed candidate that holds the blob, with its measured RTT and whether the
-/// client already has a live payment channel with it.
+/// A probed candidate that holds the blob, with its measured RTT.
 #[derive(Debug, Clone)]
 pub struct Probed {
     /// The node that answered the probe with `has_blob = true`.
@@ -761,9 +755,6 @@ pub struct Probed {
     /// spares the multi-source engagement gate a throwaway header open just to
     /// learn whether the blob clears the fan-out floor.
     pub total_bytes: Option<u64>,
-    /// Whether the buyer-channel store already holds a live (non-expired)
-    /// channel for `candidate.eth_address`.
-    pub has_live_channel: bool,
 }
 
 /// A bonded non-holder the client has a measured RTT for, and could route a
@@ -779,11 +770,10 @@ pub struct WarmingCandidate {
     /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`
     /// probe issued for this request**.
     ///
-    /// Note this diverges from ADR 037 § RTT source, which specifies the
-    /// client's longitudinal per-peer RTT map. That map ([`crate::rtt_map`]) is
-    /// staged but not yet wired, so the candidate pool is presently limited to
-    /// the ≤`SELECT_K` nodes this request happened to probe rather than the full
-    /// peer table minus holders.
+    /// Note this diverges from ADR 037 § RTT source, which specifies a
+    /// longitudinal per-peer RTT map; no such map exists, so the candidate pool
+    /// is limited to the ≤`SELECT_K` nodes this request happened to probe rather
+    /// than the full peer table minus holders.
     pub rtt_ms: f64,
 }
 
@@ -829,24 +819,6 @@ pub fn proxy_warming_order(
         .collect();
     qualifying.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
     qualifying
-}
-
-/// Pick the node to fetch from among probed blob-holders (decision 4): prefer a
-/// node the client already has a live channel with when its RTT is within
-/// [`RTT_REUSE_TOLERANCE`]× the best observed RTT; otherwise the lowest-RTT
-/// node. `holders` must already be filtered to blob-holders. Returns `None`
-/// when `holders` is empty.
-#[must_use]
-pub fn rank(holders: &[Probed]) -> Option<&Probed> {
-    let best = holders
-        .iter()
-        .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))?;
-    let threshold = best.rtt_ms * RTT_REUSE_TOLERANCE;
-    holders
-        .iter()
-        .filter(|p| p.has_live_channel && p.rtt_ms <= threshold)
-        .min_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms))
-        .or(Some(best))
 }
 
 #[cfg(test)]
@@ -931,15 +903,6 @@ mod tests {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: Address::repeat_byte(seed),
             region_hint: Region::parse(region),
-        }
-    }
-
-    fn probed(seed: u8, rtt_ms: f64, has_live_channel: bool) -> Probed {
-        Probed {
-            candidate: candidate(seed, "US"),
-            rtt_ms,
-            total_bytes: None,
-            has_live_channel,
         }
     }
 
@@ -1103,35 +1066,6 @@ mod tests {
     fn admit_sources_zero_max_returns_empty() {
         let ranked = vec![cand(pk(1), addr(1), Some("US"))];
         assert_eq!(admit_sources(ranked, 0), Vec::new());
-    }
-
-    #[test]
-    fn rank_empty_is_none() {
-        assert!(rank(&[]).is_none());
-    }
-
-    #[test]
-    fn rank_prefers_channel_within_tolerance() {
-        // Nearest is seed 1 (10ms, no channel); seed 2 has a channel at 14ms
-        // (≤ 1.5×10 = 15) so it wins on reuse.
-        let holders = vec![probed(1, 10.0, false), probed(2, 14.0, true)];
-        let pick = rank(&holders).unwrap();
-        assert_eq!(pick.candidate.eth_address, Address::repeat_byte(2));
-    }
-
-    #[test]
-    fn rank_falls_back_to_nearest_when_channel_too_slow() {
-        // Channel-holder seed 2 is at 16ms (> 1.5×10 = 15): pick the nearest.
-        let holders = vec![probed(1, 10.0, false), probed(2, 16.0, true)];
-        let pick = rank(&holders).unwrap();
-        assert_eq!(pick.candidate.eth_address, Address::repeat_byte(1));
-    }
-
-    #[test]
-    fn rank_nearest_when_no_channels() {
-        let holders = vec![probed(1, 30.0, false), probed(2, 12.0, false)];
-        let pick = rank(&holders).unwrap();
-        assert_eq!(pick.candidate.eth_address, Address::repeat_byte(2));
     }
 
     #[test]

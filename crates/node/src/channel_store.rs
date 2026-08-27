@@ -2076,21 +2076,6 @@ mod tests {
         Ok(())
     }
 
-    /// Each [`CheckpointKey`] is an independent cursor in the one table.
-    #[test]
-    fn watcher_checkpoint_keys_are_independent() -> anyhow::Result<()> {
-        let dir = data_dir()?;
-        let store = PersistentPoolStateStore::open(dir.path())?;
-        store.record_checkpoint(CheckpointKey::PoolOpened, 100)?;
-        store.record_checkpoint(CheckpointKey::Origin, 300)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(100));
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::Origin)? == Some(300));
-        store.record_checkpoint(CheckpointKey::Origin, 350)?;
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::PoolOpened)? == Some(100));
-        anyhow::ensure!(store.load_checkpoint(CheckpointKey::Origin)? == Some(350));
-        Ok(())
-    }
-
     /// Pending-settle entries round-trip, re-stamp on a re-close, survive a
     /// reopen, and forget cleanly (#327). Keyed by `pool_id`.
     #[test]
