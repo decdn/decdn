@@ -31,7 +31,7 @@ This ADR targets **desktop and server clients** — POSIX or Windows hosts with 
 A client is a lightweight QUIC endpoint that streams content and pays per MB. It is **not** a bonded node and has no on-chain registration requirement. Capabilities:
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
-- Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
+- Discovers nodes from the on-chain registry and probes candidates over `cdn/probe/v1`; it does not speak `cdn/dht/v1`. Content discovery is node-side, on the serving node's cache-miss pull leg (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). This keeps the DHT requester population bounded by node count and keeps clients from depending on DHT participation
 - Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); it shares them with no one
 - Maintains a local node list (from the on-chain registry) and reputation scores
 - Signs vouchers authorizing off-chain USDC payments, from a capability-authorized signer key the pool owner delegates (its own key by default)

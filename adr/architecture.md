@@ -62,7 +62,7 @@ The implementation language, the peer mesh's shape, the content-addressing primi
 
 ### Chapter 2 — Discovery
 
-How a client or node finds the right peer for a given hash. The DHT is the primary mechanism; proxy warming bootstraps the first regional copy when discovery returns only distant holders.
+How a client or node finds the right peer for a given hash. Clients select nodes from the on-chain registry via probes; nodes use the DHT on cache-miss pulls; proxy warming bootstraps the first regional copy when discovery finds only distant holders.
 
 1. [ADR 022 — Content Discovery at Scale (DHT)](022-content-discovery.md#adr-022--content-discovery-at-scale)
 2. [ADR 037 — Latency-Driven Proxy Warming for Regional Locality](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)

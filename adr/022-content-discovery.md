@@ -5,7 +5,7 @@
 
 ## Context
 
-Content discovery answers: "which nodes currently hold blob H?" The answer drives both client→node delivery (client picks a node to stream from) and node→node pull-through (a node with a cache miss finds a provider to pull from).
+Content discovery answers: "which nodes currently hold blob H?" Nodes are the only DHT requesters: the answer drives node→node pull-through (a node with a cache miss finds a provider to pull from). Clients do not join the DHT. A client selects a serving node from the on-chain registry via `cdn/probe/v1` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)), and the node it pays serves a miss by pull-through. Client demand therefore reaches the DHT only through the serving node, so per-hash lookup load is bounded by node count, not user count.
 
 A **Kademlia-based content DHT** has the right properties for an incentive-driven CDN:
 
@@ -279,7 +279,7 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 | Proxy warming ([ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) | Reactive window-paced pull-through warms a regional copy on real paid demand. STORE-on-commit makes a completed warmed copy discoverable through the normal FIND_VALUE path. |
 | Reputation system ([ADR 008](008-reputation.md#adr-008-reputation-system)) | A node publishing a false STORE record fails at probe time → reputation penalty → fewer clients selected. No new slash condition needed. |
 | Eviction hold ([ADR 005](005-protocol.md#adr-005-wire-protocol)) | Nodes stop re-publishing DHT records when a blob is evicted. TTL ensures stale records expire within 1 hour. |
-| Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients use DHT FIND_VALUE for content discovery the same way nodes do. The on-chain origin-directory fallback applies equally. |
+| Client discovery ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)) | Clients do not query the DHT. A client selects a serving node from the on-chain registry via `cdn/probe/v1`; that node runs the FIND_VALUE flow on its cache-miss pull leg. The on-chain origin-directory fallback is likewise node-side. |
 
 ### Schema Evolution
 
