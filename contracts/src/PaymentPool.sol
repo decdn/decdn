@@ -81,6 +81,13 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`).
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
+    /// @dev Ceiling of the governable minimum `openPool` deposit, in USDC
+    ///      base units ($100 at 6 decimals). The ceiling keeps governance
+    ///      from pricing small honest buyers out of opening a pool at all;
+    ///      there is no floor — `0` keeps the knob dormant and any non-zero
+    ///      deposit opens a pool.
+    uint64 internal constant MIN_DEPOSIT_CEILING = 100e6;
+
     /// @dev The payment quantum: one chunk of delivery, in bytes. A `PayWord`
     ///      hash-chain tick pays for exactly this much (ADR 003 §Chunk
     ///      Cadence). Equal to `BYTES_PER_MB` **by identity**, which is what
@@ -138,6 +145,18 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
 
     /// @notice Grace window in seconds (default 48h; bounded [48h, 72h]).
     uint256 public disputeWindow;
+
+    /// @notice Minimum credited `openPool` deposit in USDC base units
+    ///         (bounded [0, $100]; dormant at `0`, where any non-zero
+    ///         deposit opens a pool). A Sybil-economics floor: holding N
+    ///         concurrent pools locks at least `N × minDeposit`, which is
+    ///         what makes a pool identity meaningfully less cheap than a
+    ///         bare client identity. The deposit stays fully refundable at
+    ///         close, so the floor taxes locked capital for simultaneous
+    ///         pools, not a per-pool sunk cost. `topUp` is deliberately
+    ///         exempt — the cost is about minting a new identity, not
+    ///         adding to an existing pool.
+    uint64 public minDeposit;
 
     /// @dev Per-MB delivery-rate floor in USDC base units. There is no
     ///      governance ceiling: a seller self-clamping its own advertised
@@ -234,6 +253,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
     event RateBoundsUpdated(uint256 newDeliveryFloor);
+    event MinDepositUpdated(uint64 oldValue, uint64 newValue);
 
     // -----------------------------------------------------------------
     // Errors
@@ -245,6 +265,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error RateBoundsInvalid(uint256 deliveryFloor);
     error ZeroAmount();
+    /// @dev The credited `openPool` deposit — the received balance delta, not
+    ///      the requested amount — is below the governed `minDeposit`.
+    error BelowMinDeposit(uint256 received, uint256 minDeposit);
     error PoolNotOpen();
     error NotPoolOwner();
     error InvalidVoucherSignature();
@@ -280,6 +303,9 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @param disputeWindow_ Initial grace window (seconds; bounded [48h, 72h]).
     /// @param deliveryFloor_ Per-byte price floor enforced at redemption
     ///                       (USDC base units per MB; >= 1).
+    /// @param minDeposit_    Minimum credited `openPool` deposit (USDC base
+    ///                       units; bounded [0, $100] — `0` keeps the knob
+    ///                       dormant).
     /// @param admin          `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder
     ///                       (the deployer; handed to the Timelock post-deploy).
     constructor(
@@ -288,6 +314,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         address feeRouter_,
         uint256 disputeWindow_,
         uint256 deliveryFloor_,
+        uint64 minDeposit_,
         address admin
     ) EIP712("PaymentPool", "1") {
         if (
@@ -304,12 +331,16 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         if (deliveryFloor_ < MIN_RATE_FLOOR || deliveryFloor_ > MAX_RATE_PER_MB) {
             revert RateBoundsInvalid(deliveryFloor_);
         }
+        if (minDeposit_ > MIN_DEPOSIT_CEILING) {
+            revert ParamOutOfBounds(minDeposit_, 0, MIN_DEPOSIT_CEILING);
+        }
 
         usdc = usdc_;
         capacityBond = capacityBond_;
         feeRouter = feeRouter_;
         disputeWindow = disputeWindow_;
         deliveryFloor = deliveryFloor_;
+        minDeposit = minDeposit_;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
@@ -324,6 +355,7 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
     /// @notice Open a USDC pool; transfers `deposit` in and derives
     ///         `poolId = keccak256(owner, ownerPoolNonce[owner])`. Names no
     ///         provider and no signer — a pool is bound to no payee at open.
+    ///         The credited amount must meet the governed `minDeposit`.
     // slither-disable-next-line reentrancy-no-eth
     function openPool(uint64 deposit) external nonReentrant whenNotPaused returns (bytes32 poolId) {
         if (deposit == 0) revert ZeroAmount();
@@ -350,6 +382,10 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         // nothing), not a dangerous balance equality.
         // slither-disable-next-line incorrect-equality
         if (received == 0) revert ZeroAmount();
+        // The Sybil floor is enforced on the credited amount, not the
+        // requested `deposit`, so a fee-on-transfer proxy cannot open a pool
+        // below it (same reason the deposit itself credits the delta).
+        if (received < minDeposit) revert BelowMinDeposit(received, minDeposit);
         // `received <= deposit` for a well-behaved or fee-on-transfer token,
         // but a token that credits more than it was asked for must not silently
         // truncate the pool's deposit.
@@ -700,6 +736,19 @@ contract PaymentPool is AccessControl, ReentrancyGuard, SunsettingPausable, EIP7
         }
         deliveryFloor = newFloor;
         emit RateBoundsUpdated(newFloor);
+    }
+
+    /// @notice Set the minimum credited `openPool` deposit (bounded
+    ///         [0, `MIN_DEPOSIT_CEILING`]; `0` returns the knob to dormant).
+    ///         Applies to subsequent `openPool` calls only; open pools and
+    ///         `topUp` are unaffected.
+    function setMinDeposit(uint64 newMin) external onlyRole(GOVERNANCE_ROLE) {
+        if (newMin > MIN_DEPOSIT_CEILING) {
+            revert ParamOutOfBounds(newMin, 0, MIN_DEPOSIT_CEILING);
+        }
+        uint64 old = minDeposit;
+        minDeposit = newMin;
+        emit MinDepositUpdated(old, newMin);
     }
 
     // -----------------------------------------------------------------

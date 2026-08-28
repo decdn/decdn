@@ -166,6 +166,12 @@ contract PaymentPoolTest is Test {
 
     uint256 internal constant DISPUTE_WINDOW = 48 hours;
     uint256 internal constant DELIVERY_FLOOR = 1;
+    /// Mirrors the deploy script's dormant launch `minDeposit` (bounds
+    /// [0, $100]; 0 = any non-zero deposit opens). Tests that exercise an
+    /// armed floor raise it via `setMinDeposit` or construct with `ARMED_MIN`.
+    uint64 internal constant MIN_DEPOSIT = 0;
+    uint64 internal constant ARMED_MIN = 5e6;
+    uint64 internal constant MIN_DEPOSIT_CEILING = 100e6;
     uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
     uint64 internal constant DEPOSIT = 1000e6;
     uint256 internal constant BYTES_PER_MB = 1_048_576;
@@ -209,6 +215,7 @@ contract PaymentPoolTest is Test {
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
     event RateBoundsUpdated(uint256 newDeliveryFloor);
+    event MinDepositUpdated(uint64 oldValue, uint64 newValue);
 
     function setUp() public {
         owner = vm.addr(OWNER_PK);
@@ -225,6 +232,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(router),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
 
@@ -279,9 +287,29 @@ contract PaymentPoolTest is Test {
     }
 
     function test_openPool_acceptsOneBaseUnit() public {
+        // `minDeposit == 0` (the dormant launch value) preserves the
+        // any-non-zero-deposit-opens behavior.
         vm.prank(owner);
         bytes32 id = pool.openPool(1);
         assertEq(pool.getPool(id).deposit, 1, "a one-base-unit deposit must open");
+    }
+
+    function test_openPool_enforcesArmedMinDeposit() public {
+        vm.prank(admin);
+        pool.setMinDeposit(ARMED_MIN);
+
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(PaymentPool.BelowMinDeposit.selector, uint256(ARMED_MIN - 1), uint256(ARMED_MIN))
+        );
+        pool.openPool(ARMED_MIN - 1);
+
+        // Exactly the minimum opens; above it too.
+        vm.prank(owner);
+        bytes32 id = pool.openPool(ARMED_MIN);
+        assertEq(pool.getPool(id).deposit, ARMED_MIN, "exactly minDeposit must open");
+        vm.prank(owner);
+        pool.openPool(ARMED_MIN + 1);
     }
 
     function test_openPool_revertsWhenPaused() public {
@@ -301,6 +329,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(feeRouter),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
         feeUsdc.transfer(owner, 100_000e6);
@@ -326,6 +355,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(feeRouter),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
         feeUsdc.transfer(owner, 100_000e6);
@@ -336,6 +366,32 @@ contract PaymentPoolTest is Test {
         vm.prank(owner);
         vm.expectRevert(PaymentPool.ZeroAmount.selector);
         feePool.openPool(DEPOSIT);
+    }
+
+    function test_openPool_minDepositEnforcedOnReceivedNotRequested() public {
+        FeeOnTransferUSDC feeUsdc = new FeeOnTransferUSDC();
+        MockSettlementRouter feeRouter = new MockSettlementRouter(feeUsdc);
+        PaymentPool feePool = new PaymentPool({
+            usdc_: feeUsdc,
+            capacityBond_: bond,
+            feeRouter_: address(feeRouter),
+            disputeWindow_: DISPUTE_WINDOW,
+            deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: ARMED_MIN,
+            admin: admin
+        });
+        feeUsdc.transfer(owner, 100_000e6);
+        vm.prank(owner);
+        feeUsdc.approve(address(feePool), type(uint256).max);
+        feeUsdc.setFeeBps(100);
+
+        // The requested deposit meets the minimum, but the credited delta
+        // falls below it once the transfer fee shaves it — the floor reads
+        // `received`, so the open reverts.
+        uint256 received = ARMED_MIN - (uint256(ARMED_MIN) * 100 / 10_000);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(PaymentPool.BelowMinDeposit.selector, received, uint256(ARMED_MIN)));
+        feePool.openPool(ARMED_MIN);
     }
 
     // -----------------------------------------------------------------
@@ -367,6 +423,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(router),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
         vm.prank(owner);
@@ -399,6 +456,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(feeRouter),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
         feeUsdc.transfer(owner, 100_000e6);
@@ -419,37 +477,52 @@ contract PaymentPoolTest is Test {
         assertEq(feeUsdc.balanceOf(address(feePool)), DEPOSIT + credited, "and it matches the real balance");
     }
 
+    function test_topUp_unaffectedByMinDeposit() public {
+        // The Sybil floor prices minting a NEW pool identity; adding to an
+        // existing pool stays free of it, down to a single base unit.
+        vm.prank(admin);
+        pool.setMinDeposit(ARMED_MIN);
+        vm.prank(owner);
+        bytes32 id = pool.openPool(ARMED_MIN);
+
+        vm.prank(owner);
+        pool.topUp(id, 1);
+        assertEq(pool.getPool(id).deposit, ARMED_MIN + 1, "a sub-minimum top-up must credit");
+    }
+
     // -----------------------------------------------------------------
     // Constructor validation
     // -----------------------------------------------------------------
 
     function test_constructor_revertsOnZeroAddress() public {
         vm.expectRevert(PaymentPool.ZeroAddress.selector);
-        new PaymentPool(IERC20(address(0)), bond, address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, admin);
+        new PaymentPool(IERC20(address(0)), bond, address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, admin);
 
         vm.expectRevert(PaymentPool.ZeroAddress.selector);
-        new PaymentPool(usdc, ICapacityBondActivity(address(0)), address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, admin);
+        new PaymentPool(
+            usdc, ICapacityBondActivity(address(0)), address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, admin
+        );
 
         vm.expectRevert(PaymentPool.ZeroAddress.selector);
-        new PaymentPool(usdc, bond, address(0), DISPUTE_WINDOW, DELIVERY_FLOOR, admin);
+        new PaymentPool(usdc, bond, address(0), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, admin);
 
         vm.expectRevert(PaymentPool.ZeroAddress.selector);
-        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, address(0));
+        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, address(0));
     }
 
     function test_constructor_revertsOnEoaFeeRouter() public {
         vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterHasNoCode.selector, stranger));
-        new PaymentPool(usdc, bond, stranger, DISPUTE_WINDOW, DELIVERY_FLOOR, admin);
+        new PaymentPool(usdc, bond, stranger, DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, admin);
     }
 
     function test_constructor_revertsOnRouterMissingPausedView() public {
         NoPauseRouter bad = new NoPauseRouter();
         vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterMissingPausedView.selector, address(bad)));
-        new PaymentPool(usdc, bond, address(bad), DISPUTE_WINDOW, DELIVERY_FLOOR, admin);
+        new PaymentPool(usdc, bond, address(bad), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, admin);
 
         NonBoolPauseRouter bad2 = new NonBoolPauseRouter();
         vm.expectRevert(abi.encodeWithSelector(PaymentPool.FeeRouterMissingPausedView.selector, address(bad2)));
-        new PaymentPool(usdc, bond, address(bad2), DISPUTE_WINDOW, DELIVERY_FLOOR, admin);
+        new PaymentPool(usdc, bond, address(bad2), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT, admin);
     }
 
     function test_constructor_revertsOnDisputeWindowOutOfBounds() public {
@@ -458,18 +531,46 @@ contract PaymentPoolTest is Test {
                 PaymentPool.ParamOutOfBounds.selector, uint256(1 hours), uint256(48 hours), uint256(72 hours)
             )
         );
-        new PaymentPool(usdc, bond, address(router), 1 hours, DELIVERY_FLOOR, admin);
+        new PaymentPool(usdc, bond, address(router), 1 hours, DELIVERY_FLOOR, MIN_DEPOSIT, admin);
     }
 
     function test_constructor_revertsOnRateFloorAboveWireCap() public {
         uint256 badFloor = MAX_RATE_PER_MB + 1;
         vm.expectRevert(abi.encodeWithSelector(PaymentPool.RateBoundsInvalid.selector, badFloor));
-        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, badFloor, admin);
+        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, badFloor, MIN_DEPOSIT, admin);
     }
 
     function test_constructor_revertsOnRateFloorBelowMinimum() public {
         vm.expectRevert(abi.encodeWithSelector(PaymentPool.RateBoundsInvalid.selector, uint256(0)));
-        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, 0, admin);
+        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, 0, MIN_DEPOSIT, admin);
+    }
+
+    function test_constructor_revertsOnMinDepositAboveCeiling() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PaymentPool.ParamOutOfBounds.selector,
+                uint256(MIN_DEPOSIT_CEILING) + 1,
+                uint256(0),
+                uint256(MIN_DEPOSIT_CEILING)
+            )
+        );
+        new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT_CEILING + 1, admin);
+    }
+
+    function test_constructor_armsMinDepositUpToCeiling() public {
+        PaymentPool armed =
+            new PaymentPool(usdc, bond, address(router), DISPUTE_WINDOW, DELIVERY_FLOOR, MIN_DEPOSIT_CEILING, admin);
+        assertEq(armed.minDeposit(), MIN_DEPOSIT_CEILING, "constructor stores the launch minimum");
+
+        vm.prank(owner);
+        usdc.approve(address(armed), type(uint256).max);
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PaymentPool.BelowMinDeposit.selector, uint256(MIN_DEPOSIT_CEILING) - 1, uint256(MIN_DEPOSIT_CEILING)
+            )
+        );
+        armed.openPool(MIN_DEPOSIT_CEILING - 1);
     }
 
     // -----------------------------------------------------------------
@@ -933,6 +1034,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(router),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
         vm.prank(owner);
@@ -1043,6 +1145,7 @@ contract PaymentPoolTest is Test {
             feeRouter_: address(under),
             disputeWindow_: DISPUTE_WINDOW,
             deliveryFloor_: DELIVERY_FLOOR,
+            minDeposit_: MIN_DEPOSIT,
             admin: admin
         });
         vm.prank(owner);
@@ -2782,6 +2885,49 @@ contract PaymentPoolTest is Test {
         assertEq(pool.getRateBounds(), 1000);
     }
 
+    function test_setMinDeposit_enforcesCeiling() public {
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PaymentPool.ParamOutOfBounds.selector,
+                uint256(MIN_DEPOSIT_CEILING) + 1,
+                uint256(0),
+                uint256(MIN_DEPOSIT_CEILING)
+            )
+        );
+        pool.setMinDeposit(MIN_DEPOSIT_CEILING + 1);
+
+        vm.prank(admin);
+        pool.setMinDeposit(MIN_DEPOSIT_CEILING);
+        assertEq(pool.minDeposit(), MIN_DEPOSIT_CEILING, "the ceiling itself is settable");
+    }
+
+    function test_setMinDeposit_updatesEmitsAndReturnsToDormant() public {
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit MinDepositUpdated(0, ARMED_MIN);
+        vm.prank(admin);
+        pool.setMinDeposit(ARMED_MIN);
+        assertEq(pool.minDeposit(), ARMED_MIN);
+
+        // Setting back to 0 returns the knob to dormant: any non-zero
+        // deposit opens again.
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit MinDepositUpdated(ARMED_MIN, 0);
+        vm.prank(admin);
+        pool.setMinDeposit(0);
+        vm.prank(owner);
+        bytes32 id = pool.openPool(1);
+        assertEq(pool.getPool(id).deposit, 1, "dormant again after reset");
+    }
+
+    function test_setMinDeposit_onlyGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setMinDeposit(ARMED_MIN);
+    }
+
     function test_setters_onlyGovernance() public {
         vm.startPrank(stranger);
 
@@ -2799,6 +2945,11 @@ contract PaymentPoolTest is Test {
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
         );
         pool.setFeeRouter(address(router));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        pool.setMinDeposit(ARMED_MIN);
 
         vm.stopPrank();
     }
@@ -2854,8 +3005,9 @@ contract PaymentPoolHarness is PaymentPool {
         address feeRouter_,
         uint256 disputeWindow_,
         uint256 deliveryFloor_,
+        uint64 minDeposit_,
         address admin
-    ) PaymentPool(usdc_, capacityBond_, feeRouter_, disputeWindow_, deliveryFloor_, admin) { }
+    ) PaymentPool(usdc_, capacityBond_, feeRouter_, disputeWindow_, deliveryFloor_, minDeposit_, admin) { }
 
     function forceStatus(bytes32 poolId, Status s) external {
         pools[poolId].status = s;

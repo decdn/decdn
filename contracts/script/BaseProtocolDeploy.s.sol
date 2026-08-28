@@ -239,6 +239,11 @@ abstract contract BaseProtocolDeploy is Script {
     // governance-tunable post-deploy within the contract's safety bounds.
     uint256 internal constant PAYMENT_DISPUTE_WINDOW = 48 hours;
     uint256 internal constant PAYMENT_DELIVERY_FLOOR = 1;
+    // Minimum `openPool` deposit (contract bounds [0, $100]) — the
+    // Sybil-economics floor on minting fresh pool identities (ADR 003).
+    // Ships dormant at 0 (any non-zero deposit opens a pool); governance
+    // arms it post-deploy via `setMinDeposit`.
+    uint64 internal constant PAYMENT_MIN_DEPOSIT = 0;
 
     // SlashJudge launch params (ADR 014 § Governable Parameters). `maxEvidenceAge`
     // (5 days) must stay `< unbondingPeriod` (14 days default) — the SlashJudge
@@ -545,6 +550,7 @@ abstract contract BaseProtocolDeploy is Script {
             feeRouter_: address(d.router),
             disputeWindow_: PAYMENT_DISPUTE_WINDOW,
             deliveryFloor_: PAYMENT_DELIVERY_FLOOR,
+            minDeposit_: PAYMENT_MIN_DEPOSIT,
             admin: cfg.deployer
         });
 
