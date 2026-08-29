@@ -2071,6 +2071,65 @@ mod tests {
         );
     }
 
+    /// Measure one 4 MiB (`INGEST_CHECKPOINT_BYTES`) checkpoint's delivery
+    /// through a fresh lane on this machine, and return a `unit_deadline`
+    /// rested a safety factor above it.
+    ///
+    /// `unit_deadline` is the budget a lane gets to shrink the missing window
+    /// before the watchdog reassigns it, so the honest rate to size it against
+    /// is the time one checkpoint actually takes to land here. A fixed value
+    /// is load-flaky: a contended runner routinely moves 4 MiB slower than a
+    /// constant chosen for the healthy case, and the healthy lane then gets
+    /// falsely reassigned. Measuring the same machine first keeps the budget
+    /// above that lane's delivery time, floored for fast machines and capped
+    /// well under the test's outer timeout so a wedged lane still trips
+    /// promptly.
+    async fn calibrated_unit_deadline() -> anyhow::Result<Duration> {
+        const CHECKPOINT: usize = 4 * 1024 * 1024;
+        const FLOOR: Duration = Duration::from_millis(600);
+        const CEILING: Duration = Duration::from_secs(5);
+        const K: u32 = 10;
+
+        let data = blob(CHECKPOINT);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let src = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
+        let root = src.root();
+        let total = src.total_bytes();
+        let (store, _dir) = fresh_store(root, total);
+        let funder = FakeFunder::new(0, DepositOutcome::Added(U256::ZERO));
+        let pacer = BudgetPacer::new();
+        let lanes = vec![lane(&src, Arc::clone(&ledger), 0xBB)];
+        let started = tokio::time::Instant::now();
+        multi_source_fetch(
+            &store,
+            &lanes,
+            &pacer,
+            &funder,
+            root,
+            0,
+            total,
+            &DriveConfig {
+                working_deposit: U256::ZERO,
+                max_settle_waits: 0,
+                settle_backoff: Duration::from_millis(1),
+            },
+            // A generous deadline so this calibration fetch — a healthy lane —
+            // is measured, not tripped.
+            &MultiSourceConfig {
+                max_sources: 1,
+                unit_deadline: CEILING,
+            },
+            None,
+        )
+        .await?;
+        let measured = started.elapsed();
+        let budget = measured
+            .checked_mul(K)
+            .unwrap_or(CEILING)
+            .clamp(FLOOR, CEILING);
+        Ok(budget)
+    }
+
     /// End-to-end: a source that opens, delivers a prefix, then WEDGES without
     /// erroring is ended by the watchdog ALONE, and its unfetched remainder is
     /// picked up by a healthy peer. `with_fault_after` cannot produce this shape —
@@ -2121,9 +2180,9 @@ mod tests {
                 },
                 &MultiSourceConfig {
                     max_sources: 2,
-                    // Well above a checkpoint's worth of delivery time, well
-                    // below the 120 s wedge.
-                    unit_deadline: Duration::from_millis(600),
+                    // Calibrated: comfortably above a checkpoint's worth of
+                    // healthy delivery time, well below the 20 s wedge.
+                    unit_deadline: calibrated_unit_deadline().await?,
                 },
                 None,
             ),
