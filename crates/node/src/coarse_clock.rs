@@ -27,9 +27,9 @@ use std::time::Duration;
 
 /// Live wall clock in milliseconds since the Unix epoch, or `0` if the system
 /// clock is before the epoch. The refresher writes this into the cell, and a
-/// cell still at its `0` sentinel falls back to it. Mirrors
-/// [`crate::handlers::client::unix_millis`]; kept local so this module stays a
-/// self-contained utility with no dependency back into the handler.
+/// cell still at its `0` sentinel falls back to it. Mirrors the handler's
+/// `unix_millis`; kept local so this module stays a self-contained utility with
+/// no dependency back into the handler.
 fn live_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
