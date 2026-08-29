@@ -10,6 +10,17 @@
 //! between two flushes loses the unflushed lane advances; the caller decides
 //! the flush cadence.
 //!
+//! The owner-signed **capability** table is buffered in the same shape:
+//! `put_capability` mutates the in-memory set only (deduping an identical
+//! repeat write), and the same `flush()` that lands the dirty lanes writes the
+//! dirty capability rows in the same fsynced transaction. A capability present
+//! only in the buffer is still served from `get_capability` (it reads the
+//! buffer), so the redeemer needs the material only by its first redemption,
+//! which the pre-redeem `flush_store_durable` already floors. Losing an
+//! unflushed capability row on a crash is frontier-loss-ok per ADR 003: the
+//! client re-sends the capability on its next request and intake re-persists
+//! it.
+//!
 //! See [`decdn_incentive::store`] for the trait contract and
 //! [ADR 003 §Off-chain voucher state persistence] for the protocol rule
 //! this implements: a node MUST advance `(last_amount, last_bytes_delivered)`
@@ -187,7 +198,10 @@ fn capability_key_bytes(pool_id: B256, signer: Address) -> [u8; CAPABILITY_KEY_L
 /// signature. `spending_cap` is a fixed-width big-endian array (identical to the
 /// on-chain representation); `owner_sig` is the raw EIP-712 signature (65-byte
 /// ECDSA, or an ERC-1271 payload) verbatim.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `PartialEq` lets [`PersistentPoolStateStore::put_capability`] dedup an
+/// identical repeat write (equal fields ⇒ equal record ⇒ nothing to mark dirty).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredCapability {
     spending_cap: [u8; 32],
     expiry: u64,
@@ -406,6 +420,15 @@ pub struct PersistentPoolStateStore {
     /// `record` (ADR 003 §Off-chain voucher state persistence): a `record` that
     /// lands after a key is drained pushes it afresh and is captured next flush.
     dirty: SegQueue<LaneKey>,
+    /// Buffered capability rows keyed by `pool_id ‖ signer` (`[u8; 52]` —
+    /// [`capability_key_bytes`]). Sharded like `lanes`, and for the same
+    /// reason: a `put_capability` on the intake path locks only its own row's
+    /// shard. Capability rows are never tombstoned, so the map needs no slot
+    /// enum — an absent key is an absent row.
+    caps: DashMap<[u8; CAPABILITY_KEY_LEN], StoredCapability>,
+    /// Lock-free work-list of capability rows changed since the last flush,
+    /// drained by `flush` exactly like `dirty`.
+    dirty_caps: SegQueue<[u8; CAPABILITY_KEY_LEN]>,
 }
 
 impl PersistentPoolStateStore {
@@ -523,11 +546,14 @@ impl PersistentPoolStateStore {
         }
 
         let lanes = Self::hydrate_lanes(&db)?;
+        let caps = Self::hydrate_capabilities(&db)?;
         Ok(Self {
             db,
             path,
             lanes,
             dirty: SegQueue::new(),
+            caps,
+            dirty_caps: SegQueue::new(),
         })
     }
 
@@ -554,6 +580,39 @@ impl PersistentPoolStateStore {
             let key_bytes: [u8; LANE_KEY_LEN] = *key_guard.value();
             let state = decode_record(&key_bytes, value_guard.value())?;
             out.insert(state.key(), LaneSlot::Live(state));
+        }
+        Ok(out)
+    }
+
+    /// Read the whole capability table into the in-memory working set at open.
+    /// A corrupt record aborts startup like a corrupt lane row would — the
+    /// redeemer must not silently miss registration material for a signer it is
+    /// about to register on-chain.
+    fn hydrate_capabilities(
+        db: &Database,
+    ) -> Result<DashMap<[u8; CAPABILITY_KEY_LEN], StoredCapability>, StoreError> {
+        let read_txn = db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(CAPABILITY_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(DashMap::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let out = DashMap::new();
+        let iter = table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            let key_bytes: [u8; CAPABILITY_KEY_LEN] = *key_guard.value();
+            let record: StoredCapability =
+                postcard::from_bytes(value_guard.value()).map_err(|err| StoreError::Corrupt {
+                    pool_id: Some(B256::from_slice(&key_bytes[..32])),
+                    detail: format!("capability postcard decode failed: {err}"),
+                })?;
+            out.insert(key_bytes, record);
         }
         Ok(out)
     }
@@ -755,8 +814,9 @@ impl PoolStateStore for PersistentPoolStateStore {
         Ok(())
     }
 
-    /// Write every dirty lane and apply every tombstone in ONE fsynced redb
-    /// transaction. Idempotent — a no-op when clean.
+    /// Write every dirty lane, apply every tombstone, and write every dirty
+    /// capability row in ONE fsynced redb transaction. Idempotent — a no-op
+    /// when clean.
     ///
     /// Double-buffered: the dirty work-list is drained and each lane's slot is
     /// cloned out (a cheap memcpy — [`LaneState`] holds no heap fields), then
@@ -776,7 +836,11 @@ impl PoolStateStore for PersistentPoolStateStore {
         while let Some(key) = self.dirty.pop() {
             drained.insert(key);
         }
-        if drained.is_empty() {
+        let mut drained_caps: HashSet<[u8; CAPABILITY_KEY_LEN]> = HashSet::new();
+        while let Some(key) = self.dirty_caps.pop() {
+            drained_caps.insert(key);
+        }
+        if drained.is_empty() && drained_caps.is_empty() {
             return Ok(());
         }
 
@@ -797,9 +861,14 @@ impl PoolStateStore for PersistentPoolStateStore {
                             // Re-push every drained key so the next flush retries
                             // them — an early return here without the re-push
                             // would leave the un-encoded lanes permanently
-                            // "clean" and never reach disk.
+                            // "clean" and never reach disk. The capability
+                            // work-list is already drained too, so it re-pushes
+                            // on the same path.
                             for key in &drained {
                                 self.dirty.push(*key);
+                            }
+                            for key in &drained_caps {
+                                self.dirty_caps.push(*key);
                             }
                             return Err(StoreError::Codec(format!(
                                 "postcard encode failed: {err}"
@@ -814,8 +883,37 @@ impl PoolStateStore for PersistentPoolStateStore {
                 None => {}
             }
         }
-        let mut snapshot = FlushSnapshot { writes, tombstones };
-        // Both batches reach redb in ascending key order; see
+        let mut cap_writes: Vec<([u8; CAPABILITY_KEY_LEN], Vec<u8>)> =
+            Vec::with_capacity(drained_caps.len());
+        for key in &drained_caps {
+            // Same shape as the lane loop: clone the row out under its shard
+            // lock, release, then encode. A drained key with no row cannot
+            // happen (capability rows are never removed), so treat it as
+            // nothing to write.
+            let Some(record) = self.caps.get(key).map(|entry| entry.value().clone()) else {
+                continue;
+            };
+            match postcard::to_allocvec(&record) {
+                Ok(encoded) => cap_writes.push((*key, encoded)),
+                Err(err) => {
+                    for key in &drained {
+                        self.dirty.push(*key);
+                    }
+                    for key in &drained_caps {
+                        self.dirty_caps.push(*key);
+                    }
+                    return Err(StoreError::Codec(format!(
+                        "capability postcard encode failed: {err}"
+                    )));
+                }
+            }
+        }
+        let mut snapshot = FlushSnapshot {
+            writes,
+            tombstones,
+            cap_writes,
+        };
+        // Every batch reaches redb in ascending key order; see
         // [`FlushSnapshot::sort_by_table_key`].
         snapshot.sort_by_table_key();
 
@@ -832,6 +930,9 @@ impl PoolStateStore for PersistentPoolStateStore {
             for key in &snapshot.tombstones {
                 self.dirty.push(*key);
             }
+            for (key, _) in &snapshot.cap_writes {
+                self.dirty_caps.push(*key);
+            }
             return Err(err);
         }
 
@@ -846,12 +947,13 @@ impl PoolStateStore for PersistentPoolStateStore {
     }
 }
 
-/// Encoded dirty writes and tombstone keys resolved from the drained work-list,
-/// so [`PersistentPoolStateStore::flush`] can run its fsynced commit with no lane
-/// shard lock held.
+/// Encoded dirty writes, tombstone keys, and dirty capability rows resolved from
+/// the drained work-lists, so [`PersistentPoolStateStore::flush`] can run its
+/// fsynced commit with no shard lock held.
 struct FlushSnapshot {
     writes: Vec<(LaneKey, Vec<u8>)>,
     tombstones: Vec<LaneKey>,
+    cap_writes: Vec<([u8; CAPABILITY_KEY_LEN], Vec<u8>)>,
 }
 
 impl FlushSnapshot {
@@ -874,19 +976,23 @@ impl FlushSnapshot {
     /// each drained key resolves to exactly one of a live slot or a tombstone —
     /// so the insert run and the remove run never meet on one key, and sorting
     /// both leaves the whole flush deterministic even though the work-list drains
-    /// through a `HashSet` whose iteration order carries no meaning.
+    /// through a `HashSet` whose iteration order carries no meaning. The
+    /// capability keys are already their own table keys, so sorting them by the
+    /// raw `[u8; CAPABILITY_KEY_LEN]` (lexicographic) gives the same ascending
+    /// append pattern on `CAPABILITY_TABLE`.
     fn sort_by_table_key(&mut self) {
         self.writes
             .sort_by_cached_key(|(lane, _)| lane_key_bytes(lane));
         self.tombstones.sort_by_cached_key(lane_key_bytes);
+        self.cap_writes.sort_by_key(|(key, _)| *key);
     }
 }
 
 impl PersistentPoolStateStore {
-    /// Apply a [`FlushSnapshot`] in ONE fsynced redb transaction. Holds no lane
-    /// shard lock — every value was already encoded during the snapshot. Both
-    /// batches arrive in ascending table-key order, so the insert loop appends
-    /// rightward through the B-tree.
+    /// Apply a [`FlushSnapshot`] in ONE fsynced redb transaction. Holds no
+    /// shard lock — every value was already encoded during the snapshot. All
+    /// batches arrive in ascending table-key order, so the insert loops append
+    /// rightward through the B-trees.
     fn commit_snapshot(&self, snapshot: &FlushSnapshot) -> Result<(), StoreError> {
         let mut write_txn = self
             .db
@@ -911,6 +1017,14 @@ impl PersistentPoolStateStore {
                     .remove(&key_bytes)
                     .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
             }
+            let mut cap_table = write_txn
+                .open_table(CAPABILITY_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            for (key, encoded) in &snapshot.cap_writes {
+                cap_table
+                    .insert(key, encoded.as_slice())
+                    .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+            }
         }
         write_txn
             .commit()
@@ -926,12 +1040,24 @@ impl PersistentPoolStateStore {
 impl PersistentPoolStateStore {
     /// Persist the owner-signed capability material for `(pool_id, signer)` so
     /// the redeemer can register the signer on its first on-chain redemption.
-    /// Idempotent: a repeated intake of the same capability overwrites with an
-    /// identical value. Fsynced on commit like every other write here.
+    ///
+    /// Buffered like [`PoolStateStore::record`]: inserts into the in-memory
+    /// working set and pushes the row onto the dirty work-list, landing on disk
+    /// in the SAME fsynced transaction as the lanes at the next [`Self::flush`].
+    /// Locks only this row's [`DashMap`] shard. Deduped: a repeat intake whose
+    /// `(spending_cap, expiry, owner_sig)` already equals the buffered row marks
+    /// nothing dirty, so repeated capability sends are free (the intake path
+    /// calls this on every request carrying a capability).
+    ///
+    /// A crash between two flushes loses unflushed capability rows — frontier
+    /// loss, exactly like lane advances (ADR 003 §Off-chain voucher state
+    /// persistence): the client re-sends the capability on its next request,
+    /// and the pre-redeem `flush_store_durable` already floors the material the
+    /// redeemer needs by first redemption.
     ///
     /// # Errors
     ///
-    /// On a redb backend or postcard-encode failure.
+    /// Infallible today; the `Result` matches the [`CapabilitySink`] contract.
     pub fn put_capability(
         &self,
         pool_id: B256,
@@ -945,61 +1071,33 @@ impl PersistentPoolStateStore {
             expiry,
             owner_sig: owner_sig.to_vec(),
         };
-        let encoded = postcard::to_allocvec(&record)
-            .map_err(|err| StoreError::Codec(format!("capability postcard encode: {err}")))?;
         let key_bytes = capability_key_bytes(pool_id, signer);
-
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        {
-            let mut table = write_txn
-                .open_table(CAPABILITY_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            table
-                .insert(&key_bytes, encoded.as_slice())
-                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        // Decide the dedup under the entry's shard lock, so two concurrent
+        // intakes of different material for one row cannot both conclude
+        // "unchanged" against the value the other is about to replace.
+        match self.caps.entry(key_bytes) {
+            Entry::Occupied(mut occ) => {
+                if occ.get() == &record {
+                    return Ok(());
+                }
+                occ.insert(record);
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(record);
+            }
         }
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        self.dirty_caps.push(key_bytes);
         Ok(())
     }
 
-    /// Read the persisted capability material for `(pool_id, signer)`, or `None`
-    /// if this node holds no capability for it.
-    ///
-    /// # Errors
-    ///
-    /// On a redb backend or postcard-decode failure.
-    fn get_capability(
-        &self,
-        pool_id: B256,
-        signer: Address,
-    ) -> Result<Option<StoredCapability>, StoreError> {
+    /// Read the stored capability material for `(pool_id, signer)`, or `None`
+    /// if this node holds no capability for it. Reads the in-memory working
+    /// set, so a row written by [`Self::put_capability`] but not yet flushed is
+    /// still visible — the buffer is the authoritative copy after `open()`
+    /// hydrates it, which is also why the read cannot fault.
+    fn get_capability(&self, pool_id: B256, signer: Address) -> Option<StoredCapability> {
         let key_bytes = capability_key_bytes(pool_id, signer);
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(CAPABILITY_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let Some(value_guard) = table
-            .get(&key_bytes)
-            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-        else {
-            return Ok(None);
-        };
-        let record: StoredCapability = postcard::from_bytes(value_guard.value())
-            .map_err(|err| StoreError::Codec(format!("capability postcard decode: {err}")))?;
-        Ok(Some(record))
+        self.caps.get(&key_bytes).map(|entry| entry.value().clone())
     }
 }
 
@@ -1060,26 +1158,13 @@ impl crate::payment_settlement::CapabilitySource for StoredCapabilitySource {
         &self,
         key: &LaneKey,
     ) -> Option<crate::payment_settlement::CapabilityMaterial> {
-        match self.inner.get_capability(key.pool_id, key.signer) {
-            Ok(Some(record)) => Some(crate::payment_settlement::CapabilityMaterial {
+        self.inner
+            .get_capability(key.pool_id, key.signer)
+            .map(|record| crate::payment_settlement::CapabilityMaterial {
                 spending_cap: U256::from_be_bytes(record.spending_cap),
                 expiry: record.expiry,
                 owner_sig: alloy::primitives::Bytes::from(record.owner_sig),
-            }),
-            Ok(None) => None,
-            Err(err) => {
-                // A read fault here is not fatal: the redeemer skips a signer with
-                // no material, so the lane simply waits for the next redemption
-                // attempt rather than registering against a bad payload.
-                tracing::warn!(
-                    pool_id = %key.pool_id,
-                    signer = %key.signer,
-                    error = %err,
-                    "capability store read failed; skipping first-redemption registration"
-                );
-                None
-            }
-        }
+            })
     }
 }
 
@@ -1711,6 +1796,160 @@ mod tests {
             provider: address!("00000000000000000000000000000000000000ff"),
         };
         anyhow::ensure!(source.registration_material(&other_provider_key).is_some());
+        Ok(())
+    }
+
+    /// A repeated intake of an IDENTICAL capability pushes nothing onto the
+    /// dirty work-list: the buffered row already equals
+    /// `{spending_cap, expiry, owner_sig}`, so the dedup makes repeated sends
+    /// free instead of re-queuing an fsync. Only a genuinely changed row pushes.
+    #[test]
+    fn repeated_identical_capability_write_marks_nothing_dirty() -> anyhow::Result<()> {
+        use crate::payment_settlement::CapabilitySource;
+
+        let dir = data_dir()?;
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        let pool_id = b256!("9000000000000000000000000000000000000000000000000000000000000001");
+        let signer = address!("00000000000000000000000000000000000000ee");
+        let owner_sig = vec![0x42u8; 65];
+
+        CapabilitySink::store_capability(
+            store.as_ref(),
+            pool_id,
+            signer,
+            U256::from(5u64),
+            1000,
+            &owner_sig,
+        )?;
+        anyhow::ensure!(
+            store.dirty_caps.len() == 1,
+            "first write marks the row dirty"
+        );
+        // Identical repeat: nothing pushed.
+        CapabilitySink::store_capability(
+            store.as_ref(),
+            pool_id,
+            signer,
+            U256::from(5u64),
+            1000,
+            &owner_sig,
+        )?;
+        anyhow::ensure!(
+            store.dirty_caps.len() == 1,
+            "identical repeat must not re-mark the row"
+        );
+        // A changed value pushes the key again; the flush dedups the two.
+        CapabilitySink::store_capability(
+            store.as_ref(),
+            pool_id,
+            signer,
+            U256::from(6u64),
+            1000,
+            &owner_sig,
+        )?;
+        anyhow::ensure!(
+            store.dirty_caps.len() == 2,
+            "a changed value re-marks the row"
+        );
+        // Flush drains the work-list; the changed value is what lands.
+        store.flush()?;
+        anyhow::ensure!(
+            store.dirty_caps.is_empty(),
+            "flush drains the dirty capability work-list"
+        );
+        let source = StoredCapabilitySource::new(Arc::clone(&store));
+        let material = source
+            .registration_material(&LaneKey {
+                pool_id,
+                signer,
+                provider: address!("00000000000000000000000000000000000000de"),
+            })
+            .ok_or_else(|| anyhow::anyhow!("expected stored capability material"))?;
+        anyhow::ensure!(
+            material.spending_cap == U256::from(6u64),
+            "the updated cap landed"
+        );
+        // After a flush the buffer still holds the row, so re-writing the same
+        // value is still a dedup no-op — only a changed value re-marks.
+        CapabilitySink::store_capability(
+            store.as_ref(),
+            pool_id,
+            signer,
+            U256::from(6u64),
+            1000,
+            &owner_sig,
+        )?;
+        anyhow::ensure!(
+            store.dirty_caps.is_empty(),
+            "re-writing the just-flushed value is still a dedup no-op"
+        );
+        Ok(())
+    }
+
+    /// Crash-between-flush replay semantics: an unflushed capability row is
+    /// lost on reopen (frontier loss) — but the client re-sends the capability
+    /// on its next request, so a second intake restores it, and once flushed
+    /// the row survives.
+    #[test]
+    fn unflushed_capability_is_lost_but_resend_restores_it() -> anyhow::Result<()> {
+        use crate::payment_settlement::CapabilitySource;
+
+        let dir = data_dir()?;
+        let pool_id = b256!("9100000000000000000000000000000000000000000000000000000000000001");
+        let signer = address!("00000000000000000000000000000000000000dd");
+        let provider = address!("00000000000000000000000000000000000000de");
+        let owner_sig = vec![0x99u8; 65];
+
+        // Write WITHOUT flushing, then drop the store (a crash).
+        {
+            let store = PersistentPoolStateStore::open(dir.path())?;
+            CapabilitySink::store_capability(
+                &store,
+                pool_id,
+                signer,
+                U256::from(7u64),
+                2000,
+                &owner_sig,
+            )?;
+        }
+        // Reopen: the row is gone (frontier-loss-ok), so the redeemer would
+        // find no material yet.
+        let store = Arc::new(PersistentPoolStateStore::open(dir.path())?);
+        let source = StoredCapabilitySource::new(Arc::clone(&store));
+        anyhow::ensure!(
+            source
+                .registration_material(&LaneKey {
+                    pool_id,
+                    signer,
+                    provider
+                })
+                .is_none(),
+            "an unflushed capability row is lost on a crash"
+        );
+        // The client re-sends on its next request; intake re-persists, and a
+        // later flush makes it durable. The pre-flush `source` clone must go
+        // before reopen — it holds the database handle open.
+        CapabilitySink::store_capability(
+            store.as_ref(),
+            pool_id,
+            signer,
+            U256::from(7u64),
+            2000,
+            &owner_sig,
+        )?;
+        store.flush()?;
+        drop(source);
+        drop(store);
+        let store = PersistentPoolStateStore::open(dir.path())?;
+        let source = StoredCapabilitySource::new(Arc::new(store));
+        let material = source
+            .registration_material(&LaneKey {
+                pool_id,
+                signer,
+                provider,
+            })
+            .ok_or_else(|| anyhow::anyhow!("a flushed capability row must survive a re-open"))?;
+        anyhow::ensure!(material.expiry == 2000);
         Ok(())
     }
 
@@ -2395,6 +2634,7 @@ mod tests {
                 .map(|lane| (*lane, vec![pool_tag(lane)]))
                 .collect(),
             tombstones: forgotten.iter().rev().copied().collect(),
+            cap_writes: Vec::new(),
         };
         snapshot.sort_by_table_key();
 

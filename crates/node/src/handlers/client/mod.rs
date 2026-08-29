@@ -1427,24 +1427,17 @@ impl ClientHandler {
         }
 
         // Persist the owner-signed material for the redeemer (if a settlement
-        // sink is wired). `None` (tests) makes this a no-op.
+        // sink is wired). `None` (tests) makes this a no-op. The sink is a
+        // buffered in-memory insert (#1789 item 1): repeated identical
+        // capability sends dedup against the buffered row, and the row lands
+        // on disk in the periodic lane flush's fsynced commit — not a
+        // per-request `spawn_blocking` fsync on the intake path.
         let Some(sink) = self.capability_sink.as_ref() else {
             return;
         };
-        let sink = Arc::clone(sink);
         let owner_sig = capability.owner_signature.clone();
-        let write = tokio::task::spawn_blocking(move || {
-            sink.store_capability(pool_id, signer, spending_cap, expiry, &owner_sig)
-        })
-        .await;
-        match write {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(%pool_id, %signer, error = %e, "capability persist failed");
-            }
-            Err(e) => {
-                tracing::warn!(%pool_id, %signer, error = %e, "capability persist task join failed");
-            }
+        if let Err(e) = sink.store_capability(pool_id, signer, spending_cap, expiry, &owner_sig) {
+            tracing::warn!(%pool_id, %signer, error = %e, "capability persist failed");
         }
     }
 
