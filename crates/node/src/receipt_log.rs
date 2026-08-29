@@ -637,7 +637,7 @@ impl ReceiptLog for NoopReceiptLog {
     }
 }
 
-/// Non-blocking enqueue boundary for [`DownloadReceipt`]s on the paid-delivery
+/// Non-blocking enqueue boundary for [`RawReceipt`]s on the paid-delivery
 /// hot path (#803).
 ///
 /// The voucher-accept path records a receipt through this seam as each voucher
@@ -816,21 +816,25 @@ async fn receipt_writer_loop(
 /// Render one raw receipt and append it on the blocking pool, logging a
 /// non-fatal failure.
 ///
-/// The hex/decimal rendering and the timestamp read happen here (#1792 item 2),
-/// off the paid-delivery path — the delivery task only enqueued a
-/// [`RawReceipt`]. The timestamp is stamped at dequeue, so it lags the
-/// acceptance point by the queue-drain latency and stays in FIFO order.
+/// The delivery task only enqueued a [`RawReceipt`]; the hex/decimal rendering
+/// happens here (#1792 item 2), off the paid-delivery path. The timestamp is
+/// read at dequeue — so it lags the acceptance point only by the queue-drain
+/// latency and stays in FIFO order — while the render itself runs *inside* the
+/// [`tokio::task::spawn_blocking`] closure, so no formatting or allocation
+/// touches a runtime worker thread either.
 ///
-/// Offloaded to [`tokio::task::spawn_blocking`] so the synchronous
-/// `write_all`/`flush` (and any disk stall under a full or slow `data_dir`)
-/// runs on the blocking pool, never on a runtime worker. The single writer
-/// awaits each append before the next, preserving receipt order. An append
-/// error is non-fatal — the payment already advanced the lane watermark — so it
-/// is logged at `warn` and the loop continues.
+/// The blocking pool is also where the synchronous `write_all`/`flush` (and any
+/// disk stall under a full or slow `data_dir`) runs, never on a runtime worker.
+/// The single writer awaits each append before the next, preserving receipt
+/// order. An append error is non-fatal — the payment already advanced the lane
+/// watermark — so it is logged at `warn` and the loop continues.
 async fn append_one(log: &Arc<dyn ReceiptLog>, raw: RawReceipt) {
-    let receipt = raw.render(crate::payment_settlement::unix_now());
+    // Stamp at dequeue so the timestamp reflects acceptance order; the render
+    // that consumes it runs on the blocking pool below.
+    let stamped_at = crate::payment_settlement::unix_now();
     let log = Arc::clone(log);
     let join = tokio::task::spawn_blocking(move || {
+        let receipt = raw.render(stamped_at);
         let res = log.append(&receipt);
         (res, receipt)
     })
@@ -949,14 +953,25 @@ mod tests {
             seen.len()
         );
         // The writer stamps the timestamp itself, so identity is checked on the
-        // rendered fields the raw receipt carried; `size` is the per-tag key.
-        let sizes: Vec<u64> = seen.iter().map(DownloadReceipt::size).collect();
-        let want: Vec<u64> = (0..8u8).map(|t| u64::from(t) * 1024).collect();
-        anyhow::ensure!(sizes == want, "receipts out of FIFO order: {sizes:?}");
-        anyhow::ensure!(
-            seen.iter().all(|r| r.timestamp_secs() > 0),
-            "the writer must stamp a wall-clock timestamp on every receipt"
-        );
+        // fields the raw receipt carried through the render, ignoring the
+        // timestamp value; `sample(tag)` is the same identity with a fixed stamp.
+        for (i, tag) in (0..8u8).enumerate() {
+            let Some(got) = seen.get(i) else {
+                anyhow::bail!("missing drained receipt at {i}");
+            };
+            let want = sample(tag);
+            anyhow::ensure!(
+                got.size() == want.size()
+                    && got.hash() == want.hash()
+                    && got.client_node_id() == want.client_node_id()
+                    && got.voucher_amount() == want.voucher_amount(),
+                "receipt {i} identity/order not preserved through render: {got:?}"
+            );
+            anyhow::ensure!(
+                got.timestamp_secs() > 0,
+                "the writer must stamp a wall-clock timestamp on receipt {i}"
+            );
+        }
         Ok(())
     }
 
