@@ -59,7 +59,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
-use crate::receipt_log::{DownloadReceipt, ReceiptSink};
+use crate::receipt_log::{RawReceipt, ReceiptSink};
 
 // The paid-delivery methods are split across concern-focused submodules, each
 // a bare `impl ClientHandler` block over the fields defined here. Support
