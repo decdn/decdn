@@ -107,7 +107,7 @@ const RECEIPT_LOG_FILE_MODE: u32 = 0o600;
 ///
 /// The on-disk shape. The paid-delivery path captures a [`RawReceipt`] at the
 /// voucher-acceptance point and the background writer renders it into this
-/// value ([`RawReceipt::render`], #1792 item 2), so every receipt still
+/// value (`RawReceipt::render`, #1792 item 2), so every receipt still
 /// corresponds to a cumulative payment the node verified and committed — the
 /// rendering just happens off the hot path. All identifier fields are lower-hex
 /// strings (no `0x` prefix) so the log is self-describing and greppable without
@@ -239,7 +239,7 @@ impl DownloadReceipt {
 /// moves — no hex encoding, no `U256` decimal formatting, and no
 /// `SystemTime::now()` (issue #1792 item 2). The background writer
 /// ([`spawn_receipt_writer`]) turns it into the on-disk [`DownloadReceipt`] via
-/// [`RawReceipt::render`], which is where the two 64-char hex renders, the
+/// `RawReceipt::render`, which is where the two 64-char hex renders, the
 /// decimal-`uint256` render, and the acceptance timestamp are applied — off the
 /// hot path, in the same task that already owns the disk write (#803).
 #[derive(Debug, Clone, Copy)]
