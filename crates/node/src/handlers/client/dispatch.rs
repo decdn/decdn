@@ -4,23 +4,33 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, CHUNK_BYTES, CHUNK_GROUP_BYTES, CacheError, ClientHandler, Connection, FillOutcome,
-    FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, Mutex, OwnedSemaphorePermit,
+    FirstMessage, FloorReservation, Hash, LaneKey, LaneSlot, OwnedSemaphorePermit,
     REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason, Semaphore, SendStream, ServeRejectReason,
     StreamReadError, StreamResponseBody, U256, VarInt, read_first_message, reset_stream,
     verify_binding,
 };
-use futures_util::StreamExt as _;
+use arc_swap::ArcSwapOption;
 use std::sync::atomic::Ordering;
+use tokio::task::{JoinError, JoinSet};
 
 impl ClientHandler {
     /// Accept the connection-level rate-limit permit, then serve each inbound
-    /// bidi stream concurrently under a per-connection stream cap.
+    /// bidi stream on its OWN spawned task under a per-connection stream cap.
     ///
-    /// Streams run as concurrent futures on this task (via `FuturesUnordered`)
-    /// rather than `tokio::spawn`, because the iroh `ProtocolHandler::accept`
-    /// signature borrows `&self` — spawned tasks would need a `'static` handle
-    /// the trait does not hand us. Cooperative concurrency is sufficient for
-    /// the I/O-bound delivery path.
+    /// Each stream runs as a `tokio::spawn`ed task (via a [`JoinSet`]) rather
+    /// than as a cooperative future on this accept task, so every synchronous
+    /// per-stream CPU cost — the two open-time ecrecovers and the response ECDSA
+    /// signature, the per-voucher ecrecover, the up-to-255-keccak preimage walk,
+    /// the per-frame copies — runs off the accept loop and off its sibling
+    /// streams. A voucher-heavy stream does not stall the others or delay
+    /// acceptance of new streams, and effective per-connection throughput is not
+    /// bounded by one core's worth of serialized CPU (ADR 005 §Concurrent stream
+    /// limits, #1788).
+    ///
+    /// The handler is shared as `Arc<Self>` so each task holds the `'static`
+    /// handle a spawn needs; the iroh `ProtocolHandler::accept` `&self` borrow is
+    /// bridged by [`super::ClientProtocol`], which owns the `Arc` and hands
+    /// `serve` a clone.
     ///
     /// The loop also enforces the ADR 005 §Connection lifetime application-layer
     /// idle-close: once no stream is in flight, a connection with no new stream
@@ -28,7 +38,7 @@ impl ClientHandler {
     /// reclaims a peer that keeps the QUIC connection alive with keep-alive PINGs
     /// but sends no streams — which the transport idle timer never reaps.
     #[allow(clippy::cognitive_complexity)] // linear accept/select loop; splitting obscures it.
-    pub(super) async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
+    pub(super) async fn serve(self: Arc<Self>, conn: Connection) -> anyhow::Result<()> {
         let _permit = match self.limiter.acquire(&conn) {
             Ok(p) => p,
             Err(reason) => {
@@ -47,12 +57,22 @@ impl ClientHandler {
         let stream_sem = Arc::new(Semaphore::new(self.max_concurrent_streams));
         // Connection-scoped verified client binding (ADR 005 §Client identity
         // binding): the recovered Ethereum address is cached for the
-        // connection's lifetime once a valid `BindNodeId` arrives.
-        let bound_addr: Arc<Mutex<Option<Address>>> = Arc::new(Mutex::new(None));
+        // connection's lifetime once a valid `BindNodeId` arrives. Lock-free
+        // (`ArcSwapOption`) so the per-stream tasks — which now run concurrently
+        // on separate tasks (#1788) — read and publish it without an await point
+        // or a shared mutex (#1788 item 3). The cell is only a FALLBACK: every
+        // spend-authorizing decision uses the binding on its OWN stream when the
+        // request carries one, and reads this cell only when the request omits
+        // it. Publishes are last-writer-wins (as under the prior mutex); a client
+        // that re-sends its one identity per ADR 005 just re-publishes the same
+        // address, and a client that races two different identities only muddies
+        // the fallback for its own unbound streams — no lane it cannot already
+        // sign for.
+        let bound_addr: Arc<ArcSwapOption<Address>> = Arc::new(ArcSwapOption::empty());
         let client_node_id = B256::from(*conn.remote_id().as_bytes());
 
         let idle_timeout = self.idle_timeout.unwrap_or(APP_IDLE_TIMEOUT);
-        let mut inflight = futures_util::stream::FuturesUnordered::new();
+        let mut inflight: JoinSet<anyhow::Result<()>> = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
@@ -60,7 +80,17 @@ impl ClientHandler {
                     Ok((send, recv)) => {
                         let permit = Arc::clone(&stream_sem).try_acquire_owned().ok();
                         let bound = Arc::clone(&bound_addr);
-                        inflight.push(self.serve_stream(send, recv, permit, bound, client_node_id));
+                        let this = Arc::clone(&self);
+                        // Boxed: the serve future is large (clippy::large_futures),
+                        // and spawning the boxed future keeps it off the accept
+                        // task's stack frame. Each task holds its own `Arc<Self>`.
+                        inflight.spawn(Box::pin(this.serve_stream(
+                            send,
+                            recv,
+                            permit,
+                            bound,
+                            client_node_id,
+                        )));
                     }
                     // The connection closed (client done) or errored — stop
                     // accepting new streams. Not a handler fault.
@@ -83,20 +113,41 @@ impl ClientHandler {
                     conn.close(VarInt::from_u32(APP_ERR_NO_ERROR), b"idle");
                     break;
                 }
-                Some(res) = inflight.next(), if !inflight.is_empty() => {
-                    if let Err(e) = res {
-                        self.log_stream_end(&e);
-                    }
+                Some(joined) = inflight.join_next(), if !inflight.is_empty() => {
+                    self.note_joined_stream(joined);
                 }
             }
         }
         // Drain any streams still finishing after the connection closed.
-        while let Some(res) = inflight.next().await {
-            if let Err(e) = res {
-                self.log_stream_end(&e);
-            }
+        while let Some(joined) = inflight.join_next().await {
+            self.note_joined_stream(joined);
         }
         Ok(())
+    }
+
+    /// File one finished per-stream task by its join outcome.
+    ///
+    /// A task that returned an error routes to [`Self::log_stream_end`], which
+    /// attributes it to peer or node by the marker on the error chain. A
+    /// [`JoinError`] means the task did not return a value — the `JoinSet`
+    /// isolates that from the connection, which keeps serving its other streams —
+    /// and splits two ways: a PANIC is a node-side bug, metered on
+    /// `decdn_serve_stream_node_fault_total` and logged at `error!` so its rate is
+    /// alertable; a CANCELLATION is a benign teardown artifact (the drain path
+    /// never aborts, so this only arises on runtime shutdown), logged at `debug!`
+    /// and not counted.
+    fn note_joined_stream(&self, joined: Result<anyhow::Result<()>, JoinError>) {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.log_stream_end(&e),
+            Err(join_err) if join_err.is_panic() => {
+                self.metrics.serve_stream_node_fault();
+                tracing::error!(error = %join_err, "client stream task panicked");
+            }
+            Err(join_err) => {
+                tracing::debug!(error = %join_err, "client stream task cancelled");
+            }
+        }
     }
 
     /// File one finished serve stream's error by who caused it.
@@ -132,11 +183,11 @@ impl ClientHandler {
     /// handler's `serve`.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub(super) async fn serve_stream(
-        &self,
+        self: Arc<Self>,
         mut send: SendStream,
         mut recv: RecvStream,
         permit: Option<OwnedSemaphorePermit>,
-        bound_addr: Arc<Mutex<Option<Address>>>,
+        bound_addr: Arc<ArcSwapOption<Address>>,
         client_node_id: B256,
     ) -> anyhow::Result<()> {
         let first = match read_first_message(&mut recv).await {
@@ -167,7 +218,7 @@ impl ClientHandler {
         // identity binding) and remember the recovered address for the
         // connection's lifetime (a binding may be sent once and omitted on
         // later requests). A malformed binding is a client fault — reset.
-        let mut verified_client: Option<Address> = *bound_addr.lock().await;
+        let mut verified_client: Option<Address> = bound_addr.load().as_deref().copied();
         if let Some(binding) = &ext.binding {
             let addr_bytes = binding.ethereum_address;
             match verify_binding(
@@ -178,7 +229,7 @@ impl ClientHandler {
             ) {
                 Ok(recovered) if recovered.as_slice() == addr_bytes => {
                     verified_client = Some(recovered);
-                    *bound_addr.lock().await = Some(recovered);
+                    bound_addr.store(Some(Arc::new(recovered)));
                 }
                 Ok(recovered) => {
                     tracing::warn!(

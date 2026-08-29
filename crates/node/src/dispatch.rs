@@ -27,18 +27,27 @@
 //!
 //! The keyed rate limiter is provided by the [`governor`] crate. Hot-
 //! reload of the rate/burst quota rebuilds the limiter from scratch and
-//! swaps it in under an `RwLock` — token-bucket state is *not* preserved
-//! across a reload (operators changing live quotas should expect the
-//! next acquire from each source to start with a fresh burst budget).
+//! swaps the whole `PerSource` in through an [`ArcSwap`] — the acquire
+//! read path is lock-free, matching the rest of the reload surface
+//! (`semaphore` is an [`ArcSwapOption`]; the reload-fed serve structures
+//! are `ArcSwap`/atomic). Token-bucket state is *not* preserved across a
+//! reload (operators changing live quotas should expect the next acquire
+//! from each source to start with a fresh burst budget).
+//!
+//! The keyspace prune (`retain_recent`, an `O(n)` walk over the keyed map)
+//! never runs on the accept path. An accept does only the constant-time
+//! bucket check plus an `O(1)` keyspace-length comparison; when the
+//! keyspace grows past `cap + cap/10` the accept offloads one single-
+//! flighted `retain_recent` sweep to a background task, so connection
+//! admission stays constant-time regardless of keyspace size.
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use governor::{DefaultKeyedRateLimiter, Quota};
 use iroh::endpoint::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -215,7 +224,8 @@ fn build_semaphore(cap: u32) -> Option<Arc<Semaphore>> {
 ///
 /// `reload(&self, &ResolvedSecurity)` applies a new resolved-security
 /// snapshot in place. The per-source [`governor`] limiter is rebuilt
-/// from the new quota and swapped in under an internal `RwLock`. The
+/// from the new quota and swapped in wholesale through an internal
+/// [`ArcSwap`]. The
 /// global semaphore is replaced wholesale: a fresh `Arc<Semaphore>` of
 /// the new capacity is built and atomically swapped into the
 /// [`ArcSwapOption`] cell, so the next acquire hits the new semaphore.
@@ -232,32 +242,27 @@ pub struct ConnectionLimiter {
     /// 0`), `Some(arc)` otherwise. Reload swaps the whole `Arc` in;
     /// the acquire path loads it lock-free.
     semaphore: ArcSwapOption<Semaphore>,
-    /// Per-source keyed limiter behind an `RwLock` so reads (the hot
-    /// path) take a shared lock and reloads briefly take exclusive.
-    /// Held in `Arc` form for cheap cloning into the rare case where
-    /// concurrent acquires want to release the read guard before
-    /// calling `check_key`.
-    per_source: RwLock<PerSource>,
+    /// Per-source keyed limiter published through an [`ArcSwap`] so the
+    /// acquire read path is lock-free: it loads the current [`PerSource`]
+    /// and clones the inner limiter `Arc` out. Reload swaps a fresh
+    /// `Arc<PerSource>` in wholesale; in-flight acquires keep operating on
+    /// the generation they loaded, which is indistinguishable from
+    /// arriving microseconds before the swap.
+    per_source: ArcSwap<PerSource>,
     /// Mirrors `per_source.limiter.is_some()`. Read on the relay-only-
     /// connection fast path so we can record
-    /// `dispatch_per_source_skipped_no_addr` without taking the
-    /// `RwLock` on every relay accept. Written only under the
-    /// `per_source` write guard during reload.
+    /// `dispatch_per_source_skipped_no_addr` without loading the whole
+    /// `PerSource` on every relay accept. Written on reload.
     per_source_enabled: AtomicBool,
-    /// One-shot poison-log gate. Set on the first observation of a
-    /// poisoned `per_source` lock so `tracing::error!` fires once per
-    /// process rather than once per acquire — under sustained traffic
-    /// on a poisoned lock the unguarded form would emit megabytes of
-    /// identical log lines per second.
-    per_source_poison_logged: AtomicBool,
     /// Single-flight guard for `retain_recent` pruning. Without it, a
     /// flood of distinct-source connections that all observe an
-    /// over-cap keyspace simultaneously would each spawn an `O(n)`
+    /// over-cap keyspace simultaneously would each dispatch an `O(n)`
     /// walk over the keyed state — one per acquire thread. The flag
-    /// ensures at most one thread is pruning at a time; concurrent
-    /// over-cap observers skip and the next observer after the prune
-    /// completes picks up the work.
-    pruning_in_progress: AtomicBool,
+    /// ensures at most one sweep is in flight at a time; concurrent
+    /// over-cap observers skip and the next observer after the sweep
+    /// completes dispatches any remaining work. Held in an `Arc` so the
+    /// background sweep task owns a `'static` handle to reset it.
+    pruning_in_progress: Arc<AtomicBool>,
     metrics: Arc<Metrics>,
 }
 
@@ -273,10 +278,9 @@ impl ConnectionLimiter {
         let per_source_enabled = AtomicBool::new(per_source.limiter.is_some());
         Self {
             semaphore,
-            per_source: RwLock::new(per_source),
+            per_source: ArcSwap::from_pointee(per_source),
             per_source_enabled,
-            per_source_poison_logged: AtomicBool::new(false),
-            pruning_in_progress: AtomicBool::new(false),
+            pruning_in_progress: Arc::new(AtomicBool::new(false)),
             metrics,
         }
     }
@@ -284,8 +288,9 @@ impl ConnectionLimiter {
     /// Apply a new `ResolvedSecurity` to the live limiter.
     ///
     /// - Per-source: rebuild the keyed [`governor`] limiter from the new
-    ///   quota and atomically swap it in under the per-source write
-    ///   lock. **Token-bucket state is not preserved across the swap.**
+    ///   quota and atomically swap the whole `PerSource` into the
+    ///   [`ArcSwap`] cell. **Token-bucket state is not preserved across the
+    ///   swap.**
     /// - Global semaphore: build a fresh `Arc<Semaphore>` (or `None`
     ///   when `max_concurrent_handlers == 0`) and atomically swap it
     ///   into the [`ArcSwapOption`] cell. Already-acquired permits hold
@@ -295,21 +300,16 @@ impl ConnectionLimiter {
     /// Infallible. Caller (`RuntimeReloadState::reload`) has already
     /// validated the values via `resolve_security`.
     pub fn reload(&self, cfg: &ResolvedSecurity) {
-        // 1. Per-source: rebuild limiter from the new quota and swap
-        //    under the write lock.
+        // 1. Per-source: rebuild the limiter from the new quota and swap the
+        //    whole `Arc<PerSource>` into the `ArcSwap` cell. In-flight acquires
+        //    keep the generation they loaded until they drop it.
         let new_per_source = PerSource::new(
             cfg.per_source_rate_per_sec,
             cfg.per_source_burst,
             cfg.max_tracked_sources,
         );
         let per_source_enabled = new_per_source.limiter.is_some();
-        {
-            let mut g = self.per_source.write().unwrap_or_else(|poisoned| {
-                self.log_per_source_poison();
-                poisoned.into_inner()
-            });
-            *g = new_per_source;
-        }
+        self.per_source.store(Arc::new(new_per_source));
         // Mirror the enabled state for the relay-only fast path.
         // Stored under Relaxed because there's no happens-before
         // relationship to the limiter's own state — the worst case
@@ -413,62 +413,44 @@ impl ConnectionLimiter {
     ///
     /// Disabled-layer fast path: if the inner limiter is `None` the
     /// layer is administratively disabled and the call short-circuits
-    /// to `None`. Otherwise: bucket the address (`/64` for IPv6),
-    /// call `check_key`, and prune the keyspace if it has grown past
-    /// `cap`. Pruning runs lazily under the read guard via
-    /// `retain_recent` (drops keys whose state is indistinguishable
-    /// from a fresh bucket).
+    /// to `None`. Otherwise: bucket the address (`/64` for IPv6) and
+    /// call `check_key`. The `O(n)` keyspace prune never runs here —
+    /// when the keyspace has grown past `cap + cap/10` the accept
+    /// offloads one single-flighted `retain_recent` sweep to a
+    /// background task (#1788) so admission stays constant-time.
     fn check_per_source(&self, ip: IpAddr) -> Option<RejectReason> {
         let key = source_key(ip);
-        // Snapshot the limiter `Arc` and cap under the read guard, then
-        // drop the guard before doing anything O(n). `retain_recent` walks
-        // the entire keyed state map; holding the read guard across it
-        // would block reload (which needs the write lock) for the
-        // duration of the walk under a flood. The `Arc` clone keeps the
-        // observed `KeyedRateLimiter` alive across a concurrent reload —
-        // a reload swap leaves us operating on the prior generation,
-        // which is operationally indistinguishable from arriving
-        // microseconds earlier.
-        let (limiter, cap) = {
-            let g = self.per_source.read().unwrap_or_else(|poisoned| {
-                self.log_per_source_poison();
-                poisoned.into_inner()
-            });
-            (g.limiter.clone(), g.cap)
-        };
-        let limiter = limiter?;
+        // Load the current `PerSource` lock-free and clone the limiter `Arc`
+        // out. The clone keeps the observed `KeyedRateLimiter` alive across a
+        // concurrent reload swap — operating on the prior generation is
+        // indistinguishable from arriving microseconds earlier.
+        let per_source = self.per_source.load();
+        let limiter = per_source.limiter.clone()?;
+        let cap = per_source.cap;
         let result = limiter.check_key(&key);
-        // Best-effort cap enforcement, two layers of throttle:
+        // Best-effort cap enforcement, kept OFF the accept path (#1788 item 2).
+        // The accept does only two constant-time reads here — `check_key` above
+        // and `len()` below — and, when the keyspace has grown past `cap + cap/10`,
+        // dispatches ONE single-flighted `retain_recent` sweep to a background
+        // task rather than walking the `O(n)` keyed map inline:
         //
-        // 1. 10% slack: prune only when the keyspace has grown past
-        //    cap + cap/10 so a sustained 1-key-over-cap fluctuation
-        //    under flood doesn't trigger an O(n) walk on every accept.
-        // 2. Single-flight: a connection flood from N distinct sources
-        //    that all observe over-cap simultaneously would otherwise
-        //    spawn N concurrent O(n) walks. The pruning_in_progress
-        //    flag bounds it to one walk at a time; concurrent observers
-        //    skip and the next over-cap observer after the prune
-        //    completes picks up any remaining work.
+        // 1. 10% slack: dispatch only past cap + cap/10 so a sustained
+        //    1-key-over-cap fluctuation under flood doesn't dispatch a sweep on
+        //    every accept.
+        // 2. Single-flight: a flood from N distinct sources that all observe
+        //    over-cap simultaneously would otherwise dispatch N concurrent
+        //    `O(n)` sweeps. The `pruning_in_progress` flag bounds it to one in
+        //    flight at a time; concurrent observers skip and the next over-cap
+        //    observer after the sweep completes dispatches any remaining work.
         //
-        // The map can briefly exceed cap by more than 10% while the
-        // single-flight prune is in progress; on completion governor's
-        // retain_recent brings it back to cap (it drops keys whose
-        // state is indistinguishable from fresh). Runs after the read
-        // guard has been released so the walk can't block reload.
-        if cap > 0
-            && limiter.len() > cap.saturating_add(cap / 10)
-            && self
-                .pruning_in_progress
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        {
-            // RAII reset on drop: if `retain_recent` ever panics we must
-            // not leave `pruning_in_progress` stuck `true`, or both this
-            // path and the periodic GC task would be permanently disabled
-            // for the lifetime of the process — exactly the
-            // unbounded-keyspace pathology #440 fixes. See `PruneGuard`.
-            let _guard = PruneGuard(&self.pruning_in_progress);
-            limiter.retain_recent();
+        // The map can briefly exceed cap by more than 10% while a sweep is in
+        // flight; on completion governor's `retain_recent` brings it back to cap
+        // (it drops keys whose state is indistinguishable from fresh). `len()` is
+        // `O(1)` in the keyspace size; only the `retain_recent` walk it gates is
+        // load-dependent, which is why the walk — and only the walk — runs off
+        // the accept path.
+        if cap > 0 && limiter.len() > cap.saturating_add(cap / 10) {
+            self.dispatch_prune(limiter);
         }
         match result {
             Ok(()) => None,
@@ -476,10 +458,44 @@ impl ConnectionLimiter {
         }
     }
 
+    /// Run one single-flighted `retain_recent` sweep off the accept path.
+    ///
+    /// Wins the `false -> true` CAS or returns immediately (another sweep is in
+    /// flight). The winner offloads the `O(n)` walk to a `spawn_blocking` task so
+    /// the accepting task never blocks on it; the [`PruneGuard`] resets the
+    /// single-flight flag when the walk finishes, even on panic. When no tokio
+    /// runtime is present — synchronous unit tests drive `acquire` directly — the
+    /// sweep runs inline, since there is no accept task to keep responsive.
+    fn dispatch_prune(&self, limiter: Arc<DefaultKeyedRateLimiter<IpAddr>>) {
+        if self
+            .pruning_in_progress
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let flag = Arc::clone(&self.pruning_in_progress);
+        let sweep = move || {
+            // RAII reset on drop: a panic inside `retain_recent` (third-party
+            // `governor` code, or an allocation failure during the walk) must not
+            // leave the flag stuck `true`, or both this path and the periodic GC
+            // task would be permanently disabled for the process lifetime — the
+            // unbounded-keyspace pathology #440 prevents. See `PruneGuard`.
+            let _guard = PruneGuard(&flag);
+            limiter.retain_recent();
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(sweep);
+            }
+            Err(_) => sweep(),
+        }
+    }
+
     /// Drop per-source buckets whose state has refilled to the fresh
-    /// baseline (#440). The acquire path already prunes opportunistically
-    /// when the keyspace exceeds `cap + cap/10`, but a node whose
-    /// connection rate falls below the over-cap threshold can carry
+    /// baseline (#440). The acquire path dispatches an opportunistic
+    /// background sweep when the keyspace exceeds `cap + cap/10`, but a node
+    /// whose connection rate falls below the over-cap threshold can carry
     /// millions of stale buckets indefinitely. The runtime spawns a
     /// periodic task that calls this method to bound steady-state
     /// memory regardless of acquire-driven activity.
@@ -496,18 +512,10 @@ impl ConnectionLimiter {
     /// observers (the periodic task and a flood-driven acquire)
     /// coexist without spawning duplicate `O(n)` walks.
     pub fn gc_per_source(&self) -> Option<(usize, usize)> {
-        // Snapshot the limiter `Arc` under the read guard, then release
-        // the lock before the `O(n)` walk. Holding the read guard across
-        // `retain_recent` would block reload (which needs the write
-        // lock) for the whole walk — same reasoning as `check_per_source`.
-        let limiter = {
-            let g = self.per_source.read().unwrap_or_else(|poisoned| {
-                self.log_per_source_poison();
-                poisoned.into_inner()
-            });
-            g.limiter.clone()
-        };
-        let limiter = limiter?;
+        // Load the current `PerSource` lock-free and clone the limiter `Arc`
+        // out before the `O(n)` walk, so the walk operates on a stable handle
+        // even across a concurrent reload swap.
+        let limiter = self.per_source.load().limiter.clone()?;
         if self
             .pruning_in_progress
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -529,29 +537,11 @@ impl ConnectionLimiter {
     /// keyspace size with the bookkeeping cap.
     #[must_use]
     pub fn per_source_tracked(&self) -> usize {
-        let g = self.per_source.read().unwrap_or_else(|poisoned| {
-            self.log_per_source_poison();
-            poisoned.into_inner()
-        });
-        g.limiter.as_ref().map_or(0, |l| l.len())
-    }
-
-    /// One-shot poison log for the `per_source` lock. The first
-    /// observation emits `tracing::error!`; every subsequent recovery
-    /// is silent. Without the gate, sustained traffic on a poisoned
-    /// lock would emit one error line per acquire — megabytes per
-    /// second under flood.
-    fn log_per_source_poison(&self) {
-        if self
-            .per_source_poison_logged
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            tracing::error!(
-                "dispatch per-source limiter lock poisoned; recovering inner state \
-                 (further occurrences suppressed)"
-            );
-        }
+        self.per_source
+            .load()
+            .limiter
+            .as_ref()
+            .map_or(0, |l| l.len())
     }
 }
 
@@ -700,24 +690,6 @@ mod tests {
             .map(|h| usize::from(h.join().unwrap()))
             .sum();
         assert_eq!(successes, 1, "exactly one acquire should succeed");
-    }
-
-    #[test]
-    fn poisoned_lock_recovers_inner_state() {
-        let metrics = Arc::new(Metrics::new());
-        let limiter = Arc::new(ConnectionLimiter::new(&permissive_security(), metrics));
-        let lim_for_thread = Arc::clone(&limiter);
-        // Poison per_source from a panicking thread holding the write lock.
-        let join = std::thread::spawn(move || {
-            let _g = lim_for_thread.per_source.write().unwrap();
-            panic!("intentional");
-        });
-        let _ = join.join();
-        assert!(limiter.per_source.is_poisoned());
-        // acquire must still work — recovery branch returns the inner guard.
-        let _p = limiter
-            .acquire_inner(Some(ip(10, 0, 0, 1)))
-            .expect("acquire after per_source poison");
     }
 
     // --- Disabled-layer (0 = unlimited) ---------------------------------------
@@ -1079,6 +1051,50 @@ mod tests {
             limiter.per_source_tracked(),
             0,
             "refilled buckets should be dropped by gc_per_source"
+        );
+    }
+
+    /// An accept that trips `cap + cap/10` prunes the refilled keyspace off the
+    /// bucket check (#1788 item 2). In production the sweep is offloaded to a
+    /// `spawn_blocking` task; here there is no tokio runtime, so `dispatch_prune`
+    /// runs the SAME single-flighted `retain_recent` sweep inline — which lets
+    /// this test assert the outcome deterministically. Fast refill (rate=1000/s,
+    /// burst=1) so an idle bucket returns to its fresh baseline within the wait,
+    /// and `retain_recent` drops every bucket except the one the triggering
+    /// accept just used.
+    #[test]
+    fn over_cap_accept_prunes_refilled_keyspace() {
+        let metrics = Arc::new(Metrics::new());
+        let cfg = ResolvedSecurity {
+            max_concurrent_handlers: u32::MAX,
+            per_source_rate_per_sec: 1000.0,
+            per_source_burst: 1,
+            // Small cap so a handful of distinct sources trips cap + cap/10 (== 2).
+            max_tracked_sources: 2,
+        };
+        let limiter = ConnectionLimiter::new(&cfg, Arc::clone(&metrics));
+        // Populate 8 distinct per-source buckets, well past cap + cap/10. In this
+        // tight synchronous loop no bucket has time to refill, so the over-cap
+        // sweeps that fire during it drop nothing and the keyspace grows to 8.
+        for i in 0..8u8 {
+            let _ = limiter.acquire_inner(Some(ip(10, 0, 0, i)));
+        }
+        assert_eq!(
+            limiter.per_source_tracked(),
+            8,
+            "every distinct source should be tracked before the refill window"
+        );
+        // Let every populated bucket refill to its fresh baseline (~1ms each).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // One more over-cap accept from a fresh source. Its bucket is now
+        // non-baseline (a token was just drawn), so the sweep keeps it and drops
+        // the 8 refilled buckets.
+        let _ = limiter.acquire_inner(Some(ip(10, 0, 0, 200)));
+        assert_eq!(
+            limiter.per_source_tracked(),
+            1,
+            "the over-cap accept should prune the refilled keyspace back to only \
+             the just-used bucket"
         );
     }
 

@@ -419,7 +419,9 @@ fn spawn_a_server(
             } else {
                 let handler = Arc::clone(&client_handler);
                 tokio::spawn(async move {
-                    let _ = handler.accept(conn).await;
+                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                        .accept(conn)
+                        .await;
                 });
             }
         }
@@ -458,7 +460,9 @@ fn spawn_a_probe_counting_server(
             } else {
                 let handler = Arc::clone(&client_handler);
                 tokio::spawn(async move {
-                    let _ = handler.accept(conn).await;
+                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                        .accept(conn)
+                        .await;
                 });
             }
         }
@@ -1846,6 +1850,7 @@ fn spawn_server_concurrent(
     server_ep: iroh::Endpoint,
     handler: Arc<decdn_node::handlers::client::ClientHandler>,
 ) -> tokio::task::JoinHandle<()> {
+    use decdn_node::handlers::client::ClientProtocol;
     use iroh::protocol::ProtocolHandler;
     tokio::spawn(async move {
         while let Some(incoming) = server_ep.accept().await {
@@ -1855,7 +1860,7 @@ fn spawn_server_concurrent(
             let Ok(conn) = connecting.await else { continue };
             let handler = Arc::clone(&handler);
             tokio::spawn(async move {
-                let _ = handler.accept(conn).await;
+                let _ = ClientProtocol::new(handler).accept(conn).await;
             });
         }
     })
@@ -10620,7 +10625,9 @@ fn spawn_a_serving_server_with_counters(
                 let streams = Arc::clone(&streams);
                 tokio::spawn(async move {
                     streams.fetch_add(1, Ordering::SeqCst);
-                    let _ = handler.accept(conn).await;
+                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
+                        .accept(conn)
+                        .await;
                 });
             }
         }
