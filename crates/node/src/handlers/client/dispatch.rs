@@ -60,7 +60,14 @@ impl ClientHandler {
         // connection's lifetime once a valid `BindNodeId` arrives. Lock-free
         // (`ArcSwapOption`) so the per-stream tasks — which now run concurrently
         // on separate tasks (#1788) — read and publish it without an await point
-        // or a shared mutex (#1788 item 3): a write-once-then-read cell.
+        // or a shared mutex (#1788 item 3). The cell is only a FALLBACK: every
+        // spend-authorizing decision uses the binding on its OWN stream when the
+        // request carries one, and reads this cell only when the request omits
+        // it. Publishes are last-writer-wins (as under the prior mutex); a client
+        // that re-sends its one identity per ADR 005 just re-publishes the same
+        // address, and a client that races two different identities only muddies
+        // the fallback for its own unbound streams — no lane it cannot already
+        // sign for.
         let bound_addr: Arc<ArcSwapOption<Address>> = Arc::new(ArcSwapOption::empty());
         let client_node_id = B256::from(*conn.remote_id().as_bytes());
 
@@ -121,21 +128,24 @@ impl ClientHandler {
     /// File one finished per-stream task by its join outcome.
     ///
     /// A task that returned an error routes to [`Self::log_stream_end`], which
-    /// attributes it to peer or node by the marker on the error chain. A task
-    /// that PANICKED cannot take the connection down with it — the `JoinSet`
-    /// isolates the unwind — so it is filed here as a node-side fault: metered on
-    /// `decdn_serve_stream_node_fault_total` and logged at `error!`, and the
-    /// connection keeps serving its other streams.
+    /// attributes it to peer or node by the marker on the error chain. A
+    /// [`JoinError`] means the task did not return a value — the `JoinSet`
+    /// isolates that from the connection, which keeps serving its other streams —
+    /// and splits two ways: a PANIC is a node-side bug, metered on
+    /// `decdn_serve_stream_node_fault_total` and logged at `error!` so its rate is
+    /// alertable; a CANCELLATION is a benign teardown artifact (the drain path
+    /// never aborts, so this only arises on runtime shutdown), logged at `debug!`
+    /// and not counted.
     fn note_joined_stream(&self, joined: Result<anyhow::Result<()>, JoinError>) {
         match joined {
             Ok(Ok(())) => {}
             Ok(Err(e)) => self.log_stream_end(&e),
-            Err(join_err) => {
+            Err(join_err) if join_err.is_panic() => {
                 self.metrics.serve_stream_node_fault();
-                tracing::error!(
-                    error = %join_err,
-                    "client stream task terminated abnormally (panic)"
-                );
+                tracing::error!(error = %join_err, "client stream task panicked");
+            }
+            Err(join_err) => {
+                tracing::debug!(error = %join_err, "client stream task cancelled");
             }
         }
     }
