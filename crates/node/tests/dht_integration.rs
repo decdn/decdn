@@ -1,6 +1,6 @@
 //! End-to-end integration coverage for the iterative `FindValue`
-//! lookup path introduced in PR #673 (ADR 022 §`FIND_VALUE` Flow,
-//! §Routing Table, §Lookup integrity). Issue #711.
+//! lookup path (ADR 022 §`FIND_VALUE` Flow, §Routing Table,
+//! §Lookup integrity). Issue #711.
 //!
 //! `dht_lookup.rs` already pins the single-hop lookup invariants
 //! (happy path, the active-staker and negative-cache response filters,
@@ -646,7 +646,7 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
 /// it to now, and `contains_active` reads `expiry <= now` as elapsed and
 /// evicts.
 #[tokio::test(flavor = "multi_thread")]
-async fn find_providers_negative_cache_expires_after_ttl() -> anyhow::Result<()> {
+async fn find_providers_stops_suppressing_once_the_negative_entry_expires() -> anyhow::Result<()> {
     let target: [u8; 32] = [0xC3; 32];
 
     let client_sk = fresh_key();
