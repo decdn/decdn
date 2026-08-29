@@ -19,7 +19,7 @@ use super::{
     Arc, B256, BufferedProofReader, ClientHandler, DEFAULT_TOLERANCE_BPS, Hash, LaneDeliveryState,
     LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream, RetrySignal, SendStream,
     SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, VoucherStop, WatermarkBundle,
-    unix_millis, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
 
@@ -231,7 +231,7 @@ impl ClientHandler {
         // `CapabilityExpired` — distinct from a cap-exhausted `SpendingCapExhausted`,
         // since the fix is a fresh capability, not a cap raise.
         let expiry = guard.state.expiry;
-        if expiry != 0 && crate::payment_settlement::unix_now() >= expiry {
+        if expiry != 0 && self.coarse_clock.unix_seconds() >= expiry {
             drop(guard);
             self.write_reject(send, VoucherRejectReason::CapabilityExpired, None)
                 .await?;
@@ -286,7 +286,7 @@ impl ClientHandler {
         // relaxed store needs no ordering against the record above.
         guard
             .last_voucher_at
-            .store(unix_millis(), Ordering::Relaxed);
+            .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
         drop(guard);
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
@@ -413,7 +413,7 @@ impl ClientHandler {
         }
         guard
             .last_voucher_at
-            .store(unix_millis(), Ordering::Relaxed);
+            .store(self.coarse_clock.unix_millis(), Ordering::Relaxed);
         drop(guard);
 
         // Post-acceptance bookkeeping, off the durability path. The receipt
