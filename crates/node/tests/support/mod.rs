@@ -24,7 +24,7 @@ use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::PoolStateStore;
 use decdn_node::dispatch::ConnectionLimiter;
-use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
+use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
 use decdn_node::metrics::Metrics;
 use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
 use decdn_protocol::client::ClientMessage;
@@ -651,7 +651,7 @@ pub fn spawn_server(
                 continue;
             };
             let Ok(conn) = connecting.await else { continue };
-            let _ = handler.accept(conn).await;
+            let _ = ClientProtocol::new(Arc::clone(&handler)).accept(conn).await;
         }
     })
 }

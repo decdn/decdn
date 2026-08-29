@@ -1873,9 +1873,33 @@ enum VoucherStop {
     Rejected,
 }
 
-impl ProtocolHandler for ClientHandler {
+/// Router-facing `ProtocolHandler` for `cdn/client/v1`.
+///
+/// Wraps the shared `Arc<ClientHandler>` so the serve loop can hand every
+/// per-stream task a `'static` clone of the handler and `tokio::spawn` it
+/// (#1788). The iroh [`ProtocolHandler::accept`] signature borrows `&self`, so
+/// the handler itself cannot spawn tasks that outlive the borrow; owning the
+/// `Arc` here and cloning it into `ClientHandler::serve` bridges that gap. The
+/// wrapper is cheap to clone (one `Arc` bump) and the router holds one for the
+/// process lifetime.
+#[derive(Clone, Debug)]
+pub struct ClientProtocol(Arc<ClientHandler>);
+
+impl ClientProtocol {
+    /// The `cdn/client/v1` ALPN this handler answers.
+    pub const ALPN: &'static [u8] = ALPN_CLIENT;
+
+    /// Wrap a shared handler for registration on the iroh `Router`.
+    #[must_use]
+    pub const fn new(handler: Arc<ClientHandler>) -> Self {
+        Self(handler)
+    }
+}
+
+impl ProtocolHandler for ClientProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.serve(connection)
+        Arc::clone(&self.0)
+            .serve(connection)
             .await
             .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))
     }

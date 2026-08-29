@@ -30,7 +30,7 @@ use crate::admin;
 use crate::channel_store::PersistentPoolStateStore;
 use crate::dht::{DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
-use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
+use crate::handlers::client::{ClientHandler, ClientProtocol, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
 use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePolicy};
 use crate::handlers::probe_rate_limit::ProbeRateLimiter;
@@ -679,7 +679,7 @@ async fn serve_until_shutdown(
     let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
         Router::builder(ep.clone())
             .accept(ProbeHandler::ALPN, probe_handler)
-            .accept(ClientHandler::ALPN, client_handler)
+            .accept(ClientProtocol::ALPN, ClientProtocol::new(client_handler))
             .accept(DhtHandler::ALPN, dht_handler)
             .spawn()
     })

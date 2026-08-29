@@ -1308,6 +1308,7 @@ fn spawn_server_concurrent(
     server_ep: iroh::Endpoint,
     handler: Arc<ClientHandler>,
 ) -> tokio::task::JoinHandle<()> {
+    use decdn_node::handlers::client::ClientProtocol;
     use iroh::protocol::ProtocolHandler;
     tokio::spawn(async move {
         while let Some(incoming) = server_ep.accept().await {
@@ -1317,7 +1318,7 @@ fn spawn_server_concurrent(
             let Ok(conn) = connecting.await else { continue };
             let handler = Arc::clone(&handler);
             tokio::spawn(async move {
-                let _ = handler.accept(conn).await;
+                let _ = ClientProtocol::new(handler).accept(conn).await;
             });
         }
     })
