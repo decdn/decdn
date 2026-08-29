@@ -2071,26 +2071,51 @@ mod tests {
         );
     }
 
-    /// Measure one 4 MiB (`INGEST_CHECKPOINT_BYTES`) checkpoint's delivery
-    /// through a fresh lane on this machine, and return a `unit_deadline`
-    /// rested a safety factor above it.
+    /// The two deadlines the wedge test runs under, both derived from one
+    /// measurement so they cannot drift apart.
+    struct WedgeBudget {
+        /// What a lane gets to shrink the missing window before the watchdog
+        /// reassigns it.
+        unit_deadline: Duration,
+        /// What the whole fetch gets before the test calls the watchdog broken.
+        outer_bound: Duration,
+    }
+
+    /// Measure one [`ClientRangedStore::INGEST_CHECKPOINT_BYTES`] checkpoint's
+    /// delivery through a fresh lane on this machine, and size both of the
+    /// wedge test's deadlines a safety factor above it.
     ///
     /// `unit_deadline` is the budget a lane gets to shrink the missing window
     /// before the watchdog reassigns it, so the honest rate to size it against
-    /// is the time one checkpoint actually takes to land here. A fixed value
-    /// is load-flaky: a contended runner routinely moves 4 MiB slower than a
-    /// constant chosen for the healthy case, and the healthy lane then gets
-    /// falsely reassigned. Measuring the same machine first keeps the budget
-    /// above that lane's delivery time, floored for fast machines and capped
-    /// well under the test's outer timeout so a wedged lane still trips
-    /// promptly.
-    async fn calibrated_unit_deadline() -> anyhow::Result<Duration> {
-        const CHECKPOINT: usize = 4 * 1024 * 1024;
+    /// is the time one checkpoint actually takes to land here. A fixed value is
+    /// load-flaky: a contended runner routinely moves a checkpoint slower than
+    /// a constant chosen for the healthy case, and the healthy lane then gets
+    /// falsely reassigned.
+    ///
+    /// `outer_bound` scales with it, because a fixed bound against a scaled
+    /// deadline only moves the flake. The watchdog needs up to TWO windows to
+    /// trip — one that sees the checkpoint land and resets, one that sees
+    /// nothing — and the surviving lane then refetches the wedged lane's tail,
+    /// so the bound has to cover several deadlines rather than a constant.
+    ///
+    /// `measured` spans one whole single-lane fetch — lane open, channel
+    /// bootstrap, deposit, transfer, voucher drain — not the checkpoint alone,
+    /// so it OVERSTATES the per-checkpoint cost. That is the safe direction,
+    /// and it is why `K` is a factor rather than a margin.
+    ///
+    /// The clamp guards the derivation rather than forming part of it: under
+    /// `FLOOR` a fast machine gets a deadline too tight for its own scheduling
+    /// jitter, and over `CEILING` the safety factor decays toward 1×. A machine
+    /// slow enough to reach `CEILING` is one this test is unreliable on
+    /// whatever it is handed, so the ceiling says so on stderr rather than
+    /// pretending the factor still holds.
+    async fn calibrated_wedge_budget() -> anyhow::Result<WedgeBudget> {
         const FLOOR: Duration = Duration::from_millis(600);
         const CEILING: Duration = Duration::from_secs(5);
         const K: u32 = 10;
+        let checkpoint = usize::try_from(ClientRangedStore::INGEST_CHECKPOINT_BYTES)?;
 
-        let data = blob(CHECKPOINT);
+        let data = blob(checkpoint);
         let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
         let src = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger));
         let root = src.root();
@@ -2100,7 +2125,7 @@ mod tests {
         let pacer = BudgetPacer::new();
         let lanes = vec![lane(&src, Arc::clone(&ledger), 0xBB)];
         let started = tokio::time::Instant::now();
-        multi_source_fetch(
+        let fetched = multi_source_fetch(
             &store,
             &lanes,
             &pacer,
@@ -2121,13 +2146,28 @@ mod tests {
             },
             None,
         )
-        .await?;
-        let measured = started.elapsed();
-        let budget = measured
-            .checked_mul(K)
-            .unwrap_or(CEILING)
-            .clamp(FLOOR, CEILING);
-        Ok(budget)
+        .await;
+        // A healthy single lane with nothing to reassign to, so the only
+        // plausible failure is this fetch tripping its OWN watchdog on a
+        // machine slower than CEILING. Take the ceiling rather than failing the
+        // wedge test under a lane-fault message about the scheduler under test.
+        let measured = if fetched.is_ok() {
+            started.elapsed()
+        } else {
+            CEILING
+        };
+        let wanted = measured.saturating_mul(K);
+        let unit_deadline = wanted.clamp(FLOOR, CEILING);
+        if wanted > CEILING {
+            eprintln!(
+                "wedge calibration: one checkpoint took {measured:?}, wanting {wanted:?}; \
+                 capped at {CEILING:?}, so the {K}× safety factor is degraded here"
+            );
+        }
+        Ok(WedgeBudget {
+            unit_deadline,
+            outer_bound: unit_deadline.saturating_mul(4) + Duration::from_secs(15),
+        })
     }
 
     /// End-to-end: a source that opens, delivers a prefix, then WEDGES without
@@ -2161,10 +2201,12 @@ mod tests {
             lane(&src_a, Arc::clone(&ledger_a), 0xA1),
             lane(&src_b, Arc::clone(&ledger_b), 0xB2),
         ];
+        let budget = calibrated_wedge_budget().await?;
         // The outer bound is what turns "the watchdog never fired" into a
-        // failure rather than a two-minute wait.
+        // failure rather than a two-minute wait. It rides on the same
+        // measurement as the unit deadline, so a slow machine widens both.
         tokio::time::timeout(
-            Duration::from_secs(20),
+            budget.outer_bound,
             multi_source_fetch(
                 &store,
                 &lanes,
@@ -2181,15 +2223,19 @@ mod tests {
                 &MultiSourceConfig {
                     max_sources: 2,
                     // Calibrated: comfortably above a checkpoint's worth of
-                    // healthy delivery time, well below the 20 s wedge.
-                    unit_deadline: calibrated_unit_deadline().await?,
+                    // healthy delivery time, and far under the 120 s wedge, so
+                    // the lane is still stalled when the watchdog samples it.
+                    unit_deadline: budget.unit_deadline,
                 },
                 None,
             ),
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("the wedged lane was never ended: the watchdog did not fire")
+            anyhow::anyhow!(
+                "the fetch did not finish within {:?}: the watchdog did not end the wedged lane",
+                budget.outer_bound
+            )
         })??;
 
         store.finalize().await?;

@@ -461,7 +461,7 @@ impl ClientRangedStore {
     /// that window at four times the fsync rate, which is a storage tradeoff
     /// rather than a payment-correctness one — the payer re-pays only what it
     /// genuinely re-pulls either way.
-    const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+    pub(crate) const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 
     /// Stream the raw bao encoding of `range` (from `reader`) into the store:
     /// verify each chunk group against the root as

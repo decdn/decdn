@@ -40,13 +40,17 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
-pub mod abandon_drain;
+mod abandon_drain;
 mod admit_store;
 mod backend_source;
 mod funder;
 mod pull_leg;
 
 use abandon_drain::{ConnDrain, as_observer, drain_abandoned};
+// Public only so the integration-test teardown helper can pin its own deadline
+// above this cap. Not part of the crate's surface.
+#[doc(hidden)]
+pub use abandon_drain::ABANDON_DRAIN_CAP;
 pub(crate) use admit_store::NodeAdmitStore;
 #[allow(
     unused_imports,
