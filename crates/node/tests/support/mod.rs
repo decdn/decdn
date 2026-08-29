@@ -153,6 +153,25 @@ pub async fn local_endpoint(
 /// the `.config/nextest.toml` backstop.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The ordering above is the whole point of the constant, so it is pinned here
+/// rather than left to the prose. A `SHUTDOWN_TIMEOUT` at or below the drain
+/// cap would let a ceilinged drain consume the whole budget, collapsing the two
+/// readings the margin exists to keep distinguishable.
+const _: () = assert!(
+    SHUTDOWN_TIMEOUT.as_secs()
+        > decdn_node::node_origin::abandon_drain::ABANDON_DRAIN_CAP.as_secs()
+);
+
+/// What [`shutdown`] actually did, so a caller can assert on a breach rather
+/// than only see the warning line.
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownReport {
+    /// Tasks reaped (aborted and joined) before the deadline.
+    pub reaped: usize,
+    /// Endpoints closed before the deadline.
+    pub closed: usize,
+}
+
 /// Own a test's whole iroh teardown: abort `tasks`, reap them, then close
 /// `endpoints` — all under one shared deadline.
 ///
@@ -203,13 +222,19 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// [`JoinError::is_cancelled`]: tokio::task::JoinError::is_cancelled
 ///
+/// # Returns
+///
+/// The [`ShutdownReport`] on success — the reaped/closed counts, so a caller
+/// can assert on a breach. A breach (a deadline exceeded) is still `Ok`: it is
+/// a warning, not a failure, and the report carries the shortfall.
+///
 /// # Errors
 ///
 /// A server task that panicked.
 pub async fn shutdown<const N: usize, const M: usize>(
     tasks: [tokio::task::JoinHandle<()>; N],
     endpoints: [&Endpoint; M],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ShutdownReport> {
     for task in &tasks {
         task.abort();
     }
@@ -245,7 +270,7 @@ pub async fn shutdown<const N: usize, const M: usize>(
              ({reaped}/{N} tasks reaped, {closed}/{M} endpoints closed)"
         );
     }
-    fault.map_or(Ok(()), Err)
+    fault.map_or(Ok(ShutdownReport { reaped, closed }), Err)
 }
 
 /// Join a ONE-SHOT server task under the same deadline [`shutdown`] uses, and

@@ -40,7 +40,7 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
-mod abandon_drain;
+pub mod abandon_drain;
 mod admit_store;
 mod backend_source;
 mod funder;

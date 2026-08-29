@@ -15,7 +15,8 @@
 
 mod support;
 
-use support::{reap, shutdown};
+use iroh::Endpoint;
+use support::{fresh_key, local_endpoint, reap, shutdown};
 
 /// A task that ends on its own is reaped, not aborted, and its value comes back.
 #[tokio::test(start_paused = true)]
@@ -100,4 +101,110 @@ async fn shutdown_keeps_the_first_fault() {
         err.to_string().contains("server task 0"),
         "the first fault must be the reported one, got: {err}"
     );
+}
+
+/// The report's counters match what the docstring claims: every task reaped and
+/// every endpoint closed on a clean teardown.
+#[tokio::test(start_paused = true)]
+async fn shutdown_reports_clean_counts() -> anyhow::Result<()> {
+    let task = tokio::spawn(std::future::pending::<()>());
+    let ep = local_endpoint(fresh_key(), vec![]).await?;
+    let report = shutdown([task], [&ep.0]).await?;
+    assert_eq!(report.reaped, 1, "the one task must be reaped");
+    assert_eq!(report.closed, 1, "the one endpoint must be closed");
+    Ok(())
+}
+
+/// A close that blocks on a never-draining connection still yields `Ok`, with
+/// the report showing `closed < M` — the breach line's data, returned rather
+/// than only printed.
+///
+/// The endpoint under test DIALS OUT and its connection driver lives on a
+/// throwaway runtime; dropping that runtime strands the driver, so the
+/// connection can never reach drained and `Endpoint::close` waits on it
+/// forever — the same shape `abandon_drain` exists to wait out. `shutdown`
+/// then hits its deadline and reports the shortfall instead of failing.
+///
+/// Every live socket driver runs on its own thread, not on this paused
+/// runtime: a driver doing real socket I/O here would hold the virtual clock
+/// instead of letting it reach the deadline.
+#[tokio::test(start_paused = true)]
+async fn shutdown_reports_a_stalled_close() -> anyhow::Result<()> {
+    let (e_ep, _) = driven_endpoint(fresh_key(), vec![b"cdn/stall/v1".to_vec()])?;
+    let (peer_ep, peer_addr) = driven_endpoint(fresh_key(), vec![b"cdn/stall/v1".to_vec()])?;
+    let peer_id = peer_ep.id();
+
+    // Peer accepts one connection and holds it forever, on its own runtime.
+    let accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            if let Some(incoming) = peer_ep.accept().await
+                && let Ok(connecting) = incoming.accept()
+            {
+                let _ = connecting.await;
+                std::future::pending::<()>().await;
+            }
+        });
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // The endpoint-under-test dials out through a clone on a throwaway
+    // runtime, then that runtime is dropped to strand the connection's
+    // driver. The connection is kept alive so the endpoint still tracks it.
+    let e_clone = e_ep.clone();
+    let _conn = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let conn = rt.block_on(async {
+            e_clone
+                .connect(
+                    iroh::EndpointAddr::new(peer_id).with_ip_addr(peer_addr),
+                    b"cdn/stall/v1",
+                )
+                .await
+        })?;
+        drop(rt);
+        Ok::<_, anyhow::Error>(conn)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("connection thread panicked"))??;
+
+    let report = shutdown([], [&e_ep]).await?;
+    assert!(
+        report.closed < 1,
+        "the stalled close must be reported as a breach, got closed = {}",
+        report.closed
+    );
+    let _ = accept;
+    Ok(())
+}
+
+/// Bind an endpoint whose socket driver is driven on its own thread forever, so
+/// no live driver runs on the caller's (possibly paused) runtime.
+///
+/// Returns the endpoint and its loopback address. The driver thread runs the
+/// runtime with `block_on(pending())` for the lifetime of the program, so the
+/// endpoint keeps working for as long as the test needs it.
+fn driven_endpoint(
+    key: iroh::SecretKey,
+    alpn: Vec<Vec<u8>>,
+) -> anyhow::Result<(Endpoint, std::net::SocketAddr)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let result: anyhow::Result<(Endpoint, std::net::SocketAddr)> =
+            rt.block_on(local_endpoint(key, alpn));
+        let ok = result.is_ok();
+        let _ = tx.send(result);
+        if ok {
+            rt.block_on(std::future::pending::<()>());
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    rx.recv()?
 }

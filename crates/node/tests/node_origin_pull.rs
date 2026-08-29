@@ -11320,7 +11320,8 @@ struct TopUpFixture {
 
 impl TopUpFixture {
     async fn shutdown(self) -> Result<()> {
-        shutdown([self.task_a], [&self.ep_b, &self.ep_a]).await
+        shutdown([self.task_a], [&self.ep_b, &self.ep_a]).await?;
+        Ok(())
     }
 }
 
