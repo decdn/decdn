@@ -906,9 +906,9 @@ pub struct ClientHandlerDeps {
     /// stamp (issue #1792 item 4). `None` (the default and every test) means the
     /// handler builds its own unrefreshed clock, which reads the live wall clock
     /// on every call — identical to the pre-#1792 behavior. The runtime sets
-    /// `Some` with a refresher running, so those two reads become one relaxed
-    /// atomic load instead of a `SystemTime::now()` syscall in the critical
-    /// section.
+    /// `Some` with a refresher running, so each of those two reads becomes a
+    /// relaxed atomic load instead of a `SystemTime::now()` syscall in the
+    /// critical section.
     pub coarse_clock: Option<Arc<crate::coarse_clock::CoarseClock>>,
 }
 

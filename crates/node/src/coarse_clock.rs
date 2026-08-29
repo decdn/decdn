@@ -8,18 +8,21 @@
 //! `SystemTime::now()` syscall inside that critical section is pure per-proof
 //! overhead that lengthens the most contended lock hold on the paid path.
 //!
-//! [`CoarseClock`] replaces those syscalls with one relaxed [`AtomicU64`] load.
-//! A background task ([`CoarseClock::spawn_refresher`]) stamps the current wall
-//! clock into the cell on a timer; the hot path just reads it.
+//! [`CoarseClock`] turns each of those two syscalls into a single relaxed
+//! [`AtomicU64`] load (still two reads per proof, one load each). A background
+//! task ([`CoarseClock::spawn_refresher`]) stamps the current wall clock into
+//! the cell on a timer; the hot path just reads it.
 //!
 //! **Fallback.** Until a refresher runs the cell holds `0`, and every read falls
 //! back to a live `SystemTime::now()`. So a clock with no refresher attached
 //! (every unit and loopback test, which build a handler without one) reports the
 //! exact wall clock and behaves precisely as the pre-#1792 code did — the
 //! coarsening is a production-only optimization, not a semantic change. `0` is a
-//! safe sentinel because a real Unix-millisecond reading is never zero (that is
-//! 1970), and even a refresher that somehow wrote `0` would only cost one live
-//! read until its next tick.
+//! safe sentinel: a live millisecond reading is `0` only at the Unix epoch
+//! itself, which a running node's clock is not at, so a `0` in the cell means
+//! "unrefreshed", not "midnight 1970". Even a stray `0` (a refresher that wrote
+//! one, or a clock pinned there) is harmless — reads just route to a live
+//! `SystemTime::now()` until the next tick, correct but not coarse.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
